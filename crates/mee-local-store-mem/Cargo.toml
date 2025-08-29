@@ -1,0 +1,8 @@
+[package]
+name = "mee-local-store-mem"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mee-local-store-api = { path = "../mee-local-store-api" }
+

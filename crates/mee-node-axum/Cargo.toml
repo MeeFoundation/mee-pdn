@@ -1,0 +1,25 @@
+[package]
+name = "mee-node-axum"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8.4", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+mee-node-api = { path = "../mee-node-api" }
+mee-transport-api = { path = "../mee-transport-api" }
+mee-transport-http = { path = "../mee-transport-http" }
+mee-local-store-api = { path = "../mee-local-store-api" }
+mee-local-store-mem = { path = "../mee-local-store-mem" }
+mee-did-api = { path = "../mee-did-api" }
+mee-did-key = { path = "../mee-did-key" }
+mee-types = { path = "../mee-types" }
+thiserror = "2.0.16"
+anyhow = "1"
+
+[[bin]]
+name = "mee-node-axum"
+path = "src/main.rs"

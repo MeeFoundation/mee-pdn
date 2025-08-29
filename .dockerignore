@@ -1,0 +1,25 @@
+# VCS and metadata
+.git
+.git/*
+.gitignore
+*.code-workspace
+
+# Editor/OS files
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# Build artifacts
+target
+**/target
+
+# Local runtime/demo data
+var
+tmp
+local-data
+
+# Env and secrets
+.env
+.env.*

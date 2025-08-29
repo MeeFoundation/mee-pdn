@@ -1,0 +1,17 @@
+local-data
+.env
+target
+build
+*.log
+.vscode
+.idea
+.DS_Store
+.settings
+.classpath
+.project
+*.worksheet.sc
+**/Generated
+**/xcuserdata
+tmp
+var
+.cargo

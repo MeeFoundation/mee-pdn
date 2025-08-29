@@ -1,0 +1,22 @@
+[package]
+name = "mee-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal WASM facade for Mee PDN (build check only)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+mee-transport-api = { path = "../mee-transport-api" }
+mee-did-api = { path = "../mee-did-api" }
+mee-did-key = { path = "../mee-did-key" }
+mee-local-store-api = { path = "../mee-local-store-api" }
+mee-local-store-mem = { path = "../mee-local-store-mem" }
+mee-node-api = { path = "../mee-node-api" }
+mee-types = { path = "../mee-types" }
+
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]

@@ -1,0 +1,8 @@
+[package]
+name = "mee-did-key"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mee-did-api = { path = "../mee-did-api" }
+mee-types = { path = "../mee-types" }

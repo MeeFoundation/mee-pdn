@@ -1,0 +1,8 @@
+[package]
+name = "mee-did-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mee-types = { path = "../mee-types" }
+thiserror = "2.0.16"

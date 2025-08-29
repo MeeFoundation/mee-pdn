@@ -1,0 +1,44 @@
+{
+  "folders": [
+    {
+      "name": "root",
+      "path": "."
+    },
+    {
+      "name": "crates",
+      "path": "crates"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/target": true
+    },
+    "rust-analyzer.linkedProjects": [
+      "Cargo.toml",
+      "crates/mee-core/Cargo.toml",
+      "crates/mee-dev/Cargo.toml",
+      "crates/mee-transport-api/Cargo.toml",
+      "crates/mee-transport-fs/Cargo.toml",
+      "crates/mee-did-api/Cargo.toml",
+      "crates/mee-did-key/Cargo.toml",
+      "crates/mee-local-store-api/Cargo.toml",
+      "crates/mee-local-store-fs/Cargo.toml"
+    ],
+    "rust-analyzer.cargo.features": "all",
+    "rust-analyzer.checkOnSave": true,
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.procMacro.enable": true,
+    "editor.formatOnSave": true,
+    "editor.rulers": [
+      80
+    ],
+    "files.insertFinalNewline": true,
+    "files.trimTrailingWhitespace": true
+  },
+  "extensions": {
+    "recommendations": [
+      "rust-lang.rust-analyzer",
+      "serayuzgur.crates"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "mee-node-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mee-transport-api = { path = "../mee-transport-api" }
+mee-did-api = { path = "../mee-did-api" }
+mee-local-store-api = { path = "../mee-local-store-api" }
+mee-types = { path = "../mee-types" }
