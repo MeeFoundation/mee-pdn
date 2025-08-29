@@ -23,13 +23,27 @@ This repository is for version 3, previous version repos:
 * `just check`: format & lint check
 * `just precommit-fix`: format & lint check + autofix, tests
 
+### Demo (HTTP)
+
+Run two local nodes (Alice/Bob), send a ping, and view the inbox.
+
+* `just http-demo`
+
 ## Crates
 
-* `crates/mee-core`: Node composition layer
-* `crates/mee-dev`: Developer CLI for node actions
-* `crates/mee-transport-api`: Transport types and traits
-* `crates/mee-transport-http`: HTTP transport backend
-* `crates/mee-did-api`: DID types and traits
-* `crates/mee-did-key`: Placeholder `did:key` provider
-* `crates/mee-local-store-api`: Namespaced KV store types and traits
-* `crates/mee-local-store-mem`: In-memory KV store backend
+Core types and APIs
+
+* `crates/mee-types`: Shared domain types
+* `crates/mee-did-api`: DID
+* `crates/mee-transport-api`: Transport
+* `crates/mee-local-store-api`: Namespaced KV
+* `crates/mee-node-api`: Minimal PDN node composition crate
+
+Implementations & demos
+
+* `crates/mee-did-key`: Stub `did:key` manager (demo)
+* `crates/mee-transport-http`: HTTP transport backend (demo)
+* `crates/mee-local-store-mem`: In-memory KV store backend (demo)
+* `crates/mee-node-axum`: Axum-based demo node
+* `crates/mee-wasm`: Minimal wasm-bindgen facade for wasm builds
+* `crates/mee-dev`: Developer tools, CLI
