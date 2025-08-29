@@ -15,14 +15,17 @@
     },
     "rust-analyzer.linkedProjects": [
       "Cargo.toml",
-      "crates/mee-core/Cargo.toml",
       "crates/mee-dev/Cargo.toml",
+      "crates/mee-types/Cargo.toml",
       "crates/mee-transport-api/Cargo.toml",
-      "crates/mee-transport-fs/Cargo.toml",
+      "crates/mee-transport-http/Cargo.toml",
       "crates/mee-did-api/Cargo.toml",
       "crates/mee-did-key/Cargo.toml",
       "crates/mee-local-store-api/Cargo.toml",
-      "crates/mee-local-store-fs/Cargo.toml"
+      "crates/mee-local-store-mem/Cargo.toml",
+      "crates/mee-node-api/Cargo.toml",
+      "crates/mee-node-axum/Cargo.toml",
+      "crates/mee-wasm/Cargo.toml"
     ],
     "rust-analyzer.cargo.features": "all",
     "rust-analyzer.checkOnSave": true,
@@ -38,7 +41,7 @@
   "extensions": {
     "recommendations": [
       "rust-lang.rust-analyzer",
-      "serayuzgur.crates"
+      "fill-labs.dependi"
     ]
   }
 }
