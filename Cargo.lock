@@ -2448,6 +2448,7 @@ dependencies = [
 name = "mee-wasm"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "futures-util",
  "mee-did-api",
  "mee-did-key",

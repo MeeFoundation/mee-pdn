@@ -6,7 +6,7 @@ use std::fmt;
 pub struct NodeId(pub String);
 impl From<&str> for NodeId {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for NodeId {
@@ -31,7 +31,7 @@ impl fmt::Display for NodeId {
 pub struct TransportUserId(pub String);
 impl From<&str> for TransportUserId {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for TransportUserId {
@@ -76,7 +76,7 @@ impl fmt::Display for UserDid {
 pub struct Did(pub String);
 impl From<&str> for Did {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for Did {
@@ -130,7 +130,7 @@ impl From<&str> for DidMethod {
             "key" => Self::Key,
             "web" => Self::Web,
             "peer" => Self::Peer,
-            other => Self::Unknown(other.to_string()),
+            other => Self::Unknown(other.to_owned()),
         }
     }
 }
@@ -155,7 +155,7 @@ impl fmt::Display for DidMethod {
 pub struct DidUrl(pub String);
 impl From<&str> for DidUrl {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for DidUrl {
@@ -171,7 +171,7 @@ impl fmt::Display for DidUrl {
 impl DidUrl {
     pub fn did(&self) -> Did {
         match self.0.split_once('#') {
-            Some((d, _)) => Did(d.to_string()),
+            Some((d, _)) => Did(d.to_owned()),
             None => Did(self.0.clone()),
         }
     }

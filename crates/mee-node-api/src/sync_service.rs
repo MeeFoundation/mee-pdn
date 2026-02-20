@@ -1,14 +1,12 @@
-use mee_sync_api::{EntryInfo, EntryPath, NodeAddr, SyncError, SyncHandle, SyncTicket, SyncMode, TransportUserId};
+use mee_sync_api::{
+    EntryInfo, EntryPath, NodeAddr, SyncError, SyncHandle, SyncMode, SyncTicket, TransportUserId,
+};
 
 #[allow(async_fn_in_trait)]
 pub trait SyncService: Send + Sync {
     async fn node_addr(&self) -> Result<NodeAddr, SyncError>;
     async fn user_id(&self) -> Result<TransportUserId, SyncError>;
-    async fn share(
-        &self,
-        to: &TransportUserId,
-        write: bool,
-    ) -> Result<SyncTicket, SyncError>;
+    async fn share(&self, to: &TransportUserId, write: bool) -> Result<SyncTicket, SyncError>;
     async fn import(
         &self,
         ticket: SyncTicket,

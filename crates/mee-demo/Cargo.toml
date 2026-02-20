@@ -22,3 +22,6 @@ mee-node-demo-impl = { path = "../mee-node-demo-impl" }
 anyhow = "1"
 sha2 = "0.10"
 hex = "0.4"
+
+[lints]
+workspace = true

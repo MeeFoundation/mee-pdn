@@ -1,20 +1,20 @@
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 
 use mee_did_api::{DidCreateParams, DidKeyCreateOptions, DidProvider, DidResolver};
-use mee_sync_api::SyncEngine;
 use mee_did_key::KeyDidManager;
 use mee_local_store_mem::MemKvStore;
 use mee_node_api::{
-    Contact, DataEntry, IdentityService, Invite, InviteSignature, Node,
-    SyncService, TrustService,
+    Contact, DataEntry, IdentityService, Invite, InviteSignature, Node, SyncService, TrustService,
 };
 use mee_sync_api as api;
-use mee_sync_api::{AccessMode, EntryInfo, EntryPath, NamespaceId, SyncError, SyncHandle, SyncMode,
-    SyncTicket, TransportUserId};
+use mee_sync_api::SyncEngine;
+use mee_sync_api::{
+    AccessMode, EntryInfo, EntryPath, NamespaceId, SyncError, SyncHandle, SyncMode, SyncTicket,
+    TransportUserId,
+};
 use mee_sync_iroh_willow::IrohWillowSyncCore;
 use mee_types::{Did, NodeId};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ pub struct DemoNode {
     sync: DemoSyncService,
 }
 
+#[allow(clippy::expect_used)]
 impl DemoNode {
     pub async fn spawn() -> anyhow::Result<Arc<Self>> {
         let sync_engine = Arc::new(IrohWillowSyncCore::spawn().await?);
@@ -68,23 +69,28 @@ impl DemoNode {
             sync: sync_engine.clone(),
             namespace: namespace.clone(),
             current_did: current_did.clone(),
-            invites: invites.clone(),
-            contacts: contacts.clone(),
+            invites,
+            contacts,
         };
 
         let data = DemoDataService {
             sync: sync_engine.clone(),
             namespace: namespace.clone(),
-            persona: persona,
+            persona,
         };
 
         let sync = DemoSyncService {
             sync: sync_engine,
-            namespace: namespace.clone(),
+            namespace,
         };
 
         let node = Self {
-            node_id: NodeId::from(current_did.lock().unwrap().as_ref()),
+            node_id: NodeId::from(
+                current_did
+                    .lock()
+                    .expect("current DID lock poisoned")
+                    .as_ref(),
+            ),
             store: MemKvStore::new(),
             identity,
             trust,
@@ -137,25 +143,28 @@ pub struct DemoIdentityService {
     persona: Arc<Mutex<HashMap<String, String>>>,
 }
 
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait, clippy::expect_used)]
 impl IdentityService for DemoIdentityService {
     fn current(&self) -> Did {
-        self.current.lock().unwrap().clone()
+        self.current
+            .lock()
+            .expect("current DID lock poisoned")
+            .clone()
     }
 
     async fn create(&self, params: &DidCreateParams) -> Result<Did, mee_did_api::DidError> {
         let did = self.did_mgr.create(params).await?;
-        *self.current.lock().unwrap() = did.clone();
-        self.invites.lock().unwrap().clear();
-        self.contacts.lock().unwrap().clear();
-        self.persona.lock().unwrap().clear();
+        *self.current.lock().expect("current DID lock poisoned") = did.clone();
+        self.invites.lock().expect("invites lock poisoned").clear();
+        self.contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .clear();
+        self.persona.lock().expect("persona lock poisoned").clear();
         Ok(did)
     }
 
-    async fn resolve(
-        &self,
-        did: &Did,
-    ) -> Result<mee_did_api::DidDocument, mee_did_api::DidError> {
+    async fn resolve(&self, did: &Did) -> Result<mee_did_api::DidDocument, mee_did_api::DidError> {
         self.did_mgr.resolve(did).await
     }
 }
@@ -169,14 +178,18 @@ pub struct DemoTrustService {
     contacts: Arc<Mutex<HashMap<Did, Contact>>>,
 }
 
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait, clippy::expect_used, clippy::unwrap_in_result)]
 impl TrustService for DemoTrustService {
     fn default_namespace(&self) -> NamespaceId {
         self.namespace.clone()
     }
 
     async fn create_invite(&self) -> Result<Invite, SyncError> {
-        let inviter = self.current_did.lock().unwrap().clone();
+        let inviter = self
+            .current_did
+            .lock()
+            .expect("current DID lock poisoned")
+            .clone();
         let node = self.sync.addr().await?;
         let transport_user_id = self.sync.user_id().await?;
         let expires_at = now_ms() + 10 * 60 * 1000;
@@ -191,11 +204,7 @@ impl TrustService for DemoTrustService {
         Ok(invite)
     }
 
-    async fn accept_invite(
-        &self,
-        invite: &Invite,
-        write: bool,
-    ) -> Result<SyncTicket, SyncError> {
+    async fn accept_invite(&self, invite: &Invite, write: bool) -> Result<SyncTicket, SyncError> {
         verify_invite(invite)?;
         let mode = if write {
             AccessMode::Write
@@ -210,29 +219,37 @@ impl TrustService for DemoTrustService {
     fn remember_invite(&self, invite: Invite) {
         self.invites
             .lock()
-            .unwrap()
+            .expect("invites lock poisoned")
             .insert(invite.inviter_did.clone(), invite);
     }
 
     fn invite_for(&self, did: &Did) -> Option<Invite> {
-        self.invites.lock().unwrap().get(did).cloned()
+        self.invites
+            .lock()
+            .expect("invites lock poisoned")
+            .get(did)
+            .cloned()
     }
 
     fn add_contact(&self, contact: Contact) {
         self.contacts
             .lock()
-            .unwrap()
+            .expect("contacts lock poisoned")
             .insert(contact.did.clone(), contact);
     }
 
     fn contact(&self, did: &Did) -> Option<Contact> {
-        self.contacts.lock().unwrap().get(did).cloned()
+        self.contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .get(did)
+            .cloned()
     }
 
     fn contacts(&self) -> Vec<Contact> {
         self.contacts
             .lock()
-            .unwrap()
+            .expect("contacts lock poisoned")
             .values()
             .cloned()
             .collect()
@@ -252,13 +269,13 @@ impl DemoDataService {
     }
 }
 
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait, clippy::expect_used)]
 impl mee_node_api::DataService for DemoDataService {
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
         self.persona
             .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_string());
+            .expect("persona lock poisoned")
+            .insert(key.to_owned(), value.to_owned());
         let path = Self::persona_path(key);
         self.sync
             .insert(&self.namespace, &path, value.as_bytes())
@@ -268,7 +285,10 @@ impl mee_node_api::DataService for DemoDataService {
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.persona.lock().unwrap().remove(key);
+        self.persona
+            .lock()
+            .expect("persona lock poisoned")
+            .remove(key);
         let path = Self::persona_path(key);
         self.sync
             .insert(&self.namespace, &path, &[])
@@ -281,10 +301,10 @@ impl mee_node_api::DataService for DemoDataService {
         Ok(self
             .persona
             .lock()
-            .unwrap()
+            .expect("persona lock poisoned")
             .get(key)
             .map(|v| DataEntry {
-                key: key.to_string(),
+                key: key.to_owned(),
                 value: v.clone(),
             }))
     }
@@ -293,7 +313,7 @@ impl mee_node_api::DataService for DemoDataService {
         Ok(self
             .persona
             .lock()
-            .unwrap()
+            .expect("persona lock poisoned")
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| DataEntry {
@@ -344,7 +364,7 @@ impl SyncService for DemoSyncService {
     async fn list(&self) -> Result<Vec<EntryInfo>, SyncError> {
         let mut all = Vec::new();
         let namespaces = self.sync.list_namespaces().await?;
-        for ns in namespaces.iter() {
+        for ns in &namespaces {
             let mut stream = self.sync.get_entries(ns).await?;
             while let Some(item) = stream.next().await {
                 let entry = item?;
@@ -355,11 +375,17 @@ impl SyncService for DemoSyncService {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::as_conversions
+)]
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Truncation is safe: u64 millis covers ~584 million years from epoch.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock before UNIX epoch")
         .as_millis() as u64
 }
 
@@ -369,13 +395,13 @@ fn compute_invite_sig(inv: &Invite) -> InviteSignature {
         .node
         .relay_url
         .as_ref()
-        .map(|r| r.to_string())
+        .map(std::string::ToString::to_string)
         .unwrap_or_default();
     let mut addrs: Vec<String> = inv
         .node
         .direct_addresses
         .iter()
-        .map(|addr| addr.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     addrs.sort();
     let data = format!(

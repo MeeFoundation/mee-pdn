@@ -9,6 +9,7 @@ use super::{
 
 #[derive(Clone)]
 pub struct IrohWillowSyncEngine {
+    #[allow(dead_code)]
     engine: std::sync::Arc<IrohWillowSyncCore>,
     network: IrohWillowNetworkManager,
     namespaces: IrohWillowNamespaceManager,

@@ -6,7 +6,7 @@ use std::io;
 pub struct Namespace(pub String);
 impl From<&str> for Namespace {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for Namespace {
@@ -25,7 +25,7 @@ impl fmt::Display for Namespace {
 pub struct Key(pub String);
 impl From<&str> for Key {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for Key {
@@ -44,7 +44,7 @@ impl fmt::Display for Key {
 pub struct Value(pub String);
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for Value {

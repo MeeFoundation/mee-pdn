@@ -17,3 +17,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 data-encoding = "2.6"
 async-stream = "0.3"
 hex = "0.4"
+
+[lints]
+workspace = true

@@ -35,11 +35,7 @@ pub struct Contact {
 pub trait TrustService: Send + Sync {
     fn default_namespace(&self) -> NamespaceId;
     async fn create_invite(&self) -> Result<Invite, SyncError>;
-    async fn accept_invite(
-        &self,
-        invite: &Invite,
-        write: bool,
-    ) -> Result<SyncTicket, SyncError>;
+    async fn accept_invite(&self, invite: &Invite, write: bool) -> Result<SyncTicket, SyncError>;
     fn remember_invite(&self, invite: Invite);
     fn invite_for(&self, did: &Did) -> Option<Invite>;
     fn add_contact(&self, contact: Contact);

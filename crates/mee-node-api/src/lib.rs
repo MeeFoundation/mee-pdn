@@ -1,9 +1,9 @@
 pub use data_service::{DataEntry, DataService};
 pub use identity_service::IdentityService;
-pub use sync_service::SyncService;
-pub use trust_service::{Contact, Invite, InviteSignature, TrustService};
 use mee_local_store_api::KvStore;
 use mee_types::NodeId;
+pub use sync_service::SyncService;
+pub use trust_service::{Contact, Invite, InviteSignature, TrustService};
 
 mod data_service;
 mod identity_service;

@@ -10,3 +10,6 @@ mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+
+[lints]
+workspace = true

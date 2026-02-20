@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 mee-local-store-api = { path = "../mee-local-store-api" }
 
+
+[lints]
+workspace = true

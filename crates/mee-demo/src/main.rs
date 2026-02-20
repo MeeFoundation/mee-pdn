@@ -6,12 +6,11 @@ use axum::{
 };
 use futures_util::StreamExt as _;
 use mee_node_api::{
-    Contact, IdentityService as _, Invite, Node as _, SyncService as _,
-    TrustService as _,
+    Contact, IdentityService as _, Invite, Node as _, SyncService as _, TrustService as _,
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
-use mee_sync_api::{SyncEngine, SyncError};
+use mee_sync_api::SyncError;
 use mee_types::Did;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -26,19 +25,25 @@ struct AppState {
     sync_complete: Arc<Mutex<bool>>,
 }
 
+#[allow(clippy::expect_used)]
 impl AppState {
     async fn ensure(&self) -> Result<(), SyncError> {
-        if self.node.lock().unwrap().is_some() {
+        if self.node.lock().expect("node lock poisoned").is_some() {
             return Ok(());
         }
         let node = DemoNode::spawn()
             .await
             .map_err(|e| SyncError::Other(e.to_string()))?;
-        *self.node.lock().unwrap() = Some(node);
+        *self.node.lock().expect("node lock poisoned") = Some(node);
         Ok(())
     }
     fn get_node(&self) -> Arc<DemoNode> {
-        self.node.lock().unwrap().as_ref().unwrap().clone()
+        self.node
+            .lock()
+            .expect("node lock poisoned")
+            .as_ref()
+            .expect("get_node called before ensure")
+            .clone()
     }
 }
 
@@ -119,19 +124,19 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3011);
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
 
 async fn p2p_node(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.sync().node_addr().await {
         Ok(addr) => Json(addr).into_response(),
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -142,7 +147,7 @@ struct TransportUserIdResp {
 
 async fn p2p_transport_user_id(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.sync().user_id().await {
@@ -150,7 +155,7 @@ async fn p2p_transport_user_id(state: axum::extract::State<AppState>) -> Respons
             transport_user_id: u.0,
         })
         .into_response(),
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -161,7 +166,7 @@ struct UserDidResp {
 
 async fn p2p_user_did(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     let did = n.identity().current();
@@ -170,12 +175,12 @@ async fn p2p_user_did(state: axum::extract::State<AppState>) -> Response {
 
 async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.trust().create_invite().await {
         Ok(inv) => Json(inv).into_response(),
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -191,7 +196,7 @@ async fn p2p_ticket_from_invite(
     Json(req): Json<TicketFromInviteReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     let trust = n.trust();
@@ -205,7 +210,7 @@ async fn p2p_ticket_from_invite(
             });
             Json(ticket).into_response()
         }
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -216,7 +221,7 @@ struct BindReq {
 
 async fn p2p_bind(state: axum::extract::State<AppState>, Json(req): Json<BindReq>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     let trust = n.trust();
@@ -225,7 +230,7 @@ async fn p2p_bind(state: axum::extract::State<AppState>, Json(req): Json<BindReq
         did: req.invite.inviter_did,
         alias: None,
     });
-    "bound".to_string().into_response()
+    "bound".to_owned().into_response()
 }
 
 #[derive(Deserialize)]
@@ -240,18 +245,17 @@ async fn p2p_ticket_by_did(
     Json(req): Json<TicketByDidReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     let trust = n.trust();
-    let invite = match trust.invite_for(&req.did) {
-        Some(i) => i,
-        None => return internal_str("did not bound; import invite first").into_response(),
+    let Some(invite) = trust.invite_for(&req.did) else {
+        return internal_str("did not bound; import invite first").into_response();
     };
     // Verification is performed by ticket issuance.
     match trust.accept_invite(&invite, req.write).await {
         Ok(ticket) => Json(ticket).into_response(),
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -266,12 +270,12 @@ struct TicketReq {
 
 async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<TicketReq>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.sync().share(&req.to_user, req.write).await {
         Ok(ticket) => Json::<api::SyncTicket>(ticket).into_response(),
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -282,9 +286,10 @@ struct ImportReq {
     continuous: bool,
 }
 
+#[allow(clippy::expect_used)]
 async fn p2p_import(state: axum::extract::State<AppState>, Json(req): Json<ImportReq>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     let mode = if req.continuous {
@@ -294,7 +299,7 @@ async fn p2p_import(state: axum::extract::State<AppState>, Json(req): Json<Impor
     };
     let mut handle = match n.sync().import(req.ticket, mode).await {
         Ok(h) => h,
-        Err(e) => return internal(e).into_response(),
+        Err(e) => return internal(&e).into_response(),
     };
     let events = state.events.clone();
     let done = state.sync_complete.clone();
@@ -306,19 +311,19 @@ async fn p2p_import(state: axum::extract::State<AppState>, Json(req): Json<Impor
                 api::SyncEvent::InterestIntersection => "interest_intersection",
                 api::SyncEvent::Reconciled => "reconciled",
                 api::SyncEvent::ReconciledAll => {
-                    *done.lock().unwrap() = true;
+                    *done.lock().expect("sync_complete lock poisoned") = true;
                     "reconciled_all"
                 }
                 api::SyncEvent::Abort { .. } => "abort",
             };
-            let mut buf = events.lock().unwrap();
+            let mut buf = events.lock().expect("events lock poisoned");
             if buf.len() >= 500 {
                 buf.remove(0);
             }
-            buf.push(name.to_string());
+            buf.push(name.to_owned());
         }
     });
-    "imported".to_string().into_response()
+    "imported".to_owned().into_response()
 }
 
 #[derive(Deserialize)]
@@ -329,16 +334,12 @@ struct InsertReq {
 
 async fn p2p_insert(state: axum::extract::State<AppState>, Json(req): Json<InsertReq>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n
-        .sync()
-        .insert(&req.path, req.body.as_bytes())
-        .await
-    {
-        Ok(()) => "ok".to_string().into_response(),
-        Err(e) => internal(e).into_response(),
+    match n.sync().insert(&req.path, req.body.as_bytes()).await {
+        Ok(()) => "ok".to_owned().into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
@@ -351,7 +352,7 @@ struct ListedEntry {
 
 async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.sync().list().await {
@@ -366,15 +367,16 @@ async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
                 .collect();
             Json(out).into_response()
         }
-        Err(e) => internal(e).into_response(),
+        Err(e) => internal(&e).into_response(),
     }
 }
 
+#[allow(clippy::expect_used)]
 async fn p2p_events(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
-    Json(state.events.lock().unwrap().clone()).into_response()
+    Json(state.events.lock().expect("events lock poisoned").clone()).into_response()
 }
 
 #[derive(Deserialize)]
@@ -387,7 +389,7 @@ async fn p2p_validate_did(
     Json(req): Json<ValidateDidReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.identity().resolve(&req.did).await {
@@ -407,23 +409,28 @@ struct SyncStatus {
     status: String,
 }
 
+#[allow(clippy::expect_used)]
 async fn p2p_sync_status(
     state: axum::extract::State<AppState>,
     axum::extract::Query(q): axum::extract::Query<SyncStatusQuery>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     if let Some(ms) = q.wait_ms {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
-    let s = if *state.sync_complete.lock().unwrap() {
+    let s = if *state
+        .sync_complete
+        .lock()
+        .expect("sync_complete lock poisoned")
+    {
         "complete"
     } else {
         "pending"
     };
     Json(SyncStatus {
-        status: s.to_string(),
+        status: s.to_owned(),
     })
     .into_response()
 }
@@ -446,7 +453,7 @@ async fn p2p_create_identity(
     Json(req): Json<CreateIdentityReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
-        return internal(e).into_response();
+        return internal(&e).into_response();
     }
     let n = state.get_node();
     let params = mee_did_api::DidCreateParams::Key(mee_did_api::DidKeyCreateOptions {
@@ -459,9 +466,9 @@ async fn p2p_create_identity(
     }
 }
 
-fn internal(e: SyncError) -> (StatusCode, String) {
+fn internal(e: &SyncError) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 fn internal_str(msg: &str) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, msg.to_string())
+    (StatusCode::INTERNAL_SERVER_ERROR, msg.to_owned())
 }

@@ -22,7 +22,7 @@ impl DirectAddress {
 }
 impl From<&str> for DirectAddress {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for DirectAddress {
@@ -51,7 +51,7 @@ impl AsRef<str> for DirectAddress {
 pub struct RelayEndpoint(pub String);
 impl From<&str> for RelayEndpoint {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for RelayEndpoint {
@@ -84,7 +84,7 @@ pub struct NodeAddr {
 pub struct SubspaceId(pub String);
 impl From<&str> for SubspaceId {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for SubspaceId {
@@ -108,7 +108,7 @@ impl AsRef<str> for SubspaceId {
 pub struct EntryPath(pub String);
 impl From<&str> for EntryPath {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 impl From<String> for EntryPath {
@@ -133,7 +133,6 @@ pub struct SyncTicket {
     pub caps: Vec<serde_json::Value>,
     pub nodes: Vec<NodeAddr>,
 }
-
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessMode {
@@ -194,7 +193,6 @@ pub trait SyncEngine: Send + Sync {
         path: &EntryPath,
         bytes: &[u8],
     ) -> Result<(), SyncError>;
-
 
     type EntryStream: Stream<Item = Result<EntryInfo, SyncError>> + Send + Unpin + 'static;
     async fn get_entries(&self, ns: &NamespaceId) -> Result<Self::EntryStream, SyncError>;

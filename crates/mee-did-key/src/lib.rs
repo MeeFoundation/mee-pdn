@@ -4,10 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct KeyDidManager;
 
+#[allow(clippy::expect_used)]
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock before UNIX epoch")
         .as_millis()
 }
 
@@ -16,7 +17,7 @@ impl DidResolver for KeyDidManager {
         // placeholder, returns minimal doc with one verification method id
         Ok(DidDocument {
             id: did.clone(),
-            verification_method_ids: vec![DidUrl(format!("{}#key-1", did))],
+            verification_method_ids: vec![DidUrl(format!("{did}#key-1"))],
         })
     }
 }

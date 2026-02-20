@@ -14,16 +14,17 @@ impl MemKvStore {
     }
 }
 
+#[allow(clippy::expect_used, clippy::unwrap_in_result)]
 impl KvStore for MemKvStore {
     fn set(&self, ns: &Namespace, key: &Key, value: &Value) -> io::Result<()> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.inner.write().expect("MemKvStore lock poisoned");
         let map = guard.entry(ns.0.clone()).or_default();
         map.insert(key.0.clone(), value.0.clone());
         Ok(())
     }
 
     fn get(&self, ns: &Namespace, key: &Key) -> io::Result<Option<Value>> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.inner.read().expect("MemKvStore lock poisoned");
         Ok(guard
             .get(&ns.0)
             .and_then(|m| m.get(&key.0).cloned())

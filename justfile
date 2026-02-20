@@ -49,7 +49,7 @@ check:
   #!/bin/sh
   set -eux
   cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets -- -D warnings
+  cargo clippy --workspace --all-targets
   cargo check --workspace --all-targets
 
 # Lint and type-check, attempt fixes
@@ -58,7 +58,7 @@ check-fix:
   set -eux
   cargo fmt --all
   cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged
-  cargo clippy --workspace --all-targets -- -D warnings
+  cargo clippy --workspace --all-targets
   cargo check --workspace --all-targets
 
 # Lint, build, test

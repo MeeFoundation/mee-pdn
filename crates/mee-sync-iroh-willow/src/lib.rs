@@ -100,7 +100,7 @@ impl api::SyncHandle for IrohWillowSyncHandle {
     }
 }
 
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait, clippy::expect_used)]
 impl api::SyncEngine for IrohWillowSyncCore {
     async fn addr(&self) -> Result<api::NodeAddr, SyncError> {
         let a = self
@@ -153,12 +153,16 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         // include namespaces we imported via tickets (provider namespaces)
-        let imported = self.imported_namespaces.lock().unwrap().clone();
+        let imported = self
+            .imported_namespaces
+            .lock()
+            .expect("imported_namespaces lock poisoned")
+            .clone();
         let mut out: Vec<api::NamespaceId> = v
             .into_iter()
-            .map(|ns| api::NamespaceId(format!("{}", ns)))
+            .map(|ns| api::NamespaceId(format!("{ns}")))
             .collect();
-        for s in imported.into_iter() {
+        for s in imported {
             out.push(api::NamespaceId(s));
         }
         Ok(out)
@@ -177,9 +181,9 @@ impl api::SyncEngine for IrohWillowSyncCore {
                 .or_else(|_| {
                     let bytes = hex::decode(&ns.0)
                         .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-                        SyncError::InvalidNamespace("invalid ns length".to_string())
-                    })?;
+                    let arr: [u8; 32] = bytes
+                        .try_into()
+                        .map_err(|_| SyncError::InvalidNamespace("invalid ns length".to_owned()))?;
                     let pk = iroh_willow::proto::keys::NamespacePublicKey::from_bytes(&arr)
                         .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
                     Ok::<_, SyncError>(pk.id())
@@ -205,9 +209,9 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .node_addr()
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
-        if let Some(first) = addr.direct_addresses.iter().next().cloned() {
+        if let Some(first) = addr.direct_addresses.iter().next().copied() {
             let port = first.port();
-            let loopback: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+            let loopback: SocketAddr = format!("127.0.0.1:{port}").parse()?;
             addr.direct_addresses.insert(loopback);
         }
         let direct_addresses = addr
@@ -243,7 +247,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .filter_map(|v| serde_json::from_value(v).ok())
             .collect();
         let mut nodes: Vec<IrohNodeAddr> = Vec::new();
-        for n in ticket.nodes.iter() {
+        for n in &ticket.nodes {
             let node_id = IrohNodeId::from_str(n.node_id.as_ref())
                 .map_err(|e| SyncError::InvalidId(e.to_string()))?;
             let set: BTreeSet<SocketAddr> = n
@@ -276,7 +280,10 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         // track imported provider namespace so list_namespaces includes it
         let ns = format!("{}", space.namespace_id());
-        self.imported_namespaces.lock().unwrap().insert(ns);
+        self.imported_namespaces
+            .lock()
+            .expect("imported_namespaces lock poisoned")
+            .insert(ns);
         let s = async_stream::stream! {
             use iroh_willow::session::intents::serde_encoding::Event;
             while let Some((_peer, ev)) = handles.next().await {
@@ -303,9 +310,9 @@ impl api::SyncEngine for IrohWillowSyncCore {
                 .or_else(|_| {
                     let b = hex::decode(&ns.0)
                         .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    let arr: [u8; 32] = b.try_into().map_err(|_| {
-                        SyncError::InvalidNamespace("invalid ns length".to_string())
-                    })?;
+                    let arr: [u8; 32] = b
+                        .try_into()
+                        .map_err(|_| SyncError::InvalidNamespace("invalid ns length".to_owned()))?;
                     let pk = iroh_willow::proto::keys::NamespacePublicKey::from_bytes(&arr)
                         .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
                     Ok::<_, SyncError>(pk.id())
@@ -316,7 +323,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .filter(|s| !s.is_empty())
             .map(|s| s.as_bytes().to_vec())
             .collect();
-        let comp_refs: Vec<&[u8]> = comps.iter().map(|v| v.as_slice()).collect();
+        let comp_refs: Vec<&[u8]> = comps.iter().map(std::vec::Vec::as_slice).collect();
         let path = iroh_willow::proto::data_model::Path::from_bytes(&comp_refs)
             .map_err(|e| SyncError::InvalidNamespace(format!("invalid path: {e:?}")))?;
         let entry_form = iroh_willow::form::EntryForm::new_bytes(ns, path, bytes.to_vec());
@@ -338,9 +345,9 @@ impl api::SyncEngine for IrohWillowSyncCore {
                 .or_else(|_| {
                     let b = hex::decode(&ns.0)
                         .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    let arr: [u8; 32] = b.try_into().map_err(|_| {
-                        SyncError::InvalidNamespace("invalid ns length".to_string())
-                    })?;
+                    let arr: [u8; 32] = b
+                        .try_into()
+                        .map_err(|_| SyncError::InvalidNamespace("invalid ns length".to_owned()))?;
                     let pk = iroh_willow::proto::keys::NamespacePublicKey::from_bytes(&arr)
                         .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
                     Ok::<_, SyncError>(pk.id())
@@ -365,9 +372,9 @@ impl api::SyncEngine for IrohWillowSyncCore {
         };
         Ok(Box::pin(s))
     }
-
 }
 
+#[allow(clippy::expect_used)]
 impl IrohWillowSyncCore {
     pub(crate) async fn import_and_sync_concrete(
         &self,
@@ -380,7 +387,7 @@ impl IrohWillowSyncCore {
             .filter_map(|v| serde_json::from_value(v).ok())
             .collect();
         let mut nodes: Vec<IrohNodeAddr> = Vec::new();
-        for n in ticket.nodes.iter() {
+        for n in &ticket.nodes {
             let node_id = IrohNodeId::from_str(n.node_id.as_ref())
                 .map_err(|e| SyncError::InvalidId(e.to_string()))?;
             let set: BTreeSet<SocketAddr> = n
@@ -412,7 +419,10 @@ impl IrohWillowSyncCore {
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         let ns = format!("{}", space.namespace_id());
-        self.imported_namespaces.lock().unwrap().insert(ns);
+        self.imported_namespaces
+            .lock()
+            .expect("imported_namespaces lock poisoned")
+            .insert(ns);
         let s = async_stream::stream! {
             use iroh_willow::session::intents::serde_encoding::Event;
             while let Some((_peer, ev)) = handles.next().await {
