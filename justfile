@@ -84,7 +84,6 @@ build-core-wasm:
   cargo build --target wasm32-unknown-unknown \
     -p mee-wasm
   cargo build --target wasm32-wasip1 \
-    -p mee-transport-api \
     -p mee-did-api \
     -p mee-did-key \
     -p mee-local-store-api \
@@ -97,13 +96,13 @@ wasm-build-bindgen:
   set -eux
   cargo build --target wasm32-unknown-unknown -p mee-wasm
 
-# Full HTTP demo: start both servers, ping, show inbox, cleanup
-http-demo:
+# P2P demo (iroh, willow): share, import, replicate an entry
+p2p-demo:
   #!/bin/sh
   set -eu
   mkdir -p var
 
-  cargo build -p mee-node-axum -p mee-dev
+  cargo build -p mee-demo
 
   cleanup() {
     echo "Cleaning up running nodes"
@@ -139,10 +138,10 @@ http-demo:
   BOB_PORT=3012
   BOB_URL="http://${BOB_HOST}:${BOB_PORT}"
 
-  echo "Initializing Alice and Bob nodes"
-  ./target/debug/mee-node-axum --profile alice --addr ${ALICE_HOST}:${ALICE_PORT} --base-url ${ALICE_URL} &
+  echo "Initializing Alice and Bob nodes (P2P via mee-demo)"
+  MEE_HOST=${ALICE_HOST} MEE_PORT=${ALICE_PORT} ./target/debug/mee-demo &
   echo $! > var/alice.pid
-  ./target/debug/mee-node-axum --profile bob --addr ${BOB_HOST}:${BOB_PORT} --base-url ${BOB_URL} &
+  MEE_HOST=${BOB_HOST} MEE_PORT=${BOB_PORT} ./target/debug/mee-demo &
   echo $! > var/bob.pid
 
   # Wait for readiness
@@ -153,32 +152,49 @@ http-demo:
     sleep 0.1
   done
 
-  echo "Fetching Bob's ticket and sending ping from Alice"
-  BOB_TICKET=$(curl -s ${BOB_URL}/demo/ticket | sed -E 's/.*"ticket"\s*:\s*"([^"]+)".*/\1/')
-  echo "Bob ticket: ${BOB_TICKET}"
-  curl -s -X POST ${ALICE_URL}/demo/send/ping -H 'content-type: application/json' \
-    -d "{\"to_ticket\":\"${BOB_TICKET}\",\"body_b64\":\"aGVsbG8=\"}"
+  echo "Fetching Bob's DID-based invite"
+  BOB_INVITE=$(curl -s ${BOB_URL}/p2p/invite)
+  echo "Bob invite: ${BOB_INVITE}"
 
-  echo "Bob inbox:"
-  curl -s ${BOB_URL}/demo/inbox || true
+  echo "Alice creates a share ticket using Bob's invite"
+  TICKET_JSON=$(curl -s -X POST ${ALICE_URL}/p2p/ticket-from-invite -H 'content-type: application/json' -d "{\"invite\":${BOB_INVITE}}")
+  echo "Ticket: ${TICKET_JSON}"
+
+  echo "Bob imports the ticket and starts sync"
+  curl -s -X POST ${BOB_URL}/p2p/import -H 'content-type: application/json' -d "{\"ticket\":${TICKET_JSON},\"continuous\":true}" >/dev/null
+
+  echo "Waiting for initial reconciliation..."
+  curl -s "${BOB_URL}/p2p/sync-status?wait_ms=2000" >/dev/null
+  echo "Alice inserts an entry into the shared space"
+  curl -s -X POST ${ALICE_URL}/p2p/insert -H 'content-type: application/json' -d '{"path":"msgs/1","body":"hello via willow"}'
+
+  echo "Waiting for replication..."
+  curl -s "${BOB_URL}/p2p/sync-status?wait_ms=2000" >/dev/null
+  echo "Listing entries on Bob after sync:"
+  curl -s ${BOB_URL}/p2p/list || true
+  echo "\n"
+
+  echo "Inserting a second entry on Alice"
+  curl -s -X POST ${ALICE_URL}/p2p/insert -H 'content-type: application/json' -d '{"path":"msgs/2","body":"hello again via willow"}' >/dev/null
+
+  echo "Waiting for replication..."
+  curl -s "${BOB_URL}/p2p/sync-status?wait_ms=2000" >/dev/null
+
+  echo "Listing entries on Bob after second insert:"
+  curl -s ${BOB_URL}/p2p/list || true
   echo "\n"
 
 # Build the Docker image for the Axum node
 build-image:
   #!/bin/sh
   set -eux
-  IMAGE_TAG=${IMAGE_TAG:-mee-node-axum:dev}
+  IMAGE_TAG=${IMAGE_TAG:-mee-demo:dev}
   DOCKER_BUILDKIT=1 docker build -f ops/Dockerfile -t ${IMAGE_TAG} .
 
 # Run the Docker image locally
 run-image:
   #!/bin/sh
   set -eux
-  IMAGE_TAG=${IMAGE_TAG:-mee-node-axum:dev}
-  PROFILE=${PROFILE:-node}
+  IMAGE_TAG=${IMAGE_TAG:-mee-demo:dev}
   PORT=${PORT:-3000}
-  BASE_URL=${BASE_URL:-http://localhost:${PORT}}
-  docker run --rm -p ${PORT}:${PORT} ${IMAGE_TAG} \
-    --profile ${PROFILE} \
-    --addr 0.0.0.0:${PORT} \
-    --base-url ${BASE_URL}
+  docker run --rm -e MEE_PORT=${PORT} -e MEE_HOST=0.0.0.0 -p ${PORT}:${PORT} ${IMAGE_TAG}

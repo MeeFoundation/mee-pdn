@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 impl From<&str> for NodeId {
     fn from(s: &str) -> Self {
@@ -24,25 +25,46 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Transport-level user identifier (e.g., Willow user id).
 #[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct UserId(pub String);
-impl From<&str> for UserId {
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TransportUserId(pub String);
+impl From<&str> for TransportUserId {
     fn from(s: &str) -> Self {
         Self(s.to_string())
     }
 }
-impl From<String> for UserId {
+impl From<String> for TransportUserId {
     fn from(s: String) -> Self {
         Self(s)
     }
 }
-impl AsRef<str> for UserId {
+impl AsRef<str> for TransportUserId {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
-impl fmt::Display for UserId {
+impl fmt::Display for TransportUserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// person-level identity
+#[repr(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UserDid(pub Did);
+impl From<Did> for UserDid {
+    fn from(d: Did) -> Self {
+        Self(d)
+    }
+}
+impl From<&str> for UserDid {
+    fn from(s: &str) -> Self {
+        Self(Did::from(s))
+    }
+}
+impl fmt::Display for UserDid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -50,7 +72,7 @@ impl fmt::Display for UserId {
 // -- DID types
 
 #[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Did(pub String);
 impl From<&str> for Did {
     fn from(s: &str) -> Self {
@@ -85,7 +107,7 @@ impl Did {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DidMethod {
     Key,
     Web,
@@ -129,7 +151,7 @@ impl fmt::Display for DidMethod {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DidUrl(pub String);
 impl From<&str> for DidUrl {
     fn from(s: &str) -> Self {

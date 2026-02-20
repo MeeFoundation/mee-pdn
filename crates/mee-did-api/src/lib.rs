@@ -1,3 +1,5 @@
+mod error;
+pub use error::DidError;
 use mee_types::{Did, DidMethod, DidUrl};
 
 #[derive(Clone, Debug)]
@@ -13,21 +15,6 @@ pub enum VerificationRelationship {
     KeyAgreement,
     CapabilityInvocation,
     CapabilityDelegation,
-}
-
-// -- errors
-#[derive(thiserror::Error, Debug)]
-pub enum DidError {
-    #[error("DID method error: {0}")]
-    Method(String),
-    #[error("DID resolve error: {0}")]
-    Resolve(String),
-    #[error("Not found: {0}")]
-    NotFound(String),
-    #[error("Invalid: {0}")]
-    Invalid(String),
-    #[error("Other: {0}")]
-    Other(String),
 }
 
 #[derive(Clone, Debug)]

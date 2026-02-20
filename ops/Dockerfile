@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
   --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
-  cargo build --release -p mee-node-axum
+  cargo build --release -p mee-demo
 
 FROM debian:bookworm-slim AS runtime
 
@@ -33,17 +33,16 @@ RUN useradd -m -u 10001 appuser \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/mee-node-axum /usr/local/bin/mee-node-axum
+COPY --from=builder /app/target/release/mee-demo /usr/local/bin/mee-demo
 
 USER appuser
 
 EXPOSE 3000
 
 # Defaults for quick local runs; override as needed
-ENV MEE_PROFILE=node \
-    MEE_HOST=0.0.0.0 \
+ENV MEE_HOST=0.0.0.0 \
     MEE_PORT=3000 \
     MEE_BASE_URL=http://localhost:3000
 
-ENTRYPOINT ["/usr/local/bin/mee-node-axum"]
-CMD ["--profile","node","--addr","0.0.0.0:3000","--base-url","http://localhost:3000"]
+ENTRYPOINT ["/usr/local/bin/mee-demo"]
+CMD []

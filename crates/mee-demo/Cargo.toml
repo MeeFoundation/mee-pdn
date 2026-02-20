@@ -1,7 +1,8 @@
 [package]
-name = "mee-node-axum"
+name = "mee-demo"
 version = "0.1.0"
 edition = "2021"
+description = "Axum HTTP demo powered by mee-sync-api"
 
 [dependencies]
 axum = { version = "0.8.4", features = ["macros"] }
@@ -9,17 +10,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-mee-node-api = { path = "../mee-node-api" }
-mee-transport-api = { path = "../mee-transport-api" }
-mee-transport-http = { path = "../mee-transport-http" }
-mee-local-store-api = { path = "../mee-local-store-api" }
-mee-local-store-mem = { path = "../mee-local-store-mem" }
+futures-util = "0.3"
+mee-sync-api = { path = "../mee-sync-api" }
+mee-sync-iroh-willow = { path = "../mee-sync-iroh-willow" }
 mee-did-api = { path = "../mee-did-api" }
 mee-did-key = { path = "../mee-did-key" }
 mee-types = { path = "../mee-types" }
-thiserror = "2.0.16"
+mee-node-api = { path = "../mee-node-api" }
+mee-local-store-mem = { path = "../mee-local-store-mem" }
+mee-node-demo-impl = { path = "../mee-node-demo-impl" }
 anyhow = "1"
-
-[[bin]]
-name = "mee-node-axum"
-path = "src/main.rs"
+sha2 = "0.10"
+hex = "0.4"

@@ -15,16 +15,15 @@
     },
     "rust-analyzer.linkedProjects": [
       "Cargo.toml",
-      "crates/mee-dev/Cargo.toml",
       "crates/mee-types/Cargo.toml",
-      "crates/mee-transport-api/Cargo.toml",
-      "crates/mee-transport-http/Cargo.toml",
       "crates/mee-did-api/Cargo.toml",
       "crates/mee-did-key/Cargo.toml",
       "crates/mee-local-store-api/Cargo.toml",
       "crates/mee-local-store-mem/Cargo.toml",
       "crates/mee-node-api/Cargo.toml",
-      "crates/mee-node-axum/Cargo.toml",
+      "crates/mee-sync-api/Cargo.toml",
+      "crates/mee-sync-iroh-willow/Cargo.toml",
+      "crates/mee-demo/Cargo.toml",
       "crates/mee-wasm/Cargo.toml"
     ],
     "rust-analyzer.cargo.features": "all",
@@ -33,7 +32,7 @@
     "rust-analyzer.procMacro.enable": true,
     "editor.formatOnSave": true,
     "editor.rulers": [
-      80
+      100
     ],
     "files.insertFinalNewline": true,
     "files.trimTrailingWhitespace": true

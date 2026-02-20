@@ -23,11 +23,10 @@ This repository is for version 3, previous version repos:
 * `just check`: format & lint check
 * `just precommit-fix`: format & lint check + autofix, tests
 
-### Demo (HTTP)
+### Demo (P2P over Willow)
 
-Run two local nodes (Alice/Bob), send a ping, and view the inbox.
-
-* `just http-demo`
+* `just p2p-demo`
+* Flow: Bob exposes a Willow user id; Alice creates a share ticket for Bob; Bob imports the ticket and starts sync; Alice inserts an entry; Bob lists entries replicated via P2P.
 
 ## Crates
 
@@ -35,15 +34,14 @@ Core types and APIs
 
 * `crates/mee-types`: Shared domain types
 * `crates/mee-did-api`: DID
-* `crates/mee-transport-api`: Transport
 * `crates/mee-local-store-api`: Namespaced KV
 * `crates/mee-node-api`: Minimal PDN node composition crate
 
 Implementations & demos
 
 * `crates/mee-did-key`: Stub `did:key` manager (demo)
-* `crates/mee-transport-http`: HTTP transport backend (demo)
 * `crates/mee-local-store-mem`: In-memory KV store backend (demo)
-* `crates/mee-node-axum`: Axum-based demo node
+* `crates/mee-sync-api`: backend-agnostic sync API used by the demo
+* `crates/mee-sync-iroh-willow`: willow/iroh backend for the sync API
 * `crates/mee-wasm`: Minimal wasm-bindgen facade for wasm builds
-* `crates/mee-dev`: Developer tools, CLI
+* `crates/mee-demo`: axum node exposing P2P sync endpoints (demo)

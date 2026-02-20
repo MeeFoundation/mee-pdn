@@ -1,0 +1,22 @@
+[package]
+name = "mee-node-demo-impl"
+version = "0.1.0"
+edition = "2021"
+description = "Demo Node implementation using Willow/Iroh sync and in-memory store"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+mee-node-api = { path = "../mee-node-api" }
+mee-sync-api = { path = "../mee-sync-api" }
+mee-sync-iroh-willow = { path = "../mee-sync-iroh-willow" }
+mee-did-api = { path = "../mee-did-api" }
+mee-did-key = { path = "../mee-did-key" }
+mee-local-store-api = { path = "../mee-local-store-api" }
+mee-local-store-mem = { path = "../mee-local-store-mem" }
+mee-types = { path = "../mee-types" }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"

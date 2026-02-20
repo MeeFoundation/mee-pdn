@@ -1,17 +1,26 @@
-use mee_did_api::DidManager;
+pub use data_service::{DataEntry, DataService};
+pub use identity_service::IdentityService;
+pub use sync_service::SyncService;
+pub use trust_service::{Contact, Invite, InviteSignature, TrustService};
 use mee_local_store_api::KvStore;
-use mee_transport_api::{ProfileName, Transport};
-use mee_types::{NodeId, UserId};
+use mee_types::NodeId;
+
+mod data_service;
+mod identity_service;
+mod sync_service;
+mod trust_service;
 
 pub trait Node {
-    type Transport: Transport;
-    type DidManager: DidManager;
     type Store: KvStore;
+    type Identity: IdentityService;
+    type Trust: TrustService;
+    type Data: DataService;
+    type Sync: SyncService;
 
-    fn profile(&self) -> &ProfileName;
     fn node_id(&self) -> &NodeId;
-    fn user_id(&self) -> Option<&UserId>;
-    fn transport(&self) -> &Self::Transport;
-    fn did_manager(&self) -> &Self::DidManager;
     fn store(&self) -> &Self::Store;
+    fn identity(&self) -> &Self::Identity;
+    fn trust(&self) -> &Self::Trust;
+    fn data(&self) -> &Self::Data;
+    fn sync(&self) -> &Self::Sync;
 }
