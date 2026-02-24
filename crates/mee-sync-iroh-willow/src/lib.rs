@@ -1,6 +1,8 @@
 use futures_core::Stream;
 use futures_util::stream::{BoxStream, StreamExt as _};
-use iroh::{Endpoint, NodeAddr as IrohNodeAddr, NodeId as IrohNodeId, RelayUrl};
+use iroh::{
+    Endpoint, EndpointAddr as IrohNodeAddr, EndpointId as IrohNodeId, RelayUrl, TransportAddr,
+};
 use iroh_willow::proto::data_model::PathExt;
 use iroh_willow::{engine::AcceptOpts, Engine as WillowEngine, ALPN};
 use mee_sync_api as api;
@@ -24,8 +26,7 @@ pub struct IrohWillowSyncCore {
 
 impl IrohWillowSyncCore {
     pub async fn spawn() -> Result<Self, SyncError> {
-        let endpoint = Endpoint::builder()
-            .relay_mode(iroh::RelayMode::Disabled)
+        let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await
@@ -40,16 +41,16 @@ impl IrohWillowSyncCore {
             let endpoint = endpoint.clone();
             async move {
                 while let Some(incoming) = endpoint.accept().await {
-                    let Ok(mut connecting) = incoming.accept() else {
+                    let Ok(mut accepting) = incoming.accept() else {
                         continue;
                     };
-                    let Ok(alpn) = connecting.alpn().await else {
+                    let Ok(alpn) = accepting.alpn().await else {
                         continue;
                     };
                     if alpn != ALPN {
                         continue;
                     }
-                    let Ok(conn) = connecting.await else {
+                    let Ok(conn) = accepting.await else {
                         continue;
                     };
                     let _ = engine.handle_connection(conn).await;
@@ -109,16 +110,15 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         let direct_addresses = a
-            .direct_addresses
-            .iter()
+            .ip_addrs()
             .map(|sa| api::DirectAddress::from(*sa))
             .collect::<Vec<_>>();
         let relay_url = a
-            .relay_url
-            .as_ref()
+            .relay_urls()
+            .next()
             .map(|u| api::RelayEndpoint::from(u.to_string()));
         Ok(api::NodeAddr {
-            node_id: api::NodeId::from(format!("{}", a.node_id)),
+            node_id: api::NodeId::from(format!("{}", a.id)),
             direct_addresses,
             relay_url,
         })
@@ -209,19 +209,18 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .node_addr()
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
-        if let Some(first) = addr.direct_addresses.iter().next().copied() {
-            let port = first.port();
+        let first_port = addr.ip_addrs().next().map(SocketAddr::port);
+        if let Some(port) = first_port {
             let loopback: SocketAddr = format!("127.0.0.1:{port}").parse()?;
-            addr.direct_addresses.insert(loopback);
+            addr.addrs.insert(TransportAddr::Ip(loopback));
         }
         let direct_addresses = addr
-            .direct_addresses
-            .iter()
+            .ip_addrs()
             .map(|sa| api::DirectAddress::from(*sa))
             .collect::<Vec<_>>();
         let relay_url = addr
-            .relay_url
-            .as_ref()
+            .relay_urls()
+            .next()
             .map(|u| api::RelayEndpoint::from(u.to_string()));
         Ok(api::SyncTicket {
             caps: caps
@@ -229,7 +228,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
                 .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::json!({})))
                 .collect(),
             nodes: vec![api::NodeAddr {
-                node_id: api::NodeId::from(format!("{}", addr.node_id)),
+                node_id: api::NodeId::from(format!("{}", addr.id)),
                 direct_addresses,
                 relay_url,
             }],
@@ -255,18 +254,14 @@ impl api::SyncEngine for IrohWillowSyncCore {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            let relay_url = match &n.relay_url {
-                Some(s) => Some(
-                    RelayUrl::from_str(s.as_ref())
-                        .map_err(|e| SyncError::InvalidId(e.to_string()))?,
-                ),
-                None => None,
-            };
-            nodes.push(IrohNodeAddr {
-                node_id,
-                direct_addresses: set,
-                relay_url,
-            });
+            let mut addr =
+                IrohNodeAddr::from_parts(node_id, set.into_iter().map(TransportAddr::Ip));
+            if let Some(s) = &n.relay_url {
+                let url = RelayUrl::from_str(s.as_ref())
+                    .map_err(|e| SyncError::InvalidId(e.to_string()))?;
+                addr = addr.with_relay_url(url);
+            }
+            nodes.push(addr);
         }
         let ticket = iroh_willow::rpc::client::SpaceTicket { caps, nodes };
         let mode = match mode {
@@ -395,18 +390,14 @@ impl IrohWillowSyncCore {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            let relay_url = match &n.relay_url {
-                Some(s) => Some(
-                    RelayUrl::from_str(s.as_ref())
-                        .map_err(|e| SyncError::InvalidId(e.to_string()))?,
-                ),
-                None => None,
-            };
-            nodes.push(IrohNodeAddr {
-                node_id,
-                direct_addresses: set,
-                relay_url,
-            });
+            let mut addr =
+                IrohNodeAddr::from_parts(node_id, set.into_iter().map(TransportAddr::Ip));
+            if let Some(s) = &n.relay_url {
+                let url = RelayUrl::from_str(s.as_ref())
+                    .map_err(|e| SyncError::InvalidId(e.to_string()))?;
+                addr = addr.with_relay_url(url);
+            }
+            nodes.push(addr);
         }
         let ticket = iroh_willow::rpc::client::SpaceTicket { caps, nodes };
         let mode = match mode {
