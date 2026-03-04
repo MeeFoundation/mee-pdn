@@ -194,6 +194,14 @@ pub trait SyncEngine: Send + Sync {
         bytes: &[u8],
     ) -> Result<(), SyncError>;
 
+    async fn connect_and_share(
+        &self,
+        ns: &NamespaceId,
+        to: &TransportUserId,
+        peer_addr: &NodeAddr,
+        access: AccessMode,
+    ) -> Result<(), SyncError>;
+
     type EntryStream: Stream<Item = Result<EntryInfo, SyncError>> + Send + Unpin + 'static;
     async fn get_entries(&self, ns: &NamespaceId) -> Result<Self::EntryStream, SyncError>;
 }

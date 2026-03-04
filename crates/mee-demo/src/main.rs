@@ -4,16 +4,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::StreamExt as _;
 use mee_node_api::{
     Contact, IdentityService as _, Invite, Node as _, SyncService as _, TrustService as _,
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
 use mee_sync_api::SyncError;
+use mee_sync_iroh_willow::DiscoveryConfig;
 use mee_types::Did;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -23,6 +22,7 @@ struct AppState {
     node: Arc<Mutex<Option<Arc<DemoNode>>>>,
     events: Arc<Mutex<Vec<String>>>,
     sync_complete: Arc<Mutex<bool>>,
+    discovery: Arc<str>,
 }
 
 #[allow(clippy::expect_used)]
@@ -31,7 +31,12 @@ impl AppState {
         if self.node.lock().expect("node lock poisoned").is_some() {
             return Ok(());
         }
-        let node = DemoNode::spawn()
+        let config = match &*self.discovery {
+            "local" => DiscoveryConfig::local(),
+            "full" => DiscoveryConfig::full(),
+            _ => DiscoveryConfig::disabled(),
+        };
+        let node = DemoNode::spawn(config)
             .await
             .map_err(|e| SyncError::Other(e.to_string()))?;
         *self.node.lock().expect("node lock poisoned") = Some(node);
@@ -49,10 +54,14 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let discovery: Arc<str> = std::env::var("MEE_DISCOVERY")
+        .unwrap_or_else(|_| "disabled".into())
+        .into();
     let state = AppState {
         node: Arc::new(Mutex::new(None)),
         events: Arc::new(Mutex::new(Vec::with_capacity(256))),
         sync_complete: Arc::new(Mutex::new(false)),
+        discovery,
     };
 
     let app = Router::new()
@@ -70,8 +79,8 @@ async fn main() -> anyhow::Result<()> {
             get(|state| async move { p2p_invite(state).await }),
         )
         .route(
-            "/p2p/ticket-from-invite",
-            post(|state, payload| async move { p2p_ticket_from_invite(state, payload).await }),
+            "/p2p/connect",
+            post(|state, payload| async move { p2p_connect(state, payload).await }),
         )
         .route(
             "/p2p/bind",
@@ -96,10 +105,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/p2p/ticket",
             post(|state, payload| async move { p2p_ticket(state, payload).await }),
-        )
-        .route(
-            "/p2p/import",
-            post(|state, payload| async move { p2p_import(state, payload).await }),
         )
         .route(
             "/p2p/insert",
@@ -185,15 +190,15 @@ async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
 }
 
 #[derive(Deserialize)]
-struct TicketFromInviteReq {
+struct ConnectReq {
     invite: Invite,
     #[serde(default)]
     write: bool,
 }
 
-async fn p2p_ticket_from_invite(
+async fn p2p_connect(
     state: axum::extract::State<AppState>,
-    Json(req): Json<TicketFromInviteReq>,
+    Json(req): Json<ConnectReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
@@ -201,15 +206,19 @@ async fn p2p_ticket_from_invite(
     let n = state.get_node();
     let trust = n.trust();
     let invite = req.invite;
-    match trust.accept_invite(&invite, req.write).await {
-        Ok(ticket) => {
-            trust.remember_invite(invite.clone());
-            trust.add_contact(Contact {
-                did: invite.inviter_did,
-                alias: None,
-            });
-            Json(ticket).into_response()
-        }
+    // Remember the invite and contact before connecting
+    trust.remember_invite(invite.clone());
+    trust.add_contact(Contact {
+        did: invite.inviter_did.clone(),
+        alias: None,
+    });
+    // Connect P2P: delegates capabilities and sends ticket directly to peer
+    match n
+        .sync()
+        .connect_to_peer(&invite.transport_user_id, &invite.node, req.write)
+        .await
+    {
+        Ok(()) => "connected".to_owned().into_response(),
         Err(e) => internal(&e).into_response(),
     }
 }
@@ -277,53 +286,6 @@ async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<Ticke
         Ok(ticket) => Json::<api::SyncTicket>(ticket).into_response(),
         Err(e) => internal(&e).into_response(),
     }
-}
-
-#[derive(Deserialize)]
-struct ImportReq {
-    ticket: api::SyncTicket,
-    #[serde(default)]
-    continuous: bool,
-}
-
-#[allow(clippy::expect_used)]
-async fn p2p_import(state: axum::extract::State<AppState>, Json(req): Json<ImportReq>) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    let n = state.get_node();
-    let mode = if req.continuous {
-        api::SyncMode::Continuous
-    } else {
-        api::SyncMode::ReconcileOnce
-    };
-    let mut handle = match n.sync().import(req.ticket, mode).await {
-        Ok(h) => h,
-        Err(e) => return internal(&e).into_response(),
-    };
-    let events = state.events.clone();
-    let done = state.sync_complete.clone();
-    tokio::spawn(async move {
-        let mut h = Pin::new(&mut *handle);
-        while let Some(ev) = h.next().await {
-            let name = match ev {
-                api::SyncEvent::CapabilityIntersection => "capability_intersection",
-                api::SyncEvent::InterestIntersection => "interest_intersection",
-                api::SyncEvent::Reconciled => "reconciled",
-                api::SyncEvent::ReconciledAll => {
-                    *done.lock().expect("sync_complete lock poisoned") = true;
-                    "reconciled_all"
-                }
-                api::SyncEvent::Abort { .. } => "abort",
-            };
-            let mut buf = events.lock().expect("events lock poisoned");
-            if buf.len() >= 500 {
-                buf.remove(0);
-            }
-            buf.push(name.to_owned());
-        }
-    });
-    "imported".to_owned().into_response()
 }
 
 #[derive(Deserialize)]

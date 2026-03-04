@@ -15,9 +15,9 @@ impl mgr::SessionManager for IrohWillowSessionManager {
     async fn import_and_sync(
         &self,
         ticket: api::SyncTicket,
-        mode: api::SyncMode,
+        _mode: api::SyncMode,
     ) -> Result<Self::Handle, SyncError> {
-        let h = self.engine.import_and_sync_concrete(ticket, mode).await?;
+        let h = self.engine.import_and_sync_inner(ticket).await?;
         Ok(h)
     }
 }

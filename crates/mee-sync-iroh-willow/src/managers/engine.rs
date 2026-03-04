@@ -1,4 +1,4 @@
-use crate::{IrohWillowSyncCore, IrohWillowSyncHandle};
+use crate::{DiscoveryConfig, IrohWillowSyncCore, IrohWillowSyncHandle};
 use mee_sync_api::managers as mgr;
 use mee_sync_api::SyncError;
 
@@ -19,8 +19,8 @@ pub struct IrohWillowSyncEngine {
 }
 
 impl IrohWillowSyncEngine {
-    pub async fn spawn() -> Result<Self, SyncError> {
-        let engine = std::sync::Arc::new(IrohWillowSyncCore::spawn().await?);
+    pub async fn spawn(config: DiscoveryConfig) -> Result<Self, SyncError> {
+        let engine = std::sync::Arc::new(IrohWillowSyncCore::spawn(config).await?);
         Ok(Self {
             network: IrohWillowNetworkManager {
                 engine: engine.clone(),

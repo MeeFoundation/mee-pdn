@@ -251,6 +251,14 @@ impl SyncService for WasmSyncService {
         }
         Ok(Box::new(H))
     }
+    async fn connect_to_peer(
+        &self,
+        _to: &TransportUserId,
+        _peer_addr: &api::NodeAddr,
+        _write: bool,
+    ) -> Result<(), api::SyncError> {
+        Ok(())
+    }
     async fn insert(&self, _path: &api::EntryPath, _bytes: &[u8]) -> Result<(), api::SyncError> {
         Ok(())
     }
@@ -317,6 +325,15 @@ impl api::SyncEngine for WasmNoopSync {
             }
         }
         Ok(Box::new(H))
+    }
+    async fn connect_and_share(
+        &self,
+        _ns: &api::NamespaceId,
+        _to: &TransportUserId,
+        _peer_addr: &api::NodeAddr,
+        _access: api::AccessMode,
+    ) -> Result<(), api::SyncError> {
+        Ok(())
     }
     async fn insert(
         &self,

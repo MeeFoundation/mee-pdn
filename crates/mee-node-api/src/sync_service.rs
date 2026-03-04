@@ -12,6 +12,12 @@ pub trait SyncService: Send + Sync {
         ticket: SyncTicket,
         mode: SyncMode,
     ) -> Result<Box<dyn SyncHandle>, SyncError>;
+    async fn connect_to_peer(
+        &self,
+        to: &TransportUserId,
+        peer_addr: &NodeAddr,
+        write: bool,
+    ) -> Result<(), SyncError>;
     async fn insert(&self, path: &EntryPath, bytes: &[u8]) -> Result<(), SyncError>;
     async fn list(&self) -> Result<Vec<EntryInfo>, SyncError>;
 }

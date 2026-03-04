@@ -15,7 +15,7 @@ use mee_sync_api::{
     AccessMode, EntryInfo, EntryPath, NamespaceId, SyncError, SyncHandle, SyncMode, SyncTicket,
     TransportUserId,
 };
-use mee_sync_iroh_willow::IrohWillowSyncCore;
+use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
 use mee_types::{Did, NodeId};
 use sha2::{Digest, Sha256};
 
@@ -31,8 +31,8 @@ pub struct DemoNode {
 
 #[allow(clippy::expect_used)]
 impl DemoNode {
-    pub async fn spawn() -> anyhow::Result<Arc<Self>> {
-        let sync_engine = Arc::new(IrohWillowSyncCore::spawn().await?);
+    pub async fn spawn(discovery: DiscoveryConfig) -> anyhow::Result<Arc<Self>> {
+        let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery).await?);
         let did_mgr = Arc::new(KeyDidManager);
         let params = DidCreateParams::Key(DidKeyCreateOptions {
             jwk: String::new(),
@@ -355,6 +355,22 @@ impl SyncService for DemoSyncService {
         mode: SyncMode,
     ) -> Result<Box<dyn SyncHandle>, SyncError> {
         self.sync.import_and_sync(ticket, mode).await
+    }
+
+    async fn connect_to_peer(
+        &self,
+        to: &TransportUserId,
+        peer_addr: &api::NodeAddr,
+        write: bool,
+    ) -> Result<(), SyncError> {
+        let access = if write {
+            AccessMode::Write
+        } else {
+            AccessMode::Read
+        };
+        self.sync
+            .connect_and_share(&self.namespace, to, peer_addr, access)
+            .await
     }
 
     async fn insert(&self, path: &EntryPath, bytes: &[u8]) -> Result<(), SyncError> {

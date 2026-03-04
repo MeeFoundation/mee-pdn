@@ -156,12 +156,9 @@ p2p-demo:
   BOB_INVITE=$(curl -s ${BOB_URL}/p2p/invite)
   echo "Bob invite: ${BOB_INVITE}"
 
-  echo "Alice creates a share ticket using Bob's invite"
-  TICKET_JSON=$(curl -s -X POST ${ALICE_URL}/p2p/ticket-from-invite -H 'content-type: application/json' -d "{\"invite\":${BOB_INVITE}}")
-  echo "Ticket: ${TICKET_JSON}"
-
-  echo "Bob imports the ticket and starts sync"
-  curl -s -X POST ${BOB_URL}/p2p/import -H 'content-type: application/json' -d "{\"ticket\":${TICKET_JSON},\"continuous\":true}" >/dev/null
+  echo "Alice connects to Bob P2P using his invite"
+  curl -s -X POST ${ALICE_URL}/p2p/connect -H 'content-type: application/json' -d "{\"invite\":${BOB_INVITE}}"
+  echo ""
 
   echo "Waiting for initial reconciliation..."
   curl -s "${BOB_URL}/p2p/sync-status?wait_ms=2000" >/dev/null

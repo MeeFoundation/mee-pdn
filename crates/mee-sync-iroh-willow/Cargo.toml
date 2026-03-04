@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Willow/iroh implementation of mee-sync-api"
 
+[features]
+default = ["mdns"]
+mdns = ["iroh/address-lookup-mdns"]
+dht = ["iroh/address-lookup-pkarr-dht"]
+
 [dependencies]
 mee-sync-api = { path = "../mee-sync-api" }
 serde = { version = "1", features = ["derive"] }
