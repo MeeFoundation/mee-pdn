@@ -2,12 +2,17 @@
 
 use mee_did_api::DidProvider;
 use mee_node_api::{
-    Contact, DataEntry, IdentityService, Invite, InviteSignature, Node, SyncService, TrustService,
+    Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
+    TrustService,
 };
 use mee_sync_api as api;
-use mee_types::{Did, NodeId, TransportUserId};
+use mee_sync_api::AccessMode;
+use mee_types::{Did, NodeId};
 use serde_json as _;
 use wasm_bindgen::prelude::*;
+
+/// Placeholder zero ID for WASM stubs.
+const ZERO_ID: [u8; 32] = [0u8; 32];
 
 // tiny facade just to ensure our core APIs compile to wasm.
 #[wasm_bindgen]
@@ -27,23 +32,6 @@ pub fn did_key_manager_method() -> String {
     mgr.method().to_string()
 }
 
-#[wasm_bindgen]
-pub fn mem_kv_roundtrip_ok(k: &str, v: &str) -> bool {
-    use mee_local_store_api::{Key, KvStore, Namespace, Value};
-    use mee_local_store_mem::MemKvStore;
-    let store = MemKvStore::new();
-    let ns = Namespace(k.into());
-    let key = Key(k.into());
-    let val = Value(v.into());
-    if store.set(&ns, &key, &val).is_err() {
-        return false;
-    }
-    match store.get(&ns, &key) {
-        Ok(Some(got)) => got.0 == v,
-        _ => false,
-    }
-}
-
 // --- Noop implementations for WASM build-check ---
 
 #[allow(dead_code)]
@@ -51,7 +39,6 @@ struct WasmNoopSync;
 
 struct WasmNode {
     node_id: NodeId,
-    store: mee_local_store_mem::MemKvStore,
     identity: WasmIdentityService,
     trust: WasmTrustService,
     data: WasmDataService,
@@ -61,8 +48,7 @@ struct WasmNode {
 impl WasmNode {
     fn new() -> Self {
         Self {
-            node_id: NodeId::from("did:key:zwasm"),
-            store: mee_local_store_mem::MemKvStore::new(),
+            node_id: NodeId::from_bytes(ZERO_ID),
             identity: WasmIdentityService,
             trust: WasmTrustService,
             data: WasmDataService,
@@ -72,7 +58,6 @@ impl WasmNode {
 }
 
 impl Node for WasmNode {
-    type Store = mee_local_store_mem::MemKvStore;
     type Identity = WasmIdentityService;
     type Trust = WasmTrustService;
     type Data = WasmDataService;
@@ -80,9 +65,6 @@ impl Node for WasmNode {
 
     fn node_id(&self) -> &NodeId {
         &self.node_id
-    }
-    fn store(&self) -> &Self::Store {
-        &self.store
     }
     fn identity(&self) -> &Self::Identity {
         &self.identity
@@ -102,7 +84,6 @@ impl Node for WasmNode {
 pub fn node_trait_compiles() -> bool {
     let node = WasmNode::new();
     let _ = node.node_id();
-    let _ = node.store();
     true
 }
 
@@ -139,14 +120,14 @@ pub struct WasmTrustService;
 #[allow(async_fn_in_trait)]
 impl TrustService for WasmTrustService {
     fn default_namespace(&self) -> api::NamespaceId {
-        api::NamespaceId("ns_wasm".into())
+        api::NamespaceId::from_bytes(ZERO_ID)
     }
     async fn create_invite(&self) -> Result<Invite, api::SyncError> {
         Ok(Invite {
             inviter_did: Did("did:key:zwasm".into()),
-            transport_user_id: TransportUserId("wasm_user".into()),
+            subspace_id: api::SubspaceId::from_bytes(ZERO_ID),
             node: api::NodeAddr {
-                node_id: NodeId::from("n_wasm"),
+                node_id: NodeId::from_bytes(ZERO_ID),
                 direct_addresses: vec![],
                 relay_url: None,
             },
@@ -157,7 +138,7 @@ impl TrustService for WasmTrustService {
     async fn accept_invite(
         &self,
         _invite: &Invite,
-        _write: bool,
+        _access: AccessMode,
     ) -> Result<api::SyncTicket, api::SyncError> {
         Ok(api::SyncTicket {
             caps: vec![],
@@ -184,16 +165,16 @@ pub struct WasmDataService;
 
 #[allow(async_fn_in_trait)]
 impl mee_node_api::DataService for WasmDataService {
-    async fn set(&self, _key: &str, _value: &str) -> anyhow::Result<()> {
+    async fn set(&self, _key: &str, _value: &str) -> Result<(), DataError> {
         Ok(())
     }
-    async fn delete(&self, _key: &str) -> anyhow::Result<()> {
+    async fn delete(&self, _key: &str) -> Result<(), DataError> {
         Ok(())
     }
-    async fn get(&self, _key: &str) -> anyhow::Result<Option<DataEntry>> {
+    async fn get(&self, _key: &str) -> Result<Option<DataEntry>, DataError> {
         Ok(None)
     }
-    async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<DataEntry>> {
+    async fn list(&self, _prefix: &str) -> Result<Vec<DataEntry>, DataError> {
         Ok(vec![])
     }
 }
@@ -207,18 +188,18 @@ pub struct WasmSyncService;
 impl SyncService for WasmSyncService {
     async fn node_addr(&self) -> Result<api::NodeAddr, api::SyncError> {
         Ok(api::NodeAddr {
-            node_id: NodeId::from("n_wasm"),
+            node_id: NodeId::from_bytes(ZERO_ID),
             direct_addresses: vec![],
             relay_url: None,
         })
     }
-    async fn user_id(&self) -> Result<TransportUserId, api::SyncError> {
-        Ok(TransportUserId("wasm_user".into()))
+    async fn subspace_id(&self) -> Result<api::SubspaceId, api::SyncError> {
+        Ok(api::SubspaceId::from_bytes(ZERO_ID))
     }
     async fn share(
         &self,
-        _to: &TransportUserId,
-        _write: bool,
+        _to: &api::SubspaceId,
+        _access: AccessMode,
     ) -> Result<api::SyncTicket, api::SyncError> {
         Ok(api::SyncTicket {
             caps: vec![],
@@ -253,9 +234,9 @@ impl SyncService for WasmSyncService {
     }
     async fn connect_to_peer(
         &self,
-        _to: &TransportUserId,
+        _to: &api::SubspaceId,
         _peer_addr: &api::NodeAddr,
-        _write: bool,
+        _access: AccessMode,
     ) -> Result<(), api::SyncError> {
         Ok(())
     }
@@ -272,19 +253,19 @@ impl SyncService for WasmSyncService {
 impl api::SyncEngine for WasmNoopSync {
     async fn addr(&self) -> Result<api::NodeAddr, api::SyncError> {
         Ok(api::NodeAddr {
-            node_id: NodeId::from("n_wasm"),
+            node_id: NodeId::from_bytes(ZERO_ID),
             direct_addresses: vec![],
             relay_url: None,
         })
     }
-    async fn user_id(&self) -> Result<TransportUserId, api::SyncError> {
-        Ok(TransportUserId("wasm_user".into()))
+    async fn subspace_id(&self) -> Result<api::SubspaceId, api::SyncError> {
+        Ok(api::SubspaceId::from_bytes(ZERO_ID))
     }
     async fn create_namespace(
         &self,
-        _owner: &TransportUserId,
+        _owner: &api::SubspaceId,
     ) -> Result<api::NamespaceId, api::SyncError> {
-        Ok(api::NamespaceId("ns_wasm".into()))
+        Ok(api::NamespaceId::from_bytes(ZERO_ID))
     }
     async fn list_namespaces(&self) -> Result<Vec<api::NamespaceId>, api::SyncError> {
         Ok(vec![])
@@ -292,7 +273,7 @@ impl api::SyncEngine for WasmNoopSync {
     async fn share(
         &self,
         _ns: &api::NamespaceId,
-        _to: &TransportUserId,
+        _to: &api::SubspaceId,
         _access: api::AccessMode,
     ) -> Result<api::SyncTicket, api::SyncError> {
         Ok(api::SyncTicket {
@@ -329,7 +310,7 @@ impl api::SyncEngine for WasmNoopSync {
     async fn connect_and_share(
         &self,
         _ns: &api::NamespaceId,
-        _to: &TransportUserId,
+        _to: &api::SubspaceId,
         _peer_addr: &api::NodeAddr,
         _access: api::AccessMode,
     ) -> Result<(), api::SyncError> {
@@ -353,12 +334,17 @@ impl api::SyncEngine for WasmNoopSync {
 }
 
 #[wasm_bindgen]
+#[allow(clippy::expect_used)]
 pub fn sync_types_sample_ticket() -> String {
     let ticket = api::SyncTicket {
         caps: vec![serde_json::json!(null)],
         nodes: vec![api::NodeAddr {
-            node_id: NodeId::from("n_local_test"),
-            direct_addresses: vec![api::DirectAddress::from("127.0.0.1:0")],
+            node_id: NodeId::from_bytes(ZERO_ID),
+            direct_addresses: vec![api::DirectAddress::from(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("hardcoded addr"),
+            )],
             relay_url: None,
         }],
     };
@@ -367,6 +353,9 @@ pub fn sync_types_sample_ticket() -> String {
 
 #[wasm_bindgen]
 pub fn sync_namespace_roundtrip(s: &str) -> String {
-    let ns = api::NamespaceId(s.to_owned());
-    ns.0
+    // Parse hex string → NamespaceId → back to hex
+    let ns: api::NamespaceId = s
+        .parse()
+        .unwrap_or_else(|_| api::NamespaceId::from_bytes(ZERO_ID));
+    ns.to_string()
 }

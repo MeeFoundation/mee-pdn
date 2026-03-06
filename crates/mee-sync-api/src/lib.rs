@@ -1,48 +1,67 @@
 use futures_core::{Future, Stream};
 use serde::{Deserialize, Serialize};
-pub mod error;
-pub use error::SyncError;
+use std::fmt;
 use std::pin::Pin;
 
-pub use mee_types::{NodeId, TransportUserId};
+pub mod error;
+pub use error::SyncError;
 
-pub mod managers;
+pub use mee_types::NodeId;
 
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NamespaceId(pub String);
+// ---------------------------------------------------------------------------
+// Byte-backed IDs (reuse macro from mee-types)
+// ---------------------------------------------------------------------------
 
-#[repr(transparent)]
+mee_types::define_byte_id! {
+    /// Willow namespace key (32 bytes).
+    pub struct NamespaceId;
+}
+
+mee_types::define_byte_id! {
+    /// Willow subspace / entry-author key (32 bytes).
+    ///
+    /// This is the operational signing key used for entry authoring,
+    /// capability delegation, and subspace ownership. It maps to
+    /// Willow's `UserId` concept.
+    pub struct SubspaceId;
+}
+
+// ---------------------------------------------------------------------------
+// Network address types
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct DirectAddress(pub String);
-impl DirectAddress {
-    pub fn parse(&self) -> Result<std::net::SocketAddr, std::net::AddrParseError> {
-        self.0.parse()
-    }
+pub struct DirectAddress(
+    #[serde(
+        serialize_with = "ser_socket_addr",
+        deserialize_with = "de_socket_addr"
+    )]
+    pub std::net::SocketAddr,
+);
+
+fn ser_socket_addr<S: serde::Serializer>(
+    addr: &std::net::SocketAddr,
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&addr.to_string())
 }
-impl From<&str> for DirectAddress {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
+
+fn de_socket_addr<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<std::net::SocketAddr, D::Error> {
+    let s = <String as Deserialize>::deserialize(de)?;
+    s.parse().map_err(serde::de::Error::custom)
 }
-impl From<String> for DirectAddress {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
+
 impl From<std::net::SocketAddr> for DirectAddress {
     fn from(addr: std::net::SocketAddr) -> Self {
-        Self(addr.to_string())
+        Self(addr)
     }
 }
-impl std::fmt::Display for DirectAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+
+impl fmt::Display for DirectAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
-    }
-}
-impl AsRef<str> for DirectAddress {
-    fn as_ref(&self) -> &str {
-        &self.0
     }
 }
 
@@ -59,8 +78,8 @@ impl From<String> for RelayEndpoint {
         Self(s)
     }
 }
-impl std::fmt::Display for RelayEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for RelayEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -69,6 +88,10 @@ impl AsRef<str> for RelayEndpoint {
         &self.0
     }
 }
+
+// ---------------------------------------------------------------------------
+// Node address bundle
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAddr {
@@ -79,53 +102,123 @@ pub struct NodeAddr {
     pub relay_url: Option<RelayEndpoint>,
 }
 
-#[repr(transparent)]
+// ---------------------------------------------------------------------------
+// EntryPath — validated Willow path
+// ---------------------------------------------------------------------------
+
+/// Error returned when constructing an invalid [`EntryPath`].
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct PathValidationError {
+    pub message: String,
+}
+
+/// A validated Willow entry path.
+///
+/// Components are separated by `/`. Constraints:
+/// - No empty components (no leading, trailing, or double slashes)
+/// - At most 16 components
+/// - Each component at most 256 bytes (UTF-8)
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SubspaceId(pub String);
-impl From<&str> for SubspaceId {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
+#[serde(try_from = "String", into = "String")]
+pub struct EntryPath(String);
+
+/// Maximum number of path components.
+const MAX_PATH_COMPONENTS: usize = 16;
+/// Maximum byte length per component.
+const MAX_COMPONENT_BYTES: usize = 256;
+
+impl EntryPath {
+    /// Create a new validated entry path.
+    pub fn new(path: impl Into<String>) -> Result<Self, PathValidationError> {
+        let s: String = path.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
     }
-}
-impl From<String> for SubspaceId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-impl std::fmt::Display for SubspaceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl AsRef<str> for SubspaceId {
-    fn as_ref(&self) -> &str {
+
+    /// View the path as a string slice.
+    pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Iterate over path components.
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/')
+    }
+
+    fn validate(s: &str) -> Result<(), PathValidationError> {
+        if s.is_empty() {
+            return Err(PathValidationError {
+                message: "path must not be empty".into(),
+            });
+        }
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() > MAX_PATH_COMPONENTS {
+            return Err(PathValidationError {
+                message: format!(
+                    "too many components: {} (max {})",
+                    parts.len(),
+                    MAX_PATH_COMPONENTS
+                ),
+            });
+        }
+        for part in &parts {
+            if part.is_empty() {
+                return Err(PathValidationError {
+                    message: "empty component (leading, trailing, \
+                         or double slash)"
+                        .into(),
+                });
+            }
+            if part.len() > MAX_COMPONENT_BYTES {
+                return Err(PathValidationError {
+                    message: format!(
+                        "component too long: {} bytes (max {})",
+                        part.len(),
+                        MAX_COMPONENT_BYTES
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EntryPath(pub String);
-impl From<&str> for EntryPath {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
+impl TryFrom<String> for EntryPath {
+    type Error = PathValidationError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s)
     }
 }
-impl From<String> for EntryPath {
-    fn from(s: String) -> Self {
-        Self(s)
+
+impl TryFrom<&str> for EntryPath {
+    type Error = PathValidationError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::new(s)
     }
 }
-impl std::fmt::Display for EntryPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+
+impl From<EntryPath> for String {
+    fn from(p: EntryPath) -> Self {
+        p.0
+    }
+}
+
+impl fmt::Display for EntryPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
+
 impl AsRef<str> for EntryPath {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sync protocol types
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncTicket {
@@ -158,10 +251,35 @@ pub enum SyncEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
     pub namespace: NamespaceId,
-    pub subspace_hex: SubspaceId,
+    pub subspace: SubspaceId,
     pub path: EntryPath,
     pub payload_len: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Roadmap placeholders
+// ---------------------------------------------------------------------------
+
+/// Whether a namespace is single-owner or communal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NamespaceKind {
+    /// Single owner controls all subspaces.
+    Owned,
+    /// Multiple writers via delegated subspaces.
+    Communal,
+}
+
+/// A principal's role within a namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NamespaceRole {
+    Owner,
+    Writer,
+    Reader,
+}
+
+// ---------------------------------------------------------------------------
+// Sync engine trait
+// ---------------------------------------------------------------------------
 
 #[allow(async_fn_in_trait)]
 pub trait SyncHandle: Stream<Item = SyncEvent> + Send + Unpin {
@@ -173,20 +291,26 @@ pub trait SyncHandle: Stream<Item = SyncEvent> + Send + Unpin {
 #[allow(async_fn_in_trait)]
 pub trait SyncEngine: Send + Sync {
     async fn addr(&self) -> Result<NodeAddr, SyncError>;
-    async fn user_id(&self) -> Result<TransportUserId, SyncError>;
-    async fn create_namespace(&self, owner: &TransportUserId) -> Result<NamespaceId, SyncError>;
+
+    async fn subspace_id(&self) -> Result<SubspaceId, SyncError>;
+
+    async fn create_namespace(&self, owner: &SubspaceId) -> Result<NamespaceId, SyncError>;
+
     async fn list_namespaces(&self) -> Result<Vec<NamespaceId>, SyncError>;
+
     async fn share(
         &self,
         ns: &NamespaceId,
-        to: &TransportUserId,
+        to: &SubspaceId,
         access: AccessMode,
     ) -> Result<SyncTicket, SyncError>;
+
     async fn import_and_sync(
         &self,
         ticket: SyncTicket,
         mode: SyncMode,
     ) -> Result<Box<dyn SyncHandle>, SyncError>;
+
     async fn insert(
         &self,
         ns: &NamespaceId,
@@ -197,7 +321,7 @@ pub trait SyncEngine: Send + Sync {
     async fn connect_and_share(
         &self,
         ns: &NamespaceId,
-        to: &TransportUserId,
+        to: &SubspaceId,
         peer_addr: &NodeAddr,
         access: AccessMode,
     ) -> Result<(), SyncError>;

@@ -5,15 +5,15 @@ use futures_util::StreamExt;
 
 use mee_did_api::{DidCreateParams, DidKeyCreateOptions, DidProvider, DidResolver};
 use mee_did_key::KeyDidManager;
-use mee_local_store_mem::MemKvStore;
 use mee_node_api::{
-    Contact, DataEntry, IdentityService, Invite, InviteSignature, Node, SyncService, TrustService,
+    Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
+    TrustService,
 };
 use mee_sync_api as api;
 use mee_sync_api::SyncEngine;
 use mee_sync_api::{
-    AccessMode, EntryInfo, EntryPath, NamespaceId, SyncError, SyncHandle, SyncMode, SyncTicket,
-    TransportUserId,
+    AccessMode, EntryInfo, EntryPath, NamespaceId, SubspaceId, SyncError, SyncHandle, SyncMode,
+    SyncTicket,
 };
 use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
 use mee_types::{Did, NodeId};
@@ -22,7 +22,6 @@ use sha2::{Digest, Sha256};
 #[derive(Clone)]
 pub struct DemoNode {
     node_id: NodeId,
-    store: MemKvStore,
     identity: DemoIdentityService,
     trust: DemoTrustService,
     data: DemoDataService,
@@ -45,13 +44,19 @@ impl DemoNode {
         let current_did = Arc::new(Mutex::new(initial_did));
 
         let owner = sync_engine
-            .user_id()
+            .subspace_id()
             .await
-            .map_err(|e| anyhow::anyhow!("willow user id error: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("willow subspace id error: {e}"))?;
         let namespace = sync_engine
             .create_namespace(&owner)
             .await
             .map_err(|e| anyhow::anyhow!("namespace create error: {e}"))?;
+
+        // Get the actual transport NodeId from the endpoint
+        let node_addr = sync_engine
+            .addr()
+            .await
+            .map_err(|e| anyhow::anyhow!("node addr error: {e}"))?;
 
         let invites = Arc::new(Mutex::new(HashMap::<Did, Invite>::new()));
         let contacts = Arc::new(Mutex::new(HashMap::<Did, Contact>::new()));
@@ -67,7 +72,7 @@ impl DemoNode {
 
         let trust = DemoTrustService {
             sync: sync_engine.clone(),
-            namespace: namespace.clone(),
+            namespace,
             current_did: current_did.clone(),
             invites,
             contacts,
@@ -75,7 +80,7 @@ impl DemoNode {
 
         let data = DemoDataService {
             sync: sync_engine.clone(),
-            namespace: namespace.clone(),
+            namespace,
             persona,
         };
 
@@ -85,13 +90,7 @@ impl DemoNode {
         };
 
         let node = Self {
-            node_id: NodeId::from(
-                current_did
-                    .lock()
-                    .expect("current DID lock poisoned")
-                    .as_ref(),
-            ),
-            store: MemKvStore::new(),
+            node_id: node_addr.node_id,
             identity,
             trust,
             data,
@@ -103,7 +102,6 @@ impl DemoNode {
 }
 
 impl Node for DemoNode {
-    type Store = MemKvStore;
     type Identity = DemoIdentityService;
     type Trust = DemoTrustService;
     type Data = DemoDataService;
@@ -111,10 +109,6 @@ impl Node for DemoNode {
 
     fn node_id(&self) -> &NodeId {
         &self.node_id
-    }
-
-    fn store(&self) -> &Self::Store {
-        &self.store
     }
 
     fn identity(&self) -> &Self::Identity {
@@ -181,7 +175,7 @@ pub struct DemoTrustService {
 #[allow(async_fn_in_trait, clippy::expect_used, clippy::unwrap_in_result)]
 impl TrustService for DemoTrustService {
     fn default_namespace(&self) -> NamespaceId {
-        self.namespace.clone()
+        self.namespace
     }
 
     async fn create_invite(&self) -> Result<Invite, SyncError> {
@@ -191,11 +185,11 @@ impl TrustService for DemoTrustService {
             .expect("current DID lock poisoned")
             .clone();
         let node = self.sync.addr().await?;
-        let transport_user_id = self.sync.user_id().await?;
+        let subspace_id = self.sync.subspace_id().await?;
         let expires_at = now_ms() + 10 * 60 * 1000;
         let mut invite = Invite {
             inviter_did: inviter,
-            transport_user_id,
+            subspace_id,
             node,
             expires_at,
             sig: InviteSignature::default(),
@@ -204,15 +198,14 @@ impl TrustService for DemoTrustService {
         Ok(invite)
     }
 
-    async fn accept_invite(&self, invite: &Invite, write: bool) -> Result<SyncTicket, SyncError> {
+    async fn accept_invite(
+        &self,
+        invite: &Invite,
+        access: AccessMode,
+    ) -> Result<SyncTicket, SyncError> {
         verify_invite(invite)?;
-        let mode = if write {
-            AccessMode::Write
-        } else {
-            AccessMode::Read
-        };
         self.sync
-            .share(&self.namespace, &invite.transport_user_id, mode)
+            .share(&self.namespace, &invite.subspace_id, access)
             .await
     }
 
@@ -264,40 +257,37 @@ pub struct DemoDataService {
 }
 
 impl DemoDataService {
-    fn persona_path(key: &str) -> EntryPath {
-        EntryPath(format!("persona/{key}"))
+    fn persona_path(key: &str) -> Result<EntryPath, DataError> {
+        EntryPath::new(format!("persona/{key}"))
+            .map_err(|e| DataError::Sync(SyncError::Backend(format!("invalid persona path: {e}"))))
     }
 }
 
 #[allow(async_fn_in_trait, clippy::expect_used)]
 impl mee_node_api::DataService for DemoDataService {
-    async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+    async fn set(&self, key: &str, value: &str) -> Result<(), DataError> {
         self.persona
             .lock()
             .expect("persona lock poisoned")
             .insert(key.to_owned(), value.to_owned());
-        let path = Self::persona_path(key);
+        let path = Self::persona_path(key)?;
         self.sync
             .insert(&self.namespace, &path, value.as_bytes())
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+    async fn delete(&self, key: &str) -> Result<(), DataError> {
         self.persona
             .lock()
             .expect("persona lock poisoned")
             .remove(key);
-        let path = Self::persona_path(key);
-        self.sync
-            .insert(&self.namespace, &path, &[])
-            .await
-            .map_err(anyhow::Error::from)?;
+        let path = Self::persona_path(key)?;
+        self.sync.insert(&self.namespace, &path, &[]).await?;
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> anyhow::Result<Option<DataEntry>> {
+    async fn get(&self, key: &str) -> Result<Option<DataEntry>, DataError> {
         Ok(self
             .persona
             .lock()
@@ -309,7 +299,7 @@ impl mee_node_api::DataService for DemoDataService {
             }))
     }
 
-    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<DataEntry>> {
+    async fn list(&self, prefix: &str) -> Result<Vec<DataEntry>, DataError> {
         Ok(self
             .persona
             .lock()
@@ -336,17 +326,12 @@ impl SyncService for DemoSyncService {
         self.sync.addr().await
     }
 
-    async fn user_id(&self) -> Result<TransportUserId, SyncError> {
-        self.sync.user_id().await
+    async fn subspace_id(&self) -> Result<SubspaceId, SyncError> {
+        self.sync.subspace_id().await
     }
 
-    async fn share(&self, to: &TransportUserId, write: bool) -> Result<SyncTicket, SyncError> {
-        let mode = if write {
-            AccessMode::Write
-        } else {
-            AccessMode::Read
-        };
-        self.sync.share(&self.namespace, to, mode).await
+    async fn share(&self, to: &SubspaceId, access: AccessMode) -> Result<SyncTicket, SyncError> {
+        self.sync.share(&self.namespace, to, access).await
     }
 
     async fn import(
@@ -359,15 +344,10 @@ impl SyncService for DemoSyncService {
 
     async fn connect_to_peer(
         &self,
-        to: &TransportUserId,
+        to: &SubspaceId,
         peer_addr: &api::NodeAddr,
-        write: bool,
+        access: AccessMode,
     ) -> Result<(), SyncError> {
-        let access = if write {
-            AccessMode::Write
-        } else {
-            AccessMode::Read
-        };
         self.sync
             .connect_and_share(&self.namespace, to, peer_addr, access)
             .await
@@ -398,7 +378,7 @@ impl SyncService for DemoSyncService {
 )]
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    // Truncation is safe: u64 millis covers ~584 million years from epoch.
+    // Truncation is safe: u64 millis covers ~584M years.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
@@ -423,8 +403,8 @@ fn compute_invite_sig(inv: &Invite) -> InviteSignature {
     let data = format!(
         "demo|{}|{}|{}|{}|{}",
         inv.inviter_did,
-        inv.transport_user_id,
-        inv.node.node_id.as_ref(),
+        inv.subspace_id,
+        inv.node.node_id,
         addrs.join(","),
         relay,
     );

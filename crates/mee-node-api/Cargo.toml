@@ -5,11 +5,10 @@ edition = "2021"
 
 [dependencies]
 mee-did-api = { path = "../mee-did-api" }
-mee-local-store-api = { path = "../mee-local-store-api" }
 mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }
 serde = { version = "1", features = ["derive"] }
-anyhow = "1"
+thiserror = "2"
 
 [lints]
 workspace = true

@@ -2,8 +2,6 @@
 members = [
   "crates/mee-did-api", # DID provider api & types
   "crates/mee-did-key", # stub did:key provider
-  "crates/mee-local-store-api", # namespaced KV store api & types
-  "crates/mee-local-store-mem", # KV store - in-memory backend
   "crates/mee-node-api", # node api & types
   "crates/mee-wasm", # minimal wasm facade (wasm-bindgen)
   "crates/mee-types", # shared domain types

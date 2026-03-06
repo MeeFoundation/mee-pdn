@@ -9,12 +9,9 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-anyhow = "1"
 wasm-bindgen = "0.2"
 mee-did-api = { path = "../mee-did-api" }
 mee-did-key = { path = "../mee-did-key" }
-mee-local-store-api = { path = "../mee-local-store-api" }
-mee-local-store-mem = { path = "../mee-local-store-mem" }
 mee-node-api = { path = "../mee-node-api" }
 mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }

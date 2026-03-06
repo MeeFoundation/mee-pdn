@@ -9,7 +9,7 @@ use mee_node_api::{
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
-use mee_sync_api::SyncError;
+use mee_sync_api::{AccessMode, SyncError};
 use mee_sync_iroh_willow::DiscoveryConfig;
 use mee_types::Did;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex};
 struct AppState {
     node: Arc<Mutex<Option<Arc<DemoNode>>>>,
     events: Arc<Mutex<Vec<String>>>,
-    sync_complete: Arc<Mutex<bool>>,
     discovery: Arc<str>,
 }
 
@@ -60,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         node: Arc::new(Mutex::new(None)),
         events: Arc::new(Mutex::new(Vec::with_capacity(256))),
-        sync_complete: Arc::new(Mutex::new(false)),
         discovery,
     };
 
@@ -71,8 +69,8 @@ async fn main() -> anyhow::Result<()> {
             get(|state| async move { p2p_node(state).await }),
         )
         .route(
-            "/p2p/transport-user-id",
-            get(|state| async move { p2p_transport_user_id(state).await }),
+            "/p2p/subspace-id",
+            get(|state| async move { p2p_subspace_id(state).await }),
         )
         .route(
             "/p2p/invite",
@@ -118,10 +116,6 @@ async fn main() -> anyhow::Result<()> {
             "/p2p/events",
             get(|state| async move { p2p_events(state).await }),
         )
-        .route(
-            "/p2p/sync-status",
-            get(|state, q| async move { p2p_sync_status(state, q).await }),
-        )
         .with_state(state);
 
     let host = std::env::var("MEE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -146,18 +140,18 @@ async fn p2p_node(state: axum::extract::State<AppState>) -> Response {
 }
 
 #[derive(Serialize)]
-struct TransportUserIdResp {
-    transport_user_id: String,
+struct SubspaceIdResp {
+    subspace_id: String,
 }
 
-async fn p2p_transport_user_id(state: axum::extract::State<AppState>) -> Response {
+async fn p2p_subspace_id(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.sync().user_id().await {
-        Ok(u) => Json(TransportUserIdResp {
-            transport_user_id: u.0,
+    match n.sync().subspace_id().await {
+        Ok(id) => Json(SubspaceIdResp {
+            subspace_id: id.to_string(),
         })
         .into_response(),
         Err(e) => internal(&e).into_response(),
@@ -193,7 +187,7 @@ async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
 struct ConnectReq {
     invite: Invite,
     #[serde(default)]
-    write: bool,
+    access: Option<AccessMode>,
 }
 
 async fn p2p_connect(
@@ -206,16 +200,18 @@ async fn p2p_connect(
     let n = state.get_node();
     let trust = n.trust();
     let invite = req.invite;
+    let access = req.access.unwrap_or(AccessMode::Read);
     // Remember the invite and contact before connecting
     trust.remember_invite(invite.clone());
     trust.add_contact(Contact {
         did: invite.inviter_did.clone(),
         alias: None,
     });
-    // Connect P2P: delegates capabilities and sends ticket directly to peer
+    // Connect P2P: delegates capabilities and sends ticket
+    // directly to peer
     match n
         .sync()
-        .connect_to_peer(&invite.transport_user_id, &invite.node, req.write)
+        .connect_to_peer(&invite.subspace_id, &invite.node, access)
         .await
     {
         Ok(()) => "connected".to_owned().into_response(),
@@ -246,7 +242,7 @@ async fn p2p_bind(state: axum::extract::State<AppState>, Json(req): Json<BindReq
 struct TicketByDidReq {
     did: Did,
     #[serde(default)]
-    write: bool,
+    access: Option<AccessMode>,
 }
 
 async fn p2p_ticket_by_did(
@@ -261,20 +257,18 @@ async fn p2p_ticket_by_did(
     let Some(invite) = trust.invite_for(&req.did) else {
         return internal_str("did not bound; import invite first").into_response();
     };
-    // Verification is performed by ticket issuance.
-    match trust.accept_invite(&invite, req.write).await {
+    let access = req.access.unwrap_or(AccessMode::Read);
+    match trust.accept_invite(&invite, access).await {
         Ok(ticket) => Json(ticket).into_response(),
         Err(e) => internal(&e).into_response(),
     }
 }
 
-// time/sig helpers moved to mee-node-demo-impl; server delegates to node.
-
 #[derive(Deserialize)]
 struct TicketReq {
-    to_user: api::TransportUserId,
+    to_subspace: api::SubspaceId,
     #[serde(default)]
-    write: bool,
+    access: Option<AccessMode>,
 }
 
 async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<TicketReq>) -> Response {
@@ -282,7 +276,8 @@ async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<Ticke
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.sync().share(&req.to_user, req.write).await {
+    let access = req.access.unwrap_or(AccessMode::Read);
+    match n.sync().share(&req.to_subspace, access).await {
         Ok(ticket) => Json::<api::SyncTicket>(ticket).into_response(),
         Err(e) => internal(&e).into_response(),
     }
@@ -290,7 +285,7 @@ async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<Ticke
 
 #[derive(Deserialize)]
 struct InsertReq {
-    path: api::EntryPath,
+    path: String,
     body: String,
 }
 
@@ -298,8 +293,14 @@ async fn p2p_insert(state: axum::extract::State<AppState>, Json(req): Json<Inser
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
+    let path = match api::EntryPath::new(req.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid path: {e}")).into_response();
+        }
+    };
     let n = state.get_node();
-    match n.sync().insert(&req.path, req.body.as_bytes()).await {
+    match n.sync().insert(&path, req.body.as_bytes()).await {
         Ok(()) => "ok".to_owned().into_response(),
         Err(e) => internal(&e).into_response(),
     }
@@ -307,7 +308,7 @@ async fn p2p_insert(state: axum::extract::State<AppState>, Json(req): Json<Inser
 
 #[derive(Serialize)]
 struct ListedEntry {
-    subspace_hex: String,
+    subspace: String,
     path: String,
     payload_len: u64,
 }
@@ -322,7 +323,7 @@ async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
             let out: Vec<ListedEntry> = entries
                 .into_iter()
                 .map(|i| ListedEntry {
-                    subspace_hex: i.subspace_hex.to_string(),
+                    subspace: i.subspace.to_string(),
                     path: i.path.to_string(),
                     payload_len: i.payload_len,
                 })
@@ -358,43 +359,6 @@ async fn p2p_validate_did(
         Ok(doc) => Json(doc.id.0).into_response(),
         Err(e) => internal_str(&format!("did resolve error: {e}")).into_response(),
     }
-}
-
-#[derive(Deserialize)]
-struct SyncStatusQuery {
-    #[serde(default)]
-    wait_ms: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct SyncStatus {
-    status: String,
-}
-
-#[allow(clippy::expect_used)]
-async fn p2p_sync_status(
-    state: axum::extract::State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<SyncStatusQuery>,
-) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    if let Some(ms) = q.wait_ms {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-    }
-    let s = if *state
-        .sync_complete
-        .lock()
-        .expect("sync_complete lock poisoned")
-    {
-        "complete"
-    } else {
-        "pending"
-    };
-    Json(SyncStatus {
-        status: s.to_owned(),
-    })
-    .into_response()
 }
 
 #[derive(Deserialize)]

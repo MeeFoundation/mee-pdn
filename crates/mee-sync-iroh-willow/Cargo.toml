@@ -8,6 +8,7 @@ description = "Willow/iroh implementation of mee-sync-api"
 default = ["mdns"]
 mdns = ["iroh/address-lookup-mdns"]
 dht = ["iroh/address-lookup-pkarr-dht"]
+test-utils = []
 
 [dependencies]
 mee-sync-api = { path = "../mee-sync-api" }
@@ -19,9 +20,10 @@ iroh = "0.96.1"
 iroh-blobs = "0.98"
 iroh-willow = { git = "https://github.com/MeeFoundation/iroh-willow.git", branch = "willow-experiments-iroh-0.96" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-data-encoding = "2.6"
 async-stream = "0.3"
-hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

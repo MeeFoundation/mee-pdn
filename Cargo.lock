@@ -2333,7 +2333,6 @@ dependencies = [
  "hex",
  "mee-did-api",
  "mee-did-key",
- "mee-local-store-mem",
  "mee-node-api",
  "mee-node-demo-impl",
  "mee-sync-api",
@@ -2362,26 +2361,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "mee-local-store-api"
-version = "0.1.0"
-
-[[package]]
-name = "mee-local-store-mem"
-version = "0.1.0"
-dependencies = [
- "mee-local-store-api",
-]
-
-[[package]]
 name = "mee-node-api"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "mee-did-api",
- "mee-local-store-api",
  "mee-sync-api",
  "mee-types",
  "serde",
+ "thiserror 2.0.16",
 ]
 
 [[package]]
@@ -2389,13 +2376,10 @@ name = "mee-node-demo-impl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "futures-util",
  "hex",
  "mee-did-api",
  "mee-did-key",
- "mee-local-store-api",
- "mee-local-store-mem",
  "mee-node-api",
  "mee-sync-api",
  "mee-sync-iroh-willow",
@@ -2403,6 +2387,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
@@ -2421,10 +2406,8 @@ name = "mee-sync-iroh-willow"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "data-encoding",
  "futures-core",
  "futures-util",
- "hex",
  "iroh",
  "iroh-blobs",
  "iroh-willow",
@@ -2439,18 +2422,16 @@ name = "mee-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror 2.0.16",
 ]
 
 [[package]]
 name = "mee-wasm"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "futures-util",
  "mee-did-api",
  "mee-did-key",
- "mee-local-store-api",
- "mee-local-store-mem",
  "mee-node-api",
  "mee-sync-api",
  "mee-types",

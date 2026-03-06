@@ -1,12 +1,13 @@
 use mee_sync_api::{
-    EntryInfo, EntryPath, NodeAddr, SyncError, SyncHandle, SyncMode, SyncTicket, TransportUserId,
+    AccessMode, EntryInfo, EntryPath, NodeAddr, SubspaceId, SyncError, SyncHandle, SyncMode,
+    SyncTicket,
 };
 
 #[allow(async_fn_in_trait)]
 pub trait SyncService: Send + Sync {
     async fn node_addr(&self) -> Result<NodeAddr, SyncError>;
-    async fn user_id(&self) -> Result<TransportUserId, SyncError>;
-    async fn share(&self, to: &TransportUserId, write: bool) -> Result<SyncTicket, SyncError>;
+    async fn subspace_id(&self) -> Result<SubspaceId, SyncError>;
+    async fn share(&self, to: &SubspaceId, access: AccessMode) -> Result<SyncTicket, SyncError>;
     async fn import(
         &self,
         ticket: SyncTicket,
@@ -14,9 +15,9 @@ pub trait SyncService: Send + Sync {
     ) -> Result<Box<dyn SyncHandle>, SyncError>;
     async fn connect_to_peer(
         &self,
-        to: &TransportUserId,
+        to: &SubspaceId,
         peer_addr: &NodeAddr,
-        write: bool,
+        access: AccessMode,
     ) -> Result<(), SyncError>;
     async fn insert(&self, path: &EntryPath, bytes: &[u8]) -> Result<(), SyncError>;
     async fn list(&self) -> Result<Vec<EntryInfo>, SyncError>;

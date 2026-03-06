@@ -1,3 +1,6 @@
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_helpers;
+
 use futures_core::Stream;
 use futures_util::stream::{BoxStream, StreamExt as _};
 #[cfg(feature = "mdns")]
@@ -18,7 +21,6 @@ use std::{
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
     pin::Pin,
-    str::FromStr,
     sync::{Arc, Mutex},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,6 +38,9 @@ pub struct DiscoveryConfig {
     pub n0_discovery: bool,
     /// Bind to a specific address (None = OS default).
     pub bind_addr: Option<SocketAddr>,
+    /// Clear all IP transports before binding. Required for test
+    /// stability on multi-homed machines (prevents multipath flakiness).
+    pub clear_ip_transports: bool,
 }
 
 impl DiscoveryConfig {
@@ -46,6 +51,7 @@ impl DiscoveryConfig {
             mdns: false,
             n0_discovery: false,
             bind_addr: None,
+            clear_ip_transports: false,
         }
     }
 
@@ -56,6 +62,7 @@ impl DiscoveryConfig {
             mdns: true,
             n0_discovery: false,
             bind_addr: None,
+            clear_ip_transports: false,
         }
     }
 
@@ -66,6 +73,22 @@ impl DiscoveryConfig {
             mdns: true,
             n0_discovery: true,
             bind_addr: None,
+            clear_ip_transports: false,
+        }
+    }
+
+    /// Test-stable config: no discovery, localhost-only binding,
+    /// cleared IP transports to prevent multipath flakiness.
+    pub fn test() -> Self {
+        Self {
+            relay_mode: RelayMode::Disabled,
+            mdns: false,
+            n0_discovery: false,
+            bind_addr: Some(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                0u16,
+            )),
+            clear_ip_transports: true,
         }
     }
 }
@@ -89,7 +112,7 @@ struct ConnectResponse {
 #[derive(Clone)]
 struct ConnectHandler {
     client: iroh_willow::rpc::client::MemClient,
-    imported_namespaces: Arc<Mutex<HashSet<String>>>,
+    imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
 }
 
 impl std::fmt::Debug for ConnectHandler {
@@ -150,7 +173,7 @@ impl ConnectHandler {
         // Send response
         let resp_bytes = serde_json::to_vec(&resp)
             .map_err(|e| SyncError::Backend(format!("serialize response: {e}")))?;
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+        #[allow(clippy::cast_possible_truncation)]
         let resp_len = resp_bytes.len() as u32;
         send.write_u32(resp_len)
             .await
@@ -166,11 +189,57 @@ impl ConnectHandler {
             tokio::spawn(async move { while handle.next().await.is_some() {} });
         }
 
-        // Wait for the peer to close the connection (or timeout) so the
-        // response data is fully delivered before we drop `conn`.
+        // Wait for the peer to close the connection (or timeout)
+        // so the response data is fully delivered before we drop
+        // `conn`.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
 
         Ok(())
+    }
+}
+
+// -- Shared helpers ---------------------------------------------------------
+
+/// Convert an `api::NodeAddr` to an iroh `EndpointAddr`.
+fn to_iroh_addr(addr: &api::NodeAddr) -> Result<IrohNodeAddr, SyncError> {
+    let node_id = IrohNodeId::from_bytes(addr.node_id.as_bytes())
+        .map_err(|e| SyncError::InvalidId(e.to_string()))?;
+    let set: BTreeSet<SocketAddr> = addr.direct_addresses.iter().map(|d| d.0).collect();
+    let mut iroh_addr = IrohNodeAddr::from_parts(node_id, set.into_iter().map(TransportAddr::Ip));
+    if let Some(s) = &addr.relay_url {
+        let url: RelayUrl = s
+            .as_ref()
+            .parse()
+            .map_err(|e: iroh::RelayUrlParseError| SyncError::InvalidId(e.to_string()))?;
+        iroh_addr = iroh_addr.with_relay_url(url);
+    }
+    Ok(iroh_addr)
+}
+
+/// Convert an `api::NamespaceId` to the iroh-willow type.
+fn to_willow_ns(ns: &api::NamespaceId) -> iroh_willow::proto::keys::NamespaceId {
+    iroh_willow::proto::keys::NamespaceId::from_bytes_unchecked(*ns.as_bytes())
+}
+
+/// Convert an `api::SubspaceId` to a Willow `UserId`.
+fn to_willow_user(sub: &api::SubspaceId) -> iroh_willow::proto::keys::UserId {
+    iroh_willow::proto::keys::UserId::from_bytes_unchecked(*sub.as_bytes())
+}
+
+/// Build an `api::NodeAddr` from an iroh `EndpointAddr`.
+fn from_iroh_addr(a: &IrohNodeAddr) -> api::NodeAddr {
+    let direct_addresses = a
+        .ip_addrs()
+        .map(|sa| api::DirectAddress::from(*sa))
+        .collect::<Vec<_>>();
+    let relay_url = a
+        .relay_urls()
+        .next()
+        .map(|u| api::RelayEndpoint::from(u.to_string()));
+    api::NodeAddr {
+        node_id: api::NodeId::from_bytes(*a.id.as_bytes()),
+        direct_addresses,
+        relay_url,
     }
 }
 
@@ -179,7 +248,7 @@ impl ConnectHandler {
 #[allow(clippy::expect_used)]
 async fn do_import_and_sync(
     client: &iroh_willow::rpc::client::MemClient,
-    imported_namespaces: &Mutex<HashSet<String>>,
+    imported_namespaces: &Mutex<HashSet<api::NamespaceId>>,
     ticket: api::SyncTicket,
 ) -> Result<IrohWillowSyncHandle, SyncError> {
     let caps: Vec<iroh_willow::interest::CapabilityPack> = ticket
@@ -189,20 +258,7 @@ async fn do_import_and_sync(
         .collect();
     let mut nodes: Vec<IrohNodeAddr> = Vec::new();
     for n in &ticket.nodes {
-        let node_id = IrohNodeId::from_str(n.node_id.as_ref())
-            .map_err(|e| SyncError::InvalidId(e.to_string()))?;
-        let set: BTreeSet<SocketAddr> = n
-            .direct_addresses
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let mut addr = IrohNodeAddr::from_parts(node_id, set.into_iter().map(TransportAddr::Ip));
-        if let Some(s) = &n.relay_url {
-            let url =
-                RelayUrl::from_str(s.as_ref()).map_err(|e| SyncError::InvalidId(e.to_string()))?;
-            addr = addr.with_relay_url(url);
-        }
-        nodes.push(addr);
+        nodes.push(to_iroh_addr(n)?);
     }
     let space_ticket = iroh_willow::rpc::client::SpaceTicket { caps, nodes };
     let mode = iroh_willow::session::SessionMode::Continuous;
@@ -210,20 +266,30 @@ async fn do_import_and_sync(
         .import_and_sync(space_ticket, mode)
         .await
         .map_err(|e| SyncError::Backend(e.to_string()))?;
-    let ns = format!("{}", space.namespace_id());
+    let ns_id = api::NamespaceId::from_bytes(*space.namespace_id().as_bytes());
     imported_namespaces
         .lock()
         .expect("imported_namespaces lock poisoned")
-        .insert(ns);
+        .insert(ns_id);
     let s = async_stream::stream! {
         use iroh_willow::session::intents::serde_encoding::Event;
         while let Some((_peer, ev)) = handles.next().await {
             let out = match ev {
-                Event::CapabilityIntersection { .. } => api::SyncEvent::CapabilityIntersection,
-                Event::InterestIntersection { .. } => api::SyncEvent::InterestIntersection,
-                Event::Reconciled { .. } => api::SyncEvent::Reconciled,
-                Event::ReconciledAll => api::SyncEvent::ReconciledAll,
-                Event::Abort { error } => api::SyncEvent::Abort { error },
+                Event::CapabilityIntersection { .. } => {
+                    api::SyncEvent::CapabilityIntersection
+                }
+                Event::InterestIntersection { .. } => {
+                    api::SyncEvent::InterestIntersection
+                }
+                Event::Reconciled { .. } => {
+                    api::SyncEvent::Reconciled
+                }
+                Event::ReconciledAll => {
+                    api::SyncEvent::ReconciledAll
+                }
+                Event::Abort { error } => {
+                    api::SyncEvent::Abort { error }
+                }
             };
             yield out;
         }
@@ -239,10 +305,15 @@ pub struct IrohWillowSyncCore {
     client: iroh_willow::rpc::client::MemClient,
     owner_user: iroh_willow::proto::keys::UserId,
     _router: Router,
-    imported_namespaces: Arc<Mutex<HashSet<String>>>,
+    imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
 }
 
 impl IrohWillowSyncCore {
+    /// Access the underlying iroh endpoint (for address exchange in tests).
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     pub async fn spawn(config: DiscoveryConfig) -> Result<Self, SyncError> {
         let mut builder = Endpoint::empty_builder(config.relay_mode).alpns(vec![ALPN.to_vec()]);
 
@@ -255,6 +326,10 @@ impl IrohWillowSyncCore {
         #[cfg(feature = "mdns")]
         if config.mdns {
             builder = builder.address_lookup(MdnsAddressLookup::builder());
+        }
+
+        if config.clear_ip_transports {
+            builder = builder.clear_ip_transports();
         }
 
         if let Some(addr) = config.bind_addr {
@@ -301,19 +376,6 @@ impl IrohWillowSyncCore {
     }
 }
 
-impl IrohWillowSyncCore {
-    /// Concrete import-and-sync returning the typed handle (used by the session manager).
-    pub(crate) async fn import_and_sync_inner(
-        &self,
-        ticket: api::SyncTicket,
-    ) -> Result<IrohWillowSyncHandle, SyncError> {
-        do_import_and_sync(&self.client, &self.imported_namespaces, ticket).await
-    }
-}
-
-// Split-responsibility manager façade moved into managers module.
-pub mod managers;
-
 pub struct IrohWillowSyncHandle(BoxStream<'static, api::SyncEvent>);
 
 impl Stream for IrohWillowSyncHandle {
@@ -346,41 +408,26 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .node_addr()
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
-        let direct_addresses = a
-            .ip_addrs()
-            .map(|sa| api::DirectAddress::from(*sa))
-            .collect::<Vec<_>>();
-        let relay_url = a
-            .relay_urls()
-            .next()
-            .map(|u| api::RelayEndpoint::from(u.to_string()));
-        Ok(api::NodeAddr {
-            node_id: api::NodeId::from(format!("{}", a.id)),
-            direct_addresses,
-            relay_url,
-        })
+        Ok(from_iroh_addr(&a))
     }
 
-    async fn user_id(&self) -> Result<api::TransportUserId, SyncError> {
-        Ok(api::TransportUserId(
-            data_encoding::BASE32_NOPAD.encode(self.owner_user.as_bytes()),
-        ))
+    async fn subspace_id(&self) -> Result<api::SubspaceId, SyncError> {
+        Ok(api::SubspaceId::from_bytes(*self.owner_user.as_bytes()))
     }
 
     async fn create_namespace(
         &self,
-        owner: &api::TransportUserId,
+        owner: &api::SubspaceId,
     ) -> Result<api::NamespaceId, SyncError> {
-        let u = owner
-            .0
-            .parse::<iroh_willow::proto::keys::UserId>()
-            .map_err(|e| SyncError::InvalidId(e.to_string()))?;
+        let u = to_willow_user(owner);
         let space = self
             .client
             .create(iroh_willow::proto::keys::NamespaceKind::Owned, u)
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
-        Ok(api::NamespaceId(format!("{}", space.namespace_id())))
+        Ok(api::NamespaceId::from_bytes(
+            *space.namespace_id().as_bytes(),
+        ))
     }
 
     async fn list_namespaces(&self) -> Result<Vec<api::NamespaceId>, SyncError> {
@@ -389,7 +436,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .list_namespaces()
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
-        // include namespaces we imported via tickets (provider namespaces)
+        // include namespaces we imported via tickets
         let imported = self
             .imported_namespaces
             .lock()
@@ -397,37 +444,22 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .clone();
         let mut out: Vec<api::NamespaceId> = v
             .into_iter()
-            .map(|ns| api::NamespaceId(format!("{ns}")))
+            .map(|ns| api::NamespaceId::from_bytes(*ns.as_bytes()))
             .collect();
-        for s in imported {
-            out.push(api::NamespaceId(s));
-        }
+        out.extend(imported);
         Ok(out)
     }
 
     async fn share(
         &self,
         ns: &api::NamespaceId,
-        to: &api::TransportUserId,
+        to: &api::SubspaceId,
         access: api::AccessMode,
     ) -> Result<api::SyncTicket, SyncError> {
         use iroh_willow::interest::{CapSelector, DelegateTo, RestrictArea};
         use iroh_willow::proto::meadowcap::AccessMode;
-        let ns =
-            ns.0.parse::<iroh_willow::proto::keys::NamespaceId>()
-                .or_else(|_| {
-                    let bytes = hex::decode(&ns.0)
-                        .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    let arr: [u8; 32] = bytes
-                        .try_into()
-                        .map_err(|_| SyncError::InvalidNamespace("invalid ns length".to_owned()))?;
-                    let pk = iroh_willow::proto::keys::NamespacePublicKey::from_bytes(&arr)
-                        .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    Ok::<_, SyncError>(pk.id())
-                })?;
-        let to =
-            to.0.parse::<iroh_willow::proto::keys::UserId>()
-                .map_err(|e| SyncError::InvalidId(e.to_string()))?;
+        let willow_ns = to_willow_ns(ns);
+        let willow_user = to_willow_user(to);
         let access = match access {
             api::AccessMode::Read => AccessMode::Read,
             api::AccessMode::Write => AccessMode::Write,
@@ -435,9 +467,9 @@ impl api::SyncEngine for IrohWillowSyncCore {
         let caps = self
             .client
             .delegate_caps(
-                CapSelector::any(ns),
+                CapSelector::any(willow_ns),
                 access,
-                DelegateTo::new(to, RestrictArea::None),
+                DelegateTo::new(willow_user, RestrictArea::None),
             )
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
@@ -451,24 +483,13 @@ impl api::SyncEngine for IrohWillowSyncCore {
             let loopback: SocketAddr = format!("127.0.0.1:{port}").parse()?;
             addr.addrs.insert(TransportAddr::Ip(loopback));
         }
-        let direct_addresses = addr
-            .ip_addrs()
-            .map(|sa| api::DirectAddress::from(*sa))
-            .collect::<Vec<_>>();
-        let relay_url = addr
-            .relay_urls()
-            .next()
-            .map(|u| api::RelayEndpoint::from(u.to_string()));
+        let node_addr = from_iroh_addr(&addr);
         Ok(api::SyncTicket {
             caps: caps
                 .into_iter()
                 .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::json!({})))
                 .collect(),
-            nodes: vec![api::NodeAddr {
-                node_id: api::NodeId::from(format!("{}", addr.id)),
-                direct_addresses,
-                relay_url,
-            }],
+            nodes: vec![node_addr],
         })
     }
 
@@ -484,7 +505,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
     async fn connect_and_share(
         &self,
         ns: &api::NamespaceId,
-        to: &api::TransportUserId,
+        to: &api::SubspaceId,
         peer_addr: &api::NodeAddr,
         access: api::AccessMode,
     ) -> Result<(), SyncError> {
@@ -492,19 +513,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
         let ticket = self.share(ns, to, access).await?;
 
         // 2. Resolve peer's iroh address
-        let node_id = IrohNodeId::from_str(peer_addr.node_id.as_ref())
-            .map_err(|e| SyncError::InvalidId(e.to_string()))?;
-        let set: BTreeSet<SocketAddr> = peer_addr
-            .direct_addresses
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let mut addr = IrohNodeAddr::from_parts(node_id, set.into_iter().map(TransportAddr::Ip));
-        if let Some(s) = &peer_addr.relay_url {
-            let url =
-                RelayUrl::from_str(s.as_ref()).map_err(|e| SyncError::InvalidId(e.to_string()))?;
-            addr = addr.with_relay_url(url);
-        }
+        let addr = to_iroh_addr(peer_addr)?;
 
         // 3. Connect to peer over mee-connect ALPN
         let conn = self
@@ -522,7 +531,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
         let req = ConnectRequest { ticket };
         let req_bytes = serde_json::to_vec(&req)
             .map_err(|e| SyncError::Backend(format!("serialize request: {e}")))?;
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+        #[allow(clippy::cast_possible_truncation)]
         let req_len = req_bytes.len() as u32;
         send.write_u32(req_len)
             .await
@@ -546,7 +555,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
         let resp: ConnectResponse = serde_json::from_slice(&resp_buf)
             .map_err(|e| SyncError::Backend(format!("parse response: {e}")))?;
 
-        // Close the connection gracefully so the peer can stop waiting.
+        // Close the connection gracefully
         conn.close(0u32.into(), b"done");
 
         if resp.ok {
@@ -565,28 +574,18 @@ impl api::SyncEngine for IrohWillowSyncCore {
         path: &api::EntryPath,
         bytes: &[u8],
     ) -> Result<(), SyncError> {
-        let ns =
-            ns.0.parse::<iroh_willow::proto::keys::NamespaceId>()
-                .or_else(|_| {
-                    let b = hex::decode(&ns.0)
-                        .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    let arr: [u8; 32] = b
-                        .try_into()
-                        .map_err(|_| SyncError::InvalidNamespace("invalid ns length".to_owned()))?;
-                    let pk = iroh_willow::proto::keys::NamespacePublicKey::from_bytes(&arr)
-                        .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    Ok::<_, SyncError>(pk.id())
-                })?;
+        let willow_ns = to_willow_ns(ns);
         let comps: Vec<Vec<u8>> = path
-            .as_ref()
+            .as_str()
             .split('/')
             .filter(|s| !s.is_empty())
             .map(|s| s.as_bytes().to_vec())
             .collect();
         let comp_refs: Vec<&[u8]> = comps.iter().map(std::vec::Vec::as_slice).collect();
-        let path = iroh_willow::proto::data_model::Path::from_bytes(&comp_refs)
+        let willow_path = iroh_willow::proto::data_model::Path::from_bytes(&comp_refs)
             .map_err(|e| SyncError::InvalidNamespace(format!("invalid path: {e:?}")))?;
-        let entry_form = iroh_willow::form::EntryForm::new_bytes(ns, path, bytes.to_vec());
+        let entry_form =
+            iroh_willow::form::EntryForm::new_bytes(willow_ns, willow_path, bytes.to_vec());
         self.engine
             .insert_entry(
                 entry_form,
@@ -600,32 +599,35 @@ impl api::SyncEngine for IrohWillowSyncCore {
     type EntryStream = BoxStream<'static, Result<api::EntryInfo, SyncError>>;
 
     async fn get_entries(&self, ns: &api::NamespaceId) -> Result<Self::EntryStream, SyncError> {
-        let ns =
-            ns.0.parse::<iroh_willow::proto::keys::NamespaceId>()
-                .or_else(|_| {
-                    let b = hex::decode(&ns.0)
-                        .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    let arr: [u8; 32] = b
-                        .try_into()
-                        .map_err(|_| SyncError::InvalidNamespace("invalid ns length".to_owned()))?;
-                    let pk = iroh_willow::proto::keys::NamespacePublicKey::from_bytes(&arr)
-                        .map_err(|e| SyncError::InvalidNamespace(e.to_string()))?;
-                    Ok::<_, SyncError>(pk.id())
-                })?;
+        let willow_ns = to_willow_ns(ns);
         let range = iroh_willow::proto::grouping::Range3d::new_full();
         let mut stream = self
             .engine
-            .get_entries(ns, range)
+            .get_entries(willow_ns, range)
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         let s = async_stream::try_stream! {
             while let Some(item) = stream.next().await {
-                let e = item.map_err(|e| SyncError::Backend(e.to_string()))?;
+                let e = item
+                    .map_err(|e| {
+                        SyncError::Backend(e.to_string())
+                    })?;
                 let entry = e.entry();
+                let path_str = entry.path().fmt_utf8();
+                let path = api::EntryPath::new(path_str)
+                    .map_err(|e| {
+                        SyncError::Backend(format!(
+                            "invalid entry path: {e}"
+                        ))
+                    })?;
                 yield api::EntryInfo {
-                    namespace: api::NamespaceId(format!("{}", entry.namespace_id())),
-                    subspace_hex: api::SubspaceId::from(entry.subspace_id().to_string()),
-                    path: api::EntryPath::from(entry.path().fmt_utf8()),
+                    namespace: api::NamespaceId::from_bytes(
+                        *entry.namespace_id().as_bytes(),
+                    ),
+                    subspace: api::SubspaceId::from_bytes(
+                        *entry.subspace_id().as_bytes(),
+                    ),
+                    path,
                     payload_len: entry.payload_length()
                 };
             }
