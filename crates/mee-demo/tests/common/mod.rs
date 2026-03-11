@@ -46,11 +46,7 @@ impl MeeNode {
             .await
             .expect("start container");
 
-        let host = container
-            .get_host()
-            .await
-            .expect("get host")
-            .to_string();
+        let host = container.get_host().await.expect("get host").to_string();
 
         let host_port = container
             .get_host_port_ipv4(INTERNAL_PORT)
@@ -128,7 +124,10 @@ impl MeeNode {
         self.host_port
             .store(new_port, std::sync::atomic::Ordering::Relaxed);
 
-        eprintln!("[{}] restarted on port {new_port}, waiting for ready...", self.label);
+        eprintln!(
+            "[{}] restarted on port {new_port}, waiting for ready...",
+            self.label
+        );
         self.wait_ready().await;
     }
 
