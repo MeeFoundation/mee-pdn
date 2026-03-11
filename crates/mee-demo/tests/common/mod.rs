@@ -1,0 +1,253 @@
+//! Testcontainers harness for mee-demo integration tests.
+//!
+//! Provides [`MeeNode`] — a wrapper around a Docker container running
+//! `mee-demo:dev`, with helpers for the HTTP API and node lifecycle
+//! (stop / start).
+
+// Test helper module — expect/unwrap/print are fine here.
+#![allow(clippy::expect_used, clippy::print_stderr)]
+
+use std::time::Duration;
+
+use reqwest::Client;
+use serde_json::Value;
+use testcontainers::{
+    core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+};
+
+const IMAGE_NAME: &str = "mee-demo";
+const IMAGE_TAG: &str = "dev";
+const INTERNAL_PORT: u16 = 3000;
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A running mee-demo node inside a Docker container.
+pub struct MeeNode {
+    pub label: String,
+    container: ContainerAsync<GenericImage>,
+    host: String,
+    /// Docker Desktop may reassign the host port after stop/start.
+    host_port: std::sync::atomic::AtomicU16,
+    client: Client,
+}
+
+impl MeeNode {
+    /// Spawn a new node container on the given Docker network.
+    ///
+    /// Blocks until the `/live` health-check responds with 200 OK.
+    pub async fn spawn(label: &str, network: &str) -> Self {
+        let container: ContainerAsync<GenericImage> = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+            .with_exposed_port(ContainerPort::Tcp(INTERNAL_PORT))
+            .with_env_var("MEE_HOST", "0.0.0.0")
+            .with_env_var("MEE_PORT", INTERNAL_PORT.to_string())
+            .with_env_var("MEE_DISCOVERY", "disabled")
+            .with_network(network)
+            .start()
+            .await
+            .expect("start container");
+
+        let host = container
+            .get_host()
+            .await
+            .expect("get host")
+            .to_string();
+
+        let host_port = container
+            .get_host_port_ipv4(INTERNAL_PORT)
+            .await
+            .expect("get host port");
+
+        eprintln!("[{label}] container started: {host}:{host_port}");
+
+        let node = Self {
+            label: label.to_owned(),
+            container,
+            host,
+            host_port: std::sync::atomic::AtomicU16::new(host_port),
+            client: Client::new(),
+        };
+
+        node.wait_ready().await;
+        node
+    }
+
+    /// Base URL reachable from the test host.
+    pub fn url(&self) -> String {
+        let port = self.host_port.load(std::sync::atomic::Ordering::Relaxed);
+        format!("http://{}:{port}", self.host)
+    }
+
+    /// Poll `GET /live` until the node is ready.
+    pub async fn wait_ready(&self) {
+        let url = format!("{}/live", self.url());
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => return,
+                Ok(resp) => {
+                    eprintln!("[{}] /live returned {}", self.label, resp.status());
+                }
+                Err(e) => {
+                    eprintln!("[{}] /live error: {e}", self.label);
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "[{}] node not ready at {url} after {READY_TIMEOUT:?}",
+                self.label,
+            );
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Stop the container (the node process exits, state is lost).
+    pub async fn stop(&self) {
+        self.container.stop().await.expect("stop container");
+        eprintln!("[{}] stopped", self.label);
+    }
+
+    /// Restart the container and wait until the node is ready again.
+    ///
+    /// Since all state is in-memory, the restarted node has a fresh
+    /// identity — a new invite/connect cycle is required.
+    pub async fn start(&self) {
+        self.container.start().await.expect("start container");
+
+        // Docker Desktop may reassign the host port after stop/start.
+        let new_port = self
+            .container
+            .get_host_port_ipv4(INTERNAL_PORT)
+            .await
+            .expect("get host port after restart");
+        self.host_port
+            .store(new_port, std::sync::atomic::Ordering::Relaxed);
+
+        eprintln!("[{}] restarted on port {new_port}, waiting for ready...", self.label);
+        self.wait_ready().await;
+    }
+
+    /// Returns `true` if `GET /live` responds 200 within 2 seconds.
+    pub async fn is_alive(&self) -> bool {
+        self.client
+            .get(format!("{}/live", self.url()))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    }
+
+    // ---- HTTP API helpers ----
+
+    /// `GET /p2p/invite` — create an invite for this node.
+    pub async fn get_invite(&self) -> Value {
+        self.client
+            .get(format!("{}/p2p/invite", self.url()))
+            .send()
+            .await
+            .expect("get invite request")
+            .json()
+            .await
+            .expect("parse invite json")
+    }
+
+    /// `POST /p2p/connect` — connect to a peer using their invite.
+    pub async fn connect(&self, invite: &Value) {
+        let body = serde_json::json!({ "invite": invite });
+        let resp = self
+            .client
+            .post(format!("{}/p2p/connect", self.url()))
+            .json(&body)
+            .send()
+            .await
+            .expect("connect request");
+        assert!(
+            resp.status().is_success(),
+            "[{}] connect failed: {}",
+            self.label,
+            resp.status(),
+        );
+    }
+
+    /// `POST /p2p/insert` — insert an entry into the node's namespace.
+    pub async fn insert(&self, path: &str, body: &str) {
+        let payload = serde_json::json!({ "path": path, "body": body });
+        let resp = self
+            .client
+            .post(format!("{}/p2p/insert", self.url()))
+            .json(&payload)
+            .send()
+            .await
+            .expect("insert request");
+        assert!(
+            resp.status().is_success(),
+            "[{}] insert failed: {}",
+            self.label,
+            resp.status(),
+        );
+    }
+
+    /// `GET /p2p/list` — list all synced entries.
+    pub async fn list(&self) -> Vec<Value> {
+        self.client
+            .get(format!("{}/p2p/list", self.url()))
+            .send()
+            .await
+            .expect("list request")
+            .json()
+            .await
+            .expect("parse list json")
+    }
+}
+
+// ---- Docker network helpers ----
+
+/// Create a Docker bridge network. Idempotent (ignores "already exists").
+pub async fn create_network(name: &str) {
+    let output = tokio::process::Command::new("docker")
+        .args(["network", "create", name])
+        .output()
+        .await
+        .expect("docker network create");
+    // Ignore "already exists" errors
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("already exists"),
+            "docker network create failed: {stderr}",
+        );
+    }
+}
+
+/// Remove a Docker network. Ignores errors (best-effort cleanup).
+pub async fn remove_network(name: &str) {
+    let _ = tokio::process::Command::new("docker")
+        .args(["network", "rm", name])
+        .output()
+        .await;
+}
+
+/// Poll `node.list()` until an entry with the given `path` appears.
+pub async fn wait_for_entry(node: &MeeNode, expected_path: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let entries = node.list().await;
+        if entries
+            .iter()
+            .any(|e| e.get("path").and_then(Value::as_str) == Some(expected_path))
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "[{}] timed out waiting for entry '{expected_path}' after {timeout:?}",
+            node.label,
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
