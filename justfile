@@ -86,8 +86,6 @@ build-core-wasm:
   cargo build --target wasm32-wasip1 \
     -p mee-did-api \
     -p mee-did-key \
-    -p mee-local-store-api \
-    -p mee-local-store-mem \
     -p mee-node-api
 
 # Build the wasm-bindgen facade for browser target
