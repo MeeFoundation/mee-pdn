@@ -86,8 +86,6 @@ build-core-wasm:
   cargo build --target wasm32-wasip1 \
     -p mee-did-api \
     -p mee-did-key \
-    -p mee-local-store-api \
-    -p mee-local-store-mem \
     -p mee-node-api
 
 # Build the wasm-bindgen facade for browser target
@@ -195,3 +193,10 @@ run-image:
   IMAGE_TAG=${IMAGE_TAG:-mee-demo:dev}
   PORT=${PORT:-3000}
   docker run --rm -e MEE_PORT=${PORT} -e MEE_HOST=0.0.0.0 -p ${PORT}:${PORT} ${IMAGE_TAG}
+
+# Build image and run container integration tests
+test-containers:
+  #!/bin/sh
+  set -eux
+  IMAGE_TAG=mee-demo:dev just build-image
+  cargo test -p mee-demo --test containers -- --ignored --nocapture
