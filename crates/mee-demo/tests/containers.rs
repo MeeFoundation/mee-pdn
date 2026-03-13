@@ -4,7 +4,7 @@
 //! - Docker running
 //! - Image built: `just build-image`
 //!
-//! Run with: `just test-containers`
+//! Run with: `just integration-tests`
 
 mod common;
 

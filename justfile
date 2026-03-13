@@ -195,7 +195,7 @@ run-image:
   docker run --rm -e MEE_PORT=${PORT} -e MEE_HOST=0.0.0.0 -p ${PORT}:${PORT} ${IMAGE_TAG}
 
 # Build image and run container integration tests
-test-containers:
+integration-tests:
   #!/bin/sh
   set -eux
   IMAGE_TAG=mee-demo:dev just build-image
