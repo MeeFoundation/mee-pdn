@@ -54,7 +54,8 @@ impl PeerCache {
 
     /// Insert or update a peer's advertisement.
     /// Returns `true` if the ad was new or had a higher version.
-    pub fn upsert(&mut self, ad: PeerAdvertisement) -> bool {
+    /// Clones the advertisement only when it will be stored.
+    pub fn upsert(&mut self, ad: &PeerAdvertisement) -> bool {
         let now = Instant::now();
         if let Some(cached) = self.peers.get(&ad.peer_id) {
             if ad.version <= cached.advertisement.version {
@@ -64,7 +65,7 @@ impl PeerCache {
             self.peers.insert(
                 ad.peer_id,
                 CachedPeer {
-                    advertisement: ad,
+                    advertisement: ad.clone(),
                     received_at: now,
                     connected,
                 },
@@ -74,7 +75,7 @@ impl PeerCache {
             self.peers.insert(
                 ad.peer_id,
                 CachedPeer {
-                    advertisement: ad,
+                    advertisement: ad.clone(),
                     received_at: now,
                     connected: false,
                 },
@@ -158,8 +159,8 @@ mod tests {
         let mut cache = PeerCache::new();
         let ad1 = make_ad([1u8; 32], 1);
         let ad2 = make_ad([1u8; 32], 2);
-        assert!(cache.upsert(ad1));
-        assert!(cache.upsert(ad2));
+        assert!(cache.upsert(&ad1));
+        assert!(cache.upsert(&ad2));
         let cached = cache.get(&[1u8; 32]).expect("exists");
         assert_eq!(cached.advertisement.version, 2);
     }
@@ -169,8 +170,8 @@ mod tests {
         let mut cache = PeerCache::new();
         let ad2 = make_ad([1u8; 32], 2);
         let ad1 = make_ad([1u8; 32], 1);
-        assert!(cache.upsert(ad2));
-        assert!(!cache.upsert(ad1));
+        assert!(cache.upsert(&ad2));
+        assert!(!cache.upsert(&ad1));
         let cached = cache.get(&[1u8; 32]).expect("exists");
         assert_eq!(cached.advertisement.version, 2);
     }
@@ -179,15 +180,15 @@ mod tests {
     fn version_same_ignored() {
         let mut cache = PeerCache::new();
         let ad = make_ad([1u8; 32], 1);
-        assert!(cache.upsert(ad.clone()));
-        assert!(!cache.upsert(ad));
+        assert!(cache.upsert(&ad));
+        assert!(!cache.upsert(&ad));
     }
 
     #[tokio::test]
     async fn staleness_eviction() {
         let mut cache = PeerCache::new();
         let ad = make_ad([1u8; 32], 1);
-        cache.upsert(ad);
+        cache.upsert(&ad);
 
         // Immediately evict with zero threshold
         let evicted = cache.evict_stale(Duration::ZERO);
@@ -200,7 +201,7 @@ mod tests {
     async fn staleness_fresh_not_evicted() {
         let mut cache = PeerCache::new();
         let ad = make_ad([1u8; 32], 1);
-        cache.upsert(ad);
+        cache.upsert(&ad);
 
         // Large threshold — nothing should be evicted
         let evicted = cache.evict_stale(Duration::from_secs(3600));
@@ -212,11 +213,11 @@ mod tests {
     fn set_connected_preserves_on_upsert() {
         let mut cache = PeerCache::new();
         let ad1 = make_ad([1u8; 32], 1);
-        cache.upsert(ad1);
+        cache.upsert(&ad1);
         cache.set_connected(&[1u8; 32], true);
 
         let ad2 = make_ad([1u8; 32], 2);
-        cache.upsert(ad2);
+        cache.upsert(&ad2);
         let cached = cache.get(&[1u8; 32]).expect("exists");
         assert!(cached.connected);
     }

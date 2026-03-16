@@ -63,9 +63,11 @@ impl DemoNode {
         let contacts = Arc::new(Mutex::new(HashMap::<Aid, Contact>::new()));
         let persona = Arc::new(Mutex::new(HashMap::<String, String>::new()));
 
+        let current_aid = Arc::new(Mutex::new(initial_aid));
+
         let identity = DemoIdentityService {
             identity_mgr: identity_mgr.clone(),
-            current: Arc::new(Mutex::new(initial_aid)),
+            current: current_aid.clone(),
             invites: invites.clone(),
             contacts: contacts.clone(),
             persona: persona.clone(),
@@ -74,7 +76,7 @@ impl DemoNode {
         let trust = DemoTrustService {
             sync: sync_engine.clone(),
             namespace,
-            current_aid: Arc::new(Mutex::new(initial_aid)),
+            current_aid,
             invites,
             contacts,
         };

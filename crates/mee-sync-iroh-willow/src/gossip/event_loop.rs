@@ -130,7 +130,7 @@ async fn handle_message(state: &mut EventLoopState, content: &[u8]) {
     }
 
     // 4. Version check + cache update
-    if !state.peer_cache.upsert(ad.clone()) {
+    if !state.peer_cache.upsert(&ad) {
         return;
     }
 
@@ -177,10 +177,13 @@ async fn try_auto_connect(
     let peer_addr = from_iroh_addr(&iroh_addr);
     let peer_subspace = api::SubspaceId::from_bytes(ad.peer_id);
 
+    // Fetch our own address once for all namespace tickets
+    let own_addr = fetch_own_addr(&state.client).await?;
+
     // Share our matched namespaces with the discovered peer
     for ns_bytes in matched_namespaces {
         let ns_id = api::NamespaceId::from_bytes(*ns_bytes);
-        let ticket_result = share_namespace(&state.client, &ns_id, &peer_subspace).await;
+        let ticket_result = share_namespace(&state.client, &ns_id, &peer_subspace, &own_addr).await;
 
         let Ok(ticket) = ticket_result else {
             continue;
@@ -192,11 +195,32 @@ async fn try_auto_connect(
     Ok(())
 }
 
+/// Fetch our own node address with loopback added for local connections.
+async fn fetch_own_addr(
+    client: &iroh_willow::rpc::client::MemClient,
+) -> Result<api::NodeAddr, GossipError> {
+    let mut addr = client
+        .node_addr()
+        .await
+        .map_err(|e| GossipError::Protocol(e.to_string()))?;
+
+    let first_port = addr.ip_addrs().next().map(std::net::SocketAddr::port);
+    if let Some(port) = first_port {
+        let loopback: std::net::SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .map_err(|e: std::net::AddrParseError| GossipError::Protocol(e.to_string()))?;
+        addr.addrs.insert(iroh::TransportAddr::Ip(loopback));
+    }
+
+    Ok(crate::from_iroh_addr(&addr))
+}
+
 /// Delegate capabilities for a namespace and build a ticket.
 async fn share_namespace(
     client: &iroh_willow::rpc::client::MemClient,
     ns: &api::NamespaceId,
     to: &api::SubspaceId,
+    own_addr: &api::NodeAddr,
 ) -> Result<api::SyncTicket, GossipError> {
     use iroh_willow::interest::{CapSelector, DelegateTo, RestrictArea};
     use iroh_willow::proto::meadowcap::AccessMode;
@@ -213,27 +237,12 @@ async fn share_namespace(
         .await
         .map_err(|e| GossipError::Protocol(e.to_string()))?;
 
-    let mut addr = client
-        .node_addr()
-        .await
-        .map_err(|e| GossipError::Protocol(e.to_string()))?;
-
-    // Add loopback address for local connections
-    let first_port = addr.ip_addrs().next().map(std::net::SocketAddr::port);
-    if let Some(port) = first_port {
-        let loopback: std::net::SocketAddr = format!("127.0.0.1:{port}")
-            .parse()
-            .map_err(|e: std::net::AddrParseError| GossipError::Protocol(e.to_string()))?;
-        addr.addrs.insert(iroh::TransportAddr::Ip(loopback));
-    }
-
-    let node_addr = crate::from_iroh_addr(&addr);
     Ok(api::SyncTicket {
         caps: caps
             .into_iter()
             .filter_map(|c| serde_json::to_value(&c).ok())
             .collect(),
-        nodes: vec![node_addr],
+        nodes: vec![own_addr.clone()],
     })
 }
 
@@ -258,7 +267,10 @@ async fn build_own_ad(state: &EventLoopState) -> Result<PeerAdvertisement, Gossi
         .node_addr()
         .await
         .map_err(|e| GossipError::Protocol(e.to_string()))?;
-    let addresses: Vec<String> = addr.ip_addrs().map(|sa| sa.to_string()).collect();
+    let addresses: Vec<String> = addr
+        .ip_addrs()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

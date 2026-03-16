@@ -12,7 +12,6 @@ use mee_sync_api::{self as api, SyncEngine};
 
 use crate::{DiscoveryConfig, IrohWillowSyncCore};
 
-#[cfg(feature = "gossip")]
 use crate::gossip;
 
 /// A test-friendly wrapper around the sync core.
@@ -35,7 +34,6 @@ impl TestNode {
     }
 
     /// Spawn a test node with gossip discovery enabled.
-    #[cfg(feature = "gossip")]
     pub async fn spawn_with_gossip(label: &str) -> Result<Self, api::SyncError> {
         let mut config = DiscoveryConfig::test();
         config.gossip = Some(gossip::GossipConfig::test());
@@ -47,7 +45,6 @@ impl TestNode {
     }
 
     /// Spawn a test node with a custom gossip config.
-    #[cfg(feature = "gossip")]
     pub async fn spawn_with_gossip_config(
         label: &str,
         gossip_config: gossip::GossipConfig,
@@ -163,7 +160,6 @@ pub async fn wait_for_entry_count(
 
 /// Poll the gossip manager's peer cache until at least `min_count`
 /// peers are cached. Returns the cached peer info.
-#[cfg(feature = "gossip")]
 pub async fn wait_for_gossip_peer_count(
     manager: &gossip::GossipManager,
     min_count: usize,
@@ -190,7 +186,6 @@ pub async fn wait_for_gossip_peer_count(
 ///
 /// Both nodes must have gossip managers. This establishes
 /// gossip mesh connectivity between the pair.
-#[cfg(feature = "gossip")]
 pub async fn join_gossip_peers(a: &TestNode, b: &TestNode) {
     use iroh::address_lookup::memory::MemoryLookup;
 

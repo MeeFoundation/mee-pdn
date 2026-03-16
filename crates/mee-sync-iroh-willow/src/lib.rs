@@ -1,4 +1,3 @@
-#[cfg(feature = "gossip")]
 pub mod gossip;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -45,7 +44,6 @@ pub struct DiscoveryConfig {
     /// stability on multi-homed machines (prevents multipath flakiness).
     pub clear_ip_transports: bool,
     /// Gossip discovery config. None = gossip disabled.
-    #[cfg(feature = "gossip")]
     pub gossip: Option<gossip::GossipConfig>,
 }
 
@@ -58,7 +56,6 @@ impl DiscoveryConfig {
             n0_discovery: false,
             bind_addr: None,
             clear_ip_transports: false,
-            #[cfg(feature = "gossip")]
             gossip: None,
         }
     }
@@ -71,7 +68,6 @@ impl DiscoveryConfig {
             n0_discovery: false,
             bind_addr: None,
             clear_ip_transports: false,
-            #[cfg(feature = "gossip")]
             gossip: None,
         }
     }
@@ -84,7 +80,6 @@ impl DiscoveryConfig {
             n0_discovery: true,
             bind_addr: None,
             clear_ip_transports: false,
-            #[cfg(feature = "gossip")]
             gossip: None,
         }
     }
@@ -101,7 +96,6 @@ impl DiscoveryConfig {
                 0u16,
             )),
             clear_ip_transports: true,
-            #[cfg(feature = "gossip")]
             gossip: None,
         }
     }
@@ -380,7 +374,6 @@ pub struct IrohWillowSyncCore {
     owner_user: iroh_willow::proto::keys::UserId,
     _router: Router,
     imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
-    #[cfg(feature = "gossip")]
     gossip_manager: Option<gossip::GossipManager>,
 }
 
@@ -390,11 +383,9 @@ impl IrohWillowSyncCore {
         &self.endpoint
     }
 
-    #[allow(unused_mut, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub async fn spawn(config: DiscoveryConfig) -> Result<Self, SyncError> {
-        let mut alpns = vec![ALPN.to_vec()];
-        #[cfg(feature = "gossip")]
-        alpns.push(iroh_gossip::ALPN.to_vec());
+        let alpns = vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()];
         let mut builder = Endpoint::empty_builder(config.relay_mode).alpns(alpns);
 
         if config.n0_discovery {
@@ -446,22 +437,17 @@ impl IrohWillowSyncCore {
         };
 
         // Create Gossip instance before Router
-        #[cfg(feature = "gossip")]
         let gossip_instance = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
 
         let mut router_builder = Router::builder(endpoint.clone())
             .accept(ALPN, engine.clone())
             .accept(MEE_CONNECT_ALPN, connect_handler);
 
-        #[cfg(feature = "gossip")]
-        {
-            router_builder = router_builder.accept(iroh_gossip::ALPN, gossip_instance.clone());
-        }
+        router_builder = router_builder.accept(iroh_gossip::ALPN, gossip_instance.clone());
 
         let router = router_builder.spawn();
 
         // Start gossip manager after Router is up
-        #[cfg(feature = "gossip")]
         let gossip_manager = if let Some(gossip_config) = config.gossip {
             Some(
                 gossip::GossipManager::start(
@@ -487,13 +473,11 @@ impl IrohWillowSyncCore {
             owner_user,
             _router: router,
             imported_namespaces,
-            #[cfg(feature = "gossip")]
             gossip_manager,
         })
     }
 
     /// Access the gossip manager (if gossip is enabled).
-    #[cfg(feature = "gossip")]
     pub fn gossip_manager(&self) -> Option<&gossip::GossipManager> {
         self.gossip_manager.as_ref()
     }
