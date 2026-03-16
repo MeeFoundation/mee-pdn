@@ -26,7 +26,8 @@ pub struct TestNode {
 impl TestNode {
     /// Spawn a single test node bound to localhost on an OS-assigned port.
     pub async fn spawn(label: &str) -> Result<Self, api::SyncError> {
-        let core = IrohWillowSyncCore::spawn(DiscoveryConfig::test()).await?;
+        let store = mee_types::LocalStore::new();
+        let core = IrohWillowSyncCore::spawn(DiscoveryConfig::test(), store).await?;
         Ok(Self {
             core,
             label: label.to_owned(),
@@ -37,7 +38,8 @@ impl TestNode {
     pub async fn spawn_with_gossip(label: &str) -> Result<Self, api::SyncError> {
         let mut config = DiscoveryConfig::test();
         config.gossip = Some(gossip::GossipConfig::test());
-        let core = IrohWillowSyncCore::spawn(config).await?;
+        let store = mee_types::LocalStore::new();
+        let core = IrohWillowSyncCore::spawn(config, store).await?;
         Ok(Self {
             core,
             label: label.to_owned(),
@@ -51,7 +53,8 @@ impl TestNode {
     ) -> Result<Self, api::SyncError> {
         let mut config = DiscoveryConfig::test();
         config.gossip = Some(gossip_config);
-        let core = IrohWillowSyncCore::spawn(config).await?;
+        let store = mee_types::LocalStore::new();
+        let core = IrohWillowSyncCore::spawn(config, store).await?;
         Ok(Self {
             core,
             label: label.to_owned(),

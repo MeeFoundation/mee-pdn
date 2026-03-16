@@ -254,7 +254,7 @@ async fn three_node_transitive_discovery() {
         .share(&ns_charlie, &alice_sub, AccessMode::Read)
         .await
         .unwrap();
-    ticket.nodes.clear(); // No addresses — alice can't connect directly
+    ticket.node_hints.clear(); // No addresses — alice can't connect directly
     alice
         .core
         .import_and_sync(ticket, mee_sync_api::SyncMode::Continuous)
@@ -324,7 +324,7 @@ async fn gossip_match_to_sync_pipeline() {
         .share(&ns_charlie, &alice_sub, AccessMode::Read)
         .await
         .unwrap();
-    ticket.nodes.clear();
+    ticket.node_hints.clear();
     alice
         .core
         .import_and_sync(ticket, mee_sync_api::SyncMode::Continuous)

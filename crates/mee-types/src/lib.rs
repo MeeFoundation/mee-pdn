@@ -1,3 +1,6 @@
+pub mod local_store;
+pub use local_store::{LocalStore, StoreError};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

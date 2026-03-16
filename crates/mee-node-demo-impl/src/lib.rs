@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 
@@ -16,12 +15,14 @@ use mee_sync_api::{
     SyncTicket,
 };
 use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
-use mee_types::{Aid, NodeId};
+use mee_types::local_store::keys;
+use mee_types::{Aid, LocalStore, NodeId};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct DemoNode {
     node_id: NodeId,
+    store: LocalStore,
     identity: DemoIdentityService,
     trust: DemoTrustService,
     data: DemoDataService,
@@ -30,15 +31,18 @@ pub struct DemoNode {
 
 #[allow(clippy::expect_used)]
 impl DemoNode {
-    // TODO(persistent-storage): Accept data_dir: Option<PathBuf> and pass through
-    // to IrohWillowSyncCore::spawn().
     pub async fn spawn(discovery: DiscoveryConfig) -> anyhow::Result<Arc<Self>> {
-        let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery).await?);
+        let store = LocalStore::new();
+        let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery, store.clone()).await?);
         let identity_mgr = Arc::new(KeriIdentityManager::new());
         let initial_aid = identity_mgr
             .create()
             .await
             .map_err(|e| anyhow::anyhow!("identity create error: {e}"))?;
+
+        store
+            .set_json(keys::CURRENT_AID, &initial_aid)
+            .map_err(|e| anyhow::anyhow!("store error: {e}"))?;
 
         let owner = sync_engine
             .subspace_id()
@@ -57,34 +61,21 @@ impl DemoNode {
             .await
             .map_err(|e| anyhow::anyhow!("node addr error: {e}"))?;
 
-        // TODO(persistent-storage): Replace in-memory HashMaps with persistent storage
-        // (redb or _local/ entries in home namespace). Lost on restart.
-        let invites = Arc::new(Mutex::new(HashMap::<Aid, Invite>::new()));
-        let contacts = Arc::new(Mutex::new(HashMap::<Aid, Contact>::new()));
-        let persona = Arc::new(Mutex::new(HashMap::<String, String>::new()));
-
-        let current_aid = Arc::new(Mutex::new(initial_aid));
-
         let identity = DemoIdentityService {
             identity_mgr: identity_mgr.clone(),
-            current: current_aid.clone(),
-            invites: invites.clone(),
-            contacts: contacts.clone(),
-            persona: persona.clone(),
+            store: store.clone(),
         };
 
         let trust = DemoTrustService {
             sync: sync_engine.clone(),
             namespace,
-            current_aid,
-            invites,
-            contacts,
+            store: store.clone(),
         };
 
         let data = DemoDataService {
             sync: sync_engine.clone(),
             namespace,
-            persona,
+            store: store.clone(),
         };
 
         let sync = DemoSyncService {
@@ -94,6 +85,7 @@ impl DemoNode {
 
         let node = Self {
             node_id: node_addr.node_id,
+            store,
             identity,
             trust,
             data,
@@ -101,6 +93,11 @@ impl DemoNode {
         };
 
         Ok(Arc::new(node))
+    }
+
+    /// Access the shared local store.
+    pub fn store(&self) -> &LocalStore {
+        &self.store
     }
 }
 
@@ -134,29 +131,28 @@ impl Node for DemoNode {
 #[derive(Clone)]
 pub struct DemoIdentityService {
     identity_mgr: Arc<KeriIdentityManager>,
-    current: Arc<Mutex<Aid>>,
-    invites: Arc<Mutex<HashMap<Aid, Invite>>>,
-    contacts: Arc<Mutex<HashMap<Aid, Contact>>>,
-    persona: Arc<Mutex<HashMap<String, String>>>,
+    store: LocalStore,
 }
 
 #[allow(async_fn_in_trait, clippy::expect_used)]
 impl IdentityService for DemoIdentityService {
     fn aid(&self) -> Aid {
-        *self.current.lock().expect("current AID lock poisoned")
+        self.store
+            .get_json::<Aid>(keys::CURRENT_AID)
+            .expect("store read")
+            .expect("AID not set")
     }
 
     // TODO: Identity re-creation shouldn't wipe invites/contacts/persona
     // once persistent storage exists. Demo-only shortcut.
     async fn create(&self) -> Result<Aid, mee_identity_api::IdentityError> {
         let aid = self.identity_mgr.create().await?;
-        *self.current.lock().expect("current AID lock poisoned") = aid;
-        self.invites.lock().expect("invites lock poisoned").clear();
-        self.contacts
-            .lock()
-            .expect("contacts lock poisoned")
-            .clear();
-        self.persona.lock().expect("persona lock poisoned").clear();
+        self.store
+            .set_json(keys::CURRENT_AID, &aid)
+            .expect("store write");
+        let _ = self.store.delete_prefix(keys::INVITES_PREFIX);
+        let _ = self.store.delete_prefix(keys::CONTACTS_PREFIX);
+        let _ = self.store.delete_prefix(keys::PERSONA_PREFIX);
         Ok(aid)
     }
 
@@ -172,9 +168,7 @@ impl IdentityService for DemoIdentityService {
 pub struct DemoTrustService {
     sync: Arc<IrohWillowSyncCore>,
     namespace: NamespaceId,
-    current_aid: Arc<Mutex<Aid>>,
-    invites: Arc<Mutex<HashMap<Aid, Invite>>>,
-    contacts: Arc<Mutex<HashMap<Aid, Contact>>>,
+    store: LocalStore,
 }
 
 #[allow(async_fn_in_trait, clippy::expect_used, clippy::unwrap_in_result)]
@@ -184,15 +178,20 @@ impl TrustService for DemoTrustService {
     }
 
     async fn create_invite(&self) -> Result<Invite, SyncError> {
-        let inviter = *self.current_aid.lock().expect("current AID lock poisoned");
-        let node = self.sync.addr().await?;
+        let inviter: Aid = self
+            .store
+            .get_json(keys::CURRENT_AID)
+            .map_err(|e| SyncError::Backend(e.to_string()))?
+            .ok_or_else(|| SyncError::Other("AID not set".into()))?;
+        let node_addr = self.sync.addr().await?;
         let subspace_id = self.sync.subspace_id().await?;
         // TODO: Make invite expiry configurable instead of hardcoded 10 minutes.
         let expires_at = now_ms() + 10 * 60 * 1000;
         let mut invite = Invite {
             inviter_aid: inviter,
+            namespace_id: self.namespace,
             subspace_id,
-            node,
+            node_hints: vec![node_addr],
             expires_at,
             sig: InviteSignature::default(),
         };
@@ -212,42 +211,31 @@ impl TrustService for DemoTrustService {
     }
 
     fn remember_invite(&self, invite: Invite) {
-        self.invites
-            .lock()
-            .expect("invites lock poisoned")
-            .insert(invite.inviter_aid, invite);
+        let _ = self
+            .store
+            .set_json(&keys::invite(&invite.inviter_aid), &invite);
     }
 
     fn invite_for(&self, aid: &Aid) -> Option<Invite> {
-        self.invites
-            .lock()
-            .expect("invites lock poisoned")
-            .get(aid)
-            .cloned()
+        self.store
+            .get_json::<Invite>(&keys::invite(aid))
+            .expect("store read")
     }
 
     fn add_contact(&self, contact: Contact) {
-        self.contacts
-            .lock()
-            .expect("contacts lock poisoned")
-            .insert(contact.aid, contact);
+        let _ = self.store.set_json(&keys::contact(&contact.aid), &contact);
     }
 
     fn contact(&self, aid: &Aid) -> Option<Contact> {
-        self.contacts
-            .lock()
-            .expect("contacts lock poisoned")
-            .get(aid)
-            .cloned()
+        self.store
+            .get_json::<Contact>(&keys::contact(aid))
+            .expect("store read")
     }
 
     fn contacts(&self) -> Vec<Contact> {
-        self.contacts
-            .lock()
-            .expect("contacts lock poisoned")
-            .values()
-            .cloned()
-            .collect()
+        self.store
+            .values_json::<Contact>(keys::CONTACTS_PREFIX)
+            .expect("store read")
     }
 }
 
@@ -255,7 +243,7 @@ impl TrustService for DemoTrustService {
 pub struct DemoDataService {
     sync: Arc<IrohWillowSyncCore>,
     namespace: NamespaceId,
-    persona: Arc<Mutex<HashMap<String, String>>>,
+    store: LocalStore,
 }
 
 impl DemoDataService {
@@ -268,10 +256,7 @@ impl DemoDataService {
 #[allow(async_fn_in_trait, clippy::expect_used)]
 impl mee_node_api::DataService for DemoDataService {
     async fn set(&self, key: &str, value: &str) -> Result<(), DataError> {
-        self.persona
-            .lock()
-            .expect("persona lock poisoned")
-            .insert(key.to_owned(), value.to_owned());
+        let _ = self.store.set_json(&keys::persona(key), &value);
         let path = Self::persona_path(key)?;
         self.sync
             .insert(&self.namespace, &path, value.as_bytes())
@@ -280,10 +265,7 @@ impl mee_node_api::DataService for DemoDataService {
     }
 
     async fn delete(&self, key: &str) -> Result<(), DataError> {
-        self.persona
-            .lock()
-            .expect("persona lock poisoned")
-            .remove(key);
+        let _ = self.store.delete(&keys::persona(key));
         let path = Self::persona_path(key)?;
         self.sync.insert(&self.namespace, &path, &[]).await?;
         Ok(())
@@ -291,28 +273,34 @@ impl mee_node_api::DataService for DemoDataService {
 
     async fn get(&self, key: &str) -> Result<Option<DataEntry>, DataError> {
         Ok(self
-            .persona
-            .lock()
-            .expect("persona lock poisoned")
-            .get(key)
+            .store
+            .get_json::<String>(&keys::persona(key))
+            .expect("store read")
             .map(|v| DataEntry {
                 key: key.to_owned(),
-                value: v.clone(),
+                value: v,
             }))
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<DataEntry>, DataError> {
-        Ok(self
-            .persona
-            .lock()
-            .expect("persona lock poisoned")
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| DataEntry {
-                key: k.clone(),
-                value: v.clone(),
-            })
-            .collect())
+        let full_prefix = keys::persona(prefix);
+        let matching_keys = self.store.keys(&full_prefix).expect("store read");
+        let mut out = Vec::new();
+        for store_key in matching_keys {
+            if let Some(persona_key) = store_key.strip_prefix(keys::PERSONA_PREFIX) {
+                if let Some(value) = self
+                    .store
+                    .get_json::<String>(&store_key)
+                    .expect("store read")
+                {
+                    out.push(DataEntry {
+                        key: persona_key.to_owned(),
+                        value,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -320,6 +308,16 @@ impl mee_node_api::DataService for DemoDataService {
 pub struct DemoSyncService {
     sync: Arc<IrohWillowSyncCore>,
     namespace: NamespaceId,
+}
+
+impl DemoSyncService {
+    /// Access the underlying sync core.
+    ///
+    /// This is a demo-only escape hatch for debug routes and test
+    /// tooling. Not part of the public node API.
+    pub fn core(&self) -> &IrohWillowSyncCore {
+        &self.sync
+    }
 }
 
 #[allow(async_fn_in_trait)]
@@ -391,31 +389,28 @@ fn now_ms() -> u64 {
 // the operational private key from the signer's KEL.
 fn compute_invite_sig(inv: &Invite) -> InviteSignature {
     let mut h = Sha256::new();
-    let relay = inv
-        .node
-        .relay_url
-        .as_ref()
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default();
-    let mut addrs: Vec<String> = inv
-        .node
-        .direct_addresses
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-    addrs.sort();
     let data = format!(
-        "demo|{}|{}|{}|{}|{}",
-        inv.inviter_aid,
-        inv.subspace_id,
-        inv.node.node_id,
-        addrs.join(","),
-        relay,
+        "demo|{}|{}|{}",
+        inv.inviter_aid, inv.namespace_id, inv.subspace_id,
     );
     h.update(data.as_bytes());
+
+    // Hash all node hints deterministically
+    let mut all_addrs: Vec<String> = Vec::new();
+    for hint in &inv.node_hints {
+        all_addrs.push(hint.node_id.to_string());
+        for addr in &hint.direct_addresses {
+            all_addrs.push(addr.to_string());
+        }
+        if let Some(ref relay) = hint.relay_url {
+            all_addrs.push(relay.to_string());
+        }
+    }
+    all_addrs.sort();
+    h.update(all_addrs.join(",").as_bytes());
+
     h.update(inv.expires_at.to_le_bytes());
-    let out = h.finalize();
-    InviteSignature::new(hex::encode(out))
+    InviteSignature::new(hex::encode(h.finalize()))
 }
 
 // TODO(keri): Replace with Ed25519 signature verification using the

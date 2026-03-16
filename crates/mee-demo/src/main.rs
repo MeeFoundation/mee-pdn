@@ -10,17 +10,18 @@ use mee_node_api::{
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
 use mee_sync_api::{AccessMode, SyncError};
+use mee_sync_iroh_willow::gossip::GossipConfig;
 use mee_sync_iroh_willow::DiscoveryConfig;
 use mee_types::Aid;
 use serde::{Deserialize, Serialize};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct AppState {
     node: Arc<Mutex<Option<Arc<DemoNode>>>>,
-    events: Arc<Mutex<Vec<String>>>,
     discovery: Arc<str>,
 }
 
@@ -33,6 +34,25 @@ impl AppState {
         let config = match &*self.discovery {
             "local" => DiscoveryConfig::local(),
             "full" => DiscoveryConfig::full(),
+            "gossip" => {
+                let mut gc = GossipConfig::default_config();
+                if let Some(s) = std::env::var("MEE_GOSSIP_REBROADCAST_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    gc.rebroadcast_interval = Duration::from_secs(s);
+                }
+                if let Some(s) = std::env::var("MEE_GOSSIP_EVICTION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    gc.eviction_threshold = Duration::from_secs(s);
+                    gc.staleness_threshold = Duration::from_secs(s);
+                }
+                let mut config = DiscoveryConfig::disabled();
+                config.gossip = Some(gc);
+                config
+            }
             _ => DiscoveryConfig::disabled(),
         };
         // TODO(persistent-storage): Read MEE_DATA_DIR env var and pass to
@@ -53,6 +73,7 @@ impl AppState {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let discovery: Arc<str> = std::env::var("MEE_DISCOVERY")
@@ -60,7 +81,6 @@ async fn main() -> anyhow::Result<()> {
         .into();
     let state = AppState {
         node: Arc::new(Mutex::new(None)),
-        events: Arc::new(Mutex::new(Vec::with_capacity(256))),
         discovery,
     };
 
@@ -113,12 +133,27 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/p2p/list",
             get(|state| async move { p2p_list(state).await }),
+        );
+
+    // Debug/test routes — only available when MEE_DEBUG=1
+    let app = if std::env::var("MEE_DEBUG").is_ok_and(|v| v == "1" || v == "true") {
+        app.route(
+            "/debug/endpoint-id",
+            get(|state| async move { p2p_endpoint_id(state).await }),
         )
         .route(
-            "/p2p/events",
-            get(|state| async move { p2p_events(state).await }),
+            "/debug/import",
+            post(|state, payload| async move { p2p_import(state, payload).await }),
         )
-        .with_state(state);
+        .route(
+            "/debug/gossip/peers",
+            get(|state| async move { p2p_gossip_peers(state).await }),
+        )
+    } else {
+        app
+    };
+
+    let app = app.with_state(state);
 
     let host = std::env::var("MEE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("MEE_PORT")
@@ -212,16 +247,26 @@ async fn p2p_connect(
         aid: invite.inviter_aid,
         alias: None,
     });
-    // Connect P2P: delegates capabilities and sends ticket
-    // directly to peer
-    match n
-        .sync()
-        .connect_to_peer(&invite.subspace_id, &invite.node, access)
-        .await
-    {
-        Ok(()) => "connected".to_owned().into_response(),
-        Err(e) => internal(&e).into_response(),
+    // Try direct connection via each node_hint.
+    for hint in &invite.node_hints {
+        if n.sync()
+            .connect_to_peer(&invite.subspace_id, hint, access)
+            .await
+            .is_ok()
+        {
+            return "connected".to_owned().into_response();
+        }
     }
+
+    // All hints failed (or none provided) — defer to gossip discovery.
+    // Store a pending marker so the gossip event loop can match this
+    // invite against future peer advertisements.
+    let pending_key = mee_types::local_store::keys::pending_invite(
+        &invite.subspace_id,
+        &invite.namespace_id,
+    );
+    let _ = n.store().set(&pending_key, Vec::new());
+    "pending".to_owned().into_response()
 }
 
 #[derive(Deserialize)]
@@ -339,14 +384,6 @@ async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
     }
 }
 
-#[allow(clippy::expect_used)]
-async fn p2p_events(state: axum::extract::State<AppState>) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    Json(state.events.lock().expect("events lock poisoned").clone()).into_response()
-}
-
 #[derive(Deserialize)]
 struct ValidateAidReq {
     aid: Aid,
@@ -386,6 +423,76 @@ async fn p2p_create_identity(state: axum::extract::State<AppState>) -> Response 
         Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
     }
 }
+
+// -- Gossip routes ----------------------------------------------------------
+
+#[derive(Serialize)]
+struct EndpointIdResp {
+    endpoint_id: String,
+}
+
+async fn p2p_endpoint_id(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    let eid = n.sync().core().endpoint().id();
+    Json(EndpointIdResp {
+        endpoint_id: hex::encode(eid.as_bytes()),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    ticket: api::SyncTicket,
+}
+
+async fn p2p_import(state: axum::extract::State<AppState>, Json(req): Json<ImportReq>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    match n.sync().import(req.ticket, api::SyncMode::Continuous).await {
+        Ok(_handle) => "imported".to_owned().into_response(),
+        Err(e) => internal(&e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct CachedPeerResp {
+    peer_id: String,
+    namespace_ids: Vec<String>,
+    version: u64,
+    connected: bool,
+}
+
+async fn p2p_gossip_peers(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    let Some(gossip) = n.sync().core().gossip_manager() else {
+        return internal_str("gossip not enabled").into_response();
+    };
+    match gossip.cached_peers().await {
+        Ok(peers) => {
+            let out: Vec<CachedPeerResp> = peers
+                .into_iter()
+                .map(|p| CachedPeerResp {
+                    peer_id: hex::encode(p.peer_id),
+                    namespace_ids: p.namespace_ids.iter().map(hex::encode).collect(),
+                    version: p.version,
+                    connected: p.connected,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => internal_str(&e.to_string()).into_response(),
+    }
+}
+
+// -- Helpers ----------------------------------------------------------------
 
 fn internal(e: &SyncError) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())

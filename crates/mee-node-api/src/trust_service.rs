@@ -2,13 +2,15 @@ use mee_sync_api::{AccessMode, NamespaceId, NodeAddr, SubspaceId, SyncError, Syn
 use mee_types::Aid;
 use serde::{Deserialize, Serialize};
 
-// TODO(personal-namespaces): Add namespace_id field to track which peer namespace
-// this invite grants access to.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invite {
     pub inviter_aid: Aid,
+    /// Which namespace this invite grants access to.
+    pub namespace_id: NamespaceId,
     pub subspace_id: SubspaceId,
-    pub node: NodeAddr,
+    /// Connection hints — addresses where the inviter was at creation
+    /// time. May be stale or empty; gossip provides fallback.
+    pub node_hints: Vec<NodeAddr>,
     pub expires_at: u64,
     pub sig: InviteSignature,
 }

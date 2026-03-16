@@ -120,12 +120,13 @@ impl TrustService for WasmTrustService {
     async fn create_invite(&self) -> Result<Invite, api::SyncError> {
         Ok(Invite {
             inviter_aid: Aid::from_bytes(ZERO_ID),
+            namespace_id: api::NamespaceId::from_bytes(ZERO_ID),
             subspace_id: api::SubspaceId::from_bytes(ZERO_ID),
-            node: api::NodeAddr {
+            node_hints: vec![api::NodeAddr {
                 node_id: NodeId::from_bytes(ZERO_ID),
                 direct_addresses: vec![],
                 relay_url: None,
-            },
+            }],
             expires_at: 0,
             sig: InviteSignature::default(),
         })
@@ -137,7 +138,7 @@ impl TrustService for WasmTrustService {
     ) -> Result<api::SyncTicket, api::SyncError> {
         Ok(api::SyncTicket {
             caps: vec![],
-            nodes: vec![],
+            node_hints: vec![],
         })
     }
     fn remember_invite(&self, _invite: Invite) {}
@@ -200,7 +201,7 @@ impl SyncService for WasmSyncService {
     ) -> Result<api::SyncTicket, api::SyncError> {
         Ok(api::SyncTicket {
             caps: vec![],
-            nodes: vec![],
+            node_hints: vec![],
         })
     }
     async fn import(
@@ -275,7 +276,7 @@ impl api::SyncEngine for WasmNoopSync {
     ) -> Result<api::SyncTicket, api::SyncError> {
         Ok(api::SyncTicket {
             caps: vec![],
-            nodes: vec![],
+            node_hints: vec![],
         })
     }
     async fn import_and_sync(
@@ -335,7 +336,7 @@ impl api::SyncEngine for WasmNoopSync {
 pub fn sync_types_sample_ticket() -> String {
     let ticket = api::SyncTicket {
         caps: vec![serde_json::json!(null)],
-        nodes: vec![api::NodeAddr {
+        node_hints: vec![api::NodeAddr {
             node_id: NodeId::from_bytes(ZERO_ID),
             direct_addresses: vec![api::DirectAddress::from(
                 "127.0.0.1:0"

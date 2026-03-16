@@ -225,7 +225,9 @@ pub struct SyncTicket {
     // TODO: Replace opaque serde_json::Value caps with a typed capability
     // representation once meadowcap serialization format stabilises.
     pub caps: Vec<serde_json::Value>,
-    pub nodes: Vec<NodeAddr>,
+    /// Connection hints — addresses where the sharer was at ticket
+    /// creation time. May be stale or empty; gossip provides fallback.
+    pub node_hints: Vec<NodeAddr>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

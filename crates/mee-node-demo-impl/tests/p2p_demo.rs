@@ -59,9 +59,13 @@ async fn invite_connect_and_replicate() {
             aid: invite.inviter_aid,
             alias: None,
         });
+        let node_hint = invite
+            .node_hints
+            .first()
+            .expect("test invite has node_hints");
         alice
             .sync()
-            .connect_to_peer(&invite.subspace_id, &invite.node, AccessMode::Read)
+            .connect_to_peer(&invite.subspace_id, node_hint, AccessMode::Read)
             .await
             .expect("connect to bob");
 

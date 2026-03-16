@@ -1,7 +1,6 @@
 //! Background task for gossip receive, broadcast, and eviction.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
@@ -26,11 +25,11 @@ pub(crate) struct EventLoopState {
     pub held_namespace_ids: HashSet<[u8; 32]>,
     pub ad_version: u64,
     pub config: GossipConfig,
-    /// Kept for future use (async namespace listing).
-    pub _engine: WillowEngine,
+    pub engine: WillowEngine,
     pub client: iroh_willow::rpc::client::MemClient,
     pub endpoint: Endpoint,
-    pub imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
+    /// Local key-value store for node state (imported namespaces, etc.).
+    pub store: mee_types::LocalStore,
     pub owner_user: iroh_willow::proto::keys::UserId,
 }
 
@@ -42,7 +41,7 @@ pub(crate) async fn run(
     mut cmd_rx: mpsc::Receiver<GossipCommand>,
 ) {
     // Initial namespace refresh + broadcast
-    refresh_held_namespaces(&mut state);
+    refresh_held_namespaces(&mut state).await;
     let _ = broadcast_own_ad(&mut state).await;
 
     let mut rebroadcast = tokio::time::interval(state.config.rebroadcast_interval);
@@ -60,7 +59,7 @@ pub(crate) async fn run(
             }
 
             _ = rebroadcast.tick() => {
-                refresh_held_namespaces(&mut state);
+                refresh_held_namespaces(&mut state).await;
                 let _ =
                     broadcast_own_ad(&mut state).await;
             }
@@ -74,7 +73,7 @@ pub(crate) async fn run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(GossipCommand::Broadcast) => {
-                        refresh_held_namespaces(&mut state);
+                        refresh_held_namespaces(&mut state).await;
                         let _ =
                             broadcast_own_ad(&mut state).await;
                     }
@@ -134,22 +133,24 @@ async fn handle_message(state: &mut EventLoopState, content: &[u8]) {
         return;
     }
 
-    // 5. Namespace intersection
-    let matches = intersect_namespaces(&ad.namespace_ids, &state.held_namespace_ids);
-    if matches.is_empty() {
-        return;
-    }
+    // 5. Skip if already connected
+    let already_connected = state
+        .peer_cache
+        .get(&ad.peer_id)
+        .is_some_and(|c| c.connected);
 
-    // 6. Skip if already connected
-    if let Some(cached) = state.peer_cache.get(&ad.peer_id) {
-        if cached.connected {
-            return;
+    if !already_connected {
+        // Path 1: Namespace intersection (existing held namespaces)
+        let matches = intersect_namespaces(&ad.namespace_ids, &state.held_namespace_ids);
+        if !matches.is_empty() {
+            if try_auto_connect(state, &ad, &matches).await.is_ok() {
+                state.peer_cache.set_connected(&ad.peer_id, true);
+                return;
+            }
         }
-    }
 
-    // 7. Auto-connect
-    if try_auto_connect(state, &ad, &matches).await.is_ok() {
-        state.peer_cache.set_connected(&ad.peer_id, true);
+        // Path 2: Pending invite discovery
+        check_pending_invites(state, &ad).await;
     }
 }
 
@@ -242,7 +243,7 @@ async fn share_namespace(
             .into_iter()
             .filter_map(|c| serde_json::to_value(&c).ok())
             .collect(),
-        nodes: vec![own_addr.clone()],
+        node_hints: vec![own_addr.clone()],
     })
 }
 
@@ -292,21 +293,78 @@ async fn build_own_ad(state: &EventLoopState) -> Result<PeerAdvertisement, Gossi
     Ok(ad)
 }
 
-// TODO: Use Engine.list_namespaces() (async) instead of only the
-// imported_namespaces set. Currently misses locally-created namespaces.
-#[allow(clippy::expect_used)]
-fn refresh_held_namespaces(state: &mut EventLoopState) {
-    // Sync call — reads from the imported_namespaces set
-    // which is maintained by do_import_and_sync.
-    // Engine.list_namespaces() is async, but we can't
-    // easily call it here. For the prototype, we use only
-    // the imported_namespaces set which is synchronous.
-    let imported = state
-        .imported_namespaces
-        .lock()
-        .expect("imported_namespaces lock poisoned");
+/// Check if any pending invites match this advertisement.
+///
+/// A pending invite is a marker key at `pending_invites/{subspace}/{namespace}`
+/// written when an invite's `node_hints` were empty or stale. When an ad
+/// arrives from the matching peer advertising the matching namespace, we
+/// auto-connect and delete the marker.
+async fn check_pending_invites(state: &mut EventLoopState, ad: &PeerAdvertisement) {
+    let pending_keys = match state
+        .store
+        .keys(mee_types::local_store::keys::PENDING_INVITES_PREFIX)
+    {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+
+    for key in pending_keys {
+        let suffix = match key.strip_prefix(mee_types::local_store::keys::PENDING_INVITES_PREFIX) {
+            Some(s) => s,
+            None => continue,
+        };
+        let Some((sub_hex, ns_hex)) = suffix.split_once('/') else {
+            continue;
+        };
+        let Ok(subspace) = sub_hex.parse::<api::SubspaceId>() else {
+            continue;
+        };
+        let Ok(namespace) = ns_hex.parse::<api::NamespaceId>() else {
+            continue;
+        };
+
+        // Security: peer_id must match invite's subspace_id
+        if ad.peer_id != *subspace.as_bytes() {
+            continue;
+        }
+        // Namespace must be in the advertisement
+        if !ad
+            .namespace_ids
+            .iter()
+            .any(|ns| *ns == *namespace.as_bytes())
+        {
+            continue;
+        }
+
+        // Match! Auto-connect using the invite's namespace.
+        let ns_bytes = *namespace.as_bytes();
+        if try_auto_connect(state, ad, &[ns_bytes]).await.is_ok() {
+            state.peer_cache.set_connected(&ad.peer_id, true);
+            let _ = state.store.delete(&key);
+            return;
+        }
+    }
+}
+
+/// Refresh the set of held namespace IDs from both the Willow engine
+/// and the local store (imported namespaces tracked via tickets).
+async fn refresh_held_namespaces(state: &mut EventLoopState) {
     state.held_namespace_ids.clear();
-    for ns in imported.iter() {
-        state.held_namespace_ids.insert(*ns.as_bytes());
+    if let Ok(namespaces) = state.engine.list_namespaces().await {
+        for ns in namespaces {
+            state.held_namespace_ids.insert(*ns.as_bytes());
+        }
+    }
+    if let Ok(keys) = state
+        .store
+        .keys(mee_types::local_store::keys::NAMESPACES_IMPORTED_PREFIX)
+    {
+        for key in keys {
+            let suffix =
+                key.trim_start_matches(mee_types::local_store::keys::NAMESPACES_IMPORTED_PREFIX);
+            if let Ok(id) = suffix.parse::<mee_sync_api::NamespaceId>() {
+                state.held_namespace_ids.insert(*id.as_bytes());
+            }
+        }
     }
 }

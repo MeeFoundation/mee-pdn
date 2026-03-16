@@ -16,13 +16,9 @@ pub use config::GossipConfig;
 pub use error::GossipError;
 pub use peer_cache::CachedPeerInfo;
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-
 use iroh::Endpoint;
 use iroh_gossip::{Gossip, TopicId};
 use iroh_willow::Engine as WillowEngine;
-use mee_sync_api as api;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -65,12 +61,33 @@ impl GossipManager {
         endpoint: Endpoint,
         engine: WillowEngine,
         client: iroh_willow::rpc::client::MemClient,
-        imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
         owner_user: iroh_willow::proto::keys::UserId,
         config: GossipConfig,
+        store: mee_types::LocalStore,
     ) -> Result<Self, GossipError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        Self::start_with_channel(
+            gossip, endpoint, engine, client, owner_user, config, cmd_tx, cmd_rx, store,
+        )
+        .await
+    }
 
+    /// Start with a pre-created command channel.
+    ///
+    /// Used when the sender needs to be shared with other subsystems
+    /// (e.g. `ConnectHandler`) before the gossip manager is started.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_with_channel(
+        gossip: Gossip,
+        endpoint: Endpoint,
+        engine: WillowEngine,
+        client: iroh_willow::rpc::client::MemClient,
+        owner_user: iroh_willow::proto::keys::UserId,
+        config: GossipConfig,
+        cmd_tx: mpsc::Sender<GossipCommand>,
+        cmd_rx: mpsc::Receiver<GossipCommand>,
+        store: mee_types::LocalStore,
+    ) -> Result<Self, GossipError> {
         let topic_id = discovery_topic_id();
         let topic = gossip
             .subscribe(topic_id, config.bootstrap_peers.clone())
@@ -82,13 +99,13 @@ impl GossipManager {
         let state = event_loop::EventLoopState {
             sender,
             peer_cache: peer_cache::PeerCache::new(),
-            held_namespace_ids: HashSet::new(),
+            held_namespace_ids: std::collections::HashSet::new(),
             ad_version: 0,
             config,
-            _engine: engine,
+            engine,
             client,
             endpoint,
-            imported_namespaces,
+            store,
             owner_user,
         };
 

@@ -19,12 +19,7 @@ use iroh_willow::{engine::AcceptOpts, Engine as WillowEngine, ALPN};
 use mee_sync_api as api;
 use mee_sync_api::SyncError;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeSet, HashSet},
-    net::SocketAddr,
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeSet, net::SocketAddr, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// ALPN for the mee-connect handshake protocol.
@@ -120,7 +115,8 @@ struct ConnectResponse {
 #[derive(Clone)]
 struct ConnectHandler {
     client: iroh_willow::rpc::client::MemClient,
-    imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
+    store: mee_types::LocalStore,
+    gossip_cmd_tx: Option<tokio::sync::mpsc::Sender<gossip::GossipCommand>>,
 }
 
 impl std::fmt::Debug for ConnectHandler {
@@ -165,7 +161,7 @@ impl ConnectHandler {
             .map_err(|e| SyncError::Backend(format!("invalid connect request: {e}")))?;
 
         // Import the ticket and start sync
-        let result = do_import_and_sync(&self.client, &self.imported_namespaces, req.ticket).await;
+        let result = do_import_and_sync(&self.client, &self.store, req.ticket).await;
 
         let resp = match &result {
             Ok(_handle) => ConnectResponse {
@@ -193,7 +189,14 @@ impl ConnectHandler {
             .map_err(|e| SyncError::Backend(e.to_string()))?;
 
         // If import succeeded, spawn a task to drain the sync handle
+        // and auto-join the connecting peer in gossip.
         if let Ok(mut handle) = result {
+            if let Some(ref tx) = self.gossip_cmd_tx {
+                let peer_eid = conn.remote_id();
+                let _ = tx
+                    .send(gossip::GossipCommand::JoinPeers(vec![peer_eid]))
+                    .await;
+            }
             tokio::spawn(async move { while handle.next().await.is_some() {} });
         }
 
@@ -313,10 +316,9 @@ pub(crate) async fn send_ticket(
 
 // -- Shared import logic ---------------------------------------------------
 
-#[allow(clippy::expect_used)]
 async fn do_import_and_sync(
     client: &iroh_willow::rpc::client::MemClient,
-    imported_namespaces: &Mutex<HashSet<api::NamespaceId>>,
+    store: &mee_types::LocalStore,
     ticket: api::SyncTicket,
 ) -> Result<IrohWillowSyncHandle, SyncError> {
     let caps: Vec<iroh_willow::interest::CapabilityPack> = ticket
@@ -325,7 +327,7 @@ async fn do_import_and_sync(
         .filter_map(|v| serde_json::from_value(v).ok())
         .collect();
     let mut nodes: Vec<IrohNodeAddr> = Vec::new();
-    for n in &ticket.nodes {
+    for n in &ticket.node_hints {
         nodes.push(to_iroh_addr(n)?);
     }
     let space_ticket = iroh_willow::rpc::client::SpaceTicket { caps, nodes };
@@ -335,10 +337,10 @@ async fn do_import_and_sync(
         .await
         .map_err(|e| SyncError::Backend(e.to_string()))?;
     let ns_id = api::NamespaceId::from_bytes(*space.namespace_id().as_bytes());
-    imported_namespaces
-        .lock()
-        .expect("imported_namespaces lock poisoned")
-        .insert(ns_id);
+    let _ = store.set(
+        &mee_types::local_store::keys::namespace_imported(&ns_id),
+        Vec::new(),
+    );
     let s = async_stream::stream! {
         use iroh_willow::session::intents::serde_encoding::Event;
         while let Some((_peer, ev)) = handles.next().await {
@@ -373,7 +375,7 @@ pub struct IrohWillowSyncCore {
     client: iroh_willow::rpc::client::MemClient,
     owner_user: iroh_willow::proto::keys::UserId,
     _router: Router,
-    imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
+    store: mee_types::LocalStore,
     gossip_manager: Option<gossip::GossipManager>,
 }
 
@@ -384,7 +386,10 @@ impl IrohWillowSyncCore {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub async fn spawn(config: DiscoveryConfig) -> Result<Self, SyncError> {
+    pub async fn spawn(
+        config: DiscoveryConfig,
+        store: mee_types::LocalStore,
+    ) -> Result<Self, SyncError> {
         let alpns = vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()];
         let mut builder = Endpoint::empty_builder(config.relay_mode).alpns(alpns);
 
@@ -429,11 +434,18 @@ impl IrohWillowSyncCore {
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
 
-        let imported_namespaces = Arc::new(Mutex::new(HashSet::new()));
+        // Create gossip command channel early so ConnectHandler can
+        // auto-join peers before GossipManager is fully started.
+        let gossip_cmd_tx = if config.gossip.is_some() {
+            Some(tokio::sync::mpsc::channel::<gossip::GossipCommand>(16))
+        } else {
+            None
+        };
 
         let connect_handler = ConnectHandler {
             client: client.clone(),
-            imported_namespaces: imported_namespaces.clone(),
+            store: store.clone(),
+            gossip_cmd_tx: gossip_cmd_tx.as_ref().map(|(tx, _)| tx.clone()),
         };
 
         // Create Gossip instance before Router
@@ -447,17 +459,21 @@ impl IrohWillowSyncCore {
 
         let router = router_builder.spawn();
 
-        // Start gossip manager after Router is up
+        // Start gossip manager after Router is up, passing the
+        // pre-created command channel.
         let gossip_manager = if let Some(gossip_config) = config.gossip {
+            let (cmd_tx, cmd_rx) = gossip_cmd_tx.expect("channel created when gossip enabled");
             Some(
-                gossip::GossipManager::start(
+                gossip::GossipManager::start_with_channel(
                     gossip_instance,
                     endpoint.clone(),
                     engine.clone(),
                     client.clone(),
-                    imported_namespaces.clone(),
                     owner_user,
                     gossip_config,
+                    cmd_tx,
+                    cmd_rx,
+                    store.clone(),
                 )
                 .await
                 .map_err(|e| SyncError::Backend(e.to_string()))?,
@@ -472,7 +488,7 @@ impl IrohWillowSyncCore {
             client,
             owner_user,
             _router: router,
-            imported_namespaces,
+            store,
             gossip_manager,
         })
     }
@@ -535,10 +551,10 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         let ns_id = api::NamespaceId::from_bytes(*space.namespace_id().as_bytes());
         // Track for gossip advertisement
-        self.imported_namespaces
-            .lock()
-            .expect("imported_namespaces lock poisoned")
-            .insert(ns_id);
+        let _ = self.store.set(
+            &mee_types::local_store::keys::namespace_imported(&ns_id),
+            Vec::new(),
+        );
         Ok(ns_id)
     }
 
@@ -548,17 +564,29 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .list_namespaces()
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<api::NamespaceId> = Vec::new();
+        for ns in v {
+            let id = api::NamespaceId::from_bytes(*ns.as_bytes());
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
         // include namespaces we imported via tickets
-        let imported = self
-            .imported_namespaces
-            .lock()
-            .expect("imported_namespaces lock poisoned")
-            .clone();
-        let mut out: Vec<api::NamespaceId> = v
-            .into_iter()
-            .map(|ns| api::NamespaceId::from_bytes(*ns.as_bytes()))
-            .collect();
-        out.extend(imported);
+        if let Ok(keys) = self
+            .store
+            .keys(mee_types::local_store::keys::NAMESPACES_IMPORTED_PREFIX)
+        {
+            for key in keys {
+                let suffix = key
+                    .trim_start_matches(mee_types::local_store::keys::NAMESPACES_IMPORTED_PREFIX);
+                if let Ok(id) = suffix.parse::<api::NamespaceId>() {
+                    if seen.insert(id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -603,7 +631,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
                 // back to empty JSON object.
                 .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::json!({})))
                 .collect(),
-            nodes: vec![node_addr],
+            node_hints: vec![node_addr],
         })
     }
 
@@ -614,7 +642,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
         ticket: api::SyncTicket,
         _mode: api::SyncMode,
     ) -> Result<Box<dyn api::SyncHandle>, SyncError> {
-        let handle = do_import_and_sync(&self.client, &self.imported_namespaces, ticket).await?;
+        let handle = do_import_and_sync(&self.client, &self.store, ticket).await?;
         Ok(Box::new(handle))
     }
 
@@ -626,7 +654,16 @@ impl api::SyncEngine for IrohWillowSyncCore {
         access: api::AccessMode,
     ) -> Result<(), SyncError> {
         let ticket = self.share(ns, to, access).await?;
-        send_ticket(&self.endpoint, peer_addr, ticket).await
+        send_ticket(&self.endpoint, peer_addr, ticket).await?;
+
+        // Auto-join peer in gossip mesh
+        if let Some(gm) = self.gossip_manager() {
+            if let Ok(eid) = iroh::EndpointId::from_bytes(peer_addr.node_id.as_bytes()) {
+                let _ = gm.join_peers(vec![eid]).await;
+            }
+        }
+
+        Ok(())
     }
 
     async fn insert(
