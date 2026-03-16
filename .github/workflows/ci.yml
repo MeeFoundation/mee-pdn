@@ -40,3 +40,6 @@ jobs:
 
       - name: Build core WASM targets
         run: just build-core-wasm
+
+      - name: Run integration tests
+        run: just integration-tests
