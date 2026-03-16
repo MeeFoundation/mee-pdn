@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 
-use mee_did_api::{DidCreateParams, DidKeyCreateOptions, DidProvider, DidResolver};
-use mee_did_key::KeyDidManager;
+use mee_identity_api::{IdentityProvider, IdentityResolver};
+use mee_identity_keri::KeriIdentityManager;
 use mee_node_api::{
     Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
     TrustService,
@@ -16,7 +16,7 @@ use mee_sync_api::{
     SyncTicket,
 };
 use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
-use mee_types::{Did, NodeId};
+use mee_types::{Aid, NodeId};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
@@ -30,23 +30,22 @@ pub struct DemoNode {
 
 #[allow(clippy::expect_used)]
 impl DemoNode {
+    // TODO(persistent-storage): Accept data_dir: Option<PathBuf> and pass through
+    // to IrohWillowSyncCore::spawn().
     pub async fn spawn(discovery: DiscoveryConfig) -> anyhow::Result<Arc<Self>> {
         let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery).await?);
-        let did_mgr = Arc::new(KeyDidManager);
-        let params = DidCreateParams::Key(DidKeyCreateOptions {
-            jwk: String::new(),
-            use_jcs_pub: true,
-        });
-        let initial_did = did_mgr
-            .create(&params)
+        let identity_mgr = Arc::new(KeriIdentityManager::new());
+        let initial_aid = identity_mgr
+            .create()
             .await
-            .map_err(|e| anyhow::anyhow!("did create error: {e}"))?;
-        let current_did = Arc::new(Mutex::new(initial_did));
+            .map_err(|e| anyhow::anyhow!("identity create error: {e}"))?;
 
         let owner = sync_engine
             .subspace_id()
             .await
             .map_err(|e| anyhow::anyhow!("willow subspace id error: {e}"))?;
+        // TODO(personal-namespaces): Replace create_namespace() with home_namespace().
+        // The node should use a single personal namespace, not ad-hoc ones.
         let namespace = sync_engine
             .create_namespace(&owner)
             .await
@@ -58,13 +57,15 @@ impl DemoNode {
             .await
             .map_err(|e| anyhow::anyhow!("node addr error: {e}"))?;
 
-        let invites = Arc::new(Mutex::new(HashMap::<Did, Invite>::new()));
-        let contacts = Arc::new(Mutex::new(HashMap::<Did, Contact>::new()));
+        // TODO(persistent-storage): Replace in-memory HashMaps with persistent storage
+        // (redb or _local/ entries in home namespace). Lost on restart.
+        let invites = Arc::new(Mutex::new(HashMap::<Aid, Invite>::new()));
+        let contacts = Arc::new(Mutex::new(HashMap::<Aid, Contact>::new()));
         let persona = Arc::new(Mutex::new(HashMap::<String, String>::new()));
 
         let identity = DemoIdentityService {
-            did_mgr: did_mgr.clone(),
-            current: current_did.clone(),
+            identity_mgr: identity_mgr.clone(),
+            current: Arc::new(Mutex::new(initial_aid)),
             invites: invites.clone(),
             contacts: contacts.clone(),
             persona: persona.clone(),
@@ -73,7 +74,7 @@ impl DemoNode {
         let trust = DemoTrustService {
             sync: sync_engine.clone(),
             namespace,
-            current_did: current_did.clone(),
+            current_aid: Arc::new(Mutex::new(initial_aid)),
             invites,
             contacts,
         };
@@ -130,36 +131,38 @@ impl Node for DemoNode {
 
 #[derive(Clone)]
 pub struct DemoIdentityService {
-    did_mgr: Arc<KeyDidManager>,
-    current: Arc<Mutex<Did>>,
-    invites: Arc<Mutex<HashMap<Did, Invite>>>,
-    contacts: Arc<Mutex<HashMap<Did, Contact>>>,
+    identity_mgr: Arc<KeriIdentityManager>,
+    current: Arc<Mutex<Aid>>,
+    invites: Arc<Mutex<HashMap<Aid, Invite>>>,
+    contacts: Arc<Mutex<HashMap<Aid, Contact>>>,
     persona: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[allow(async_fn_in_trait, clippy::expect_used)]
 impl IdentityService for DemoIdentityService {
-    fn current(&self) -> Did {
-        self.current
-            .lock()
-            .expect("current DID lock poisoned")
-            .clone()
+    fn aid(&self) -> Aid {
+        *self.current.lock().expect("current AID lock poisoned")
     }
 
-    async fn create(&self, params: &DidCreateParams) -> Result<Did, mee_did_api::DidError> {
-        let did = self.did_mgr.create(params).await?;
-        *self.current.lock().expect("current DID lock poisoned") = did.clone();
+    // TODO: Identity re-creation shouldn't wipe invites/contacts/persona
+    // once persistent storage exists. Demo-only shortcut.
+    async fn create(&self) -> Result<Aid, mee_identity_api::IdentityError> {
+        let aid = self.identity_mgr.create().await?;
+        *self.current.lock().expect("current AID lock poisoned") = aid;
         self.invites.lock().expect("invites lock poisoned").clear();
         self.contacts
             .lock()
             .expect("contacts lock poisoned")
             .clear();
         self.persona.lock().expect("persona lock poisoned").clear();
-        Ok(did)
+        Ok(aid)
     }
 
-    async fn resolve(&self, did: &Did) -> Result<mee_did_api::DidDocument, mee_did_api::DidError> {
-        self.did_mgr.resolve(did).await
+    async fn resolve(
+        &self,
+        aid: &Aid,
+    ) -> Result<mee_identity_api::IdentityState, mee_identity_api::IdentityError> {
+        self.identity_mgr.resolve(aid).await
     }
 }
 
@@ -167,9 +170,9 @@ impl IdentityService for DemoIdentityService {
 pub struct DemoTrustService {
     sync: Arc<IrohWillowSyncCore>,
     namespace: NamespaceId,
-    current_did: Arc<Mutex<Did>>,
-    invites: Arc<Mutex<HashMap<Did, Invite>>>,
-    contacts: Arc<Mutex<HashMap<Did, Contact>>>,
+    current_aid: Arc<Mutex<Aid>>,
+    invites: Arc<Mutex<HashMap<Aid, Invite>>>,
+    contacts: Arc<Mutex<HashMap<Aid, Contact>>>,
 }
 
 #[allow(async_fn_in_trait, clippy::expect_used, clippy::unwrap_in_result)]
@@ -179,16 +182,13 @@ impl TrustService for DemoTrustService {
     }
 
     async fn create_invite(&self) -> Result<Invite, SyncError> {
-        let inviter = self
-            .current_did
-            .lock()
-            .expect("current DID lock poisoned")
-            .clone();
+        let inviter = *self.current_aid.lock().expect("current AID lock poisoned");
         let node = self.sync.addr().await?;
         let subspace_id = self.sync.subspace_id().await?;
+        // TODO: Make invite expiry configurable instead of hardcoded 10 minutes.
         let expires_at = now_ms() + 10 * 60 * 1000;
         let mut invite = Invite {
-            inviter_did: inviter,
+            inviter_aid: inviter,
             subspace_id,
             node,
             expires_at,
@@ -213,14 +213,14 @@ impl TrustService for DemoTrustService {
         self.invites
             .lock()
             .expect("invites lock poisoned")
-            .insert(invite.inviter_did.clone(), invite);
+            .insert(invite.inviter_aid, invite);
     }
 
-    fn invite_for(&self, did: &Did) -> Option<Invite> {
+    fn invite_for(&self, aid: &Aid) -> Option<Invite> {
         self.invites
             .lock()
             .expect("invites lock poisoned")
-            .get(did)
+            .get(aid)
             .cloned()
     }
 
@@ -228,14 +228,14 @@ impl TrustService for DemoTrustService {
         self.contacts
             .lock()
             .expect("contacts lock poisoned")
-            .insert(contact.did.clone(), contact);
+            .insert(contact.aid, contact);
     }
 
-    fn contact(&self, did: &Did) -> Option<Contact> {
+    fn contact(&self, aid: &Aid) -> Option<Contact> {
         self.contacts
             .lock()
             .expect("contacts lock poisoned")
-            .get(did)
+            .get(aid)
             .cloned()
     }
 
@@ -385,6 +385,8 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+// TODO(keri): Replace SHA256 placeholder with Ed25519 signature using
+// the operational private key from the signer's KEL.
 fn compute_invite_sig(inv: &Invite) -> InviteSignature {
     let mut h = Sha256::new();
     let relay = inv
@@ -402,7 +404,7 @@ fn compute_invite_sig(inv: &Invite) -> InviteSignature {
     addrs.sort();
     let data = format!(
         "demo|{}|{}|{}|{}|{}",
-        inv.inviter_did,
+        inv.inviter_aid,
         inv.subspace_id,
         inv.node.node_id,
         addrs.join(","),
@@ -414,6 +416,8 @@ fn compute_invite_sig(inv: &Invite) -> InviteSignature {
     InviteSignature::new(hex::encode(out))
 }
 
+// TODO(keri): Replace with Ed25519 signature verification using the
+// resolved IdentityState's operational public key.
 fn verify_invite(inv: &Invite) -> Result<(), SyncError> {
     if now_ms() > inv.expires_at {
         return Err(SyncError::Other("invite expired".into()));

@@ -1,13 +1,13 @@
 // #![cfg(target_arch = "wasm32")]
 
-use mee_did_api::DidProvider;
+use mee_identity_api::{IdentityError, IdentityState};
 use mee_node_api::{
     Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
     TrustService,
 };
 use mee_sync_api as api;
 use mee_sync_api::AccessMode;
-use mee_types::{Did, NodeId};
+use mee_types::{Aid, NodeId};
 use serde_json as _;
 use wasm_bindgen::prelude::*;
 
@@ -21,15 +21,9 @@ pub fn version() -> String {
 }
 
 #[wasm_bindgen]
-pub fn did_method_of(did: &str) -> String {
-    let method = Did(did.to_owned()).method();
-    method.to_string()
-}
-
-#[wasm_bindgen]
-pub fn did_key_manager_method() -> String {
-    let mgr = mee_did_key::KeyDidManager;
-    mgr.method().to_string()
+pub fn aid_hex_roundtrip(hex: &str) -> String {
+    let aid: Aid = hex.parse().unwrap_or_else(|_| Aid::from_bytes(ZERO_ID));
+    aid.to_string()
 }
 
 // --- Noop implementations for WASM build-check ---
@@ -94,26 +88,27 @@ pub struct WasmIdentityService;
 
 #[allow(async_fn_in_trait)]
 impl IdentityService for WasmIdentityService {
-    fn current(&self) -> Did {
-        Did("did:key:zwasm".into())
+    // TODO(keri): Return real stored AID once WASM key storage exists.
+    fn aid(&self) -> Aid {
+        Aid::from_bytes(ZERO_ID)
     }
-    async fn create(
-        &self,
-        params: &mee_did_api::DidCreateParams,
-    ) -> Result<Did, mee_did_api::DidError> {
-        let mgr = mee_did_key::KeyDidManager;
-        mgr.create(params).await
+    // TODO(keri): Implement KERI inception via WebCrypto API.
+    async fn create(&self) -> Result<Aid, IdentityError> {
+        Ok(Aid::from_bytes(ZERO_ID))
     }
-    async fn resolve(&self, _did: &Did) -> Result<mee_did_api::DidDocument, mee_did_api::DidError> {
-        Ok(mee_did_api::DidDocument {
-            id: Did("did:key:zwasm".into()),
-            verification_method_ids: vec![],
+    // TODO(keri): Implement KEL resolution for WASM target.
+    async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError> {
+        Ok(IdentityState {
+            aid: *aid,
+            current_operational_key: *aid.as_bytes(),
         })
     }
 }
 
 // --- TrustService ---
 
+// TODO: All methods are no-ops. Implement using browser storage
+// (IndexedDB/localStorage) once WASM runtime matures.
 #[derive(Clone)]
 pub struct WasmTrustService;
 
@@ -124,7 +119,7 @@ impl TrustService for WasmTrustService {
     }
     async fn create_invite(&self) -> Result<Invite, api::SyncError> {
         Ok(Invite {
-            inviter_did: Did("did:key:zwasm".into()),
+            inviter_aid: Aid::from_bytes(ZERO_ID),
             subspace_id: api::SubspaceId::from_bytes(ZERO_ID),
             node: api::NodeAddr {
                 node_id: NodeId::from_bytes(ZERO_ID),
@@ -146,11 +141,11 @@ impl TrustService for WasmTrustService {
         })
     }
     fn remember_invite(&self, _invite: Invite) {}
-    fn invite_for(&self, _did: &Did) -> Option<Invite> {
+    fn invite_for(&self, _aid: &Aid) -> Option<Invite> {
         None
     }
     fn add_contact(&self, _contact: Contact) {}
-    fn contact(&self, _did: &Did) -> Option<Contact> {
+    fn contact(&self, _aid: &Aid) -> Option<Contact> {
         None
     }
     fn contacts(&self) -> Vec<Contact> {
@@ -160,6 +155,8 @@ impl TrustService for WasmTrustService {
 
 // --- DataService ---
 
+// TODO: All methods are no-ops. Implement using browser storage
+// once WASM runtime matures.
 #[derive(Clone)]
 pub struct WasmDataService;
 

@@ -11,7 +11,7 @@ use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
 use mee_sync_api::{AccessMode, SyncError};
 use mee_sync_iroh_willow::DiscoveryConfig;
-use mee_types::Did;
+use mee_types::Aid;
 use serde::{Deserialize, Serialize};
 
 use std::net::SocketAddr;
@@ -35,6 +35,8 @@ impl AppState {
             "full" => DiscoveryConfig::full(),
             _ => DiscoveryConfig::disabled(),
         };
+        // TODO(persistent-storage): Read MEE_DATA_DIR env var and pass to
+        // DemoNode::spawn(). Default to ./var/data/{port}/.
         let node = DemoNode::spawn(config)
             .await
             .map_err(|e| SyncError::Other(e.to_string()))?;
@@ -85,20 +87,20 @@ async fn main() -> anyhow::Result<()> {
             post(|state, payload| async move { p2p_bind(state, payload).await }),
         )
         .route(
-            "/p2p/ticket-by-did",
-            post(|state, payload| async move { p2p_ticket_by_did(state, payload).await }),
+            "/p2p/ticket-by-aid",
+            post(|state, payload| async move { p2p_ticket_by_aid(state, payload).await }),
         )
         .route(
-            "/p2p/user-did",
-            get(|state| async move { p2p_user_did(state).await }),
+            "/p2p/user-aid",
+            get(|state| async move { p2p_user_aid(state).await }),
         )
         .route(
-            "/p2p/validate-did",
-            post(|state, payload| async move { p2p_validate_did(state, payload).await }),
+            "/p2p/validate-aid",
+            post(|state, payload| async move { p2p_validate_aid(state, payload).await }),
         )
         .route(
             "/p2p/identity",
-            post(|state, payload| async move { p2p_create_identity(state, payload).await }),
+            post(|state| async move { p2p_create_identity(state).await }),
         )
         .route(
             "/p2p/ticket",
@@ -159,17 +161,20 @@ async fn p2p_subspace_id(state: axum::extract::State<AppState>) -> Response {
 }
 
 #[derive(Serialize)]
-struct UserDidResp {
-    user_did: String,
+struct UserAidResp {
+    user_aid: String,
 }
 
-async fn p2p_user_did(state: axum::extract::State<AppState>) -> Response {
+async fn p2p_user_aid(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    let did = n.identity().current();
-    Json(UserDidResp { user_did: did.0 }).into_response()
+    let aid = n.identity().aid();
+    Json(UserAidResp {
+        user_aid: aid.to_string(),
+    })
+    .into_response()
 }
 
 async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
@@ -204,7 +209,7 @@ async fn p2p_connect(
     // Remember the invite and contact before connecting
     trust.remember_invite(invite.clone());
     trust.add_contact(Contact {
-        did: invite.inviter_did.clone(),
+        aid: invite.inviter_aid,
         alias: None,
     });
     // Connect P2P: delegates capabilities and sends ticket
@@ -232,30 +237,30 @@ async fn p2p_bind(state: axum::extract::State<AppState>, Json(req): Json<BindReq
     let trust = n.trust();
     trust.remember_invite(req.invite.clone());
     trust.add_contact(Contact {
-        did: req.invite.inviter_did,
+        aid: req.invite.inviter_aid,
         alias: None,
     });
     "bound".to_owned().into_response()
 }
 
 #[derive(Deserialize)]
-struct TicketByDidReq {
-    did: Did,
+struct TicketByAidReq {
+    aid: Aid,
     #[serde(default)]
     access: Option<AccessMode>,
 }
 
-async fn p2p_ticket_by_did(
+async fn p2p_ticket_by_aid(
     state: axum::extract::State<AppState>,
-    Json(req): Json<TicketByDidReq>,
+    Json(req): Json<TicketByAidReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
     let trust = n.trust();
-    let Some(invite) = trust.invite_for(&req.did) else {
-        return internal_str("did not bound; import invite first").into_response();
+    let Some(invite) = trust.invite_for(&req.aid) else {
+        return internal_str("aid not bound; import invite first").into_response();
     };
     let access = req.access.unwrap_or(AccessMode::Read);
     match trust.accept_invite(&invite, access).await {
@@ -343,51 +348,41 @@ async fn p2p_events(state: axum::extract::State<AppState>) -> Response {
 }
 
 #[derive(Deserialize)]
-struct ValidateDidReq {
-    did: Did,
+struct ValidateAidReq {
+    aid: Aid,
 }
 
-async fn p2p_validate_did(
+async fn p2p_validate_aid(
     state: axum::extract::State<AppState>,
-    Json(req): Json<ValidateDidReq>,
+    Json(req): Json<ValidateAidReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.identity().resolve(&req.did).await {
-        Ok(doc) => Json(doc.id.0).into_response(),
-        Err(e) => internal_str(&format!("did resolve error: {e}")).into_response(),
+    match n.identity().resolve(&req.aid).await {
+        Ok(identity_state) => Json(identity_state.aid.to_string()).into_response(),
+        Err(e) => internal_str(&format!("identity resolve error: {e}")).into_response(),
     }
 }
 
-#[derive(Deserialize)]
-struct CreateIdentityReq {
-    #[serde(default)]
-    jwk: String,
-    #[serde(default)]
-    use_jcs_pub: bool,
-}
-
+// TODO(keri): Add params for key type, witness config when real
+// KERI inception is implemented. Currently parameterless.
 #[derive(Serialize)]
 struct CreateIdentityResp {
-    did: String,
+    aid: String,
 }
 
-async fn p2p_create_identity(
-    state: axum::extract::State<AppState>,
-    Json(req): Json<CreateIdentityReq>,
-) -> Response {
+async fn p2p_create_identity(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    let params = mee_did_api::DidCreateParams::Key(mee_did_api::DidKeyCreateOptions {
-        jwk: req.jwk,
-        use_jcs_pub: req.use_jcs_pub,
-    });
-    match n.identity().create(&params).await {
-        Ok(did) => Json(CreateIdentityResp { did: did.0 }).into_response(),
+    match n.identity().create().await {
+        Ok(aid) => Json(CreateIdentityResp {
+            aid: aid.to_string(),
+        })
+        .into_response(),
         Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
     }
 }

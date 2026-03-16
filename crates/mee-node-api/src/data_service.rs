@@ -22,6 +22,9 @@ pub enum DataError {
     Io(#[from] std::io::Error),
 }
 
+// TODO(personal-namespaces): Add namespace-aware and path-scoped methods for
+// personal namespace model. Current flat key/value API doesn't
+// distinguish owner subspace from guest subspaces or _sys/ paths.
 #[allow(async_fn_in_trait)]
 pub trait DataService: Send + Sync {
     async fn set(&self, key: &str, value: &str) -> Result<(), DataError>;

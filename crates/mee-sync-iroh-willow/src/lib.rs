@@ -1,3 +1,6 @@
+#[cfg(feature = "gossip")]
+pub mod gossip;
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
 
@@ -41,6 +44,9 @@ pub struct DiscoveryConfig {
     /// Clear all IP transports before binding. Required for test
     /// stability on multi-homed machines (prevents multipath flakiness).
     pub clear_ip_transports: bool,
+    /// Gossip discovery config. None = gossip disabled.
+    #[cfg(feature = "gossip")]
+    pub gossip: Option<gossip::GossipConfig>,
 }
 
 impl DiscoveryConfig {
@@ -52,6 +58,8 @@ impl DiscoveryConfig {
             n0_discovery: false,
             bind_addr: None,
             clear_ip_transports: false,
+            #[cfg(feature = "gossip")]
+            gossip: None,
         }
     }
 
@@ -63,6 +71,8 @@ impl DiscoveryConfig {
             n0_discovery: false,
             bind_addr: None,
             clear_ip_transports: false,
+            #[cfg(feature = "gossip")]
+            gossip: None,
         }
     }
 
@@ -74,6 +84,8 @@ impl DiscoveryConfig {
             n0_discovery: true,
             bind_addr: None,
             clear_ip_transports: false,
+            #[cfg(feature = "gossip")]
+            gossip: None,
         }
     }
 
@@ -89,6 +101,8 @@ impl DiscoveryConfig {
                 0u16,
             )),
             clear_ip_transports: true,
+            #[cfg(feature = "gossip")]
+            gossip: None,
         }
     }
 }
@@ -201,7 +215,7 @@ impl ConnectHandler {
 // -- Shared helpers ---------------------------------------------------------
 
 /// Convert an `api::NodeAddr` to an iroh `EndpointAddr`.
-fn to_iroh_addr(addr: &api::NodeAddr) -> Result<IrohNodeAddr, SyncError> {
+pub(crate) fn to_iroh_addr(addr: &api::NodeAddr) -> Result<IrohNodeAddr, SyncError> {
     let node_id = IrohNodeId::from_bytes(addr.node_id.as_bytes())
         .map_err(|e| SyncError::InvalidId(e.to_string()))?;
     let set: BTreeSet<SocketAddr> = addr.direct_addresses.iter().map(|d| d.0).collect();
@@ -217,17 +231,17 @@ fn to_iroh_addr(addr: &api::NodeAddr) -> Result<IrohNodeAddr, SyncError> {
 }
 
 /// Convert an `api::NamespaceId` to the iroh-willow type.
-fn to_willow_ns(ns: &api::NamespaceId) -> iroh_willow::proto::keys::NamespaceId {
+pub(crate) fn to_willow_ns(ns: &api::NamespaceId) -> iroh_willow::proto::keys::NamespaceId {
     iroh_willow::proto::keys::NamespaceId::from_bytes_unchecked(*ns.as_bytes())
 }
 
 /// Convert an `api::SubspaceId` to a Willow `UserId`.
-fn to_willow_user(sub: &api::SubspaceId) -> iroh_willow::proto::keys::UserId {
+pub(crate) fn to_willow_user(sub: &api::SubspaceId) -> iroh_willow::proto::keys::UserId {
     iroh_willow::proto::keys::UserId::from_bytes_unchecked(*sub.as_bytes())
 }
 
 /// Build an `api::NodeAddr` from an iroh `EndpointAddr`.
-fn from_iroh_addr(a: &IrohNodeAddr) -> api::NodeAddr {
+pub(crate) fn from_iroh_addr(a: &IrohNodeAddr) -> api::NodeAddr {
     let direct_addresses = a
         .ip_addrs()
         .map(|sa| api::DirectAddress::from(*sa))
@@ -240,6 +254,66 @@ fn from_iroh_addr(a: &IrohNodeAddr) -> api::NodeAddr {
         node_id: api::NodeId::from_bytes(*a.id.as_bytes()),
         direct_addresses,
         relay_url,
+    }
+}
+
+// -- Shared connect logic --------------------------------------------------
+
+/// Send a `SyncTicket` to a peer over the mee-connect/0 protocol.
+///
+/// Extracted from `connect_and_share` so the gossip event loop
+/// can reuse the same connection protocol.
+pub(crate) async fn send_ticket(
+    endpoint: &Endpoint,
+    peer_addr: &api::NodeAddr,
+    ticket: api::SyncTicket,
+) -> Result<(), SyncError> {
+    let addr = to_iroh_addr(peer_addr)?;
+    let conn = endpoint
+        .connect(addr, MEE_CONNECT_ALPN)
+        .await
+        .map_err(|e| SyncError::Backend(format!("connect to peer: {e}")))?;
+
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+    let req = ConnectRequest { ticket };
+    let req_bytes = serde_json::to_vec(&req)
+        .map_err(|e| SyncError::Backend(format!("serialize request: {e}")))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let req_len = req_bytes.len() as u32;
+    send.write_u32(req_len)
+        .await
+        .map_err(|e| SyncError::Backend(e.to_string()))?;
+    send.write_all(&req_bytes)
+        .await
+        .map_err(|e| SyncError::Backend(e.to_string()))?;
+    send.finish()
+        .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+    let resp_len = recv
+        .read_u32()
+        .await
+        .map_err(|e| SyncError::Backend(format!("read response length: {e}")))?;
+    let mut resp_buf = vec![0u8; resp_len as usize];
+    recv.read_exact(&mut resp_buf)
+        .await
+        .map_err(|e| SyncError::Backend(format!("read response: {e}")))?;
+
+    let resp: ConnectResponse = serde_json::from_slice(&resp_buf)
+        .map_err(|e| SyncError::Backend(format!("parse response: {e}")))?;
+
+    conn.close(0u32.into(), b"done");
+
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(SyncError::Backend(
+            resp.error
+                .unwrap_or_else(|| "peer rejected connection".to_owned()),
+        ))
     }
 }
 
@@ -306,6 +380,8 @@ pub struct IrohWillowSyncCore {
     owner_user: iroh_willow::proto::keys::UserId,
     _router: Router,
     imported_namespaces: Arc<Mutex<HashSet<api::NamespaceId>>>,
+    #[cfg(feature = "gossip")]
+    gossip_manager: Option<gossip::GossipManager>,
 }
 
 impl IrohWillowSyncCore {
@@ -314,8 +390,12 @@ impl IrohWillowSyncCore {
         &self.endpoint
     }
 
+    #[allow(unused_mut, clippy::too_many_lines)]
     pub async fn spawn(config: DiscoveryConfig) -> Result<Self, SyncError> {
-        let mut builder = Endpoint::empty_builder(config.relay_mode).alpns(vec![ALPN.to_vec()]);
+        let mut alpns = vec![ALPN.to_vec()];
+        #[cfg(feature = "gossip")]
+        alpns.push(iroh_gossip::ALPN.to_vec());
+        let mut builder = Endpoint::empty_builder(config.relay_mode).alpns(alpns);
 
         if config.n0_discovery {
             builder = builder
@@ -343,6 +423,11 @@ impl IrohWillowSyncCore {
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
 
+        // TODO(persistent-storage): Switch to persistent storage backends:
+        // - iroh_blobs::store::fs::Store (loaded from data_dir)
+        // - iroh_willow::store::persistent::Store (redb-backed)
+        // Accept data_dir: Option<PathBuf> in spawn(). When None, keep
+        // in-memory for tests.
         let blobs = iroh_blobs::store::mem::MemStore::default();
         let create_store = move || iroh_willow::store::memory::Store::new(blobs.clone());
         let engine = WillowEngine::spawn(endpoint.clone(), create_store, AcceptOpts::default());
@@ -360,10 +445,40 @@ impl IrohWillowSyncCore {
             imported_namespaces: imported_namespaces.clone(),
         };
 
-        let router = Router::builder(endpoint.clone())
+        // Create Gossip instance before Router
+        #[cfg(feature = "gossip")]
+        let gossip_instance = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
+
+        let mut router_builder = Router::builder(endpoint.clone())
             .accept(ALPN, engine.clone())
-            .accept(MEE_CONNECT_ALPN, connect_handler)
-            .spawn();
+            .accept(MEE_CONNECT_ALPN, connect_handler);
+
+        #[cfg(feature = "gossip")]
+        {
+            router_builder = router_builder.accept(iroh_gossip::ALPN, gossip_instance.clone());
+        }
+
+        let router = router_builder.spawn();
+
+        // Start gossip manager after Router is up
+        #[cfg(feature = "gossip")]
+        let gossip_manager = if let Some(gossip_config) = config.gossip {
+            Some(
+                gossip::GossipManager::start(
+                    gossip_instance,
+                    endpoint.clone(),
+                    engine.clone(),
+                    client.clone(),
+                    imported_namespaces.clone(),
+                    owner_user,
+                    gossip_config,
+                )
+                .await
+                .map_err(|e| SyncError::Backend(e.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
             endpoint,
@@ -372,7 +487,15 @@ impl IrohWillowSyncCore {
             owner_user,
             _router: router,
             imported_namespaces,
+            #[cfg(feature = "gossip")]
+            gossip_manager,
         })
+    }
+
+    /// Access the gossip manager (if gossip is enabled).
+    #[cfg(feature = "gossip")]
+    pub fn gossip_manager(&self) -> Option<&gossip::GossipManager> {
+        self.gossip_manager.as_ref()
     }
 }
 
@@ -415,6 +538,7 @@ impl api::SyncEngine for IrohWillowSyncCore {
         Ok(api::SubspaceId::from_bytes(*self.owner_user.as_bytes()))
     }
 
+    #[allow(clippy::expect_used)]
     async fn create_namespace(
         &self,
         owner: &api::SubspaceId,
@@ -425,9 +549,13 @@ impl api::SyncEngine for IrohWillowSyncCore {
             .create(iroh_willow::proto::keys::NamespaceKind::Owned, u)
             .await
             .map_err(|e| SyncError::Backend(e.to_string()))?;
-        Ok(api::NamespaceId::from_bytes(
-            *space.namespace_id().as_bytes(),
-        ))
+        let ns_id = api::NamespaceId::from_bytes(*space.namespace_id().as_bytes());
+        // Track for gossip advertisement
+        self.imported_namespaces
+            .lock()
+            .expect("imported_namespaces lock poisoned")
+            .insert(ns_id);
+        Ok(ns_id)
     }
 
     async fn list_namespaces(&self) -> Result<Vec<api::NamespaceId>, SyncError> {
@@ -487,12 +615,16 @@ impl api::SyncEngine for IrohWillowSyncCore {
         Ok(api::SyncTicket {
             caps: caps
                 .into_iter()
+                // TODO: Propagate serialization errors instead of silently falling
+                // back to empty JSON object.
                 .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::json!({})))
                 .collect(),
             nodes: vec![node_addr],
         })
     }
 
+    // TODO: Respect SyncMode parameter. Currently always uses Continuous
+    // mode regardless of caller request (ReconcileOnce is ignored).
     async fn import_and_sync(
         &self,
         ticket: api::SyncTicket,
@@ -509,63 +641,8 @@ impl api::SyncEngine for IrohWillowSyncCore {
         peer_addr: &api::NodeAddr,
         access: api::AccessMode,
     ) -> Result<(), SyncError> {
-        // 1. Delegate capabilities and build a ticket
         let ticket = self.share(ns, to, access).await?;
-
-        // 2. Resolve peer's iroh address
-        let addr = to_iroh_addr(peer_addr)?;
-
-        // 3. Connect to peer over mee-connect ALPN
-        let conn = self
-            .endpoint
-            .connect(addr, MEE_CONNECT_ALPN)
-            .await
-            .map_err(|e| SyncError::Backend(format!("connect to peer: {e}")))?;
-
-        // 4. Send ticket over bi-stream
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| SyncError::Backend(e.to_string()))?;
-
-        let req = ConnectRequest { ticket };
-        let req_bytes = serde_json::to_vec(&req)
-            .map_err(|e| SyncError::Backend(format!("serialize request: {e}")))?;
-        #[allow(clippy::cast_possible_truncation)]
-        let req_len = req_bytes.len() as u32;
-        send.write_u32(req_len)
-            .await
-            .map_err(|e| SyncError::Backend(e.to_string()))?;
-        send.write_all(&req_bytes)
-            .await
-            .map_err(|e| SyncError::Backend(e.to_string()))?;
-        send.finish()
-            .map_err(|e| SyncError::Backend(e.to_string()))?;
-
-        // 5. Read response
-        let resp_len = recv
-            .read_u32()
-            .await
-            .map_err(|e| SyncError::Backend(format!("read response length: {e}")))?;
-        let mut resp_buf = vec![0u8; resp_len as usize];
-        recv.read_exact(&mut resp_buf)
-            .await
-            .map_err(|e| SyncError::Backend(format!("read response: {e}")))?;
-
-        let resp: ConnectResponse = serde_json::from_slice(&resp_buf)
-            .map_err(|e| SyncError::Backend(format!("parse response: {e}")))?;
-
-        // Close the connection gracefully
-        conn.close(0u32.into(), b"done");
-
-        if resp.ok {
-            Ok(())
-        } else {
-            Err(SyncError::Backend(
-                resp.error
-                    .unwrap_or_else(|| "peer rejected connection".to_owned()),
-            ))
-        }
+        send_ticket(&self.endpoint, peer_addr, ticket).await
     }
 
     async fn insert(

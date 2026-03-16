@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -133,139 +132,21 @@ define_byte_id! {
     pub struct NodeId;
 }
 
-// -- DID types (genuinely string-backed) ------------------------------------
+// -- KERI identity types ----------------------------------------------------
 
-/// person-level identity
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UserDid(pub Did);
-impl From<Did> for UserDid {
-    fn from(d: Did) -> Self {
-        Self(d)
-    }
-}
-impl From<&str> for UserDid {
-    fn from(s: &str) -> Self {
-        Self(Did::from(s))
-    }
-}
-impl fmt::Display for UserDid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Did(pub String);
-impl From<&str> for Did {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
-}
-impl From<String> for Did {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-impl AsRef<str> for Did {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-impl fmt::Display for Did {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl Did {
-    pub fn method(&self) -> DidMethod {
-        let s = self.as_ref();
-        if let Some(rest) = s.strip_prefix("did:") {
-            let method = rest.split(':').next().unwrap_or("");
-            if !method.is_empty() {
-                return DidMethod::from(method);
-            }
-        }
-        DidMethod::Unknown(String::new())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DidMethod {
-    Key,
-    Web,
-    Peer,
-    Unknown(String),
-}
-impl DidMethod {
-    pub fn as_str(&self) -> &str {
-        match self {
-            DidMethod::Key => "key",
-            DidMethod::Web => "web",
-            DidMethod::Peer => "peer",
-            DidMethod::Unknown(s) => s.as_str(),
-        }
-    }
-}
-impl From<&str> for DidMethod {
-    fn from(s: &str) -> Self {
-        match s {
-            "key" => Self::Key,
-            "web" => Self::Web,
-            "peer" => Self::Peer,
-            other => Self::Unknown(other.to_owned()),
-        }
-    }
-}
-impl From<String> for DidMethod {
-    fn from(s: String) -> Self {
-        Self::from(s.as_str())
-    }
-}
-impl AsRef<str> for DidMethod {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-impl fmt::Display for DidMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DidUrl(pub String);
-impl From<&str> for DidUrl {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
-}
-impl From<String> for DidUrl {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-impl fmt::Display for DidUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl DidUrl {
-    pub fn did(&self) -> Did {
-        match self.0.split_once('#') {
-            Some((d, _)) => Did(d.to_owned()),
-            None => Did(self.0.clone()),
-        }
-    }
-    pub fn fragment(&self) -> Option<&str> {
-        self.0.split_once('#').map(|(_, frag)| frag)
-    }
+define_byte_id! {
+    /// KERI Autonomic Identifier (ed25519 inception public key, 32 bytes).
+    ///
+    /// A self-certifying root identifier that never changes even as
+    /// operational keys rotate. Derived from the ed25519 public key
+    /// present in the KERI inception event.
+    pub struct Aid;
 }
 
 // -- Roadmap placeholders ---------------------------------------------------
 
+// TODO: Integrate into identity/trust layer once persona management
+// is implemented. Currently defined but unused.
 /// Classification of a persona's visibility scope.
 /// Maps to the First Person Network's P-DID / C-DID / U-DID concepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

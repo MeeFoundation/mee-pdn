@@ -1,7 +1,7 @@
 [workspace]
 members = [
-  "crates/mee-did-api", # DID provider api & types
-  "crates/mee-did-key", # stub did:key provider
+  "crates/mee-identity-api", # KERI identity API & types
+  "crates/mee-identity-keri", # KERI identity provider (placeholder impl)
   "crates/mee-node-api", # node api & types
   "crates/mee-wasm", # minimal wasm facade (wasm-bindgen)
   "crates/mee-types", # shared domain types

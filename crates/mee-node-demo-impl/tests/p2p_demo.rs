@@ -34,7 +34,7 @@ async fn wait_for_entry_via_list(sync: &impl SyncService, expected_path: &str, m
 /// This is the Rust equivalent of `just p2p-demo`.
 ///
 /// Flow:
-/// 1. Bob creates an invite (contains his DID, subspace, address)
+/// 1. Bob creates an invite (contains his AID, subspace, address)
 /// 2. Alice connects using Bob's invite — this shares Alice's namespace
 ///    with Bob via `connect_and_share`
 /// 3. Alice inserts an entry into her own namespace
@@ -56,7 +56,7 @@ async fn invite_connect_and_replicate() {
         // Alice remembers the invite and connects
         alice.trust().remember_invite(invite.clone());
         alice.trust().add_contact(Contact {
-            did: invite.inviter_did.clone(),
+            aid: invite.inviter_aid,
             alias: None,
         });
         alice

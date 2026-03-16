@@ -222,7 +222,8 @@ impl AsRef<str> for EntryPath {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncTicket {
-    // Keep caps opaque so the API is backend-agnostic
+    // TODO: Replace opaque serde_json::Value caps with a typed capability
+    // representation once meadowcap serialization format stabilises.
     pub caps: Vec<serde_json::Value>,
     pub nodes: Vec<NodeAddr>,
 }
@@ -260,6 +261,8 @@ pub struct EntryInfo {
 // Roadmap placeholders
 // ---------------------------------------------------------------------------
 
+// TODO(personal-namespaces): Integrate into create_namespace() and
+// home_namespace(). Currently defined but unused.
 /// Whether a namespace is single-owner or communal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NamespaceKind {
@@ -269,6 +272,8 @@ pub enum NamespaceKind {
     Communal,
 }
 
+// TODO(personal-namespaces): Integrate into capability delegation.
+// Currently defined but unused.
 /// A principal's role within a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NamespaceRole {
@@ -288,6 +293,11 @@ pub trait SyncHandle: Stream<Item = SyncEvent> + Send + Unpin {
     ) -> Pin<Box<dyn Future<Output = Result<(), SyncError>> + Send + 'a>>;
 }
 
+// TODO(personal-namespaces): Add home namespace support:
+// - async fn home_namespace(&self) -> Result<NamespaceId, SyncError>;
+//   Creates on first call, reloads from persistent store after restart.
+// - async fn publish_sys_metadata(&self, path: &str, data: &[u8]) -> ...;
+//   Writes to _sys/{path} in home namespace (addrs, kel, peers).
 #[allow(async_fn_in_trait)]
 pub trait SyncEngine: Send + Sync {
     async fn addr(&self) -> Result<NodeAddr, SyncError>;

@@ -12,6 +12,9 @@ use mee_sync_api::{self as api, SyncEngine};
 
 use crate::{DiscoveryConfig, IrohWillowSyncCore};
 
+#[cfg(feature = "gossip")]
+use crate::gossip;
+
 /// A test-friendly wrapper around the sync core.
 ///
 /// Uses [`DiscoveryConfig::test()`] to enforce localhost-only binding
@@ -25,6 +28,33 @@ impl TestNode {
     /// Spawn a single test node bound to localhost on an OS-assigned port.
     pub async fn spawn(label: &str) -> Result<Self, api::SyncError> {
         let core = IrohWillowSyncCore::spawn(DiscoveryConfig::test()).await?;
+        Ok(Self {
+            core,
+            label: label.to_owned(),
+        })
+    }
+
+    /// Spawn a test node with gossip discovery enabled.
+    #[cfg(feature = "gossip")]
+    pub async fn spawn_with_gossip(label: &str) -> Result<Self, api::SyncError> {
+        let mut config = DiscoveryConfig::test();
+        config.gossip = Some(gossip::GossipConfig::test());
+        let core = IrohWillowSyncCore::spawn(config).await?;
+        Ok(Self {
+            core,
+            label: label.to_owned(),
+        })
+    }
+
+    /// Spawn a test node with a custom gossip config.
+    #[cfg(feature = "gossip")]
+    pub async fn spawn_with_gossip_config(
+        label: &str,
+        gossip_config: gossip::GossipConfig,
+    ) -> Result<Self, api::SyncError> {
+        let mut config = DiscoveryConfig::test();
+        config.gossip = Some(gossip_config);
+        let core = IrohWillowSyncCore::spawn(config).await?;
         Ok(Self {
             core,
             label: label.to_owned(),
@@ -129,4 +159,62 @@ pub async fn wait_for_entry_count(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Poll the gossip manager's peer cache until at least `min_count`
+/// peers are cached. Returns the cached peer info.
+#[cfg(feature = "gossip")]
+pub async fn wait_for_gossip_peer_count(
+    manager: &gossip::GossipManager,
+    min_count: usize,
+    max_wait: Duration,
+) -> Vec<gossip::CachedPeerInfo> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        if let Ok(peers) = manager.cached_peers().await {
+            if peers.len() >= min_count {
+                return peers;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: expected >= {min_count} gossip peers \
+             after {max_wait:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Connect two gossip-enabled nodes by adding each other's
+/// endpoint addresses and joining gossip peers.
+///
+/// Both nodes must have gossip managers. This establishes
+/// gossip mesh connectivity between the pair.
+#[cfg(feature = "gossip")]
+pub async fn join_gossip_peers(a: &TestNode, b: &TestNode) {
+    use iroh::address_lookup::memory::MemoryLookup;
+
+    let a_id = a.core.endpoint().id();
+    let b_id = b.core.endpoint().id();
+
+    // Get iroh-level addresses
+    let a_ep_addr = a.core.endpoint().addr();
+    let b_ep_addr = b.core.endpoint().addr();
+
+    // Pre-register addresses via MemoryLookup so iroh
+    // can resolve endpoint IDs for gossip connections
+    let a_lookup = MemoryLookup::new();
+    a_lookup.add_endpoint_info(b_ep_addr);
+    a.core.endpoint().address_lookup().add(a_lookup);
+
+    let b_lookup = MemoryLookup::new();
+    b_lookup.add_endpoint_info(a_ep_addr);
+    b.core.endpoint().address_lookup().add(b_lookup);
+
+    // Tell gossip to connect to each other
+    let a_mgr = a.core.gossip_manager().expect("gossip manager");
+    let b_mgr = b.core.gossip_manager().expect("gossip manager");
+
+    a_mgr.join_peers(vec![b_id]).await.expect("join");
+    b_mgr.join_peers(vec![a_id]).await.expect("join");
 }

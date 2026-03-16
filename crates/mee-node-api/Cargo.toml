@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-mee-did-api = { path = "../mee-did-api" }
+mee-identity-api = { path = "../mee-identity-api" }
 mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }
 serde = { version = "1", features = ["derive"] }
