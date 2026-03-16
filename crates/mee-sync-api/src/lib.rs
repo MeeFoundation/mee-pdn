@@ -340,4 +340,12 @@ pub trait SyncEngine: Send + Sync {
 
     type EntryStream: Stream<Item = Result<EntryInfo, SyncError>> + Send + Unpin + 'static;
     async fn get_entries(&self, ns: &NamespaceId) -> Result<Self::EntryStream, SyncError>;
+
+    /// Read the payload bytes for an entry at the given path.
+    /// Returns `None` if the entry doesn't exist.
+    async fn read_entry_payload(
+        &self,
+        ns: &NamespaceId,
+        path: &EntryPath,
+    ) -> Result<Option<Vec<u8>>, SyncError>;
 }

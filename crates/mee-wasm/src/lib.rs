@@ -323,6 +323,13 @@ impl api::SyncEngine for WasmNoopSync {
     ) -> Result<Self::EntryStream, api::SyncError> {
         Ok(futures_util::stream::empty())
     }
+    async fn read_entry_payload(
+        &self,
+        _ns: &api::NamespaceId,
+        _path: &api::EntryPath,
+    ) -> Result<Option<Vec<u8>>, api::SyncError> {
+        Ok(None)
+    }
 }
 
 #[wasm_bindgen]

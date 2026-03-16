@@ -374,6 +374,7 @@ pub struct IrohWillowSyncCore {
     engine: WillowEngine,
     client: iroh_willow::rpc::client::MemClient,
     owner_user: iroh_willow::proto::keys::UserId,
+    blobs: iroh_blobs::api::Store,
     _router: Router,
     store: mee_types::LocalStore,
     gossip_manager: Option<gossip::GossipManager>,
@@ -425,6 +426,7 @@ impl IrohWillowSyncCore {
         // Accept data_dir: Option<PathBuf> in spawn(). When None, keep
         // in-memory for tests.
         let blobs = iroh_blobs::store::mem::MemStore::default();
+        let blobs_api: iroh_blobs::api::Store = (*blobs).clone();
         let create_store = move || iroh_willow::store::memory::Store::new(blobs.clone());
         let engine = WillowEngine::spawn(endpoint.clone(), create_store, AcceptOpts::default());
 
@@ -487,6 +489,7 @@ impl IrohWillowSyncCore {
             engine,
             client,
             owner_user,
+            blobs: blobs_api,
             _router: router,
             store,
             gossip_manager,
@@ -731,5 +734,35 @@ impl api::SyncEngine for IrohWillowSyncCore {
             }
         };
         Ok(Box::pin(s))
+    }
+
+    async fn read_entry_payload(
+        &self,
+        ns: &api::NamespaceId,
+        path: &api::EntryPath,
+    ) -> Result<Option<Vec<u8>>, SyncError> {
+        let willow_ns = to_willow_ns(ns);
+        let range = iroh_willow::proto::grouping::Range3d::new_full();
+        let mut stream = self
+            .engine
+            .get_entries(willow_ns, range)
+            .await
+            .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+        while let Some(item) = stream.next().await {
+            let entry = item.map_err(|e| SyncError::Backend(e.to_string()))?;
+            let entry_path = entry.entry().path().fmt_utf8();
+            if entry_path == path.as_str() {
+                let hash = entry.entry().payload_digest().0;
+                let bytes = self
+                    .blobs
+                    .blobs()
+                    .get_bytes(hash)
+                    .await
+                    .map_err(|e| SyncError::Backend(format!("blob read: {e}")))?;
+                return Ok(Some(bytes.to_vec()));
+            }
+        }
+        Ok(None)
     }
 }
