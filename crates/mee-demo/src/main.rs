@@ -5,7 +5,8 @@ use axum::{
     Json, Router,
 };
 use mee_node_api::{
-    Contact, IdentityService as _, Invite, Node as _, SyncService as _, TrustService as _,
+    Contact, DataService as _, IdentityService as _, Invite, Node as _, SyncService as _,
+    TrustService as _,
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
@@ -261,10 +262,8 @@ async fn p2p_connect(
     // All hints failed (or none provided) — defer to gossip discovery.
     // Store a pending marker so the gossip event loop can match this
     // invite against future peer advertisements.
-    let pending_key = mee_types::local_store::keys::pending_invite(
-        &invite.subspace_id,
-        &invite.namespace_id,
-    );
+    let pending_key =
+        mee_types::local_store::keys::pending_invite(&invite.subspace_id, &invite.namespace_id);
     let _ = n.store().set(&pending_key, Vec::new());
     "pending".to_owned().into_response()
 }
@@ -343,24 +342,17 @@ async fn p2p_insert(state: axum::extract::State<AppState>, Json(req): Json<Inser
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
-    let path = match api::EntryPath::new(req.path) {
-        Ok(p) => p,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("invalid path: {e}")).into_response();
-        }
-    };
     let n = state.get_node();
-    match n.sync().insert(&path, req.body.as_bytes()).await {
+    match n.data().set(&req.path, &req.body).await {
         Ok(()) => "ok".to_owned().into_response(),
-        Err(e) => internal(&e).into_response(),
+        Err(e) => internal_str(&e.to_string()).into_response(),
     }
 }
 
 #[derive(Serialize)]
 struct ListedEntry {
-    subspace: String,
-    path: String,
-    payload_len: u64,
+    key: String,
+    value: String,
 }
 
 async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
@@ -368,19 +360,18 @@ async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.sync().list().await {
+    match n.data().list("").await {
         Ok(entries) => {
             let out: Vec<ListedEntry> = entries
                 .into_iter()
                 .map(|i| ListedEntry {
-                    subspace: i.subspace.to_string(),
-                    path: i.path.to_string(),
-                    payload_len: i.payload_len,
+                    key: i.key,
+                    value: i.value,
                 })
                 .collect();
             Json(out).into_response()
         }
-        Err(e) => internal(&e).into_response(),
+        Err(e) => internal_str(&e.to_string()).into_response(),
     }
 }
 

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-
 use mee_identity_api::{IdentityProvider, IdentityResolver};
 use mee_identity_keri::KeriIdentityManager;
 use mee_node_api::{
@@ -11,8 +10,7 @@ use mee_node_api::{
 use mee_sync_api as api;
 use mee_sync_api::SyncEngine;
 use mee_sync_api::{
-    AccessMode, EntryInfo, EntryPath, NamespaceId, SubspaceId, SyncError, SyncHandle, SyncMode,
-    SyncTicket,
+    AccessMode, EntryPath, NamespaceId, SubspaceId, SyncError, SyncHandle, SyncMode, SyncTicket,
 };
 use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
 use mee_types::local_store::keys;
@@ -272,31 +270,62 @@ impl mee_node_api::DataService for DemoDataService {
     }
 
     async fn get(&self, key: &str) -> Result<Option<DataEntry>, DataError> {
-        Ok(self
+        // Check local store first (fast, covers local writes)
+        if let Some(v) = self
             .store
             .get_json::<String>(&keys::persona(key))
             .expect("store read")
-            .map(|v| DataEntry {
+        {
+            return Ok(Some(DataEntry {
                 key: key.to_owned(),
                 value: v,
-            }))
+            }));
+        }
+        // Fall back to Willow (covers replicated data)
+        let path = Self::persona_path(key)?;
+        let namespaces = self.sync.list_namespaces().await?;
+        for ns in &namespaces {
+            let mut stream = self.sync.get_entries(ns).await?;
+            while let Some(Ok(entry)) = stream.next().await {
+                if entry.path == path {
+                    // Read payload from Willow
+                    // TODO: get_entries doesn't return payload bytes,
+                    // only metadata. For now, return the key with
+                    // empty value to indicate existence.
+                    return Ok(Some(DataEntry {
+                        key: key.to_owned(),
+                        value: String::new(),
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<DataEntry>, DataError> {
-        let full_prefix = keys::persona(prefix);
-        let matching_keys = self.store.keys(&full_prefix).expect("store read");
+        // Read from Willow — the authoritative source for replicated data.
+        // Entries are stored under the persona/ path prefix.
+        let persona_prefix = format!("persona/{prefix}");
         let mut out = Vec::new();
-        for store_key in matching_keys {
-            if let Some(persona_key) = store_key.strip_prefix(keys::PERSONA_PREFIX) {
-                if let Some(value) = self
-                    .store
-                    .get_json::<String>(&store_key)
-                    .expect("store read")
-                {
-                    out.push(DataEntry {
-                        key: persona_key.to_owned(),
-                        value,
-                    });
+        let namespaces = self.sync.list_namespaces().await?;
+        for ns in &namespaces {
+            let mut stream = self.sync.get_entries(ns).await?;
+            while let Some(Ok(entry)) = stream.next().await {
+                let path_str = entry.path.as_str();
+                if let Some(key) = path_str.strip_prefix("persona/") {
+                    if key.starts_with(prefix) {
+                        // Check local store for the value (Willow entries
+                        // don't carry payload in get_entries metadata)
+                        let value = self
+                            .store
+                            .get_json::<String>(&keys::persona(key))
+                            .expect("store read")
+                            .unwrap_or_default();
+                        out.push(DataEntry {
+                            key: key.to_owned(),
+                            value,
+                        });
+                    }
                 }
             }
         }
@@ -351,23 +380,6 @@ impl SyncService for DemoSyncService {
         self.sync
             .connect_and_share(&self.namespace, to, peer_addr, access)
             .await
-    }
-
-    async fn insert(&self, path: &EntryPath, bytes: &[u8]) -> Result<(), SyncError> {
-        self.sync.insert(&self.namespace, path, bytes).await
-    }
-
-    async fn list(&self) -> Result<Vec<EntryInfo>, SyncError> {
-        let mut all = Vec::new();
-        let namespaces = self.sync.list_namespaces().await?;
-        for ns in &namespaces {
-            let mut stream = self.sync.get_entries(ns).await?;
-            while let Some(item) = stream.next().await {
-                let entry = item?;
-                all.push(entry);
-            }
-        }
-        Ok(all)
     }
 }
 

@@ -238,12 +238,6 @@ impl SyncService for WasmSyncService {
     ) -> Result<(), api::SyncError> {
         Ok(())
     }
-    async fn insert(&self, _path: &api::EntryPath, _bytes: &[u8]) -> Result<(), api::SyncError> {
-        Ok(())
-    }
-    async fn list(&self) -> Result<Vec<api::EntryInfo>, api::SyncError> {
-        Ok(vec![])
-    }
 }
 
 // --- SyncEngine (noop for WASM) ---

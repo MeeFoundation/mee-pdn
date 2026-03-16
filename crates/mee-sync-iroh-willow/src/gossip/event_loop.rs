@@ -142,12 +142,11 @@ async fn handle_message(state: &mut EventLoopState, content: &[u8]) {
     if !already_connected {
         // Path 1: Namespace intersection (existing held namespaces)
         let matches = intersect_namespaces(&ad.namespace_ids, &state.held_namespace_ids);
-        if !matches.is_empty() {
-            if try_auto_connect(state, &ad, &matches).await.is_ok() {
+        if !matches.is_empty()
+            && try_auto_connect(state, &ad, &matches).await.is_ok() {
                 state.peer_cache.set_connected(&ad.peer_id, true);
                 return;
             }
-        }
 
         // Path 2: Pending invite discovery
         check_pending_invites(state, &ad).await;

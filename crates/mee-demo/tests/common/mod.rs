@@ -304,7 +304,6 @@ impl MeeNode {
             .await
             .expect("parse gossip peers json")
     }
-
 }
 
 // ---- Docker network helpers ----
@@ -336,20 +335,20 @@ pub async fn remove_network(name: &str) {
 
 // ---- Polling helpers ----
 
-/// Poll `node.list()` until an entry with the given `path` appears.
-pub async fn wait_for_entry(node: &MeeNode, expected_path: &str, timeout: Duration) {
+/// Poll `node.list()` until an entry with the given `key` appears.
+pub async fn wait_for_entry(node: &MeeNode, expected_key: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let entries = node.list().await;
         if entries
             .iter()
-            .any(|e| e.get("path").and_then(Value::as_str) == Some(expected_path))
+            .any(|e| e.get("key").and_then(Value::as_str) == Some(expected_key))
         {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "[{}] timed out waiting for entry '{expected_path}' after {timeout:?}",
+            "[{}] timed out waiting for entry '{expected_key}' after {timeout:?}",
             node.label,
         );
         tokio::time::sleep(Duration::from_millis(300)).await;

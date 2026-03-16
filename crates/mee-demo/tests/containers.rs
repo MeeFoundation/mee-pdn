@@ -289,7 +289,7 @@ async fn gossip_restart_rediscovery_inner() {
 }
 
 /// Deferred gossip-based invite discovery: Alice receives an invite
-/// from Charlie with empty node_hints. The connect returns "pending".
+/// from Charlie with empty `node_hints`. The connect returns "pending".
 /// Gossip discovers Charlie through Bob and auto-connects.
 ///
 /// This is the phone->PC scenario: Charlie invites Alice on his phone,
