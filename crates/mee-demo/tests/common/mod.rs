@@ -35,17 +35,13 @@ impl MeeNode {
     /// Spawn a new node container on the given Docker network.
     ///
     /// Blocks until the `/live` health-check responds with 200 OK.
+    ///
+    /// Gossip is always on. Fast timers for test stability.
     pub async fn spawn(label: &str, network: &str) -> Self {
-        Self::spawn_inner(label, network, &[("MEE_DISCOVERY", "disabled")]).await
-    }
-
-    /// Spawn a node with gossip discovery enabled and fast test timers.
-    pub async fn spawn_with_gossip(label: &str, network: &str) -> Self {
         Self::spawn_inner(
             label,
             network,
             &[
-                ("MEE_DISCOVERY", "gossip"),
                 ("MEE_GOSSIP_REBROADCAST_SECS", "1"),
                 ("MEE_GOSSIP_EVICTION_SECS", "3"),
             ],

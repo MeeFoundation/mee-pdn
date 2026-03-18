@@ -94,9 +94,9 @@ async fn gossip_transitive_sync() {
 }
 
 async fn gossip_transitive_sync_inner() {
-    let alice = MeeNode::spawn_with_gossip("alice", "mee-gossip-trans").await;
-    let bob = MeeNode::spawn_with_gossip("bob", "mee-gossip-trans").await;
-    let charlie = MeeNode::spawn_with_gossip("charlie", "mee-gossip-trans").await;
+    let alice = MeeNode::spawn("alice", "mee-gossip-trans").await;
+    let bob = MeeNode::spawn("bob", "mee-gossip-trans").await;
+    let charlie = MeeNode::spawn("charlie", "mee-gossip-trans").await;
 
     let charlie_ns = charlie.home_namespace().await;
 
@@ -131,8 +131,8 @@ async fn gossip_symmetric_connect_after_invite() {
 }
 
 async fn gossip_symmetric_connect_after_invite_inner() {
-    let alice = MeeNode::spawn_with_gossip("alice", "mee-gossip-sym").await;
-    let bob = MeeNode::spawn_with_gossip("bob", "mee-gossip-sym").await;
+    let alice = MeeNode::spawn("alice", "mee-gossip-sym").await;
+    let bob = MeeNode::spawn("bob", "mee-gossip-sym").await;
 
     let bob_sub = bob.subspace_id().await;
     let bob_invite = bob.get_invite().await;
@@ -161,9 +161,9 @@ async fn gossip_no_overlap_no_connect() {
 }
 
 async fn gossip_no_overlap_no_connect_inner() {
-    let alice = MeeNode::spawn_with_gossip("alice", "mee-gossip-noop").await;
-    let bob = MeeNode::spawn_with_gossip("bob", "mee-gossip-noop").await;
-    let bridge = MeeNode::spawn_with_gossip("bridge", "mee-gossip-noop").await;
+    let alice = MeeNode::spawn("alice", "mee-gossip-noop").await;
+    let bob = MeeNode::spawn("bob", "mee-gossip-noop").await;
+    let bridge = MeeNode::spawn("bridge", "mee-gossip-noop").await;
 
     let bridge_invite1 = bridge.get_invite().await;
     alice.connect(&bridge_invite1).await;
@@ -193,8 +193,8 @@ async fn gossip_restart_rediscovery() {
 }
 
 async fn gossip_restart_rediscovery_inner() {
-    let alice = MeeNode::spawn_with_gossip("alice", "mee-gossip-restart").await;
-    let bob = MeeNode::spawn_with_gossip("bob", "mee-gossip-restart").await;
+    let alice = MeeNode::spawn("alice", "mee-gossip-restart").await;
+    let bob = MeeNode::spawn("bob", "mee-gossip-restart").await;
 
     bidirectional_connect(&alice, &bob).await;
     wait_for_gossip_peers(&alice, 1, SYNC_TIMEOUT).await;
@@ -232,9 +232,9 @@ async fn gossip_deferred_invite_discovery() {
 }
 
 async fn gossip_deferred_invite_discovery_inner() {
-    let alice = MeeNode::spawn_with_gossip("alice", "mee-gossip-defer").await;
-    let bob = MeeNode::spawn_with_gossip("bob", "mee-gossip-defer").await;
-    let charlie = MeeNode::spawn_with_gossip("charlie", "mee-gossip-defer").await;
+    let alice = MeeNode::spawn("alice", "mee-gossip-defer").await;
+    let bob = MeeNode::spawn("bob", "mee-gossip-defer").await;
+    let charlie = MeeNode::spawn("charlie", "mee-gossip-defer").await;
 
     let charlie_ns = charlie.home_namespace().await;
 

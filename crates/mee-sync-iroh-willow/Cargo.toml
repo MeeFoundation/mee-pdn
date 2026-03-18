@@ -8,7 +8,6 @@ description = "Willow/iroh implementation of mee-sync-api"
 default = ["mdns"]
 mdns = ["iroh/address-lookup-mdns"]
 dht = ["iroh/address-lookup-pkarr-dht"]
-test-utils = []
 
 [dependencies]
 mee-sync-api = { path = "../mee-sync-api" }
@@ -25,13 +24,6 @@ iroh-gossip = "0.96"
 sha2 = "0.10"
 bytes = "1"
 thiserror = "2"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-
-[[test]]
-name = "gossip_discovery"
-required-features = ["test-utils"]
 
 [lints]
 workspace = true

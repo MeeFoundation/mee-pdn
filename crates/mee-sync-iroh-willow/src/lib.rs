@@ -1,8 +1,5 @@
 pub mod gossip;
 
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_helpers;
-
 use futures_core::Stream;
 use futures_util::stream::{BoxStream, StreamExt as _};
 #[cfg(feature = "mdns")]
@@ -43,57 +40,32 @@ pub struct DiscoveryConfig {
 }
 
 impl DiscoveryConfig {
-    /// No discovery, no relay. Current localhost-only behavior.
-    pub fn disabled() -> Self {
+    /// Default config: gossip on, no relay, no mDNS.
+    ///
+    /// Relay and mDNS can be toggled via env vars (`MEE_RELAY=1`,
+    /// `MEE_MDNS=1`) when needed for internet deployment.
+    pub fn default_config() -> Self {
         Self {
             relay_mode: RelayMode::Disabled,
             mdns: false,
             n0_discovery: false,
             bind_addr: None,
             clear_ip_transports: false,
-            gossip: None,
+            gossip: Some(gossip::GossipConfig::default_config()),
         }
     }
 
-    /// mDNS only — discovers peers on the local network, no relay.
-    pub fn local() -> Self {
-        Self {
-            relay_mode: RelayMode::Disabled,
-            mdns: true,
-            n0_discovery: false,
-            bind_addr: None,
-            clear_ip_transports: false,
-            gossip: None,
-        }
+    /// Enable relay + DNS/pkarr discovery (n0 infrastructure).
+    pub fn enable_relay(&mut self) {
+        self.relay_mode = RelayMode::Default;
+        self.n0_discovery = true;
     }
 
-    /// Full discovery: relay + DNS/pkarr + mDNS.
-    pub fn full() -> Self {
-        Self {
-            relay_mode: RelayMode::Default,
-            mdns: true,
-            n0_discovery: true,
-            bind_addr: None,
-            clear_ip_transports: false,
-            gossip: None,
-        }
+    /// Enable mDNS for local network peer discovery.
+    pub fn enable_mdns(&mut self) {
+        self.mdns = true;
     }
 
-    /// Test-stable config: no discovery, localhost-only binding,
-    /// cleared IP transports to prevent multipath flakiness.
-    pub fn test() -> Self {
-        Self {
-            relay_mode: RelayMode::Disabled,
-            mdns: false,
-            n0_discovery: false,
-            bind_addr: Some(SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                0u16,
-            )),
-            clear_ip_transports: true,
-            gossip: None,
-        }
-    }
 }
 
 // -- Connect protocol types ------------------------------------------------

@@ -11,7 +11,6 @@ use mee_node_api::{
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
 use mee_sync_api::{AccessMode, SyncEngine as _, SyncError};
-use mee_sync_iroh_willow::gossip::GossipConfig;
 use mee_sync_iroh_willow::DiscoveryConfig;
 use mee_types::Aid;
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,6 @@ use std::time::Duration;
 #[derive(Clone)]
 struct AppState {
     node: Arc<Mutex<Option<Arc<DemoNode>>>>,
-    discovery: Arc<str>,
 }
 
 #[allow(clippy::expect_used)]
@@ -32,32 +30,34 @@ impl AppState {
         if self.node.lock().expect("node lock poisoned").is_some() {
             return Ok(());
         }
-        let config = match &*self.discovery {
-            "local" => DiscoveryConfig::local(),
-            "full" => DiscoveryConfig::full(),
-            "gossip" => {
-                let mut gc = GossipConfig::default_config();
-                if let Some(s) = std::env::var("MEE_GOSSIP_REBROADCAST_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    gc.rebroadcast_interval = Duration::from_secs(s);
-                }
-                if let Some(s) = std::env::var("MEE_GOSSIP_EVICTION_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    gc.eviction_threshold = Duration::from_secs(s);
-                    gc.staleness_threshold = Duration::from_secs(s);
-                }
-                gc.audit_connections = std::env::var("MEE_DEBUG")
-                    .is_ok_and(|v| v == "1" || v == "true");
-                let mut config = DiscoveryConfig::disabled();
-                config.gossip = Some(gc);
-                config
+        let mut config = DiscoveryConfig::default_config();
+
+        // Transport toggles (dormant until internet deployment)
+        if std::env::var("MEE_RELAY").is_ok_and(|v| v == "1" || v == "true") {
+            config.enable_relay();
+        }
+        if std::env::var("MEE_MDNS").is_ok_and(|v| v == "1" || v == "true") {
+            config.enable_mdns();
+        }
+
+        // Gossip timing overrides (for tests)
+        if let Some(gc) = &mut config.gossip {
+            if let Some(s) = std::env::var("MEE_GOSSIP_REBROADCAST_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                gc.rebroadcast_interval = Duration::from_secs(s);
             }
-            _ => DiscoveryConfig::disabled(),
-        };
+            if let Some(s) = std::env::var("MEE_GOSSIP_EVICTION_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                gc.eviction_threshold = Duration::from_secs(s);
+                gc.staleness_threshold = Duration::from_secs(s);
+            }
+            gc.audit_connections = std::env::var("MEE_DEBUG")
+                .is_ok_and(|v| v == "1" || v == "true");
+        }
         // TODO(persistent-storage): Read MEE_DATA_DIR env var and pass to
         // DemoNode::spawn(). Default to ./var/data/{port}/.
         let node = DemoNode::spawn(config)
@@ -79,12 +79,8 @@ impl AppState {
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let discovery: Arc<str> = std::env::var("MEE_DISCOVERY")
-        .unwrap_or_else(|_| "disabled".into())
-        .into();
     let state = AppState {
         node: Arc::new(Mutex::new(None)),
-        discovery,
     };
 
     let app = Router::new()
