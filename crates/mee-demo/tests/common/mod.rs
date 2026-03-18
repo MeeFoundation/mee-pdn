@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 //! Testcontainers harness for mee-demo integration tests.
 //!
 //! Provides [`MeeNode`] — a wrapper around a Docker container running

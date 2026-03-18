@@ -23,25 +23,19 @@ This repository is for version 3, previous version repos:
 * `just check`: format & lint check
 * `just precommit-fix`: format & lint check + autofix, tests
 
-### Demo (P2P over Willow)
-
-* `just p2p-demo`
-* Flow: Bob exposes a Willow user id; Alice creates a share ticket for Bob; Bob imports the ticket and starts sync; Alice inserts an entry; Bob lists entries replicated via P2P.
-
 ## Crates
 
 Core types and APIs
 
 * `crates/mee-types`: Shared domain types
-* `crates/mee-did-api`: DID
-* `crates/mee-local-store-api`: Namespaced KV
-* `crates/mee-node-api`: Minimal PDN node composition crate
+* `crates/mee-identity-api`: Identity provider/resolver traits
+* `crates/mee-sync-api`: Backend-agnostic sync traits
+* `crates/mee-node-api`: Node composition trait + service traits
 
 Implementations & demos
 
-* `crates/mee-did-key`: Stub `did:key` manager (demo)
-* `crates/mee-local-store-mem`: In-memory KV store backend (demo)
-* `crates/mee-sync-api`: backend-agnostic sync API used by the demo
-* `crates/mee-sync-iroh-willow`: willow/iroh backend for the sync API
+* `crates/mee-identity-keri`: KERI-shaped identity manager (placeholder)
+* `crates/mee-sync-iroh-willow`: Willow/iroh P2P sync engine
+* `crates/mee-node-demo-impl`: Wires implementations into `DemoNode`
+* `crates/mee-demo`: Axum API over demo node
 * `crates/mee-wasm`: Minimal wasm-bindgen facade for wasm builds
-* `crates/mee-demo`: axum node exposing P2P sync endpoints (demo)

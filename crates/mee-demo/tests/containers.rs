@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 //! Integration tests using Docker containers (testcontainers).
 //!
 //! Prerequisites:

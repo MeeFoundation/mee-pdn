@@ -341,7 +341,11 @@ async fn check_pending_invites(state: &mut EventLoopState, ad: &PeerAdvertisemen
 /// `_local/connections/{peer_id_hex}` for observability.
 async fn audit_connection(state: &EventLoopState, peer_id: &[u8; 32]) {
     if state.config.audit_connections {
-        let peer_hex: String = peer_id.iter().map(|b| format!("{b:02x}")).collect();
+        use std::fmt::Write;
+        let mut peer_hex = String::with_capacity(64);
+        for b in peer_id {
+            let _ = write!(peer_hex, "{b:02x}");
+        }
         let suffix = format!("connections/{peer_hex}");
         let _ = crate::write_local_raw(
             &state.engine,
