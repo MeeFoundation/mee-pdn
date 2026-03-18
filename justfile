@@ -200,3 +200,15 @@ integration-tests:
   set -eux
   IMAGE_TAG=mee-demo:dev just build-image
   cargo test -p mee-demo --test containers -- --ignored --nocapture
+
+pr-review branch:
+  #!/bin/sh
+  set -eu
+  git fetch origin
+  git checkout {{ branch }}
+  git pull origin {{ branch }}
+  git checkout main
+  git pull origin main
+  git merge {{ branch }} --no-ff -m "Merge {{ branch }}"
+  git reset --soft HEAD~1
+  just build

@@ -1,6 +1,3 @@
-pub mod local_store;
-pub use local_store::{LocalStore, StoreError};
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -43,7 +40,7 @@ fn hex_digit(b: u8) -> Result<u8, ByteIdParseError> {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
-        // REASON: u8 → char is a safe widening cast for error display.
+        // REASON: u8 -> char is a safe widening cast for error display.
         _ => Err(ByteIdParseError {
             message: format!("invalid hex digit: {}", b as char),
         }),

@@ -13,14 +13,12 @@ use mee_sync_api::{
     AccessMode, EntryPath, NamespaceId, SubspaceId, SyncError, SyncHandle, SyncMode, SyncTicket,
 };
 use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
-use mee_types::local_store::keys;
-use mee_types::{Aid, LocalStore, NodeId};
-use sha2::{Digest, Sha256};
+use mee_types::Aid;
 
 #[derive(Clone)]
 pub struct DemoNode {
-    node_id: NodeId,
-    store: LocalStore,
+    node_id: mee_types::NodeId,
+    namespace: NamespaceId,
     identity: DemoIdentityService,
     trust: DemoTrustService,
     data: DemoDataService,
@@ -30,28 +28,24 @@ pub struct DemoNode {
 #[allow(clippy::expect_used)]
 impl DemoNode {
     pub async fn spawn(discovery: DiscoveryConfig) -> anyhow::Result<Arc<Self>> {
-        let store = LocalStore::new();
-        let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery, store.clone()).await?);
+        let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery).await?);
         let identity_mgr = Arc::new(KeriIdentityManager::new());
         let initial_aid = identity_mgr
             .create()
             .await
             .map_err(|e| anyhow::anyhow!("identity create error: {e}"))?;
 
-        store
-            .set_json(keys::CURRENT_AID, &initial_aid)
-            .map_err(|e| anyhow::anyhow!("store error: {e}"))?;
+        let namespace = sync_engine.home_namespace();
 
-        let owner = sync_engine
-            .subspace_id()
+        // Write initial AID to Willow _local/ path
+        let aid_json =
+            serde_json::to_vec(&initial_aid).map_err(|e| anyhow::anyhow!("serialize aid: {e}"))?;
+        let aid_path = EntryPath::new("_local/identity/current_aid")
+            .map_err(|e| anyhow::anyhow!("invalid path: {e}"))?;
+        sync_engine
+            .insert(&namespace, &aid_path, &aid_json)
             .await
-            .map_err(|e| anyhow::anyhow!("willow subspace id error: {e}"))?;
-        // TODO(personal-namespaces): Replace create_namespace() with home_namespace().
-        // The node should use a single personal namespace, not ad-hoc ones.
-        let namespace = sync_engine
-            .create_namespace(&owner)
-            .await
-            .map_err(|e| anyhow::anyhow!("namespace create error: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("write aid: {e}"))?;
 
         // Get the actual transport NodeId from the endpoint
         let node_addr = sync_engine
@@ -61,19 +55,17 @@ impl DemoNode {
 
         let identity = DemoIdentityService {
             identity_mgr: identity_mgr.clone(),
-            store: store.clone(),
+            sync: sync_engine.clone(),
+            namespace,
         };
 
         let trust = DemoTrustService {
             sync: sync_engine.clone(),
             namespace,
-            store: store.clone(),
         };
 
         let data = DemoDataService {
             sync: sync_engine.clone(),
-            namespace,
-            store: store.clone(),
         };
 
         let sync = DemoSyncService {
@@ -83,7 +75,7 @@ impl DemoNode {
 
         let node = Self {
             node_id: node_addr.node_id,
-            store,
+            namespace,
             identity,
             trust,
             data,
@@ -91,11 +83,6 @@ impl DemoNode {
         };
 
         Ok(Arc::new(node))
-    }
-
-    /// Access the shared local store.
-    pub fn store(&self) -> &LocalStore {
-        &self.store
     }
 }
 
@@ -105,8 +92,12 @@ impl Node for DemoNode {
     type Data = DemoDataService;
     type Sync = DemoSyncService;
 
-    fn node_id(&self) -> &NodeId {
+    fn node_id(&self) -> &mee_types::NodeId {
         &self.node_id
+    }
+
+    fn home_namespace(&self) -> NamespaceId {
+        self.namespace
     }
 
     fn identity(&self) -> &Self::Identity {
@@ -129,28 +120,38 @@ impl Node for DemoNode {
 #[derive(Clone)]
 pub struct DemoIdentityService {
     identity_mgr: Arc<KeriIdentityManager>,
-    store: LocalStore,
+    sync: Arc<IrohWillowSyncCore>,
+    namespace: NamespaceId,
 }
 
-#[allow(async_fn_in_trait, clippy::expect_used)]
+#[allow(async_fn_in_trait)]
 impl IdentityService for DemoIdentityService {
-    fn aid(&self) -> Aid {
-        self.store
-            .get_json::<Aid>(keys::CURRENT_AID)
-            .expect("store read")
-            .expect("AID not set")
+    async fn aid(&self) -> Result<Aid, mee_identity_api::IdentityError> {
+        let path = EntryPath::new("_local/identity/current_aid")
+            .map_err(|e| mee_identity_api::IdentityError::Other(format!("invalid path: {e}")))?;
+        let bytes = self
+            .sync
+            .read_entry_payload(&self.namespace, &path)
+            .await
+            .map_err(|e| mee_identity_api::IdentityError::Other(format!("read aid: {e}")))?
+            .ok_or_else(|| mee_identity_api::IdentityError::Other("AID not set".to_owned()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| mee_identity_api::IdentityError::Other(format!("deserialize aid: {e}")))
     }
 
-    // TODO: Identity re-creation shouldn't wipe invites/contacts/persona
-    // once persistent storage exists. Demo-only shortcut.
     async fn create(&self) -> Result<Aid, mee_identity_api::IdentityError> {
         let aid = self.identity_mgr.create().await?;
-        self.store
-            .set_json(keys::CURRENT_AID, &aid)
-            .expect("store write");
-        let _ = self.store.delete_prefix(keys::INVITES_PREFIX);
-        let _ = self.store.delete_prefix(keys::CONTACTS_PREFIX);
-        let _ = self.store.delete_prefix(keys::PERSONA_PREFIX);
+        let aid_json = serde_json::to_vec(&aid)
+            .map_err(|e| mee_identity_api::IdentityError::Other(format!("serialize aid: {e}")))?;
+        let aid_path = EntryPath::new("_local/identity/current_aid")
+            .map_err(|e| mee_identity_api::IdentityError::Other(format!("invalid path: {e}")))?;
+        self.sync
+            .insert(&self.namespace, &aid_path, &aid_json)
+            .await
+            .map_err(|e| mee_identity_api::IdentityError::Other(format!("write aid: {e}")))?;
+        // Note: We don't delete old invites/contacts here because
+        // Willow entries are immutable. In the future, we could
+        // tombstone them by writing empty payloads.
         Ok(aid)
     }
 
@@ -166,21 +167,20 @@ impl IdentityService for DemoIdentityService {
 pub struct DemoTrustService {
     sync: Arc<IrohWillowSyncCore>,
     namespace: NamespaceId,
-    store: LocalStore,
 }
 
-#[allow(async_fn_in_trait, clippy::expect_used, clippy::unwrap_in_result)]
+#[allow(async_fn_in_trait)]
 impl TrustService for DemoTrustService {
-    fn default_namespace(&self) -> NamespaceId {
-        self.namespace
-    }
-
     async fn create_invite(&self) -> Result<Invite, SyncError> {
-        let inviter: Aid = self
-            .store
-            .get_json(keys::CURRENT_AID)
-            .map_err(|e| SyncError::Backend(e.to_string()))?
+        let aid_path = EntryPath::new("_local/identity/current_aid")
+            .map_err(|e| SyncError::Backend(format!("invalid path: {e}")))?;
+        let aid_bytes = self
+            .sync
+            .read_entry_payload(&self.namespace, &aid_path)
+            .await?
             .ok_or_else(|| SyncError::Other("AID not set".into()))?;
+        let inviter: Aid = serde_json::from_slice(&aid_bytes)
+            .map_err(|e| SyncError::Backend(format!("deserialize aid: {e}")))?;
         let node_addr = self.sync.addr().await?;
         let subspace_id = self.sync.subspace_id().await?;
         // TODO: Make invite expiry configurable instead of hardcoded 10 minutes.
@@ -208,124 +208,133 @@ impl TrustService for DemoTrustService {
             .await
     }
 
-    fn remember_invite(&self, invite: Invite) {
-        let _ = self
-            .store
-            .set_json(&keys::invite(&invite.inviter_aid), &invite);
+    async fn remember_invite(&self, invite: Invite) -> Result<(), SyncError> {
+        let suffix = format!("invites/{}", invite.inviter_aid);
+        let path_str = format!("_local/{suffix}");
+        let path = EntryPath::new(path_str)
+            .map_err(|e| SyncError::Backend(format!("invalid path: {e}")))?;
+        let bytes = serde_json::to_vec(&invite)
+            .map_err(|e| SyncError::Backend(format!("serialize invite: {e}")))?;
+        self.sync.insert(&self.namespace, &path, &bytes).await
     }
 
-    fn invite_for(&self, aid: &Aid) -> Option<Invite> {
-        self.store
-            .get_json::<Invite>(&keys::invite(aid))
-            .expect("store read")
+    async fn invite_for(&self, aid: &Aid) -> Result<Option<Invite>, SyncError> {
+        let suffix = format!("invites/{aid}");
+        let path_str = format!("_local/{suffix}");
+        let path = EntryPath::new(path_str)
+            .map_err(|e| SyncError::Backend(format!("invalid path: {e}")))?;
+        match self.sync.read_entry_payload(&self.namespace, &path).await? {
+            Some(bytes) if !bytes.is_empty() => {
+                let invite: Invite = serde_json::from_slice(&bytes)
+                    .map_err(|e| SyncError::Backend(format!("deserialize invite: {e}")))?;
+                Ok(Some(invite))
+            }
+            _ => Ok(None),
+        }
     }
 
-    fn add_contact(&self, contact: Contact) {
-        let _ = self.store.set_json(&keys::contact(&contact.aid), &contact);
+    async fn add_contact(&self, contact: Contact) -> Result<(), SyncError> {
+        let suffix = format!("contacts/{}", contact.aid);
+        let path_str = format!("_local/{suffix}");
+        let path = EntryPath::new(path_str)
+            .map_err(|e| SyncError::Backend(format!("invalid path: {e}")))?;
+        let bytes = serde_json::to_vec(&contact)
+            .map_err(|e| SyncError::Backend(format!("serialize contact: {e}")))?;
+        self.sync.insert(&self.namespace, &path, &bytes).await
     }
 
-    fn contact(&self, aid: &Aid) -> Option<Contact> {
-        self.store
-            .get_json::<Contact>(&keys::contact(aid))
-            .expect("store read")
+    async fn contact(&self, aid: &Aid) -> Result<Option<Contact>, SyncError> {
+        let suffix = format!("contacts/{aid}");
+        let path_str = format!("_local/{suffix}");
+        let path = EntryPath::new(path_str)
+            .map_err(|e| SyncError::Backend(format!("invalid path: {e}")))?;
+        match self.sync.read_entry_payload(&self.namespace, &path).await? {
+            Some(bytes) if !bytes.is_empty() => {
+                let contact: Contact = serde_json::from_slice(&bytes)
+                    .map_err(|e| SyncError::Backend(format!("deserialize contact: {e}")))?;
+                Ok(Some(contact))
+            }
+            _ => Ok(None),
+        }
     }
 
-    fn contacts(&self) -> Vec<Contact> {
-        self.store
-            .values_json::<Contact>(keys::CONTACTS_PREFIX)
-            .expect("store read")
+    async fn contacts(&self) -> Result<Vec<Contact>, SyncError> {
+        let prefix = "_local/contacts/";
+        let mut out = Vec::new();
+        let mut stream = self.sync.get_entries(&self.namespace).await?;
+        while let Some(Ok(entry)) = stream.next().await {
+            let path_str = entry.path.as_str();
+            if path_str.starts_with(prefix) {
+                if let Some(bytes) = self
+                    .sync
+                    .read_entry_payload(&self.namespace, &entry.path)
+                    .await?
+                {
+                    if !bytes.is_empty() {
+                        if let Ok(contact) = serde_json::from_slice::<Contact>(&bytes) {
+                            out.push(contact);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
 #[derive(Clone)]
 pub struct DemoDataService {
     sync: Arc<IrohWillowSyncCore>,
-    namespace: NamespaceId,
-    store: LocalStore,
 }
 
 impl DemoDataService {
-    fn persona_path(key: &str) -> Result<EntryPath, DataError> {
-        EntryPath::new(format!("persona/{key}"))
-            .map_err(|e| DataError::Sync(SyncError::Backend(format!("invalid persona path: {e}"))))
+    fn data_path(key: &str) -> Result<EntryPath, DataError> {
+        EntryPath::new(format!("data/{key}"))
+            .map_err(|e| DataError::Sync(SyncError::Backend(format!("invalid data path: {e}"))))
     }
 }
 
-#[allow(async_fn_in_trait, clippy::expect_used)]
+#[allow(async_fn_in_trait)]
 impl mee_node_api::DataService for DemoDataService {
-    async fn set(&self, key: &str, value: &str) -> Result<(), DataError> {
-        let _ = self.store.set_json(&keys::persona(key), &value);
-        let path = Self::persona_path(key)?;
-        self.sync
-            .insert(&self.namespace, &path, value.as_bytes())
-            .await?;
+    async fn set(&self, ns: &NamespaceId, key: &str, value: &[u8]) -> Result<(), DataError> {
+        let path = Self::data_path(key)?;
+        self.sync.insert(ns, &path, value).await?;
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> Result<(), DataError> {
-        let _ = self.store.delete(&keys::persona(key));
-        let path = Self::persona_path(key)?;
-        self.sync.insert(&self.namespace, &path, &[]).await?;
+    async fn delete(&self, ns: &NamespaceId, key: &str) -> Result<(), DataError> {
+        let path = Self::data_path(key)?;
+        self.sync.insert(ns, &path, &[]).await?;
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Option<DataEntry>, DataError> {
-        // Check local store first (fast, covers local writes)
-        if let Some(v) = self
-            .store
-            .get_json::<String>(&keys::persona(key))
-            .expect("store read")
-        {
-            return Ok(Some(DataEntry {
+    async fn get(&self, ns: &NamespaceId, key: &str) -> Result<Option<DataEntry>, DataError> {
+        let path = Self::data_path(key)?;
+        match self.sync.read_entry_payload(ns, &path).await? {
+            Some(bytes) if !bytes.is_empty() => Ok(Some(DataEntry {
                 key: key.to_owned(),
-                value: v,
-            }));
+                value: bytes,
+            })),
+            _ => Ok(None),
         }
-        // Fall back to Willow (covers replicated data)
-        let path = Self::persona_path(key)?;
-        let namespaces = self.sync.list_namespaces().await?;
-        for ns in &namespaces {
-            let mut stream = self.sync.get_entries(ns).await?;
-            while let Some(Ok(entry)) = stream.next().await {
-                if entry.path == path {
-                    // Read payload from Willow
-                    // TODO: get_entries doesn't return payload bytes,
-                    // only metadata. For now, return the key with
-                    // empty value to indicate existence.
-                    return Ok(Some(DataEntry {
-                        key: key.to_owned(),
-                        value: String::new(),
-                    }));
-                }
-            }
-        }
-        Ok(None)
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<DataEntry>, DataError> {
-        // Read from Willow — the authoritative source for replicated data.
-        // Entries are stored under the persona/ path prefix.
-        let persona_prefix = format!("persona/{prefix}");
+    async fn list(&self, ns: &NamespaceId, prefix: &str) -> Result<Vec<DataEntry>, DataError> {
         let mut out = Vec::new();
-        let namespaces = self.sync.list_namespaces().await?;
-        for ns in &namespaces {
-            let mut stream = self.sync.get_entries(ns).await?;
-            while let Some(Ok(entry)) = stream.next().await {
-                let path_str = entry.path.as_str();
-                if let Some(key) = path_str.strip_prefix("persona/") {
-                    if key.starts_with(prefix) {
-                        // Check local store for the value (Willow entries
-                        // don't carry payload in get_entries metadata)
-                        let value = self
-                            .store
-                            .get_json::<String>(&keys::persona(key))
-                            .expect("store read")
-                            .unwrap_or_default();
-                        out.push(DataEntry {
-                            key: key.to_owned(),
-                            value,
-                        });
-                    }
+        let mut stream = self.sync.get_entries(ns).await?;
+        while let Some(Ok(entry)) = stream.next().await {
+            let path_str = entry.path.as_str();
+            if let Some(key) = path_str.strip_prefix("data/") {
+                if key.starts_with(prefix) {
+                    let value = self
+                        .sync
+                        .read_entry_payload(ns, &entry.path)
+                        .await?
+                        .unwrap_or_default();
+                    out.push(DataEntry {
+                        key: key.to_owned(),
+                        value,
+                    });
                 }
             }
         }
@@ -400,7 +409,8 @@ fn now_ms() -> u64 {
 // TODO(keri): Replace SHA256 placeholder with Ed25519 signature using
 // the operational private key from the signer's KEL.
 fn compute_invite_sig(inv: &Invite) -> InviteSignature {
-    let mut h = Sha256::new();
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
     let data = format!(
         "demo|{}|{}|{}",
         inv.inviter_aid, inv.namespace_id, inv.subspace_id,

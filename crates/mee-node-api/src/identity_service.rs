@@ -4,7 +4,7 @@ use mee_types::Aid;
 #[allow(async_fn_in_trait)]
 pub trait IdentityService: Send + Sync {
     /// The node's AID. Set once at inception, never changes.
-    fn aid(&self) -> Aid;
+    async fn aid(&self) -> Result<Aid, IdentityError>;
 
     /// Create a new identity (KERI inception).
     // TODO(keri): Should initialize local KEL with inception event.

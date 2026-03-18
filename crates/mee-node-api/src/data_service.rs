@@ -1,11 +1,11 @@
-use mee_sync_api::SyncError;
+use mee_sync_api::{NamespaceId, SyncError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataEntry {
     pub key: String,
-    pub value: String,
+    pub value: Vec<u8>,
 }
 
 /// Domain errors for the data service layer.
@@ -22,13 +22,15 @@ pub enum DataError {
     Io(#[from] std::io::Error),
 }
 
-// TODO(personal-namespaces): Add namespace-aware and path-scoped methods for
-// personal namespace model. Current flat key/value API doesn't
-// distinguish owner subspace from guest subspaces or _sys/ paths.
+/// Data operations on a specific Willow namespace.
+///
+/// Every method takes an explicit `NamespaceId`. Callers pass
+/// `node.home_namespace()` for their own data, or any other
+/// namespace they have access to.
 #[allow(async_fn_in_trait)]
 pub trait DataService: Send + Sync {
-    async fn set(&self, key: &str, value: &str) -> Result<(), DataError>;
-    async fn delete(&self, key: &str) -> Result<(), DataError>;
-    async fn get(&self, key: &str) -> Result<Option<DataEntry>, DataError>;
-    async fn list(&self, prefix: &str) -> Result<Vec<DataEntry>, DataError>;
+    async fn set(&self, ns: &NamespaceId, key: &str, value: &[u8]) -> Result<(), DataError>;
+    async fn delete(&self, ns: &NamespaceId, key: &str) -> Result<(), DataError>;
+    async fn get(&self, ns: &NamespaceId, key: &str) -> Result<Option<DataEntry>, DataError>;
+    async fn list(&self, ns: &NamespaceId, prefix: &str) -> Result<Vec<DataEntry>, DataError>;
 }

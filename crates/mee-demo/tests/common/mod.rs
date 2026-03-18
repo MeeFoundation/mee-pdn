@@ -213,9 +213,30 @@ impl MeeNode {
         resp.text().await.expect("read response body")
     }
 
-    /// `POST /p2p/insert` — insert an entry into the node's namespace.
-    pub async fn insert(&self, path: &str, body: &str) {
-        let payload = serde_json::json!({ "path": path, "body": body });
+    /// `GET /p2p/home-namespace` — returns the node's home namespace ID.
+    pub async fn home_namespace(&self) -> String {
+        let resp: Value = self
+            .client
+            .get(format!("{}/p2p/home-namespace", self.url()))
+            .send()
+            .await
+            .expect("home-namespace request")
+            .json()
+            .await
+            .expect("parse home-namespace json");
+        resp["namespace"]
+            .as_str()
+            .expect("namespace field")
+            .to_owned()
+    }
+
+    /// `POST /p2p/insert` — insert an entry into the given namespace.
+    pub async fn insert(&self, namespace: &str, path: &str, body: &str) {
+        let payload = serde_json::json!({
+            "namespace": namespace,
+            "path": path,
+            "body": body,
+        });
         let resp = self
             .client
             .post(format!("{}/p2p/insert", self.url()))
@@ -231,10 +252,11 @@ impl MeeNode {
         );
     }
 
-    /// `GET /p2p/list` — list all synced entries.
-    pub async fn list(&self) -> Vec<Value> {
+    /// `POST /p2p/list` — list entries from a specific namespace.
+    pub async fn list(&self, namespace: &str) -> Vec<Value> {
         self.client
-            .get(format!("{}/p2p/list", self.url()))
+            .post(format!("{}/p2p/list", self.url()))
+            .json(&serde_json::json!({ "namespace": namespace }))
             .send()
             .await
             .expect("list request")
@@ -336,10 +358,15 @@ pub async fn remove_network(name: &str) {
 // ---- Polling helpers ----
 
 /// Poll `node.list()` until an entry with the given `key` appears.
-pub async fn wait_for_entry(node: &MeeNode, expected_key: &str, timeout: Duration) {
+pub async fn wait_for_entry(
+    node: &MeeNode,
+    namespace: &str,
+    expected_key: &str,
+    timeout: Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let entries = node.list().await;
+        let entries = node.list(namespace).await;
         if entries
             .iter()
             .any(|e| e.get("key").and_then(Value::as_str) == Some(expected_key))

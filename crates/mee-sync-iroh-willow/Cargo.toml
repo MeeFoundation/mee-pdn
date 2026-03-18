@@ -12,7 +12,6 @@ test-utils = []
 
 [dependencies]
 mee-sync-api = { path = "../mee-sync-api" }
-mee-types = { path = "../mee-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-core = "0.3"

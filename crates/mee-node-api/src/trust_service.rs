@@ -39,19 +39,15 @@ pub struct Contact {
 
 #[allow(async_fn_in_trait)]
 pub trait TrustService: Send + Sync {
-    // TODO(personal-namespaces): Replace with home_namespace() that returns the
-    // node's personal namespace. Update share flow to delegate scoped
-    // capabilities on both peers' home namespaces.
-    fn default_namespace(&self) -> NamespaceId;
     async fn create_invite(&self) -> Result<Invite, SyncError>;
     async fn accept_invite(
         &self,
         invite: &Invite,
         access: AccessMode,
     ) -> Result<SyncTicket, SyncError>;
-    fn remember_invite(&self, invite: Invite);
-    fn invite_for(&self, aid: &Aid) -> Option<Invite>;
-    fn add_contact(&self, contact: Contact);
-    fn contact(&self, aid: &Aid) -> Option<Contact>;
-    fn contacts(&self) -> Vec<Contact>;
+    async fn remember_invite(&self, invite: Invite) -> Result<(), SyncError>;
+    async fn invite_for(&self, aid: &Aid) -> Result<Option<Invite>, SyncError>;
+    async fn add_contact(&self, contact: Contact) -> Result<(), SyncError>;
+    async fn contact(&self, aid: &Aid) -> Result<Option<Contact>, SyncError>;
+    async fn contacts(&self) -> Result<Vec<Contact>, SyncError>;
 }

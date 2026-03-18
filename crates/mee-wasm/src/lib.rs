@@ -60,6 +60,9 @@ impl Node for WasmNode {
     fn node_id(&self) -> &NodeId {
         &self.node_id
     }
+    fn home_namespace(&self) -> api::NamespaceId {
+        api::NamespaceId::from_bytes(ZERO_ID)
+    }
     fn identity(&self) -> &Self::Identity {
         &self.identity
     }
@@ -89,8 +92,8 @@ pub struct WasmIdentityService;
 #[allow(async_fn_in_trait)]
 impl IdentityService for WasmIdentityService {
     // TODO(keri): Return real stored AID once WASM key storage exists.
-    fn aid(&self) -> Aid {
-        Aid::from_bytes(ZERO_ID)
+    async fn aid(&self) -> Result<Aid, IdentityError> {
+        Ok(Aid::from_bytes(ZERO_ID))
     }
     // TODO(keri): Implement KERI inception via WebCrypto API.
     async fn create(&self) -> Result<Aid, IdentityError> {
@@ -114,9 +117,6 @@ pub struct WasmTrustService;
 
 #[allow(async_fn_in_trait)]
 impl TrustService for WasmTrustService {
-    fn default_namespace(&self) -> api::NamespaceId {
-        api::NamespaceId::from_bytes(ZERO_ID)
-    }
     async fn create_invite(&self) -> Result<Invite, api::SyncError> {
         Ok(Invite {
             inviter_aid: Aid::from_bytes(ZERO_ID),
@@ -141,16 +141,20 @@ impl TrustService for WasmTrustService {
             node_hints: vec![],
         })
     }
-    fn remember_invite(&self, _invite: Invite) {}
-    fn invite_for(&self, _aid: &Aid) -> Option<Invite> {
-        None
+    async fn remember_invite(&self, _invite: Invite) -> Result<(), api::SyncError> {
+        Ok(())
     }
-    fn add_contact(&self, _contact: Contact) {}
-    fn contact(&self, _aid: &Aid) -> Option<Contact> {
-        None
+    async fn invite_for(&self, _aid: &Aid) -> Result<Option<Invite>, api::SyncError> {
+        Ok(None)
     }
-    fn contacts(&self) -> Vec<Contact> {
-        vec![]
+    async fn add_contact(&self, _contact: Contact) -> Result<(), api::SyncError> {
+        Ok(())
+    }
+    async fn contact(&self, _aid: &Aid) -> Result<Option<Contact>, api::SyncError> {
+        Ok(None)
+    }
+    async fn contacts(&self) -> Result<Vec<Contact>, api::SyncError> {
+        Ok(vec![])
     }
 }
 
@@ -163,16 +167,29 @@ pub struct WasmDataService;
 
 #[allow(async_fn_in_trait)]
 impl mee_node_api::DataService for WasmDataService {
-    async fn set(&self, _key: &str, _value: &str) -> Result<(), DataError> {
+    async fn set(
+        &self,
+        _ns: &api::NamespaceId,
+        _key: &str,
+        _value: &[u8],
+    ) -> Result<(), DataError> {
         Ok(())
     }
-    async fn delete(&self, _key: &str) -> Result<(), DataError> {
+    async fn delete(&self, _ns: &api::NamespaceId, _key: &str) -> Result<(), DataError> {
         Ok(())
     }
-    async fn get(&self, _key: &str) -> Result<Option<DataEntry>, DataError> {
+    async fn get(
+        &self,
+        _ns: &api::NamespaceId,
+        _key: &str,
+    ) -> Result<Option<DataEntry>, DataError> {
         Ok(None)
     }
-    async fn list(&self, _prefix: &str) -> Result<Vec<DataEntry>, DataError> {
+    async fn list(
+        &self,
+        _ns: &api::NamespaceId,
+        _prefix: &str,
+    ) -> Result<Vec<DataEntry>, DataError> {
         Ok(vec![])
     }
 }
@@ -352,7 +369,7 @@ pub fn sync_types_sample_ticket() -> String {
 
 #[wasm_bindgen]
 pub fn sync_namespace_roundtrip(s: &str) -> String {
-    // Parse hex string → NamespaceId → back to hex
+    // Parse hex string -> NamespaceId -> back to hex
     let ns: api::NamespaceId = s
         .parse()
         .unwrap_or_else(|_| api::NamespaceId::from_bytes(ZERO_ID));

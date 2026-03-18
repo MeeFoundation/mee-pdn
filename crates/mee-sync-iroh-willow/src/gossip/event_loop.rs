@@ -28,8 +28,10 @@ pub(crate) struct EventLoopState {
     pub engine: WillowEngine,
     pub client: iroh_willow::rpc::client::MemClient,
     pub endpoint: Endpoint,
-    /// Local key-value store for node state (imported namespaces, etc.).
-    pub store: mee_types::LocalStore,
+    /// Blob store for reading `_local/` entry payloads.
+    pub blobs: iroh_blobs::api::Store,
+    /// The node's home namespace, used for `_local/` state.
+    pub home_namespace: api::NamespaceId,
     pub owner_user: iroh_willow::proto::keys::UserId,
 }
 
@@ -142,11 +144,10 @@ async fn handle_message(state: &mut EventLoopState, content: &[u8]) {
     if !already_connected {
         // Path 1: Namespace intersection (existing held namespaces)
         let matches = intersect_namespaces(&ad.namespace_ids, &state.held_namespace_ids);
-        if !matches.is_empty()
-            && try_auto_connect(state, &ad, &matches).await.is_ok() {
-                state.peer_cache.set_connected(&ad.peer_id, true);
-                return;
-            }
+        if !matches.is_empty() && try_auto_connect(state, &ad, &matches).await.is_ok() {
+            state.peer_cache.set_connected(&ad.peer_id, true);
+            return;
+        }
 
         // Path 2: Pending invite discovery
         check_pending_invites(state, &ad).await;
@@ -294,24 +295,24 @@ async fn build_own_ad(state: &EventLoopState) -> Result<PeerAdvertisement, Gossi
 
 /// Check if any pending invites match this advertisement.
 ///
-/// A pending invite is a marker key at `pending_invites/{subspace}/{namespace}`
-/// written when an invite's `node_hints` were empty or stale. When an ad
-/// arrives from the matching peer advertising the matching namespace, we
-/// auto-connect and delete the marker.
+/// A pending invite is a marker at `_local/pending/{subspace}/{namespace}`
+/// in the home namespace. When an ad arrives from the matching peer
+/// advertising the matching namespace, we auto-connect and delete the
+/// marker.
 async fn check_pending_invites(state: &mut EventLoopState, ad: &PeerAdvertisement) {
-    let pending_keys = match state
-        .store
-        .keys(mee_types::local_store::keys::PENDING_INVITES_PREFIX)
-    {
-        Ok(k) => k,
-        Err(_) => return,
+    let Ok(entries) = crate::list_local_entries(
+        &state.engine,
+        &state.blobs,
+        &state.home_namespace,
+        "pending/",
+    )
+    .await
+    else {
+        return;
     };
 
-    for key in pending_keys {
-        let suffix = match key.strip_prefix(mee_types::local_store::keys::PENDING_INVITES_PREFIX) {
-            Some(s) => s,
-            None => continue,
-        };
+    for (suffix, _) in entries {
+        // suffix is "{subspace}/{namespace}"
         let Some((sub_hex, ns_hex)) = suffix.split_once('/') else {
             continue;
         };
@@ -339,14 +340,22 @@ async fn check_pending_invites(state: &mut EventLoopState, ad: &PeerAdvertisemen
         let ns_bytes = *namespace.as_bytes();
         if try_auto_connect(state, ad, &[ns_bytes]).await.is_ok() {
             state.peer_cache.set_connected(&ad.peer_id, true);
-            let _ = state.store.delete(&key);
+            // Delete the pending marker
+            let del_suffix = format!("pending/{sub_hex}/{ns_hex}");
+            let _ = crate::delete_local(
+                &state.engine,
+                state.owner_user,
+                &state.home_namespace,
+                &del_suffix,
+            )
+            .await;
             return;
         }
     }
 }
 
 /// Refresh the set of held namespace IDs from both the Willow engine
-/// and the local store (imported namespaces tracked via tickets).
+/// and the `_local/namespaces/imported/` entries in the home namespace.
 async fn refresh_held_namespaces(state: &mut EventLoopState) {
     state.held_namespace_ids.clear();
     if let Ok(namespaces) = state.engine.list_namespaces().await {
@@ -354,13 +363,15 @@ async fn refresh_held_namespaces(state: &mut EventLoopState) {
             state.held_namespace_ids.insert(*ns.as_bytes());
         }
     }
-    if let Ok(keys) = state
-        .store
-        .keys(mee_types::local_store::keys::NAMESPACES_IMPORTED_PREFIX)
+    if let Ok(entries) = crate::list_local_entries(
+        &state.engine,
+        &state.blobs,
+        &state.home_namespace,
+        "namespaces/imported/",
+    )
+    .await
     {
-        for key in keys {
-            let suffix =
-                key.trim_start_matches(mee_types::local_store::keys::NAMESPACES_IMPORTED_PREFIX);
+        for (suffix, _) in entries {
             if let Ok(id) = suffix.parse::<mee_sync_api::NamespaceId>() {
                 state.held_namespace_ids.insert(*id.as_bytes());
             }

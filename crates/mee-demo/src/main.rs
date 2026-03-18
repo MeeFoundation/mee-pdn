@@ -10,7 +10,7 @@ use mee_node_api::{
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
-use mee_sync_api::{AccessMode, SyncError};
+use mee_sync_api::{AccessMode, SyncEngine as _, SyncError};
 use mee_sync_iroh_willow::gossip::GossipConfig;
 use mee_sync_iroh_willow::DiscoveryConfig;
 use mee_types::Aid;
@@ -128,12 +128,16 @@ async fn main() -> anyhow::Result<()> {
             post(|state, payload| async move { p2p_ticket(state, payload).await }),
         )
         .route(
+            "/p2p/home-namespace",
+            get(|state| async move { p2p_home_namespace(state).await }),
+        )
+        .route(
             "/p2p/insert",
             post(|state, payload| async move { p2p_insert(state, payload).await }),
         )
         .route(
             "/p2p/list",
-            get(|state| async move { p2p_list(state).await }),
+            post(|state, payload| async move { p2p_list(state, payload).await }),
         );
 
     // Debug/test routes — only available when MEE_DEBUG=1
@@ -206,11 +210,13 @@ async fn p2p_user_aid(state: axum::extract::State<AppState>) -> Response {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    let aid = n.identity().aid();
-    Json(UserAidResp {
-        user_aid: aid.to_string(),
-    })
-    .into_response()
+    match n.identity().aid().await {
+        Ok(aid) => Json(UserAidResp {
+            user_aid: aid.to_string(),
+        })
+        .into_response(),
+        Err(e) => internal_str(&format!("identity error: {e}")).into_response(),
+    }
 }
 
 async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
@@ -243,11 +249,18 @@ async fn p2p_connect(
     let invite = req.invite;
     let access = req.access.unwrap_or(AccessMode::Read);
     // Remember the invite and contact before connecting
-    trust.remember_invite(invite.clone());
-    trust.add_contact(Contact {
-        aid: invite.inviter_aid,
-        alias: None,
-    });
+    if let Err(e) = trust.remember_invite(invite.clone()).await {
+        return internal(&e).into_response();
+    }
+    if let Err(e) = trust
+        .add_contact(Contact {
+            aid: invite.inviter_aid,
+            alias: None,
+        })
+        .await
+    {
+        return internal(&e).into_response();
+    }
     // Try direct connection via each node_hint.
     for hint in &invite.node_hints {
         if n.sync()
@@ -260,11 +273,19 @@ async fn p2p_connect(
     }
 
     // All hints failed (or none provided) — defer to gossip discovery.
-    // Store a pending marker so the gossip event loop can match this
-    // invite against future peer advertisements.
-    let pending_key =
-        mee_types::local_store::keys::pending_invite(&invite.subspace_id, &invite.namespace_id);
-    let _ = n.store().set(&pending_key, Vec::new());
+    // Store a pending marker in Willow so the gossip event loop can
+    // match this invite against future peer advertisements.
+    let pending_path_str = format!(
+        "_local/pending/{}/{}",
+        invite.subspace_id, invite.namespace_id
+    );
+    if let Ok(path) = mee_sync_api::EntryPath::new(pending_path_str) {
+        let _ = n
+            .sync()
+            .core()
+            .insert(&n.home_namespace(), &path, &[])
+            .await;
+    }
     "pending".to_owned().into_response()
 }
 
@@ -279,11 +300,18 @@ async fn p2p_bind(state: axum::extract::State<AppState>, Json(req): Json<BindReq
     }
     let n = state.get_node();
     let trust = n.trust();
-    trust.remember_invite(req.invite.clone());
-    trust.add_contact(Contact {
-        aid: req.invite.inviter_aid,
-        alias: None,
-    });
+    if let Err(e) = trust.remember_invite(req.invite.clone()).await {
+        return internal(&e).into_response();
+    }
+    if let Err(e) = trust
+        .add_contact(Contact {
+            aid: req.invite.inviter_aid,
+            alias: None,
+        })
+        .await
+    {
+        return internal(&e).into_response();
+    }
     "bound".to_owned().into_response()
 }
 
@@ -303,8 +331,12 @@ async fn p2p_ticket_by_aid(
     }
     let n = state.get_node();
     let trust = n.trust();
-    let Some(invite) = trust.invite_for(&req.aid) else {
-        return internal_str("aid not bound; import invite first").into_response();
+    let invite = match trust.invite_for(&req.aid).await {
+        Ok(Some(inv)) => inv,
+        Ok(None) => {
+            return internal_str("aid not bound; import invite first").into_response();
+        }
+        Err(e) => return internal(&e).into_response(),
     };
     let access = req.access.unwrap_or(AccessMode::Read);
     match trust.accept_invite(&invite, access).await {
@@ -334,6 +366,7 @@ async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<Ticke
 
 #[derive(Deserialize)]
 struct InsertReq {
+    namespace: api::NamespaceId,
     path: String,
     body: String,
 }
@@ -343,10 +376,21 @@ async fn p2p_insert(state: axum::extract::State<AppState>, Json(req): Json<Inser
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.data().set(&req.path, &req.body).await {
+    match n
+        .data()
+        .set(&req.namespace, &req.path, req.body.as_bytes())
+        .await
+    {
         Ok(()) => "ok".to_owned().into_response(),
         Err(e) => internal_str(&e.to_string()).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct ListReq {
+    namespace: api::NamespaceId,
+    #[serde(default)]
+    prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -355,18 +399,22 @@ struct ListedEntry {
     value: String,
 }
 
-async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
+async fn p2p_list(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<ListReq>,
+) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.data().list("").await {
+    let prefix = req.prefix.as_deref().unwrap_or("");
+    match n.data().list(&req.namespace, prefix).await {
         Ok(entries) => {
             let out: Vec<ListedEntry> = entries
                 .into_iter()
                 .map(|i| ListedEntry {
                     key: i.key,
-                    value: i.value,
+                    value: String::from_utf8_lossy(&i.value).into_owned(),
                 })
                 .collect();
             Json(out).into_response()
@@ -413,6 +461,22 @@ async fn p2p_create_identity(state: axum::extract::State<AppState>) -> Response 
         .into_response(),
         Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct HomeNamespaceResp {
+    namespace: String,
+}
+
+async fn p2p_home_namespace(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    Json(HomeNamespaceResp {
+        namespace: n.home_namespace().to_string(),
+    })
+    .into_response()
 }
 
 // -- Gossip routes ----------------------------------------------------------

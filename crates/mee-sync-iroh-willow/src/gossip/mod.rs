@@ -19,6 +19,7 @@ pub use peer_cache::CachedPeerInfo;
 use iroh::Endpoint;
 use iroh_gossip::{Gossip, TopicId};
 use iroh_willow::Engine as WillowEngine;
+use mee_sync_api as api;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -63,11 +64,21 @@ impl GossipManager {
         client: iroh_willow::rpc::client::MemClient,
         owner_user: iroh_willow::proto::keys::UserId,
         config: GossipConfig,
-        store: mee_types::LocalStore,
+        blobs: iroh_blobs::api::Store,
+        home_namespace: api::NamespaceId,
     ) -> Result<Self, GossipError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         Self::start_with_channel(
-            gossip, endpoint, engine, client, owner_user, config, cmd_tx, cmd_rx, store,
+            gossip,
+            endpoint,
+            engine,
+            client,
+            owner_user,
+            config,
+            cmd_tx,
+            cmd_rx,
+            blobs,
+            home_namespace,
         )
         .await
     }
@@ -86,7 +97,8 @@ impl GossipManager {
         config: GossipConfig,
         cmd_tx: mpsc::Sender<GossipCommand>,
         cmd_rx: mpsc::Receiver<GossipCommand>,
-        store: mee_types::LocalStore,
+        blobs: iroh_blobs::api::Store,
+        home_namespace: api::NamespaceId,
     ) -> Result<Self, GossipError> {
         let topic_id = discovery_topic_id();
         let topic = gossip
@@ -105,7 +117,8 @@ impl GossipManager {
             engine,
             client,
             endpoint,
-            store,
+            blobs,
+            home_namespace,
             owner_user,
         };
 
