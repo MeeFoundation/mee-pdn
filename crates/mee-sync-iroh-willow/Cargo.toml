@@ -21,9 +21,17 @@ iroh-blobs = "0.98"
 iroh-willow = { git = "https://github.com/MeeFoundation/iroh-willow.git", branch = "willow-experiments-iroh-0.96" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 async-stream = "0.3"
+iroh-gossip = "0.96"
+sha2 = "0.10"
+bytes = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[[test]]
+name = "gossip_discovery"
+required-features = ["test-utils"]
 
 [lints]
 workspace = true
