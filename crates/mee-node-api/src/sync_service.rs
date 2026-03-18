@@ -1,8 +1,7 @@
-use mee_sync_api::{
-    AccessMode, EntryInfo, EntryPath, NodeAddr, SubspaceId, SyncError, SyncHandle, SyncMode,
-    SyncTicket,
-};
+use mee_sync_api::{AccessMode, NodeAddr, SubspaceId, SyncError, SyncHandle, SyncMode, SyncTicket};
 
+// TODO(personal-namespaces): Add home_namespace() method that returns
+// the node's personal namespace ID.
 #[allow(async_fn_in_trait)]
 pub trait SyncService: Send + Sync {
     async fn node_addr(&self) -> Result<NodeAddr, SyncError>;
@@ -19,6 +18,4 @@ pub trait SyncService: Send + Sync {
         peer_addr: &NodeAddr,
         access: AccessMode,
     ) -> Result<(), SyncError>;
-    async fn insert(&self, path: &EntryPath, bytes: &[u8]) -> Result<(), SyncError>;
-    async fn list(&self) -> Result<Vec<EntryInfo>, SyncError>;
 }
