@@ -13,8 +13,7 @@ base64 = "0.22"
 futures-util = "0.3"
 mee-sync-api = { path = "../mee-sync-api" }
 mee-sync-iroh-willow = { path = "../mee-sync-iroh-willow" }
-mee-did-api = { path = "../mee-did-api" }
-mee-did-key = { path = "../mee-did-key" }
+mee-identity-api = { path = "../mee-identity-api" }
 mee-types = { path = "../mee-types" }
 mee-node-api = { path = "../mee-node-api" }
 mee-node-demo-impl = { path = "../mee-node-demo-impl" }
