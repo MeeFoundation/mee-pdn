@@ -36,15 +36,36 @@ impl MeeNode {
     ///
     /// Blocks until the `/live` health-check responds with 200 OK.
     pub async fn spawn(label: &str, network: &str) -> Self {
-        let container: ContainerAsync<GenericImage> = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+        Self::spawn_inner(label, network, &[("MEE_DISCOVERY", "disabled")]).await
+    }
+
+    /// Spawn a node with gossip discovery enabled and fast test timers.
+    pub async fn spawn_with_gossip(label: &str, network: &str) -> Self {
+        Self::spawn_inner(
+            label,
+            network,
+            &[
+                ("MEE_DISCOVERY", "gossip"),
+                ("MEE_GOSSIP_REBROADCAST_SECS", "1"),
+                ("MEE_GOSSIP_EVICTION_SECS", "3"),
+            ],
+        )
+        .await
+    }
+
+    async fn spawn_inner(label: &str, network: &str, extra_env: &[(&str, &str)]) -> Self {
+        let mut image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
             .with_exposed_port(ContainerPort::Tcp(INTERNAL_PORT))
             .with_env_var("MEE_HOST", "0.0.0.0")
             .with_env_var("MEE_PORT", INTERNAL_PORT.to_string())
-            .with_env_var("MEE_DISCOVERY", "disabled")
-            .with_network(network)
-            .start()
-            .await
-            .expect("start container");
+            .with_env_var("MEE_DEBUG", "1")
+            .with_network(network);
+
+        for (k, v) in extra_env {
+            image = image.with_env_var(*k, *v);
+        }
+
+        let container: ContainerAsync<GenericImage> = image.start().await.expect("start container");
 
         let host = container.get_host().await.expect("get host").to_string();
 
@@ -141,7 +162,7 @@ impl MeeNode {
             .is_ok_and(|r| r.status().is_success())
     }
 
-    // ---- HTTP API helpers ----
+    // ---- Public API helpers (/p2p/*) ----
 
     /// `GET /p2p/invite` — create an invite for this node.
     pub async fn get_invite(&self) -> Value {
@@ -173,9 +194,49 @@ impl MeeNode {
         );
     }
 
-    /// `POST /p2p/insert` — insert an entry into the node's namespace.
-    pub async fn insert(&self, path: &str, body: &str) {
-        let payload = serde_json::json!({ "path": path, "body": body });
+    /// `POST /p2p/connect` — returns response body ("connected" or "pending").
+    pub async fn connect_status(&self, invite: &Value) -> String {
+        let body = serde_json::json!({ "invite": invite });
+        let resp = self
+            .client
+            .post(format!("{}/p2p/connect", self.url()))
+            .json(&body)
+            .send()
+            .await
+            .expect("connect request");
+        assert!(
+            resp.status().is_success(),
+            "[{}] connect failed: {}",
+            self.label,
+            resp.status(),
+        );
+        resp.text().await.expect("read response body")
+    }
+
+    /// `GET /p2p/home-namespace` — returns the node's home namespace ID.
+    pub async fn home_namespace(&self) -> String {
+        let resp: Value = self
+            .client
+            .get(format!("{}/p2p/home-namespace", self.url()))
+            .send()
+            .await
+            .expect("home-namespace request")
+            .json()
+            .await
+            .expect("parse home-namespace json");
+        resp["namespace"]
+            .as_str()
+            .expect("namespace field")
+            .to_owned()
+    }
+
+    /// `POST /p2p/insert` — insert an entry into the given namespace.
+    pub async fn insert(&self, namespace: &str, path: &str, body: &str) {
+        let payload = serde_json::json!({
+            "namespace": namespace,
+            "path": path,
+            "body": body,
+        });
         let resp = self
             .client
             .post(format!("{}/p2p/insert", self.url()))
@@ -191,16 +252,92 @@ impl MeeNode {
         );
     }
 
-    /// `GET /p2p/list` — list all synced entries.
-    pub async fn list(&self) -> Vec<Value> {
+    /// `POST /p2p/list` — list entries from a specific namespace.
+    pub async fn list(&self, namespace: &str) -> Vec<Value> {
         self.client
-            .get(format!("{}/p2p/list", self.url()))
+            .post(format!("{}/p2p/list", self.url()))
+            .json(&serde_json::json!({ "namespace": namespace }))
             .send()
             .await
             .expect("list request")
             .json()
             .await
             .expect("parse list json")
+    }
+
+    /// `GET /p2p/subspace-id` — returns the node's `SubspaceId` (hex).
+    pub async fn subspace_id(&self) -> String {
+        let resp: Value = self
+            .client
+            .get(format!("{}/p2p/subspace-id", self.url()))
+            .send()
+            .await
+            .expect("subspace-id request")
+            .json()
+            .await
+            .expect("parse subspace-id json");
+        resp["subspace_id"]
+            .as_str()
+            .expect("subspace_id field")
+            .to_owned()
+    }
+
+    /// `POST /p2p/ticket` — generate a `SyncTicket` for a subspace.
+    pub async fn create_ticket(&self, to_subspace: &str) -> Value {
+        self.client
+            .post(format!("{}/p2p/ticket", self.url()))
+            .json(&serde_json::json!({ "to_subspace": to_subspace }))
+            .send()
+            .await
+            .expect("create ticket request")
+            .json()
+            .await
+            .expect("parse ticket json")
+    }
+
+    // ---- Debug helpers (/debug/*) — requires MEE_DEBUG=1 ----
+
+    /// `POST /debug/import` — import a `SyncTicket` (no direct connection).
+    pub async fn import_ticket(&self, ticket: &Value) {
+        let body = serde_json::json!({ "ticket": ticket });
+        let resp = self
+            .client
+            .post(format!("{}/debug/import", self.url()))
+            .json(&body)
+            .send()
+            .await
+            .expect("import request");
+        assert!(
+            resp.status().is_success(),
+            "[{}] import failed: {}",
+            self.label,
+            resp.status(),
+        );
+    }
+
+    /// `GET /debug/gossip/peers` — returns cached peer advertisements.
+    pub async fn gossip_peers(&self) -> Vec<Value> {
+        self.client
+            .get(format!("{}/debug/gossip/peers", self.url()))
+            .send()
+            .await
+            .expect("gossip peers request")
+            .json()
+            .await
+            .expect("parse gossip peers json")
+    }
+
+    /// `GET /debug/connections` — returns peer IDs that were
+    /// auto-connected via gossip (audit log).
+    pub async fn connections(&self) -> Vec<String> {
+        self.client
+            .get(format!("{}/debug/connections", self.url()))
+            .send()
+            .await
+            .expect("connections request")
+            .json()
+            .await
+            .expect("parse connections json")
     }
 }
 
@@ -231,22 +368,57 @@ pub async fn remove_network(name: &str) {
         .await;
 }
 
-/// Poll `node.list()` until an entry with the given `path` appears.
-pub async fn wait_for_entry(node: &MeeNode, expected_path: &str, timeout: Duration) {
+// ---- Connection helpers ----
+
+/// Bidirectional invite exchange: both nodes connect to each other.
+pub async fn bidirectional_connect(a: &MeeNode, b: &MeeNode) {
+    let b_invite = b.get_invite().await;
+    a.connect(&b_invite).await;
+    let a_invite = a.get_invite().await;
+    b.connect(&a_invite).await;
+}
+
+// ---- Polling helpers ----
+
+/// Poll `node.list()` until an entry with the given `key` appears.
+pub async fn wait_for_entry(
+    node: &MeeNode,
+    namespace: &str,
+    expected_key: &str,
+    timeout: Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let entries = node.list().await;
+        let entries = node.list(namespace).await;
         if entries
             .iter()
-            .any(|e| e.get("path").and_then(Value::as_str) == Some(expected_path))
+            .any(|e| e.get("key").and_then(Value::as_str) == Some(expected_key))
         {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "[{}] timed out waiting for entry '{expected_path}' after {timeout:?}",
+            "[{}] timed out waiting for entry '{expected_key}' after {timeout:?}",
             node.label,
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Poll gossip peer cache until at least `min_count` peers appear.
+pub async fn wait_for_gossip_peers(node: &MeeNode, min_count: usize, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let peers = node.gossip_peers().await;
+        if peers.len() >= min_count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "[{}] timed out waiting for {} gossip peers after {timeout:?}",
+            node.label,
+            min_count,
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
