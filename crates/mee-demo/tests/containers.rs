@@ -53,7 +53,9 @@ async fn two_node_stop_restart_inner() {
     alice.connect(&bob_invite).await;
 
     // Alice inserts data into her namespace
-    alice.insert(&alice_ns, "msgs/hello", "hello from alice").await;
+    alice
+        .insert(&alice_ns, "msgs/hello", "hello from alice")
+        .await;
 
     // Bob should see it via Willow replication (in Alice's namespace)
     wait_for_entry(&bob, &alice_ns, "msgs/hello", SYNC_TIMEOUT).await;

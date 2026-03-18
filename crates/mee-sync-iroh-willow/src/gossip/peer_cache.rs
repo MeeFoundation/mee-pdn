@@ -183,5 +183,4 @@ mod tests {
         assert!(evicted.is_empty());
         assert!(cache.get(&[1u8; 32]).is_some());
     }
-
 }

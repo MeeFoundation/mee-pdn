@@ -65,7 +65,6 @@ impl DiscoveryConfig {
     pub fn enable_mdns(&mut self) {
         self.mdns = true;
     }
-
 }
 
 // -- Connect protocol types ------------------------------------------------
@@ -243,10 +242,7 @@ pub(crate) fn from_iroh_addr(a: &IrohNodeAddr) -> api::NodeAddr {
 pub(crate) fn add_loopback_addr(addr: &mut IrohNodeAddr) {
     let first_port = addr.ip_addrs().next().map(SocketAddr::port);
     if let Some(port) = first_port {
-        let loopback = SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port,
-        );
+        let loopback = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
         addr.addrs.insert(TransportAddr::Ip(loopback));
     }
 }
@@ -609,13 +605,7 @@ impl IrohWillowSyncCore {
 
     /// Delete a `_local/` entry (tombstone) in the home namespace.
     pub async fn remove_local(&self, suffix: &str) -> Result<(), SyncError> {
-        delete_local(
-            &self.engine,
-            self.owner_user,
-            &self.home_namespace,
-            suffix,
-        )
-        .await
+        delete_local(&self.engine, self.owner_user, &self.home_namespace, suffix).await
     }
 
     #[allow(clippy::too_many_lines)]

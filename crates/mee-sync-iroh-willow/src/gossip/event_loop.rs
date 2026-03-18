@@ -135,11 +135,8 @@ async fn handle_message(state: &mut EventLoopState, content: &[u8]) {
     }
 
     // 5. Namespace intersection (existing held namespaces)
-    let matches =
-        intersect_namespaces(&ad.namespace_ids, &state.held_namespace_ids);
-    if !matches.is_empty()
-        && try_auto_connect(state, &ad, &matches).await.is_ok()
-    {
+    let matches = intersect_namespaces(&ad.namespace_ids, &state.held_namespace_ids);
+    if !matches.is_empty() && try_auto_connect(state, &ad, &matches).await.is_ok() {
         audit_connection(state, &ad.peer_id).await;
         return;
     }
@@ -342,13 +339,9 @@ async fn check_pending_invites(state: &mut EventLoopState, ad: &PeerAdvertisemen
 
 /// If `audit_connections` is enabled, write a marker at
 /// `_local/connections/{peer_id_hex}` for observability.
-async fn audit_connection(
-    state: &EventLoopState,
-    peer_id: &[u8; 32],
-) {
+async fn audit_connection(state: &EventLoopState, peer_id: &[u8; 32]) {
     if state.config.audit_connections {
-        let peer_hex: String =
-            peer_id.iter().map(|b| format!("{b:02x}")).collect();
+        let peer_hex: String = peer_id.iter().map(|b| format!("{b:02x}")).collect();
         let suffix = format!("connections/{peer_hex}");
         let _ = crate::write_local_raw(
             &state.engine,

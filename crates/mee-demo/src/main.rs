@@ -55,8 +55,8 @@ impl AppState {
                 gc.eviction_threshold = Duration::from_secs(s);
                 gc.staleness_threshold = Duration::from_secs(s);
             }
-            gc.audit_connections = std::env::var("MEE_DEBUG")
-                .is_ok_and(|v| v == "1" || v == "true");
+            gc.audit_connections =
+                std::env::var("MEE_DEBUG").is_ok_and(|v| v == "1" || v == "true");
         }
         // TODO(persistent-storage): Read MEE_DATA_DIR env var and pass to
         // DemoNode::spawn(). Default to ./var/data/{port}/.
@@ -154,9 +154,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/debug/connections",
-            get(|state| async move {
-                debug_connections(state).await
-            }),
+            get(|state| async move { debug_connections(state).await }),
         )
     } else {
         app
@@ -403,10 +401,7 @@ struct ListedEntry {
     value: String,
 }
 
-async fn p2p_list(
-    state: axum::extract::State<AppState>,
-    Json(req): Json<ListReq>,
-) -> Response {
+async fn p2p_list(state: axum::extract::State<AppState>, Json(req): Json<ListReq>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
@@ -539,11 +534,7 @@ async fn p2p_gossip_peers(state: axum::extract::State<AppState>) -> Response {
                 .into_iter()
                 .map(|p| CachedPeerResp {
                     peer_id: hex::encode(p.peer_id),
-                    namespace_ids: p
-                        .namespace_ids
-                        .iter()
-                        .map(hex::encode)
-                        .collect(),
+                    namespace_ids: p.namespace_ids.iter().map(hex::encode).collect(),
                     timestamp: p.timestamp,
                 })
                 .collect();
@@ -553,17 +544,14 @@ async fn p2p_gossip_peers(state: axum::extract::State<AppState>) -> Response {
     }
 }
 
-async fn debug_connections(
-    state: axum::extract::State<AppState>,
-) -> Response {
+async fn debug_connections(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
     match n.sync().core().list_local("connections/").await {
         Ok(entries) => {
-            let ids: Vec<String> =
-                entries.into_iter().map(|(suffix, _)| suffix).collect();
+            let ids: Vec<String> = entries.into_iter().map(|(suffix, _)| suffix).collect();
             Json(ids).into_response()
         }
         Err(e) => internal(&e).into_response(),
