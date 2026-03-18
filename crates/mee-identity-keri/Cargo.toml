@@ -1,0 +1,11 @@
+[package]
+name = "mee-identity-keri"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mee-identity-api = { path = "../mee-identity-api" }
+mee-types = { path = "../mee-types" }
+
+[lints]
+workspace = true
