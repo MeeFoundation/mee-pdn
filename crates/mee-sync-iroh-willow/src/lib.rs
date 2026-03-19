@@ -611,7 +611,9 @@ impl IrohWillowSyncCore {
     #[allow(clippy::too_many_lines)]
     pub async fn spawn(config: DiscoveryConfig) -> Result<Self, SyncError> {
         let alpns = vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()];
-        let mut builder = Endpoint::empty_builder(config.relay_mode).alpns(alpns);
+        let mut builder = Endpoint::empty_builder()
+            .relay_mode(config.relay_mode)
+            .alpns(alpns);
 
         if config.n0_discovery {
             builder = builder
