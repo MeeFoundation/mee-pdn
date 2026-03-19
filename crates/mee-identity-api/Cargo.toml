@@ -1,5 +1,5 @@
 [package]
-name = "mee-did-api"
+name = "mee-identity-api"
 version = "0.1.0"
 edition = "2021"
 

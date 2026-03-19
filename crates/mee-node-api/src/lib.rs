@@ -1,5 +1,6 @@
 pub use data_service::{DataEntry, DataError, DataService};
 pub use identity_service::IdentityService;
+use mee_sync_api::NamespaceId;
 use mee_types::NodeId;
 pub use sync_service::SyncService;
 pub use trust_service::{Contact, Invite, InviteSignature, TrustService};
@@ -16,6 +17,7 @@ pub trait Node {
     type Sync: SyncService;
 
     fn node_id(&self) -> &NodeId;
+    fn home_namespace(&self) -> NamespaceId;
     fn identity(&self) -> &Self::Identity;
     fn trust(&self) -> &Self::Trust;
     fn data(&self) -> &Self::Data;

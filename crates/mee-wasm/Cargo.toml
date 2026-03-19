@@ -10,8 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
-mee-did-api = { path = "../mee-did-api" }
-mee-did-key = { path = "../mee-did-key" }
+mee-identity-api = { path = "../mee-identity-api" }
 mee-node-api = { path = "../mee-node-api" }
 mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }

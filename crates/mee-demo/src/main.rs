@@ -5,23 +5,23 @@ use axum::{
     Json, Router,
 };
 use mee_node_api::{
-    Contact, IdentityService as _, Invite, Node as _, SyncService as _, TrustService as _,
+    Contact, DataService as _, IdentityService as _, Invite, Node as _, SyncService as _,
+    TrustService as _,
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
-use mee_sync_api::{AccessMode, SyncError};
+use mee_sync_api::{AccessMode, SyncEngine as _, SyncError};
 use mee_sync_iroh_willow::DiscoveryConfig;
-use mee_types::Did;
+use mee_types::Aid;
 use serde::{Deserialize, Serialize};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct AppState {
     node: Arc<Mutex<Option<Arc<DemoNode>>>>,
-    events: Arc<Mutex<Vec<String>>>,
-    discovery: Arc<str>,
 }
 
 #[allow(clippy::expect_used)]
@@ -30,11 +30,36 @@ impl AppState {
         if self.node.lock().expect("node lock poisoned").is_some() {
             return Ok(());
         }
-        let config = match &*self.discovery {
-            "local" => DiscoveryConfig::local(),
-            "full" => DiscoveryConfig::full(),
-            _ => DiscoveryConfig::disabled(),
-        };
+        let mut config = DiscoveryConfig::default_config();
+
+        // Transport toggles (dormant until internet deployment)
+        if std::env::var("MEE_RELAY").is_ok_and(|v| v == "1" || v == "true") {
+            config.enable_relay();
+        }
+        if std::env::var("MEE_MDNS").is_ok_and(|v| v == "1" || v == "true") {
+            config.enable_mdns();
+        }
+
+        // Gossip timing overrides (for tests)
+        if let Some(gc) = &mut config.gossip {
+            if let Some(s) = std::env::var("MEE_GOSSIP_REBROADCAST_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                gc.rebroadcast_interval = Duration::from_secs(s);
+            }
+            if let Some(s) = std::env::var("MEE_GOSSIP_EVICTION_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                gc.eviction_threshold = Duration::from_secs(s);
+                gc.staleness_threshold = Duration::from_secs(s);
+            }
+            gc.audit_connections =
+                std::env::var("MEE_DEBUG").is_ok_and(|v| v == "1" || v == "true");
+        }
+        // TODO(persistent-storage): Read MEE_DATA_DIR env var and pass to
+        // DemoNode::spawn(). Default to ./var/data/{port}/.
         let node = DemoNode::spawn(config)
             .await
             .map_err(|e| SyncError::Other(e.to_string()))?;
@@ -51,15 +76,11 @@ impl AppState {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let discovery: Arc<str> = std::env::var("MEE_DISCOVERY")
-        .unwrap_or_else(|_| "disabled".into())
-        .into();
     let state = AppState {
         node: Arc::new(Mutex::new(None)),
-        events: Arc::new(Mutex::new(Vec::with_capacity(256))),
-        discovery,
     };
 
     let app = Router::new()
@@ -85,24 +106,28 @@ async fn main() -> anyhow::Result<()> {
             post(|state, payload| async move { p2p_bind(state, payload).await }),
         )
         .route(
-            "/p2p/ticket-by-did",
-            post(|state, payload| async move { p2p_ticket_by_did(state, payload).await }),
+            "/p2p/ticket-by-aid",
+            post(|state, payload| async move { p2p_ticket_by_aid(state, payload).await }),
         )
         .route(
-            "/p2p/user-did",
-            get(|state| async move { p2p_user_did(state).await }),
+            "/p2p/user-aid",
+            get(|state| async move { p2p_user_aid(state).await }),
         )
         .route(
-            "/p2p/validate-did",
-            post(|state, payload| async move { p2p_validate_did(state, payload).await }),
+            "/p2p/validate-aid",
+            post(|state, payload| async move { p2p_validate_aid(state, payload).await }),
         )
         .route(
             "/p2p/identity",
-            post(|state, payload| async move { p2p_create_identity(state, payload).await }),
+            post(|state| async move { p2p_create_identity(state).await }),
         )
         .route(
             "/p2p/ticket",
             post(|state, payload| async move { p2p_ticket(state, payload).await }),
+        )
+        .route(
+            "/p2p/home-namespace",
+            get(|state| async move { p2p_home_namespace(state).await }),
         )
         .route(
             "/p2p/insert",
@@ -110,13 +135,32 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/p2p/list",
-            get(|state| async move { p2p_list(state).await }),
+            post(|state, payload| async move { p2p_list(state, payload).await }),
+        );
+
+    // Debug/test routes — only available when MEE_DEBUG=1
+    let app = if std::env::var("MEE_DEBUG").is_ok_and(|v| v == "1" || v == "true") {
+        app.route(
+            "/debug/endpoint-id",
+            get(|state| async move { p2p_endpoint_id(state).await }),
         )
         .route(
-            "/p2p/events",
-            get(|state| async move { p2p_events(state).await }),
+            "/debug/import",
+            post(|state, payload| async move { p2p_import(state, payload).await }),
         )
-        .with_state(state);
+        .route(
+            "/debug/gossip/peers",
+            get(|state| async move { p2p_gossip_peers(state).await }),
+        )
+        .route(
+            "/debug/connections",
+            get(|state| async move { debug_connections(state).await }),
+        )
+    } else {
+        app
+    };
+
+    let app = app.with_state(state);
 
     let host = std::env::var("MEE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("MEE_PORT")
@@ -159,17 +203,22 @@ async fn p2p_subspace_id(state: axum::extract::State<AppState>) -> Response {
 }
 
 #[derive(Serialize)]
-struct UserDidResp {
-    user_did: String,
+struct UserAidResp {
+    user_aid: String,
 }
 
-async fn p2p_user_did(state: axum::extract::State<AppState>) -> Response {
+async fn p2p_user_aid(state: axum::extract::State<AppState>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    let did = n.identity().current();
-    Json(UserDidResp { user_did: did.0 }).into_response()
+    match n.identity().aid().await {
+        Ok(aid) => Json(UserAidResp {
+            user_aid: aid.to_string(),
+        })
+        .into_response(),
+        Err(e) => internal_str(&format!("identity error: {e}")).into_response(),
+    }
 }
 
 async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
@@ -202,21 +251,44 @@ async fn p2p_connect(
     let invite = req.invite;
     let access = req.access.unwrap_or(AccessMode::Read);
     // Remember the invite and contact before connecting
-    trust.remember_invite(invite.clone());
-    trust.add_contact(Contact {
-        did: invite.inviter_did.clone(),
-        alias: None,
-    });
-    // Connect P2P: delegates capabilities and sends ticket
-    // directly to peer
-    match n
-        .sync()
-        .connect_to_peer(&invite.subspace_id, &invite.node, access)
+    if let Err(e) = trust.remember_invite(invite.clone()).await {
+        return internal(&e).into_response();
+    }
+    if let Err(e) = trust
+        .add_contact(Contact {
+            aid: invite.inviter_aid,
+            alias: None,
+        })
         .await
     {
-        Ok(()) => "connected".to_owned().into_response(),
-        Err(e) => internal(&e).into_response(),
+        return internal(&e).into_response();
     }
+    // Try direct connection via each node_hint.
+    for hint in &invite.node_hints {
+        if n.sync()
+            .connect_to_peer(&invite.subspace_id, hint, access)
+            .await
+            .is_ok()
+        {
+            return "connected".to_owned().into_response();
+        }
+    }
+
+    // All hints failed (or none provided) — defer to gossip discovery.
+    // Store a pending marker in Willow so the gossip event loop can
+    // match this invite against future peer advertisements.
+    let pending_path_str = format!(
+        "_local/pending/{}/{}",
+        invite.subspace_id, invite.namespace_id
+    );
+    if let Ok(path) = mee_sync_api::EntryPath::new(pending_path_str) {
+        let _ = n
+            .sync()
+            .core()
+            .insert(&n.home_namespace(), &path, &[])
+            .await;
+    }
+    "pending".to_owned().into_response()
 }
 
 #[derive(Deserialize)]
@@ -230,32 +302,43 @@ async fn p2p_bind(state: axum::extract::State<AppState>, Json(req): Json<BindReq
     }
     let n = state.get_node();
     let trust = n.trust();
-    trust.remember_invite(req.invite.clone());
-    trust.add_contact(Contact {
-        did: req.invite.inviter_did,
-        alias: None,
-    });
+    if let Err(e) = trust.remember_invite(req.invite.clone()).await {
+        return internal(&e).into_response();
+    }
+    if let Err(e) = trust
+        .add_contact(Contact {
+            aid: req.invite.inviter_aid,
+            alias: None,
+        })
+        .await
+    {
+        return internal(&e).into_response();
+    }
     "bound".to_owned().into_response()
 }
 
 #[derive(Deserialize)]
-struct TicketByDidReq {
-    did: Did,
+struct TicketByAidReq {
+    aid: Aid,
     #[serde(default)]
     access: Option<AccessMode>,
 }
 
-async fn p2p_ticket_by_did(
+async fn p2p_ticket_by_aid(
     state: axum::extract::State<AppState>,
-    Json(req): Json<TicketByDidReq>,
+    Json(req): Json<TicketByAidReq>,
 ) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
     let trust = n.trust();
-    let Some(invite) = trust.invite_for(&req.did) else {
-        return internal_str("did not bound; import invite first").into_response();
+    let invite = match trust.invite_for(&req.aid).await {
+        Ok(Some(inv)) => inv,
+        Ok(None) => {
+            return internal_str("aid not bound; import invite first").into_response();
+        }
+        Err(e) => return internal(&e).into_response(),
     };
     let access = req.access.unwrap_or(AccessMode::Read);
     match trust.accept_invite(&invite, access).await {
@@ -285,6 +368,7 @@ async fn p2p_ticket(state: axum::extract::State<AppState>, Json(req): Json<Ticke
 
 #[derive(Deserialize)]
 struct InsertReq {
+    namespace: api::NamespaceId,
     path: String,
     body: String,
 }
@@ -293,104 +377,188 @@ async fn p2p_insert(state: axum::extract::State<AppState>, Json(req): Json<Inser
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
-    let path = match api::EntryPath::new(req.path) {
-        Ok(p) => p,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("invalid path: {e}")).into_response();
-        }
-    };
     let n = state.get_node();
-    match n.sync().insert(&path, req.body.as_bytes()).await {
+    match n
+        .data()
+        .set(&req.namespace, &req.path, req.body.as_bytes())
+        .await
+    {
         Ok(()) => "ok".to_owned().into_response(),
-        Err(e) => internal(&e).into_response(),
+        Err(e) => internal_str(&e.to_string()).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct ListReq {
+    namespace: api::NamespaceId,
+    #[serde(default)]
+    prefix: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ListedEntry {
-    subspace: String,
-    path: String,
-    payload_len: u64,
+    key: String,
+    value: String,
 }
 
-async fn p2p_list(state: axum::extract::State<AppState>) -> Response {
+async fn p2p_list(state: axum::extract::State<AppState>, Json(req): Json<ListReq>) -> Response {
     if let Err(e) = state.ensure().await {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.sync().list().await {
+    let prefix = req.prefix.as_deref().unwrap_or("");
+    match n.data().list(&req.namespace, prefix).await {
         Ok(entries) => {
             let out: Vec<ListedEntry> = entries
                 .into_iter()
                 .map(|i| ListedEntry {
-                    subspace: i.subspace.to_string(),
-                    path: i.path.to_string(),
-                    payload_len: i.payload_len,
+                    key: i.key,
+                    value: String::from_utf8_lossy(&i.value).into_owned(),
                 })
                 .collect();
             Json(out).into_response()
+        }
+        Err(e) => internal_str(&e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ValidateAidReq {
+    aid: Aid,
+}
+
+async fn p2p_validate_aid(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<ValidateAidReq>,
+) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    match n.identity().resolve(&req.aid).await {
+        Ok(identity_state) => Json(identity_state.aid.to_string()).into_response(),
+        Err(e) => internal_str(&format!("identity resolve error: {e}")).into_response(),
+    }
+}
+
+// TODO(keri): Add params for key type, witness config when real
+// KERI inception is implemented. Currently parameterless.
+#[derive(Serialize)]
+struct CreateIdentityResp {
+    aid: String,
+}
+
+async fn p2p_create_identity(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    match n.identity().create().await {
+        Ok(aid) => Json(CreateIdentityResp {
+            aid: aid.to_string(),
+        })
+        .into_response(),
+        Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct HomeNamespaceResp {
+    namespace: String,
+}
+
+async fn p2p_home_namespace(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    Json(HomeNamespaceResp {
+        namespace: n.home_namespace().to_string(),
+    })
+    .into_response()
+}
+
+// -- Gossip routes ----------------------------------------------------------
+
+#[derive(Serialize)]
+struct EndpointIdResp {
+    endpoint_id: String,
+}
+
+async fn p2p_endpoint_id(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    let eid = n.sync().core().endpoint().id();
+    Json(EndpointIdResp {
+        endpoint_id: hex::encode(eid.as_bytes()),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    ticket: api::SyncTicket,
+}
+
+async fn p2p_import(state: axum::extract::State<AppState>, Json(req): Json<ImportReq>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    match n.sync().import(req.ticket, api::SyncMode::Continuous).await {
+        Ok(_handle) => "imported".to_owned().into_response(),
+        Err(e) => internal(&e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct CachedPeerResp {
+    peer_id: String,
+    namespace_ids: Vec<String>,
+    timestamp: u64,
+}
+
+async fn p2p_gossip_peers(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    let Some(gossip) = n.sync().core().gossip_manager() else {
+        return internal_str("gossip not enabled").into_response();
+    };
+    match gossip.cached_peers().await {
+        Ok(peers) => {
+            let out: Vec<CachedPeerResp> = peers
+                .into_iter()
+                .map(|p| CachedPeerResp {
+                    peer_id: hex::encode(p.peer_id),
+                    namespace_ids: p.namespace_ids.iter().map(hex::encode).collect(),
+                    timestamp: p.timestamp,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => internal_str(&e.to_string()).into_response(),
+    }
+}
+
+async fn debug_connections(state: axum::extract::State<AppState>) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+    match n.sync().core().list_local("connections/").await {
+        Ok(entries) => {
+            let ids: Vec<String> = entries.into_iter().map(|(suffix, _)| suffix).collect();
+            Json(ids).into_response()
         }
         Err(e) => internal(&e).into_response(),
     }
 }
 
-#[allow(clippy::expect_used)]
-async fn p2p_events(state: axum::extract::State<AppState>) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    Json(state.events.lock().expect("events lock poisoned").clone()).into_response()
-}
-
-#[derive(Deserialize)]
-struct ValidateDidReq {
-    did: Did,
-}
-
-async fn p2p_validate_did(
-    state: axum::extract::State<AppState>,
-    Json(req): Json<ValidateDidReq>,
-) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    let n = state.get_node();
-    match n.identity().resolve(&req.did).await {
-        Ok(doc) => Json(doc.id.0).into_response(),
-        Err(e) => internal_str(&format!("did resolve error: {e}")).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct CreateIdentityReq {
-    #[serde(default)]
-    jwk: String,
-    #[serde(default)]
-    use_jcs_pub: bool,
-}
-
-#[derive(Serialize)]
-struct CreateIdentityResp {
-    did: String,
-}
-
-async fn p2p_create_identity(
-    state: axum::extract::State<AppState>,
-    Json(req): Json<CreateIdentityReq>,
-) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    let n = state.get_node();
-    let params = mee_did_api::DidCreateParams::Key(mee_did_api::DidKeyCreateOptions {
-        jwk: req.jwk,
-        use_jcs_pub: req.use_jcs_pub,
-    });
-    match n.identity().create(&params).await {
-        Ok(did) => Json(CreateIdentityResp { did: did.0 }).into_response(),
-        Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
-    }
-}
+// -- Helpers ----------------------------------------------------------------
 
 fn internal(e: &SyncError) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
