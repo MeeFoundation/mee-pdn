@@ -16,7 +16,7 @@ use iroh_willow::{engine::AcceptOpts, Engine as WillowEngine, ALPN};
 use mee_sync_api as api;
 use mee_sync_api::SyncError;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, net::SocketAddr, pin::Pin};
+use std::{collections::BTreeSet, net::SocketAddr, pin::Pin, sync::Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// ALPN for the mee-connect handshake protocol.
@@ -532,11 +532,27 @@ pub struct IrohWillowSyncCore {
     owner_user: iroh_willow::proto::keys::UserId,
     blobs: iroh_blobs::api::Store,
     home_namespace: api::NamespaceId,
-    _router: Router,
+    router: Mutex<Option<Router>>,
     gossip_manager: Option<gossip::GossipManager>,
 }
 
 impl IrohWillowSyncCore {
+    /// Gracefully shut down the node: stops the router accept loop
+    /// and closes the iroh endpoint.
+    ///
+    /// Safe to call multiple times — the second call is a no-op.
+    #[allow(clippy::expect_used)]
+    pub async fn shutdown(&self) -> Result<(), SyncError> {
+        let router = self.router.lock().expect("router lock poisoned").take();
+        if let Some(router) = router {
+            router
+                .shutdown()
+                .await
+                .map_err(|e| SyncError::Backend(format!("router shutdown: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Access the underlying iroh endpoint (for address exchange in tests).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
@@ -727,7 +743,7 @@ impl IrohWillowSyncCore {
             owner_user,
             blobs: blobs_api,
             home_namespace,
-            _router: router,
+            router: Mutex::new(Some(router)),
             gossip_manager,
         })
     }

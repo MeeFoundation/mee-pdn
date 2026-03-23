@@ -2366,7 +2366,7 @@ dependencies = [
 [[package]]
 name = "iroh-willow"
 version = "0.28.0"
-source = "git+https://github.com/MeeFoundation/iroh-willow.git?branch=willow-experiments-iroh-0.97#e807ae22d985b0e6cc5b4059e5a9f829f11a339c"
+source = "git+https://github.com/MeeFoundation/iroh-willow.git?branch=willow-experiments-iroh-0.97#4c3f9dddc43c2cd56e37e4aef1bca290799b0158"
 dependencies = [
  "anyhow",
  "bao-tree",

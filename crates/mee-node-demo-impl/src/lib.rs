@@ -27,6 +27,15 @@ pub struct DemoNode {
 
 #[allow(clippy::expect_used)]
 impl DemoNode {
+    /// Gracefully shut down the iroh endpoint and router.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.sync
+            .core()
+            .shutdown()
+            .await
+            .map_err(|e| anyhow::anyhow!("shutdown: {e}"))
+    }
+
     pub async fn spawn(discovery: DiscoveryConfig) -> anyhow::Result<Arc<Self>> {
         let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery).await?);
         let identity_mgr = Arc::new(KeriIdentityManager::new());
