@@ -250,16 +250,26 @@ impl MeeNode {
     }
 
     /// `POST /p2p/list` — list entries from a specific namespace.
-    pub async fn list(&self, namespace: &str) -> Vec<Value> {
-        self.client
+    /// Returns `Err` on transient errors (non-200, non-JSON) so callers
+    /// can distinguish "no entries yet" (`Ok(vec![])`) from "server error".
+    pub async fn list(&self, namespace: &str) -> Result<Vec<Value>, String> {
+        let resp = self
+            .client
             .post(format!("{}/p2p/list", self.url()))
             .json(&serde_json::json!({ "namespace": namespace }))
             .send()
             .await
-            .expect("list request")
-            .json()
-            .await
-            .expect("parse list json")
+            .expect("list request");
+        if !resp.status().is_success() {
+            let msg = format!("[{}] list returned {}", self.label, resp.status());
+            eprintln!("{msg}");
+            return Err(msg);
+        }
+        resp.json().await.map_err(|e| {
+            let msg = format!("[{}] list response not JSON: {e}", self.label);
+            eprintln!("{msg}");
+            msg
+        })
     }
 
     /// `GET /p2p/subspace-id` — returns the node's `SubspaceId` (hex).
@@ -386,11 +396,13 @@ pub async fn wait_for_entry(
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let entries = node.list(namespace).await;
-        if entries
+        let found = node
+            .list(namespace)
+            .await
+            .unwrap_or_default()
             .iter()
-            .any(|e| e.get("key").and_then(Value::as_str) == Some(expected_key))
-        {
+            .any(|e| e.get("key").and_then(Value::as_str) == Some(expected_key));
+        if found {
             return;
         }
         assert!(
