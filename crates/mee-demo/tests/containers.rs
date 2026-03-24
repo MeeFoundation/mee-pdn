@@ -21,7 +21,7 @@ use common::{
 };
 
 const NETWORK: &str = "mee-test-net";
-const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Two nodes: invite -> connect -> insert -> replicate -> stop -> restart -> reconnect.
 #[tokio::test(flavor = "multi_thread")]
@@ -106,6 +106,11 @@ async fn gossip_transitive_sync_inner() {
     // Establish connectivity via invites (auto-wires gossip)
     bidirectional_connect(&alice, &bob).await;
     bidirectional_connect(&bob, &charlie).await;
+
+    // Wait for the full gossip mesh to form before relying on transitive discovery
+    wait_for_gossip_peers(&alice, 1, SYNC_TIMEOUT).await;
+    wait_for_gossip_peers(&bob, 2, SYNC_TIMEOUT).await;
+    wait_for_gossip_peers(&charlie, 1, SYNC_TIMEOUT).await;
 
     // Charlie creates a ticket for Alice's subspace — strip addresses
     let alice_sub = alice.subspace_id().await;

@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         app
     };
 
+    let shutdown_state = state.clone();
     let app = app.with_state(state);
 
     let host = std::env::var("MEE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -168,7 +169,24 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3011);
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+
+    // Gracefully shut down the iroh endpoint so connections close cleanly.
+    #[allow(clippy::expect_used)]
+    let node = shutdown_state
+        .node
+        .lock()
+        .expect("node lock poisoned")
+        .clone();
+    if let Some(node) = node {
+        let _ = node.shutdown().await;
+    }
+
     Ok(())
 }
 
