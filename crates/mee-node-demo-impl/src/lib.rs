@@ -4,8 +4,7 @@ use futures_util::StreamExt;
 use mee_identity_api::{IdentityProvider, IdentityResolver};
 use mee_identity_keri::KeriIdentityManager;
 use mee_node_api::{
-    Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
-    TrustService,
+    Contact, DataEntry, DataError, Invite, InviteSignature, Node, SyncService, TrustService,
 };
 use mee_sync_api as api;
 use mee_sync_api::SyncEngine;
@@ -91,7 +90,8 @@ impl DemoNode {
 }
 
 impl Node for DemoNode {
-    type Identity = DemoIdentityService;
+    type IdentityProvider = DemoIdentityService;
+    type IdentityResolver = DemoIdentityService;
     type Trust = DemoTrustService;
     type Data = DemoDataService;
     type Sync = DemoSyncService;
@@ -104,7 +104,11 @@ impl Node for DemoNode {
         self.namespace
     }
 
-    fn identity(&self) -> &Self::Identity {
+    fn identity_provider(&self) -> &Self::IdentityProvider {
+        &self.identity
+    }
+
+    fn identity_resolver(&self) -> &Self::IdentityResolver {
         &self.identity
     }
 
@@ -128,15 +132,7 @@ pub struct DemoIdentityService {
 }
 
 #[allow(async_fn_in_trait)]
-impl IdentityService for DemoIdentityService {
-    async fn aid(&self) -> Result<Aid, mee_identity_api::IdentityError> {
-        self.sync
-            .get_local_json::<Aid>("identity/current_aid")
-            .await
-            .map_err(|e| mee_identity_api::IdentityError::Other(e.to_string()))?
-            .ok_or_else(|| mee_identity_api::IdentityError::Other("AID not set".to_owned()))
-    }
-
+impl IdentityProvider for DemoIdentityService {
     async fn create(&self) -> Result<Aid, mee_identity_api::IdentityError> {
         let aid = self.identity_mgr.create().await?;
         self.sync
@@ -146,11 +142,41 @@ impl IdentityService for DemoIdentityService {
         Ok(aid)
     }
 
+    fn aid(&self) -> Aid {
+        self.identity_mgr.aid()
+    }
+
+    async fn rotate_key(
+        &self,
+        compromised: bool,
+    ) -> Result<mee_types::OperationalKey, mee_identity_api::IdentityError> {
+        self.identity_mgr.rotate_key(compromised).await
+    }
+
+    async fn export_kel(&self) -> Result<Vec<u8>, mee_identity_api::IdentityError> {
+        self.identity_mgr.export_kel().await
+    }
+}
+
+#[allow(async_fn_in_trait)]
+impl IdentityResolver for DemoIdentityService {
     async fn resolve(
         &self,
         aid: &Aid,
     ) -> Result<mee_identity_api::IdentityState, mee_identity_api::IdentityError> {
         self.identity_mgr.resolve(aid).await
+    }
+
+    async fn key_at(
+        &self,
+        aid: &Aid,
+        at_time: u64,
+    ) -> Result<mee_identity_api::KeyAtResult, mee_identity_api::IdentityError> {
+        self.identity_mgr.key_at(aid, at_time).await
+    }
+
+    async fn import_kel(&self, kel_bytes: &[u8]) -> Result<Aid, mee_identity_api::IdentityError> {
+        self.identity_mgr.import_kel(kel_bytes).await
     }
 }
 

@@ -1,62 +1,101 @@
 mod error;
 pub use error::IdentityError;
-use mee_types::Aid;
+use mee_types::{Aid, OperationalKey};
 
 /// The verified current state of a KERI identity.
 ///
 /// Resolved from the AID's Key Event Log (KEL).
-/// Contains the stable root identifier plus the current
-/// operational signing key.
 #[derive(Clone, Debug)]
 pub struct IdentityState {
     /// The stable root Autonomic Identifier.
-    /// Derived from the ed25519 inception public key.
     pub aid: Aid,
 
-    /// Current operational signing key (`SubspaceId` in Willow terms).
-    /// Designated by the most recent rotation or inception event.
-    // TODO(keri): This must be verified against the KEL chain.
-    // Currently set to the same bytes as the AID (no key rotation
-    // support yet). Real implementation extracts this from the
-    // latest rotation event, or from inception if no rotation.
-    pub current_operational_key: [u8; 32],
+    /// Current operational signing key.
+    /// Maps to Willow `SubspaceId` / iroh-willow `UserId`.
+    pub current_key: OperationalKey,
+
+    /// Sequence number of the latest KEL event.
+    /// 0 = inception only, 1 = one rotation, etc.
+    pub event_seq: u64,
 }
 
-/// Provides identity creation and access to the node's AID.
+/// Result of a historical key lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyAtResult {
+    /// The operational key that was active at the queried time.
+    pub key: OperationalKey,
+    /// Whether this key is still the current operational key.
+    pub current: bool,
+    /// Whether this key was later marked compromised
+    /// by a recovery rotation.
+    pub compromised: bool,
+}
+
+/// Provides identity creation, key rotation, and KEL export.
 ///
-/// Implementors manage the local KERI key material and KEL.
+/// Holder-side operations. Implementors manage the local KERI
+/// key material and KEL.
 #[allow(async_fn_in_trait)]
 pub trait IdentityProvider: Send + Sync {
     /// Create a new identity (KERI inception event).
     ///
-    /// Generates a new ed25519 keypair, creates the inception
-    /// event, and returns the resulting AID.
-    // TODO(keri): Real implementation must:
-    // 1. Generate ed25519 keypair
-    // 2. Derive AID from inception public key
-    // 3. Create and sign inception event with pre-rotation
-    //    key commitment
-    // 4. Store inception event in local KEL
-    // 5. Set initial operational key = inception key
+    /// Generates an ed25519 keypair, creates the inception event
+    /// with a pre-rotation commitment, and stores the inception
+    /// event as the first entry in the local KEL.
     async fn create(&self) -> Result<Aid, IdentityError>;
 
-    /// Return the node's AID. Set once at inception, never changes.
+    /// The node's AID. Set once at inception, never changes.
     fn aid(&self) -> Aid;
+
+    /// Rotate the current operational key.
+    ///
+    /// Activates the pre-committed next key and commits to a new
+    /// next-key hash. Appends the rotation event to the local KEL.
+    ///
+    /// If `compromised` is true, this is a **recovery rotation**:
+    /// the current key is marked as compromised, signaling relying
+    /// parties that signatures from the old key after this event
+    /// should not be trusted.
+    async fn rotate_key(&self, compromised: bool) -> Result<OperationalKey, IdentityError>;
+
+    /// Export the local KEL as opaque bytes for peer exchange.
+    ///
+    /// The sync layer sends this to peers during the mee-connect/0
+    /// handshake. The KEL is also stored at `_sys/kel/self` in the
+    /// owner's namespace and replicates via Willow sync.
+    async fn export_kel(&self) -> Result<Vec<u8>, IdentityError>;
 }
 
-/// Resolves an AID to its current verified identity state.
+/// Resolves an AID to its current or historical identity state.
 ///
-/// In KERI direct mode, this means obtaining and verifying the
-/// peer's Key Event Log.
+/// Relying-party operations. Owns the stored KELs for known peers.
+/// The sync layer uses this to verify capabilities anchored to
+/// operational keys.
 #[allow(async_fn_in_trait)]
 pub trait IdentityResolver: Send + Sync {
-    /// Resolve an AID to its current identity state.
-    // TODO(keri): Real implementation must:
-    // 1. Obtain the peer's KEL (from local cache or via
-    //    mee-connect/0 direct exchange)
-    // 2. Verify the full event chain (signatures, hash links)
-    // 3. Extract current operational key from the latest
-    //    rotation event (or inception if no rotation)
-    // 4. Return verified IdentityState
+    /// Resolve an AID to its current verified identity state.
+    ///
+    /// Walks the peer's KEL from inception through all rotation
+    /// events, verifying signatures and hash links, and returns
+    /// the state designated by the most recent event.
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError>;
+
+    /// What key was active for an AID at a point in time?
+    ///
+    /// Returns the operational key that was active at `at_time`
+    /// (Unix seconds), whether it's still current, and whether
+    /// it was later marked compromised by a recovery rotation.
+    ///
+    /// Returns `IdentityError::NotFound` if the AID is unknown
+    /// or did not exist at `at_time`.
+    async fn key_at(&self, aid: &Aid, at_time: u64) -> Result<KeyAtResult, IdentityError>;
+
+    /// Import a peer's KEL — verify and store locally.
+    ///
+    /// Verifies the full event chain. If a KEL for this AID
+    /// already exists locally, extends it with new events.
+    /// Rejects forks (divergent KELs for the same AID).
+    ///
+    /// Returns the AID extracted from the inception event.
+    async fn import_kel(&self, kel_bytes: &[u8]) -> Result<Aid, IdentityError>;
 }

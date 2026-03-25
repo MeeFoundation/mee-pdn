@@ -1,5 +1,7 @@
-use mee_identity_api::{IdentityError, IdentityProvider, IdentityResolver, IdentityState};
-use mee_types::Aid;
+use mee_identity_api::{
+    IdentityError, IdentityProvider, IdentityResolver, IdentityState, KeyAtResult,
+};
+use mee_types::{Aid, OperationalKey};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,8 +34,6 @@ impl Default for KeriIdentityManager {
 
 /// Generate a placeholder AID from the current timestamp.
 // TODO(keri): Replace with real ed25519 key generation.
-// Real implementation: generate ed25519 keypair, derive AID
-// from the public key bytes (the inception key).
 #[allow(clippy::expect_used)]
 fn timestamp_aid() -> Aid {
     let ms = SystemTime::now()
@@ -42,8 +42,7 @@ fn timestamp_aid() -> Aid {
         .as_millis();
     let mut bytes = [0u8; 32];
     let ms_bytes = ms.to_le_bytes();
-    // REASON: ms_bytes is 16 bytes, bytes is 32 — copy_from_slice is safe
-    // for the first 16 bytes.
+    // REASON: ms_bytes is 16 bytes, bytes is 32 — safe slice copy
     #[allow(clippy::indexing_slicing)]
     bytes[..16].copy_from_slice(&ms_bytes);
     Aid::from_bytes(bytes)
@@ -51,13 +50,8 @@ fn timestamp_aid() -> Aid {
 
 #[allow(clippy::expect_used)]
 impl IdentityProvider for KeriIdentityManager {
-    // TODO(keri): Real implementation must:
-    // 1. Generate ed25519 keypair
-    // 2. Derive AID from inception public key
-    // 3. Create and sign inception event with pre-rotation
-    //    key commitment
-    // 4. Store inception event in local KEL
-    // 5. Set initial operational key = inception key
+    // TODO(keri): Real implementation must generate ed25519 keypair,
+    // create inception event with pre-rotation commitment, store in KEL.
     async fn create(&self) -> Result<Aid, IdentityError> {
         let aid = timestamp_aid();
         let mut guard = self.aid.lock().expect("aid lock poisoned");
@@ -71,21 +65,52 @@ impl IdentityProvider for KeriIdentityManager {
             .expect("aid lock poisoned")
             .unwrap_or_else(|| Aid::from_bytes([0u8; 32]))
     }
+
+    // TODO(keri): Real implementation must activate the pre-committed
+    // next key and append a rotation event to the KEL.
+    async fn rotate_key(&self, _compromised: bool) -> Result<OperationalKey, IdentityError> {
+        Err(IdentityError::Rotation(
+            "key rotation not yet implemented".to_owned(),
+        ))
+    }
+
+    // TODO(keri): Real implementation must serialize the local KEL
+    // (inception event + all rotation events) for peer exchange.
+    async fn export_kel(&self) -> Result<Vec<u8>, IdentityError> {
+        Err(IdentityError::Other(
+            "KEL export not yet implemented".to_owned(),
+        ))
+    }
 }
 
 impl IdentityResolver for KeriIdentityManager {
-    // TODO(keri): Real implementation must:
-    // 1. Obtain the peer's KEL (from local cache or via
-    //    mee-connect/0 direct exchange)
-    // 2. Verify the full event chain (signatures, hash links)
-    // 3. Extract current operational key from the latest
-    //    rotation event (or inception if no rotation)
-    // 4. Return verified IdentityState
+    // TODO(keri): Real implementation must walk the peer's KEL,
+    // verify signatures and hash links, extract current operational key.
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError> {
         // Placeholder: operational key = AID bytes (no key rotation)
         Ok(IdentityState {
             aid: *aid,
-            current_operational_key: *aid.as_bytes(),
+            current_key: OperationalKey::from_bytes(*aid.as_bytes()),
+            event_seq: 0,
         })
+    }
+
+    // TODO(keri): Real implementation must walk the KEL to find
+    // which key was active at at_time and check for later compromise.
+    async fn key_at(&self, aid: &Aid, _at_time: u64) -> Result<KeyAtResult, IdentityError> {
+        // Placeholder: only one key (the AID), always current, never compromised
+        Ok(KeyAtResult {
+            key: OperationalKey::from_bytes(*aid.as_bytes()),
+            current: true,
+            compromised: false,
+        })
+    }
+
+    // TODO(keri): Real implementation must verify the KEL chain
+    // and store it locally for future resolve/key_at calls.
+    async fn import_kel(&self, _kel_bytes: &[u8]) -> Result<Aid, IdentityError> {
+        Err(IdentityError::Other(
+            "KEL import not yet implemented".to_owned(),
+        ))
     }
 }
