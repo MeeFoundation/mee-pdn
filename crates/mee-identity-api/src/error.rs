@@ -16,6 +16,10 @@ pub enum IdentityError {
     // and why (bad signature, missing predecessor, etc.).
     #[error("KEL verification error: {0}")]
     KelVerification(String),
+    #[error("key rotation error: {0}")]
+    Rotation(String),
+    #[error("KEL conflict: logs diverge at event {0}")]
+    KelConflict(u64),
     #[error("other identity error: {0}")]
     Other(String),
 }

@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use mee_identity_api::{IdentityProvider, IdentityResolver};
+use mee_identity_api::{IdentityError, IdentityProvider, IdentityRepository, Kel};
 use mee_identity_keri::KeriIdentityManager;
 use mee_node_api::{
-    Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
-    TrustService,
+    Contact, DataEntry, DataError, Invite, InviteSignature, Node, SyncService, TrustService,
 };
 use mee_sync_api as api;
 use mee_sync_api::SyncEngine;
@@ -15,11 +14,47 @@ use mee_sync_api::{
 use mee_sync_iroh_willow::{DiscoveryConfig, IrohWillowSyncCore};
 use mee_types::Aid;
 
+// ---------------------------------------------------------------------------
+// WillowIdentityRepository
+// ---------------------------------------------------------------------------
+
+/// `IdentityRepository` backed by Willow `_local/` storage.
+pub struct WillowIdentityRepository {
+    sync: Arc<IrohWillowSyncCore>,
+}
+
+impl WillowIdentityRepository {
+    pub fn new(sync: Arc<IrohWillowSyncCore>) -> Self {
+        Self { sync }
+    }
+}
+
+#[allow(async_fn_in_trait)]
+impl IdentityRepository for WillowIdentityRepository {
+    async fn load_kel(&self) -> Result<Option<Kel>, IdentityError> {
+        self.sync
+            .get_local_json::<Kel>("identity/kel")
+            .await
+            .map_err(|e| IdentityError::Other(e.to_string()))
+    }
+
+    async fn store_kel(&self, kel: &Kel) -> Result<(), IdentityError> {
+        self.sync
+            .put_local_json("identity/kel", kel)
+            .await
+            .map_err(|e| IdentityError::Other(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DemoNode
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct DemoNode {
     node_id: mee_types::NodeId,
     namespace: NamespaceId,
-    identity: DemoIdentityService,
+    identity: Arc<KeriIdentityManager<WillowIdentityRepository>>,
     trust: DemoTrustService,
     data: DemoDataService,
     sync: DemoSyncService,
@@ -38,34 +73,24 @@ impl DemoNode {
 
     pub async fn spawn(discovery: DiscoveryConfig) -> anyhow::Result<Arc<Self>> {
         let sync_engine = Arc::new(IrohWillowSyncCore::spawn(discovery).await?);
-        let identity_mgr = Arc::new(KeriIdentityManager::new());
-        let initial_aid = identity_mgr
-            .create()
-            .await
-            .map_err(|e| anyhow::anyhow!("identity create error: {e}"))?;
-
         let namespace = sync_engine.home_namespace();
 
-        // Write initial AID to Willow _local/ path
-        sync_engine
-            .put_local_json("identity/current_aid", &initial_aid)
-            .await
-            .map_err(|e| anyhow::anyhow!("write aid: {e}"))?;
+        let repo = WillowIdentityRepository::new(sync_engine.clone());
+        let identity = Arc::new(
+            KeriIdentityManager::init(repo)
+                .await
+                .map_err(|e| anyhow::anyhow!("identity init: {e}"))?,
+        );
 
-        // Get the actual transport NodeId from the endpoint
         let node_addr = sync_engine
             .addr()
             .await
             .map_err(|e| anyhow::anyhow!("node addr error: {e}"))?;
 
-        let identity = DemoIdentityService {
-            identity_mgr: identity_mgr.clone(),
-            sync: sync_engine.clone(),
-        };
-
         let trust = DemoTrustService {
             sync: sync_engine.clone(),
             namespace,
+            aid: identity.aid(),
         };
 
         let data = DemoDataService {
@@ -91,7 +116,8 @@ impl DemoNode {
 }
 
 impl Node for DemoNode {
-    type Identity = DemoIdentityService;
+    type IdentityProvider = KeriIdentityManager<WillowIdentityRepository>;
+    type IdentityResolver = KeriIdentityManager<WillowIdentityRepository>;
     type Trust = DemoTrustService;
     type Data = DemoDataService;
     type Sync = DemoSyncService;
@@ -104,7 +130,11 @@ impl Node for DemoNode {
         self.namespace
     }
 
-    fn identity(&self) -> &Self::Identity {
+    fn identity_provider(&self) -> &Self::IdentityProvider {
+        &self.identity
+    }
+
+    fn identity_resolver(&self) -> &Self::IdentityResolver {
         &self.identity
     }
 
@@ -121,59 +151,26 @@ impl Node for DemoNode {
     }
 }
 
-#[derive(Clone)]
-pub struct DemoIdentityService {
-    identity_mgr: Arc<KeriIdentityManager>,
-    sync: Arc<IrohWillowSyncCore>,
-}
-
-#[allow(async_fn_in_trait)]
-impl IdentityService for DemoIdentityService {
-    async fn aid(&self) -> Result<Aid, mee_identity_api::IdentityError> {
-        self.sync
-            .get_local_json::<Aid>("identity/current_aid")
-            .await
-            .map_err(|e| mee_identity_api::IdentityError::Other(e.to_string()))?
-            .ok_or_else(|| mee_identity_api::IdentityError::Other("AID not set".to_owned()))
-    }
-
-    async fn create(&self) -> Result<Aid, mee_identity_api::IdentityError> {
-        let aid = self.identity_mgr.create().await?;
-        self.sync
-            .put_local_json("identity/current_aid", &aid)
-            .await
-            .map_err(|e| mee_identity_api::IdentityError::Other(e.to_string()))?;
-        Ok(aid)
-    }
-
-    async fn resolve(
-        &self,
-        aid: &Aid,
-    ) -> Result<mee_identity_api::IdentityState, mee_identity_api::IdentityError> {
-        self.identity_mgr.resolve(aid).await
-    }
-}
+// ---------------------------------------------------------------------------
+// DemoTrustService
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct DemoTrustService {
     sync: Arc<IrohWillowSyncCore>,
     namespace: NamespaceId,
+    aid: Aid,
 }
 
 #[allow(async_fn_in_trait)]
 impl TrustService for DemoTrustService {
     async fn create_invite(&self) -> Result<Invite, SyncError> {
-        let inviter: Aid = self
-            .sync
-            .get_local_json("identity/current_aid")
-            .await?
-            .ok_or_else(|| SyncError::Other("AID not set".into()))?;
         let node_addr = self.sync.addr().await?;
         let subspace_id = self.sync.subspace_id().await?;
         // TODO: Make invite expiry configurable instead of hardcoded 10 minutes.
         let expires_at = now_ms() + 10 * 60 * 1000;
         let mut invite = Invite {
-            inviter_aid: inviter,
+            inviter_aid: self.aid,
             namespace_id: self.namespace,
             subspace_id,
             node_hints: vec![node_addr],
@@ -228,6 +225,10 @@ impl TrustService for DemoTrustService {
         Ok(out)
     }
 }
+
+// ---------------------------------------------------------------------------
+// DemoDataService
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct DemoDataService {
@@ -289,6 +290,10 @@ impl mee_node_api::DataService for DemoDataService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DemoSyncService
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct DemoSyncService {
     sync: Arc<IrohWillowSyncCore>,
@@ -338,6 +343,10 @@ impl SyncService for DemoSyncService {
             .await
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 #[allow(
     clippy::expect_used,

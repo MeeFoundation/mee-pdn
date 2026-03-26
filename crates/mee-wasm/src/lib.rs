@@ -1,13 +1,14 @@
 // #![cfg(target_arch = "wasm32")]
 
-use mee_identity_api::{IdentityError, IdentityState};
+use mee_identity_api::{
+    IdentityError, IdentityProvider, IdentityResolver, IdentityState, KeyAtResult,
+};
 use mee_node_api::{
-    Contact, DataEntry, DataError, IdentityService, Invite, InviteSignature, Node, SyncService,
-    TrustService,
+    Contact, DataEntry, DataError, Invite, InviteSignature, Node, SyncService, TrustService,
 };
 use mee_sync_api as api;
 use mee_sync_api::AccessMode;
-use mee_types::{Aid, NodeId};
+use mee_types::{Aid, NodeId, OperationalKey};
 use serde_json as _;
 use wasm_bindgen::prelude::*;
 
@@ -52,7 +53,8 @@ impl WasmNode {
 }
 
 impl Node for WasmNode {
-    type Identity = WasmIdentityService;
+    type IdentityProvider = WasmIdentityService;
+    type IdentityResolver = WasmIdentityService;
     type Trust = WasmTrustService;
     type Data = WasmDataService;
     type Sync = WasmSyncService;
@@ -63,7 +65,10 @@ impl Node for WasmNode {
     fn home_namespace(&self) -> api::NamespaceId {
         api::NamespaceId::from_bytes(ZERO_ID)
     }
-    fn identity(&self) -> &Self::Identity {
+    fn identity_provider(&self) -> &Self::IdentityProvider {
+        &self.identity
+    }
+    fn identity_resolver(&self) -> &Self::IdentityResolver {
         &self.identity
     }
     fn trust(&self) -> &Self::Trust {
@@ -84,27 +89,44 @@ pub fn node_trait_compiles() -> bool {
     true
 }
 
-// --- IdentityService ---
+// --- Identity ---
 
 #[derive(Clone)]
 pub struct WasmIdentityService;
 
 #[allow(async_fn_in_trait)]
-impl IdentityService for WasmIdentityService {
-    // TODO(keri): Return real stored AID once WASM key storage exists.
-    async fn aid(&self) -> Result<Aid, IdentityError> {
-        Ok(Aid::from_bytes(ZERO_ID))
+impl IdentityProvider for WasmIdentityService {
+    fn aid(&self) -> Aid {
+        Aid::from_bytes(ZERO_ID)
     }
-    // TODO(keri): Implement KERI inception via WebCrypto API.
-    async fn create(&self) -> Result<Aid, IdentityError> {
-        Ok(Aid::from_bytes(ZERO_ID))
+    async fn rotate_key(&self, _compromised: bool) -> Result<OperationalKey, IdentityError> {
+        Err(IdentityError::Rotation(
+            "not implemented in WASM".to_owned(),
+        ))
     }
-    // TODO(keri): Implement KEL resolution for WASM target.
+    async fn export_kel(&self) -> Result<Vec<u8>, IdentityError> {
+        Err(IdentityError::Other("not implemented in WASM".to_owned()))
+    }
+}
+
+#[allow(async_fn_in_trait)]
+impl IdentityResolver for WasmIdentityService {
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError> {
         Ok(IdentityState {
             aid: *aid,
-            current_operational_key: *aid.as_bytes(),
+            current_key: OperationalKey::from_bytes(*aid.as_bytes()),
+            event_seq: 0,
         })
+    }
+    async fn key_at(&self, aid: &Aid, _at_time: u64) -> Result<KeyAtResult, IdentityError> {
+        Ok(KeyAtResult {
+            key: OperationalKey::from_bytes(*aid.as_bytes()),
+            current: true,
+            compromised: false,
+        })
+    }
+    async fn import_kel(&self, _kel_bytes: &[u8]) -> Result<Aid, IdentityError> {
+        Err(IdentityError::Other("not implemented in WASM".to_owned()))
     }
 }
 

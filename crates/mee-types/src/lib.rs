@@ -143,6 +143,14 @@ define_byte_id! {
     pub struct Aid;
 }
 
+define_byte_id! {
+    /// Current ed25519 operational signing key from the latest KEL event.
+    ///
+    /// Maps to Willow `SubspaceId` / iroh-willow `UserId`.
+    /// Changes on key rotation (unlike `Aid`, which is permanent).
+    pub struct OperationalKey;
+}
+
 // -- Roadmap placeholders ---------------------------------------------------
 
 // TODO: Integrate into identity/trust layer once persona management

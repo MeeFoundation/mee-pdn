@@ -5,8 +5,8 @@ use axum::{
     Json, Router,
 };
 use mee_node_api::{
-    Contact, DataService as _, IdentityService as _, Invite, Node as _, SyncService as _,
-    TrustService as _,
+    Contact, DataService as _, IdentityProvider as _, IdentityResolver as _, Invite, Node as _,
+    SyncService as _, TrustService as _,
 };
 use mee_node_demo_impl::DemoNode;
 use mee_sync_api as api;
@@ -118,10 +118,6 @@ async fn main() -> anyhow::Result<()> {
             post(|state, payload| async move { p2p_validate_aid(state, payload).await }),
         )
         .route(
-            "/p2p/identity",
-            post(|state| async move { p2p_create_identity(state).await }),
-        )
-        .route(
             "/p2p/ticket",
             post(|state, payload| async move { p2p_ticket(state, payload).await }),
         )
@@ -230,13 +226,11 @@ async fn p2p_user_aid(state: axum::extract::State<AppState>) -> Response {
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.identity().aid().await {
-        Ok(aid) => Json(UserAidResp {
-            user_aid: aid.to_string(),
-        })
-        .into_response(),
-        Err(e) => internal_str(&format!("identity error: {e}")).into_response(),
-    }
+    let aid = n.identity_provider().aid();
+    Json(UserAidResp {
+        user_aid: aid.to_string(),
+    })
+    .into_response()
 }
 
 async fn p2p_invite(state: axum::extract::State<AppState>) -> Response {
@@ -453,30 +447,9 @@ async fn p2p_validate_aid(
         return internal(&e).into_response();
     }
     let n = state.get_node();
-    match n.identity().resolve(&req.aid).await {
+    match n.identity_resolver().resolve(&req.aid).await {
         Ok(identity_state) => Json(identity_state.aid.to_string()).into_response(),
         Err(e) => internal_str(&format!("identity resolve error: {e}")).into_response(),
-    }
-}
-
-// TODO(keri): Add params for key type, witness config when real
-// KERI inception is implemented. Currently parameterless.
-#[derive(Serialize)]
-struct CreateIdentityResp {
-    aid: String,
-}
-
-async fn p2p_create_identity(state: axum::extract::State<AppState>) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    let n = state.get_node();
-    match n.identity().create().await {
-        Ok(aid) => Json(CreateIdentityResp {
-            aid: aid.to_string(),
-        })
-        .into_response(),
-        Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
     }
 }
 
