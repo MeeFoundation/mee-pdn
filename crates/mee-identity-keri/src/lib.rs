@@ -14,7 +14,9 @@ pub struct KeriIdentityManager<R: IdentityRepository> {
 impl<R: IdentityRepository> KeriIdentityManager<R> {
     /// Load identity from the repository, or create a new one if absent.
     pub async fn init(repo: R) -> Result<Self, IdentityError> {
-        let kel = if let Some(kel) = repo.load_kel().await? { kel } else {
+        let kel = if let Some(kel) = repo.load_kel().await? {
+            kel
+        } else {
             let aid = Self::create_aid();
             let kel = Kel {
                 aid,
@@ -88,7 +90,11 @@ impl<R: IdentityRepository> IdentityResolver for KeriIdentityManager<R> {
         Ok(IdentityState {
             aid: *aid,
             current_key: self.operational_key_for(aid),
-            event_seq: if *aid == self.kel.aid { self.kel.event_seq } else { 0 },
+            event_seq: if *aid == self.kel.aid {
+                self.kel.event_seq
+            } else {
+                0
+            },
         })
     }
 
