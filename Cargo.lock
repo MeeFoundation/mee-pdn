@@ -2687,6 +2687,7 @@ name = "mee-identity-api"
 version = "0.1.0"
 dependencies = [
  "mee-types",
+ "serde",
  "thiserror 2.0.16",
 ]
 

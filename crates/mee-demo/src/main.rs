@@ -118,10 +118,6 @@ async fn main() -> anyhow::Result<()> {
             post(|state, payload| async move { p2p_validate_aid(state, payload).await }),
         )
         .route(
-            "/p2p/identity",
-            post(|state| async move { p2p_create_identity(state).await }),
-        )
-        .route(
             "/p2p/ticket",
             post(|state, payload| async move { p2p_ticket(state, payload).await }),
         )
@@ -454,27 +450,6 @@ async fn p2p_validate_aid(
     match n.identity_resolver().resolve(&req.aid).await {
         Ok(identity_state) => Json(identity_state.aid.to_string()).into_response(),
         Err(e) => internal_str(&format!("identity resolve error: {e}")).into_response(),
-    }
-}
-
-// TODO(keri): Add params for key type, witness config when real
-// KERI inception is implemented. Currently parameterless.
-#[derive(Serialize)]
-struct CreateIdentityResp {
-    aid: String,
-}
-
-async fn p2p_create_identity(state: axum::extract::State<AppState>) -> Response {
-    if let Err(e) = state.ensure().await {
-        return internal(&e).into_response();
-    }
-    let n = state.get_node();
-    match n.identity_provider().create().await {
-        Ok(aid) => Json(CreateIdentityResp {
-            aid: aid.to_string(),
-        })
-        .into_response(),
-        Err(e) => internal_str(&format!("identity create error: {e}")).into_response(),
     }
 }
 

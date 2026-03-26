@@ -96,9 +96,6 @@ pub struct WasmIdentityService;
 
 #[allow(async_fn_in_trait)]
 impl IdentityProvider for WasmIdentityService {
-    async fn create(&self) -> Result<Aid, IdentityError> {
-        Ok(Aid::from_bytes(ZERO_ID))
-    }
     fn aid(&self) -> Aid {
         Aid::from_bytes(ZERO_ID)
     }

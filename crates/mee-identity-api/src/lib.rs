@@ -1,6 +1,7 @@
 mod error;
 pub use error::IdentityError;
 use mee_types::{Aid, OperationalKey};
+use serde::{Deserialize, Serialize};
 
 /// The verified current state of a KERI identity.
 ///
@@ -31,19 +32,12 @@ pub struct KeyAtResult {
     pub compromised: bool,
 }
 
-/// Provides identity creation, key rotation, and KEL export.
+/// Provides key rotation and KEL export for the user identity.
 ///
 /// Holder-side operations. Implementors manage the local KERI
 /// key material and KEL.
 #[allow(async_fn_in_trait)]
 pub trait IdentityProvider: Send + Sync {
-    /// Create a new identity (KERI inception event).
-    ///
-    /// Generates an ed25519 keypair, creates the inception event
-    /// with a pre-rotation commitment, and stores the inception
-    /// event as the first entry in the local KEL.
-    async fn create(&self) -> Result<Aid, IdentityError>;
-
     /// The node's AID. Set once at inception, never changes.
     fn aid(&self) -> Aid;
 
@@ -98,4 +92,27 @@ pub trait IdentityResolver: Send + Sync {
     ///
     /// Returns the AID extracted from the inception event.
     async fn import_kel(&self, kel_bytes: &[u8]) -> Result<Aid, IdentityError>;
+}
+
+/// Stub Key Event Log.
+///
+/// Placeholder for the real KERI KEL. Currently holds the minimum
+/// state: AID, current operational key, and event sequence number.
+/// Will be replaced with a real event chain (inception + rotation
+/// events) when KERI is implemented.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Kel {
+    pub aid: Aid,
+    pub current_key: OperationalKey,
+    pub event_seq: u64,
+}
+
+/// Persistence interface for identity state.
+#[allow(async_fn_in_trait)]
+pub trait IdentityRepository: Send + Sync {
+    /// Load the local KEL. Returns `None` if no identity exists yet.
+    async fn load_kel(&self) -> Result<Option<Kel>, IdentityError>;
+
+    /// Persist the local KEL.
+    async fn store_kel(&self, kel: &Kel) -> Result<(), IdentityError>;
 }
