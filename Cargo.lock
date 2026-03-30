@@ -2695,8 +2695,11 @@ dependencies = [
 name = "mee-identity-keri"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek 3.0.0-pre.1",
  "mee-identity-api",
  "mee-types",
+ "rand_core 0.9.3",
+ "tokio",
 ]
 
 [[package]]

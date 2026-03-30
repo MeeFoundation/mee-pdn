@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 mee-identity-api = { path = "../mee-identity-api" }
 mee-types = { path = "../mee-types" }
+ed25519-dalek = { version = "3.0.0-pre.1", features = ["rand_core"] }
+rand_core = { version = "0.9", features = ["os_rng"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
