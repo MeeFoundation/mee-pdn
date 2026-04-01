@@ -1,4 +1,4 @@
-use ed25519_dalek::SigningKey;
+pub use ed25519_dalek::SigningKey;
 use mee_identity_api::{
     IdentityError, IdentityProvider, IdentityRepository, IdentityResolver, IdentityState, Kel,
     KeyAtResult,
@@ -6,50 +6,52 @@ use mee_identity_api::{
 use mee_types::{Aid, OperationalKey};
 use rand_core::{OsRng, TryRngCore};
 
+/// Generate a new ed25519 identity (KERI inception).
+///
+/// Returns the initial KEL and the signing key. The caller is
+/// responsible for persisting both: KEL via `IdentityRepository`,
+/// signing key via secure storage.
+pub fn create_identity() -> (Kel, SigningKey) {
+    let signing_key = SigningKey::generate(&mut OsRng.unwrap_err());
+    let pub_bytes = signing_key.verifying_key().to_bytes();
+    let aid = Aid::from_bytes(pub_bytes);
+    let kel = Kel {
+        aid,
+        current_key: OperationalKey::from_bytes(pub_bytes),
+        event_seq: 0,
+    };
+    (kel, signing_key)
+}
+
 /// KERI identity manager backed by a real ed25519 keypair.
 ///
-/// On fresh creation the signing key lives in memory.
-/// After reload from the repository the signing key is `None`
-/// (future: persist via platform secure storage).
+/// A node always has both a KEL and a signing key. The caller
+/// provides both at construction time — identity creation and
+/// key retrieval happen outside the manager.
 pub struct KeriIdentityManager<R: IdentityRepository> {
     _repo: R,
     kel: Kel,
-    /// Ed25519 signing key — available after fresh creation, `None` after reload.
-    signing_key: Option<SigningKey>,
+    signing_key: SigningKey,
 }
 
 impl<R: IdentityRepository> KeriIdentityManager<R> {
-    /// Load identity from the repository, or create a new one if absent.
-    pub async fn init(repo: R) -> Result<Self, IdentityError> {
-        if let Some(kel) = repo.load_kel().await? {
-            Ok(Self {
-                _repo: repo,
-                kel,
-                signing_key: None,
-            })
-        } else {
-            let signing_key = SigningKey::generate(&mut OsRng.unwrap_err());
-            let pub_bytes = signing_key.verifying_key().to_bytes();
-            let aid = Aid::from_bytes(pub_bytes);
-            let kel = Kel {
-                aid,
-                current_key: OperationalKey::from_bytes(pub_bytes),
-                event_seq: 0,
-            };
-            repo.store_kel(&kel).await?;
-            Ok(Self {
-                _repo: repo,
-                kel,
-                signing_key: Some(signing_key),
-            })
+    /// Create a new identity manager with the given KEL and signing key.
+    ///
+    /// The caller is responsible for:
+    /// - Loading or creating the KEL (see [`create_identity`])
+    /// - Providing the signing key from secure storage or fresh generation
+    /// - Persisting both before calling this constructor
+    pub fn new(repo: R, kel: Kel, signing_key: SigningKey) -> Self {
+        Self {
+            _repo: repo,
+            kel,
+            signing_key,
         }
     }
 
-    /// Whether the in-memory signing key is available.
-    ///
-    /// `true` after fresh creation, `false` after reload from repository.
-    pub fn has_signing_key(&self) -> bool {
-        self.signing_key.is_some()
+    /// Access the signing key.
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
     }
 }
 
@@ -138,12 +140,6 @@ mod tests {
                 kel: Mutex::new(None),
             }
         }
-
-        fn with_kel(kel: Kel) -> Self {
-            Self {
-                kel: Mutex::new(Some(kel)),
-            }
-        }
     }
 
     #[allow(clippy::expect_used)]
@@ -158,92 +154,56 @@ mod tests {
         }
     }
 
-    // -- init tests --
-
-    #[tokio::test]
-    async fn init_creates_valid_aid() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
-        assert_ne!(*mgr.aid().as_bytes(), [0u8; 32]);
+    fn make_manager() -> KeriIdentityManager<InMemoryRepo> {
+        let (kel, signing_key) = create_identity();
+        KeriIdentityManager::new(InMemoryRepo::empty(), kel, signing_key)
     }
 
-    #[tokio::test]
-    async fn init_creates_ed25519_public_key() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
-        // AID bytes must be a valid ed25519 public key.
-        let result = ed25519_dalek::VerifyingKey::from_bytes(mgr.aid().as_bytes());
+    // -- create_identity tests --
+
+    #[test]
+    fn create_identity_valid_aid() {
+        let (kel, _) = create_identity();
+        assert_ne!(*kel.aid.as_bytes(), [0u8; 32]);
+    }
+
+    #[test]
+    fn create_identity_ed25519_public_key() {
+        let (kel, _) = create_identity();
+        let result = ed25519_dalek::VerifyingKey::from_bytes(kel.aid.as_bytes());
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn init_stores_kel_in_repo() {
-        let repo = InMemoryRepo::empty();
-        let mgr = KeriIdentityManager::init(repo).await.unwrap();
-        // The repo is moved into the manager; access kel via the manager.
-        let state = mgr.kel.clone();
-        assert_eq!(state.aid, mgr.aid());
-        assert_eq!(state.event_seq, 0);
+    #[test]
+    fn create_identity_kel_matches_signing_key() {
+        let (kel, signing_key) = create_identity();
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        assert_eq!(*kel.aid.as_bytes(), pub_bytes);
+        assert_eq!(*kel.current_key.as_bytes(), pub_bytes);
+        assert_eq!(kel.event_seq, 0);
     }
 
-    #[tokio::test]
-    async fn init_loads_existing_kel() {
-        // Pre-populate repo with a known AID.
-        let known_aid = Aid::from_bytes([42u8; 32]);
-        let kel = Kel {
-            aid: known_aid,
-            current_key: OperationalKey::from_bytes([42u8; 32]),
-            event_seq: 5,
-        };
-        let mgr = KeriIdentityManager::init(InMemoryRepo::with_kel(kel))
-            .await
-            .unwrap();
-        assert_eq!(mgr.aid(), known_aid);
-        assert_eq!(mgr.kel.event_seq, 5);
+    #[test]
+    fn create_identity_unique() {
+        let (a, _) = create_identity();
+        let (b, _) = create_identity();
+        assert_ne!(a.aid, b.aid);
     }
 
-    #[tokio::test]
-    async fn init_has_signing_key_on_fresh_create() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
-        assert!(mgr.has_signing_key());
-    }
+    // -- new() tests --
 
-    #[tokio::test]
-    async fn init_no_signing_key_on_reload() {
-        let known_aid = Aid::from_bytes([7u8; 32]);
-        let kel = Kel {
-            aid: known_aid,
-            current_key: OperationalKey::from_bytes([7u8; 32]),
-            event_seq: 0,
-        };
-        let mgr = KeriIdentityManager::init(InMemoryRepo::with_kel(kel))
-            .await
-            .unwrap();
-        assert!(!mgr.has_signing_key());
-    }
-
-    #[tokio::test]
-    async fn two_fresh_inits_differ() {
-        let a = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
-        let b = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
-        assert_ne!(a.aid(), b.aid());
+    #[test]
+    fn new_returns_correct_aid() {
+        let mgr = make_manager();
+        let expected = mgr.signing_key().verifying_key().to_bytes();
+        assert_eq!(*mgr.aid().as_bytes(), expected);
     }
 
     // -- resolve / key_at tests --
 
     #[tokio::test]
     async fn resolve_own_aid_uses_own_key() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
+        let mgr = make_manager();
         let state = mgr.resolve(&mgr.aid()).await.unwrap();
         assert_eq!(state.current_key, mgr.kel.current_key);
         assert_eq!(state.event_seq, 0);
@@ -251,9 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_peer_aid_uses_placeholder() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
+        let mgr = make_manager();
         let peer = Aid::from_bytes([99u8; 32]);
         let state = mgr.resolve(&peer).await.unwrap();
         assert_eq!(*state.current_key.as_bytes(), [99u8; 32]);
@@ -262,9 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_at_own_aid() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
+        let mgr = make_manager();
         let result = mgr.key_at(&mgr.aid(), 0).await.unwrap();
         assert_eq!(result.key, mgr.kel.current_key);
         assert!(result.current);
@@ -275,27 +231,21 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_key_not_implemented() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
+        let mgr = make_manager();
         let err = mgr.rotate_key(false).await.unwrap_err();
         assert!(matches!(err, IdentityError::Rotation(_)));
     }
 
     #[tokio::test]
     async fn export_kel_not_implemented() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
+        let mgr = make_manager();
         let err = mgr.export_kel().await.unwrap_err();
         assert!(matches!(err, IdentityError::Other(_)));
     }
 
     #[tokio::test]
     async fn import_kel_not_implemented() {
-        let mgr = KeriIdentityManager::init(InMemoryRepo::empty())
-            .await
-            .unwrap();
+        let mgr = make_manager();
         let err = mgr.import_kel(b"fake").await.unwrap_err();
         assert!(matches!(err, IdentityError::Other(_)));
     }
