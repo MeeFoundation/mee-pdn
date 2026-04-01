@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use mee_identity_api::{IdentityError, IdentityProvider, IdentityRepository, Kel};
-use mee_identity_keri::KeriIdentityManager;
+use mee_identity_keri::{create_identity, KeriIdentityManager, SigningKey};
 use mee_node_api::{
     Contact, DataEntry, DataError, Invite, InviteSignature, Node, SyncService, TrustService,
 };
@@ -76,11 +76,36 @@ impl DemoNode {
         let namespace = sync_engine.home_namespace();
 
         let repo = WillowIdentityRepository::new(sync_engine.clone());
-        let identity = Arc::new(
-            KeriIdentityManager::init(repo)
+
+        // Identity lives outside the node: load or create, then hand both
+        // the KEL and signing key to the manager.
+        let (kel, signing_key) = if let Some(kel) = repo
+            .load_kel()
+            .await
+            .map_err(|e| anyhow::anyhow!("load kel: {e}"))?
+        {
+            // Subsequent launch: retrieve signing key from local storage.
+            // TODO(secure-storage): Replace with platform Keychain/Keystore.
+            let sk_bytes: [u8; 32] = sync_engine
+                .get_local_json("identity/signing_key")
                 .await
-                .map_err(|e| anyhow::anyhow!("identity init: {e}"))?,
-        );
+                .map_err(|e| anyhow::anyhow!("load signing key: {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("signing key missing from local storage"))?;
+            (kel, SigningKey::from_bytes(&sk_bytes))
+        } else {
+            // Initial launch: create new identity.
+            let (kel, signing_key) = create_identity();
+            repo.store_kel(&kel)
+                .await
+                .map_err(|e| anyhow::anyhow!("store kel: {e}"))?;
+            sync_engine
+                .put_local_json("identity/signing_key", &signing_key.to_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("store signing key: {e}"))?;
+            (kel, signing_key)
+        };
+
+        let identity = Arc::new(KeriIdentityManager::new(repo, kel, signing_key));
 
         let node_addr = sync_engine
             .addr()
