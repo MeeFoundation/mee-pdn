@@ -1,0 +1,19 @@
+{
+  "network": [
+    {
+      "action": "allow",
+      "host": "*",
+      "method": "GET"
+    },
+    {
+      "action": "allow",
+      "host": "172.17.*",
+      "comment": "Allow all traffic to Docker bridge network (testcontainers)"
+    },
+    {
+      "action": "allow",
+      "host": "127.0.0.1",
+      "comment": "Allow localhost traffic"
+    }
+  ]
+}
