@@ -14,9 +14,25 @@ RUN apt-get update \
     && ln -s $(which fdfind) /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Docker CLI from official Docker repository for testcontainers support
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+
 COPY --chmod=755 sandcat/scripts/app-init.sh /usr/local/bin/app-init.sh
 COPY --chmod=755 sandcat/scripts/app-user-init.sh /usr/local/bin/app-user-init.sh
 COPY --chown=vscode:vscode sandcat/tmux.conf /home/vscode/.tmux.conf
+
+# Add vscode user to docker group for socket access
+RUN groupadd -f docker \
+    && usermod -aG docker vscode
 
 USER vscode
 

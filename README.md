@@ -11,9 +11,10 @@ This repository is for version 3, previous version repos:
 
 ### First-time setup
 
-* install [rust](https://www.rust-lang.org/)
-* install [just](https://github.com/casey/just)
-* setup tooling - `just setup-tooling`
+
+### Devcontainer setup
+
+To work with this project in a devcontainer, see [.devcontainer/README.md](.devcontainer/README.md) for token configuration instructions.
 
 ### Development
 

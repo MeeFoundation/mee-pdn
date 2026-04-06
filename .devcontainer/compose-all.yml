@@ -14,6 +14,8 @@ services:
       # Named volume for the home directory so Claude Code auth state,
       # shell history, and other user-level config persist across rebuilds.
       - app-home:/home/vscode
+      # Mount Docker socket for testcontainers (integration tests)
+      - /var/run/docker.sock:/var/run/docker.sock
       # Shared volume from mitmproxy containing the CA cert and
       # sandcat.env (env vars + secret placeholders). Read-only — app
       # containers should never write to this.

@@ -53,6 +53,22 @@ else
     echo "No $SANDCAT_ENV found — env vars and secret substitution disabled"
 fi
 
+# Ensure vscode user can access Docker socket (for testcontainers)
+if [ -S /var/run/docker.sock ]; then
+    DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+    DOCKER_GROUP=$(getent group "$DOCKER_GID" | cut -d: -f1)
+    if [ -n "$DOCKER_GROUP" ]; then
+        # Socket group exists (e.g., 'root' or 'docker'), add vscode to it
+        usermod -aG "$DOCKER_GROUP" vscode 2>/dev/null
+        echo "Added vscode to $DOCKER_GROUP group (GID=$DOCKER_GID) for socket access"
+    else
+        # Socket GID doesn't exist, update docker group to match
+        groupmod -g "$DOCKER_GID" docker 2>/dev/null || groupadd -g "$DOCKER_GID" docker
+        usermod -aG docker vscode 2>/dev/null
+        echo "Configured docker group (GID=$DOCKER_GID) for socket access"
+    fi
+fi
+
 # Run vscode-user tasks: git identity, Java trust store, Claude Code update.
 su - vscode -c /usr/local/bin/app-user-init.sh
 
