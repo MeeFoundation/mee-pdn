@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod non_empty;
+pub use non_empty::NonEmpty;
+
 // ---------------------------------------------------------------------------
 // Byte-backed ID infrastructure
 // ---------------------------------------------------------------------------

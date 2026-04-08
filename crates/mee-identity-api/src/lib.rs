@@ -1,6 +1,6 @@
 mod error;
 pub use error::IdentityError;
-use mee_types::{Aid, OperationalKey};
+use mee_types::{Aid, NonEmpty, OperationalKey};
 use serde::{Deserialize, Serialize};
 
 /// The verified current state of a KERI identity.
@@ -11,9 +11,11 @@ pub struct IdentityState {
     /// The stable root Autonomic Identifier.
     pub aid: Aid,
 
-    /// Current operational signing key.
-    /// Maps to Willow `SubspaceId` / iroh-willow `UserId`.
-    pub current_key: OperationalKey,
+    /// Currently active operational keys (one per device).
+    ///
+    /// In the single-device model this contains a single key.
+    /// Multi-device support will allow multiple concurrent keys.
+    pub active_keys: NonEmpty<OperationalKey>,
 
     /// Sequence number of the latest KEL event.
     /// 0 = inception only, 1 = one rotation, etc.
@@ -94,16 +96,39 @@ pub trait IdentityResolver: Send + Sync {
     async fn import_kel(&self, kel_bytes: &[u8]) -> Result<Aid, IdentityError>;
 }
 
+/// Current status of an operational key within an AID's KEL.
+///
+/// Will replace `KeyAtResult` when `key_at()` is migrated to
+/// `verify_key()` in a future PR.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// Key is currently active (associated with a live device).
+    Active,
+    /// Key was rotated out (replaced by a newer key on the same device).
+    Rotated {
+        /// Unix-seconds timestamp of the rotation event.
+        rotated_at: u64,
+    },
+    /// Key was marked compromised via recovery rotation.
+    Compromised {
+        /// Unix-seconds timestamp of the compromise event.
+        compromised_at: u64,
+    },
+}
+
 /// Stub Key Event Log.
 ///
 /// Placeholder for the real KERI KEL. Currently holds the minimum
-/// state: AID, current operational key, and event sequence number.
+/// state: AID, active operational keys, and event sequence number.
 /// Will be replaced with a real event chain (inception + rotation
 /// events) when KERI is implemented.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Kel {
     pub aid: Aid,
-    pub current_key: OperationalKey,
+    /// Currently active operational keys (one per device).
+    ///
+    /// In the single-device model this contains a single key.
+    pub active_keys: NonEmpty<OperationalKey>,
     pub event_seq: u64,
 }
 
