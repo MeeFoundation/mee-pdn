@@ -8,7 +8,7 @@ use mee_node_api::{
 };
 use mee_sync_api as api;
 use mee_sync_api::AccessMode;
-use mee_types::{Aid, NodeId, OperationalKey};
+use mee_types::{Aid, NodeId, NonEmpty, OperationalKey};
 use serde_json as _;
 use wasm_bindgen::prelude::*;
 
@@ -114,7 +114,7 @@ impl IdentityResolver for WasmIdentityService {
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError> {
         Ok(IdentityState {
             aid: *aid,
-            current_key: OperationalKey::from_bytes(*aid.as_bytes()),
+            active_keys: NonEmpty::new(OperationalKey::from_bytes(*aid.as_bytes())),
             event_seq: 0,
         })
     }

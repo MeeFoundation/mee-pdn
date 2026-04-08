@@ -3,7 +3,7 @@ use mee_identity_api::{
     IdentityError, IdentityProvider, IdentityRepository, IdentityResolver, IdentityState, Kel,
     KeyAtResult,
 };
-use mee_types::{Aid, OperationalKey};
+use mee_types::{Aid, NonEmpty, OperationalKey};
 use rand_core::{OsRng, TryRngCore};
 
 /// Generate a new ed25519 identity (KERI inception).
@@ -17,7 +17,7 @@ pub fn create_identity() -> (Kel, SigningKey) {
     let aid = Aid::from_bytes(pub_bytes);
     let kel = Kel {
         aid,
-        current_key: OperationalKey::from_bytes(pub_bytes),
+        active_keys: NonEmpty::new(OperationalKey::from_bytes(pub_bytes)),
         event_seq: 0,
     };
     (kel, signing_key)
@@ -78,11 +78,13 @@ impl<R: IdentityRepository> IdentityProvider for KeriIdentityManager<R> {
 }
 
 impl<R: IdentityRepository> KeriIdentityManager<R> {
-    /// Resolve the operational key for an AID. Returns the cached key
-    /// for our own AID, or a placeholder (AID bytes) for peers.
+    /// Resolve a single operational key for an AID.
+    ///
+    /// For our own AID, derives from the signing key. For peers,
+    /// returns the AID bytes as a placeholder.
     fn operational_key_for(&self, aid: &Aid) -> OperationalKey {
         if *aid == self.kel.aid {
-            self.kel.current_key
+            OperationalKey::from_bytes(self.signing_key.verifying_key().to_bytes())
         } else {
             OperationalKey::from_bytes(*aid.as_bytes())
         }
@@ -95,7 +97,11 @@ impl<R: IdentityRepository> IdentityResolver for KeriIdentityManager<R> {
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError> {
         Ok(IdentityState {
             aid: *aid,
-            current_key: self.operational_key_for(aid),
+            active_keys: if *aid == self.kel.aid {
+                self.kel.active_keys.clone()
+            } else {
+                NonEmpty::new(OperationalKey::from_bytes(*aid.as_bytes()))
+            },
             event_seq: if *aid == self.kel.aid {
                 self.kel.event_seq
             } else {
@@ -179,7 +185,7 @@ mod tests {
         let (kel, signing_key) = create_identity();
         let pub_bytes = signing_key.verifying_key().to_bytes();
         assert_eq!(*kel.aid.as_bytes(), pub_bytes);
-        assert_eq!(*kel.current_key.as_bytes(), pub_bytes);
+        assert_eq!(*kel.active_keys.first().as_bytes(), pub_bytes);
         assert_eq!(kel.event_seq, 0);
     }
 
@@ -205,7 +211,7 @@ mod tests {
     async fn resolve_own_aid_uses_own_key() {
         let mgr = make_manager();
         let state = mgr.resolve(&mgr.aid()).await.unwrap();
-        assert_eq!(state.current_key, mgr.kel.current_key);
+        assert_eq!(state.active_keys, mgr.kel.active_keys);
         assert_eq!(state.event_seq, 0);
     }
 
@@ -214,7 +220,7 @@ mod tests {
         let mgr = make_manager();
         let peer = Aid::from_bytes([99u8; 32]);
         let state = mgr.resolve(&peer).await.unwrap();
-        assert_eq!(*state.current_key.as_bytes(), [99u8; 32]);
+        assert_eq!(*state.active_keys.first().as_bytes(), [99u8; 32]);
         assert_eq!(state.event_seq, 0);
     }
 
@@ -222,7 +228,7 @@ mod tests {
     async fn key_at_own_aid() {
         let mgr = make_manager();
         let result = mgr.key_at(&mgr.aid(), 0).await.unwrap();
-        assert_eq!(result.key, mgr.kel.current_key);
+        assert_eq!(result.key, *mgr.kel.active_keys.first());
         assert!(result.current);
         assert!(!result.compromised);
     }

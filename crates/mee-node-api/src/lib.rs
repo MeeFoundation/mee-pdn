@@ -1,6 +1,6 @@
 pub use data_service::{DataEntry, DataError, DataService};
 pub use mee_identity_api::{
-    IdentityError, IdentityProvider, IdentityResolver, IdentityState, KeyAtResult,
+    IdentityError, IdentityProvider, IdentityResolver, IdentityState, KeyAtResult, KeyStatus,
 };
 use mee_sync_api::NamespaceId;
 use mee_types::NodeId;
