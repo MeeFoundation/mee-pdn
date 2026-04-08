@@ -98,6 +98,9 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     echo '{"hasCompletedOnboarding":true}' > "$HOME/.claude.json"
 fi
 
+# Ensure WASM targets are available (volume mount overwrites Dockerfile results).
+rustup target add wasm32-unknown-unknown wasm32-wasip1 2>/dev/null || true
+
 # Claude Code is installed at build time (Dockerfile.app).
 # Background update so it doesn't block startup.
 (claude install >/dev/null 2>&1 &)
