@@ -315,6 +315,11 @@ async fn multi_device_two_alice_one_bob_inner() {
         "pair-device should return D1's home namespace"
     );
 
+    // 5b. Establish gossip connection D1 ↔ D2 (needed for sync)
+    bidirectional_connect(&alice_d1, &alice_d2).await;
+    wait_for_gossip_peers(&alice_d1, 2, SYNC_TIMEOUT).await; // D1 sees Bob + D2
+    wait_for_gossip_peers(&alice_d2, 1, SYNC_TIMEOUT).await; // D2 sees D1
+
     // 6. D2 imports the ticket (starts Willow sync with D1)
     alice_d2.import_ticket(&ticket).await;
 
