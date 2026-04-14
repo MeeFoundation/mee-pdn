@@ -1,10 +1,11 @@
 pub use ed25519_dalek::SigningKey;
 use mee_identity_api::{
     IdentityError, IdentityProvider, IdentityRepository, IdentityResolver, IdentityState, Kel,
-    KeyAtResult,
+    KeyStatus,
 };
 use mee_types::{Aid, NonEmpty, OperationalKey};
 use rand_core::{OsRng, TryRngCore};
+use std::sync::Mutex;
 
 /// Generate a new ed25519 identity (KERI inception).
 ///
@@ -28,9 +29,14 @@ pub fn create_identity() -> (Kel, SigningKey) {
 /// A node always has both a KEL and a signing key. The caller
 /// provides both at construction time — identity creation and
 /// key retrieval happen outside the manager.
+///
+/// The KEL is behind a `Mutex` to allow mutation via `&self`
+/// (required by `IdentityProvider` trait methods).
 pub struct KeriIdentityManager<R: IdentityRepository> {
-    _repo: R,
-    kel: Kel,
+    repo: R,
+    /// Cached AID — set at inception, never changes.
+    aid: Aid,
+    kel: Mutex<Kel>,
     signing_key: SigningKey,
 }
 
@@ -42,9 +48,11 @@ impl<R: IdentityRepository> KeriIdentityManager<R> {
     /// - Providing the signing key from secure storage or fresh generation
     /// - Persisting both before calling this constructor
     pub fn new(repo: R, kel: Kel, signing_key: SigningKey) -> Self {
+        let aid = kel.aid;
         Self {
-            _repo: repo,
-            kel,
+            repo,
+            aid,
+            kel: Mutex::new(kel),
             signing_key,
         }
     }
@@ -55,9 +63,42 @@ impl<R: IdentityRepository> KeriIdentityManager<R> {
     }
 }
 
+#[allow(clippy::expect_used)] // Mutex lock — unrecoverable if poisoned
 impl<R: IdentityRepository> IdentityProvider for KeriIdentityManager<R> {
     fn aid(&self) -> Aid {
-        self.kel.aid
+        self.aid
+    }
+
+    fn operational_key(&self) -> OperationalKey {
+        OperationalKey::from_bytes(self.signing_key.verifying_key().to_bytes())
+    }
+
+    async fn add_device(&self, new_key: OperationalKey) -> Result<(), IdentityError> {
+        // Mutate under lock, clone, then drop lock before .await.
+        let snapshot = {
+            let mut kel = self.kel.lock().expect("kel lock poisoned");
+            if kel.active_keys.contains(&new_key) {
+                return Err(IdentityError::Invalid(
+                    "key already in active_keys".to_owned(),
+                ));
+            }
+            kel.active_keys.push(new_key);
+            kel.event_seq += 1;
+            kel.clone()
+        };
+        self.repo.store_kel(&snapshot).await
+    }
+
+    async fn remove_device(&self, key: &OperationalKey) -> Result<(), IdentityError> {
+        let snapshot = {
+            let mut kel = self.kel.lock().expect("kel lock poisoned");
+            kel.active_keys.try_remove(|k| k == key).map_err(|()| {
+                IdentityError::Invalid("key not found or cannot remove last key".to_owned())
+            })?;
+            kel.event_seq += 1;
+            kel.clone()
+        };
+        self.repo.store_kel(&snapshot).await
     }
 
     // TODO(keri): Real implementation must activate the pre-committed
@@ -77,51 +118,51 @@ impl<R: IdentityRepository> IdentityProvider for KeriIdentityManager<R> {
     }
 }
 
-impl<R: IdentityRepository> KeriIdentityManager<R> {
-    /// Resolve a single operational key for an AID.
-    ///
-    /// For our own AID, derives from the signing key. For peers,
-    /// returns the AID bytes as a placeholder.
-    fn operational_key_for(&self, aid: &Aid) -> OperationalKey {
-        if *aid == self.kel.aid {
-            OperationalKey::from_bytes(self.signing_key.verifying_key().to_bytes())
-        } else {
-            OperationalKey::from_bytes(*aid.as_bytes())
-        }
-    }
-}
-
+#[allow(clippy::expect_used)] // Mutex lock — unrecoverable if poisoned
 impl<R: IdentityRepository> IdentityResolver for KeriIdentityManager<R> {
     // TODO(keri): Real implementation must walk the peer's KEL,
     // verify signatures and hash links, extract current operational key.
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError> {
+        let kel = self.kel.lock().expect("kel lock poisoned");
         Ok(IdentityState {
             aid: *aid,
-            active_keys: if *aid == self.kel.aid {
-                self.kel.active_keys.clone()
+            active_keys: if *aid == self.aid {
+                kel.active_keys.clone()
             } else {
                 NonEmpty::new(OperationalKey::from_bytes(*aid.as_bytes()))
             },
-            event_seq: if *aid == self.kel.aid {
-                self.kel.event_seq
-            } else {
-                0
-            },
+            event_seq: if *aid == self.aid { kel.event_seq } else { 0 },
         })
     }
 
     // TODO(keri): Real implementation must walk the KEL to find
-    // which key was active at at_time and check for later compromise.
-    async fn key_at(&self, aid: &Aid, _at_time: u64) -> Result<KeyAtResult, IdentityError> {
-        Ok(KeyAtResult {
-            key: self.operational_key_for(aid),
-            current: true,
-            compromised: false,
-        })
+    // which event introduced/rotated/compromised this key.
+    async fn verify_key(
+        &self,
+        aid: &Aid,
+        key: &OperationalKey,
+    ) -> Result<KeyStatus, IdentityError> {
+        if *aid == self.aid {
+            let kel = self.kel.lock().expect("kel lock poisoned");
+            if kel.active_keys.iter().any(|k| k == key) {
+                Ok(KeyStatus::Active)
+            } else {
+                Err(IdentityError::NotFound(
+                    "key not found in active keys".to_owned(),
+                ))
+            }
+        } else {
+            // Stub for peers: if key matches AID bytes, treat as active
+            if *key == OperationalKey::from_bytes(*aid.as_bytes()) {
+                Ok(KeyStatus::Active)
+            } else {
+                Err(IdentityError::NotFound("unknown peer key".to_owned()))
+            }
+        }
     }
 
     // TODO(keri): Real implementation must verify the KEL chain
-    // and store it locally for future resolve/key_at calls.
+    // and store it locally for future resolve/verify_key calls.
     async fn import_kel(&self, _kel_bytes: &[u8]) -> Result<Aid, IdentityError> {
         Err(IdentityError::Other(
             "KEL import not yet implemented".to_owned(),
@@ -205,13 +246,16 @@ mod tests {
         assert_eq!(*mgr.aid().as_bytes(), expected);
     }
 
-    // -- resolve / key_at tests --
+    // -- resolve / verify_key tests --
 
     #[tokio::test]
     async fn resolve_own_aid_uses_own_key() {
         let mgr = make_manager();
         let state = mgr.resolve(&mgr.aid()).await.unwrap();
-        assert_eq!(state.active_keys, mgr.kel.active_keys);
+        assert_eq!(
+            *state.active_keys.first().as_bytes(),
+            mgr.signing_key().verifying_key().to_bytes()
+        );
         assert_eq!(state.event_seq, 0);
     }
 
@@ -225,12 +269,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_at_own_aid() {
+    async fn verify_key_own_active() {
         let mgr = make_manager();
-        let result = mgr.key_at(&mgr.aid(), 0).await.unwrap();
-        assert_eq!(result.key, *mgr.kel.active_keys.first());
-        assert!(result.current);
-        assert!(!result.compromised);
+        let key = mgr.operational_key();
+        let status = mgr.verify_key(&mgr.aid(), &key).await.unwrap();
+        assert_eq!(status, KeyStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn verify_key_unknown_returns_not_found() {
+        let mgr = make_manager();
+        let unknown = OperationalKey::from_bytes([77u8; 32]);
+        let err = mgr.verify_key(&mgr.aid(), &unknown).await.unwrap_err();
+        assert!(matches!(err, IdentityError::NotFound(_)));
+    }
+
+    // -- operational_key tests --
+
+    #[test]
+    fn operational_key_matches_signing_key() {
+        let mgr = make_manager();
+        let expected = mgr.signing_key().verifying_key().to_bytes();
+        assert_eq!(*mgr.operational_key().as_bytes(), expected);
+    }
+
+    // -- add_device / remove_device tests --
+
+    #[tokio::test]
+    async fn add_device_adds_key() {
+        let mgr = make_manager();
+        let new_key = OperationalKey::from_bytes([42u8; 32]);
+        mgr.add_device(new_key).await.unwrap();
+
+        let state = mgr.resolve(&mgr.aid()).await.unwrap();
+        assert_eq!(state.active_keys.len(), 2);
+        assert_eq!(state.event_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn add_device_rejects_duplicate() {
+        let mgr = make_manager();
+        let own_key = mgr.operational_key();
+        let err = mgr.add_device(own_key).await.unwrap_err();
+        assert!(matches!(err, IdentityError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn remove_device_removes_key() {
+        let mgr = make_manager();
+        let new_key = OperationalKey::from_bytes([42u8; 32]);
+        mgr.add_device(new_key).await.unwrap();
+        mgr.remove_device(&new_key).await.unwrap();
+
+        let state = mgr.resolve(&mgr.aid()).await.unwrap();
+        assert_eq!(state.active_keys.len(), 1);
+        assert_eq!(state.event_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn remove_device_rejects_last_key() {
+        let mgr = make_manager();
+        let own_key = mgr.operational_key();
+        let err = mgr.remove_device(&own_key).await.unwrap_err();
+        assert!(matches!(err, IdentityError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn add_device_persists_to_repo() {
+        let mgr = make_manager();
+        let new_key = OperationalKey::from_bytes([42u8; 32]);
+        mgr.add_device(new_key).await.unwrap();
+
+        let stored = mgr.repo.load_kel().await.unwrap().unwrap();
+        assert_eq!(stored.active_keys.len(), 2);
+        assert_eq!(stored.event_seq, 1);
     }
 
     // -- stub error tests --

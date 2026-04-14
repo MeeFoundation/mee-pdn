@@ -22,18 +22,6 @@ pub struct IdentityState {
     pub event_seq: u64,
 }
 
-/// Result of a historical key lookup.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyAtResult {
-    /// The operational key that was active at the queried time.
-    pub key: OperationalKey,
-    /// Whether this key is still the current operational key.
-    pub current: bool,
-    /// Whether this key was later marked compromised
-    /// by a recovery rotation.
-    pub compromised: bool,
-}
-
 /// Provides key rotation and KEL export for the user identity.
 ///
 /// Holder-side operations. Implementors manage the local KERI
@@ -42,6 +30,25 @@ pub struct KeyAtResult {
 pub trait IdentityProvider: Send + Sync {
     /// The node's AID. Set once at inception, never changes.
     fn aid(&self) -> Aid;
+
+    /// This device's operational key (derived from signing key).
+    ///
+    /// Differs from `IdentityResolver::resolve()` which returns keys
+    /// for **all** devices under this AID.
+    fn operational_key(&self) -> OperationalKey;
+
+    /// Authorize a new device key under this AID.
+    ///
+    /// Adds the key to `active_keys` and appends an authorization
+    /// event to the KEL. The new device must have generated its own
+    /// keypair; only the public key is passed here.
+    async fn add_device(&self, new_key: OperationalKey) -> Result<(), IdentityError>;
+
+    /// Revoke a device's operational key.
+    ///
+    /// Removes the key from `active_keys` and appends a revocation
+    /// event to the KEL. Cannot remove the last remaining key.
+    async fn remove_device(&self, key: &OperationalKey) -> Result<(), IdentityError>;
 
     /// Rotate the current operational key.
     ///
@@ -76,15 +83,15 @@ pub trait IdentityResolver: Send + Sync {
     /// the state designated by the most recent event.
     async fn resolve(&self, aid: &Aid) -> Result<IdentityState, IdentityError>;
 
-    /// What key was active for an AID at a point in time?
+    /// Check the current status of a specific key for an AID.
     ///
-    /// Returns the operational key that was active at `at_time`
-    /// (Unix seconds), whether it's still current, and whether
-    /// it was later marked compromised by a recovery rotation.
+    /// Walks the peer's KEL to determine whether the key is
+    /// currently active, was rotated out, or was marked compromised.
     ///
-    /// Returns `IdentityError::NotFound` if the AID is unknown
-    /// or did not exist at `at_time`.
-    async fn key_at(&self, aid: &Aid, at_time: u64) -> Result<KeyAtResult, IdentityError>;
+    /// Returns `IdentityError::NotFound` if the key was never
+    /// part of this AID's KEL.
+    async fn verify_key(&self, aid: &Aid, key: &OperationalKey)
+        -> Result<KeyStatus, IdentityError>;
 
     /// Import a peer's KEL — verify and store locally.
     ///
@@ -98,8 +105,7 @@ pub trait IdentityResolver: Send + Sync {
 
 /// Current status of an operational key within an AID's KEL.
 ///
-/// Will replace `KeyAtResult` when `key_at()` is migrated to
-/// `verify_key()` in a future PR.
+/// Returned by `IdentityResolver::verify_key()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyStatus {
     /// Key is currently active (associated with a live device).

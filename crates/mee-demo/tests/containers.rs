@@ -271,3 +271,69 @@ async fn gossip_deferred_invite_discovery_inner() {
     // Alice discovers Charlie via gossip
     wait_for_entry(&alice, &charlie_ns, "msgs/deferred", SYNC_TIMEOUT).await;
 }
+
+// ---- Multi-device tests -------------------------------------------------------
+
+/// Alice uses two devices (D1, D2) interacting with Bob.
+///
+/// D1 pairs D2 by delegating Write access to its namespace. D2 writes
+/// data that replicates through D1 to Bob (D2 → D1 → Bob).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker + pre-built mee-demo:dev image"]
+async fn multi_device_two_alice_one_bob() {
+    Box::pin(run_with_network(
+        "mee-multi-dev",
+        multi_device_two_alice_one_bob_inner(),
+    ))
+    .await;
+}
+
+async fn multi_device_two_alice_one_bob_inner() {
+    // 1. Spawn three nodes: Alice Device 1, Alice Device 2, Bob
+    let alice_d1 = MeeNode::spawn("alice-d1", "mee-multi-dev").await;
+    let alice_d2 = MeeNode::spawn("alice-d2", "mee-multi-dev").await;
+    let bob = MeeNode::spawn("bob", "mee-multi-dev").await;
+
+    // 2. Connect Alice D1 ↔ Bob (bidirectional invite exchange)
+    bidirectional_connect(&alice_d1, &bob).await;
+
+    let alice_ns = alice_d1.home_namespace().await;
+
+    // 3. Alice D1 inserts data
+    alice_d1
+        .insert(&alice_ns, "msgs/from-d1", "hello from device 1")
+        .await;
+
+    // 4. Bob should see D1's data via Willow replication
+    wait_for_entry(&bob, &alice_ns, "msgs/from-d1", SYNC_TIMEOUT).await;
+
+    // 5. Pair Alice D2: D1 delegates Write access to D2's SubspaceId
+    let d2_sub = alice_d2.subspace_id().await;
+    let (ns, ticket) = alice_d1.pair_device(&d2_sub).await;
+    assert_eq!(
+        ns, alice_ns,
+        "pair-device should return D1's home namespace"
+    );
+
+    // 5b. Establish gossip connection D1 ↔ D2 (needed for sync)
+    bidirectional_connect(&alice_d1, &alice_d2).await;
+    wait_for_gossip_peers(&alice_d1, 2, SYNC_TIMEOUT).await; // D1 sees Bob + D2
+    wait_for_gossip_peers(&alice_d2, 1, SYNC_TIMEOUT).await; // D2 sees D1
+
+    // 6. D2 imports the ticket (starts Willow sync with D1)
+    alice_d2.import_ticket(&ticket).await;
+
+    // 7. D2 should see D1's existing data
+    wait_for_entry(&alice_d2, &alice_ns, "msgs/from-d1", SYNC_TIMEOUT).await;
+
+    // 8. D2 writes new data into D1's namespace
+    alice_d2
+        .insert(&alice_ns, "msgs/from-d2", "hello from device 2")
+        .await;
+
+    // 9. Bob should see D2's data (replicated: D2 → D1 → Bob)
+    wait_for_entry(&bob, &alice_ns, "msgs/from-d2", SYNC_TIMEOUT).await;
+
+    // 10. D1 should also see D2's data
+    wait_for_entry(&alice_d1, &alice_ns, "msgs/from-d2", SYNC_TIMEOUT).await;
+}
