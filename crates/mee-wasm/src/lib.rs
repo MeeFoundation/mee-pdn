@@ -1,7 +1,7 @@
 // #![cfg(target_arch = "wasm32")]
 
 use mee_identity_api::{
-    IdentityError, IdentityProvider, IdentityResolver, IdentityState, KeyAtResult,
+    IdentityError, IdentityProvider, IdentityResolver, IdentityState, KeyStatus,
 };
 use mee_node_api::{
     Contact, DataEntry, DataError, Invite, InviteSignature, Node, SyncService, TrustService,
@@ -99,6 +99,15 @@ impl IdentityProvider for WasmIdentityService {
     fn aid(&self) -> Aid {
         Aid::from_bytes(ZERO_ID)
     }
+    fn operational_key(&self) -> OperationalKey {
+        OperationalKey::from_bytes(ZERO_ID)
+    }
+    async fn add_device(&self, _new_key: OperationalKey) -> Result<(), IdentityError> {
+        Err(IdentityError::Other("not implemented in WASM".to_owned()))
+    }
+    async fn remove_device(&self, _key: &OperationalKey) -> Result<(), IdentityError> {
+        Err(IdentityError::Other("not implemented in WASM".to_owned()))
+    }
     async fn rotate_key(&self, _compromised: bool) -> Result<OperationalKey, IdentityError> {
         Err(IdentityError::Rotation(
             "not implemented in WASM".to_owned(),
@@ -118,12 +127,12 @@ impl IdentityResolver for WasmIdentityService {
             event_seq: 0,
         })
     }
-    async fn key_at(&self, aid: &Aid, _at_time: u64) -> Result<KeyAtResult, IdentityError> {
-        Ok(KeyAtResult {
-            key: OperationalKey::from_bytes(*aid.as_bytes()),
-            current: true,
-            compromised: false,
-        })
+    async fn verify_key(
+        &self,
+        _aid: &Aid,
+        _key: &OperationalKey,
+    ) -> Result<KeyStatus, IdentityError> {
+        Ok(KeyStatus::Active)
     }
     async fn import_kel(&self, _kel_bytes: &[u8]) -> Result<Aid, IdentityError> {
         Err(IdentityError::Other("not implemented in WASM".to_owned()))

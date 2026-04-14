@@ -152,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
             "/debug/connections",
             get(|state| async move { debug_connections(state).await }),
         )
+        .route(
+            "/debug/pair-device",
+            post(|state, payload| async move { debug_pair_device(state, payload).await }),
+        )
     } else {
         app
     };
@@ -547,6 +551,47 @@ async fn debug_connections(state: axum::extract::State<AppState>) -> Response {
         }
         Err(e) => internal(&e).into_response(),
     }
+}
+
+// -- Device pairing ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PairDeviceReq {
+    subspace_id: api::SubspaceId,
+}
+
+#[derive(Serialize)]
+struct PairDeviceResp {
+    namespace: String,
+    ticket: api::SyncTicket,
+}
+
+async fn debug_pair_device(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<PairDeviceReq>,
+) -> Response {
+    if let Err(e) = state.ensure().await {
+        return internal(&e).into_response();
+    }
+    let n = state.get_node();
+
+    // Register the new device's key in the identity layer.
+    let new_key = mee_types::OperationalKey::from_bytes(*req.subspace_id.as_bytes());
+    if let Err(e) = n.identity_provider().add_device(new_key).await {
+        return internal_str(&format!("add_device: {e}")).into_response();
+    }
+
+    // Share home namespace with Write access to the new device's subspace.
+    let ticket = match n.sync().share(&req.subspace_id, AccessMode::Write).await {
+        Ok(t) => t,
+        Err(e) => return internal(&e).into_response(),
+    };
+
+    Json(PairDeviceResp {
+        namespace: n.home_namespace().to_string(),
+        ticket,
+    })
+    .into_response()
 }
 
 // -- Helpers ----------------------------------------------------------------

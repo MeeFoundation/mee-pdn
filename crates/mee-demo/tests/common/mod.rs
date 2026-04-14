@@ -322,6 +322,33 @@ impl MeeNode {
         );
     }
 
+    /// `POST /debug/pair-device` — pair a second device with this node.
+    ///
+    /// Returns `(namespace, ticket)` where ticket has Write capability.
+    pub async fn pair_device(&self, subspace_id: &str) -> (String, Value) {
+        let body = serde_json::json!({ "subspace_id": subspace_id });
+        let resp = self
+            .client
+            .post(format!("{}/debug/pair-device", self.url()))
+            .json(&body)
+            .send()
+            .await
+            .expect("pair-device request");
+        assert!(
+            resp.status().is_success(),
+            "[{}] pair-device failed: {}",
+            self.label,
+            resp.status(),
+        );
+        let json: Value = resp.json().await.expect("parse pair-device json");
+        let namespace = json["namespace"]
+            .as_str()
+            .expect("namespace field")
+            .to_owned();
+        let ticket = json["ticket"].clone();
+        (namespace, ticket)
+    }
+
     /// `GET /debug/gossip/peers` — returns cached peer advertisements.
     pub async fn gossip_peers(&self) -> Vec<Value> {
         self.client

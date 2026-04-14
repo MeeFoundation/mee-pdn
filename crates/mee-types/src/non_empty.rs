@@ -66,6 +66,41 @@ impl<T> NonEmpty<T> {
         self.tail.push(item);
     }
 
+    /// Returns `true` if the collection contains the given item.
+    pub fn contains(&self, item: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.head == *item || self.tail.contains(item)
+    }
+
+    /// Remove the first element matching `predicate`.
+    ///
+    /// Returns `Err(())` if no element matches or if removing the
+    /// match would leave the collection empty (i.e. the match is the
+    /// only element).
+    #[allow(clippy::result_unit_err)] // Callers map to domain error
+    pub fn try_remove<F>(&mut self, predicate: F) -> Result<T, ()>
+    where
+        F: Fn(&T) -> bool,
+    {
+        if predicate(&self.head) {
+            // Head matches — can only remove if tail is non-empty.
+            if self.tail.is_empty() {
+                return Err(()); // last element
+            }
+            let new_head = self.tail.remove(0);
+            let removed = std::mem::replace(&mut self.head, new_head);
+            return Ok(removed);
+        }
+        // Check tail.
+        if let Some(pos) = self.tail.iter().position(&predicate) {
+            Ok(self.tail.remove(pos))
+        } else {
+            Err(()) // not found
+        }
+    }
+
     /// Consume into a `Vec<T>`.
     pub fn into_vec(self) -> Vec<T> {
         let mut v = Vec::with_capacity(1 + self.tail.len());
@@ -223,5 +258,69 @@ mod tests {
         let c = NonEmpty::from_vec(vec![1, 3]).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    // -- contains --
+
+    #[test]
+    fn contains_head() {
+        let ne = NonEmpty::from_vec(vec![1, 2, 3]).unwrap();
+        assert!(ne.contains(&1));
+    }
+
+    #[test]
+    fn contains_tail() {
+        let ne = NonEmpty::from_vec(vec![1, 2, 3]).unwrap();
+        assert!(ne.contains(&3));
+    }
+
+    #[test]
+    fn contains_missing() {
+        let ne = NonEmpty::from_vec(vec![1, 2, 3]).unwrap();
+        assert!(!ne.contains(&99));
+    }
+
+    // -- try_remove --
+
+    #[test]
+    fn try_remove_from_head() {
+        let mut ne = NonEmpty::from_vec(vec![1, 2, 3]).unwrap();
+        let removed = ne.try_remove(|x| *x == 1).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(ne.head, 2);
+        assert_eq!(ne.tail, vec![3]);
+    }
+
+    #[test]
+    fn try_remove_from_tail() {
+        let mut ne = NonEmpty::from_vec(vec![1, 2, 3]).unwrap();
+        let removed = ne.try_remove(|x| *x == 2).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(ne.head, 1);
+        assert_eq!(ne.tail, vec![3]);
+    }
+
+    #[test]
+    fn try_remove_last_element_fails() {
+        let mut ne = NonEmpty::new(42);
+        assert!(ne.try_remove(|x| *x == 42).is_err());
+        assert_eq!(ne.len(), 1); // unchanged
+    }
+
+    #[test]
+    fn try_remove_not_found() {
+        let mut ne = NonEmpty::from_vec(vec![1, 2]).unwrap();
+        assert!(ne.try_remove(|x| *x == 99).is_err());
+        assert_eq!(ne.len(), 2); // unchanged
+    }
+
+    #[test]
+    fn try_remove_head_promotes_tail() {
+        let mut ne = NonEmpty::from_vec(vec![10, 20]).unwrap();
+        let removed = ne.try_remove(|x| *x == 10).unwrap();
+        assert_eq!(removed, 10);
+        assert_eq!(ne.head, 20);
+        assert!(ne.tail.is_empty());
+        assert_eq!(ne.len(), 1);
     }
 }
