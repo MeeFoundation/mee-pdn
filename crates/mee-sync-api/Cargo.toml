@@ -1,0 +1,13 @@
+[package]
+name = "mee-sync-api"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-agnostic P2P sync API for Mee PDN"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+mee-types = { path = "../mee-types" }
+thiserror = "2"
+
+[lints]
+workspace = true
