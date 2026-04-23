@@ -2,6 +2,7 @@
 members = [
   "crates/mee-types", # shared domain types
   "crates/mee-sync-api", # backend-agnostic sync engine API
+  "crates/mee-pdn-layer", # DRAFT: PDN-layer operation AST, material for discussion
 ]
 resolver = "2"
 
