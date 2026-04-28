@@ -134,6 +134,17 @@ define_byte_id! {
     pub struct NodeId;
 }
 
+// -- PDN identity ----------------------------------------------------------
+
+define_byte_id! {
+    /// Stable identifier of a participant on the Mee PDN.
+    ///
+    /// Used at the PDN domain layer (claims, connections, delegation) so
+    /// that higher-level code does not depend on identity-implementation
+    /// details such as KERI `Aid`.
+    pub struct MeeId;
+}
+
 // -- KERI identity types ----------------------------------------------------
 
 define_byte_id! {

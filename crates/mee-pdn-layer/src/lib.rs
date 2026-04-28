@@ -1,33 +1,16 @@
 use mee_sync_api::{EntryPath, NamespaceId};
-use mee_types::{Aid, OperationalKey};
+use mee_types::{MeeId, OperationalKey};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
 
-/// Access mode granted to a capability recipient.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AccessMode {
-    Read,
-    Write,
-}
-
-/// Which fragment of a namespace a capability covers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Scope {
-    /// The whole namespace.
-    Whole,
-    /// A path prefix (all entries beneath it).
-    Prefix(EntryPath),
-    /// A specific entry.
-    Entry(EntryPath),
-}
-
 /// What a peer receives when accepting an invite.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invite {
-    pub from: Aid,
+    pub from: MeeId,
     // Transport hints (NodeAddr) — not yet ported into the rebuilt workspace.
     // Signature and expiry also pending.
 }
@@ -35,27 +18,67 @@ pub struct Invite {
 /// Public view of a connection with a peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
-    pub peer: Aid,
+    pub peer: MeeId,
     pub alias: Option<String>,
     /// Peer's device operational keys that we know about.
     pub peer_devices: Vec<OperationalKey>,
 }
 
-/// Summary of a granted or received capability.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GrantInfo {
-    pub counterparty: Aid,
-    pub namespace: NamespaceId,
-    pub scope: Scope,
-    pub access: AccessMode,
-}
-
 /// Claim locator: (subject, issuer) pair plus path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClaimLocator {
-    pub about: Aid,
-    pub issued_by: Aid,
+    pub about: MeeId,
+    pub issued_by: MeeId,
     pub path: EntryPath,
+}
+
+// ---------------------------------------------------------------------------
+// Domain-model types: Attribute, Capability, Claim, DelegatedClaim
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AttributeValue {
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    List(Vec<AttributeValue>),
+    Set(Vec<AttributeValue>),
+    Object(BTreeMap<String, AttributeValue>),
+}
+
+/// Named, typed property holding a single piece of data.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Attribute {
+    pub name: String,
+    pub value: AttributeValue,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Capability {}
+
+/// An assertion about a Subject by a Subject. Inseparable bundle of
+/// data (`Attribute`) and access semantics (`Capability`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Claim {
+    pub attribute: Attribute,
+    pub capability: Capability,
+}
+
+/// Reference to an Identity Context.
+///
+/// **Placeholder shape.**
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityContextRef {
+    pub counterparty: MeeId,
+}
+
+/// A `Claim` conditionally shared into another Identity Context.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DelegatedClaim {
+    pub source: ClaimLocator,
+    pub target_context: IdentityContextRef,
+    pub conditions: Capability,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,12 +93,13 @@ pub struct ClaimLocator {
 #[allow(dead_code)]
 pub enum PdnOp {
     // --- Identity and devices --------------------------------------------
-    /// Create a fresh identity. -> (Aid, OperationalKey)
+    /// Create a fresh identity. -> (MeeId, OperationalKey)
     ///
-    /// Initializes the local KEL and generates the inception key.
+    /// Initializes the local identity state and generates the inception
+    /// device key.
     CreateIdentity,
 
-    /// Authorize a new device under the current Aid. -> ()
+    /// Authorize a new device under the current MeeId. -> ()
     ///
     /// The new device has already generated its keypair; only the public
     /// part is passed here.
@@ -90,7 +114,7 @@ pub enum PdnOp {
     /// is marked as compromised.
     RotateKey { compromised: bool },
 
-    /// List keys currently active under my Aid. -> NonEmpty<OperationalKey>
+    /// List keys currently active under my MeeId. -> NonEmpty<OperationalKey>
     ActiveDevices,
 
     // --- Connections -----------------------------------------------------
@@ -104,63 +128,48 @@ pub enum PdnOp {
     ListConnections,
 
     /// Get details of a specific connection. -> Option<Connection>
-    GetConnection { peer: Aid },
+    GetConnection { peer: MeeId },
 
     /// Close a connection. -> ()
     ///
-    /// Side effect: all capabilities granted to this peer are revoked.
-    CloseConnection { peer: Aid },
+    /// Side effect: all delegated claims involving this peer are revoked.
+    CloseConnection { peer: MeeId },
 
-    // --- Claims (statements) ---------------------------------------------
-    /// Write a statement into the (about, self) namespace. -> ()
+    // --- Claims ----------------------------------------------------------
+    /// Put a claim into the (subject, self) namespace at `path`. -> ()
     ///
-    /// Degenerate case `about == self`: writing into one's own namespace
-    /// (e.g. an r-card). There is no recipient encoded here — visibility
-    /// is governed by Grants.
-    WriteClaim {
-        about: Aid,
+    PutClaim {
+        subject: MeeId,
         path: EntryPath,
-        bytes: Vec<u8>,
+        claim: Claim,
     },
 
-    /// Read a statement from a specific (about, issued_by) namespace.
-    /// -> Option<Vec<u8>>
-    ReadClaim { locator: ClaimLocator },
+    /// Get a claim at the given locator. -> Option<Claim>
+    GetClaim { locator: ClaimLocator },
 
-    /// Enumerate everything I can see about a specific Aid.
+    /// Enumerate everything I can see about a specific MeeId.
     /// -> Vec<ClaimLocator>
-    ///
-    /// That is, all namespaces where `about = target` and I hold a
-    /// read-cap. Example: "show me what people I know are saying about
-    /// Carol."
-    ListClaimsAbout { about: Aid },
+    ListClaimsAbout { about: MeeId },
 
     /// Enumerate all claims I have authored. -> Vec<ClaimLocator>
-    ///
-    /// That is, namespaces where `issued_by = self`.
     ListMyClaims,
 
-    // --- Capabilities / sharing ------------------------------------------
-    /// Grant a peer a capability over a scope within a namespace. -> ()
-    Grant {
-        peer: Aid,
-        namespace: NamespaceId,
-        scope: Scope,
-        access: AccessMode,
+    // --- Delegation ------------------------------------------------------
+    /// Delegate a claim into another Identity Context under conditions.
+    /// -> DelegatedClaim
+    DelegateClaim {
+        source: ClaimLocator,
+        to: IdentityContextRef,
+        conditions: Capability,
     },
 
-    /// Revoke a previously issued capability. -> ()
-    Revoke {
-        peer: Aid,
-        namespace: NamespaceId,
-        scope: Scope,
-    },
+    /// List my outgoing delegations to a specific identity context.
+    /// -> Vec<DelegatedClaim>
+    ListDelegationsTo { context: IdentityContextRef },
 
-    /// What I have granted to this peer. -> Vec<GrantInfo>
-    ListOutgoingGrants { peer: Aid },
-
-    /// What peers have granted to me. -> Vec<GrantInfo>
-    ListIncomingGrants,
+    /// List delegations others have made into my contexts.
+    /// -> Vec<DelegatedClaim>
+    ListIncomingDelegations,
 
     // --- Discovery / sync (candidate ops) --------------------------------
     /// Sync a namespace once with reachable peers. -> ()
