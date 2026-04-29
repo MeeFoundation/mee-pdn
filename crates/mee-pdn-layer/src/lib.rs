@@ -1,5 +1,5 @@
-use mee_sync_api::{EntryPath, NamespaceId};
-use mee_types::{MeeId, OperationalKey};
+use mee_sync_api::NamespaceId;
+use mee_types::{MeeId, MeeIdentityProof, OperationalKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -18,18 +18,17 @@ pub struct Invite {
 /// Public view of a connection with a peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
+    pub id: ConnectionId,
     pub peer: MeeId,
     pub alias: Option<String>,
     /// Peer's device operational keys that we know about.
     pub peer_devices: Vec<OperationalKey>,
+    /// Claims associated with this connection.
+    pub claim_ids: Vec<ClaimId>,
 }
 
-/// Claim locator: (subject, issuer) pair plus path.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClaimLocator {
-    pub about: MeeId,
-    pub issued_by: MeeId,
-    pub path: EntryPath,
+mee_types::define_byte_id! {
+    pub struct ConnectionId;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,23 +60,21 @@ pub struct Capability {}
 /// data (`Attribute`) and access semantics (`Capability`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Claim {
+    pub about: MeeId,
+    pub issued_by: MeeId,
+    pub proof_of_issued_by: MeeIdentityProof,
     pub attribute: Attribute,
     pub capability: Capability,
 }
 
-/// Reference to an Identity Context.
-///
-/// **Placeholder shape.**
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IdentityContextRef {
-    pub counterparty: MeeId,
+mee_types::define_byte_id! {
+    pub struct ClaimId;
 }
 
 /// A `Claim` conditionally shared into another Identity Context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DelegatedClaim {
-    pub source: ClaimLocator,
-    pub target_context: IdentityContextRef,
+    pub source: ClaimId,
     pub conditions: Capability,
 }
 
@@ -130,42 +127,40 @@ pub enum PdnOp {
     /// Get details of a specific connection. -> Option<Connection>
     GetConnection { peer: MeeId },
 
-    /// Close a connection. -> ()
+    /// Deactivate a connection. -> ()
     ///
     /// Side effect: all delegated claims involving this peer are revoked.
-    CloseConnection { peer: MeeId },
+    DeactivateConnection { peer: MeeId },
 
     // --- Claims ----------------------------------------------------------
-    /// Put a claim into the (subject, self) namespace at `path`. -> ()
+    /// Write a claim into the (subject, self) namespace at `path`. -> ()
     ///
-    PutClaim {
-        subject: MeeId,
-        path: EntryPath,
+    WriteClaim {
+        connection_id: ConnectionId,
         claim: Claim,
     },
 
-    /// Get a claim at the given locator. -> Option<Claim>
-    GetClaim { locator: ClaimLocator },
+    /// Get a claim by id. -> Option<Claim>
+    GetClaim { claim_id: ClaimId },
 
     /// Enumerate everything I can see about a specific MeeId.
-    /// -> Vec<ClaimLocator>
+    /// -> Vec<ClaimId>
     ListClaimsAbout { about: MeeId },
 
-    /// Enumerate all claims I have authored. -> Vec<ClaimLocator>
+    /// Enumerate all claims I have authored. -> Vec<ClaimId>
     ListMyClaims,
 
     // --- Delegation ------------------------------------------------------
     /// Delegate a claim into another Identity Context under conditions.
     /// -> DelegatedClaim
     DelegateClaim {
-        source: ClaimLocator,
-        to: IdentityContextRef,
-        conditions: Capability,
+        claim_id: ClaimId,
+        capability: Capability,
     },
 
     /// List my outgoing delegations to a specific identity context.
     /// -> Vec<DelegatedClaim>
-    ListDelegationsTo { context: IdentityContextRef },
+    ListDelegationsTo,
 
     /// List delegations others have made into my contexts.
     /// -> Vec<DelegatedClaim>

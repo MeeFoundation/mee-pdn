@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod non_empty;
@@ -144,6 +145,10 @@ define_byte_id! {
     /// details such as KERI `Aid`.
     pub struct MeeId;
 }
+
+/// Cryptographic evidence that a particular `MeeId` issued a statement.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MeeIdentityProof {}
 
 // -- KERI identity types ----------------------------------------------------
 
