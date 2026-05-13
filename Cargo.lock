@@ -36,6 +36,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mee-willow-layer"
+version = "0.1.0"
+dependencies = [
+ "mee-sync-api",
+ "mee-types",
+ "serde",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

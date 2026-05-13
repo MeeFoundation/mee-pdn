@@ -53,8 +53,21 @@ pub struct Attribute {
     pub value: AttributeValue,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Capability {}
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccessMode {
+    Read,
+    Write,
+    // Delete,
+    // Delegate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Capability {
+    pub holders: Vec<MeeId>,
+    pub access: AccessMode,
+    /// Wall-clock expiry, unix ms. `None` = no explicit expiry
+    pub expires_at: Option<u64>,
+}
 
 /// An assertion about a Subject by a Subject. Inseparable bundle of
 /// data (`Attribute`) and access semantics (`Capability`).
