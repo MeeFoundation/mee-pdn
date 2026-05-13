@@ -7,6 +7,10 @@
     {
       "name": "crates",
       "path": "crates"
+    },
+    {
+      "name": "mia-docs",
+      "path": "mia-docs"
     }
   ],
   "settings": {
