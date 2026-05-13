@@ -1,0 +1,4 @@
+schema: spec-driven
+
+context: |
+  Rust workspace implementing a portion of the Mee Personal Data Network.
