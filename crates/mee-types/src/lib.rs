@@ -135,6 +135,21 @@ define_byte_id! {
     pub struct NodeId;
 }
 
+// -- PDN identity ----------------------------------------------------------
+
+define_byte_id! {
+    /// Stable identifier of a participant on the Mee PDN.
+    ///
+    /// Used at the PDN domain layer (claims, connections, delegation) so
+    /// that higher-level code does not depend on identity-implementation
+    /// details such as KERI `Aid`.
+    pub struct MeeId;
+}
+
+/// Cryptographic evidence that a particular `MeeId` issued a statement.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MeeIdentityProof {}
+
 // -- KERI identity types ----------------------------------------------------
 
 define_byte_id! {
@@ -152,20 +167,4 @@ define_byte_id! {
     /// Maps to Willow `SubspaceId` / iroh-willow `UserId`.
     /// Changes on key rotation (unlike `Aid`, which is permanent).
     pub struct OperationalKey;
-}
-
-// -- Roadmap placeholders ---------------------------------------------------
-
-// TODO: Integrate into identity/trust layer once persona management
-// is implemented. Currently defined but unused.
-/// Classification of a persona's visibility scope.
-/// Maps to the First Person Network's P-DID / C-DID / U-DID concepts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PersonaKind {
-    /// Public persona (P-DID). Visible to anyone.
-    Public,
-    /// Community persona (C-DID). Shared within a specific community.
-    Community,
-    /// Private persona (U-DID). Shared only with specific parties.
-    Private,
 }

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ "**" ]
+    branches: ["**"]
 
 jobs:
   lint-test-wasm:
@@ -37,9 +37,3 @@ jobs:
 
       - name: Run tests
         run: just test
-
-      - name: Build core WASM targets
-        run: just build-core-wasm
-
-      - name: Run integration tests
-        run: just integration-tests

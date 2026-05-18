@@ -1,12 +1,13 @@
 [package]
-name = "mee-identity-api"
+name = "mee-willow-layer"
 version = "0.1.0"
 edition = "2021"
+description = "Draft: willow/iroh-layer AST"
 
 [dependencies]
 mee-types = { path = "../mee-types" }
+mee-sync-api = { path = "../mee-sync-api" }
 serde = { version = "1", features = ["derive"] }
-thiserror = "2.0.16"
 
 [lints]
 workspace = true
