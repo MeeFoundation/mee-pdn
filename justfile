@@ -3,10 +3,6 @@ set dotenv-load
 _default:
   @ just --list --unsorted
 
-# Clean demo data
-clean-demo:
-  rm -rf var/dev-nodes var/caps-alice-to-bob.txt || true
-
 # Build the entire workspace
 build:
   #!/bin/sh
@@ -44,13 +40,6 @@ test-release:
   set -eux
   cargo test --workspace --release --all-targets
 
-# Build image and run container integration tests
-integration-tests:
-  #!/bin/sh
-  set -eux
-  IMAGE_TAG=mee-demo:dev just build-image
-  cargo test -p mee-demo --test containers -- --ignored --nocapture
-
 # Lint and type-check without modifying files
 check:
   #!/bin/sh
@@ -74,8 +63,6 @@ precommit-check:
   set -eux
   just check
   just test
-  just build-core-wasm
-  just integration-tests
 
 # Lint, build, test, integration tests, attempt fixes
 precommit-fix:
@@ -83,40 +70,6 @@ precommit-fix:
   set -eux
   just check-fix
   just test
-  just build-core-wasm
-  just integration-tests
-
-# Build core libraries for wasm
-build-core-wasm:
-  #!/bin/sh
-  set -eux
-  cargo build --target wasm32-unknown-unknown \
-    -p mee-wasm
-  cargo build --target wasm32-wasip1 \
-    -p mee-identity-api \
-    -p mee-identity-keri \
-    -p mee-node-api
-
-# Build the wasm-bindgen facade for browser target
-wasm-build-bindgen:
-  #!/bin/sh
-  set -eux
-  cargo build --target wasm32-unknown-unknown -p mee-wasm
-
-# Build the Docker image for the Axum node
-build-image:
-  #!/bin/sh
-  set -eux
-  IMAGE_TAG=${IMAGE_TAG:-mee-demo:dev}
-  DOCKER_BUILDKIT=1 docker build -f ops/Dockerfile -t ${IMAGE_TAG} .
-
-# Run the Docker image locally
-run-image:
-  #!/bin/sh
-  set -eux
-  IMAGE_TAG=${IMAGE_TAG:-mee-demo:dev}
-  PORT=${PORT:-3000}
-  docker run --rm -e MEE_PORT=${PORT} -e MEE_HOST=0.0.0.0 -p ${PORT}:${PORT} ${IMAGE_TAG}
 
 pr-review branch:
   #!/bin/sh

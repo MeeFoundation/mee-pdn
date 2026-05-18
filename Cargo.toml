@@ -1,21 +1,15 @@
 [workspace]
 members = [
-  "crates/mee-identity-api", # KERI identity API & types
-  "crates/mee-identity-keri", # KERI identity provider (placeholder impl)
-  "crates/mee-node-api", # node api & types
-  "crates/mee-wasm", # minimal wasm facade (wasm-bindgen)
   "crates/mee-types", # shared domain types
   "crates/mee-sync-api", # backend-agnostic sync engine API
-  "crates/mee-sync-iroh-willow", # iroh/willow sync engine
-  "crates/mee-node-demo-impl", # demo Node implementation (iroh, willow, mem kv store)
-  "crates/mee-demo", # demo node + axum surface
+  "crates/mee-pdn-layer", # DRAFT: PDN-layer operation AST, material for discussion
+  "crates/mee-willow-layer", # DRAFT: willow/iroh-layer AST, material for discussion
 ]
 resolver = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
-# missing_docs = "warn"  # TODO: re-enable once public API stabilises
 non_ascii_idents = "deny"
 
 [workspace.lints.clippy]
@@ -77,8 +71,3 @@ infinite_loop = "deny"
 shadow_unrelated = "allow"
 redundant_clone = "warn"
 large_futures = "warn"
-
-[patch.crates-io]
-willow-data-model = { git = "https://github.com/n0-computer/willow-rs.git", branch = "main" }
-willow-encoding = { git = "https://github.com/n0-computer/willow-rs.git", branch = "main" }
-meadowcap = { git = "https://github.com/n0-computer/willow-rs.git", branch = "main" }
