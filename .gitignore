@@ -16,4 +16,4 @@ build
 tmp
 var
 .cargo
-.claude
+CLAUDE.local.md

@@ -54,6 +54,11 @@ RUN mise use -g rust@latest
 
 # END STACKS
 
+# Node.js + OpenSpec CLI (used by .claude/commands/opsx/* and .claude/skills/openspec-*).
+# Kept outside the sandcat-managed stacks block so `sandcat init --stacks` won't overwrite it.
+RUN mise use -g node@latest \
+    && npm install -g @fission-ai/openspec
+
 # If Java was installed above, bake JAVA_HOME and JAVA_TOOL_OPTIONS into
 # .bashrc so VS Code's env probe picks them up before the entrypoint runs.
 # Without JAVA_HOME, JVM tooling like Metals fails to find the JDK.
