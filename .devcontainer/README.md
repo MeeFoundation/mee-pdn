@@ -138,3 +138,32 @@ If a token expires or is compromised:
 
 - Git commit author
 - Automatically configured on container startup
+
+---
+
+## Troubleshooting
+
+### Build-time installs from `Dockerfile.app` not visible after rebuild
+
+The `/home/vscode` directory is backed by the named Docker volume
+`mee-pdn-sandbox_app-home` so Claude Code auth, shell history, and similar
+user state survive rebuilds. The trade-off: the volume is populated from
+the image only on **first** container creation. Subsequent rebuilds keep
+the existing volume contents, so anything new the Dockerfile installs into
+`/home/vscode/...` (mise toolchains, npm globals, etc.) is shadowed.
+
+Symptom: `openspec --version` (or another tool just added to `Dockerfile.app`)
+returns `command not found` after **Rebuild Container**.
+
+Fix — wipe the home volume, then rebuild:
+
+```bash
+# On the host, with the devcontainer stopped:
+docker volume rm mee-pdn-sandbox_app-home
+```
+
+Then **Dev Containers: Rebuild Container** in VS Code. The volume is
+recreated from the fresh image, so the new tools land. You will lose
+container-local user state (shell history, anything cached only inside
+`/home/vscode`); Claude Code OAuth re-auths automatically from the host
+token.

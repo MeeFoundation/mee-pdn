@@ -16,4 +16,5 @@ build
 tmp
 var
 .cargo
-.claude
+.claude/settings.local.json
+CLAUDE.local.md
