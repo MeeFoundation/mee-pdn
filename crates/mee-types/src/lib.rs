@@ -168,3 +168,12 @@ define_byte_id! {
     /// Changes on key rotation (unlike `Aid`, which is permanent).
     pub struct OperationalKey;
 }
+
+define_byte_id! {
+    /// Stable identifier of a claim in the PDN domain layer.
+    ///
+    /// Used as the resource in `UWill` capability tokens (`res.claim_id`),
+    /// so that capabilities reference domain-level claims rather than
+    /// Willow-level geometric areas.
+    pub struct ClaimId;
+}

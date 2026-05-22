@@ -7,6 +7,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+willow-data-model = "0.7"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
