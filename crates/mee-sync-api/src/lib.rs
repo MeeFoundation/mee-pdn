@@ -1,13 +1,25 @@
+use mee_types::MeeId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Byte-backed IDs (reuse macro from mee-types)
+// NamespaceId
 // ---------------------------------------------------------------------------
 
-mee_types::define_byte_id! {
-    /// Willow namespace key (32 bytes).
-    pub struct NamespaceId;
+/// Willow namespace identifier — the pair `(about, issued_by)`.
+///
+/// `issued_by` is the sole writer/owner; `about` is the subject the
+/// namespace's entries concern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NamespaceId {
+    pub about: MeeId,
+    pub issued_by: MeeId,
+}
+
+impl NamespaceId {
+    pub const fn new(about: MeeId, issued_by: MeeId) -> Self {
+        Self { about, issued_by }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,17 +137,8 @@ impl AsRef<str> for EntryPath {
 }
 
 // ---------------------------------------------------------------------------
-// Namespace classification
+// Namespace roles
 // ---------------------------------------------------------------------------
-
-/// Whether a namespace is single-owner or communal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum NamespaceKind {
-    /// Single owner controls all subspaces.
-    Owned,
-    /// Multiple writers via delegated subspaces.
-    Communal,
-}
 
 /// A principal's role within a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

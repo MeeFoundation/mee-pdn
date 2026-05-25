@@ -8,6 +8,7 @@ description = "Draft: willow/iroh-layer AST"
 mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 
 [lints]
 workspace = true

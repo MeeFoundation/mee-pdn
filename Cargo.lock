@@ -42,6 +42,7 @@ dependencies = [
  "mee-sync-api",
  "mee-types",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
