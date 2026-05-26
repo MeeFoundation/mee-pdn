@@ -55,6 +55,16 @@ mee_types::define_byte_id! {
     pub struct CapabilityCid;
 }
 
+/// Wall-clock validity window for a `UWill` capability.
+///
+/// Both bounds are absolute unix-ms timestamps, matching the wire format
+/// of `nbf` / `exp` in [`UwillCapability`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ValidityWindow {
+    pub nbf: u64,
+    pub exp: u64,
+}
+
 // ---------------------------------------------------------------------------
 // WillowLayer — interface the PDN layer drives
 // ---------------------------------------------------------------------------
@@ -64,7 +74,35 @@ mee_types::define_byte_id! {
 pub enum WillowLayerError {
     /// The local node does not control a device key resolvable to `issued_by`.
     #[error("local node is not authorized to write as {issued_by}")]
-    NotAuthorized { issued_by: MeeId },
+    NotAuthorizedToWrite { issued_by: MeeId },
+
+    /// The local node is neither the namespace owner of `res` nor a holder
+    /// of a parent capability for `res` that includes the `Delegate` command.
+    #[error("local node is not authorized to delegate {res}")]
+    NotAuthorizedToDelegate { res: ClaimId },
+
+    /// Requested commands are not a subset of what the holder can delegate
+    /// (either a parent capability does not cover them, or `Read` is missing).
+    #[error("requested commands exceed holder's delegatable set: {requested:?}")]
+    CommandsExceedAuthority { requested: Vec<WillowCommand> },
+
+    /// Requested validity window is not contained within the parent
+    /// capability's `[nbf, exp]`.
+    #[error("requested validity {requested:?} not within parent's {parent:?}")]
+    ValidityOutsideParent {
+        requested: ValidityWindow,
+        parent: ValidityWindow,
+    },
+
+    /// Local capability store has no record for `cid` — cannot build the
+    /// proof chain needed to verify revocation authority.
+    #[error("capability not found: {cid}")]
+    CapabilityNotFound { cid: CapabilityCid },
+
+    /// The local node's `MeeId` is not in the issuer chain of `cid` up to
+    /// the namespace owner.
+    #[error("local node is not authorized to revoke {cid}")]
+    NotAuthorizedToRevoke { cid: CapabilityCid },
 
     /// Payload exceeds the willow `max_payload_size` parameter.
     #[error("payload too large: {size} bytes (max {max})")]
@@ -94,4 +132,35 @@ pub trait WillowLayer: Send + Sync {
         path: &EntryPath,
         payload: &[u8],
     ) -> Result<(), WillowLayerError>;
+
+    /// Issue a `UWill` capability granting `commands` over `res` to `audience`,
+    /// valid during `validity`.
+    ///
+    /// Succeeds when the local node is either the owner of the namespace
+    /// containing `res`, or holds a parent capability for `res` whose `cmd`
+    /// includes `Delegate` and covers all of `commands`. In the latter case
+    /// the parent capability is embedded in the proof chain automatically.
+    ///
+    /// Returns the signed capability (for transmission to `audience`) and
+    /// its CID (for local tracking and future revocation).
+    async fn issue_capability(
+        &self,
+        audience: MeeId,
+        commands: Vec<WillowCommand>,
+        res: ClaimId,
+        validity: ValidityWindow,
+    ) -> Result<(UwillCapability, CapabilityCid), WillowLayerError>;
+
+    /// Revoke the capability identified by `cid`.
+    ///
+    /// Succeeds when the local node's `MeeId` is in the issuer chain of
+    /// `cid` up to the namespace owner. Idempotent: revoking an already
+    /// revoked capability is a no-op `Ok(())`.
+    ///
+    /// Revocation records propagate via willow sync; callers do not need
+    /// to distribute anything themselves.
+    ///
+    /// Consider returning the revocation `Invocation`'s CID if a future
+    /// caller needs to reference it (e.g. for audit). Not exposed today.
+    async fn revoke_capability(&self, cid: CapabilityCid) -> Result<(), WillowLayerError>;
 }
