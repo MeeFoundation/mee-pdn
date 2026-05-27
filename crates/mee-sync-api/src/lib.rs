@@ -137,6 +137,26 @@ impl AsRef<str> for EntryPath {
 }
 
 // ---------------------------------------------------------------------------
+// EntryInfo — metadata about a stored entry, without the payload bytes
+// ---------------------------------------------------------------------------
+
+/// Metadata for a single willow entry, without the payload bytes.
+///
+/// Returned by enumeration methods so callers can decide which entries'
+/// payloads to actually load.
+///
+/// The willow-level `subspace_id` is omitted: in our model it is fixed
+/// to `namespace.issued_by` (so claims converge across the issuer's
+/// devices via willow's newer-wins overwrite semantics) and would be
+/// redundant here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryInfo {
+    pub namespace: NamespaceId,
+    pub path: EntryPath,
+    pub payload_len: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Namespace roles
 // ---------------------------------------------------------------------------
 

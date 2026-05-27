@@ -1,4 +1,5 @@
-use mee_sync_api::{EntryPath, NamespaceId};
+use futures_core::Stream;
+use mee_sync_api::{EntryInfo, EntryPath, NamespaceId};
 use mee_types::{ClaimId, MeeId, NodeId};
 use serde::{Deserialize, Serialize};
 
@@ -163,4 +164,26 @@ pub trait WillowLayer: Send + Sync {
     /// Consider returning the revocation `Invocation`'s CID if a future
     /// caller needs to reference it (e.g. for audit). Not exposed today.
     async fn revoke_capability(&self, cid: CapabilityCid) -> Result<(), WillowLayerError>;
+
+    /// Read the payload bytes for the entry at `path` in `namespace`.
+    /// Returns `Ok(None)` if no such entry exists.
+    async fn get_entry(
+        &self,
+        namespace: &NamespaceId,
+        path: &EntryPath,
+    ) -> Result<Option<Vec<u8>>, WillowLayerError>;
+
+    /// Stream type yielding entry metadata for [`list_entries`].
+    type EntryStream: Stream<Item = Result<EntryInfo, WillowLayerError>> + Send + Unpin + 'static;
+
+    /// Enumerate metadata for entries in `namespace`, optionally filtered
+    /// to those whose `path` starts with `path_prefix`.
+    ///
+    /// Yields metadata only (no payload bytes); use [`get_entry`] to fetch
+    /// payloads for entries of interest.
+    async fn list_entries(
+        &self,
+        namespace: &NamespaceId,
+        path_prefix: Option<&EntryPath>,
+    ) -> Result<Self::EntryStream, WillowLayerError>;
 }
