@@ -1,13 +1,25 @@
+use mee_types::MeeId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Byte-backed IDs (reuse macro from mee-types)
+// NamespaceId
 // ---------------------------------------------------------------------------
 
-mee_types::define_byte_id! {
-    /// Willow namespace key (32 bytes).
-    pub struct NamespaceId;
+/// Willow namespace identifier — the pair `(about, issued_by)`.
+///
+/// `issued_by` is the sole writer/owner; `about` is the subject the
+/// namespace's entries concern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NamespaceId {
+    pub about: MeeId,
+    pub issued_by: MeeId,
+}
+
+impl NamespaceId {
+    pub const fn new(about: MeeId, issued_by: MeeId) -> Self {
+        Self { about, issued_by }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,17 +137,28 @@ impl AsRef<str> for EntryPath {
 }
 
 // ---------------------------------------------------------------------------
-// Namespace classification
+// EntryInfo — metadata about a stored entry, without the payload bytes
 // ---------------------------------------------------------------------------
 
-/// Whether a namespace is single-owner or communal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum NamespaceKind {
-    /// Single owner controls all subspaces.
-    Owned,
-    /// Multiple writers via delegated subspaces.
-    Communal,
+/// Metadata for a single willow entry, without the payload bytes.
+///
+/// Returned by enumeration methods so callers can decide which entries'
+/// payloads to actually load.
+///
+/// The willow-level `subspace_id` is omitted: in our model it is fixed
+/// to `namespace.issued_by` (so claims converge across the issuer's
+/// devices via willow's newer-wins overwrite semantics) and would be
+/// redundant here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryInfo {
+    pub namespace: NamespaceId,
+    pub path: EntryPath,
+    pub payload_len: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Namespace roles
+// ---------------------------------------------------------------------------
 
 /// A principal's role within a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

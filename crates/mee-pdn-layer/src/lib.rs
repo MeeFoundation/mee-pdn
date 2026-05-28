@@ -1,5 +1,5 @@
 use mee_sync_api::NamespaceId;
-use mee_types::{MeeId, MeeIdentityProof, OperationalKey};
+use mee_types::{ClaimId, MeeId, MeeIdentityProof, OperationalKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -78,10 +78,6 @@ pub struct Claim {
     pub proof_of_issued_by: MeeIdentityProof,
     pub attribute: Attribute,
     pub capability: Capability,
-}
-
-mee_types::define_byte_id! {
-    pub struct ClaimId;
 }
 
 /// A `Claim` conditionally shared into another Identity Context.
