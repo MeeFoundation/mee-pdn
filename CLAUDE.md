@@ -56,6 +56,7 @@ Relaxed in test code via `clippy.toml` (allows unwrap/expect/print/dbg/indexing)
 use `.get()` and `TryFrom`/`TryInto` where possible.
 
 Formatting: `max_width = 100` (rustfmt.toml). Cognitive complexity threshold: 15.
-Max lines per function: 80. Future-size threshold: 8192 (because iroh
-futures are ~7KB structurally; not relevant in the rebuilt branch yet but
-kept consistent).
+Max lines per function: 80. Future-size threshold: 16384 (clippy's default;
+iroh's `Endpoint::bind`/`spawn` futures are ~10KB structurally, so the
+earlier 8192 threshold flagged every iroh await point once iroh came into
+actual use in `iroh-docs-experiment`).

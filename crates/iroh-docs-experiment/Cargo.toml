@@ -1,0 +1,18 @@
+[package]
+name = "iroh-docs-experiment"
+version = "0.1.0"
+edition = "2021"
+description = "Experiment: sync documents over iroh-docs, bypassing willow"
+
+[dependencies]
+iroh = "1.0.0-rc.1"
+iroh-blobs = "0.102"
+iroh-docs = "0.100"
+iroh-gossip = "0.100"
+
+[dev-dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

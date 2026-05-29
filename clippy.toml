@@ -15,5 +15,6 @@ too-many-lines-threshold = 80
 # Don't require docs on private items
 check-private-items = false
 
-# Large future threshold
-future-size-threshold = 8192
+# Large future threshold — iroh's spawn/bind futures are ~10KB structurally,
+# so use clippy's default ceiling rather than flagging every iroh await point.
+future-size-threshold = 16384

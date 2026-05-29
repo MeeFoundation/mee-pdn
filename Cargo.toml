@@ -4,6 +4,7 @@ members = [
   "crates/mee-sync-api", # backend-agnostic sync engine API
   "crates/mee-pdn-layer", # DRAFT: PDN-layer operation AST, material for discussion
   "crates/mee-willow-layer", # DRAFT: willow/iroh-layer AST, material for discussion
+  "crates/iroh-docs-experiment", # EXPERIMENT: sync documents via iroh-docs, bypassing willow
 ]
 resolver = "2"
 
@@ -49,8 +50,8 @@ print_stderr = "deny"
 # Don't call process::exit
 exit = "deny"
 
-# Useless string ops
-string_to_string = "deny"
+# Useless clones / string ops (clippy removed `string_to_string`; `implicit_clone` supersedes it)
+implicit_clone = "deny"
 
 # --- Warn: aspirational, tighten later ---
 
