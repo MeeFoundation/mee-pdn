@@ -1839,6 +1839,8 @@ dependencies = [
  "iroh-blobs",
  "iroh-docs",
  "iroh-gossip",
+ "mee-sync-api",
+ "mee-types",
  "tokio",
 ]
 
