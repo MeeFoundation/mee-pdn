@@ -7,7 +7,7 @@ description = "Experiment: sync documents over iroh-docs, bypassing willow"
 [dependencies]
 iroh = "1.0.0-rc.1"
 iroh-blobs = "0.102"
-iroh-docs = "0.100"
+iroh-docs = { path = "../../../iroh-docs" }
 iroh-gossip = "0.100"
 
 [dev-dependencies]
