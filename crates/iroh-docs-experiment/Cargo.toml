@@ -4,15 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Experiment: sync documents over iroh-docs, bypassing willow"
 
-[dependencies]
-iroh = "1.0.0-rc.1"
-iroh-blobs = "0.102"
-iroh-docs = { path = "../../../iroh-docs" }
-iroh-gossip = "0.100"
-
 [dev-dependencies]
 anyhow = "1"
 mee-sync-api = { path = "../mee-sync-api" }
+mee-sync-iroh-docs = { path = "../mee-sync-iroh-docs" }
 mee-types = { path = "../mee-types" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 

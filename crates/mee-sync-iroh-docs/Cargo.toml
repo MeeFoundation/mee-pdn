@@ -1,0 +1,17 @@
+[package]
+name = "mee-sync-iroh-docs"
+version = "0.1.0"
+edition = "2021"
+description = "Data-layer adapter: capability-gated document sync over the iroh-docs variant"
+
+[dependencies]
+anyhow = "1"
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
+mee-sync-api = { path = "../mee-sync-api" }
+mee-types = { path = "../mee-types" }
+
+[lints]
+workspace = true

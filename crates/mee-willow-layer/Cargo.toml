@@ -7,6 +7,7 @@ description = "Draft: willow/iroh-layer AST"
 [dependencies]
 mee-types = { path = "../mee-types" }
 mee-sync-api = { path = "../mee-sync-api" }
+uwill = { path = "../uwill" }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

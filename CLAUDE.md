@@ -8,7 +8,7 @@ Top of `/Users/theman/work/mee-pdn/`:
 
 | Path        | What it is                                                              |
 | ----------- | ----------------------------------------------------------------------- |
-| `crates/`   | The rebuilt workspace — four draft crates (see below).                  |
+| `crates/`   | The rebuilt workspace — draft crates (see below).                       |
 | `mia-docs/` | Sibling repo cloned in-place (gitignored) — UWill ADRs, openspec specs. |
 
 ## Project (rebuilt workspace)
@@ -19,9 +19,12 @@ privacy and user sovereignty. Monorepo using Cargo workspaces.
 ### Crates (drafts)
 
 - [`crates/mee-types`](crates/mee-types/) — shared domain types: `define_byte_id!`, `NodeId`, `Aid`, `OperationalKey`, `MeeId`, `MeeIdentityProof`, `NonEmpty<T>`.
-- [`crates/mee-sync-api`](crates/mee-sync-api/) — holds `NamespaceId`, `EntryPath`, `NamespaceKind`, `NamespaceRole`.
+- [`crates/mee-sync-api`](crates/mee-sync-api/) — holds `NamespaceId`, `EntryPath`, `EntryInfo`, `NamespaceRole`.
+- [`crates/uwill`](crates/uwill/) — UWill capability tokens: `UwillCapability`, `WillowCommand`, `CapabilityCid`, `ValidityWindow`; transport-independent, future home of chain validation.
 - [`crates/mee-pdn-layer`](crates/mee-pdn-layer/) — draft of the PDN-layer AST.
-- [`crates/mee-willow-layer`](crates/mee-willow-layer/) — draft of the middle layer between PDN and iroh. `UwillCapability` placeholder;
+- [`crates/mee-willow-layer`](crates/mee-willow-layer/) — draft of the middle layer between PDN and iroh: the `WillowLayer` trait; re-exports the `uwill` types it speaks in.
+- [`crates/mee-sync-iroh-docs`](crates/mee-sync-iroh-docs/) — data-layer adapter over the forked iroh-docs (local checkout at `../iroh-docs`, capability-gated ingest per ADR-0008): `SyncNode` stack assembly, namespace registry, `IngestPolicy` gate. Everything Mee-specific lives here so the fork stays iroh-native and minimal.
+- [`crates/iroh-docs-experiment`](crates/iroh-docs-experiment/) — scenario tests driving the public API of `mee-sync-iroh-docs`.
 
 ## Commands
 

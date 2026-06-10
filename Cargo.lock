@@ -1834,11 +1834,8 @@ name = "iroh-docs-experiment"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "iroh",
- "iroh-blobs",
- "iroh-docs",
- "iroh-gossip",
  "mee-sync-api",
+ "mee-sync-iroh-docs",
  "mee-types",
  "tokio",
 ]
@@ -2199,6 +2196,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mee-sync-iroh-docs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "iroh-blobs",
+ "iroh-docs",
+ "iroh-gossip",
+ "mee-sync-api",
+ "mee-types",
+]
+
+[[package]]
 name = "mee-types"
 version = "0.1.0"
 dependencies = [
@@ -2216,6 +2226,7 @@ dependencies = [
  "mee-types",
  "serde",
  "thiserror",
+ "uwill",
 ]
 
 [[package]]
@@ -4169,6 +4180,14 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uwill"
+version = "0.1.0"
+dependencies = [
+ "mee-types",
+ "serde",
 ]
 
 [[package]]

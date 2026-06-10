@@ -2,14 +2,22 @@
 members = [
   "crates/mee-types", # shared domain types
   "crates/mee-sync-api", # backend-agnostic sync engine API
+  "crates/uwill", # UWill capability tokens: format + (future) chain validation
   "crates/mee-pdn-layer", # DRAFT: PDN-layer operation AST, material for discussion
   "crates/mee-willow-layer", # DRAFT: willow/iroh-layer AST, material for discussion
+  "crates/mee-sync-iroh-docs", # data-layer adapter: capability-gated sync over the iroh-docs variant
   "crates/iroh-docs-experiment", # EXPERIMENT: sync documents via iroh-docs, bypassing willow
 ]
 resolver = "2"
 
 [workspace.dependencies]
 willow-data-model = "0.7"
+# The iroh stack is pinned here so the adapter and the experiment crates
+# always agree; `iroh-docs` is our local variant (capability-gated ingest).
+iroh = "1.0.0-rc.1"
+iroh-blobs = "0.102"
+iroh-docs = { path = "../iroh-docs" }
+iroh-gossip = "0.100"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
