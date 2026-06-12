@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod data;
 mod non_empty;
+pub use data::{EntryInfo, EntryPath, NamespaceId, NamespaceRole, NodeAddr, PathValidationError};
 pub use non_empty::NonEmpty;
 
 // ---------------------------------------------------------------------------
@@ -138,17 +140,17 @@ define_byte_id! {
 // -- PDN identity ----------------------------------------------------------
 
 define_byte_id! {
-    /// Stable identifier of a participant on the Mee PDN.
+    /// Stable identifier of a participant on the PDN.
     ///
     /// Used at the PDN domain layer (claims, connections, delegation) so
     /// that higher-level code does not depend on identity-implementation
     /// details such as KERI `Aid`.
-    pub struct MeeId;
+    pub struct PdnId;
 }
 
-/// Cryptographic evidence that a particular `MeeId` issued a statement.
+/// Cryptographic evidence that a particular `PdnId` issued a statement.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MeeIdentityProof {}
+pub struct PdnIdentityProof {}
 
 // -- KERI identity types ----------------------------------------------------
 
@@ -164,7 +166,6 @@ define_byte_id! {
 define_byte_id! {
     /// Current ed25519 operational signing key from the latest KEL event.
     ///
-    /// Maps to Willow `SubspaceId` / iroh-willow `UserId`.
     /// Changes on key rotation (unlike `Aid`, which is permanent).
     pub struct OperationalKey;
 }
@@ -172,8 +173,8 @@ define_byte_id! {
 define_byte_id! {
     /// Stable identifier of a claim in the PDN domain layer.
     ///
-    /// Used as the resource in `UWill` capability tokens (`res.claim_id`),
-    /// so that capabilities reference domain-level claims rather than
-    /// Willow-level geometric areas.
+    /// Used as the resource in `UWill` capability tokens (`res`), so that
+    /// capabilities reference domain-level claims rather than
+    /// storage-level locations.
     pub struct ClaimId;
 }

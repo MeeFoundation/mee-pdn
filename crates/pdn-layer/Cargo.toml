@@ -1,0 +1,12 @@
+[package]
+name = "pdn-layer"
+version = "0.1.0"
+edition = "2021"
+description = "Platform surface: domain model, operation AST, UWill capability tokens"
+
+[dependencies]
+pdn-types = { path = "../pdn-types" }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

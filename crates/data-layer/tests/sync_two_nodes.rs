@@ -1,7 +1,7 @@
 //! Capability-gated end-to-end sync over iroh-docs.
 //!
-//! Two in-process nodes built from `mee-sync-iroh-docs`. Bob's node accepts
-//! an incoming entry only if the issuer of the entry's namespace is in his
+//! Two in-process nodes built from `data-layer`. Bob's node accepts an
+//! incoming entry only if the issuer of the entry's namespace is in his
 //! live `Connections` set — the simplified, single-link form of a capability
 //! chain, enforced by the `ConnectionsPolicy` ingest gate inside the local
 //! iroh-docs variant.
@@ -9,9 +9,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use mee_sync_api::{EntryPath, NamespaceId};
-use mee_sync_iroh_docs::{AddrInfoOptions, Connections, ConnectionsPolicy, ShareMode, SyncNode};
-use mee_types::MeeId;
+use data_layer::{AddrInfoOptions, Connections, ConnectionsPolicy, ShareMode, SyncNode};
+use pdn_types::{EntryPath, NamespaceId, PdnId};
 
 /// Poll until `path` is present on `node`, or return `None` once `timeout`
 /// elapses.
@@ -35,9 +34,9 @@ async fn wait_for_entry(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn capability_gated_sync() -> Result<()> {
-    // Mee identities.
-    let carol = MeeId::from_bytes([0xca; 32]);
-    let alice = MeeId::from_bytes([0xa1; 32]);
+    // PDN identities.
+    let carol = PdnId::from_bytes([0xca; 32]);
+    let alice = PdnId::from_bytes([0xa1; 32]);
 
     // Each node runs a connections-gated ingest policy; the `Connections`
     // handles stay with the test so the sets can be mutated at runtime.

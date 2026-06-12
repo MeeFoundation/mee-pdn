@@ -1,18 +1,19 @@
 //! `UWill` capability tokens.
 //!
-//! The delegation token format shared by every layer that issues,
-//! transports, stores, or validates capabilities. This crate is
-//! transport-independent: it knows nothing about iroh, willow, or how
-//! tokens travel between nodes.
+//! The delegation token format shared by every part of the platform that
+//! issues, transports, stores, or validates capabilities. The module is
+//! transport-independent: it knows nothing about iroh or the data-layer
+//! backend, and its types must not leak below the PDN layer — the data
+//! layer sees tokens only as opaque payloads plus an injected ingest
+//! policy.
 //!
 //! Pure chain validation (proof-chain verification, expiry, revocation
-//! checks) belongs here as it lands; backends such as the iroh-docs
-//! ingest gate only resolve an entry to the relevant chain and call into
-//! this crate for the verdict.
+//! checks) belongs here as it lands; the node runtime resolves an entry
+//! to the relevant chain and calls into this module for the verdict.
 //!
 //! See `components/pdn-node/uwill.md` for the full specification.
 
-use mee_types::{ClaimId, MeeId};
+use pdn_types::{ClaimId, PdnId};
 use serde::{Deserialize, Serialize};
 
 /// Commands that a `UWill` capability can grant.
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// `Read` MUST be present in every capability.
 /// `Write`, `Delete`, `Delegate` are optional.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WillowCommand {
+pub enum Command {
     Read,
     Write,
     Delete,
@@ -30,18 +31,18 @@ pub enum WillowCommand {
 /// `UWill` delegation token: UCAN envelope with a single-claim resource and DID principals.
 ///
 /// Field names follow the UCAN v1.0.0-rc.1 Delegation spec.
-/// Willow-level addressing (namespace, subspace, path) is NOT exposed here;
-/// the sync backend resolves `res` → concrete storage leaf internally.
+/// Storage-level addressing (namespace, path) is NOT exposed here;
+/// resolving `res` to a concrete storage location is the runtime's job.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UwillCapability {
-    /// Delegator's MeeId-backed DID.
-    pub iss: MeeId,
-    /// Delegate's MeeId-backed DID.
-    pub aud: MeeId,
-    /// Namespace owner's MeeId-backed DID.
-    pub sub: MeeId,
+    /// Delegator's PdnId-backed DID.
+    pub iss: PdnId,
+    /// Delegate's PdnId-backed DID.
+    pub aud: PdnId,
+    /// Namespace owner's PdnId-backed DID.
+    pub sub: PdnId,
     /// Granted commands. `Read` MUST always be present; validators MUST reject tokens without it.
-    pub cmd: Vec<WillowCommand>,
+    pub cmd: Vec<Command>,
     /// Resource: the single claim this capability grants access to.
     pub res: ClaimId,
     /// Wall-clock validity start (unix ms).
@@ -52,7 +53,7 @@ pub struct UwillCapability {
     pub nonce: [u8; 12],
 }
 
-mee_types::define_byte_id! {
+pdn_types::define_byte_id! {
     /// CID of a `UWill` delegation — used for revocation references.
     pub struct CapabilityCid;
 }

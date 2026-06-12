@@ -16,7 +16,7 @@ use iroh_docs::{
     AuthorId, DocTicket, ALPN as DOCS_ALPN,
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
-use mee_sync_api::{EntryPath, NamespaceId};
+use pdn_types::{EntryPath, NamespaceId};
 
 use crate::gate::{self, IngestPolicy};
 use crate::registry::{NamespaceIndex, Registry};

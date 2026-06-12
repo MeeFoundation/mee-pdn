@@ -2,7 +2,7 @@
 //! fork's `CapabilityValidator` hook.
 //!
 //! The fork's hook sees `&SignedEntry` and returns `bool` — it knows nothing
-//! about `MeeIds`. This module translates: resolve the entry's iroh namespace
+//! about `PdnId`s. This module translates: resolve the entry's iroh namespace
 //! to a domain [`NamespaceId`] via the shared registry index, hand the
 //! domain view to an [`IngestPolicy`], and map the verdict back to `bool`.
 
@@ -10,8 +10,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use iroh_docs::{CapabilityValidator, SignedEntry};
-use mee_sync_api::NamespaceId;
-use mee_types::MeeId;
+use pdn_types::{NamespaceId, PdnId};
 
 use crate::registry::NamespaceIndex;
 
@@ -69,7 +68,7 @@ pub(crate) fn capability_validator(
     })
 }
 
-/// A node's live set of connections: the [`MeeId`]s it currently accepts
+/// A node's live set of connections: the [`PdnId`]s it currently accepts
 /// entries from.
 ///
 /// Cheaply cloneable handle around shared state: the application side
@@ -77,7 +76,7 @@ pub(crate) fn capability_validator(
 /// thread.
 #[derive(Clone, Debug, Default)]
 pub struct Connections {
-    inner: Arc<RwLock<HashSet<MeeId>>>,
+    inner: Arc<RwLock<HashSet<PdnId>>>,
 }
 
 impl Connections {
@@ -87,7 +86,7 @@ impl Connections {
     }
 
     /// Add `id` to the set; returns `false` if it was already present.
-    pub fn insert(&self, id: MeeId) -> bool {
+    pub fn insert(&self, id: PdnId) -> bool {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -95,7 +94,7 @@ impl Connections {
     }
 
     /// Remove `id` from the set; returns `true` if it was present.
-    pub fn remove(&self, id: &MeeId) -> bool {
+    pub fn remove(&self, id: &PdnId) -> bool {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -103,7 +102,7 @@ impl Connections {
     }
 
     /// Whether `id` is currently in the set.
-    pub fn contains(&self, id: &MeeId) -> bool {
+    pub fn contains(&self, id: &PdnId) -> bool {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)

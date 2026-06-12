@@ -640,6 +640,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-layer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-core",
+ "iroh",
+ "iroh-blobs",
+ "iroh-docs",
+ "iroh-gossip",
+ "pdn-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "der"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1830,17 +1845,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh-docs-experiment"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "mee-sync-api",
- "mee-sync-iroh-docs",
- "mee-types",
- "tokio",
-]
-
-[[package]]
 name = "iroh-gossip"
 version = "0.100.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2175,58 +2179,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
-]
-
-[[package]]
-name = "mee-pdn-layer"
-version = "0.1.0"
-dependencies = [
- "mee-sync-api",
- "mee-types",
- "serde",
-]
-
-[[package]]
-name = "mee-sync-api"
-version = "0.1.0"
-dependencies = [
- "mee-types",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "mee-sync-iroh-docs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "iroh",
- "iroh-blobs",
- "iroh-docs",
- "iroh-gossip",
- "mee-sync-api",
- "mee-types",
-]
-
-[[package]]
-name = "mee-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "mee-willow-layer"
-version = "0.1.0"
-dependencies = [
- "futures-core",
- "mee-sync-api",
- "mee-types",
- "serde",
- "thiserror",
- "uwill",
 ]
 
 [[package]]
@@ -2774,6 +2726,23 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pdn-layer"
+version = "0.1.0"
+dependencies = [
+ "pdn-types",
+ "serde",
+]
+
+[[package]]
+name = "pdn-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "pem"
@@ -4180,14 +4149,6 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "uwill"
-version = "0.1.0"
-dependencies = [
- "mee-types",
- "serde",
 ]
 
 [[package]]

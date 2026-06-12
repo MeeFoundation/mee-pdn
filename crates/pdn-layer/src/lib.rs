@@ -1,7 +1,15 @@
-use mee_sync_api::NamespaceId;
-use mee_types::{ClaimId, MeeId, MeeIdentityProof, OperationalKey};
+//! The PDN layer: the platform surface products consume.
+//!
+//! Pure domain — no transport, no storage backend. The domain model
+//! (claims, connections, delegation), the operation AST ([`PdnOp`]), and
+//! the [`uwill`] capability-token module live here; executing operations
+//! over a data layer is the job of the (future) node runtime.
+
+use pdn_types::{ClaimId, NamespaceId, OperationalKey, PdnId, PdnIdentityProof};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub mod uwill;
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -10,8 +18,8 @@ use std::collections::BTreeMap;
 /// What a peer receives when accepting an invite.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invite {
-    pub from: MeeId,
-    // Transport hints (NodeAddr) — not yet ported into the rebuilt workspace.
+    pub from: PdnId,
+    // Transport hints (NodeAddr) — not yet wired in.
     // Signature and expiry also pending.
 }
 
@@ -19,7 +27,7 @@ pub struct Invite {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
     pub id: ConnectionId,
-    pub peer: MeeId,
+    pub peer: PdnId,
     pub alias: Option<String>,
     /// Peer's device operational keys that we know about.
     pub peer_devices: Vec<OperationalKey>,
@@ -27,7 +35,7 @@ pub struct Connection {
     pub claim_ids: Vec<ClaimId>,
 }
 
-mee_types::define_byte_id! {
+pdn_types::define_byte_id! {
     pub struct ConnectionId;
 }
 
@@ -63,7 +71,7 @@ pub enum AccessMode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Capability {
-    pub holders: Vec<MeeId>,
+    pub holders: Vec<PdnId>,
     pub access: AccessMode,
     /// Wall-clock expiry, unix ms. `None` = no explicit expiry
     pub expires_at: Option<u64>,
@@ -73,9 +81,9 @@ pub struct Capability {
 /// data (`Attribute`) and access semantics (`Capability`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Claim {
-    pub about: MeeId,
-    pub issued_by: MeeId,
-    pub proof_of_issued_by: MeeIdentityProof,
+    pub about: PdnId,
+    pub issued_by: PdnId,
+    pub proof_of_issued_by: PdnIdentityProof,
     pub attribute: Attribute,
     pub capability: Capability,
 }
@@ -99,13 +107,13 @@ pub struct DelegatedClaim {
 #[allow(dead_code)]
 pub enum PdnOp {
     // --- Identity and devices --------------------------------------------
-    /// Create a fresh identity. -> (`MeeId`, `OperationalKey`)
+    /// Create a fresh identity. -> (`PdnId`, `OperationalKey`)
     ///
     /// Initializes the local identity state and generates the inception
     /// device key.
     CreateIdentity,
 
-    /// Authorize a new device under the current `MeeId`. -> ()
+    /// Authorize a new device under the current `PdnId`. -> ()
     ///
     /// The new device has already generated its keypair; only the public
     /// part is passed here.
@@ -120,7 +128,7 @@ pub enum PdnOp {
     /// is marked as compromised.
     RotateKey { compromised: bool },
 
-    /// List keys currently active under my `MeeId`. -> `NonEmpty`<OperationalKey>
+    /// List keys currently active under my `PdnId`. -> `NonEmpty`<OperationalKey>
     ActiveDevices,
 
     // --- Connections -----------------------------------------------------
@@ -134,12 +142,12 @@ pub enum PdnOp {
     ListConnections,
 
     /// Get details of a specific connection. -> Option<Connection>
-    GetConnection { peer: MeeId },
+    GetConnection { peer: PdnId },
 
     /// Deactivate a connection. -> ()
     ///
     /// Side effect: all delegated claims involving this peer are revoked.
-    DeactivateConnection { peer: MeeId },
+    DeactivateConnection { peer: PdnId },
 
     // --- Claims ----------------------------------------------------------
     /// Write a claim into the (subject, self) namespace at `path`. -> ()
@@ -152,9 +160,9 @@ pub enum PdnOp {
     /// Get a claim by id. -> Option<Claim>
     GetClaim { claim_id: ClaimId },
 
-    /// Enumerate everything I can see about a specific `MeeId`.
+    /// Enumerate everything I can see about a specific `PdnId`.
     /// -> Vec<ClaimId>
-    ListClaimsAbout { about: MeeId },
+    ListClaimsAbout { about: PdnId },
 
     /// Enumerate all claims I have authored. -> Vec<ClaimId>
     ListMyClaims,

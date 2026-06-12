@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use iroh_docs::{api::Doc, NamespaceId as IrohNamespaceId};
-use mee_sync_api::NamespaceId;
+use pdn_types::NamespaceId;
 
 /// Shared, synchronously readable map: iroh namespace → domain namespace.
 ///
