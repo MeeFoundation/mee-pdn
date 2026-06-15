@@ -6,7 +6,8 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
-use iroh_docs::{
+use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
+use pdn_store::{
     api::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc, DocsApi,
@@ -15,7 +16,6 @@ use iroh_docs::{
     store::Query,
     AuthorId, DocTicket, ALPN as DOCS_ALPN,
 };
-use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_types::{EntryPath, NamespaceId};
 
 use crate::gate::{self, IngestPolicy};
@@ -117,12 +117,22 @@ impl SyncNode {
     }
 
     /// Read the latest payload at `path` in `namespace`, if present.
+    ///
+    /// Returns `Ok(None)` both when no entry exists and when the entry is
+    /// already stored but its payload has not been fetched yet: entry
+    /// records and blob content arrive independently (sync inserts the
+    /// record, the downloader fetches the bytes), so "stored" precedes
+    /// "readable". Poll again for the payload to become available.
     pub async fn read(&self, namespace: &NamespaceId, path: &EntryPath) -> Result<Option<Vec<u8>>> {
         let doc = self.doc(namespace)?;
         let query = Query::single_latest_per_key().key_exact(path.as_str().as_bytes());
         match doc.get_one(query).await? {
             Some(entry) => {
-                let bytes = self.blobs.get_bytes(entry.content_hash()).await?;
+                let hash = entry.content_hash();
+                if !self.blobs.has(hash).await? {
+                    return Ok(None);
+                }
+                let bytes = self.blobs.get_bytes(hash).await?;
                 Ok(Some(bytes.to_vec()))
             }
             None => Ok(None),

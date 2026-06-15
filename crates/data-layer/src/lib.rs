@@ -33,9 +33,10 @@ pub use gate::{Admission, Connections, ConnectionsPolicy, IngestCtx, IngestPolic
 pub use layer::{DataLayer, DataLayerError};
 pub use node::SyncNode;
 
-// Re-exported iroh-docs vocabulary for the common share/import/write flows,
-// so downstream crates don't need a direct iroh-docs dependency.
-pub use iroh_docs::{
+// Re-exported pdn-store (iroh-docs fork) vocabulary for the common
+// share/import/write flows, so downstream crates don't need a direct
+// dependency on it.
+pub use pdn_store::{
     api::protocol::{AddrInfoOptions, ShareMode},
     AuthorId, DocTicket,
 };

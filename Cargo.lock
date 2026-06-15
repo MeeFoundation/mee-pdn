@@ -1808,6 +1808,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.100.0"
+source = "git+ssh://git@github.com/MeeFoundation/pdn-store.git#6d4fae25ab02e96bad58311434d7b4d2e198dbf7"
 dependencies = [
  "anyhow",
  "async-channel",

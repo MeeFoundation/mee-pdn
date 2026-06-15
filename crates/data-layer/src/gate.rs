@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use iroh_docs::{CapabilityValidator, SignedEntry};
+use pdn_store::{CapabilityValidator, SignedEntry};
 use pdn_types::{NamespaceId, PdnId};
 
 use crate::registry::NamespaceIndex;

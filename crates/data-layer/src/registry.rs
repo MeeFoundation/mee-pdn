@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use iroh_docs::{api::Doc, NamespaceId as IrohNamespaceId};
+use pdn_store::{api::Doc, NamespaceId as IrohNamespaceId};
 use pdn_types::NamespaceId;
 
 /// Shared, synchronously readable map: iroh namespace → domain namespace.

@@ -25,7 +25,7 @@ wire). `pdn-layer` does NOT depend on `data-layer` — both see only
 ### Crates
 
 - [`crates/pdn-types`](crates/pdn-types/) — platform primitives (`define_byte_id!`, `PdnId`, `PdnIdentityProof`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, `NonEmpty<T>`) plus the data vocabulary (`NamespaceId` = `(about, issued_by)`, `EntryPath`, `EntryInfo`, `NamespaceRole`, `NodeAddr`).
-- [`crates/data-layer`](crates/data-layer/) — the data layer over the forked iroh-docs (local checkout at `../iroh-docs`, capability-gated ingest per ADR-0008): the entries-only `DataLayer` trait, `SyncNode` stack assembly, namespace registry, `IngestPolicy` gate. Scenario tests in its `tests/`. Capability _semantics_ stay above: tokens are opaque payloads here, policies are injected.
+- [`crates/data-layer`](crates/data-layer/) — the data layer over the forked iroh-docs (git dependency on `github.com/MeeFoundation/pdn-store`, capability-gated ingest per ADR-0008): the entries-only `DataLayer` trait, `SyncNode` stack assembly, namespace registry, `IngestPolicy` gate. Scenario tests in its `tests/`. Capability _semantics_ stay above: tokens are opaque payloads here, policies are injected. To hack on the fork locally, `[patch]` it to `../pdn-store` (see the workspace `Cargo.toml` comment).
 - [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` module (capability-token format, future chain validation). No iroh dependencies.
 
 ## Commands

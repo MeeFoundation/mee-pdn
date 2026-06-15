@@ -9,8 +9,8 @@ anyhow = "1"
 futures-core = "0.3"
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
-iroh-docs = { workspace = true }
 iroh-gossip = { workspace = true }
+pdn-store = { workspace = true }
 pdn-types = { path = "../pdn-types" }
 thiserror = "2"
 
