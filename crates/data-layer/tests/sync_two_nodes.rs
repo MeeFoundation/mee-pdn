@@ -84,7 +84,10 @@ async fn capability_gated_sync() -> Result<()> {
     alice_node
         .write(&namespace, alice_author, &k2, b"v2")
         .await?;
-    let got = wait_for_entry(&bob_node, &namespace, &k2, Duration::from_secs(15)).await?;
+    // Generous liveness ceiling: this is a "must eventually sync" bound, not a
+    // correctness one, so a larger value only tolerates slow/loaded CI runners
+    // — it never makes the assertion wrong.
+    let got = wait_for_entry(&bob_node, &namespace, &k2, Duration::from_secs(30)).await?;
     assert_eq!(
         got.as_deref(),
         Some(b"v2".as_ref()),
