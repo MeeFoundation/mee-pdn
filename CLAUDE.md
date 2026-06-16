@@ -8,20 +8,25 @@ Top of `/Users/theman/work/mee-pdn/`:
 
 | Path        | What it is                                                              |
 | ----------- | ----------------------------------------------------------------------- |
-| `crates/`   | The rebuilt workspace — four draft crates (see below).                  |
+| `crates/`   | The rebuilt workspace — draft crates (see below).                       |
 | `mia-docs/` | Sibling repo cloned in-place (gitignored) — UWill ADRs, openspec specs. |
 
-## Project (rebuilt workspace)
+## Project
 
-Mee PDN — a decentralized, local-first data platform in Rust focused on
-privacy and user sovereignty. Monorepo using Cargo workspaces.
+PDN — a decentralized, local-first data platform in Rust focused on
+privacy and user sovereignty. Built within the Mee organization for the
+mia product, but not limited to it — org/product names stay out of the
+code. Monorepo using Cargo workspaces.
 
-### Crates (drafts)
+Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the
+wire). `pdn-layer` does NOT depend on `data-layer` — both see only
+`pdn-types`; the future `pdn-node` runtime glues them together.
 
-- [`crates/mee-types`](crates/mee-types/) — shared domain types: `define_byte_id!`, `NodeId`, `Aid`, `OperationalKey`, `MeeId`, `MeeIdentityProof`, `NonEmpty<T>`.
-- [`crates/mee-sync-api`](crates/mee-sync-api/) — holds `NamespaceId`, `EntryPath`, `NamespaceKind`, `NamespaceRole`.
-- [`crates/mee-pdn-layer`](crates/mee-pdn-layer/) — draft of the PDN-layer AST.
-- [`crates/mee-willow-layer`](crates/mee-willow-layer/) — draft of the middle layer between PDN and iroh. `UwillCapability` placeholder;
+### Crates
+
+- [`crates/pdn-types`](crates/pdn-types/) — platform primitives (`define_byte_id!`, `PdnId`, `PdnIdentityProof`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, `NonEmpty<T>`) plus the data vocabulary (`NamespaceId` = `(about, issued_by)`, `EntryPath`, `EntryInfo`, `NamespaceRole`, `NodeAddr`).
+- [`crates/data-layer`](crates/data-layer/) — the data layer over the forked iroh-docs (git dependency on `github.com/MeeFoundation/pdn-store`, capability-gated ingest per ADR-0008): the entries-only `DataLayer` trait, `SyncNode` stack assembly, namespace registry, `IngestPolicy` gate. Scenario tests in its `tests/`. Capability _semantics_ stay above: tokens are opaque payloads here, policies are injected. To hack on the fork locally, `[patch]` it to `../pdn-store` (see the workspace `Cargo.toml` comment).
+- [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` module (capability-token format, future chain validation). No iroh dependencies.
 
 ## Commands
 
@@ -56,6 +61,7 @@ Relaxed in test code via `clippy.toml` (allows unwrap/expect/print/dbg/indexing)
 use `.get()` and `TryFrom`/`TryInto` where possible.
 
 Formatting: `max_width = 100` (rustfmt.toml). Cognitive complexity threshold: 15.
-Max lines per function: 80. Future-size threshold: 8192 (because iroh
-futures are ~7KB structurally; not relevant in the rebuilt branch yet but
-kept consistent).
+Max lines per function: 80. Future-size threshold: 16384 (clippy's default;
+iroh's `Endpoint::bind`/`spawn` futures are ~10KB structurally, so the
+earlier 8192 threshold flagged every iroh await point once iroh came into
+actual use in `iroh-docs-experiment`).

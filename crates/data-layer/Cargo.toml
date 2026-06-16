@@ -1,0 +1,21 @@
+[package]
+name = "data-layer"
+version = "0.1.0"
+edition = "2021"
+description = "Data layer: capability-gated document sync over our iroh-docs variant"
+
+[dependencies]
+anyhow = "1"
+futures-core = "0.3"
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-gossip = { workspace = true }
+pdn-store = { workspace = true }
+pdn-types = { path = "../pdn-types" }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -1,4 +1,9 @@
-use mee_types::MeeId;
+//! The data vocabulary: how entries and namespaces are addressed across
+//! the platform. Shared by the data layer (which stores and syncs them)
+//! and the PDN layer (which speaks about them) without either depending
+//! on the other.
+
+use crate::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -6,24 +11,24 @@ use std::fmt;
 // NamespaceId
 // ---------------------------------------------------------------------------
 
-/// Willow namespace identifier — the pair `(about, issued_by)`.
+/// Data namespace identifier — the pair `(about, issued_by)`.
 ///
 /// `issued_by` is the sole writer/owner; `about` is the subject the
 /// namespace's entries concern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NamespaceId {
-    pub about: MeeId,
-    pub issued_by: MeeId,
+    pub about: PdnId,
+    pub issued_by: PdnId,
 }
 
 impl NamespaceId {
-    pub const fn new(about: MeeId, issued_by: MeeId) -> Self {
+    pub const fn new(about: PdnId, issued_by: PdnId) -> Self {
         Self { about, issued_by }
     }
 }
 
 // ---------------------------------------------------------------------------
-// EntryPath — validated Willow path
+// EntryPath — validated entry path
 // ---------------------------------------------------------------------------
 
 /// Error returned when constructing an invalid [`EntryPath`].
@@ -33,7 +38,7 @@ pub struct PathValidationError {
     pub message: String,
 }
 
-/// A validated Willow entry path.
+/// A validated entry path.
 ///
 /// Components are separated by `/`. Constraints:
 /// - No empty components (no leading, trailing, or double slashes)
@@ -140,14 +145,14 @@ impl AsRef<str> for EntryPath {
 // EntryInfo — metadata about a stored entry, without the payload bytes
 // ---------------------------------------------------------------------------
 
-/// Metadata for a single willow entry, without the payload bytes.
+/// Metadata for a single data-layer entry, without the payload bytes.
 ///
 /// Returned by enumeration methods so callers can decide which entries'
 /// payloads to actually load.
 ///
-/// The willow-level `subspace_id` is omitted: in our model it is fixed
-/// to `namespace.issued_by` (so claims converge across the issuer's
-/// devices via willow's newer-wins overwrite semantics) and would be
+/// The author dimension is omitted: in our model it is fixed to
+/// `namespace.issued_by` (so claims converge across the issuer's devices
+/// via the data layer's newer-wins overwrite semantics) and would be
 /// redundant here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
@@ -166,4 +171,14 @@ pub enum NamespaceRole {
     Owner,
     Writer,
     Reader,
+}
+
+// ---------------------------------------------------------------------------
+// Transport hints
+// ---------------------------------------------------------------------------
+
+/// Transport address hint for reaching a node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeAddr {
+    pub node_id: NodeId,
 }
