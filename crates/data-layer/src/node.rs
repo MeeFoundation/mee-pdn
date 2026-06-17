@@ -16,10 +16,10 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket, ALPN as DOCS_ALPN,
 };
-use pdn_types::{EntryPath, NamespaceId};
+use pdn_types::{EntryPath, NamespaceId, PdnId};
 
 use crate::gate::{self, IngestPolicy};
-use crate::registry::{NamespaceIndex, Registry};
+use crate::registry::{BindingIndex, Registry};
 
 /// One running node: iroh endpoint, gossip, in-memory blob store, and the
 /// capability-gated docs engine, with replicas addressed by domain
@@ -42,7 +42,7 @@ impl SyncNode {
         let blobs = MemStore::default();
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        let index = NamespaceIndex::default();
+        let index = BindingIndex::default();
         let validator = gate::capability_validator(Arc::new(policy), index.clone());
 
         let docs = Docs::memory()
@@ -64,14 +64,14 @@ impl SyncNode {
         })
     }
 
-    /// Create a fresh doc and bind it to `namespace`.
+    /// Create a fresh doc and bind it to data `namespace`.
     pub async fn create_namespace(&mut self, namespace: NamespaceId) -> Result<()> {
         let doc = self.docs.create().await?;
-        self.registry.bind(namespace, doc);
+        self.registry.bind_data(namespace, doc);
         Ok(())
     }
 
-    /// Import a doc shared via `ticket` and bind it to `namespace`.
+    /// Import a doc shared via `ticket` and bind it to data `namespace`.
     ///
     /// Binding teaches the ingest gate which domain namespace — and thus
     /// which issuer — incoming entries of this doc belong to.
@@ -81,8 +81,29 @@ impl SyncNode {
         ticket: DocTicket,
     ) -> Result<()> {
         let doc = self.docs.import(ticket).await?;
-        self.registry.bind(namespace, doc);
+        self.registry.bind_data(namespace, doc);
         Ok(())
+    }
+
+    /// Create a fresh doc for the connections store of `owner` and bind it as
+    /// `Connections { owner }`. Returns the backing doc for the
+    /// [`ConnectionsStore`](crate::ConnectionsStore) to hold.
+    pub(crate) async fn new_connections_doc(&mut self, owner: PdnId) -> Result<Doc> {
+        let doc = self.docs.create().await?;
+        self.registry.bind_connections(owner, &doc);
+        Ok(doc)
+    }
+
+    /// Import the connections store of `owner` from `ticket` (device linking)
+    /// and bind it as `Connections { owner }`.
+    pub(crate) async fn import_connections_doc(
+        &mut self,
+        owner: PdnId,
+        ticket: DocTicket,
+    ) -> Result<Doc> {
+        let doc = self.docs.import(ticket).await?;
+        self.registry.bind_connections(owner, &doc);
+        Ok(doc)
     }
 
     /// Share `namespace` as a ticket other nodes can import.
@@ -146,7 +167,7 @@ impl SyncNode {
     }
 
     fn doc(&self, namespace: &NamespaceId) -> Result<&Doc> {
-        match self.registry.doc(namespace) {
+        match self.registry.data_doc(namespace) {
             Some(doc) => Ok(doc),
             None => bail!("namespace not bound on this node: {namespace:?}"),
         }

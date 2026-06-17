@@ -1,18 +1,18 @@
-//! Ingest gate: domain-level admission policy and its bridge into the
+//! Ingest gate: domain-level admission policies and their bridge into the
 //! fork's `CapabilityValidator` hook.
 //!
 //! The fork's hook sees `&SignedEntry` and returns `bool` — it knows nothing
 //! about `PdnId`s. This module translates: resolve the entry's iroh namespace
-//! to a domain [`NamespaceId`] via the shared registry index, hand the
-//! domain view to an [`IngestPolicy`], and map the verdict back to `bool`.
+//! to a domain [`Binding`] via the shared registry index, hand the domain
+//! view to an [`IngestPolicy`], and map the verdict back to `bool`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use pdn_store::{CapabilityValidator, SignedEntry};
-use pdn_types::{NamespaceId, PdnId};
+use pdn_types::PdnId;
 
-use crate::registry::NamespaceIndex;
+use crate::registry::{Binding, BindingIndex};
 
 /// Verdict of an [`IngestPolicy`] for one incoming entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,14 +30,14 @@ pub enum Admission {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct IngestCtx {
-    /// The domain namespace the entry belongs to, if the backing iroh
-    /// namespace is bound in the local registry; `None` for unknown docs.
+    /// The resolved [`Binding`] of the entry's replica, if it is bound in the
+    /// local registry; `None` for unknown replicas.
     ///
     /// Why `Option`:
     /// - the hook is global per docs engine: entries from replicas unbound in the registry exist;
     /// - "unknown → reject" is itself a verdict — verdicts live in the policy, not the bridge;
     /// - `import` starts syncing before `bind` runs, so a gate hit in that gap has no mapping yet.
-    pub namespace: Option<NamespaceId>,
+    pub binding: Option<Binding>,
 }
 
 /// Domain-level admission policy consulted for every incoming (non-local)
@@ -47,9 +47,8 @@ pub struct IngestCtx {
 ///
 /// The check runs synchronously on the sync-actor thread, ahead of the
 /// store `put`. Implementations must not block or perform I/O: everything
-/// a decision needs (connection sets, capability indexes) must already be
-/// in memory. In particular, a decision can never depend on the entry's
-/// blob content — only its record metadata.
+/// a decision needs must already be in memory. In particular, a decision
+/// can never depend on the entry's blob content — only its record metadata.
 pub trait IngestPolicy: Send + Sync + 'static {
     /// Decide whether the entry described by `ctx` may be persisted.
     fn admit(&self, ctx: &IngestCtx) -> Admission;
@@ -58,22 +57,81 @@ pub trait IngestPolicy: Send + Sync + 'static {
 /// Bridge a domain [`IngestPolicy`] into the fork's iroh-native hook.
 pub(crate) fn capability_validator(
     policy: Arc<dyn IngestPolicy>,
-    index: NamespaceIndex,
+    index: BindingIndex,
 ) -> CapabilityValidator {
     Arc::new(move |entry: &SignedEntry| {
         let ctx = IngestCtx {
-            namespace: index.resolve(entry.entry().namespace()),
+            binding: index.resolve(entry.entry().namespace()),
         };
         policy.admit(&ctx) == Admission::Accept
     })
 }
 
+/// Admit an entry when any composed policy admits it (first-accept).
+///
+/// The composition seam: combine the device axiom with data-gating policies
+/// in one node. Empty `AnyOf` rejects everything.
+pub struct AnyOf {
+    policies: Vec<Box<dyn IngestPolicy>>,
+}
+
+impl AnyOf {
+    /// Build from a list of policies, tried in order until one accepts.
+    pub fn new(policies: Vec<Box<dyn IngestPolicy>>) -> Self {
+        Self { policies }
+    }
+}
+
+impl IngestPolicy for AnyOf {
+    fn admit(&self, ctx: &IngestCtx) -> Admission {
+        for policy in &self.policies {
+            if policy.admit(ctx) == Admission::Accept {
+                return Admission::Accept;
+            }
+        }
+        Admission::Reject
+    }
+}
+
+/// Device axiom: a node admits entries of bindings owned by its own identity
+/// — its connections store and its own data namespaces — **without reading
+/// any store**.
+///
+/// This is what lets an identity's state replicate between its devices: a
+/// node always trusts state authored under its own `PdnId`, so gating that
+/// on a store would be circular (the store cannot authorize its own
+/// arrival). Being read-free is also why it needs no fork change — it
+/// inspects only the resolved [`Binding`].
+#[derive(Clone, Copy, Debug)]
+pub struct SelfOwned {
+    me: PdnId,
+}
+
+impl SelfOwned {
+    /// Build the axiom for the local identity `me`.
+    pub fn new(me: PdnId) -> Self {
+        Self { me }
+    }
+}
+
+impl IngestPolicy for SelfOwned {
+    fn admit(&self, ctx: &IngestCtx) -> Admission {
+        match &ctx.binding {
+            Some(Binding::Connections { owner }) if *owner == self.me => Admission::Accept,
+            Some(Binding::Data(ns)) if ns.issued_by == self.me => Admission::Accept,
+            _ => Admission::Reject,
+        }
+    }
+}
+
 /// A node's live set of connections: the [`PdnId`]s it currently accepts
-/// entries from.
+/// data entries from.
 ///
 /// Cheaply cloneable handle around shared state: the application side
 /// mutates it at runtime while the gate reads it from the sync-actor
-/// thread.
+/// thread. This is the naive, in-memory mechanism; a store-reading
+/// successor (the gate consulting the replicated connections store) is a
+/// deferred follow-up.
 #[derive(Clone, Debug, Default)]
 pub struct Connections {
     inner: Arc<RwLock<HashSet<PdnId>>>,
@@ -110,9 +168,9 @@ impl Connections {
     }
 }
 
-/// Naive peering policy: admit an entry iff the issuer of its namespace is
-/// a current connection — the single-link, degenerate form of a capability
-/// chain (ADR-0008). Entries of unknown namespaces are rejected.
+/// Naive peering policy: admit a data-namespace entry iff the issuer of its
+/// namespace is a current connection — the single-link, degenerate form of a
+/// capability chain (ADR-0008). Entries of other bindings are rejected.
 #[derive(Clone, Debug)]
 pub struct ConnectionsPolicy {
     connections: Connections,
@@ -127,8 +185,10 @@ impl ConnectionsPolicy {
 
 impl IngestPolicy for ConnectionsPolicy {
     fn admit(&self, ctx: &IngestCtx) -> Admission {
-        match &ctx.namespace {
-            Some(ns) if self.connections.contains(&ns.issued_by) => Admission::Accept,
+        match &ctx.binding {
+            Some(Binding::Data(ns)) if self.connections.contains(&ns.issued_by) => {
+                Admission::Accept
+            }
             _ => Admission::Reject,
         }
     }

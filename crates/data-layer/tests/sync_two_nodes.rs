@@ -1,10 +1,10 @@
-//! Capability-gated end-to-end sync over iroh-docs.
+//! Capability-gated end-to-end sync over pdn-store.
 //!
 //! Two in-process nodes built from `data-layer`. Bob's node accepts an
 //! incoming entry only if the issuer of the entry's namespace is in his
 //! live `Connections` set — the simplified, single-link form of a capability
 //! chain, enforced by the `ConnectionsPolicy` ingest gate inside the local
-//! iroh-docs variant.
+//! pdn-store.
 
 use std::time::{Duration, Instant};
 

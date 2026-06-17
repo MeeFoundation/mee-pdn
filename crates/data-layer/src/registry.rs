@@ -1,29 +1,44 @@
-//! Binding between domain namespaces and the iroh docs that back them.
+//! Binding between domain replicas — data namespaces and the connections
+//! store — and the iroh docs that back them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use pdn_store::{api::Doc, NamespaceId as IrohNamespaceId};
-use pdn_types::NamespaceId;
+use pdn_types::{NamespaceId, PdnId};
 
-/// Shared, synchronously readable map: iroh namespace → domain namespace.
+/// What an iroh replica is, in domain terms.
 ///
-/// Written when namespaces are created or imported; read by the ingest gate
-/// on the sync-actor thread to resolve incoming entries to domain terms.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct NamespaceIndex {
-    inner: Arc<RwLock<HashMap<IrohNamespaceId, NamespaceId>>>,
+/// The gate resolves this from an incoming entry's iroh namespace so a
+/// policy can decide structurally — a peer-visible data namespace vs. the
+/// device-shared connections store. The enum can grow (`Meta { .. }`) when
+/// cross-party metadata channels arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// A peer-visible data namespace, addressed by the `(about, issued_by)` pair.
+    Data(NamespaceId),
+    /// The device-shared connections store of `owner`.
+    Connections { owner: PdnId },
 }
 
-impl NamespaceIndex {
-    fn bind(&self, iroh_ns: IrohNamespaceId, domain_ns: NamespaceId) {
+/// Shared, synchronously readable map: iroh namespace → [`Binding`].
+///
+/// Written when replicas are created or imported; read by the ingest gate
+/// on the sync-actor thread to resolve incoming entries to domain terms.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BindingIndex {
+    inner: Arc<RwLock<HashMap<IrohNamespaceId, Binding>>>,
+}
+
+impl BindingIndex {
+    fn bind(&self, iroh_ns: IrohNamespaceId, binding: Binding) {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(iroh_ns, domain_ns);
+            .insert(iroh_ns, binding);
     }
 
-    pub(crate) fn resolve(&self, iroh_ns: IrohNamespaceId) -> Option<NamespaceId> {
+    pub(crate) fn resolve(&self, iroh_ns: IrohNamespaceId) -> Option<Binding> {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -32,32 +47,40 @@ impl NamespaceIndex {
     }
 }
 
-/// Node-local registry: domain namespace → backing doc, plus the shared
-/// [`NamespaceIndex`] the gate reads.
+/// Node-local registry: data namespace → backing doc, plus the shared
+/// [`BindingIndex`] the gate reads.
+///
+/// The connections store's doc is held by its `ConnectionsStore`, not here;
+/// the registry only needs to teach the gate its binding.
 #[derive(Debug)]
 pub(crate) struct Registry {
-    index: NamespaceIndex,
-    docs: HashMap<NamespaceId, Doc>,
+    index: BindingIndex,
+    data_docs: HashMap<NamespaceId, Doc>,
 }
 
 impl Registry {
-    pub(crate) fn new(index: NamespaceIndex) -> Self {
+    pub(crate) fn new(index: BindingIndex) -> Self {
         Self {
             index,
-            docs: HashMap::new(),
+            data_docs: HashMap::new(),
         }
     }
 
-    /// Bind `domain_ns` to `doc`, teaching the gate's index the reverse
-    /// mapping. Both created and imported namespaces register here, so the
-    /// gate can resolve remote entries regardless of which side opened the
-    /// doc first.
-    pub(crate) fn bind(&mut self, domain_ns: NamespaceId, doc: Doc) {
-        self.index.bind(doc.id(), domain_ns);
-        self.docs.insert(domain_ns, doc);
+    /// Bind a data namespace to `doc`, teaching the gate the reverse mapping.
+    /// Both created and imported namespaces register here, so the gate can
+    /// resolve remote entries regardless of which side opened the doc first.
+    pub(crate) fn bind_data(&mut self, domain_ns: NamespaceId, doc: Doc) {
+        self.index.bind(doc.id(), Binding::Data(domain_ns));
+        self.data_docs.insert(domain_ns, doc);
     }
 
-    pub(crate) fn doc(&self, domain_ns: &NamespaceId) -> Option<&Doc> {
-        self.docs.get(domain_ns)
+    /// Bind the connections store of `owner`, teaching the gate the reverse
+    /// mapping. The backing doc lives in the `ConnectionsStore`.
+    pub(crate) fn bind_connections(&mut self, owner: PdnId, doc: &Doc) {
+        self.index.bind(doc.id(), Binding::Connections { owner });
+    }
+
+    pub(crate) fn data_doc(&self, domain_ns: &NamespaceId) -> Option<&Doc> {
+        self.data_docs.get(domain_ns)
     }
 }
