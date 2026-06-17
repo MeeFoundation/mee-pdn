@@ -1,7 +1,7 @@
 //! The connections store: a device-replicated registry of an identity's
 //! connections.
 //!
-//! A dedicated iroh-docs replica, separate from data namespaces, that all
+//! A dedicated pdn-store replica, separate from data namespaces, that all
 //! devices of one identity converge on. One entry per connection at
 //! `connections/<pdnid-hex>`; the payload is an opaque marker (the key
 //! carries the identity), and `disconnect` writes a tombstone (empty entry).

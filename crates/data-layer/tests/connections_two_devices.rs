@@ -2,7 +2,7 @@
 //!
 //! Phone and laptop share the same PdnId; each gates ingest with the device
 //! axiom `SelfOwned { me: alice }`. Connect/disconnect happen on phone; the
-//! laptop observes convergence through plain iroh-docs sync. No second
+//! laptop observes convergence through plain pdn-store sync. No second
 //! identity and no data-namespace gating — that is a deferred follow-up.
 
 use std::time::{Duration, Instant};

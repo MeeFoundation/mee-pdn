@@ -1,5 +1,5 @@
-//! The data layer: capability-gated document sync over our iroh-docs
-//! variant.
+//! The data layer: capability-gated document sync over pdn-store, our
+//! iroh-docs fork.
 //!
 //! Everything platform-specific around the fork lives here, so the fork
 //! itself stays iroh-native and minimal — its only seam is the

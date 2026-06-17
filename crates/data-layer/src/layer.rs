@@ -32,8 +32,8 @@ pub enum DataLayerError {
 /// ingest-time checks are injected into the backend as an
 /// [`IngestPolicy`](crate::IngestPolicy).
 ///
-/// This authorization model requires our capability-gated iroh-docs
-/// variant; plain namespace-key authorization cannot express PdnId-based
+/// This authorization model requires pdn-store, our capability-gated
+/// fork; plain namespace-key authorization cannot express PdnId-based
 /// write authority.
 #[allow(async_fn_in_trait)]
 pub trait DataLayer: Send + Sync {
