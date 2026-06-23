@@ -69,8 +69,8 @@ pub(crate) fn capability_validator(
 
 /// Admit an entry when any composed policy admits it (first-accept).
 ///
-/// The composition seam: combine the device axiom with data-gating policies
-/// in one node. Empty `AnyOf` rejects everything.
+/// The composition seam: combine Invariant 1 with
+/// data-gating policies in one node. Empty `AnyOf` rejects everything.
 pub struct AnyOf {
     policies: Vec<Box<dyn IngestPolicy>>,
 }
@@ -93,22 +93,26 @@ impl IngestPolicy for AnyOf {
     }
 }
 
-/// Device axiom: a node admits entries of bindings owned by its own identity
-/// — its connections store and its own data namespaces — **without reading
-/// any store**.
+/// Ingest policy enforcing **Invariant 1**: a node admits entries whose
+/// replica belongs to its own identity, consulting no store
+/// (`mia-docs/openspec/specs/architecture/invariants.md`).
 ///
-/// This is what lets an identity's state replicate between its devices: a
-/// node always trusts state authored under its own `PdnId`, so gating that
-/// on a store would be circular (the store cannot authorize its own
-/// arrival). Being read-free is also why it needs no fork change — it
-/// inspects only the resolved [`Binding`].
+/// Admits its connections store, its private metadata store, and the data
+/// namespaces it issues — on an identity match, reading nothing. The match
+/// means "this replica belongs to my device set," not a claim of ownership
+/// over its contents: a connection is an object between two identities,
+/// owned by neither (the `identity` binding field names which identity's
+/// private store it is, not who owns the connections). Reading nothing is
+/// what lets an identity's state replicate to a freshly linked (still-empty)
+/// device and is why it needs no fork change — it inspects only the resolved
+/// [`Binding`].
 #[derive(Clone, Copy, Debug)]
 pub struct SelfOwned {
     me: PdnId,
 }
 
 impl SelfOwned {
-    /// Build the axiom for the local identity `me`.
+    /// Build the policy for the local identity `me`.
     pub fn new(me: PdnId) -> Self {
         Self { me }
     }
@@ -117,7 +121,10 @@ impl SelfOwned {
 impl IngestPolicy for SelfOwned {
     fn admit(&self, ctx: &IngestCtx) -> Admission {
         match &ctx.binding {
-            Some(Binding::Connections { owner }) if *owner == self.me => Admission::Accept,
+            Some(Binding::Connections { identity }) if *identity == self.me => Admission::Accept,
+            Some(Binding::PrivateMetadata { identity }) if *identity == self.me => {
+                Admission::Accept
+            }
             Some(Binding::Data(ns)) if ns.issued_by == self.me => Admission::Accept,
             _ => Admission::Reject,
         }

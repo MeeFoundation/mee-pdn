@@ -10,15 +10,17 @@ use pdn_types::{NamespaceId, PdnId};
 /// What an iroh replica is, in domain terms.
 ///
 /// The gate resolves this from an incoming entry's iroh namespace so a
-/// policy can decide structurally — a peer-visible data namespace vs. the
-/// device-shared connections store. The enum can grow (`Meta { .. }`) when
-/// cross-party metadata channels arrive.
+/// policy can decide structurally — a peer-visible data namespace vs. a
+/// device-shared private store. The enum can grow when cross-party metadata
+/// channels arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Binding {
     /// A peer-visible data namespace, addressed by the `(about, issued_by)` pair.
     Data(NamespaceId),
-    /// The device-shared connections store of `owner`.
-    Connections { owner: PdnId },
+    /// The device-shared connections store of `identity`.
+    Connections { identity: PdnId },
+    /// The device-shared private metadata store of `identity` (devices, tickets).
+    PrivateMetadata { identity: PdnId },
 }
 
 /// Shared, synchronously readable map: iroh namespace → [`Binding`].
@@ -74,10 +76,17 @@ impl Registry {
         self.data_docs.insert(domain_ns, doc);
     }
 
-    /// Bind the connections store of `owner`, teaching the gate the reverse
+    /// Bind the connections store of `identity`, teaching the gate the reverse
     /// mapping. The backing doc lives in the `ConnectionsStore`.
-    pub(crate) fn bind_connections(&mut self, owner: PdnId, doc: &Doc) {
-        self.index.bind(doc.id(), Binding::Connections { owner });
+    pub(crate) fn bind_connections(&mut self, identity: PdnId, doc: &Doc) {
+        self.index.bind(doc.id(), Binding::Connections { identity });
+    }
+
+    /// Bind the private metadata store of `identity`, teaching the gate the
+    /// reverse mapping. The backing doc lives in the `PrivateMetadataStore`.
+    pub(crate) fn bind_private_metadata(&mut self, identity: PdnId, doc: &Doc) {
+        self.index
+            .bind(doc.id(), Binding::PrivateMetadata { identity });
     }
 
     pub(crate) fn data_doc(&self, domain_ns: &NamespaceId) -> Option<&Doc> {

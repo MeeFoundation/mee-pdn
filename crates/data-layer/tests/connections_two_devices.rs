@@ -1,8 +1,8 @@
-//! Two devices of one identity (Alice) converge on her connections store.
+//! Two devices of one identity (Alice) replicate her connections store.
 //!
-//! Phone and laptop share the same PdnId; each gates ingest with the device
-//! axiom `SelfOwned { me: alice }`. Connect/disconnect happen on phone; the
-//! laptop observes convergence through plain pdn-store sync. No second
+//! Phone and laptop share the same `PdnId`; each gates ingest with
+//! `SelfOwned { me: alice }`. Connect/disconnect happen on phone; the
+//! laptop sees them replicate through plain pdn-store sync. No second
 //! identity and no data-namespace gating — that is a deferred follow-up.
 
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use pdn_types::PdnId;
 
 /// Poll `is_connected(peer)` on `store` until it equals `want`, or time out.
 ///
-/// The 30s ceiling is a liveness bound (must *eventually* converge), not a
+/// The 30s ceiling is a liveness bound (must *eventually* replicate), not a
 /// correctness one — a larger value only tolerates slow/loaded CI runners.
 async fn wait_connected(
     store: &ConnectionsStore,
@@ -38,7 +38,7 @@ async fn connections_two_devices() -> Result<()> {
     let alice = PdnId::from_bytes([0xa1; 32]);
     let bob = PdnId::from_bytes([0xb0; 32]); // a peer to (dis)connect; no Bob node here
 
-    // Two devices of Alice, each gating ingest with the device axiom.
+    // Two devices of Alice, each enforcing Invariant 1 at ingest.
     let mut phone = SyncNode::spawn(SelfOwned::new(alice)).await?;
     let mut laptop = SyncNode::spawn(SelfOwned::new(alice)).await?;
 
@@ -53,7 +53,7 @@ async fn connections_two_devices() -> Result<()> {
         .await?;
     let laptop_conns = ConnectionsStore::import(&mut laptop, alice, ticket).await?;
 
-    // Catch-up: laptop converges to Bob live (reconciliation on import).
+    // Catch-up: Bob replicates to laptop (reconciliation on import).
     assert!(
         wait_connected(&laptop_conns, bob, true, Duration::from_secs(30)).await?,
         "laptop did not catch up connect(bob) from phone"

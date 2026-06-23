@@ -2,15 +2,15 @@
 //! connections.
 //!
 //! A dedicated pdn-store replica, separate from data namespaces, that all
-//! devices of one identity converge on. One entry per connection at
+//! devices of one identity replicate. One entry per connection at
 //! `connections/<pdnid-hex>`; the payload is an opaque marker (the key
 //! carries the identity), and `disconnect` writes a tombstone (empty entry).
 //! Liveness is a record-level fact — `is_connected` never waits on blob
 //! content.
 //!
-//! Its entries pass the ingest gate via the device axiom
-//! ([`SelfOwned`](crate::SelfOwned)); having the gate *read* this store to
-//! admit data is a deferred follow-up.
+//! Its entries are admitted because the gate enforces Invariant 1 (the
+//! `SelfOwned` policy — a node admits its own identity's replicas); having the
+//! gate *read* this store to admit data is a deferred follow-up.
 
 use anyhow::Result;
 use futures_lite::StreamExt;
@@ -46,35 +46,30 @@ fn peer_of(key: &[u8]) -> Option<PdnId> {
 /// Device-replicated registry of an identity's connections.
 ///
 /// Built from a [`SyncNode`]; holds the backing replica and an author for
-/// local writes. Reads (`is_connected`, `list`) go through ordinary doc
-/// queries and are never used by the gate.
+/// local writes. The owning identity is not kept here — it lives in the
+/// registry binding the gate reads. Reads (`is_connected`, `list`) go through
+/// ordinary doc queries and are never used by the gate.
 #[derive(Debug)]
 pub struct ConnectionsStore {
-    owner: PdnId,
     doc: Doc,
     author: AuthorId,
 }
 
 impl ConnectionsStore {
     /// Create a fresh connections store on `node`, bound as
-    /// `Connections { owner }`.
-    pub async fn create(node: &mut SyncNode, owner: PdnId) -> Result<Self> {
-        let doc = node.new_connections_doc(owner).await?;
+    /// `Connections { identity }`.
+    pub async fn create(node: &mut SyncNode, identity: PdnId) -> Result<Self> {
+        let doc = node.new_connections_doc(identity).await?;
         let author = node.create_author().await?;
-        Ok(Self { owner, doc, author })
+        Ok(Self { doc, author })
     }
 
     /// Import an existing connections store via `ticket` (device linking),
-    /// bound as `Connections { owner }`.
-    pub async fn import(node: &mut SyncNode, owner: PdnId, ticket: DocTicket) -> Result<Self> {
-        let doc = node.import_connections_doc(owner, ticket).await?;
+    /// bound as `Connections { identity }`.
+    pub async fn import(node: &mut SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
+        let doc = node.import_connections_doc(identity, ticket).await?;
         let author = node.create_author().await?;
-        Ok(Self { owner, doc, author })
-    }
-
-    /// The identity this store belongs to.
-    pub fn owner(&self) -> PdnId {
-        self.owner
+        Ok(Self { doc, author })
     }
 
     /// Share this store as a ticket another device can import.
