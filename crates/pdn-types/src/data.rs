@@ -151,7 +151,7 @@ impl AsRef<str> for EntryPath {
 /// payloads to actually load.
 ///
 /// The author dimension is omitted: in our model it is fixed to
-/// `namespace.issued_by` (so claims converge across the issuer's devices
+/// `namespace.issued_by` (so claims resolve across the issuer's devices
 /// via the data layer's newer-wins overwrite semantics) and would be
 /// redundant here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

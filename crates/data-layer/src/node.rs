@@ -16,7 +16,7 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket, ALPN as DOCS_ALPN,
 };
-use pdn_types::{EntryPath, NamespaceId, PdnId};
+use pdn_types::{EntryPath, NamespaceId, NodeId, PdnId};
 
 use crate::gate::{self, IngestPolicy};
 use crate::registry::{BindingIndex, Registry};
@@ -85,25 +85,51 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Create a fresh doc for the connections store of `owner` and bind it as
-    /// `Connections { owner }`. Returns the backing doc for the
+    /// Create a fresh doc for the connections store of `identity` and bind it as
+    /// `Connections { identity }`. Returns the backing doc for the
     /// [`ConnectionsStore`](crate::ConnectionsStore) to hold.
-    pub(crate) async fn new_connections_doc(&mut self, owner: PdnId) -> Result<Doc> {
+    pub(crate) async fn new_connections_doc(&mut self, identity: PdnId) -> Result<Doc> {
         let doc = self.docs.create().await?;
-        self.registry.bind_connections(owner, &doc);
+        self.registry.bind_connections(identity, &doc);
         Ok(doc)
     }
 
-    /// Import the connections store of `owner` from `ticket` (device linking)
-    /// and bind it as `Connections { owner }`.
+    /// Import the connections store of `identity` from `ticket` (device linking)
+    /// and bind it as `Connections { identity }`.
     pub(crate) async fn import_connections_doc(
         &mut self,
-        owner: PdnId,
+        identity: PdnId,
         ticket: DocTicket,
     ) -> Result<Doc> {
         let doc = self.docs.import(ticket).await?;
-        self.registry.bind_connections(owner, &doc);
+        self.registry.bind_connections(identity, &doc);
         Ok(doc)
+    }
+
+    /// Create a fresh doc for the private metadata store of `identity` and bind
+    /// it as `PrivateMetadata { identity }`. Returns the backing doc for the
+    /// [`PrivateMetadataStore`](crate::PrivateMetadataStore) to hold.
+    pub(crate) async fn new_private_metadata_doc(&mut self, identity: PdnId) -> Result<Doc> {
+        let doc = self.docs.create().await?;
+        self.registry.bind_private_metadata(identity, &doc);
+        Ok(doc)
+    }
+
+    /// Import the private metadata store of `identity` from `ticket` and bind it
+    /// as `PrivateMetadata { identity }`.
+    pub(crate) async fn import_private_metadata_doc(
+        &mut self,
+        identity: PdnId,
+        ticket: DocTicket,
+    ) -> Result<Doc> {
+        let doc = self.docs.import(ticket).await?;
+        self.registry.bind_private_metadata(identity, &doc);
+        Ok(doc)
+    }
+
+    /// Handle to the node's blob store, for stores that read entry payloads.
+    pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
+        self.blobs.clone()
     }
 
     /// Share `namespace` as a ticket other nodes can import.
@@ -121,6 +147,13 @@ impl SyncNode {
     pub async fn create_author(&self) -> Result<AuthorId> {
         let author = self.docs.author_create().await?;
         Ok(author)
+    }
+
+    /// This node's identifier on the wire — its iroh endpoint id (an ed25519
+    /// public key) as a [`NodeId`]. A device uses it to register itself in
+    /// its identity's device set.
+    pub fn node_id(&self) -> NodeId {
+        NodeId::from_bytes(*self.router.endpoint().id().as_bytes())
     }
 
     /// Write `payload` at `path` in `namespace`.

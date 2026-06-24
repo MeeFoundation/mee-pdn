@@ -9,11 +9,17 @@
 //! - [`layer`] — the entries-only [`DataLayer`] trait the node runtime
 //!   drives; this crate is where its implementation lives;
 //! - [`gate`] — the domain-level [`IngestPolicy`] trait, its bridge into the
-//!   fork's hook, the device axiom ([`SelfOwned`]) and the naive
-//!   connections-based data policy — single-link precursors of full `UWill`
-//!   chain validation;
+//!   fork's hook, [`SelfOwned`] (a node admits its own identity's replicas)
+//!   and the naive connections-based data policy — a single-link precursor of
+//!   full `UWill` chain validation;
 //! - [`connections`] — the device-replicated [`ConnectionsStore`]: an
-//!   identity's connections as a dedicated replica its devices converge on;
+//!   identity's connections as a dedicated replica replicated across its devices;
+//! - [`private_metadata`] — the device-replicated [`PrivateMetadataStore`]:
+//!   an identity's devices and the tickets to its other stores (the bootstrap
+//!   directory a newly linked device reads from);
+//! - [`linking`] — [`link_device`]: bring a new device up from a single seed
+//!   (the private-metadata-store ticket), bootstrapping the rest through that
+//!   directory;
 //! - `registry` (internal) — binding of an iroh replica to its domain
 //!   [`Binding`] (a data [`pdn_types::NamespaceId`] or the connections store),
 //!   shared with the gate so incoming entries resolve to domain terms;
@@ -30,7 +36,9 @@
 pub mod connections;
 pub mod gate;
 pub mod layer;
+pub mod linking;
 pub mod node;
+pub mod private_metadata;
 mod registry;
 
 pub use connections::ConnectionsStore;
@@ -38,7 +46,9 @@ pub use gate::{
     Admission, AnyOf, Connections, ConnectionsPolicy, IngestCtx, IngestPolicy, SelfOwned,
 };
 pub use layer::{DataLayer, DataLayerError};
+pub use linking::{link_device, LinkedStores};
 pub use node::SyncNode;
+pub use private_metadata::PrivateMetadataStore;
 pub use registry::Binding;
 
 // Re-exported pdn-store (iroh-docs fork) vocabulary for the common
