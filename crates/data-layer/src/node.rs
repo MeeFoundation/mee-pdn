@@ -16,14 +16,14 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket, ALPN as DOCS_ALPN,
 };
-use pdn_types::{EntryPath, NamespaceId, NodeId, PdnId};
+use pdn_types::{EntryPath, NodeId, PdnId};
 
 use crate::gate::{self, IngestPolicy};
 use crate::registry::{BindingIndex, Registry};
 
 /// One running node: iroh endpoint, gossip, in-memory blob store, and the
-/// capability-gated docs engine, with replicas addressed by domain
-/// [`NamespaceId`]s and entries by [`EntryPath`]s.
+/// capability-gated docs engine, with data replicas addressed by their issuer
+/// [`PdnId`] and entries by [`EntryPath`]s.
 ///
 /// Storage is in-memory for now (experiment stage); a persistent variant
 /// can be added without changing this surface.
@@ -64,24 +64,21 @@ impl SyncNode {
         })
     }
 
-    /// Create a fresh doc and bind it to data `namespace`.
-    pub async fn create_namespace(&mut self, namespace: NamespaceId) -> Result<()> {
+    /// Create a fresh doc and bind it as the data namespace of `issuer`.
+    pub async fn create_namespace(&mut self, issuer: PdnId) -> Result<()> {
         let doc = self.docs.create().await?;
-        self.registry.bind_data(namespace, doc);
+        self.registry.bind_data(issuer, doc);
         Ok(())
     }
 
-    /// Import a doc shared via `ticket` and bind it to data `namespace`.
+    /// Import a doc shared via `ticket` and bind it as the data namespace of
+    /// `issuer`.
     ///
-    /// Binding teaches the ingest gate which domain namespace — and thus
-    /// which issuer — incoming entries of this doc belong to.
-    pub async fn import_namespace(
-        &mut self,
-        namespace: NamespaceId,
-        ticket: DocTicket,
-    ) -> Result<()> {
+    /// Binding teaches the ingest gate which issuer's data namespace incoming
+    /// entries of this doc belong to.
+    pub async fn import_namespace(&mut self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
         let doc = self.docs.import(ticket).await?;
-        self.registry.bind_data(namespace, doc);
+        self.registry.bind_data(issuer, doc);
         Ok(())
     }
 
@@ -132,14 +129,14 @@ impl SyncNode {
         self.blobs.clone()
     }
 
-    /// Share `namespace` as a ticket other nodes can import.
+    /// Share the data namespace of `issuer` as a ticket other nodes can import.
     pub async fn share_ticket(
         &self,
-        namespace: &NamespaceId,
+        issuer: PdnId,
         mode: ShareMode,
         addr_options: AddrInfoOptions,
     ) -> Result<DocTicket> {
-        let ticket = self.doc(namespace)?.share(mode, addr_options).await?;
+        let ticket = self.doc(issuer)?.share(mode, addr_options).await?;
         Ok(ticket)
     }
 
@@ -156,15 +153,15 @@ impl SyncNode {
         NodeId::from_bytes(*self.router.endpoint().id().as_bytes())
     }
 
-    /// Write `payload` at `path` in `namespace`.
+    /// Write `payload` at `path` in the data namespace of `issuer`.
     pub async fn write(
         &self,
-        namespace: &NamespaceId,
+        issuer: PdnId,
         author: AuthorId,
         path: &EntryPath,
         payload: &[u8],
     ) -> Result<()> {
-        let doc = self.doc(namespace)?;
+        let doc = self.doc(issuer)?;
         doc.set_bytes(author, path.as_str().as_bytes().to_vec(), payload.to_vec())
             .await?;
         Ok(())
@@ -177,8 +174,8 @@ impl SyncNode {
     /// records and blob content arrive independently (sync inserts the
     /// record, the downloader fetches the bytes), so "stored" precedes
     /// "readable". Poll again for the payload to become available.
-    pub async fn read(&self, namespace: &NamespaceId, path: &EntryPath) -> Result<Option<Vec<u8>>> {
-        let doc = self.doc(namespace)?;
+    pub async fn read(&self, issuer: PdnId, path: &EntryPath) -> Result<Option<Vec<u8>>> {
+        let doc = self.doc(issuer)?;
         let query = Query::single_latest_per_key().key_exact(path.as_str().as_bytes());
         match doc.get_one(query).await? {
             Some(entry) => {
@@ -199,10 +196,10 @@ impl SyncNode {
         Ok(())
     }
 
-    fn doc(&self, namespace: &NamespaceId) -> Result<&Doc> {
-        match self.registry.data_doc(namespace) {
+    fn doc(&self, issuer: PdnId) -> Result<&Doc> {
+        match self.registry.data_doc(issuer) {
             Some(doc) => Ok(doc),
-            None => bail!("namespace not bound on this node: {namespace:?}"),
+            None => bail!("data namespace not bound on this node: {issuer:?}"),
         }
     }
 }

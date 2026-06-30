@@ -95,7 +95,7 @@ impl IngestPolicy for AnyOf {
 
 /// Ingest policy enforcing **Invariant 1**: a node admits entries whose
 /// replica belongs to its own identity, consulting no store
-/// (`mia-docs/openspec/specs/architecture/invariants.md`).
+/// (`mia-docs/openspec/specs/components/pdn-node/invariants.md`).
 ///
 /// Admits its connections store, its private metadata store, and the data
 /// namespaces it issues — on an identity match, reading nothing. The match
@@ -125,7 +125,7 @@ impl IngestPolicy for SelfOwned {
             Some(Binding::PrivateMetadata { identity }) if *identity == self.me => {
                 Admission::Accept
             }
-            Some(Binding::Data(ns)) if ns.issued_by == self.me => Admission::Accept,
+            Some(Binding::Data { issuer }) if *issuer == self.me => Admission::Accept,
             _ => Admission::Reject,
         }
     }
@@ -193,7 +193,7 @@ impl ConnectionsPolicy {
 impl IngestPolicy for ConnectionsPolicy {
     fn admit(&self, ctx: &IngestCtx) -> Admission {
         match &ctx.binding {
-            Some(Binding::Data(ns)) if self.connections.contains(&ns.issued_by) => {
+            Some(Binding::Data { issuer }) if self.connections.contains(issuer) => {
                 Admission::Accept
             }
             _ => Admission::Reject,

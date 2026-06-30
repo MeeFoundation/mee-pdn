@@ -8,26 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// NamespaceId
-// ---------------------------------------------------------------------------
-
-/// Data namespace identifier — the pair `(about, issued_by)`.
-///
-/// `issued_by` is the sole writer/owner; `about` is the subject the
-/// namespace's entries concern.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NamespaceId {
-    pub about: PdnId,
-    pub issued_by: PdnId,
-}
-
-impl NamespaceId {
-    pub const fn new(about: PdnId, issued_by: PdnId) -> Self {
-        Self { about, issued_by }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // EntryPath — validated entry path
 // ---------------------------------------------------------------------------
 
@@ -150,13 +130,12 @@ impl AsRef<str> for EntryPath {
 /// Returned by enumeration methods so callers can decide which entries'
 /// payloads to actually load.
 ///
-/// The author dimension is omitted: in our model it is fixed to
-/// `namespace.issued_by` (so claims resolve across the issuer's devices
-/// via the data layer's newer-wins overwrite semantics) and would be
-/// redundant here.
+/// The author dimension is omitted: in our model it is fixed to the
+/// issuer (so claims resolve across the issuer's devices via the data
+/// layer's newer-wins overwrite semantics) and would be redundant here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
-    pub namespace: NamespaceId,
+    pub issuer: PdnId,
     pub path: EntryPath,
     pub payload_len: u64,
 }

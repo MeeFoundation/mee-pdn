@@ -3,7 +3,7 @@ use thiserror::Error;
 
 mod data;
 mod non_empty;
-pub use data::{EntryInfo, EntryPath, NamespaceId, NamespaceRole, NodeAddr, PathValidationError};
+pub use data::{EntryInfo, EntryPath, NamespaceRole, NodeAddr, PathValidationError};
 pub use non_empty::NonEmpty;
 
 // ---------------------------------------------------------------------------

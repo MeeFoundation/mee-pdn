@@ -3,7 +3,7 @@
 //!
 //! A dedicated pdn-store replica, separate from data namespaces, that all
 //! devices of one identity replicate (device-internal: the gate enforces
-//! Invariant 1 — `mia-docs/openspec/specs/architecture/invariants.md`). It is
+//! Invariant 1 — `mia-docs/openspec/specs/components/pdn-node/invariants.md`). It is
 //! the bootstrap **directory**: a newly linked device reads the device list
 //! and the typed tickets here to find and import the identity's other stores.
 //! Linking is gradual — a minimal access seed first, then the rest of the
