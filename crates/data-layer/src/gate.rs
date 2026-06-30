@@ -95,7 +95,7 @@ impl IngestPolicy for AnyOf {
 
 /// Ingest policy enforcing **Invariant 1**: a node admits entries whose
 /// replica belongs to its own identity, consulting no store
-/// (`mia-docs/openspec/specs/architecture/invariants.md`).
+/// (`mia-docs/openspec/specs/components/pdn-node/invariants.md`).
 ///
 /// Admits its connections store, its private metadata store, and the data
 /// namespaces it issues — on an identity match, reading nothing. The match
