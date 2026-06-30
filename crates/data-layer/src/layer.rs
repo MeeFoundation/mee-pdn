@@ -2,7 +2,7 @@
 //! drives to read and write replicated entries.
 
 use futures_core::Stream;
-use pdn_types::{EntryInfo, EntryPath, NamespaceId, PdnId};
+use pdn_types::{EntryInfo, EntryPath, PdnId};
 
 /// Error returned by [`DataLayer`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -22,10 +22,10 @@ pub enum DataLayerError {
 
 /// Entries-only interface of the data layer.
 ///
-/// A [`NamespaceId`] is structurally the pair `(about, issued_by)`:
-/// `issued_by` is the sole writer/owner; `about` is the subject the entry
-/// concerns. Writing into `namespace` does NOT require `namespace.about`'s
-/// consent — only local authority over `namespace.issued_by` is checked.
+/// Data is keyed by its `issuer` (a [`PdnId`]): all of an issuer's entries
+/// live in that issuer's single replica. Writing does NOT require any
+/// subject's consent — only local authority over `issuer` is checked; the
+/// subject (`about`) lives inside the entry payload, not in the address.
 ///
 /// Capability semantics (issuing, revocation, chain validation) live above
 /// this trait, in the PDN layer: tokens travel as ordinary entries, and
@@ -37,34 +37,34 @@ pub enum DataLayerError {
 /// write authority.
 #[allow(async_fn_in_trait)]
 pub trait DataLayer: Send + Sync {
-    /// Insert `payload` at `path` into `namespace`.
+    /// Insert `payload` at `path` into the data namespace of `issuer`.
     async fn insert_entry(
         &self,
-        namespace: &NamespaceId,
+        issuer: PdnId,
         path: &EntryPath,
         payload: &[u8],
     ) -> Result<(), DataLayerError>;
 
-    /// Read the payload bytes for the entry at `path` in `namespace`.
-    /// Returns `Ok(None)` if no such entry exists.
+    /// Read the payload bytes for the entry at `path` in the data namespace of
+    /// `issuer`. Returns `Ok(None)` if no such entry exists.
     async fn get_entry(
         &self,
-        namespace: &NamespaceId,
+        issuer: PdnId,
         path: &EntryPath,
     ) -> Result<Option<Vec<u8>>, DataLayerError>;
 
     /// Stream type yielding entry metadata for [`list_entries`](Self::list_entries).
     type EntryStream: Stream<Item = Result<EntryInfo, DataLayerError>> + Send + Unpin + 'static;
 
-    /// Enumerate metadata for entries in `namespace`, optionally filtered
-    /// to those whose `path` starts with `path_prefix`.
+    /// Enumerate metadata for entries in the data namespace of `issuer`,
+    /// optionally filtered to those whose `path` starts with `path_prefix`.
     ///
     /// Yields metadata only (no payload bytes); use
     /// [`get_entry`](Self::get_entry) to fetch payloads for entries of
     /// interest.
     async fn list_entries(
         &self,
-        namespace: &NamespaceId,
+        issuer: PdnId,
         path_prefix: Option<&EntryPath>,
     ) -> Result<Self::EntryStream, DataLayerError>;
 }

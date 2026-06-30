@@ -5,7 +5,7 @@
 //! the [`uwill`] capability-token module live here; executing operations
 //! over a data layer is the job of the (future) node runtime.
 
-use pdn_types::{ClaimId, NamespaceId, OperationalKey, PdnId, PdnIdentityProof};
+use pdn_types::{ClaimId, OperationalKey, PdnId, PdnIdentityProof};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -150,8 +150,7 @@ pub enum PdnOp {
     DeactivateConnection { peer: PdnId },
 
     // --- Claims ----------------------------------------------------------
-    /// Write a claim into the (subject, self) namespace at `path`. -> ()
-    ///
+    /// Write a claim (addressed by its `ClaimId`). -> ()
     WriteClaim {
         connection_id: ConnectionId,
         claim: Claim,
@@ -184,6 +183,6 @@ pub enum PdnOp {
     ListIncomingDelegations,
 
     // --- Discovery / sync (candidate ops) --------------------------------
-    /// Sync a namespace once with reachable peers. -> ()
-    SyncOnce { namespace: NamespaceId },
+    /// Sync an issuer's data once with reachable peers. -> ()
+    SyncOnce { issuer: PdnId },
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use pdn_store::{api::Doc, NamespaceId as IrohNamespaceId};
-use pdn_types::{NamespaceId, PdnId};
+use pdn_types::PdnId;
 
 /// What an iroh replica is, in domain terms.
 ///
@@ -15,8 +15,8 @@ use pdn_types::{NamespaceId, PdnId};
 /// channels arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Binding {
-    /// A peer-visible data namespace, addressed by the `(about, issued_by)` pair.
-    Data(NamespaceId),
+    /// A peer-visible data namespace, keyed by its `issuer`.
+    Data { issuer: PdnId },
     /// The device-shared connections store of `identity`.
     Connections { identity: PdnId },
     /// The device-shared private metadata store of `identity` (devices, tickets).
@@ -57,7 +57,7 @@ impl BindingIndex {
 #[derive(Debug)]
 pub(crate) struct Registry {
     index: BindingIndex,
-    data_docs: HashMap<NamespaceId, Doc>,
+    data_docs: HashMap<PdnId, Doc>,
 }
 
 impl Registry {
@@ -68,12 +68,13 @@ impl Registry {
         }
     }
 
-    /// Bind a data namespace to `doc`, teaching the gate the reverse mapping.
-    /// Both created and imported namespaces register here, so the gate can
-    /// resolve remote entries regardless of which side opened the doc first.
-    pub(crate) fn bind_data(&mut self, domain_ns: NamespaceId, doc: Doc) {
-        self.index.bind(doc.id(), Binding::Data(domain_ns));
-        self.data_docs.insert(domain_ns, doc);
+    /// Bind the data namespace of `issuer` to `doc`, teaching the gate the
+    /// reverse mapping. Both created and imported namespaces register here, so
+    /// the gate can resolve remote entries regardless of which side opened the
+    /// doc first.
+    pub(crate) fn bind_data(&mut self, issuer: PdnId, doc: Doc) {
+        self.index.bind(doc.id(), Binding::Data { issuer });
+        self.data_docs.insert(issuer, doc);
     }
 
     /// Bind the connections store of `identity`, teaching the gate the reverse
@@ -89,7 +90,7 @@ impl Registry {
             .bind(doc.id(), Binding::PrivateMetadata { identity });
     }
 
-    pub(crate) fn data_doc(&self, domain_ns: &NamespaceId) -> Option<&Doc> {
-        self.data_docs.get(domain_ns)
+    pub(crate) fn data_doc(&self, issuer: PdnId) -> Option<&Doc> {
+        self.data_docs.get(&issuer)
     }
 }

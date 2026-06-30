@@ -21,10 +21,10 @@
 //!   (the private-metadata-store ticket), bootstrapping the rest through that
 //!   directory;
 //! - `registry` (internal) — binding of an iroh replica to its domain
-//!   [`Binding`] (a data [`pdn_types::NamespaceId`] or the connections store),
+//!   [`Binding`] (a data namespace keyed by issuer, or a device store),
 //!   shared with the gate so incoming entries resolve to domain terms;
 //! - [`node`] — the assembled stack: endpoint + gossip + blobs + gated docs,
-//!   addressed by domain namespace ids and [`pdn_types::EntryPath`]s.
+//!   addressed by issuer [`pdn_types::PdnId`] and [`pdn_types::EntryPath`]s.
 //!
 //! Capability *semantics* (`UWill` tokens, chains) do not live here: at this
 //! level tokens are opaque payloads, and ingest-time checks arrive as

@@ -10,19 +10,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, Connections, ConnectionsPolicy, ShareMode, SyncNode};
-use pdn_types::{EntryPath, NamespaceId, PdnId};
+use pdn_types::{EntryPath, PdnId};
 
 /// Poll until `path` is present on `node`, or return `None` once `timeout`
 /// elapses.
 async fn wait_for_entry(
     node: &SyncNode,
-    namespace: &NamespaceId,
+    issuer: PdnId,
     path: &EntryPath,
     timeout: Duration,
 ) -> Result<Option<Vec<u8>>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(value) = node.read(namespace, path).await? {
+        if let Some(value) = node.read(issuer, path).await? {
             return Ok(Some(value));
         }
         if Instant::now() > deadline {
@@ -34,8 +34,7 @@ async fn wait_for_entry(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn capability_gated_sync() -> Result<()> {
-    // PDN identities.
-    let carol = PdnId::from_bytes([0xca; 32]);
+    // PDN identity that issues the data.
     let alice = PdnId::from_bytes([0xa1; 32]);
 
     // Each node runs a connections-gated ingest policy; the `Connections`
@@ -45,12 +44,9 @@ async fn capability_gated_sync() -> Result<()> {
     let mut alice_node = SyncNode::spawn(ConnectionsPolicy::new(alice_connections.clone())).await?;
     let mut bob_node = SyncNode::spawn(ConnectionsPolicy::new(bob_connections.clone())).await?;
 
-    // Namespace about Carol, issued by Alice (the sole writer/owner).
-    let namespace = NamespaceId::new(carol, alice);
-    assert_eq!(namespace.issued_by, alice);
-
+    // Alice's data namespace, keyed by issuer = Alice.
     let alice_author = alice_node.create_author().await?;
-    alice_node.create_namespace(namespace).await?;
+    alice_node.create_namespace(alice).await?;
 
     let k1 = EntryPath::new("k1")?;
     let k2 = EntryPath::new("k2")?;
@@ -58,21 +54,15 @@ async fn capability_gated_sync() -> Result<()> {
 
     // Alice writes k1 before Bob connects: this entry reaches Bob via the
     // initial set-reconciliation path.
-    alice_node
-        .write(&namespace, alice_author, &k1, b"v1")
-        .await?;
+    alice_node.write(alice, alice_author, &k1, b"v1").await?;
 
     let ticket = alice_node
-        .share_ticket(
-            &namespace,
-            ShareMode::Write,
-            AddrInfoOptions::RelayAndAddresses,
-        )
+        .share_ticket(alice, ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    bob_node.import_namespace(namespace, ticket).await?;
+    bob_node.import_namespace(alice, ticket).await?;
 
     // Step 1 — Alice is NOT among Bob's connections: the gate drops k1.
-    let got = wait_for_entry(&bob_node, &namespace, &k1, Duration::from_secs(3)).await?;
+    let got = wait_for_entry(&bob_node, alice, &k1, Duration::from_secs(3)).await?;
     assert!(
         got.is_none(),
         "k1 synced even though Alice is not a connection"
@@ -81,13 +71,11 @@ async fn capability_gated_sync() -> Result<()> {
     // Step 2 — add Alice as a connection; a fresh write (k2) must now sync
     // (live-gossip path -> insert_entry -> validate_entry -> accept).
     bob_connections.insert(alice);
-    alice_node
-        .write(&namespace, alice_author, &k2, b"v2")
-        .await?;
+    alice_node.write(alice, alice_author, &k2, b"v2").await?;
     // Generous liveness ceiling: this is a "must eventually sync" bound, not a
     // correctness one, so a larger value only tolerates slow/loaded CI runners
     // — it never makes the assertion wrong.
-    let got = wait_for_entry(&bob_node, &namespace, &k2, Duration::from_secs(30)).await?;
+    let got = wait_for_entry(&bob_node, alice, &k2, Duration::from_secs(30)).await?;
     assert_eq!(
         got.as_deref(),
         Some(b"v2".as_ref()),
@@ -97,10 +85,8 @@ async fn capability_gated_sync() -> Result<()> {
     // Step 3 — revoke Alice (remove from connections); a fresh write (k3) is
     // rejected again, symmetric to step 1.
     bob_connections.remove(&alice);
-    alice_node
-        .write(&namespace, alice_author, &k3, b"v3")
-        .await?;
-    let got = wait_for_entry(&bob_node, &namespace, &k3, Duration::from_secs(3)).await?;
+    alice_node.write(alice, alice_author, &k3, b"v3").await?;
+    let got = wait_for_entry(&bob_node, alice, &k3, Duration::from_secs(3)).await?;
     assert!(got.is_none(), "k3 synced even though Alice was revoked");
 
     alice_node.shutdown().await?;
