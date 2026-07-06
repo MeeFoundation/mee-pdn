@@ -2,19 +2,19 @@
 //! seed — the private-metadata-store ticket (the QR) — and bootstraps the
 //! rest through that directory, joining her device set.
 //!
-//! The existing device (phone) holds a connections store (connected to Bob),
-//! publishes its ticket into the private metadata directory, and registers
-//! itself. The new device (laptop) is handed only the directory seed and runs
-//! `link_device`: it imports the directory, registers itself, discovers and
-//! imports the connections store, and the Bob connection replicates to it. The
-//! device set is bidirectional — each device ends up seeing both.
+//! The existing device (phone) provisions Alice's store set
+//! (`provision_identity`) and connects Bob. The new device (laptop) is handed
+//! only the directory seed and runs `link_device`: it imports the directory,
+//! registers itself, discovers and imports the connections store, and the Bob
+//! connection replicates to it. The device set is bidirectional — each device
+//! ends up seeing both.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use data_layer::{
-    link_device, AddrInfoOptions, ConnectionsStore, LinkedStores, PrivateMetadataStore, SelfOwned,
-    ShareMode, SyncNode,
+    link_device, provision_identity, AddrInfoOptions, ConnectionsStore, LinkedStores,
+    PrivateMetadataStore, ShareMode, SyncNode,
 };
 use pdn_types::{NodeId, PdnId};
 
@@ -51,25 +51,20 @@ async fn wait_devices(pms: &PrivateMetadataStore, want: &[NodeId]) -> Result<boo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn device_linking_bootstrap() -> Result<()> {
-    let alice = PdnId::from_bytes([0xa1; 32]);
     let bob = PdnId::from_bytes([0xb0; 32]);
 
-    let mut phone = SyncNode::spawn(SelfOwned::new(alice)).await?;
-    let mut laptop = SyncNode::spawn(SelfOwned::new(alice)).await?;
+    let mut phone = SyncNode::spawn().await?;
+    let mut laptop = SyncNode::spawn().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
 
-    // Existing device: a connections store already connected to Bob, plus the
-    // directory — with the connections ticket published and itself registered.
-    let phone_conns = ConnectionsStore::create(&mut phone, alice).await?;
+    // Existing device: provision Alice's store set, then connect Bob.
+    let LinkedStores {
+        private_metadata: phone_pms,
+        connections: phone_conns,
+        ..
+    } = provision_identity(&mut phone).await?;
     phone_conns.connect(bob).await?;
-    let conns_ticket = phone_conns
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-
-    let phone_pms = PrivateMetadataStore::create(&mut phone, alice).await?;
-    phone_pms.put_ticket("connections", &conns_ticket).await?;
-    phone_pms.add_device(phone_id).await?;
 
     // The one thing handed to the new device — the QR payload.
     let seed = phone_pms
@@ -81,7 +76,7 @@ async fn device_linking_bootstrap() -> Result<()> {
         private_metadata: laptop_pms,
         connections: laptop_conns,
         ..
-    } = link_device(&mut laptop, alice, seed, TIMEOUT).await?;
+    } = link_device(&mut laptop, seed, TIMEOUT).await?;
 
     // The store discovered through the directory replicates the Bob connection.
     assert!(

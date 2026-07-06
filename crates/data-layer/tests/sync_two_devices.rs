@@ -1,18 +1,18 @@
 //! Two devices of one identity (Alice) replicate her stores: the
 //! connections store and the data namespace she issues.
 //!
-//! Phone and laptop share the same `PdnId`; each gates ingest with
-//! `SelfOwned { me: alice }`. All writes happen on phone; the laptop sees
-//! them replicate through plain pdn-store sync — both as catch-up (writes
-//! that precede the import) and live (writes after the swarm is joined).
-//! Tickets are handed over directly by the test; discovery through the
-//! private metadata directory is the `device_linking` test. No second
-//! identity — cross-identity gating is `sync_two_nodes`.
+//! Access is bounded by ticket possession alone — the laptop holds the
+//! tickets, so it replicates everything; no ingest filter runs. All writes
+//! happen on phone; the laptop sees them replicate through plain pdn-store
+//! sync — both as catch-up (writes that precede the import) and live (writes
+//! after the swarm is joined). Tickets are handed over directly by the test;
+//! discovery through the private metadata directory is the `device_linking`
+//! test; several identities on one node is the `multi_identity` test.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, ConnectionsStore, SelfOwned, ShareMode, SyncNode};
+use data_layer::{AddrInfoOptions, ConnectionsStore, ShareMode, SyncNode};
 use pdn_types::{EntryPath, PdnId};
 
 /// Poll `is_connected(peer)` on `store` until it equals `want`, or time out.
@@ -63,13 +63,13 @@ async fn sync_two_devices() -> Result<()> {
     let bob = PdnId::from_bytes([0xb0; 32]); // a peer to (dis)connect; no Bob node here
 
     // Two devices of Alice
-    let mut phone = SyncNode::spawn(SelfOwned::new(alice)).await?;
-    let mut laptop = SyncNode::spawn(SelfOwned::new(alice)).await?;
+    let mut phone = SyncNode::spawn().await?;
+    let mut laptop = SyncNode::spawn().await?;
 
     // Phone owns the connections store and already has a connection to Bob
     // before the laptop links — so the laptop must catch this up via the
     // initial set-reconciliation when it imports.
-    let phone_conns = ConnectionsStore::create(&mut phone, alice).await?;
+    let phone_conns = ConnectionsStore::create(&mut phone).await?;
     phone_conns.connect(bob).await?;
 
     // Phone also issues Alice's data namespace, with one entry written
@@ -82,7 +82,7 @@ async fn sync_two_devices() -> Result<()> {
     let conns_ticket = phone_conns
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_conns = ConnectionsStore::import(&mut laptop, alice, conns_ticket).await?;
+    let laptop_conns = ConnectionsStore::import(&mut laptop, conns_ticket).await?;
 
     let data_ticket = phone
         .share_ticket(alice, ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
