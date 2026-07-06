@@ -1,7 +1,5 @@
-//! The assembled sync stack: endpoint + gossip + blobs + capability-gated
-//! docs, addressed in domain terms.
-
-use std::sync::Arc;
+//! The assembled sync stack: endpoint + gossip + blobs + docs, addressed in
+//! domain terms.
 
 use anyhow::{bail, Result};
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
@@ -18,12 +16,17 @@ use pdn_store::{
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
 
-use crate::gate::{self, IngestPolicy};
-use crate::registry::{BindingIndex, Registry};
+use crate::registry::Registry;
 
 /// One running node: iroh endpoint, gossip, in-memory blob store, and the
-/// capability-gated docs engine, with data replicas addressed by their issuer
-/// [`PdnId`] and entries by [`EntryPath`]s.
+/// docs engine, with data replicas addressed by their issuer [`PdnId`] and
+/// entries by [`EntryPath`]s. One node hosts the store sets of any number of
+/// identities.
+///
+/// No ingest filter is installed: the fork's `validate_entry` seam
+/// (ADR-0008) stays available but unused, and whatever a replica syncs from
+/// a peer holding its ticket is persisted. Until subset-rbsr and `UWill`
+/// land, access to a replica is bounded by possession of its ticket.
 ///
 /// Storage is in-memory for now (experiment stage); a persistent variant
 /// can be added without changing this surface.
@@ -36,17 +39,13 @@ pub struct SyncNode {
 }
 
 impl SyncNode {
-    /// Spawn the full stack with `policy` installed at the ingest gate.
-    pub async fn spawn(policy: impl IngestPolicy) -> Result<Self> {
+    /// Spawn the full stack.
+    pub async fn spawn() -> Result<Self> {
         let endpoint = Endpoint::bind(presets::Minimal).await?;
         let blobs = MemStore::default();
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        let index = BindingIndex::default();
-        let validator = gate::capability_validator(Arc::new(policy), index.clone());
-
         let docs = Docs::memory()
-            .capability_validator(validator)
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await?;
         let docs_api = docs.api().clone();
@@ -60,67 +59,37 @@ impl SyncNode {
             router,
             blobs: blobs_store,
             docs: docs_api,
-            registry: Registry::new(index),
+            registry: Registry::default(),
         })
     }
 
-    /// Create a fresh doc and bind it as the data namespace of `issuer`.
+    /// Create a fresh doc and register it as the data namespace of `issuer`.
     pub async fn create_namespace(&mut self, issuer: PdnId) -> Result<()> {
         let doc = self.docs.create().await?;
-        self.registry.bind_data(issuer, doc);
+        self.registry.register_data(issuer, doc);
         Ok(())
     }
 
-    /// Import a doc shared via `ticket` and bind it as the data namespace of
-    /// `issuer`.
-    ///
-    /// Binding teaches the ingest gate which issuer's data namespace incoming
-    /// entries of this doc belong to.
+    /// Import a doc shared via `ticket` and register it as the data namespace
+    /// of `issuer`, so reads and writes under `issuer` resolve to it.
     pub async fn import_namespace(&mut self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
         let doc = self.docs.import(ticket).await?;
-        self.registry.bind_data(issuer, doc);
+        self.registry.register_data(issuer, doc);
         Ok(())
     }
 
-    /// Create a fresh doc for the connections store of `identity` and bind it as
-    /// `Connections { identity }`. Returns the backing doc for the
-    /// [`ConnectionsStore`](crate::ConnectionsStore) to hold.
-    pub(crate) async fn new_connections_doc(&mut self, identity: PdnId) -> Result<Doc> {
+    /// Create a fresh doc for a device-shared store. Returns the backing doc
+    /// for the store handle ([`ConnectionsStore`](crate::ConnectionsStore),
+    /// [`PrivateMetadataStore`](crate::PrivateMetadataStore)) to hold.
+    pub(crate) async fn new_doc(&mut self) -> Result<Doc> {
         let doc = self.docs.create().await?;
-        self.registry.bind_connections(identity, &doc);
         Ok(doc)
     }
 
-    /// Import the connections store of `identity` from `ticket` (device linking)
-    /// and bind it as `Connections { identity }`.
-    pub(crate) async fn import_connections_doc(
-        &mut self,
-        identity: PdnId,
-        ticket: DocTicket,
-    ) -> Result<Doc> {
+    /// Import a device-shared store's doc from `ticket` (device linking).
+    /// Returns the backing doc for the store handle to hold.
+    pub(crate) async fn import_doc(&mut self, ticket: DocTicket) -> Result<Doc> {
         let doc = self.docs.import(ticket).await?;
-        self.registry.bind_connections(identity, &doc);
-        Ok(doc)
-    }
-
-    /// Create a fresh doc for the private metadata store of `identity` and bind
-    /// it as `PrivateMetadata { identity }`. Returns the backing doc for the
-    /// [`PrivateMetadataStore`](crate::PrivateMetadataStore) to hold.
-    pub(crate) async fn new_private_metadata_doc(&mut self, identity: PdnId) -> Result<Doc> {
-        let doc = self.docs.create().await?;
-        self.registry.bind_private_metadata(identity, &doc);
-        Ok(doc)
-    }
-
-    /// Import the private metadata store of `identity` from `ticket` and bind it
-    /// as `PrivateMetadata { identity }`.
-    pub(crate) async fn import_private_metadata_doc(
-        &mut self,
-        identity: PdnId,
-        ticket: DocTicket,
-    ) -> Result<Doc> {
-        let doc = self.docs.import(ticket).await?;
-        self.registry.bind_private_metadata(identity, &doc);
         Ok(doc)
     }
 

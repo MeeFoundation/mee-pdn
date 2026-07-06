@@ -1,16 +1,16 @@
 //! The connections store: a device-replicated registry of an identity's
 //! connections.
 //!
-//! A dedicated pdn-store replica, separate from data namespaces, that all
-//! devices of one identity replicate. One entry per connection at
-//! `connections/<pdnid-hex>`; the payload is an opaque marker (the key
-//! carries the identity), and `disconnect` writes a tombstone (empty entry).
-//! Liveness is a record-level fact — `is_connected` never waits on blob
-//! content.
+//! A dedicated pdn-store replica, separate from data namespaces and from
+//! every other identity's connections store, that all devices of one
+//! identity replicate. One entry per connection at `connections/<pdnid-hex>`;
+//! the payload is an opaque marker (the key carries the identity), and
+//! `disconnect` writes a tombstone (empty entry). Liveness is a record-level
+//! fact — `is_connected` never waits on blob content.
 //!
-//! Its entries are admitted because the gate enforces Invariant 1 (the
-//! `SelfOwned` policy — a node admits its own identity's replicas); having the
-//! gate *read* this store to admit data is a deferred follow-up.
+//! Access is bounded by the replica's ticket (Invariant 1's remaining
+//! mechanism): the ticket is handed only to the identity's own devices, and
+//! no ingest filter runs — whatever the replica syncs is persisted.
 
 use anyhow::Result;
 use futures_lite::StreamExt;
@@ -46,9 +46,9 @@ fn peer_of(key: &[u8]) -> Option<PdnId> {
 /// Device-replicated registry of an identity's connections.
 ///
 /// Built from a [`SyncNode`]; holds the backing replica and an author for
-/// local writes. The owning identity is not kept here — it lives in the
-/// registry binding the gate reads. Reads (`is_connected`, `list`) go through
-/// ordinary doc queries and are never used by the gate.
+/// local writes. The owning identity is not kept here — the handle's holder
+/// knows which identity it serves, and one node holds the connections stores
+/// of any number of identities.
 #[derive(Debug)]
 pub struct ConnectionsStore {
     doc: Doc,
@@ -56,18 +56,16 @@ pub struct ConnectionsStore {
 }
 
 impl ConnectionsStore {
-    /// Create a fresh connections store on `node`, bound as
-    /// `Connections { identity }`.
-    pub async fn create(node: &mut SyncNode, identity: PdnId) -> Result<Self> {
-        let doc = node.new_connections_doc(identity).await?;
+    /// Create a fresh connections store on `node`.
+    pub async fn create(node: &mut SyncNode) -> Result<Self> {
+        let doc = node.new_doc().await?;
         let author = node.create_author().await?;
         Ok(Self { doc, author })
     }
 
-    /// Import an existing connections store via `ticket` (device linking),
-    /// bound as `Connections { identity }`.
-    pub async fn import(node: &mut SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
-        let doc = node.import_connections_doc(identity, ticket).await?;
+    /// Import an existing connections store via `ticket` (device linking).
+    pub async fn import(node: &mut SyncNode, ticket: DocTicket) -> Result<Self> {
+        let doc = node.import_doc(ticket).await?;
         let author = node.create_author().await?;
         Ok(Self { doc, author })
     }

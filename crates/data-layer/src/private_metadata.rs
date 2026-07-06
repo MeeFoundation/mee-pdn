@@ -2,12 +2,15 @@
 //! own infrastructure — its devices and the tickets to its other stores.
 //!
 //! A dedicated pdn-store replica, separate from data namespaces, that all
-//! devices of one identity replicate (device-internal: the gate enforces
-//! Invariant 1 — `mia-docs/openspec/specs/components/pdn-node/invariants.md`). It is
+//! devices of one identity replicate. It is device-internal by ticket alone
+//! (Invariant 1's remaining mechanism —
+//! `mia-docs/openspec/specs/components/pdn-node/invariants.md`): its ticket is
+//! the seed handed only at device linking, and no ingest filter runs. It is
 //! the bootstrap **directory**: a newly linked device reads the device list
 //! and the typed tickets here to find and import the identity's other stores.
 //! Linking is gradual — a minimal access seed first, then the rest of the
-//! tickets and data sync in over this store.
+//! tickets and data sync in over this store. One node holds the private
+//! metadata stores of any number of identities.
 //!
 //! Device records are record-level (visible as soon as the entry syncs);
 //! ticket payloads are blobs, so `get_ticket` returns `None` until the
@@ -23,7 +26,7 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket,
 };
-use pdn_types::{NodeId, PdnId};
+use pdn_types::NodeId;
 
 use crate::node::SyncNode;
 
@@ -50,8 +53,8 @@ fn device_of(key: &[u8]) -> Option<NodeId> {
 
 /// Device-replicated registry of an identity's own metadata: its devices and
 /// the tickets to its other stores. The bootstrap directory a newly linked
-/// device reads from. The owning identity is not kept here — it lives in the
-/// registry binding the gate reads.
+/// device reads from. The owning identity is not kept here — the handle's
+/// holder knows which identity it serves.
 #[derive(Debug)]
 pub struct PrivateMetadataStore {
     doc: Doc,
@@ -60,10 +63,9 @@ pub struct PrivateMetadataStore {
 }
 
 impl PrivateMetadataStore {
-    /// Create a fresh private metadata store on `node`, bound as
-    /// `PrivateMetadata { identity }`.
-    pub async fn create(node: &mut SyncNode, identity: PdnId) -> Result<Self> {
-        let doc = node.new_private_metadata_doc(identity).await?;
+    /// Create a fresh private metadata store on `node`.
+    pub async fn create(node: &mut SyncNode) -> Result<Self> {
+        let doc = node.new_doc().await?;
         let author = node.create_author().await?;
         Ok(Self {
             doc,
@@ -73,9 +75,9 @@ impl PrivateMetadataStore {
     }
 
     /// Import an existing private metadata store via `ticket` (the access seed
-    /// handed to a newly linked device), bound as `PrivateMetadata { identity }`.
-    pub async fn import(node: &mut SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
-        let doc = node.import_private_metadata_doc(identity, ticket).await?;
+    /// handed to a newly linked device).
+    pub async fn import(node: &mut SyncNode, ticket: DocTicket) -> Result<Self> {
+        let doc = node.import_doc(ticket).await?;
         let author = node.create_author().await?;
         Ok(Self {
             doc,

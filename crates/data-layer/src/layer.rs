@@ -28,13 +28,13 @@ pub enum DataLayerError {
 /// subject (`about`) lives inside the entry payload, not in the address.
 ///
 /// Capability semantics (issuing, revocation, chain validation) live above
-/// this trait, in the PDN layer: tokens travel as ordinary entries, and
-/// ingest-time checks are injected into the backend as an
-/// [`IngestPolicy`](crate::IngestPolicy).
+/// this trait, in the PDN layer: tokens travel as ordinary entries.
+/// Enforcement below this trait arrives with subset-rbsr (egress filtering)
+/// and `UWill`; until then access to a replica is bounded by possession of
+/// its ticket.
 ///
-/// This authorization model requires pdn-store, our capability-gated
-/// fork; plain namespace-key authorization cannot express PdnId-based
-/// write authority.
+/// This authorization model requires pdn-store, our fork; plain
+/// namespace-key authorization cannot express PdnId-based write authority.
 #[allow(async_fn_in_trait)]
 pub trait DataLayer: Send + Sync {
     /// Insert `payload` at `path` into the data namespace of `issuer`.
