@@ -1,0 +1,15 @@
+[package]
+name = "test-utils"
+version = "0.1.0"
+edition = "2021"
+description = "Shared plumbing for scenario tests: poll-until helpers and the cast of test identities"
+publish = false
+
+[dependencies]
+anyhow = "1"
+data-layer = { path = "../data-layer" }
+pdn-types = { path = "../pdn-types" }
+tokio = { version = "1", features = ["time"] }
+
+[lints]
+workspace = true

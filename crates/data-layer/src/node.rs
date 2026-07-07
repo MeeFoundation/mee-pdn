@@ -1,7 +1,7 @@
 //! The assembled sync stack: endpoint + gossip + blobs + docs, addressed in
 //! domain terms.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
@@ -17,6 +17,17 @@ use pdn_store::{
 use pdn_types::{EntryPath, NodeId, PdnId};
 
 use crate::registry::Registry;
+
+/// An operation addressed a data namespace this node does not host: `issuer`
+/// has no created or imported namespace here. Downcast from the
+/// `anyhow::Error` of [`SyncNode::read`] / [`SyncNode::write`] /
+/// [`SyncNode::share_ticket`].
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("data namespace not bound on this node: {issuer}")]
+pub struct UnknownIssuer {
+    /// The issuer whose data namespace was addressed.
+    pub issuer: PdnId,
+}
 
 /// One running node: iroh endpoint, gossip, in-memory blob store, and the
 /// docs engine, with data replicas addressed by their issuer [`PdnId`] and
@@ -166,9 +177,9 @@ impl SyncNode {
     }
 
     fn doc(&self, issuer: PdnId) -> Result<&Doc> {
-        match self.registry.data_doc(issuer) {
-            Some(doc) => Ok(doc),
-            None => bail!("data namespace not bound on this node: {issuer:?}"),
-        }
+        Ok(self
+            .registry
+            .data_doc(issuer)
+            .ok_or(UnknownIssuer { issuer })?)
     }
 }

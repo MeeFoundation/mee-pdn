@@ -40,8 +40,8 @@ mod registry;
 
 pub use connections::ConnectionsStore;
 pub use layer::{DataLayer, DataLayerError};
-pub use linking::{link_device, provision_identity, LinkedStores};
-pub use node::SyncNode;
+pub use linking::{link_device, provision_identity, IdentityStores};
+pub use node::{SyncNode, UnknownIssuer};
 pub use private_metadata::PrivateMetadataStore;
 
 // Re-exported pdn-store (iroh-docs fork) vocabulary for the common

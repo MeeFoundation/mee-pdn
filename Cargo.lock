@@ -651,6 +651,7 @@ dependencies = [
  "iroh-docs",
  "iroh-gossip",
  "pdn-types",
+ "test-utils",
  "thiserror",
  "tokio",
 ]
@@ -3764,6 +3765,16 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "test-utils"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "data-layer",
+ "pdn-types",
+ "tokio",
 ]
 
 [[package]]

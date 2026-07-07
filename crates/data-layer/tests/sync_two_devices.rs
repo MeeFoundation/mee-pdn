@@ -9,59 +9,13 @@
 //! discovery through the private metadata directory is the `device_linking`
 //! test; several identities on one node is the `multi_identity` test.
 
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, ConnectionsStore, ShareMode, SyncNode};
-use pdn_types::{EntryPath, PdnId};
-
-/// Poll `is_connected(peer)` on `store` until it equals `want`, or time out.
-///
-/// The 30s ceiling is a liveness bound (must *eventually* replicate), not a
-/// correctness one — a larger value only tolerates slow/loaded CI runners.
-async fn wait_connected(
-    store: &ConnectionsStore,
-    peer: PdnId,
-    want: bool,
-    timeout: Duration,
-) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if store.is_connected(peer).await? == want {
-            return Ok(true);
-        }
-        if Instant::now() > deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Poll until `path` is present on `node`, or return `None` once `timeout`
-/// elapses.
-async fn wait_for_entry(
-    node: &SyncNode,
-    issuer: PdnId,
-    path: &EntryPath,
-    timeout: Duration,
-) -> Result<Option<Vec<u8>>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(value) = node.read(issuer, path).await? {
-            return Ok(Some(value));
-        }
-        if Instant::now() > deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
+use pdn_types::EntryPath;
+use test_utils::{eventually, ids, wait_connected, wait_entry_is};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_two_devices() -> Result<()> {
-    let alice = PdnId::from_bytes([0xa1; 32]);
-    let bob = PdnId::from_bytes([0xb0; 32]); // a peer to (dis)connect; no Bob node here
-
     // Two devices of Alice
     let mut phone = SyncNode::spawn().await?;
     let mut laptop = SyncNode::spawn().await?;
@@ -70,14 +24,14 @@ async fn sync_two_devices() -> Result<()> {
     // before the laptop links — so the laptop must catch this up via the
     // initial set-reconciliation when it imports.
     let phone_conns = ConnectionsStore::create(&mut phone).await?;
-    phone_conns.connect(bob).await?;
+    phone_conns.connect(ids::BOB).await?;
 
     // Phone also issues Alice's data namespace, with one entry written
     // before the laptop imports — same catch-up path, data-namespace store.
     let author = phone.create_author().await?;
-    phone.create_namespace(alice).await?;
+    phone.create_namespace(ids::ALICE).await?;
     let name = EntryPath::new("profile/name")?;
-    phone.write(alice, author, &name, b"Alice").await?;
+    phone.write(ids::ALICE, author, &name, b"Alice").await?;
 
     let conns_ticket = phone_conns
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -85,42 +39,112 @@ async fn sync_two_devices() -> Result<()> {
     let laptop_conns = ConnectionsStore::import(&mut laptop, conns_ticket).await?;
 
     let data_ticket = phone
-        .share_ticket(alice, ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(
+            ids::ALICE,
+            ShareMode::Write,
+            AddrInfoOptions::RelayAndAddresses,
+        )
         .await?;
-    laptop.import_namespace(alice, data_ticket).await?;
+    laptop.import_namespace(ids::ALICE, data_ticket).await?;
 
     // Catch-up: Bob replicates to laptop (reconciliation on import).
     assert!(
-        wait_connected(&laptop_conns, bob, true, Duration::from_secs(30)).await?,
+        wait_connected(&laptop_conns, ids::BOB, true).await?,
         "laptop did not catch up connect(bob) from phone"
     );
 
     // Catch-up: the pre-import data entry replicates to laptop.
-    let got = wait_for_entry(&laptop, alice, &name, Duration::from_secs(30)).await?;
-    assert_eq!(
-        got.as_deref(),
-        Some(b"Alice".as_ref()),
+    assert!(
+        wait_entry_is(&laptop, ids::ALICE, &name, b"Alice").await?,
         "laptop did not catch up the profile/name entry from phone"
     );
 
     // Live update: a fresh disconnect on phone propagates to laptop (the
     // swarm is joined by now), and the tombstone flips Bob to not-live.
-    phone_conns.disconnect(bob).await?;
+    phone_conns.disconnect(ids::BOB).await?;
     assert!(
-        wait_connected(&laptop_conns, bob, false, Duration::from_secs(30)).await?,
+        wait_connected(&laptop_conns, ids::BOB, false).await?,
         "laptop did not observe disconnect(bob) from phone"
     );
 
     // Live update: a fresh data write on phone reaches laptop the same way.
     let email = EntryPath::new("profile/email")?;
     phone
-        .write(alice, author, &email, b"alice@example.org")
+        .write(ids::ALICE, author, &email, b"alice@example.org")
         .await?;
-    let got = wait_for_entry(&laptop, alice, &email, Duration::from_secs(30)).await?;
-    assert_eq!(
-        got.as_deref(),
-        Some(b"alice@example.org".as_ref()),
+    assert!(
+        wait_entry_is(&laptop, ids::ALICE, &email, b"alice@example.org").await?,
         "laptop did not observe the live profile/email write from phone"
+    );
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
+    Ok(())
+}
+
+/// Concurrent writes to the same key on both devices converge: both replicas
+/// end up holding the same value. Which write wins is decided by timestamps
+/// and is deliberately not asserted — only that the devices agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_writes_converge() -> Result<()> {
+    let mut phone = SyncNode::spawn().await?;
+    let mut laptop = SyncNode::spawn().await?;
+
+    let phone_author = phone.create_author().await?;
+    let laptop_author = laptop.create_author().await?;
+    phone.create_namespace(ids::ALICE).await?;
+    let ticket = phone
+        .share_ticket(
+            ids::ALICE,
+            ShareMode::Write,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    laptop.import_namespace(ids::ALICE, ticket).await?;
+
+    // Both devices write the contested key with no coordination.
+    let contested = EntryPath::new("k")?;
+    phone
+        .write(ids::ALICE, phone_author, &contested, b"from-phone")
+        .await?;
+    laptop
+        .write(ids::ALICE, laptop_author, &contested, b"from-laptop")
+        .await?;
+
+    // Fences: once each side sees the other's fence, sync sessions have run
+    // in both directions and had the chance to carry the contested key too.
+    let phone_fence = EntryPath::new("fence/phone")?;
+    let laptop_fence = EntryPath::new("fence/laptop")?;
+    phone
+        .write(ids::ALICE, phone_author, &phone_fence, b"1")
+        .await?;
+    laptop
+        .write(ids::ALICE, laptop_author, &laptop_fence, b"1")
+        .await?;
+    assert!(
+        wait_entry_is(&laptop, ids::ALICE, &phone_fence, b"1").await?,
+        "phone's fence did not reach laptop"
+    );
+    assert!(
+        wait_entry_is(&phone, ids::ALICE, &laptop_fence, b"1").await?,
+        "laptop's fence did not reach phone"
+    );
+
+    // Both replicas must now agree on the contested key.
+    let converged = eventually(|| async {
+        let on_phone = phone.read(ids::ALICE, &contested).await?;
+        let on_laptop = laptop.read(ids::ALICE, &contested).await?;
+        Ok(on_phone.is_some() && on_phone == on_laptop)
+    })
+    .await?;
+    assert!(converged, "replicas did not converge on the contested key");
+    let value = phone
+        .read(ids::ALICE, &contested)
+        .await?
+        .expect("converged");
+    assert!(
+        value == b"from-phone" || value == b"from-laptop",
+        "converged to a value neither device wrote"
     );
 
     phone.shutdown().await?;
