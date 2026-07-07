@@ -34,16 +34,19 @@ use crate::private_metadata::PrivateMetadataStore;
 /// Directory key under which the connections-store ticket lives.
 const CONNECTIONS_TICKET: &str = "connections";
 
-/// The stores a newly linked device brings up from the seed.
+/// An identity's store set on this device, as assembled by
+/// [`provision_identity`] (first device) or [`link_device`] (every further
+/// device).
 ///
-/// Non-exhaustive: it grows as more stores are discovered through the
-/// directory (data namespaces are deferred — ADR-0009).
+/// Non-exhaustive: it grows as more stores join the set (data namespaces are
+/// deferred — ADR-0009).
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct LinkedStores {
+pub struct IdentityStores {
     /// The bootstrap directory itself.
     pub private_metadata: PrivateMetadataStore,
-    /// The connections store, discovered through the directory.
+    /// The connections store — created at provisioning, discovered through
+    /// the directory at linking.
     pub connections: ConnectionsStore,
 }
 
@@ -58,7 +61,7 @@ pub struct LinkedStores {
 /// ([`PrivateMetadataStore::share_ticket`]) the caller hands over out of
 /// band. Data namespaces are not provisioned here; their discovery at
 /// linking is deferred (ADR-0009).
-pub async fn provision_identity(node: &mut SyncNode) -> Result<LinkedStores> {
+pub async fn provision_identity(node: &mut SyncNode) -> Result<IdentityStores> {
     let connections = ConnectionsStore::create(node).await?;
     // Write access and dialable addresses: every device of the identity
     // writes to the shared store, and a linking device dials from the ticket.
@@ -74,7 +77,7 @@ pub async fn provision_identity(node: &mut SyncNode) -> Result<LinkedStores> {
     // sync for the local write to race.
     private_metadata.add_device(node.node_id()).await?;
 
-    Ok(LinkedStores {
+    Ok(IdentityStores {
         private_metadata,
         connections,
     })
@@ -93,7 +96,7 @@ pub async fn link_device(
     node: &mut SyncNode,
     seed: DocTicket,
     timeout: Duration,
-) -> Result<LinkedStores> {
+) -> Result<IdentityStores> {
     // Directory first — everything else is discovered through it.
     let private_metadata = PrivateMetadataStore::import(node, seed).await?;
 
@@ -107,7 +110,7 @@ pub async fn link_device(
     // after catch-up so the local write doesn't race the import's first sync.
     private_metadata.add_device(node.node_id()).await?;
 
-    Ok(LinkedStores {
+    Ok(IdentityStores {
         private_metadata,
         connections,
     })

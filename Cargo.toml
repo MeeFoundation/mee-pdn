@@ -1,8 +1,9 @@
 [workspace]
 members = [
   "crates/pdn-types",  # platform primitives + the data vocabulary
-  "crates/data-layer", # capability-gated document sync over our iroh-docs variant
+  "crates/data-layer", # document sync over our iroh-docs variant
   "crates/pdn-layer",  # platform surface: domain model + PdnOp AST + uwill tokens
+  "crates/test-utils", # shared scenario-test plumbing (dev-dependency only)
 ]
 resolver = "2"
 
