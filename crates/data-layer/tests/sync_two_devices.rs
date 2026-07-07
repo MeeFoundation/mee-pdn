@@ -151,3 +151,29 @@ async fn concurrent_writes_converge() -> Result<()> {
     laptop.shutdown().await?;
     Ok(())
 }
+
+/// An empty payload is not a storable value: zero-length entries are the
+/// underlying deletion marker, and writing one is rejected — it neither
+/// stores an "empty file" nor deletes the previous value.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_payload_write_is_rejected() -> Result<()> {
+    let mut node = SyncNode::spawn().await?;
+    let author = node.create_author().await?;
+    node.create_namespace(ids::ALICE).await?;
+    let path = EntryPath::new("k")?;
+
+    // On a fresh path: rejected, nothing stored.
+    assert!(node.write(ids::ALICE, author, &path, b"").await.is_err());
+    assert_eq!(node.read(ids::ALICE, &path).await?, None);
+
+    // Over an existing value: rejected, the previous value survives.
+    node.write(ids::ALICE, author, &path, b"value").await?;
+    assert!(node.write(ids::ALICE, author, &path, b"").await.is_err());
+    assert_eq!(
+        node.read(ids::ALICE, &path).await?.as_deref(),
+        Some(b"value".as_ref())
+    );
+
+    node.shutdown().await?;
+    Ok(())
+}
