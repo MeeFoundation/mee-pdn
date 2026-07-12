@@ -9,9 +9,9 @@ resolver = "2"
 
 [workspace.dependencies]
 # The iroh stack is pinned here so every consumer agrees.
-iroh = "1.0.0-rc.1"
-iroh-blobs = "0.102"
-iroh-gossip = "0.100"
+iroh = "1.0.2"
+iroh-blobs = "0.103"
+iroh-gossip = "0.101"
 # `pdn-store` is our iroh-docs variant (capability-gated ingest); the
 # package inside the repo keeps the upstream name `iroh-docs` (cheap
 # rebases), we alias it via `package`. To develop against a local
