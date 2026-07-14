@@ -1,0 +1,20 @@
+[package]
+name = "pdn-node"
+version = "0.1.0"
+edition = "2021"
+description = "Embeddable node runtime: identity, connections, data, and sync services over data-layer"
+
+[dependencies]
+anyhow = "1"
+data-layer = { path = "../data-layer" }
+pdn-types = { path = "../pdn-types" }
+rand = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+test-utils = { path = "../test-utils" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

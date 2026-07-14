@@ -6,9 +6,10 @@
 //! register the device. [`link_device`] is the every-further-device half: it
 //! takes the private-metadata-store ticket — the seed, as carried in a QR —
 //! imports that directory, discovers and imports the identity's other
-//! stores through it, then registers the new device in it and stays in
-//! contact until the registration has demonstrably reached one of the
-//! identity's existing devices. The private metadata store necessarily
+//! stores through it, then registers the new device in it — staying in
+//! contact with the seed's devices from the import until the registration
+//! has demonstrably reached one of the identity's existing devices, so no
+//! phase rides on a single exchange. The private metadata store necessarily
 //! comes first: every other store is found via a ticket stored inside it.
 //!
 //! Linking is per identity and repeatable: a node hosting several identities
@@ -38,9 +39,10 @@ use crate::private_metadata::PrivateMetadataStore;
 /// Directory key under which the connections-store ticket lives.
 const CONNECTIONS_TICKET: &str = "connections";
 
-/// How often the registration push re-requests contact while waiting for a
-/// confirming session.
-const PUSH_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// How often linking re-requests contact with the seed's devices while
+/// waiting on sync delivery — during ticket discovery and the registration
+/// push alike.
+const CONTACT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// An identity's store set on this device, as assembled by
 /// [`provision_identity`] (first device) or [`link_device`] (every further
@@ -95,8 +97,9 @@ pub async fn provision_identity(node: &mut SyncNode) -> Result<IdentityStores> {
 /// private-metadata-store ticket.
 ///
 /// Imports the directory, waits up to `timeout` for the connections-store
-/// ticket to sync in and imports the connections store, registers this
-/// device in the directory ([`PrivateMetadataStore::add_device`] with
+/// ticket to sync in — staying in contact with the seed's devices while it
+/// waits (see [`wait_for_ticket`]) — imports the connections store, registers
+/// this device in the directory ([`PrivateMetadataStore::add_device`] with
 /// [`SyncNode::node_id`]), and finally confirms that registration reached
 /// one of the identity's existing devices (see [`confirm_registration`]).
 /// Replicating the stores' remaining contents is ongoing sync the caller
@@ -107,17 +110,22 @@ pub async fn link_device(
     seed: DocTicket,
     timeout: Duration,
 ) -> Result<IdentityStores> {
-    // Where the directory's devices are reachable — the registration push
-    // below re-contacts them.
+    // Where the directory's devices are reachable — the ticket wait and the
+    // registration push below re-contact them.
     let seed_devices = seed.nodes.clone();
 
     // Directory first — everything else is discovered through it.
     let private_metadata = PrivateMetadataStore::import(node, seed).await?;
 
     // Discover the connections-store ticket from the directory, then import it.
-    let connections_ticket = wait_for_ticket(&private_metadata, CONNECTIONS_TICKET, timeout)
-        .await?
-        .context("connections ticket did not sync into the private metadata store")?;
+    let connections_ticket = wait_for_ticket(
+        &private_metadata,
+        &seed_devices,
+        CONNECTIONS_TICKET,
+        timeout,
+    )
+    .await?
+    .context("connections ticket did not sync into the private metadata store")?;
     let connections = ConnectionsStore::import(node, connections_ticket).await?;
 
     // Join the device set so the identity's other devices see this one. Done
@@ -160,7 +168,7 @@ async fn confirm_registration(
         // repeated.
         store.sync_with(seed_devices.clone()).await?;
 
-        let event = tokio::time::timeout(PUSH_RETRY_INTERVAL, events.next()).await;
+        let event = tokio::time::timeout(CONTACT_RETRY_INTERVAL, events.next()).await;
         if let Ok(event) = event {
             let event = event.context("replica event stream ended during linking")??;
             if let LiveEvent::SyncFinished(sync) = event {
@@ -175,14 +183,29 @@ async fn confirm_registration(
     }
 }
 
-/// Poll the directory for the ticket of `kind` until it syncs in, or time out.
+/// Wait for the ticket of `kind` to sync into the directory, re-requesting
+/// contact with the seed's devices on the way: delivery otherwise rides
+/// solely on the import's initial exchange, and if that one exchange dies —
+/// the peer transiently unreachable, the session aborted — nothing else
+/// re-triggers it, and the wait would starve to its deadline with the
+/// ticket one request away. The retry driver mirrors the registration
+/// push's ([`confirm_registration`]).
 async fn wait_for_ticket(
     store: &PrivateMetadataStore,
+    seed_devices: &[EndpointAddr],
     kind: &str,
     timeout: Duration,
 ) -> Result<Option<DocTicket>> {
     let deadline = Instant::now() + timeout;
+    let mut next_contact = Instant::now();
     loop {
+        // (Re-)request contact on the push's cadence. A request dropped
+        // against an already-running session is simply repeated once the
+        // interval elapses.
+        if Instant::now() >= next_contact {
+            store.sync_with(seed_devices.to_vec()).await?;
+            next_contact = Instant::now() + CONTACT_RETRY_INTERVAL;
+        }
         if let Some(ticket) = store.get_ticket(kind).await? {
             return Ok(Some(ticket));
         }
