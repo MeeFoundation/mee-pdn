@@ -40,6 +40,51 @@ test-release:
   set -eux
   cargo test --workspace --release --all-targets
 
+# Stress scenario tests: every integration-test binary in a counted loop, one verdict line per run, full output kept for failures only (see mia-docs flaky-tests.md)
+stress iterations="300":
+  #!/bin/sh
+  set -eu
+  out="target/stress/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$out/failures"
+  cargo test --workspace --no-run --message-format=json 2>"$out/build.log" | python3 -c '
+  import json, sys
+  for line in sys.stdin:
+      try:
+          m = json.loads(line)
+      except ValueError:
+          continue
+      if m.get("reason") != "compiler-artifact" or not m.get("executable"):
+          continue
+      t = m.get("target", {})
+      if t.get("kind") != ["test"]:
+          continue
+      src = t.get("src_path", "")
+      if "/crates/" not in src:
+          continue
+      crate = src.split("/crates/")[1].split("/")[0]
+      print(crate + "--" + t["name"] + " " + m["executable"])
+  ' | sort > "$out/binaries.txt"
+  ln -sfn "$(basename "$out")" target/stress/latest
+  echo "binaries under stress:"
+  cat "$out/binaries.txt"
+  echo "watch progress: tail -f target/stress/latest/stress.log"
+  i=1
+  while [ "$i" -le {{ iterations }} ]; do
+    while read -r name exe; do
+      t0=$(date +%s)
+      if log=$(RUST_BACKTRACE=1 "$exe" </dev/null 2>&1); then
+        printf 'iter %03d/%s %-32s ok    %3ds\n' "$i" "{{ iterations }}" "$name" "$(( $(date +%s) - t0 ))"
+      else
+        printf 'iter %03d/%s %-32s FAIL  %3ds\n' "$i" "{{ iterations }}" "$name" "$(( $(date +%s) - t0 ))"
+        printf '%s\n' "$log" > "$out/failures/iter$i-$name.log"
+      fi
+    done < "$out/binaries.txt"
+    i=$((i + 1))
+  done | tee "$out/stress.log"
+  failures=$(grep -c ' FAIL ' "$out/stress.log" || true)
+  echo "stress complete: $failures failures over {{ iterations }} iterations (logs: $out)"
+  [ "$failures" -eq 0 ]
+
 # Lint and type-check without modifying files
 check:
   #!/bin/sh
