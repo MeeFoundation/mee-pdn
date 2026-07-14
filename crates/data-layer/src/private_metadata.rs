@@ -17,12 +17,15 @@
 //! payload has arrived.
 
 use anyhow::Result;
+use futures_core::Stream;
 use futures_lite::StreamExt;
+use iroh::EndpointAddr;
 use pdn_store::{
     api::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
+    engine::LiveEvent,
     store::Query,
     AuthorId, DocTicket,
 };
@@ -129,6 +132,23 @@ impl PrivateMetadataStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// (Re-)request a sync of this store's replica with `peers` — the
+    /// registration push of device linking. The engine also includes every
+    /// peer the replica has synced with before; a request made while a
+    /// session is already running is dropped, so callers retry off the
+    /// session-finished events ([`events`](Self::events)).
+    pub(crate) async fn sync_with(&self, peers: Vec<EndpointAddr>) -> Result<()> {
+        self.doc.start_sync(peers).await?;
+        Ok(())
+    }
+
+    /// Subscribe to this store's replica events (inserts, sync sessions).
+    pub(crate) async fn events(
+        &self,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.doc.subscribe().await
     }
 
     /// Read the stored ticket for store `kind`, if present and its payload has
