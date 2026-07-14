@@ -1,9 +1,11 @@
 [workspace]
 members = [
-  "crates/pdn-types",  # platform primitives + the data vocabulary
-  "crates/data-layer", # document sync over our iroh-docs variant
-  "crates/pdn-layer",  # platform surface: domain model + PdnOp AST + uwill tokens
-  "crates/test-utils", # shared scenario-test plumbing (dev-dependency only)
+  "crates/pdn-types",     # platform primitives + the data vocabulary
+  "crates/data-layer",    # document sync over our iroh-docs variant
+  "crates/pdn-layer",     # platform surface: domain model + PdnOp AST + uwill tokens
+  "crates/pdn-node",      # embeddable node runtime: service glue over data-layer
+  "crates/pdn-node-http", # thin HTTP host embedding one runtime
+  "crates/test-utils",    # shared scenario-test plumbing (dev-dependency only)
 ]
 resolver = "2"
 

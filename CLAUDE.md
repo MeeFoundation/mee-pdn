@@ -20,13 +20,16 @@ code. Monorepo using Cargo workspaces.
 
 Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the
 wire). `pdn-layer` does NOT depend on `data-layer` — both see only
-`pdn-types`; the future `pdn-node` runtime glues them together.
+`pdn-types`; the `pdn-node` runtime glues them together (today it glues
+only `data-layer`; `pdn-layer` joins in a later change).
 
 ### Crates
 
 - [`crates/pdn-types`](crates/pdn-types/) — platform primitives (`define_byte_id!`, `PdnId`, `PdnIdentityProof`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, `NonEmpty<T>`) plus the data vocabulary (`NamespaceId` = `(about, issued_by)`, `EntryPath`, `EntryInfo`, `NamespaceRole`, `NodeAddr`).
 - [`crates/data-layer`](crates/data-layer/) — the data layer over the forked iroh-docs (git dependency on `github.com/MeeFoundation/pdn-store`; the fork's `validate_entry` ingest seam per ADR-0008 stays available but uninstalled): the entries-only `DataLayer` trait, `SyncNode` stack assembly (one node hosts the store sets of any number of identities; access is bounded by ticket possession until subset-rbsr and UWill land), the device-replicated `ConnectionsStore` (an identity's connections) and `PrivateMetadataStore` (its devices + the tickets to its other stores — the bootstrap directory), and `link_device` (single-seed bootstrap, run once per identity). Scenario tests in its `tests/`. Capability _semantics_ stay above: tokens are opaque payloads here. Invariants are numbered in `mia-docs/openspec/specs/components/pdn-node/invariants.md` (referenced by number, never name). To hack on the fork locally, `[patch]` it to `../pdn-store` (see the workspace `Cargo.toml` comment).
 - [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` module (capability-token format, future chain validation). No iroh dependencies.
+- [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / connections / data / sync services as thin glue over `data-layer` (every operation delegates to a `data-layer` primitive; no sync or authorization mechanics of its own). Each `Runtime` is one running node hosting any number of identities, each added by an explicit act (create, or link by seed); the runtime is the single owner of node assembly (where a future pairing handler threads through, ADR-0011) and of the hosted identities' store handles. Services are traits with one production implementation (`IdentityService` — a KERI-backed second implementation is the live prospect; the current one mints placeholder `PdnId`s). Whole-store ticket share/import in the data service is the interim access model, replaced when capability-scoped sharing lands. Scenario tests in its `tests/`. No host or HTTP dependencies.
+- [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime. `GET /live` always on; `/debug/` routes are demo scaffolding behind `PDN_DEBUG=1` (absent otherwise, shape unpinned). Env: `PDN_HOST` / `PDN_PORT` (default `127.0.0.1:3011`). Depends on `pdn-node` only — no direct `data-layer` dependency.
 
 ## Commands
 
@@ -65,3 +68,10 @@ Max lines per function: 80. Future-size threshold: 16384 (clippy's default;
 iroh's `Endpoint::bind`/`spawn` futures are ~10KB structurally, so the
 earlier 8192 threshold flagged every iroh await point once iroh came into
 actual use in `iroh-docs-experiment`).
+
+## Code practices
+
+Cross-cutting practices live in `mia-docs/openspec/specs/code-practices/`:
+
+- [`access-control-tests.md`](mia-docs/openspec/specs/code-practices/access-control-tests.md) — every test that asserts authorized access must, in the same place, assert the tightest unauthorized party is denied (read: an outsider, and a holder of the store's ticket but no read capability; write: a lower-level holder). A positive-only access test verifies nothing.
+- [`flaky-tests.md`](mia-docs/openspec/specs/code-practices/flaky-tests.md) — every substantial change ends with a flaky-test stress pass, before anything is built on top. After landing a change that touches sync, linking, engine wiring, or bumps iroh/pdn-store, stress the affected scenario tests in a counted loop and treat any failure as a defect of that change, diagnosed in isolation from other work. Full discipline — reproduction sizing (hundreds of runs, rule of three), fix minimization, deterministic pinning — in the spec. This exists so we never again build a feature first and then debug the previous implementation's flaky tests through it.

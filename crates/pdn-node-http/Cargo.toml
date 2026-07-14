@@ -1,0 +1,17 @@
+[package]
+name = "pdn-node-http"
+version = "0.1.0"
+edition = "2021"
+description = "Thin HTTP host for the demo stand, embedding one pdn-node runtime"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+pdn-node = { path = "../pdn-node" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
