@@ -1,7 +1,7 @@
 //! The data layer: document sync over pdn-store, our iroh-docs fork.
 //!
 //! Everything platform-specific around the fork lives here, so the fork
-//! itself stays iroh-native and minimal. Its ingest seam — the
+//! itself stays iroh-native and minimal. Its ingest filter — the
 //! `CapabilityValidator` hook (`Fn(&SignedEntry) -> bool`) consulted at the
 //! `validate_entry` chokepoint (ADR-0008) — remains in the fork but is not
 //! installed: until subset-rbsr (egress filtering) and `UWill` land, access
@@ -23,7 +23,9 @@
 //! - `registry` (internal) — the issuer-to-doc map data-namespace reads and
 //!   writes resolve through;
 //! - [`node`] — the assembled stack: endpoint + gossip + blobs + docs,
-//!   addressed by issuer [`pdn_types::PdnId`] and [`pdn_types::EntryPath`]s.
+//!   addressed by issuer [`pdn_types::PdnId`] and [`pdn_types::EntryPath`]s,
+//!   hosting ADR-0011's pairing protocol at spawn with a narrow dial handle
+//!   onto the endpoint exposed for its dial side.
 //!
 //! Capability *semantics* (`UWill` tokens, chains) do not live here: at this
 //! level tokens are opaque payloads.
@@ -41,7 +43,7 @@ mod registry;
 pub use connections::ConnectionsStore;
 pub use layer::{DataLayer, DataLayerError};
 pub use linking::{link_device, provision_identity, IdentityStores};
-pub use node::{SyncNode, UnknownIssuer};
+pub use node::{AlpnTaken, DialHandle, ExtraProtocol, SyncNode, UnknownIssuer, BUILT_IN_ALPNS};
 pub use private_metadata::PrivateMetadataStore;
 
 // Re-exported pdn-store (iroh-docs fork) vocabulary for the common
@@ -50,4 +52,16 @@ pub use private_metadata::PrivateMetadataStore;
 pub use pdn_store::{
     api::protocol::{AddrInfoOptions, ShareMode},
     AuthorId, DocTicket,
+};
+
+// The pairing registration point (ADR-0011): implement the pairing handler against these
+// and register it via `SyncNode::spawn_with_protocols`; reach the dial side
+// through `SyncNode::dial_handle`. Re-exported so consumers (the pdn-node
+// runtime) need no direct iroh dependency and the iroh version stays pinned
+// in one place. The raw `Endpoint` is deliberately not re-exported — a
+// consumer never handles one; the dial handle wraps it.
+pub use iroh::{
+    endpoint::Connection,
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler},
+    EndpointAddr, EndpointId,
 };

@@ -1,12 +1,22 @@
 //! The assembled sync stack: endpoint + gossip + blobs + docs, addressed in
-//! domain terms.
+//! domain terms. ADR-0011's pairing dialogue registers as a further protocol
+//! on the same endpoint at spawn, next to the built-in stack, and a narrow
+//! dial handle onto that endpoint is exposed for its dial side. The
+//! registration point stays protocol-agnostic (data-layer owns no pairing
+//! semantics), not a general protocol-extension facility.
 
+use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use futures_lite::StreamExt;
-use iroh::{endpoint::presets, protocol::Router, Endpoint};
+use futures_lite::{FutureExt, StreamExt};
+use iroh::{
+    endpoint::{presets, Connection},
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
+    Endpoint, EndpointAddr, EndpointId,
+};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
@@ -34,6 +44,58 @@ pub struct UnknownIssuer {
     pub issuer: PdnId,
 }
 
+/// A protocol supplied to [`SyncNode::spawn_with_protocols`] — the pairing
+/// handler (ADR-0011): the ALPN it answers under, and the handler dispatched
+/// for connections arriving on it. A plain pair because data-layer owns no
+/// pairing semantics, not a general extension type.
+pub type ExtraProtocol = (Vec<u8>, Box<dyn DynProtocolHandler>);
+
+/// The ALPNs of the built-in protocols — blob transfer, gossip, document
+/// sync. Reserved: an externally supplied protocol claiming one of these is
+/// refused at spawn with [`AlpnTaken`].
+pub const BUILT_IN_ALPNS: [&[u8]; 3] = [BLOBS_ALPN, GOSSIP_ALPN, DOCS_ALPN];
+
+/// A spawn was handed an extra protocol whose ALPN is already taken — by a
+/// built-in protocol ([`BUILT_IN_ALPNS`]) or by another extra in the same
+/// call. Downcast from the `anyhow::Error` of
+/// [`SyncNode::spawn_with_protocols`].
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("protocol ALPN already taken: {}", String::from_utf8_lossy(.alpn))]
+pub struct AlpnTaken {
+    /// The colliding ALPN.
+    pub alpn: Vec<u8>,
+}
+
+/// Wraps an externally supplied protocol handler so a panic in its `accept`
+/// cannot escape into iroh's router accept loop, where iroh treats a
+/// panicking handler task as fatal and tears the whole node down — gossip,
+/// docs, and blobs with it. A caught panic drops just that one connection
+/// (iroh logs the returned error) and the node keeps serving. This does not
+/// survive a `panic = "abort"` build; the contract on
+/// [`SyncNode::spawn_with_protocols`] still asks handlers not to panic.
+#[derive(Debug)]
+struct PanicGuarded {
+    inner: Box<dyn DynProtocolHandler>,
+}
+
+impl ProtocolHandler for PanicGuarded {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        match AssertUnwindSafe(self.inner.accept(connection))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(_panic) => Err(AcceptError::from_err(std::io::Error::other(
+                "extra protocol handler panicked",
+            ))),
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
+    }
+}
+
 /// How often the periodic reconcile pass re-requests a sync for every doc
 /// this node holds open.
 ///
@@ -53,9 +115,11 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// entries by [`EntryPath`]s. One node hosts the store sets of any number of
 /// identities. Every doc the node opens joins a periodic reconcile pass
 /// ([`RECONCILE_INTERVAL`]) that keeps replicas converging when gossip
-/// loses a broadcast.
+/// loses a broadcast. The pairing protocol (ADR-0011) joins the same
+/// endpoint at spawn ([`SyncNode::spawn_with_protocols`]); its dial side and
+/// the node's own address are reached through [`SyncNode::dial_handle`].
 ///
-/// No ingest filter is installed: the fork's `validate_entry` seam
+/// No ingest filter is installed: the fork's `validate_entry` hook
 /// (ADR-0008) stays available but unused, and whatever a replica syncs from
 /// a peer holding its ticket is persisted. Until subset-rbsr and `UWill`
 /// land, access to a replica is bounded by possession of its ticket.
@@ -76,9 +140,70 @@ pub struct SyncNode {
     reconciler_stop: oneshot::Sender<()>,
 }
 
+/// The dial side of a node's protocols, handed out by
+/// [`SyncNode::dial_handle`]. Wraps the node's iroh endpoint but exposes
+/// only what a dial needs — connect out, read the node's own address and
+/// wire id — never the endpoint's lifecycle. Closing or reconfiguring the
+/// socket stays the node's own job ([`SyncNode::shutdown`]); this handle
+/// makes that a matter of construction, not of trust.
+#[derive(Debug, Clone)]
+pub struct DialHandle {
+    endpoint: Endpoint,
+}
+
+impl DialHandle {
+    /// Open a connection to `addr` under `alpn`, as the dial side of an
+    /// extra protocol. The peer must serve `alpn` — a built-in protocol or
+    /// an extra it registered at spawn — or the dial fails.
+    pub async fn connect(&self, addr: EndpointAddr, alpn: &[u8]) -> Result<Connection> {
+        Ok(self.endpoint.connect(addr, alpn).await?)
+    }
+
+    /// This node's own address — its wire id plus the paths peers can reach
+    /// it on — to hand to a peer out of band (a pairing QR, say) as the
+    /// dial target for the reverse direction.
+    pub fn addr(&self) -> EndpointAddr {
+        self.endpoint.addr()
+    }
+
+    /// This node's wire id; [`SyncNode::node_id`] reports the same value as
+    /// a [`NodeId`].
+    pub fn id(&self) -> EndpointId {
+        self.endpoint.id()
+    }
+}
+
 impl SyncNode {
-    /// Spawn the full stack.
+    /// Spawn the full stack with no externally supplied protocols.
     pub async fn spawn() -> Result<Self> {
+        Self::spawn_with_protocols(Vec::new()).await
+    }
+
+    /// Spawn the full stack, serving `extra_protocols` on the same endpoint
+    /// next to the built-in ones (ADR-0011's slot: the pairing dialogue
+    /// registers here). A connection arriving under a registered extra ALPN
+    /// is dispatched to its handler as a raw bidirectional connection — not
+    /// a document-sync session. ALPNs must be unique across
+    /// [`BUILT_IN_ALPNS`] and the extras; a collision fails the spawn with
+    /// [`AlpnTaken`] before anything binds.
+    ///
+    /// A handler's `accept` should not panic — return `Err(AcceptError)` for
+    /// failure instead. A panic is contained (caught per connection, so it
+    /// drops only that connection and never the node's built-in sync), but
+    /// it is not a supported control-flow path, and a `panic = "abort"`
+    /// build would still abort the process.
+    pub async fn spawn_with_protocols(extra_protocols: Vec<ExtraProtocol>) -> Result<Self> {
+        // Checked before the endpoint binds: nothing to unwind on failure.
+        // A collision must never register — an extra silently replacing a
+        // built-in handler would leave a node that looks alive and never
+        // syncs.
+        let mut taken: HashSet<&[u8]> = BUILT_IN_ALPNS.into_iter().collect();
+        for (alpn, _handler) in &extra_protocols {
+            if !taken.insert(alpn.as_slice()) {
+                return Err(AlpnTaken { alpn: alpn.clone() }.into());
+            }
+        }
+
         let endpoint = Endpoint::bind(presets::Minimal).await?;
         let blobs = MemStore::default();
         let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -88,11 +213,20 @@ impl SyncNode {
             .await?;
         let docs_api = docs.api().clone();
         let blobs_store: iroh_blobs::api::Store = (*blobs).clone();
-        let router = Router::builder(endpoint)
+        let mut router = Router::builder(endpoint)
             .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs, None))
             .accept(GOSSIP_ALPN, gossip)
-            .accept(DOCS_ALPN, docs)
-            .spawn();
+            .accept(DOCS_ALPN, docs);
+        // Each extra is wrapped so a panic in its handler cannot escape into
+        // iroh's accept loop, where a panicking task is fatal to the whole
+        // node (`PanicGuarded`).
+        // Each extra is wrapped so a panic in its handler cannot escape into
+        // iroh's accept loop, where a panicking task is fatal to the whole
+        // node (`PanicGuarded`).
+        for (alpn, handler) in extra_protocols {
+            router = router.accept(alpn, PanicGuarded { inner: handler });
+        }
+        let router = router.spawn();
         let tracked_docs: Arc<Mutex<Vec<Doc>>> = Arc::default();
         let (reconciler_stop, stop) = oneshot::channel();
         let _detached = tokio::spawn(reconcile_pass(Arc::clone(&tracked_docs), stop));
@@ -177,6 +311,18 @@ impl SyncNode {
     /// its identity's device set.
     pub fn node_id(&self) -> NodeId {
         NodeId::from_bytes(*self.router.endpoint().id().as_bytes())
+    }
+
+    /// A narrow handle onto the node's iroh endpoint for the dial side of
+    /// extra protocols ([`DialHandle`]): connect out under a chosen ALPN,
+    /// and read this node's own address and wire id. Deliberately not the
+    /// raw [`Endpoint`] — the node stays the sole owner of the endpoint's
+    /// lifecycle, so closing or reconfiguring it is [`SyncNode::shutdown`]'s
+    /// job and is not reachable from here.
+    pub fn dial_handle(&self) -> DialHandle {
+        DialHandle {
+            endpoint: self.router.endpoint().clone(),
+        }
     }
 
     /// Write `payload` at `path` in the data namespace of `issuer`.
