@@ -7,7 +7,10 @@ use pdn_node::{
     UnknownIdentity, UnknownIssuer,
 };
 use pdn_types::EntryPath;
-use test_utils::{eventually, ids, TIMEOUT};
+use test_utils::{eventually, TIMEOUT};
+
+mod common;
+use common::establish_patiently;
 
 /// Create on runtime A, link runtime B by the seed: B hosts the identity
 /// and its connections store converges. Paired deny: linking identity X
@@ -17,13 +20,18 @@ use test_utils::{eventually, ids, TIMEOUT};
 async fn create_on_a_link_on_b_converges_and_stays_isolated() -> Result<()> {
     let a = Runtime::spawn().await?;
     let b = Runtime::spawn().await?;
+    let peers = Runtime::spawn().await?;
 
-    // A hosts two identities; a connection is recorded under each before
+    // A hosts two identities; each establishes its own connection before
     // any linking, so what B receives is attributable.
     let x = a.identity().create().await?;
     let y = a.identity().create().await?;
-    a.connections().record(x, ids::BOB).await?;
-    a.connections().record(y, ids::CAROL).await?;
+    let pb = peers.identity().create().await?;
+    let pc = peers.identity().create().await?;
+    let invite = a.connections().invite(x, None).await?;
+    establish_patiently(&peers, pb, &a, x, invite).await?;
+    let invite = a.connections().invite(y, None).await?;
+    establish_patiently(&peers, pc, &a, y, invite).await?;
 
     // Link B into X only.
     let seed = a.identity().linking_seed(x).await?;
@@ -34,22 +42,32 @@ async fn create_on_a_link_on_b_converges_and_stays_isolated() -> Result<()> {
 
     // X's connections store converges on B.
     assert!(
-        eventually(|| async { Ok(b.connections().list(x).await?.contains(&ids::BOB)) }).await?,
+        eventually(|| async { Ok(b.connections().list(x).await?.contains(&pb)) }).await?,
         "X's connections did not converge on the linked runtime"
     );
 
     // Paired deny: nothing of Y arrived through that act. Y is unknown to
-    // B's identity-addressed services and to its data namespaces —
-    // specifically unknown, not a generic failure.
+    // B's identity-addressed services — listing, inviting, and both grant
+    // operations — and to its data namespaces; specifically unknown, not a
+    // generic failure.
     let err = b.connections().list(y).await.unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
-    let err = b.connections().record(y, ids::DAVE).await.unwrap_err();
+    let err = b.connections().invite(y, None).await.unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
-    let err = b.data().read(y, &EntryPath::new("k")?).await.unwrap_err();
+    let err = b.connections().publish_grant(y, pc, y).await.unwrap_err();
+    assert!(err.downcast_ref::<UnknownIdentity>().is_some());
+    let err = b.connections().read_grants(y, pc).await.unwrap_err();
+    assert!(err.downcast_ref::<UnknownIdentity>().is_some());
+    let err = b
+        .data()
+        .read(y, &EntryPath::new("contact/email")?)
+        .await
+        .unwrap_err();
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
 
     a.shutdown().await?;
     b.shutdown().await?;
+    peers.shutdown().await?;
     Ok(())
 }
 

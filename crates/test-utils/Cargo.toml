@@ -7,6 +7,10 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# This crate serves the data layer and below: `data-layer`'s own tests depend
+# on it, so it must not depend on anything above them. Runtime-level helpers
+# live in `pdn-node/tests/common/` instead — putting one here would drag
+# `pdn-node` in and make the lower layer's tests compile the runtime above.
 data-layer = { path = "../data-layer" }
 pdn-types = { path = "../pdn-types" }
 tokio = { version = "1", features = ["time"] }

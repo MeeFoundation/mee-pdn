@@ -16,6 +16,11 @@
 //! - [`private_metadata`] — the device-replicated [`PrivateMetadataStore`]:
 //!   an identity's devices and the tickets to its other stores (the bootstrap
 //!   directory a newly linked device reads from);
+//! - [`connection_metadata`] — the cross-identity
+//!   [`ConnectionMetadataStore`]: one replica per direction of a connection,
+//!   written by the issuing identity's devices, read whole by the
+//!   counterparty's (Invariant 3), carrying the grants everything later
+//!   rides on;
 //! - [`linking`] — [`provision_identity`] / [`link_device`]: bring an
 //!   identity up on its first device, and every further device up from a
 //!   single seed (the private-metadata-store ticket), bootstrapping the rest
@@ -33,6 +38,7 @@
 //! Errors are `anyhow` for now; typed errors arrive together with the
 //! [`DataLayer`] implementation.
 
+pub mod connection_metadata;
 pub mod connections;
 pub mod layer;
 pub mod linking;
@@ -40,6 +46,9 @@ pub mod node;
 pub mod private_metadata;
 mod registry;
 
+pub use connection_metadata::{
+    own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore,
+};
 pub use connections::ConnectionsStore;
 pub use layer::{DataLayer, DataLayerError};
 pub use linking::{link_device, provision_identity, IdentityStores};
@@ -51,17 +60,18 @@ pub use private_metadata::PrivateMetadataStore;
 // dependency on it.
 pub use pdn_store::{
     api::protocol::{AddrInfoOptions, ShareMode},
-    AuthorId, DocTicket,
+    AuthorId, DocTicket, NamespaceId,
 };
 
-// The pairing registration point (ADR-0011): implement the pairing handler against these
-// and register it via `SyncNode::spawn_with_protocols`; reach the dial side
+// The pairing registration point (ADR-0011): the pdn-node runtime's pairing
+// handler is written against these and registered via
+// `SyncNode::spawn_with_protocols`; its dial side reaches the endpoint
 // through `SyncNode::dial_handle`. Re-exported so consumers (the pdn-node
 // runtime) need no direct iroh dependency and the iroh version stays pinned
 // in one place. The raw `Endpoint` is deliberately not re-exported — a
 // consumer never handles one; the dial handle wraps it.
 pub use iroh::{
-    endpoint::Connection,
+    endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler},
     EndpointAddr, EndpointId,
 };

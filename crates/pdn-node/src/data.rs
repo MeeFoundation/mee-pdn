@@ -12,10 +12,13 @@ use crate::runtime::Runtime;
 /// a peer's.
 ///
 /// Whole-store tickets are the interim access model (the ADR-0008 posture:
-/// possession of a replica's ticket bounds access to it); capability-scoped
-/// sharing (subset-rbsr egress, grants carried in the connection metadata
-/// store) replaces the mechanism in later changes. A test mock standing in
-/// for the network is the second implementation this trait anticipates.
+/// possession of a replica's ticket bounds access to it). The connections
+/// service's grant surface is the honest transport for these tickets
+/// between connected identities; the out-of-band share/import here remains
+/// for namespaces outside any connection. Capability-scoped sharing
+/// (subset-rbsr egress) replaces the grant payload, not the channel. A test
+/// mock standing in for the network is the second implementation this
+/// trait anticipates.
 ///
 /// Operations address issuers whose data namespace was created or imported
 /// on this node — not hosted identities: a linked identity has no data
@@ -90,7 +93,7 @@ impl DataService for RuntimeDataService<'_> {
     /// grant it came from. The runtime's registry is a cache, not the
     /// ticket's durable home.
     async fn import(&self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
-        let mut state = self.runtime.state.lock().await;
+        let state = self.runtime.state.lock().await;
         state.node.import_namespace(issuer, ticket).await
     }
 }

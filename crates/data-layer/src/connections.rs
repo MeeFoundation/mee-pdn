@@ -57,14 +57,14 @@ pub struct ConnectionsStore {
 
 impl ConnectionsStore {
     /// Create a fresh connections store on `node`.
-    pub async fn create(node: &mut SyncNode) -> Result<Self> {
+    pub async fn create(node: &SyncNode) -> Result<Self> {
         let doc = node.new_doc().await?;
         let author = node.create_author().await?;
         Ok(Self { doc, author })
     }
 
     /// Import an existing connections store via `ticket` (device linking).
-    pub async fn import(node: &mut SyncNode, ticket: DocTicket) -> Result<Self> {
+    pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
         let doc = node.import_doc(ticket).await?;
         let author = node.create_author().await?;
         Ok(Self { doc, author })

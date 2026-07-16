@@ -51,23 +51,28 @@ async fn provision_identity_with_data(
 async fn multi_identity_two_devices() -> Result<()> {
     // The same path in both data namespaces, a different value in each —
     // mixed-up stores would surface as the wrong value.
-    let path = EntryPath::new("k")?;
+    let path = EntryPath::new("affiliation/group")?;
 
     // Phone hosts both identities' store sets side by side.
     let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
-    let (work_conns, work_author, work_seed, work_data) =
-        provision_identity_with_data(&mut phone, ids::ALICE_AT_WORK, ids::BOB, &path, b"work")
-            .await?;
+    let (work_conns, work_author, work_seed, work_data) = provision_identity_with_data(
+        &mut phone,
+        ids::ALICE_AT_WORK,
+        ids::BOB,
+        &path,
+        b"Acme Engineering",
+    )
+    .await?;
     let (_leisure_conns, _leisure_author, leisure_seed, leisure_data) =
         provision_identity_with_data(
             &mut phone,
             ids::ALICE_AT_LEISURE,
             ids::CAROL,
             &path,
-            b"leisure",
+            b"Boston Bridge Club",
         )
         .await?;
 
@@ -75,7 +80,7 @@ async fn multi_identity_two_devices() -> Result<()> {
     let IdentityStores {
         connections: laptop_work_conns,
         ..
-    } = link_device(&mut laptop, work_seed, TIMEOUT).await?;
+    } = link_device(&laptop, work_seed, TIMEOUT).await?;
     assert!(
         wait_connected(&laptop_work_conns, ids::BOB, true).await?,
         "work connections did not replicate to laptop"
@@ -93,7 +98,7 @@ async fn multi_identity_two_devices() -> Result<()> {
         private_metadata: laptop_leisure_pms,
         connections: laptop_leisure_conns,
         ..
-    } = link_device(&mut laptop, leisure_seed, TIMEOUT).await?;
+    } = link_device(&laptop, leisure_seed, TIMEOUT).await?;
     assert!(
         wait_connected(&laptop_leisure_conns, ids::CAROL, true).await?,
         "leisure connections did not replicate to laptop"
@@ -112,11 +117,11 @@ async fn multi_identity_two_devices() -> Result<()> {
         .import_namespace(ids::ALICE_AT_LEISURE, leisure_data)
         .await?;
     assert!(
-        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"work").await?,
+        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"Acme Engineering").await?,
         "work data did not replicate to laptop"
     );
     assert!(
-        wait_entry_is(&laptop, ids::ALICE_AT_LEISURE, &path, b"leisure").await?,
+        wait_entry_is(&laptop, ids::ALICE_AT_LEISURE, &path, b"Boston Bridge Club").await?,
         "leisure data did not replicate to laptop"
     );
 
@@ -129,10 +134,10 @@ async fn multi_identity_two_devices() -> Result<()> {
         "work connections stopped replicating after the second identity linked"
     );
     phone
-        .write(ids::ALICE_AT_WORK, work_author, &path, b"work-2")
+        .write(ids::ALICE_AT_WORK, work_author, &path, b"Acme Research")
         .await?;
     assert!(
-        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"work-2").await?,
+        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"Acme Research").await?,
         "work data stopped replicating after the second identity linked"
     );
 

@@ -31,7 +31,7 @@ use pdn_store::{
 };
 use pdn_types::NodeId;
 
-use crate::node::SyncNode;
+use crate::node::{read_payload, SyncNode};
 
 /// Key prefix for device records.
 const DEVICES_PREFIX: &str = "devices/";
@@ -67,7 +67,7 @@ pub struct PrivateMetadataStore {
 
 impl PrivateMetadataStore {
     /// Create a fresh private metadata store on `node`.
-    pub async fn create(node: &mut SyncNode) -> Result<Self> {
+    pub async fn create(node: &SyncNode) -> Result<Self> {
         let doc = node.new_doc().await?;
         let author = node.create_author().await?;
         Ok(Self {
@@ -79,7 +79,7 @@ impl PrivateMetadataStore {
 
     /// Import an existing private metadata store via `ticket` (the access seed
     /// handed to a newly linked device).
-    pub async fn import(node: &mut SyncNode, ticket: DocTicket) -> Result<Self> {
+    pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
         let doc = node.import_doc(ticket).await?;
         let author = node.create_author().await?;
         Ok(Self {
@@ -151,18 +151,42 @@ impl PrivateMetadataStore {
         self.doc.subscribe().await
     }
 
+    /// List the kinds under which tickets are currently published
+    /// (record-level — available as soon as the records sync; a listed
+    /// kind's ticket may still be payload-waiting in
+    /// [`get_ticket`](Self::get_ticket)). The directory's audit surface:
+    /// what routing the identity's devices can discover here — and, per the
+    /// routing/grants boundary, what must not appear (no tickets to another
+    /// identity's data stores; those live in connection metadata stores).
+    pub async fn list_ticket_kinds(&self) -> Result<Vec<String>> {
+        let query = Query::single_latest_per_key().key_prefix(TICKETS_PREFIX.as_bytes());
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut kinds = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            let Ok(key) = std::str::from_utf8(entry.key()) else {
+                continue;
+            };
+            if let Some(kind) = key.strip_prefix(TICKETS_PREFIX) {
+                kinds.push(kind.to_owned());
+            }
+        }
+        Ok(kinds)
+    }
+
     /// Read the stored ticket for store `kind`, if present and its payload has
     /// arrived. Returns `Ok(None)` while the payload is still syncing.
+    ///
+    /// A payload that does not decode is an error, not an absence: the only
+    /// writers here are the identity's own devices, so garbage is this
+    /// implementation's own bug. The counterparty-written grants of
+    /// [`ConnectionMetadataStore::read_grant`](crate::ConnectionMetadataStore::read_grant)
+    /// deliberately read the other way.
     pub async fn get_ticket(&self, kind: &str) -> Result<Option<DocTicket>> {
-        let query = Query::single_latest_per_key().key_exact(ticket_key(kind).as_bytes());
-        let Some(entry) = self.doc.get_one(query).await? else {
+        let Some(bytes) = read_payload(&self.doc, &self.blobs, ticket_key(kind).as_bytes()).await?
+        else {
             return Ok(None);
         };
-        let hash = entry.content_hash();
-        if !self.blobs.has(hash).await? {
-            return Ok(None);
-        }
-        let bytes = self.blobs.get_bytes(hash).await?.to_vec();
         let ticket = std::str::from_utf8(&bytes)?.parse::<DocTicket>()?;
         Ok(Some(ticket))
     }

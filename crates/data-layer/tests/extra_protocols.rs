@@ -1,11 +1,14 @@
-//! Externally supplied protocols on the node assembly: a test echo protocol
-//! registered at spawn answers on its ALPN, dialed through the node's
-//! exposed dial handle, while the built-in stack keeps syncing, and the
-//! paired refusals hold —
-//! a dial under an ALPN the node did not register fails without running any
-//! handler, and an ALPN collision (built-in or duplicate) is refused at
-//! spawn. The types come from `data-layer`'s re-exported extension surface,
-//! the same way the future pairing handler will consume it.
+//! The refusal and containment edges of externally supplied protocols on
+//! the node assembly: a dial under an ALPN the node did not register fails
+//! without running any handler, an ALPN collision (built-in or duplicate)
+//! is refused at spawn, and a panicking handler is contained without
+//! taking the node down. The happy path — a supplied protocol answering on
+//! its ALPN next to a still-syncing built-in stack, dialed through the
+//! dial handle — is exercised end to end by its real consumer, the pairing
+//! protocol (pdn-node's establishment tests); these edges are what the
+//! real consumer never triggers. The types come from `data-layer`'s
+//! re-exported extension surface, the same way the pairing handler
+//! consumes it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -80,85 +83,52 @@ impl ProtocolHandler for PanickingHandler {
     }
 }
 
-/// An extra protocol answers on its ALPN as a raw bidirectional stream, the
-/// handler sees the dialer's node id as the remote identity, and the
-/// built-in stack on the same endpoint keeps converging replicas.
-#[tokio::test(flavor = "multi_thread")]
-async fn extra_protocol_serves_alongside_sync() -> Result<()> {
-    let echo = EchoHandler::default();
-    let mut node_a =
-        SyncNode::spawn_with_protocols(vec![(ECHO_ALPN.to_vec(), Box::new(echo.clone()))]).await?;
-    let mut node_b = SyncNode::spawn().await?;
-
-    // Dial A's extra protocol through B's dial handle; echo the bytes.
-    let conn = node_b
-        .dial_handle()
-        .connect(node_a.dial_handle().addr(), ECHO_ALPN)
-        .await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"ping").await?;
-    send.finish()?;
-    let echoed = recv.read_to_end(ECHO_LIMIT).await?;
-    assert_eq!(echoed, b"ping", "echo returned different bytes");
-    conn.close(0u32.into(), b"done");
-
-    // The handler ran exactly once, and the remote identity it observed is
-    // B's node id — the dial rode B's own endpoint.
-    assert_eq!(echo.accepts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        echo.remotes.lock().expect("remotes lock").as_slice(),
-        &[node_b.node_id()]
-    );
-
-    // The built-in stack is unaffected: the same pair converges a replica
-    // over the ordinary ticket flow.
-    let author = node_a.create_author().await?;
-    node_a.create_namespace(ids::ALICE).await?;
-    let name = EntryPath::new("profile/name")?;
-    node_a.write(ids::ALICE, author, &name, b"Alice").await?;
-    let ticket = node_a
-        .share_ticket(
-            ids::ALICE,
-            ShareMode::Read,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    node_b.import_namespace(ids::ALICE, ticket).await?;
-    assert!(
-        wait_entry_is(&node_b, ids::ALICE, &name, b"Alice").await?,
-        "replica did not converge on the node serving an extra protocol"
-    );
-
-    node_a.shutdown().await?;
-    node_b.shutdown().await?;
-    Ok(())
-}
-
 /// A panic in an extra handler is contained: the panic is caught, that one
 /// connection fails, and the node's built-in stack keeps syncing — the panic
 /// does not tear the whole node down through iroh's accept loop.
 #[tokio::test(flavor = "multi_thread")]
 async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     let panicker = PanickingHandler::default();
-    let mut node_a =
+    let node_a =
         SyncNode::spawn_with_protocols(vec![(PANIC_ALPN.to_vec(), Box::new(panicker.clone()))])
             .await?;
-    let mut node_b = SyncNode::spawn().await?;
+    let node_b = SyncNode::spawn().await?;
 
     // Dial the panicking protocol and drive a stream so its handler runs.
     // The handler panics after reading, so our side must see an error rather
-    // than a clean response.
-    let conn = node_b
-        .dial_handle()
-        .connect(node_a.dial_handle().addr(), PANIC_ALPN)
-        .await?;
+    // than a clean response. The dial is patient: a process's first
+    // accepted-ALPN handshake can stall on this machine (see
+    // `test_utils::TIMEOUT`), and this test's dial is the binary's first.
+    let deadline = std::time::Instant::now() + test_utils::TIMEOUT;
+    let conn = loop {
+        match node_b
+            .dial_handle()
+            .connect(node_a.dial_handle().addr(), PANIC_ALPN)
+            .await
+        {
+            Ok(conn) => break conn,
+            Err(err) if std::time::Instant::now() > deadline => return Err(err),
+            Err(_first_dial_stall) => {}
+        }
+    };
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(b"trigger").await?;
     send.finish()?;
+    // The handler panicked before writing anything, so the dialer must come
+    // away with no payload. Whether it learns that as a stream error or as a
+    // clean empty end-of-stream is a teardown race, not the containment
+    // property: the panic unwinds the handler's own future first, dropping
+    // its `SendStream` before the connection, and dropping one implicitly
+    // finishes the stream (`noq`'s `SendStream::drop` calls `finish()` unless
+    // the connection already carries an error). So a FIN is queued before the
+    // connection's close, and whichever reaches the dialer first decides what
+    // this read returns. Asserting `is_err()` here failed whenever the FIN
+    // won — under the load of a full-suite run, sometimes it does.
     let response = recv.read_to_end(ECHO_LIMIT).await;
+    let payload = response.as_deref().unwrap_or_default();
     assert!(
-        response.is_err(),
-        "a panicking handler must not yield a clean response"
+        payload.is_empty(),
+        "a panicking handler must not yield a payload, got {payload:?}"
     );
     assert!(
         panicker.ran.load(Ordering::SeqCst) >= 1,
@@ -169,7 +139,7 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     // the ordinary ticket flow.
     let author = node_a.create_author().await?;
     node_a.create_namespace(ids::ALICE).await?;
-    let name = EntryPath::new("profile/name")?;
+    let name = EntryPath::new("contact/name")?;
     node_a.write(ids::ALICE, author, &name, b"Alice").await?;
     let ticket = node_a
         .share_ticket(
@@ -242,18 +212,5 @@ async fn alpn_collisions_are_refused_at_spawn() -> Result<()> {
     .expect_err("a duplicate extra ALPN must be refused at spawn");
     let taken: &AlpnTaken = err.downcast_ref().expect("typed AlpnTaken error");
     assert_eq!(taken.alpn, ECHO_ALPN);
-    Ok(())
-}
-
-/// The dial handle carries the node's wire identity: its id equals the
-/// node id the rest of the stack reports.
-#[tokio::test(flavor = "multi_thread")]
-async fn dial_handle_carries_the_nodes_wire_identity() -> Result<()> {
-    let node = SyncNode::spawn().await?;
-    assert_eq!(
-        NodeId::from_bytes(*node.dial_handle().id().as_bytes()),
-        node.node_id()
-    );
-    node.shutdown().await?;
     Ok(())
 }

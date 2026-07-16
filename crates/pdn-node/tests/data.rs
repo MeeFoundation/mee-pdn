@@ -13,8 +13,8 @@ async fn writes_read_back_list_exactly_and_hand_over_by_ticket() -> Result<()> {
     let b = Runtime::spawn().await?;
 
     let alice = a.identity().create().await?;
-    let email = EntryPath::new("contacts/email")?;
-    let phone = EntryPath::new("contacts/phone")?;
+    let email = EntryPath::new("contact/email")?;
+    let phone = EntryPath::new("contact/phone")?;
 
     // Local write then read.
     a.data().write(alice, &email, b"alice@example.org").await?;
@@ -33,7 +33,7 @@ async fn writes_read_back_list_exactly_and_hand_over_by_ticket() -> Result<()> {
         .map(|e| e.path.to_string())
         .collect();
     listed.sort();
-    assert_eq!(listed, ["contacts/email", "contacts/phone"]);
+    assert_eq!(listed, ["contact/email", "contact/phone"]);
 
     // Paired deny, before any handover: on B the issuer was neither
     // created nor imported, so read, write, and list are each refused as

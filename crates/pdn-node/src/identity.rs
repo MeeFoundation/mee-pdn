@@ -52,7 +52,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
     async fn create(&self) -> Result<PdnId> {
         let identity = PdnId::from_bytes(rand::random());
         let mut state = self.runtime.state.lock().await;
-        let stores = provision_identity(&mut state.node).await?;
+        let stores = provision_identity(&state.node).await?;
         state.node.create_namespace(identity).await?;
         state.identities.insert(identity, stores);
         Ok(identity)
@@ -75,7 +75,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
         if state.identities.contains_key(&identity) {
             bail!("identity already hosted on this runtime: {identity}");
         }
-        let stores = link_device(&mut state.node, seed, timeout).await?;
+        let stores = link_device(&state.node, seed, timeout).await?;
         state.identities.insert(identity, stores);
         Ok(())
     }

@@ -20,8 +20,8 @@ use test_utils::{eventually, ids, wait_connected, wait_devices, TIMEOUT};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn device_linking_bootstrap() -> Result<()> {
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
 
@@ -30,7 +30,7 @@ async fn device_linking_bootstrap() -> Result<()> {
         private_metadata: phone_pms,
         connections: phone_conns,
         ..
-    } = provision_identity(&mut phone).await?;
+    } = provision_identity(&phone).await?;
     phone_conns.connect(ids::BOB).await?;
 
     // The one thing handed to the new device — the QR payload.
@@ -43,7 +43,7 @@ async fn device_linking_bootstrap() -> Result<()> {
         private_metadata: laptop_pms,
         connections: laptop_conns,
         ..
-    } = link_device(&mut laptop, seed, TIMEOUT).await?;
+    } = link_device(&laptop, seed, TIMEOUT).await?;
 
     // The store discovered through the directory replicates the Bob connection.
     assert!(
@@ -70,16 +70,16 @@ async fn device_linking_bootstrap() -> Result<()> {
 /// a timeout error — the documented behavior — rather than hanging.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_times_out_without_connections_ticket() -> Result<()> {
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
 
     // A bare directory: no connections ticket is ever published into it.
-    let pms = PrivateMetadataStore::create(&mut phone).await?;
+    let pms = PrivateMetadataStore::create(&phone).await?;
     let seed = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
-    let err = link_device(&mut laptop, seed, Duration::from_secs(2))
+    let err = link_device(&laptop, seed, Duration::from_secs(2))
         .await
         .unwrap_err();
     assert!(
@@ -96,20 +96,20 @@ async fn linking_times_out_without_connections_ticket() -> Result<()> {
 /// twice: the stores come up again and the device set holds each device once.
 #[tokio::test(flavor = "multi_thread")]
 async fn relinking_with_same_seed_is_harmless() -> Result<()> {
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
 
-    let stores = provision_identity(&mut phone).await?;
+    let stores = provision_identity(&phone).await?;
     stores.connections.connect(ids::BOB).await?;
     let seed = stores
         .private_metadata
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
-    let _first = link_device(&mut laptop, seed.clone(), TIMEOUT).await?;
-    let again = link_device(&mut laptop, seed, TIMEOUT).await?;
+    let _first = link_device(&laptop, seed.clone(), TIMEOUT).await?;
+    let again = link_device(&laptop, seed, TIMEOUT).await?;
 
     assert!(
         wait_connected(&again.connections, ids::BOB, true).await?,
@@ -134,10 +134,10 @@ async fn relinking_with_same_seed_is_harmless() -> Result<()> {
 /// itself in the device set, and `link_device` reports the failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn read_only_seed_cannot_link() -> Result<()> {
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
 
-    let stores = provision_identity(&mut phone).await?;
+    let stores = provision_identity(&phone).await?;
     let read_seed = stores
         .private_metadata
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
@@ -146,7 +146,7 @@ async fn read_only_seed_cannot_link() -> Result<()> {
     // The directory replicates (read is enough to sync) and the connections
     // ticket is found, but registering the device is a write — it must fail.
     // The exact error type belongs to the fork, so only failure is asserted.
-    let result = link_device(&mut laptop, read_seed, TIMEOUT).await;
+    let result = link_device(&laptop, read_seed, TIMEOUT).await;
     assert!(result.is_err(), "linking with a read-only seed succeeded");
 
     phone.shutdown().await?;
@@ -159,12 +159,12 @@ async fn read_only_seed_cannot_link() -> Result<()> {
 /// is `None` on the record alone).
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_carries_arbitrary_tickets() -> Result<()> {
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
 
     // Any ticket serves as payload — here, a fresh connections store's.
-    let phone_pms = PrivateMetadataStore::create(&mut phone).await?;
-    let payload_ticket = ConnectionsStore::create(&mut phone)
+    let phone_pms = PrivateMetadataStore::create(&phone).await?;
+    let payload_ticket = ConnectionsStore::create(&phone)
         .await?
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -173,7 +173,7 @@ async fn directory_carries_arbitrary_tickets() -> Result<()> {
     let seed = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_pms = PrivateMetadataStore::import(&mut laptop, seed).await?;
+    let laptop_pms = PrivateMetadataStore::import(&laptop, seed).await?;
 
     let arrived =
         eventually(|| async { Ok(laptop_pms.get_ticket("data").await?.is_some()) }).await?;
