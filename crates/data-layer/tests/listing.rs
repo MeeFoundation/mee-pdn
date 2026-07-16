@@ -12,12 +12,17 @@ use test_utils::ids;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> Result<()> {
-    let mut node = SyncNode::spawn().await?;
+    let node = SyncNode::spawn().await?;
     let author = node.create_author().await?;
     node.create_namespace(ids::ALICE).await?;
 
     // Payload lengths 1..=4, so the metadata is checkable per path.
-    let paths = ["contacts/a", "contacts/b", "contactsx/c", "profile/name"];
+    let paths = [
+        "banking/iban",
+        "contact/email",
+        "contact/phone",
+        "contacts/emergency",
+    ];
     for (i, path) in paths.iter().enumerate() {
         node.write(
             ids::ALICE,
@@ -45,14 +50,14 @@ async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> R
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(listed, expected);
 
-    // The prefix filter matches whole components: `contacts` matches
-    // `contacts/a` and `contacts/b`, not `contactsx/c`.
+    // The prefix filter matches whole components: `contact` matches
+    // `contact/email` and `contact/phone`, not `contacts/emergency`.
     let filtered = node
-        .list(ids::ALICE, Some(&EntryPath::new("contacts")?))
+        .list(ids::ALICE, Some(&EntryPath::new("contact")?))
         .await?;
     let mut filtered_paths: Vec<&str> = filtered.iter().map(|e| e.path.as_str()).collect();
     filtered_paths.sort_unstable();
-    assert_eq!(filtered_paths, ["contacts/a", "contacts/b"]);
+    assert_eq!(filtered_paths, ["contact/email", "contact/phone"]);
 
     // Paired deny: an issuer with no data store on this node is refused as
     // specifically unknown, not a generic failure.

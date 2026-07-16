@@ -8,11 +8,18 @@ description = "Embeddable node runtime: identity, connections, data, and sync se
 anyhow = "1"
 data-layer = { path = "../data-layer" }
 pdn-types = { path = "../pdn-types" }
+# Wire messages of the pairing dialogue.
+# Per-crate, matching the in-tree 1.1.3 from pdn-store
+postcard = { version = "1.1.3", features = ["use-std"] }
 rand = "0.10"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
+# Scenario tests probe an identity's directory through its linking seed —
+# the store-level view of what establishment published.
+data-layer = { path = "../data-layer" }
 test-utils = { path = "../test-utils" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

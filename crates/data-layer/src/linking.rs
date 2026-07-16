@@ -71,7 +71,7 @@ pub struct IdentityStores {
 /// ([`PrivateMetadataStore::share_ticket`]) the caller hands over out of
 /// band. Data namespaces are not provisioned here; their discovery at
 /// linking is deferred (ADR-0009).
-pub async fn provision_identity(node: &mut SyncNode) -> Result<IdentityStores> {
+pub async fn provision_identity(node: &SyncNode) -> Result<IdentityStores> {
     let connections = ConnectionsStore::create(node).await?;
     // Write access and dialable addresses: every device of the identity
     // writes to the shared store, and a linking device dials from the ticket.
@@ -106,7 +106,7 @@ pub async fn provision_identity(node: &mut SyncNode) -> Result<IdentityStores> {
 /// observes. A stalled directory — and a registration that cannot be
 /// delivered — surfaces as a timeout error, not a hang.
 pub async fn link_device(
-    node: &mut SyncNode,
+    node: &SyncNode,
     seed: DocTicket,
     timeout: Duration,
 ) -> Result<IdentityStores> {

@@ -28,9 +28,16 @@ pub mod ids {
 }
 
 /// Generous liveness ceiling — a "must eventually replicate" bound, not a
-/// correctness one: a larger value only tolerates slow/loaded CI runners, it
-/// never makes an assertion wrong.
-pub const TIMEOUT: Duration = Duration::from_secs(60);
+/// correctness one. Generosity is free: polls return the moment their
+/// condition holds, so a green run never pays this ceiling, and a larger
+/// value only tolerates slow environments — it never makes an assertion
+/// wrong. What it must absorb is the cold start every fresh process pays on
+/// its first dials — sockets, routes, and peers from zero, plus OS-level
+/// vetting of a newly built binary (worst observed: per-binary firewall and
+/// scan gating on macOS stalling early packets for tens of seconds when
+/// several nodes come up at once). Shrinking it makes no green run faster;
+/// it only turns slow-but-healthy cold starts into first-run-only flakes.
+pub const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Poll `check` every 100ms until it returns `true` or [`TIMEOUT`] elapses;
 /// the return says whether the condition was observed in time.

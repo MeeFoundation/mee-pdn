@@ -1,5 +1,7 @@
 //! Host smoke tests: liveness while the embedded runtime runs, and the
-//! debug gate — off means absent.
+//! debug gate — off means absent. The debug routes themselves are demo
+//! scaffolding with an unpinned shape, so only the gate is asserted, not
+//! their existence or form.
 
 use std::sync::Arc;
 
@@ -26,22 +28,6 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
         .oneshot(Request::get("/debug/status").body(Body::empty())?)
         .await?;
     assert_eq!(debug.status(), StatusCode::NOT_FOUND);
-
-    if let Ok(runtime) = Arc::try_unwrap(runtime) {
-        runtime.shutdown().await?;
-    }
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn debug_routes_exist_behind_the_flag() -> Result<()> {
-    let runtime = Arc::new(Runtime::spawn().await?);
-    let app = router(Arc::clone(&runtime), true);
-
-    let debug = app
-        .oneshot(Request::get("/debug/status").body(Body::empty())?)
-        .await?;
-    assert_eq!(debug.status(), StatusCode::OK);
 
     if let Ok(runtime) = Arc::try_unwrap(runtime) {
         runtime.shutdown().await?;

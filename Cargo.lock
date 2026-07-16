@@ -1834,7 +1834,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.101.0"
-source = "git+https://github.com/MeeFoundation/pdn-store.git#1c511e1377c2ffdd2bfd8ba219cc71e1a6829c56"
+source = "git+https://github.com/MeeFoundation/pdn-store.git#0d263f5ed9668dab1dfa02dac6d8ab8e5cf9d386"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2788,7 +2788,9 @@ dependencies = [
  "anyhow",
  "data-layer",
  "pdn-types",
+ "postcard",
  "rand",
+ "serde",
  "test-utils",
  "thiserror 2.0.18",
  "tokio",

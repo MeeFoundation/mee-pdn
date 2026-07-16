@@ -26,7 +26,7 @@ use pdn_store::{
     },
     protocol::Docs,
     store::Query,
-    AuthorId, DocTicket, ALPN as DOCS_ALPN,
+    AuthorId, DocTicket, NamespaceId, ALPN as DOCS_ALPN,
 };
 use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
 use tokio::sync::oneshot;
@@ -70,8 +70,17 @@ pub struct AlpnTaken {
 /// cannot escape into iroh's router accept loop, where iroh treats a
 /// panicking handler task as fatal and tears the whole node down — gossip,
 /// docs, and blobs with it. A caught panic drops just that one connection
-/// (iroh logs the returned error) and the node keeps serving. This does not
-/// survive a `panic = "abort"` build; the contract on
+/// (iroh logs the returned error) and the node keeps serving.
+///
+/// Containment is a promise about the node, not about what the dialer's
+/// stream read returns. The panic unwinds the handler's own future first,
+/// dropping its `SendStream` before the connection, and dropping one
+/// implicitly finishes the stream — so a FIN is queued before the
+/// connection's close, and a dialer may observe a clean empty
+/// end-of-stream rather than an error, whichever reaches it first. Nothing
+/// here can change that: the guard only runs once the unwind is over.
+///
+/// This does not survive a `panic = "abort"` build; the contract on
 /// [`SyncNode::spawn_with_protocols`] still asks handlers not to panic.
 #[derive(Debug)]
 struct PanicGuarded {
@@ -102,12 +111,15 @@ impl ProtocolHandler for PanicGuarded {
 /// Gossip broadcasts are best-effort: one fired into a still-forming or
 /// quietly degraded neighborhood is lost, and the rescue triggers
 /// (neighbor-up, sync reports) ride that same gossip — without this pass a
-/// late write can starve until some unrelated contact. The engine re-dials
-/// the peers it has recorded as useful for each doc, so the pass keeps no
-/// peer bookkeeping of its own, and pairs with a sync already running are
-/// skipped by the engine's session state. Sized for interactive replicas
-/// with a handful of peers; reconcile-on-access replaces it when
-/// subset-rbsr lands.
+/// late write can starve until some unrelated contact. Each pass re-dials a
+/// doc's import-time contacts plus the peers the engine has recorded as
+/// useful for it; the import contacts matter because the engine records a
+/// peer only after one *successful* exchange — if a doc's initial exchange
+/// dies, there is no recorded peer to re-dial, and without the import
+/// contacts the replica would starve permanently on one transient failure.
+/// Pairs with a sync already running are skipped by the engine's session
+/// state. Sized for interactive replicas with a handful of peers;
+/// reconcile-on-access replaces it when subset-rbsr lands.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// One running node: iroh endpoint, gossip, in-memory blob store, and the
@@ -134,10 +146,21 @@ pub struct SyncNode {
     registry: Registry,
     /// Every doc handle this node opened — data namespaces and device-shared
     /// stores alike — for the periodic reconcile pass.
-    tracked_docs: Arc<Mutex<Vec<Doc>>>,
+    tracked_docs: Arc<Mutex<Vec<TrackedDoc>>>,
     /// Ends the periodic reconcile pass when dropped — with the node — or by
     /// the explicit send in [`SyncNode::shutdown`].
     reconciler_stop: oneshot::Sender<()>,
+}
+
+/// One doc under the periodic reconcile pass: the handle, plus the contacts
+/// its import ticket carried (empty for docs created here). The contacts
+/// keep a replica whose initial exchange died reachable — the engine
+/// records a peer as useful only after one successful exchange, so they are
+/// the only recovery path until that first success.
+#[derive(Debug, Clone)]
+struct TrackedDoc {
+    doc: Doc,
+    contacts: Vec<EndpointAddr>,
 }
 
 /// The dial side of a node's protocols, handed out by
@@ -204,7 +227,7 @@ impl SyncNode {
             }
         }
 
-        let endpoint = Endpoint::bind(presets::Minimal).await?;
+        let endpoint = bind_endpoint().await?;
         let blobs = MemStore::default();
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
@@ -220,14 +243,11 @@ impl SyncNode {
         // Each extra is wrapped so a panic in its handler cannot escape into
         // iroh's accept loop, where a panicking task is fatal to the whole
         // node (`PanicGuarded`).
-        // Each extra is wrapped so a panic in its handler cannot escape into
-        // iroh's accept loop, where a panicking task is fatal to the whole
-        // node (`PanicGuarded`).
         for (alpn, handler) in extra_protocols {
             router = router.accept(alpn, PanicGuarded { inner: handler });
         }
         let router = router.spawn();
-        let tracked_docs: Arc<Mutex<Vec<Doc>>> = Arc::default();
+        let tracked_docs: Arc<Mutex<Vec<TrackedDoc>>> = Arc::default();
         let (reconciler_stop, stop) = oneshot::channel();
         let _detached = tokio::spawn(reconcile_pass(Arc::clone(&tracked_docs), stop));
         Ok(Self {
@@ -241,17 +261,17 @@ impl SyncNode {
     }
 
     /// Create a fresh doc and register it as the data namespace of `issuer`.
-    pub async fn create_namespace(&mut self, issuer: PdnId) -> Result<()> {
+    pub async fn create_namespace(&self, issuer: PdnId) -> Result<()> {
         let doc = self.new_doc().await?;
-        self.registry.register_data(issuer, doc);
+        self.registry.register_data(issuer, doc)?;
         Ok(())
     }
 
     /// Import a doc shared via `ticket` and register it as the data namespace
     /// of `issuer`, so reads and writes under `issuer` resolve to it.
-    pub async fn import_namespace(&mut self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
+    pub async fn import_namespace(&self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
         let doc = self.import_doc(ticket).await?;
-        self.registry.register_data(issuer, doc);
+        self.registry.register_data(issuer, doc)?;
         Ok(())
     }
 
@@ -259,28 +279,52 @@ impl SyncNode {
     /// for the store handle ([`ConnectionsStore`](crate::ConnectionsStore),
     /// [`PrivateMetadataStore`](crate::PrivateMetadataStore)) to hold. The
     /// doc joins the periodic reconcile pass.
-    pub(crate) async fn new_doc(&mut self) -> Result<Doc> {
+    pub(crate) async fn new_doc(&self) -> Result<Doc> {
         let doc = self.docs.create().await?;
-        self.track(&doc)?;
+        self.track(&doc, Vec::new())?;
         Ok(doc)
     }
 
-    /// Import a device-shared store's doc from `ticket` (device linking).
-    /// Returns the backing doc for the store handle to hold. The doc joins
-    /// the periodic reconcile pass.
-    pub(crate) async fn import_doc(&mut self, ticket: DocTicket) -> Result<Doc> {
+    /// Import a device-shared store's doc from `ticket` (device linking,
+    /// connection metadata). Returns the backing doc for the store handle to
+    /// hold. The doc joins the periodic reconcile pass together with the
+    /// ticket's contacts, so a replica whose initial exchange died is
+    /// re-dialed rather than starved.
+    pub(crate) async fn import_doc(&self, ticket: DocTicket) -> Result<Doc> {
+        let contacts = ticket.nodes.clone();
         let doc = self.docs.import(ticket).await?;
-        self.track(&doc)?;
+        self.track(&doc, contacts)?;
         Ok(doc)
     }
 
-    /// Register `doc` with the periodic reconcile pass.
-    fn track(&self, doc: &Doc) -> Result<()> {
+    /// Register `doc` with the periodic reconcile pass, re-contactable at
+    /// `contacts` (its import ticket's peers; empty for docs created here).
+    fn track(&self, doc: &Doc, contacts: Vec<EndpointAddr>) -> Result<()> {
         let mut docs = self
             .tracked_docs
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
-        docs.push(doc.clone());
+        docs.push(TrackedDoc {
+            doc: doc.clone(),
+            contacts,
+        });
+        Ok(())
+    }
+
+    /// Forget a doc: stop reconciling it and drop the replica. Rolls back a
+    /// metadata replica minted for an establishment that then failed before
+    /// it committed, so a refused pairing leaves no orphan re-synced for the
+    /// node's life. Untracks before dropping, so the reconcile pass never
+    /// re-dials a dropped replica.
+    pub async fn forget_doc(&self, namespace: NamespaceId) -> Result<()> {
+        {
+            let mut docs = self
+                .tracked_docs
+                .lock()
+                .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+            docs.retain(|tracked| tracked.doc.id() != namespace);
+        }
+        self.docs.drop_doc(namespace).await?;
         Ok(())
     }
 
@@ -348,18 +392,7 @@ impl SyncNode {
     /// "readable". Poll again for the payload to become available.
     pub async fn read(&self, issuer: PdnId, path: &EntryPath) -> Result<Option<Vec<u8>>> {
         let doc = self.doc(issuer)?;
-        let query = Query::single_latest_per_key().key_exact(path.as_str().as_bytes());
-        match doc.get_one(query).await? {
-            Some(entry) => {
-                let hash = entry.content_hash();
-                if !self.blobs.has(hash).await? {
-                    return Ok(None);
-                }
-                let bytes = self.blobs.get_bytes(hash).await?;
-                Ok(Some(bytes.to_vec()))
-            }
-            None => Ok(None),
-        }
+        read_payload(&doc, &self.blobs, path.as_str().as_bytes()).await
     }
 
     /// List entry metadata in the data namespace of `issuer` — no payload
@@ -415,37 +448,85 @@ impl SyncNode {
         Ok(())
     }
 
-    fn doc(&self, issuer: PdnId) -> Result<&Doc> {
-        Ok(self
-            .registry
-            .data_doc(issuer)
-            .ok_or(UnknownIssuer { issuer })?)
+    fn doc(&self, issuer: PdnId) -> Result<Doc> {
+        self.registry
+            .data_doc(issuer)?
+            .ok_or_else(|| UnknownIssuer { issuer }.into())
     }
 }
 
+/// Bind the node's endpoint: all interfaces by default; loopback only when
+/// the `PDN_BIND_LOOPBACK` environment variable is `1`.
+///
+/// The loopback mode exists for in-process scenario tests (the just
+/// recipes set the variable): with it the endpoint binds — and therefore
+/// advertises — `127.0.0.1`/`[::1]`, so test traffic never crosses a host
+/// firewall. Without it, nodes on one machine reach each other through the
+/// host's LAN address, where a host firewall can delay the first datagrams
+/// of every fresh flow for seconds to minutes (observed on macOS) and
+/// starve one-shot dials. Production spawns leave the variable unset.
+async fn bind_endpoint() -> Result<Endpoint> {
+    let builder = Endpoint::builder(presets::Minimal);
+    let builder = if std::env::var("PDN_BIND_LOOPBACK").is_ok_and(|v| v == "1") {
+        builder.bind_addr("127.0.0.1:0")?.bind_addr("[::1]:0")?
+    } else {
+        builder
+    };
+    Ok(builder.bind().await?)
+}
+
+/// Read the latest entry at `key` and its payload, if the record is here and
+/// its blob has arrived.
+///
+/// `Ok(None)` covers both "no such entry" and "the entry is stored but its
+/// payload has not been fetched yet": entry records and blob content travel
+/// independently — sync inserts the record, the downloader fetches the bytes
+/// — so "stored" precedes "readable", and consumers poll. Every
+/// payload-waiting read in this layer goes through here, so that rule lives
+/// in one place; what a caller makes of the bytes — and of bytes it cannot
+/// decode — is the caller's own, and the only thing left at its call site.
+pub(crate) async fn read_payload(
+    doc: &Doc,
+    blobs: &iroh_blobs::api::Store,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let query = Query::single_latest_per_key().key_exact(key);
+    let Some(entry) = doc.get_one(query).await? else {
+        return Ok(None);
+    };
+    let hash = entry.content_hash();
+    if !blobs.has(hash).await? {
+        return Ok(None);
+    }
+    Ok(Some(blobs.get_bytes(hash).await?.to_vec()))
+}
+
 /// The periodic reconcile pass: every [`RECONCILE_INTERVAL`], re-request a
-/// sync for each tracked doc. `start_sync` with no explicit peers has the
-/// engine re-dial the peers it recorded as useful for that doc; a request
+/// sync for each tracked doc with its import-time contacts. The engine
+/// unions those with the peers it recorded as useful for the doc; a request
 /// against a pair whose sync is already running is dropped by the engine's
 /// session state, and a failed request is simply retried by the next pass.
+/// The import contacts are what rescue a replica whose initial exchange
+/// died — the engine records peers only on a successful exchange, so until
+/// the first success there is nothing recorded to re-dial.
 ///
 /// Paced by timing out the wait on `stop`: the pass ends when the stop is
 /// sent ([`SyncNode::shutdown`]) or its sender is dropped with the node.
-async fn reconcile_pass(docs: Arc<Mutex<Vec<Doc>>>, mut stop: oneshot::Receiver<()>) {
+async fn reconcile_pass(docs: Arc<Mutex<Vec<TrackedDoc>>>, mut stop: oneshot::Receiver<()>) {
     while tokio::time::timeout(RECONCILE_INTERVAL, &mut stop)
         .await
         .is_err()
     {
-        let snapshot: Vec<Doc> = match docs.lock() {
+        let snapshot: Vec<TrackedDoc> = match docs.lock() {
             Ok(guard) => guard.clone(),
             // A poisoned lock means a tracking write panicked; skip this
             // pass rather than poison the task — the next tick retries.
             Err(_poisoned) => continue,
         };
-        for doc in snapshot {
+        for tracked in snapshot {
             // Best-effort by design: a failed re-request is not an error of
             // the pass, the next tick retries it.
-            let _ = doc.start_sync(Vec::new()).await;
+            let _ = tracked.doc.start_sync(tracked.contacts).await;
         }
     }
 }

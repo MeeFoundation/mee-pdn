@@ -51,7 +51,7 @@ async fn import_data_from(from: &SyncNode, to: &mut SyncNode, issuer: PdnId) -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn three_devices_two_identities() -> Result<()> {
-    let path = EntryPath::new("k")?;
+    let path = EntryPath::new("affiliation/group")?;
 
     let mut phone = SyncNode::spawn().await?;
     let mut laptop = SyncNode::spawn().await?;
@@ -61,24 +61,30 @@ async fn three_devices_two_identities() -> Result<()> {
     let tablet_id = tablet.node_id();
 
     // Phone provisions both identities, each with a connection and one entry.
-    let (work_phone, work_seed) =
-        provision_with_fixtures(&mut phone, ids::ALICE_AT_WORK, ids::BOB, &path, b"work").await?;
+    let (work_phone, work_seed) = provision_with_fixtures(
+        &mut phone,
+        ids::ALICE_AT_WORK,
+        ids::BOB,
+        &path,
+        b"Acme Engineering",
+    )
+    .await?;
     let (_leisure_phone, leisure_seed) = provision_with_fixtures(
         &mut phone,
         ids::ALICE_AT_LEISURE,
         ids::CAROL,
         &path,
-        b"leisure",
+        b"Boston Bridge Club",
     )
     .await?;
 
     // Laptop links into both identities from phone's seeds and imports the
     // work data namespace (data discovery at linking is deferred, ADR-0009).
-    let work_laptop = link_device(&mut laptop, work_seed, TIMEOUT).await?;
-    let leisure_laptop = link_device(&mut laptop, leisure_seed, TIMEOUT).await?;
+    let work_laptop = link_device(&laptop, work_seed, TIMEOUT).await?;
+    let leisure_laptop = link_device(&laptop, leisure_seed, TIMEOUT).await?;
     import_data_from(&phone, &mut laptop, ids::ALICE_AT_WORK).await?;
     assert!(
-        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"work").await?,
+        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"Acme Engineering").await?,
         "work data did not reach laptop"
     );
 
@@ -87,7 +93,7 @@ async fn three_devices_two_identities() -> Result<()> {
         .private_metadata
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let work_tablet = link_device(&mut tablet, tablet_seed, TIMEOUT).await?;
+    let work_tablet = link_device(&tablet, tablet_seed, TIMEOUT).await?;
     import_data_from(&laptop, &mut tablet, ids::ALICE_AT_WORK).await?;
 
     // Transitive catch-up: state authored on phone reaches the tablet
@@ -97,7 +103,7 @@ async fn three_devices_two_identities() -> Result<()> {
         "the Bob connection did not reach the tablet"
     );
     assert!(
-        wait_entry_is(&tablet, ids::ALICE_AT_WORK, &path, b"work").await?,
+        wait_entry_is(&tablet, ids::ALICE_AT_WORK, &path, b"Acme Engineering").await?,
         "work data did not reach the tablet"
     );
 

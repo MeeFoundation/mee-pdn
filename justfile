@@ -28,26 +28,31 @@ setup-tooling:
   cargo install cargo-watch
   rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
-# Run workspace unit tests
+# Run workspace unit tests (test nodes bind loopback — see data-layer node.rs)
 test:
   #!/bin/sh
   set -eux
+  export PDN_BIND_LOOPBACK=1
   cargo test --workspace --all-targets
 
-# Test in release mode
+# Test in release mode (test nodes bind loopback — see data-layer node.rs)
 test-release:
   #!/bin/sh
   set -eux
+  export PDN_BIND_LOOPBACK=1
   cargo test --workspace --release --all-targets
 
-# Stress scenario tests: every integration-test binary in a counted loop, one verdict line per run, full output kept for failures only (see mia-docs flaky-tests.md)
-stress iterations="300":
+# Stress scenario tests: every integration-test binary in a counted loop, one verdict line per run, full output kept for failures only (see mia-docs flaky-tests.md). `only`/`skip` narrow the binary set by comma-separated substrings of `crate--name` (e.g. `just stress 300 connection_metadata`, `just stress 100 "" connection_metadata`).
+stress iterations="300" only="" skip="":
   #!/bin/sh
   set -eu
+  export PDN_BIND_LOOPBACK=1
   out="target/stress/$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$out/failures"
   cargo test --workspace --no-run --message-format=json 2>"$out/build.log" | python3 -c '
   import json, sys
+  only = [s for s in "{{ only }}".split(",") if s]
+  skip = [s for s in "{{ skip }}".split(",") if s]
   for line in sys.stdin:
       try:
           m = json.loads(line)
@@ -62,9 +67,15 @@ stress iterations="300":
       if "/crates/" not in src:
           continue
       crate = src.split("/crates/")[1].split("/")[0]
-      print(crate + "--" + t["name"] + " " + m["executable"])
+      name = crate + "--" + t["name"]
+      if only and not any(s in name for s in only):
+          continue
+      if any(s in name for s in skip):
+          continue
+      print(name + " " + m["executable"])
   ' | sort > "$out/binaries.txt"
   ln -sfn "$(basename "$out")" target/stress/latest
+  if ! [ -s "$out/binaries.txt" ]; then echo "no binaries match only={{ only }} skip={{ skip }}"; exit 2; fi
   echo "binaries under stress:"
   cat "$out/binaries.txt"
   echo "watch progress: tail -f target/stress/latest/stress.log"

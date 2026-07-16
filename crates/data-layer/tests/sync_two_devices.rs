@@ -17,26 +17,26 @@ use test_utils::{eventually, ids, wait_connected, wait_entry_is};
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_two_devices() -> Result<()> {
     // Two devices of Alice
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
 
     // Phone owns the connections store and already has a connection to Bob
     // before the laptop links — so the laptop must catch this up via the
     // initial set-reconciliation when it imports.
-    let phone_conns = ConnectionsStore::create(&mut phone).await?;
+    let phone_conns = ConnectionsStore::create(&phone).await?;
     phone_conns.connect(ids::BOB).await?;
 
     // Phone also issues Alice's data namespace, with one entry written
     // before the laptop imports — same catch-up path, data-namespace store.
     let author = phone.create_author().await?;
     phone.create_namespace(ids::ALICE).await?;
-    let name = EntryPath::new("profile/name")?;
+    let name = EntryPath::new("contact/name")?;
     phone.write(ids::ALICE, author, &name, b"Alice").await?;
 
     let conns_ticket = phone_conns
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_conns = ConnectionsStore::import(&mut laptop, conns_ticket).await?;
+    let laptop_conns = ConnectionsStore::import(&laptop, conns_ticket).await?;
 
     let data_ticket = phone
         .share_ticket(
@@ -56,7 +56,7 @@ async fn sync_two_devices() -> Result<()> {
     // Catch-up: the pre-import data entry replicates to laptop.
     assert!(
         wait_entry_is(&laptop, ids::ALICE, &name, b"Alice").await?,
-        "laptop did not catch up the profile/name entry from phone"
+        "laptop did not catch up the contact/name entry from phone"
     );
 
     // Live update: a fresh disconnect on phone propagates to laptop (the
@@ -68,13 +68,13 @@ async fn sync_two_devices() -> Result<()> {
     );
 
     // Live update: a fresh data write on phone reaches laptop the same way.
-    let email = EntryPath::new("profile/email")?;
+    let email = EntryPath::new("contact/email")?;
     phone
         .write(ids::ALICE, author, &email, b"alice@example.org")
         .await?;
     assert!(
         wait_entry_is(&laptop, ids::ALICE, &email, b"alice@example.org").await?,
-        "laptop did not observe the live profile/email write from phone"
+        "laptop did not observe the live contact/email write from phone"
     );
 
     phone.shutdown().await?;
@@ -87,8 +87,8 @@ async fn sync_two_devices() -> Result<()> {
 /// and is deliberately not asserted — only that the devices agree.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_converge() -> Result<()> {
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
+    let phone = SyncNode::spawn().await?;
+    let laptop = SyncNode::spawn().await?;
 
     let phone_author = phone.create_author().await?;
     let laptop_author = laptop.create_author().await?;
@@ -103,7 +103,7 @@ async fn concurrent_writes_converge() -> Result<()> {
     laptop.import_namespace(ids::ALICE, ticket).await?;
 
     // Both devices write the contested key with no coordination.
-    let contested = EntryPath::new("k")?;
+    let contested = EntryPath::new("contact/nickname")?;
     phone
         .write(ids::ALICE, phone_author, &contested, b"from-phone")
         .await?;
@@ -157,10 +157,10 @@ async fn concurrent_writes_converge() -> Result<()> {
 /// stores an "empty file" nor deletes the previous value.
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_payload_write_is_rejected() -> Result<()> {
-    let mut node = SyncNode::spawn().await?;
+    let node = SyncNode::spawn().await?;
     let author = node.create_author().await?;
     node.create_namespace(ids::ALICE).await?;
-    let path = EntryPath::new("k")?;
+    let path = EntryPath::new("contact/email")?;
 
     // On a fresh path: rejected, nothing stored.
     assert!(node.write(ids::ALICE, author, &path, b"").await.is_err());
