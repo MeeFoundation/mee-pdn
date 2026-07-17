@@ -1,9 +1,10 @@
 //! The assembled sync stack: endpoint + gossip + blobs + docs, addressed in
-//! domain terms. ADR-0011's pairing dialogue registers as a further protocol
-//! on the same endpoint at spawn, next to the built-in stack, and a narrow
-//! dial handle onto that endpoint is exposed for its dial side. The
-//! registration point stays protocol-agnostic (data-layer owns no pairing
-//! semantics), not a general protocol-extension facility.
+//! domain terms. Externally supplied protocols — pdn-node's pairing and
+//! linking dialogues (ADR-0011, ADR-0012) — register on the same endpoint
+//! at spawn, next to the built-in stack, and a narrow dial handle onto that
+//! endpoint is exposed for their dial sides. The registration point stays
+//! protocol-agnostic (the ceremonies' semantics belong in pdn-node, not
+//! here), not a general protocol-extension facility.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -44,10 +45,11 @@ pub struct UnknownIssuer {
     pub issuer: PdnId,
 }
 
-/// A protocol supplied to [`SyncNode::spawn_with_protocols`] — the pairing
-/// handler (ADR-0011): the ALPN it answers under, and the handler dispatched
-/// for connections arriving on it. A plain pair because data-layer owns no
-/// pairing semantics, not a general extension type.
+/// A protocol supplied to [`SyncNode::spawn_with_protocols`] — pdn-node's
+/// pairing and linking handlers (ADR-0011, ADR-0012): the ALPN it answers
+/// under, and the handler dispatched for connections arriving on it. A
+/// plain pair because data-layer owns none of the ceremonies' semantics,
+/// not a general extension type.
 pub type ExtraProtocol = (Vec<u8>, Box<dyn DynProtocolHandler>);
 
 /// The ALPNs of the built-in protocols — blob transfer, gossip, document
@@ -127,9 +129,10 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// entries by [`EntryPath`]s. One node hosts the store sets of any number of
 /// identities. Every doc the node opens joins a periodic reconcile pass
 /// ([`RECONCILE_INTERVAL`]) that keeps replicas converging when gossip
-/// loses a broadcast. The pairing protocol (ADR-0011) joins the same
-/// endpoint at spawn ([`SyncNode::spawn_with_protocols`]); its dial side and
-/// the node's own address are reached through [`SyncNode::dial_handle`].
+/// loses a broadcast. Externally supplied protocols — pairing and linking
+/// (ADR-0011, ADR-0012) — join the same endpoint at spawn
+/// ([`SyncNode::spawn_with_protocols`]); their dial sides and the node's
+/// own address are reached through [`SyncNode::dial_handle`].
 ///
 /// No ingest filter is installed: the fork's `validate_entry` hook
 /// (ADR-0008) stays available but unused, and whatever a replica syncs from
@@ -203,8 +206,9 @@ impl SyncNode {
     }
 
     /// Spawn the full stack, serving `extra_protocols` on the same endpoint
-    /// next to the built-in ones (ADR-0011's slot: the pairing dialogue
-    /// registers here). A connection arriving under a registered extra ALPN
+    /// next to the built-in ones (the ceremony slot: pdn-node's pairing and
+    /// linking dialogues register here — ADR-0011, ADR-0012). A connection
+    /// arriving under a registered extra ALPN
     /// is dispatched to its handler as a raw bidirectional connection — not
     /// a document-sync session. ALPNs must be unique across
     /// [`BUILT_IN_ALPNS`] and the extras; a collision fails the spawn with
@@ -275,10 +279,28 @@ impl SyncNode {
         Ok(())
     }
 
+    /// Forget the data namespace of `issuer` — the counterpart of
+    /// [`import_namespace`](Self::import_namespace): stop reconciling the
+    /// replica, drop it, and remove the issuer's registration, as one act.
+    /// Operations addressed to `issuer` afterwards fail with
+    /// [`UnknownIssuer`], exactly as before the import — the rollback path
+    /// for an import that must not survive the act that made it (device
+    /// linking's failed `link`). Dropping the replica without unregistering
+    /// is deliberately not offered: the issuer would keep resolving to a
+    /// dropped replica, and its operations would fail as storage errors
+    /// instead of the distinguishable refusal.
+    pub async fn forget_namespace(&self, issuer: PdnId) -> Result<()> {
+        let doc = self
+            .registry
+            .unregister_data(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        self.forget_doc(doc.id()).await
+    }
+
     /// Create a fresh doc for a device-shared store. Returns the backing doc
-    /// for the store handle ([`ConnectionsStore`](crate::ConnectionsStore),
-    /// [`PrivateMetadataStore`](crate::PrivateMetadataStore)) to hold. The
-    /// doc joins the periodic reconcile pass.
+    /// for the store handle ([`PrivateMetadataStore`](crate::PrivateMetadataStore),
+    /// [`ConnectionMetadataStore`](crate::ConnectionMetadataStore)) to hold.
+    /// The doc joins the periodic reconcile pass.
     pub(crate) async fn new_doc(&self) -> Result<Doc> {
         let doc = self.docs.create().await?;
         self.track(&doc, Vec::new())?;
@@ -311,11 +333,14 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Forget a doc: stop reconciling it and drop the replica. Rolls back a
-    /// metadata replica minted for an establishment that then failed before
-    /// it committed, so a refused pairing leaves no orphan re-synced for the
-    /// node's life. Untracks before dropping, so the reconcile pass never
-    /// re-dials a dropped replica.
+    /// Forget a doc: stop reconciling it and drop the replica. The rollback
+    /// for a ceremony that must leave nothing behind — a metadata replica
+    /// minted for an establishment that then failed before it committed, or
+    /// a directory imported by a link that then could not catch up.
+    /// Untracks before dropping, so the reconcile pass never re-dials a
+    /// dropped replica. (Data namespaces roll back through
+    /// [`forget_namespace`](Self::forget_namespace) instead, which also
+    /// unregisters the issuer.)
     pub async fn forget_doc(&self, namespace: NamespaceId) -> Result<()> {
         {
             let mut docs = self

@@ -1,25 +1,27 @@
-//! The private metadata store: a device-replicated registry of an identity's
-//! own infrastructure — its devices and the tickets to its other stores.
+//! The private metadata store: the one device-replicated **directory** of an
+//! identity's own state — its devices, the tickets to its other stores, and
+//! its connections.
 //!
 //! A dedicated pdn-store replica, separate from data namespaces, that all
 //! devices of one identity replicate. It is device-internal by ticket alone
 //! (Invariant 1's remaining mechanism —
-//! `mia-docs/openspec/specs/components/pdn-node/invariants.md`): its ticket is
-//! the seed handed only at device linking, and no ingest filter runs. It is
-//! the bootstrap **directory**: a newly linked device reads the device list
-//! and the typed tickets here to find and import the identity's other stores.
-//! Linking is gradual — a minimal access seed first, then the rest of the
-//! tickets and data sync in over this store. One node holds the private
-//! metadata stores of any number of identities.
+//! `mia-docs/openspec/specs/components/pdn-node/invariants.md`): its ticket
+//! is handed only to the identity's own devices (over the device-linking
+//! dialogue), and no ingest filter runs. Three record families live here,
+//! under disjoint prefixes: `devices/` — the device set; `tickets/` — typed
+//! tickets to the identity's other stores and its connections' metadata
+//! pairs; `connections/` — one marker record per connection counterparty.
+//! One node holds the private metadata stores of any number of identities.
 //!
-//! Device records are record-level (visible as soon as the entry syncs);
-//! ticket payloads are blobs, so `get_ticket` returns `None` until the
-//! payload has arrived.
+//! Device and connection records are record-level (visible as soon as the
+//! entry syncs — liveness never waits on payload bytes); ticket payloads are
+//! blobs, so `get_ticket` returns `None` until the payload has arrived.
 
-use anyhow::Result;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{Context, Result};
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use iroh::EndpointAddr;
 use pdn_store::{
     api::{
         protocol::{AddrInfoOptions, ShareMode},
@@ -27,16 +29,26 @@ use pdn_store::{
     },
     engine::LiveEvent,
     store::Query,
-    AuthorId, DocTicket,
+    AuthorId, DocTicket, NamespaceId,
 };
-use pdn_types::NodeId;
+use pdn_types::{NodeId, PdnId};
 
 use crate::node::{read_payload, SyncNode};
+
+/// The bounded wait of [`PrivateMetadataStore::wait_caught_up`] elapsed with
+/// no successful sync session of the replica started after the given
+/// instant. Downcast from the `anyhow::Error` of that wait — how a caller
+/// tells "did not catch up in time" apart from this node's own failures.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("no successful sync session of the replica within the wait")]
+pub struct CatchUpTimeout;
 
 /// Key prefix for device records.
 const DEVICES_PREFIX: &str = "devices/";
 /// Key prefix for typed tickets.
 const TICKETS_PREFIX: &str = "tickets/";
+/// Key prefix for connection records.
+const CONNECTIONS_PREFIX: &str = "connections/";
 
 fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
@@ -44,6 +56,11 @@ fn device_key(device: &NodeId) -> String {
 
 fn ticket_key(kind: &str) -> String {
     format!("{TICKETS_PREFIX}{kind}")
+}
+
+/// The entry key for a connection to `peer`: `connections/<pdnid-hex>`.
+fn connection_key(peer: &PdnId) -> String {
+    format!("{CONNECTIONS_PREFIX}{peer}")
 }
 
 fn device_of(key: &[u8]) -> Option<NodeId> {
@@ -54,10 +71,18 @@ fn device_of(key: &[u8]) -> Option<NodeId> {
         .ok()
 }
 
-/// Device-replicated registry of an identity's own metadata: its devices and
-/// the tickets to its other stores. The bootstrap directory a newly linked
-/// device reads from. The owning identity is not kept here — the handle's
-/// holder knows which identity it serves.
+/// Parse a `PdnId` back out of a `connections/<hex>` key, if it matches.
+fn connection_peer_of(key: &[u8]) -> Option<PdnId> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix(CONNECTIONS_PREFIX)?
+        .parse()
+        .ok()
+}
+
+/// Device-replicated directory of an identity's own state: its devices, the
+/// tickets to its other stores, and its connections. The owning identity is
+/// not kept here — the handle's holder knows which identity it serves.
 #[derive(Debug)]
 pub struct PrivateMetadataStore {
     doc: Doc,
@@ -77,8 +102,8 @@ impl PrivateMetadataStore {
         })
     }
 
-    /// Import an existing private metadata store via `ticket` (the access seed
-    /// handed to a newly linked device).
+    /// Import an existing private metadata store via `ticket` (the write
+    /// ticket handed to a newly linked device over the linking dialogue).
     pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
         let doc = node.import_doc(ticket).await?;
         let author = node.create_author().await?;
@@ -89,7 +114,8 @@ impl PrivateMetadataStore {
         })
     }
 
-    /// Share this store as a ticket — the access seed for linking a device.
+    /// Share this store as a ticket another device of the identity can
+    /// import.
     pub async fn share_ticket(
         &self,
         mode: ShareMode,
@@ -121,8 +147,51 @@ impl PrivateMetadataStore {
         Ok(devices)
     }
 
-    /// Store the `ticket` for store `kind` (e.g. `"connections"`, `"data"`),
-    /// so a linked device can discover and import that store.
+    /// Record a live connection to `peer`. The payload is an opaque marker
+    /// (the key carries the identity), replicated to the identity's other
+    /// devices like any directory entry.
+    pub async fn connect(&self, peer: PdnId) -> Result<()> {
+        self.doc
+            .set_bytes(self.author, connection_key(&peer).into_bytes(), vec![1u8])
+            .await?;
+        Ok(())
+    }
+
+    /// Drop the connection to `peer` — writes a tombstone (empty entry) that
+    /// replicates like any other entry.
+    pub async fn disconnect(&self, peer: PdnId) -> Result<()> {
+        self.doc
+            .del(self.author, connection_key(&peer).into_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// Whether `peer` is currently a live connection.
+    ///
+    /// A record-level check: it returns `true` as soon as the connect entry
+    /// is present, without waiting on the marker blob to download. A
+    /// tombstone (latest entry empty) reads as not connected.
+    pub async fn is_connected(&self, peer: PdnId) -> Result<bool> {
+        let query = Query::single_latest_per_key().key_exact(connection_key(&peer).as_bytes());
+        Ok(self.doc.get_one(query).await?.is_some())
+    }
+
+    /// List currently live connections (record-level, like
+    /// [`is_connected`](Self::is_connected)).
+    pub async fn list_connections(&self) -> Result<Vec<PdnId>> {
+        let query = Query::single_latest_per_key().key_prefix(CONNECTIONS_PREFIX.as_bytes());
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut peers = Vec::new();
+        while let Some(entry) = stream.next().await {
+            if let Some(peer) = connection_peer_of(entry?.key()) {
+                peers.push(peer);
+            }
+        }
+        Ok(peers)
+    }
+
+    /// Store the `ticket` for store `kind` (e.g. `"data"`), so the
+    /// identity's other devices can discover and import that store.
     pub async fn put_ticket(&self, kind: &str, ticket: &DocTicket) -> Result<()> {
         self.doc
             .set_bytes(
@@ -134,21 +203,55 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// (Re-)request a sync of this store's replica with `peers` — the
-    /// registration push of device linking. The engine also includes every
-    /// peer the replica has synced with before; a request made while a
-    /// session is already running is dropped, so callers retry off the
-    /// session-finished events ([`events`](Self::events)).
-    pub(crate) async fn sync_with(&self, peers: Vec<EndpointAddr>) -> Result<()> {
-        self.doc.start_sync(peers).await?;
-        Ok(())
-    }
-
     /// Subscribe to this store's replica events (inserts, sync sessions).
+    /// Crate-private on purpose: the fork's event type stays behind this
+    /// layer, and the one property consumers need is stated by
+    /// [`wait_caught_up`](Self::wait_caught_up).
     pub(crate) async fn events(
         &self,
     ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
         self.doc.subscribe().await
+    }
+
+    /// The namespace id of the backing replica — which replica this handle
+    /// addresses. Lets an imported directory be named to
+    /// [`SyncNode::forget_doc`] when the act that imported it fails and must
+    /// leave nothing behind.
+    pub fn namespace(&self) -> NamespaceId {
+        self.doc.id()
+    }
+
+    /// Wait until the first successful sync session of this replica that
+    /// started after `since` has finished, or fail with [`CatchUpTimeout`]
+    /// once `timeout` elapses — never hang.
+    ///
+    /// The property waited on is "this replica has caught up with a peer":
+    /// a completed, successful exchange — not "some content arrived".
+    /// Polling contents cannot state it: a replica that synced and found
+    /// nothing new and one that never synced read the same. No trigger is
+    /// offered or needed — importing a replica already starts its first
+    /// session and enrols it in the node's periodic reconcile pass with the
+    /// ticket's contacts, so a first exchange that fails is re-dialed
+    /// within this wait's own budget.
+    pub async fn wait_caught_up(&self, since: SystemTime, timeout: Duration) -> Result<()> {
+        let mut events = self.events().await?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CatchUpTimeout.into());
+            }
+            let Ok(event) = tokio::time::timeout(remaining, events.next()).await else {
+                return Err(CatchUpTimeout.into());
+            };
+            let event =
+                event.context("replica event stream ended while waiting for a sync session")??;
+            if let LiveEvent::SyncFinished(sync) = event {
+                if sync.result.is_ok() && sync.started >= since {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// List the kinds under which tickets are currently published

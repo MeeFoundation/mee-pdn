@@ -8,18 +8,16 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{
-    AddrInfoOptions, ConnectionMetadataStore, PrivateMetadataStore, ShareMode, SyncNode,
-};
+use data_layer::{AddrInfoOptions, ConnectionMetadataStore, PrivateMetadataStore, ShareMode};
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, InvitePayload, Runtime,
     UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
-use pdn_types::{EntryPath, NodeId, PdnId};
+use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, TIMEOUT};
 
 mod common;
-use common::establish_patiently;
+use common::{establish_patiently, link_patiently, link_probe};
 
 /// Serializes this file's tests: each spawns several runtimes (up to a
 /// dozen endpoints per test), and letting four such tests bind their
@@ -27,21 +25,6 @@ use common::establish_patiently;
 /// first dials already suffer (see `test_utils::TIMEOUT`). Run one at a
 /// time, each with the full liveness budget to itself.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// A store-level probe of `identity`'s private-metadata directory: a raw
-/// node importing the directory from the identity's linking seed — the same
-/// act a linking device performs, so everything it reads is what any device
-/// of the identity discovers. Used to assert which ticket kinds
-/// establishment published (and which it did not).
-async fn directory_probe(
-    runtime: &Runtime,
-    identity: PdnId,
-) -> Result<(SyncNode, PrivateMetadataStore)> {
-    let seed = runtime.identity().linking_seed(identity).await?;
-    let node = SyncNode::spawn().await?;
-    let directory = PrivateMetadataStore::import(&node, seed).await?;
-    Ok((node, directory))
-}
 
 /// Wait until the probe's directory lists exactly `kinds` (order-free).
 async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
@@ -147,15 +130,15 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     );
 
     // The routing/grants boundary, probed at the store level: Y's directory
-    // carries its own connections-store ticket and the metadata-pair kinds
-    // for X — and nothing else; the ticket to X's data namespace lives only
-    // in the metadata store it was read from.
-    let (probe_node, probe_dir) = directory_probe(&rt_b, y).await?;
+    // carries the metadata-pair kinds for X — and nothing else; the ticket
+    // to X's data namespace lives only in the metadata store it was read
+    // from.
+    let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
     assert!(
         wait_kinds_exactly(
             &probe_dir,
             &[
-                "connections".to_owned(),
+                "data".to_owned(),
                 format!("connection-metadata/{x}/own"),
                 format!("connection-metadata/{x}/peer"),
             ],
@@ -172,9 +155,9 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
 }
 
 /// Establishment performed on the phones is visible from the laptops: the
-/// connections stores replicate, and each laptop opens the counterpart's
-/// metadata store from its directory's tickets — grants published on either
-/// phone are read on the other identity's laptop.
+/// directories' connections records replicate, and each laptop opens the
+/// counterpart's metadata store from its directory's tickets — grants
+/// published on either phone are read on the other identity's laptop.
 #[tokio::test(flavor = "multi_thread")]
 async fn connection_is_visible_from_linked_devices() -> Result<()> {
     let _serial = SERIAL.lock().await;
@@ -186,10 +169,8 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
     // Two identities, each with a laptop linked before the pairing.
     let x = a_phone.identity().create().await?;
     let y = b_phone.identity().create().await?;
-    let seed = a_phone.identity().linking_seed(x).await?;
-    a_laptop.identity().link(x, seed, TIMEOUT).await?;
-    let seed = b_phone.identity().linking_seed(y).await?;
-    b_laptop.identity().link(y, seed, TIMEOUT).await?;
+    link_patiently(&a_laptop, &a_phone, x).await?;
+    link_patiently(&b_laptop, &b_phone, y).await?;
 
     // Pairing runs on the phones.
     let invite = a_phone.connections().invite(x, None).await?;
@@ -267,7 +248,7 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
 
     // The directory is the identity's durable view of the pair: the own
     // store's namespace after each attempt must be the same replica.
-    let (probe_node, probe_dir) = directory_probe(&rt_a, x).await?;
+    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     let own_kind = format!("connection-metadata/{y}/own");
     assert!(
         eventually(|| async { Ok(probe_dir.get_ticket(&own_kind).await?.is_some()) }).await?,
@@ -341,10 +322,10 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     let z = rt_c.identity().create().await?;
 
     // The no-state probe: X's directory, watched from a linked-device view.
-    // Baseline before any establishment: exactly the connections kind from
-    // provisioning.
-    let (probe_node, probe_dir) = directory_probe(&rt_a, x).await?;
-    let baseline = vec!["connections".to_owned()];
+    // Baseline before any establishment: exactly the data kind from
+    // creation.
+    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
+    let baseline = vec!["data".to_owned()];
     assert!(
         wait_kinds_exactly(&probe_dir, &baseline).await?,
         "directory probe did not sync its baseline"
@@ -417,7 +398,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     rt_b.connections().establish(y, live.clone()).await?;
     assert_eq!(rt_a.connections().list(x).await?, vec![y]);
     let established = vec![
-        "connections".to_owned(),
+        "data".to_owned(),
         format!("connection-metadata/{y}/own"),
         format!("connection-metadata/{y}/peer"),
     ];
@@ -515,11 +496,9 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     );
 
     // Stand in for another device of Y republishing the pair onto a fresh
-    // replica: the linking seed is a write ticket to Y's directory, so a raw
-    // node does exactly what Y's own devices do.
-    let seed = rt_b.identity().linking_seed(y).await?;
-    let probe_node = SyncNode::spawn().await?;
-    let probe_dir = PrivateMetadataStore::import(&probe_node, seed).await?;
+    // replica: the linking reply carries a write ticket to Y's directory,
+    // so a raw linked node does exactly what Y's own devices do.
+    let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
     let replacement = ConnectionMetadataStore::create(&probe_node).await?;
     let replacement_ticket = replacement
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)

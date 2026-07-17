@@ -117,7 +117,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
 
     async fn list(&self, identity: PdnId) -> Result<Vec<PdnId>> {
         let state = self.runtime.state.lock().await;
-        state.hosted(identity)?.connections.list().await
+        state.hosted(identity)?.directory.list_connections().await
     }
 
     async fn publish_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()> {
@@ -178,7 +178,7 @@ async fn open_pair(
     identity: PdnId,
     peer: PdnId,
 ) -> Result<Option<ConnectionMetadata>> {
-    let directory = &state.hosted(identity)?.private_metadata;
+    let directory = &state.hosted(identity)?.directory;
     let own_ticket = directory
         .get_ticket(&data_layer::own_ticket_kind(&peer))
         .await?;

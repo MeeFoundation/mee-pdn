@@ -21,10 +21,10 @@ use crate::runtime::Runtime;
 /// trait anticipates.
 ///
 /// Operations address issuers whose data namespace was created or imported
-/// on this node — not hosted identities: a linked identity has no data
-/// namespace here until one is imported (its discovery at linking is
-/// deferred, ADR-0009), and an imported peer namespace belongs to no hosted
-/// identity at all.
+/// on this node — not hosted identities: creation and linking both bring a
+/// hosted identity's own namespace up (the linking reply carries its
+/// ticket), while an imported peer namespace belongs to no hosted identity
+/// at all.
 #[allow(async_fn_in_trait)]
 pub trait DataService {
     /// Write `payload` at `path` in the data namespace of `issuer`.
