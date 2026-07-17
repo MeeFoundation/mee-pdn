@@ -18,10 +18,11 @@ use pdn_types::PdnId;
 /// in-place state. `data_doc` hands back a cloned [`Doc`] (a cheap handle),
 /// not a borrow, so no read guard escapes.
 ///
-/// The connections and private metadata docs are not kept here — they live
-/// inside their store handles ([`ConnectionsStore`](crate::ConnectionsStore),
-/// [`PrivateMetadataStore`](crate::PrivateMetadataStore)), whose holders know
-/// which identity each serves.
+/// The private metadata and connection metadata docs are not kept here —
+/// they live inside their store handles
+/// ([`PrivateMetadataStore`](crate::PrivateMetadataStore),
+/// [`ConnectionMetadataStore`](crate::ConnectionMetadataStore)), whose
+/// holders know which identity each serves.
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     data_docs: RwLock<HashMap<PdnId, Doc>>,
@@ -36,6 +37,19 @@ impl Registry {
             .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
             .insert(issuer, doc);
         Ok(())
+    }
+
+    /// Remove the registration of `issuer`'s data namespace, handing back
+    /// the doc it resolved to (`None` if the issuer was not registered).
+    /// The unregister half of
+    /// [`SyncNode::forget_namespace`](crate::SyncNode::forget_namespace) —
+    /// the caller drops the replica.
+    pub(crate) fn unregister_data(&self, issuer: PdnId) -> Result<Option<Doc>> {
+        Ok(self
+            .data_docs
+            .write()
+            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
+            .remove(&issuer))
     }
 
     pub(crate) fn data_doc(&self, issuer: PdnId) -> Result<Option<Doc>> {

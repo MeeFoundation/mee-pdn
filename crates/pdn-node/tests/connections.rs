@@ -4,10 +4,10 @@
 
 use anyhow::Result;
 use pdn_node::{ConnectionsService as _, IdentityService as _, Runtime};
-use test_utils::{eventually, TIMEOUT};
+use test_utils::eventually;
 
 mod common;
-use common::establish_patiently;
+use common::{establish_patiently, link_patiently};
 
 /// One runtime hosts two identities; only one of them establishes a
 /// connection. The established connection lists under that identity alone
@@ -34,8 +34,7 @@ async fn established_on_one_device_listed_on_the_linked_one_and_disjoint_per_ide
     assert_eq!(a.connections().list(y).await?, vec![]);
 
     // A device linked into X after the establishment catches it up...
-    let seed = a.identity().linking_seed(x).await?;
-    device.identity().link(x, seed, TIMEOUT).await?;
+    link_patiently(&device, &a, x).await?;
     assert!(
         eventually(|| async { Ok(device.connections().list(x).await?.contains(&p)) }).await?,
         "the established connection did not reach the linked device"

@@ -7,10 +7,11 @@
 //! payload's address and presents the secret together with its half of the
 //! connection state; the inviter atomically verifies-and-burns the secret
 //! *before any state change* and answers with its own half. Both sides then
-//! assemble the same state, mirrored: a connections-store entry, the
-//! metadata pair ([`data_layer::ConnectionMetadata`]), and the pair's
-//! tickets in the private-metadata directory — which is how the connection
-//! reaches the identities' other devices.
+//! assemble the same state, mirrored: a connections record in the
+//! private-metadata directory, the metadata pair
+//! ([`data_layer::ConnectionMetadata`]), and the pair's tickets in the same
+//! directory — which is how the connection reaches the identities' other
+//! devices.
 //!
 //! Refusals are uniform: whatever the reason — unknown secret, expired,
 //! already burned, malformed request, unsupported version — the inviter
@@ -53,10 +54,11 @@ pub const INVITE_FORMAT_VERSION: u8 = 0;
 /// How long a pending invite lives unless the invite overrides it.
 pub(crate) const DEFAULT_INVITE_LIFETIME: Duration = Duration::from_secs(120);
 
-/// Ceiling on one length-prefixed wire message. The two dialogue messages
-/// carry ids, one address, and one ticket — far below this; the bound
+/// Ceiling on one length-prefixed wire message, shared by both ceremonies
+/// on this framing (pairing and linking). Their dialogue messages carry
+/// ids, one address, and one or two tickets — far below this; the bound
 /// exists so a malformed length prefix cannot demand an unbounded read.
-const MAX_WIRE_MESSAGE_LEN: u32 = 64 * 1024;
+pub(crate) const MAX_WIRE_MESSAGE_LEN: u32 = 64 * 1024;
 
 /// The self-contained invite payload — what the inviter's device shows and
 /// the scanner's device consumes. In-process it travels as a value; its
@@ -116,10 +118,12 @@ struct PendingInvite {
     expires_at: Instant,
 }
 
-/// The pending-invite set of one runtime, keyed by secret bytes, each
-/// bound to the identity it invites for. Lives inside the runtime state, so
-/// every operation on it — insertion at invite, the verify-and-burn at
-/// presentation — is a map operation under the runtime's one coarse lock.
+/// A pending-invite set of one runtime, keyed by secret bytes, each bound
+/// to the identity it invites for. Lives inside the runtime state — one
+/// instance per ceremony that mints one-time secrets (pairing here, device
+/// linking in [`crate::linking`]) — so every operation on it: insertion at
+/// invite, the verify-and-burn at presentation — is a map operation under
+/// the runtime's one coarse lock.
 ///
 /// Expiry is lazy: checked at presentation, swept at the next invite — no
 /// background task. Runtime restart drops the set; an invite is a live
@@ -404,7 +408,7 @@ async fn own_store_toward(
     if let Some(pair) = state.metadata_pairs.get(&(identity, peer)) {
         return Ok((pair.own.clone(), false));
     }
-    let directory = &state.hosted(identity)?.private_metadata;
+    let directory = &state.hosted(identity)?.directory;
     match directory.get_ticket(&own_ticket_kind(&peer)).await? {
         Some(write_ticket) => Ok((
             ConnectionMetadataStore::import(&state.node, write_ticket).await?,
@@ -416,9 +420,9 @@ async fn own_store_toward(
 
 /// The post-dialogue assembly, identical on both sides: import the received
 /// read ticket as `peer` (`peer_addr` supplementing its first-sync
-/// contacts), record the counterparty in the connections store, publish the
-/// pair's tickets in the directory under the per-connection kinds, and
-/// cache the pair for the grant surface.
+/// contacts), record the counterparty among the directory's connections
+/// records, publish the pair's tickets in the same directory under the
+/// per-connection kinds, and cache the pair for the grant surface.
 async fn assemble_connection(
     state: &mut State,
     identity: PdnId,
@@ -448,16 +452,14 @@ async fn assemble_connection(
     let own_write_ticket = own
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let stores = state.hosted(identity)?;
-    stores
-        .private_metadata
+    let directory = &state.hosted(identity)?.directory;
+    directory
         .put_ticket(&own_ticket_kind(&peer), &own_write_ticket)
         .await?;
-    stores
-        .private_metadata
+    directory
         .put_ticket(&peer_ticket_kind(&peer), &peer_ticket)
         .await?;
-    stores.connections.connect(peer).await?;
+    directory.connect(peer).await?;
 
     state.metadata_pairs.insert(
         (identity, peer),
@@ -470,7 +472,7 @@ async fn assemble_connection(
 }
 
 /// Write one length-prefixed postcard message.
-async fn write_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
+pub(crate) async fn write_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
     let bytes = postcard::to_stdvec(message)?;
     let len = u32::try_from(bytes.len()).context("wire message too large")?;
     if len > MAX_WIRE_MESSAGE_LEN {
@@ -483,7 +485,7 @@ async fn write_message<T: Serialize>(send: &mut SendStream, message: &T) -> Resu
 
 /// Read one length-prefixed postcard message, refusing lengths beyond
 /// [`MAX_WIRE_MESSAGE_LEN`].
-async fn read_message<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+pub(crate) async fn read_message<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     recv.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes);

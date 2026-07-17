@@ -4,9 +4,10 @@
 //! Each [`Runtime`] is one running node — a host embeds one, in-process
 //! tests embed several to stand up several nodes. One runtime hosts any
 //! number of identities, each added by an explicit act ([`create`] or
-//! [`link`]). Identities become connected by the establishment dialogue
-//! ([`pairing`], ADR-0011): the one protocol of the runtime's own, riding
-//! the data-layer assembly slot on the node's endpoint.
+//! [`link`]). Devices join an identity by the linking dialogue
+//! ([`linking`], ADR-0012), and identities become connected by the
+//! establishment dialogue ([`pairing`], ADR-0011) — the runtime's two
+//! protocols, riding the data-layer assembly slot on the node's endpoint.
 //!
 //! The runtime adds no sync or authorization mechanics of its own: every
 //! store operation delegates to a `data-layer` primitive, and access to a
@@ -21,6 +22,7 @@
 pub mod connections;
 pub mod data;
 pub mod identity;
+pub mod linking;
 pub mod pairing;
 pub mod runtime;
 pub mod sync;
@@ -28,6 +30,7 @@ pub mod sync;
 pub use connections::{ConnectionsService, PeerGrant, RuntimeConnectionsService};
 pub use data::{DataService, RuntimeDataService};
 pub use identity::{IdentityService, RuntimeIdentityService};
+pub use linking::{LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION};
 pub use pairing::{InvitePayload, UnsupportedInviteVersion, INVITE_FORMAT_VERSION};
 pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};

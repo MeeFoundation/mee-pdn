@@ -10,12 +10,12 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use data_layer::{ConnectionsStore, PrivateMetadataStore, SyncNode};
+use data_layer::{PrivateMetadataStore, SyncNode};
 use pdn_types::{EntryPath, NodeId, PdnId};
 
 /// The cast: bare [`PdnId`] values, one byte pattern each. No node runs for
 /// any of them unless a test spawns one — the peers (Bob, Carol, Dave) exist
-/// only as entries in connections stores.
+/// only as connections records in directories.
 pub mod ids {
     use pdn_types::PdnId;
 
@@ -58,9 +58,9 @@ where
     }
 }
 
-/// Wait until `is_connected(peer)` on `conns` equals `want`.
-pub async fn wait_connected(conns: &ConnectionsStore, peer: PdnId, want: bool) -> Result<bool> {
-    eventually(|| async { Ok(conns.is_connected(peer).await? == want) }).await
+/// Wait until `is_connected(peer)` on the directory `pms` equals `want`.
+pub async fn wait_connected(pms: &PrivateMetadataStore, peer: PdnId, want: bool) -> Result<bool> {
+    eventually(|| async { Ok(pms.is_connected(peer).await? == want) }).await
 }
 
 /// Wait until the entry at `path` under `issuer` reads as exactly `expected`.
