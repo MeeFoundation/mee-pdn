@@ -22,8 +22,8 @@ use test_utils::{eventually, ids, wait_devices, TIMEOUT};
 
 mod common;
 use common::{
-    dial_linking, dial_linking_without_reading, establish_patiently, link_patiently, link_probe,
-    read_frame, write_frame, LINKING_ALPN,
+    dial_linking, dial_linking_without_reading, establish_patiently, granted_patiently,
+    link_patiently, link_probe, read_frame, write_frame, LINKING_ALPN,
 };
 
 /// Serializes this file's tests: each spawns several runtimes, and letting
@@ -58,6 +58,25 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
         Ok(have == expected)
     })
     .await
+}
+
+/// Assert the probe's directory holds exactly `devices` and `kinds` — the
+/// inviter-side state a refusal must leave untouched, checked as one act
+/// because a refusal that wrote either would break the same requirement.
+async fn assert_directory_is(
+    directory: &PrivateMetadataStore,
+    devices: &[NodeId],
+    kinds: &[String],
+) -> Result<()> {
+    assert!(
+        wait_devices_exactly(directory, devices).await?,
+        "the directory's device set is not what it must be"
+    );
+    assert!(
+        wait_kinds_exactly(directory, kinds).await?,
+        "the directory's ticket kinds are not what they must be"
+    );
+    Ok(())
 }
 
 /// The positive ceremony: create on A, invite on A, link on B. The payload
@@ -243,8 +262,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
     let err = rt_b.data().read(x, &path).await.unwrap_err();
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
-    assert!(wait_kinds_exactly(&probe_dir, &baseline_kinds).await?);
-    assert!(wait_devices_exactly(&probe_dir, &baseline_devices).await?);
+    assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
 
     // A linking invite for an unhosted identity is refused with the typed
     // error and mints nothing pending.
@@ -266,8 +284,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "a never-minted secret must be refused"
     );
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
-    assert!(wait_kinds_exactly(&probe_dir, &baseline_kinds).await?);
-    assert!(wait_devices_exactly(&probe_dir, &baseline_devices).await?);
+    assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
 
     // ...and an unknown payload version refuses before dialing, with the
     // typed error only the pre-dial check produces.
@@ -305,8 +322,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "a replayed secret must be refused"
     );
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
-    assert!(wait_devices_exactly(&probe_dir, &after_link).await?);
-    assert!(wait_kinds_exactly(&probe_dir, &baseline_kinds).await?);
+    assert_directory_is(&probe_dir, &after_link, &baseline_kinds).await?;
 
     probe_node.shutdown().await?;
     rt_a.shutdown().await?;
@@ -523,6 +539,116 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 
     rt_b.shutdown().await?;
     fake_inviter.shutdown().await?;
+    Ok(())
+}
+
+/// The rollback undoes what the link did, and nothing that predates it: a
+/// failed link into an identity whose namespace this runtime already reached
+/// through a peer's grant leaves that grant working.
+///
+/// The two bindings live in different maps — the pre-dial guard reads the
+/// hosted set, `import_namespace` writes the node's issuer registry — so the
+/// guard cannot see a granted issuer and the link proceeds. What keeps the
+/// grant is that the rollback restores the binding it displaced instead of
+/// forgetting the issuer outright; forgetting is permanent (`drop_doc` takes
+/// the entries with it), and a rollback that destroys state it never created
+/// is worse than no rollback at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+
+    // Two personas of one person, as `multi_identity` models them: X on the
+    // phone, Y on the laptop, connected, with X granting Y its namespace.
+    let rt_phone = Runtime::spawn().await?;
+    let rt_laptop = Runtime::spawn().await?;
+    let x = rt_phone.identity().create().await?;
+    let y = rt_laptop.identity().create().await?;
+
+    let invite = rt_phone.connections().invite(x, None).await?;
+    establish_patiently(&rt_laptop, y, &rt_phone, x, invite).await?;
+
+    let path = EntryPath::new("shared/note")?;
+    rt_phone.data().write(x, &path, b"from-x").await?;
+    let grant = granted_patiently(&rt_phone, x, &rt_laptop, y, x).await?;
+
+    // The documented interim access path: binds X in the node's issuer
+    // registry, and nowhere near the hosted set the link's guard consults.
+    rt_laptop.data().import(x, grant.ticket).await?;
+    assert!(
+        eventually(|| async {
+            Ok(rt_laptop.data().read(x, &path).await?.as_deref() == Some(&b"from-x"[..]))
+        })
+        .await?,
+        "the granted namespace never synced — the premise of this test, not its subject"
+    );
+
+    // The person now adds X to the laptop too. The link fails: its tickets
+    // address replicas hosted nowhere, so the catch-up cannot complete.
+    let scratch = SyncNode::spawn().await?;
+    let dead_directory = PrivateMetadataStore::create(&scratch).await?;
+    let directory_ticket = dead_directory
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    scratch.create_namespace(ids::DAVE).await?;
+    let data_ticket = scratch
+        .share_ticket(
+            ids::DAVE,
+            ShareMode::Write,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    scratch.shutdown().await?;
+
+    let fake_inviter = SyncNode::spawn_with_protocols(vec![(
+        LINKING_ALPN.to_vec(),
+        Box::new(DeadTicketInviter {
+            directory: directory_ticket,
+            data: data_ticket,
+        }),
+    )])
+    .await?;
+    let payload = LinkingPayload {
+        version: LINKING_FORMAT_VERSION,
+        inviter_addr: fake_inviter.dial_handle().addr(),
+        secret: [0x42; 32],
+        identity: x,
+    };
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let err = loop {
+        let err = rt_laptop
+            .identity()
+            .link(payload.clone(), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        if err.downcast_ref::<CatchUpTimeout>().is_some() || std::time::Instant::now() > deadline {
+            break err;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        err.downcast_ref::<CatchUpTimeout>().is_some(),
+        "the failure must be the catch-up timeout, got: {err:#}"
+    );
+
+    // The grant survives the failed link, entries and all.
+    assert_eq!(
+        rt_laptop.data().read(x, &path).await?.as_deref(),
+        Some(&b"from-x"[..]),
+        "the rollback destroyed a granted namespace the link never imported"
+    );
+    // And the link left nothing of its own: X is not hosted, so the identity's
+    // own operations still refuse — the grant binding is not a hosted identity.
+    assert_eq!(rt_laptop.sync().hosted_identities().await?, vec![y]);
+    let err = rt_laptop.connections().list(x).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<UnknownIdentity>().is_some(),
+        "a restored grant binding must not make the identity hosted, got: {err:#}"
+    );
+
+    fake_inviter.shutdown().await?;
+    rt_phone.shutdown().await?;
+    rt_laptop.shutdown().await?;
     Ok(())
 }
 

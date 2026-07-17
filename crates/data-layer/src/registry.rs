@@ -29,14 +29,22 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    /// Register the data namespace of `issuer` as backed by `doc`. Both
-    /// created and imported namespaces register here.
-    pub(crate) fn register_data(&self, issuer: PdnId, doc: Doc) -> Result<()> {
-        self.data_docs
+    /// Register the data namespace of `issuer` as backed by `doc`, handing
+    /// back the registration this replaced (`None` if the issuer was
+    /// unbound). Both created and imported namespaces register here.
+    ///
+    /// The displaced doc is returned rather than dropped on the floor so a
+    /// caller that must be undoable can put it back: an act that replaced a
+    /// binding it did not create must restore it on failure, never delete
+    /// it. Discarding the return is a deliberate choice at each call site,
+    /// not the default.
+    #[must_use = "the displaced registration must be restored or knowingly discarded"]
+    pub(crate) fn register_data(&self, issuer: PdnId, doc: Doc) -> Result<Option<Doc>> {
+        Ok(self
+            .data_docs
             .write()
             .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
-            .insert(issuer, doc);
-        Ok(())
+            .insert(issuer, doc))
     }
 
     /// Remove the registration of `issuer`'s data namespace, handing back
