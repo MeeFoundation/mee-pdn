@@ -17,7 +17,7 @@ use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, TIMEOUT};
 
 mod common;
-use common::{establish_patiently, link_patiently, link_probe};
+use common::{establish_patiently, granted_patiently, link_patiently, link_probe};
 
 /// Serializes this file's tests: each spawns several runtimes (up to a
 /// dozen endpoints per test), and letting four such tests bind their
@@ -87,24 +87,7 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     // carried ticket, and reads the entries.
     let path = EntryPath::new("contact/name")?;
     rt_a.data().write(x, &path, b"X").await?;
-    rt_a.connections().publish_grant(x, y, x).await?;
-    let granted = eventually(|| async {
-        Ok(rt_b
-            .connections()
-            .read_grants(y, x)
-            .await?
-            .iter()
-            .any(|grant| grant.issuer == x))
-    })
-    .await?;
-    assert!(granted, "the grant did not reach the peer over the pair");
-    let grant = rt_b
-        .connections()
-        .read_grants(y, x)
-        .await?
-        .into_iter()
-        .find(|grant| grant.issuer == x)
-        .expect("grant just observed");
+    let grant = granted_patiently(&rt_a, x, &rt_b, y, x).await?;
     rt_b.data().import(x, grant.ticket).await?;
     assert!(
         eventually(|| async {
@@ -112,6 +95,24 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         })
         .await?,
         "granted entries did not sync to the peer"
+    );
+
+    // The grant is a *write* ticket, and the round trip proves it rather than
+    // asserting it: Y writes into X's namespace under its own author, and the
+    // entry reaches X — the issuer — through ordinary sync. Nothing rejects
+    // it: the store's capability is swarm membership, not access control, and
+    // the gates that would scope this write (ingest validation, egress
+    // filtering) are what UWill and subset-rbsr bring. Until then a grant is
+    // whole-store and unscoped in both directions, which is the posture
+    // recorded in `mee-noremote/fix-urgent.md`.
+    let peer_path = EntryPath::new("contact/note-from-y")?;
+    rt_b.data().write(x, &peer_path, b"Y was here").await?;
+    assert!(
+        eventually(|| async {
+            Ok(rt_a.data().read(x, &peer_path).await?.as_deref() == Some(&b"Y was here"[..]))
+        })
+        .await?,
+        "the grantee's write did not reach the issuer — the grant's ticket is not a write ticket"
     );
 
     // Paired denial, in the same place: Z is connected to X too, but on its

@@ -17,10 +17,11 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Context, Result};
 use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
 use pdn_node::{
-    ConnectionsService as _, IdentityService as _, InvitePayload, LinkingPayload, Runtime,
+    ConnectionsService as _, IdentityService as _, InvitePayload, LinkingPayload, PeerGrant,
+    Runtime,
 };
 use pdn_types::PdnId;
-use test_utils::TIMEOUT;
+use test_utils::{eventually, TIMEOUT};
 
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
 pub const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
@@ -173,4 +174,40 @@ pub async fn establish_patiently(
             }
         }
     }
+}
+
+/// Publish a grant of `issuer`'s namespace from the giving side's hosted
+/// identity toward the receiving side's, and hand back the grant as the
+/// receiver reads it once it has crossed the connection's metadata pair.
+///
+/// The crossing is a poll, not a wait: a grant's ticket payload is a blob and
+/// lags the record that names it, so `read_grants` omits it until it lands.
+pub async fn granted_patiently(
+    gives: &Runtime,
+    gives_id: PdnId,
+    receives: &Runtime,
+    receives_id: PdnId,
+    issuer: PdnId,
+) -> Result<PeerGrant> {
+    gives
+        .connections()
+        .publish_grant(gives_id, receives_id, issuer)
+        .await?;
+    let crossed = eventually(|| async {
+        Ok(receives
+            .connections()
+            .read_grants(receives_id, gives_id)
+            .await?
+            .iter()
+            .any(|grant| grant.issuer == issuer))
+    })
+    .await?;
+    ensure!(crossed, "the grant did not reach the peer over the pair");
+    receives
+        .connections()
+        .read_grants(receives_id, gives_id)
+        .await?
+        .into_iter()
+        .find(|grant| grant.issuer == issuer)
+        .context("grant just observed, then gone")
 }

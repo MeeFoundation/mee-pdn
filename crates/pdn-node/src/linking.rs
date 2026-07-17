@@ -289,7 +289,7 @@ pub(crate) async fn link_via_dialogue(
     // wait. Sessions the imports start count for the catch-up below: they
     // start after this instant.
     let before_import = SystemTime::now();
-    let directory = {
+    let (directory, data_import) = {
         let state = state.lock().await;
         // The inviter's address is a live first-sync contact for the
         // imported directory, exactly as a peer's address is in
@@ -297,29 +297,39 @@ pub(crate) async fn link_via_dialogue(
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
         let directory = PrivateMetadataStore::import(&state.node, directory_ticket).await?;
-        if let Err(err) = state
+        match state
             .node
             .import_namespace(payload.identity, response.data)
             .await
         {
-            // The rollback begins with the import: a directory whose
-            // sibling import failed must not survive it.
-            let _ = state.node.forget_doc(directory.namespace()).await;
-            return Err(err);
+            Ok(data_import) => (directory, data_import),
+            Err(err) => {
+                // The rollback begins with the import: a directory whose
+                // sibling import failed must not survive it.
+                let _ = state.node.forget_doc(directory.namespace()).await;
+                return Err(err);
+            }
         }
-        directory
     };
 
     // The one bounded wait, against a peer that answered the dialogue
     // moments ago — no lock held. Beyond it, the node's periodic reconcile
     // pass keeps the replicas converging.
     if let Err(err) = directory.wait_caught_up(before_import, timeout).await {
-        // Forget both replicas, so the dialing node keeps no residue and
-        // the identity's operations refuse as unknown again — not as
-        // storage errors against a dropped replica.
+        // Undo both imports, so the dialing node keeps no residue and the
+        // identity's operations refuse as unknown again — not as storage
+        // errors against a dropped replica.
+        //
+        // The data namespace is undone rather than forgotten outright: this
+        // runtime may already have been bound to that issuer before the
+        // link — a peer's granted namespace registers under the issuer too,
+        // and the pre-dial guard cannot see it (it reads the hosted set, not
+        // the node's issuer registry). Forgetting by issuer would delete a
+        // replica this link never imported, permanently: a rollback must
+        // restore what it displaced, never destroy state that predates it.
         let state = state.lock().await;
         let _ = state.node.forget_doc(directory.namespace()).await;
-        let _ = state.node.forget_namespace(payload.identity).await;
+        let _ = state.node.undo_import_namespace(data_import).await;
         return Err(err).context("the imported directory did not catch up in time");
     }
 

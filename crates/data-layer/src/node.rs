@@ -166,6 +166,20 @@ struct TrackedDoc {
     contacts: Vec<EndpointAddr>,
 }
 
+/// What one [`SyncNode::import_namespace`] did, carried back to the caller so
+/// that [`SyncNode::undo_import_namespace`] can undo exactly that and nothing
+/// more. Opaque on purpose: it holds the fork's replica handle, which stays
+/// behind this layer, and only the node consumes it.
+#[derive(Debug)]
+pub struct NamespaceImport {
+    /// The issuer whose binding the import wrote.
+    issuer: PdnId,
+    /// The namespace the import bound the issuer to.
+    imported: NamespaceId,
+    /// The binding the import displaced — `None` if the issuer was free.
+    displaced: Option<Doc>,
+}
+
 /// The dial side of a node's protocols, handed out by
 /// [`SyncNode::dial_handle`]. Wraps the node's iroh endpoint but exposes
 /// only what a dial needs — connect out, read the node's own address and
@@ -267,15 +281,62 @@ impl SyncNode {
     /// Create a fresh doc and register it as the data namespace of `issuer`.
     pub async fn create_namespace(&self, issuer: PdnId) -> Result<()> {
         let doc = self.new_doc().await?;
-        self.registry.register_data(issuer, doc)?;
+        // A registration cannot already exist: `issuer` is minted fresh from
+        // the operating system's generator by the caller that provisions it,
+        // so there is nothing here to displace or restore.
+        let _displaced = self.registry.register_data(issuer, doc)?;
         Ok(())
     }
 
     /// Import a doc shared via `ticket` and register it as the data namespace
     /// of `issuer`, so reads and writes under `issuer` resolve to it.
-    pub async fn import_namespace(&self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
+    ///
+    /// Returns what the import did, so an act that must be undoable can undo
+    /// exactly that through [`undo_import_namespace`](Self::undo_import_namespace).
+    /// An issuer can already be bound when the import happens — a namespace
+    /// reached through a peer's grant registers here too — and replacing that
+    /// binding is not this call's to keep: the token carries what was
+    /// displaced.
+    pub async fn import_namespace(
+        &self,
+        issuer: PdnId,
+        ticket: DocTicket,
+    ) -> Result<NamespaceImport> {
         let doc = self.import_doc(ticket).await?;
-        self.registry.register_data(issuer, doc)?;
+        let imported = doc.id();
+        let displaced = self.registry.register_data(issuer, doc)?;
+        Ok(NamespaceImport {
+            issuer,
+            imported,
+            displaced,
+        })
+    }
+
+    /// Undo an [`import_namespace`](Self::import_namespace): leave exactly the
+    /// state that preceded it, touching nothing the import did not touch.
+    ///
+    /// Two shapes, because an import either bound a free issuer or replaced a
+    /// binding it found. A free issuer is unbound again and the replica this
+    /// import brought up is dropped — the plain rollback. A replaced binding
+    /// is put back, and the imported replica is dropped **only** when it is a
+    /// different one: with one namespace per issuer (ADR-0009) an import
+    /// under an already-bound issuer normally resolves to the very replica
+    /// that binding names, and dropping it would destroy the data the restore
+    /// exists to preserve — `drop_doc` is permanent.
+    pub async fn undo_import_namespace(&self, import: NamespaceImport) -> Result<()> {
+        let NamespaceImport {
+            issuer,
+            imported,
+            displaced,
+        } = import;
+        let Some(previous) = displaced else {
+            return self.forget_namespace(issuer).await;
+        };
+        let previous_namespace = previous.id();
+        let _replaced = self.registry.register_data(issuer, previous)?;
+        if imported != previous_namespace {
+            self.forget_doc(imported).await?;
+        }
         Ok(())
     }
 

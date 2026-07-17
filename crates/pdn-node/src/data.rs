@@ -94,6 +94,13 @@ impl DataService for RuntimeDataService<'_> {
     /// ticket's durable home.
     async fn import(&self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
         let state = self.runtime.state.lock().await;
-        state.node.import_namespace(issuer, ticket).await
+        // Importing an issuer this runtime already knows rebinds it, and the
+        // displaced binding is dropped knowingly: with one namespace per
+        // issuer a re-import resolves to the same replica, so what the
+        // caller replaces is an equivalent handle. There is nothing to undo —
+        // an explicit import is its own last word, unlike the linking
+        // dialogue's, which must survive a failed catch-up.
+        let _displaced = state.node.import_namespace(issuer, ticket).await?;
+        Ok(())
     }
 }

@@ -59,6 +59,14 @@ pub trait ConnectionsService {
     /// Publish a grant of `issuer`'s data store — hosted on this node —
     /// toward `peer`, into `identity`'s own metadata store of that
     /// connection: the interim whole-store ticket, minted here.
+    ///
+    /// The ticket is a **write** ticket, and deliberately so: the store's
+    /// capability is not the access-control mechanism, it is swarm
+    /// membership. Read and write are `UWill`'s to decide, enforced at
+    /// ingest and egress; a read ticket here would only pretend to gate
+    /// access while the gates that matter are being built. Until they are, a
+    /// grant is whole-store and unscoped — the grantee can write into the
+    /// namespace, and nothing yet rejects what it writes.
     async fn publish_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()>;
 
     /// Read the grants `peer` has published toward hosted `identity`, from
@@ -128,7 +136,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
             .with_context(|| format!("no connection metadata pair toward {peer}"))?;
         let ticket = state
             .node
-            .share_ticket(issuer, ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .share_ticket(issuer, ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
             .await?;
         pair.own.publish_grant(issuer, &ticket).await
     }
