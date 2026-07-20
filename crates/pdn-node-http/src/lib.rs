@@ -2,10 +2,9 @@
 //! [`pdn_node::Runtime`] over HTTP.
 //!
 //! One process, one embedded runtime. The HTTP surface is a host over the
-//! core, not the platform API — other hosts (mobile, wasm) embed the same
-//! core later, and the runtime itself stays host-free. The host adds no
-//! authorization of its own: access to data remains bounded by ticket
-//! possession, the embedded runtime's interim posture.
+//! core, not the platform API, and the runtime itself stays host-free. The
+//! host adds no authorization of its own: access control is the embedded
+//! runtime's.
 //!
 //! `GET /live` is the one always-on route, probed by container harnesses
 //! and the demo stand. Everything under `/debug/` is demo scaffolding:

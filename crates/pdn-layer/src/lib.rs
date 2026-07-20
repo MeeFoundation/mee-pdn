@@ -3,7 +3,7 @@
 //! Pure domain — no transport, no storage backend. The domain model
 //! (claims, connections, delegation), the operation AST ([`PdnOp`]), and
 //! the [`uwill`] capability-token module live here; executing operations
-//! over a data layer is the job of the (future) node runtime.
+//! over a data layer is the node runtime's job.
 
 use pdn_types::{ClaimId, OperationalKey, PdnId, PdnIdentityProof};
 use serde::{Deserialize, Serialize};
@@ -15,12 +15,11 @@ pub mod uwill;
 // Supporting types
 // ---------------------------------------------------------------------------
 
-/// What a peer receives when accepting an invite.
+/// What a peer receives when accepting an invite. Carries only the issuing
+/// identity — no transport hints, signature, or expiry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invite {
     pub from: PdnId,
-    // Transport hints (NodeAddr) — not yet wired in.
-    // Signature and expiry also pending.
 }
 
 /// Public view of a connection with a peer.
@@ -65,8 +64,6 @@ pub struct Attribute {
 pub enum AccessMode {
     Read,
     Write,
-    // Delete,
-    // Delegate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,8 +99,7 @@ pub struct DelegatedClaim {
 /// Draft surface of the PDN layer.
 ///
 /// Each variant is one high-level operation. Inputs are its fields; the
-/// return type is stated in the doc comment via `-> ...`. If we later
-/// choose FT style, this enum maps one-to-one onto a trait.
+/// return type is stated in the doc comment via `-> ...`.
 #[allow(dead_code)]
 pub enum PdnOp {
     // --- Identity and devices --------------------------------------------

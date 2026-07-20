@@ -18,29 +18,32 @@
 //! device records carry no liveness semantics), and a fresh invite
 //! converges.
 //!
-//! The dial side imports both tickets and returns caught up: one bounded
-//! wait for the first successful directory sync session started after the
-//! import — not a retry loop; the node's periodic reconcile pass is the
-//! re-dial cadence inside that wait's budget. On any failure after the
-//! import it forgets both replicas, so a failed link leaves no residue and
-//! the identity is unknown to the runtime again.
+//! The dial side arms the identity for session classification the moment
+//! its directory is imported — before the data namespace exists, so no
+//! serving window opens on the long-lived namespace id — then imports both
+//! tickets and returns caught up: one bounded wait for the first successful
+//! directory sync session started after the import — not a retry loop; the
+//! node's periodic reconcile pass is the re-dial cadence inside that wait's
+//! budget. On any failure after the import it disarms the identity and
+//! forgets both replicas, so a failed link leaves no residue and the
+//! identity is unknown to the runtime again.
 //!
 //! Refusals are uniform: whatever the reason — unknown secret, expired,
 //! already burned, malformed request, unsupported version — the inviter
 //! closes the connection without a distinguishing answer, and a refused
 //! attempt leaves no observable state. A wrong secret burns nothing.
 //!
-//! The KERI proof of control over the identity is a marked step of this
-//! dialogue, deferred exactly as in pairing (ADR-0008's interim posture).
-//! Both devices must be online; pending linking invites are future work.
+//! The dialogue carries no KERI proof of control over the identity —
+//! deferred, exactly as in pairing (ADR-0008). Both devices must be online:
+//! there are no pending linking invites.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use data_layer::{
-    AcceptError, AddrInfoOptions, Connection, DocTicket, EndpointAddr, PrivateMetadataStore,
-    ProtocolHandler, ShareMode,
+    AcceptError, AddrInfoOptions, Connection, DocTicket, EndpointAddr, NamespaceId,
+    NamespaceImport, PrivateMetadataStore, ProtocolHandler, ShareMode, SyncNode,
 };
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
@@ -93,8 +96,7 @@ pub struct UnsupportedLinkingVersion {
 
 /// The new device's half of the dialogue: the format version and the
 /// secret — nothing else. In particular no node id: the inviter takes the
-/// newcomer's id from the connection's authenticated peer identity. The
-/// successor of this message gains the KERI proof step.
+/// newcomer's id from the connection's authenticated peer identity.
 #[derive(Debug, Serialize, Deserialize)]
 struct LinkingRequest {
     version: u8,
@@ -178,10 +180,10 @@ impl LinkingHandler {
             let directory = &state.hosted(identity).ok()?.directory;
             directory.add_device(newcomer).await.ok()?;
 
-            // Both bootstrap tickets, minted fresh from local replicas
-            // (D4): every device that can mint an invite hosts both — the
-            // first device by creation, every further one by its own
-            // linking reply.
+            // Both bootstrap tickets, minted fresh from local replicas:
+            // every device that can mint an invite hosts both — the first
+            // device by creation, every further one by its own linking
+            // reply.
             let directory_ticket = directory
                 .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
                 .await
@@ -235,14 +237,15 @@ impl ProtocolHandler for LinkingHandler {
 /// take the lock to answer. The caller has already refused an unsupported
 /// payload version; the already-hosted refusal here precedes the dial.
 ///
-/// On any failure after the import, both replicas are forgotten — the
-/// directory by namespace, the data namespace by issuer (unregistered, not
-/// merely dropped) — so a failed link leaves no residue and the identity is
-/// unknown to this runtime again. This covers the whole path after the
-/// import, deliberately wider than establishment's rollback (which fires
-/// only on a failed ticket mint).
+/// The directory import is followed at once — before the data-namespace
+/// import — by arming the identity for session classification, so the
+/// data binding never exists ahead of the book that judges its sessions.
+/// On any failure after the import, [`undo_link`] rolls back everything
+/// this link did — the data-namespace import, the arming, the directory —
+/// so a failed link leaves no residue and the identity is unknown to this
+/// runtime again.
 pub(crate) async fn link_via_dialogue(
-    state: &Mutex<State>,
+    state: &Arc<Mutex<State>>,
     payload: &LinkingPayload,
     timeout: Duration,
 ) -> Result<()> {
@@ -261,6 +264,97 @@ pub(crate) async fn link_via_dialogue(
 
     // Network — no lock held, and nothing local minted yet, so a failure
     // anywhere up to the reply rolls back nothing.
+    let response = run_linking_dialogue(&dial, payload).await?;
+
+    // Import both replicas under a brief lock — local acts, no network
+    // wait. Sessions the imports start count for the catch-up below: they
+    // start after this instant.
+    let before_import = SystemTime::now();
+    let (directory, data_import) = {
+        let state = state.lock().await;
+        // The inviter's address is a live first-sync contact for the
+        // imported directory, exactly as a peer's address is in
+        // establishment's assembly.
+        let mut directory_ticket = response.directory;
+        directory_ticket.nodes.push(payload.inviter_addr.clone());
+        let directory = PrivateMetadataStore::import(&state.node, directory_ticket).await?;
+        // Armed before the data namespace exists: the moment the import
+        // below registers the binding, sessions are judged through this
+        // directory — a still-catching-up book refuses callers it cannot
+        // resolve (fail-closed, re-served a reconcile pass after their
+        // device records land), and no serving window opens on the
+        // long-lived namespace id.
+        if let Err(err) = state.node.host_identity(payload.identity, &directory) {
+            undo_link(&state.node, payload.identity, directory.namespace(), None).await;
+            return Err(err);
+        }
+        match state
+            .node
+            .import_namespace(payload.identity, response.data)
+            .await
+        {
+            Ok(data_import) => (directory, data_import),
+            Err(err) => {
+                // The rollback begins with the import: a directory whose
+                // sibling import failed must not survive it.
+                undo_link(&state.node, payload.identity, directory.namespace(), None).await;
+                return Err(err);
+            }
+        }
+    };
+
+    // The one bounded wait, against a peer that answered the dialogue
+    // moments ago — no lock held. Beyond it, the node's periodic reconcile
+    // pass keeps the replicas converging.
+    if let Err(err) = directory.wait_caught_up(before_import, timeout).await {
+        let state = state.lock().await;
+        undo_link(
+            &state.node,
+            payload.identity,
+            directory.namespace(),
+            Some(data_import),
+        )
+        .await;
+        return Err(err).context("the imported directory did not catch up in time");
+    }
+
+    // Success: the identity joins the runtime's hosted set. Classification
+    // was armed before the imports (above), and by now the caught-up
+    // directory carries the identity's device records, this device included
+    // (the inviter registered it during the dialogue). The armer's
+    // subscription is taken before the handle moves into the hosted set:
+    // pairs established on the identity's other devices — already
+    // replicated or arriving later — register here as their records and
+    // ticket payloads land, so this device serves and is servable without
+    // ever touching the grant surface itself.
+    let mut guard = state.lock().await;
+    let changes = match directory.changes().await {
+        Ok(changes) => changes,
+        Err(err) => {
+            undo_link(
+                &guard.node,
+                payload.identity,
+                directory.namespace(),
+                Some(data_import),
+            )
+            .await;
+            return Err(err);
+        }
+    };
+    guard
+        .identities
+        .insert(payload.identity, HostedIdentity { directory });
+    crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
+    Ok(())
+}
+
+/// The network half of `link`: dial the inviter on the linking ALPN,
+/// present the secret, read the bootstrap reply. No local state is touched,
+/// so a failure anywhere here rolls back nothing.
+async fn run_linking_dialogue(
+    dial: &data_layer::DialHandle,
+    payload: &LinkingPayload,
+) -> Result<LinkingResponse> {
     let connection = dial
         .connect(payload.inviter_addr.clone(), LINKING_ALPN)
         .await
@@ -284,59 +378,33 @@ pub(crate) async fn link_via_dialogue(
     }
     .await?;
     connection.close(0u32.into(), b"done");
+    Ok(response)
+}
 
-    // Import both replicas under a brief lock — local acts, no network
-    // wait. Sessions the imports start count for the catch-up below: they
-    // start after this instant.
-    let before_import = SystemTime::now();
-    let (directory, data_import) = {
-        let state = state.lock().await;
-        // The inviter's address is a live first-sync contact for the
-        // imported directory, exactly as a peer's address is in
-        // establishment's assembly.
-        let mut directory_ticket = response.directory;
-        directory_ticket.nodes.push(payload.inviter_addr.clone());
-        let directory = PrivateMetadataStore::import(&state.node, directory_ticket).await?;
-        match state
-            .node
-            .import_namespace(payload.identity, response.data)
-            .await
-        {
-            Ok(data_import) => (directory, data_import),
-            Err(err) => {
-                // The rollback begins with the import: a directory whose
-                // sibling import failed must not survive it.
-                let _ = state.node.forget_doc(directory.namespace()).await;
-                return Err(err);
-            }
-        }
-    };
-
-    // The one bounded wait, against a peer that answered the dialogue
-    // moments ago — no lock held. Beyond it, the node's periodic reconcile
-    // pass keeps the replicas converging.
-    if let Err(err) = directory.wait_caught_up(before_import, timeout).await {
-        // Undo both imports, so the dialing node keeps no residue and the
-        // identity's operations refuse as unknown again — not as storage
-        // errors against a dropped replica.
-        //
-        // The data namespace is undone rather than forgotten outright: this
-        // runtime may already have been bound to that issuer before the
-        // link — a peer's granted namespace registers under the issuer too,
-        // and the pre-dial guard cannot see it (it reads the hosted set, not
-        // the node's issuer registry). Forgetting by issuer would delete a
-        // replica this link never imported, permanently: a rollback must
-        // restore what it displaced, never destroy state that predates it.
-        let state = state.lock().await;
-        let _ = state.node.forget_doc(directory.namespace()).await;
-        let _ = state.node.undo_import_namespace(data_import).await;
-        return Err(err).context("the imported directory did not catch up in time");
+/// Undo an abandoned link's local effects, in reverse order of their
+/// creation: the data-namespace import (when it happened), the
+/// classification arming, and the directory import — so the dialing node
+/// keeps no residue and the identity's operations refuse as unknown again,
+/// not as storage errors against a dropped replica. Best-effort on every
+/// step: the link already failed, and the original error is what the
+/// caller reports.
+///
+/// The data namespace is undone rather than forgotten outright: this
+/// runtime may already have been bound to that issuer before the link — a
+/// peer's granted namespace registers under the issuer too, and the
+/// pre-dial guard cannot see it (it reads the hosted set, not the node's
+/// issuer registry). Forgetting by issuer would delete a replica this link
+/// never imported, permanently: a rollback must restore what it displaced,
+/// never destroy state that predates it.
+async fn undo_link(
+    node: &SyncNode,
+    identity: PdnId,
+    directory_namespace: NamespaceId,
+    data_import: Option<NamespaceImport>,
+) {
+    if let Some(import) = data_import {
+        let _ = node.undo_import_namespace(import).await;
     }
-
-    // Success: the identity is hosted from here on.
-    let mut state = state.lock().await;
-    state
-        .identities
-        .insert(payload.identity, HostedIdentity { directory });
-    Ok(())
+    let _ = node.unhost_identity(identity);
+    let _ = node.forget_doc(directory_namespace).await;
 }

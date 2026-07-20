@@ -18,10 +18,10 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Install just
+      - name: Install just + nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just,nextest
 
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2

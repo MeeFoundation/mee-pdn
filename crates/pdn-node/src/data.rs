@@ -1,5 +1,5 @@
 //! The data service: entries in data namespaces hosted on this node, plus
-//! the interim whole-store ticket handover.
+//! the whole-store ticket handover.
 
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, DocTicket, ShareMode};
@@ -8,17 +8,15 @@ use pdn_types::{EntryInfo, EntryPath, PdnId};
 use crate::runtime::Runtime;
 
 /// Writing, reading, and listing entries by issuer and path, and the
-/// interim namespace-ticket handover: share a namespace hosted here, import
-/// a peer's.
+/// namespace-ticket handover: share a namespace hosted here, import a
+/// peer's.
 ///
-/// Whole-store tickets are the interim access model (the ADR-0008 posture:
-/// possession of a replica's ticket bounds access to it). The connections
-/// service's grant surface is the honest transport for these tickets
-/// between connected identities; the out-of-band share/import here remains
-/// for namespaces outside any connection. Capability-scoped sharing
-/// (subset-rbsr egress) replaces the grant payload, not the channel. A test
-/// mock standing in for the network is the second implementation this
-/// trait anticipates.
+/// The connections service's grant surface is the sanctioned transport for
+/// namespace access between connected identities — whole-store or scoped.
+/// The out-of-band share/import here does not deliver from an armed
+/// issuer: creation arms fail-closed serving, so a bare ticket without a
+/// recorded grant is refused; the surface remains for un-armed assemblies
+/// and as the paired-denial material.
 ///
 /// Operations address issuers whose data namespace was created or imported
 /// on this node — not hosted identities: creation and linking both bring a
@@ -41,13 +39,26 @@ pub trait DataService {
     async fn list(&self, issuer: PdnId, path_prefix: Option<&EntryPath>) -> Result<Vec<EntryInfo>>;
 
     /// Share the data namespace of `issuer` as a ticket a peer runtime can
-    /// import: the interim whole-store handover.
+    /// import: the whole-store handover.
     async fn share(&self, issuer: PdnId, mode: ShareMode) -> Result<DocTicket>;
 
-    /// Import a peer's data namespace from `ticket`, registering it under
-    /// `issuer` (named by the caller — the ticket carries the namespace,
-    /// not its issuer), after which its entries sync whole.
+    /// Import a peer's data namespace from `ticket` as a whole-store grant,
+    /// registering it under `issuer` (named by the caller — the ticket
+    /// carries the namespace, not its issuer), after which its entries sync
+    /// whole. As a grantee the runtime never re-serves the replica to third
+    /// parties and never joins its gossip swarm: the swarm of a data
+    /// namespace is its issuer's device set, and delivery here is
+    /// classified reconciliation with the issuer's devices — what makes the
+    /// grant whole-store rather than scoped is the issuer's grant record,
+    /// not the import.
     async fn import(&self, issuer: PdnId, ticket: DocTicket) -> Result<()>;
+
+    /// Import a peer's data namespace whose access arrived through a
+    /// scoped grant: the replica registers under `issuer`, stays outside
+    /// the gossip swarm, and syncs by capability-filtered reconciliation
+    /// only — the issuer's devices reveal exactly the granted claims.
+    /// Reads nudge a reconciliation and are served from the local replica.
+    async fn import_scoped(&self, issuer: PdnId, ticket: DocTicket) -> Result<()>;
 }
 
 /// The production [`DataService`], backed by the runtime's `data-layer`
@@ -100,7 +111,17 @@ impl DataService for RuntimeDataService<'_> {
         // caller replaces is an equivalent handle. There is nothing to undo —
         // an explicit import is its own last word, unlike the linking
         // dialogue's, which must survive a failed catch-up.
-        let _displaced = state.node.import_namespace(issuer, ticket).await?;
+        let _displaced = state.node.import_namespace_granted(issuer, ticket).await?;
+        Ok(())
+    }
+
+    async fn import_scoped(&self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
+        let state = self.runtime.state.lock().await;
+        // Same rebinding contract as `import` — and the same grantee stance
+        // below it (contacts-only sync, never re-serving); the two names
+        // keep the caller's intent readable, the issuer's grant record is
+        // what scopes the view.
+        let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         Ok(())
     }
 }

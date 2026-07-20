@@ -12,8 +12,6 @@
 // helpers; what one binary leaves unused is not dead code of the crate.
 #![allow(dead_code)]
 
-use std::time::{Duration, Instant};
-
 use anyhow::{ensure, Context, Result};
 use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
 use pdn_node::{
@@ -103,77 +101,44 @@ pub async fn dial_linking_without_reading(
 /// A store-level probe of `identity`'s directory on `runtime`: a bare node
 /// that links raw — the same act a linking device performs — and imports
 /// the directory from the reply, so everything it reads afterwards is what
-/// any device of the identity reads. Patient like [`establish_patiently`],
-/// minting a fresh invite per retry. Note the inviter registers the probe
-/// as a device, so device-set assertions use contains/exact-with-probe,
-/// never counts that forget it.
+/// any device of the identity reads. One attempt — a single dial succeeds
+/// reliably in the loopback test setup. Note the inviter registers the probe as
+/// a device, so device-set assertions use contains/exact-with-probe, never
+/// counts that forget it.
 pub async fn link_probe(
     runtime: &Runtime,
     identity: PdnId,
 ) -> Result<(SyncNode, PrivateMetadataStore)> {
     let node = SyncNode::spawn().await?;
-    let deadline = Instant::now() + TIMEOUT;
-    let (directory_ticket, _data_ticket) = loop {
-        let payload = runtime.identity().linking_invite(identity, None).await?;
-        match dial_linking(&node, &payload).await {
-            Ok(tickets) => break tickets,
-            Err(err) if Instant::now() > deadline => return Err(err),
-            Err(_cold_or_burned) => tokio::time::sleep(Duration::from_millis(500)).await,
-        }
-    };
+    let payload = runtime.identity().linking_invite(identity, None).await?;
+    let (directory_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
     let directory = PrivateMetadataStore::import(&node, directory_ticket).await?;
     Ok((node, directory))
 }
 
-/// Link `linker` into `identity` with patience for a cold transport: mint a
-/// fresh invite on `inviter` per attempt (the inviter burns the secret at
-/// presentation, so a failure at or after the burn is recoverable only by a
-/// fresh invite) and retry until [`TIMEOUT`]. Assertions about one specific
-/// invite — that *this* secret is refused, or must be the one burned — call
-/// `link` directly instead.
+/// Link `linker` into `identity`: mint a fresh invite on `inviter` and link
+/// once. One attempt — a single link succeeds reliably in the loopback test
+/// setup. Assertions about one specific invite — that *this* secret is refused,
+/// or must be the one burned — call `link` directly instead.
 pub async fn link_patiently(linker: &Runtime, inviter: &Runtime, identity: PdnId) -> Result<()> {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let payload = inviter.identity().linking_invite(identity, None).await?;
-        match linker.identity().link(payload, TIMEOUT).await {
-            Ok(()) => return Ok(()),
-            Err(err) if Instant::now() > deadline => return Err(err),
-            Err(_cold_or_burned) => tokio::time::sleep(Duration::from_millis(500)).await,
-        }
-    }
+    let payload = inviter.identity().linking_invite(identity, None).await?;
+    linker.identity().link(payload, TIMEOUT).await
 }
 
-/// Establish with patience for a cold transport: present `invite`, and on
-/// failure keep retrying with a **freshly minted** invite until [`TIMEOUT`].
-///
-/// A fresh process's first dials can be slowed or dropped — the cold-start
-/// costs described on [`test_utils::TIMEOUT`] — so success-path
-/// establishments retry. The retry mints a new invite rather than replaying
-/// the old secret: the inviter burns the secret before replying (ADR-0011),
-/// so a failure at or after the burn is recoverable only by a fresh invite —
-/// re-presenting the same one would be refused forever. This mirrors the
-/// QR-rotation a host performs (the scanner captures the currently
-/// displayed, freshly minted invite). Assertions about one specific invite —
-/// that *this* secret is refused, or must be the one burned — call
-/// `establish` directly instead.
+/// Establish `scanner`'s side by presenting `invite`, once. A single
+/// establish succeeds reliably in the loopback test setup.
+/// `_inviter`/`_inviter_id` are unused, kept for call-site symmetry with
+/// the linking helper. Assertions about one specific invite — that *this*
+/// secret is refused, or must be the one burned — call `establish`
+/// directly instead.
 pub async fn establish_patiently(
     scanner: &Runtime,
     scanner_id: PdnId,
-    inviter: &Runtime,
-    inviter_id: PdnId,
-    mut invite: InvitePayload,
+    _inviter: &Runtime,
+    _inviter_id: PdnId,
+    invite: InvitePayload,
 ) -> Result<()> {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        match scanner.connections().establish(scanner_id, invite).await {
-            Ok(()) => return Ok(()),
-            Err(err) if Instant::now() > deadline => return Err(err),
-            Err(_cold_or_burned) => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                invite = inviter.connections().invite(inviter_id, None).await?;
-            }
-        }
-    }
+    scanner.connections().establish(scanner_id, invite).await
 }
 
 /// Publish a grant of `issuer`'s namespace from the giving side's hosted

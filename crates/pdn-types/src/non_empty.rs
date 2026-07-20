@@ -1,7 +1,6 @@
 //! A correct-by-construction non-empty collection.
 //!
-//! API mirrors the [`nonempty`](https://crates.io/crates/nonempty) crate so
-//! we can swap to the external dep later if needed.
+//! API mirrors the [`nonempty`](https://crates.io/crates/nonempty) crate.
 
 use serde::de::Deserializer;
 use serde::ser::{SerializeSeq, Serializer};

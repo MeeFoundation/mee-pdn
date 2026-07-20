@@ -19,10 +19,9 @@
 //! attempt leaves no observable state. A wrong secret burns nothing: a
 //! guess cannot extinguish a ceremony in progress.
 //!
-//! The KERI proof of control over a presented `PdnId` is a marked step of
-//! this dialogue, deferred: the exchange is bearer-level (secret plus
-//! tickets), consistent with ADR-0008's interim posture. Both peers must be
-//! online; pending invitations are future work.
+//! The dialogue carries no KERI proof of control over a presented `PdnId`
+//! — deferred (ADR-0008): the exchange is bearer-level, secret plus
+//! tickets. Both peers must be online: there are no pending invitations.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
@@ -93,7 +92,7 @@ pub struct UnsupportedInviteVersion {
 
 /// The scanner's half of the dialogue: the secret, who is scanning, where
 /// to reach it, and the read ticket to the metadata store it issues toward
-/// the inviter. The successor of this message gains the KERI proof step.
+/// the inviter.
 #[derive(Debug, Serialize, Deserialize)]
 struct PairingRequest {
     version: u8,
@@ -105,7 +104,7 @@ struct PairingRequest {
 
 /// The inviter's half, sent only after the verify-and-burn and the state
 /// assembly: the read ticket to the metadata store it issues toward the
-/// scanner. The successor of this message gains the KERI proof step.
+/// scanner.
 #[derive(Debug, Serialize, Deserialize)]
 struct PairingResponse {
     ticket: DocTicket,
@@ -246,7 +245,7 @@ impl PairingHandler {
             else {
                 // Sharing failed before assemble committed: forget a freshly
                 // created own so a failed accept leaves no orphan, the same
-                // rollback the dial side does (#4).
+                // rollback the dial side does.
                 if created_fresh {
                     let _ = state.node.forget_doc(own.namespace()).await;
                 }
@@ -340,7 +339,7 @@ pub(crate) async fn establish_via_dialogue(
     // answer (this is what breaks the reciprocal-establishment deadlock). Any
     // failure here is before assemble commits, so a freshly created `own` is
     // an orphan — unreferenced by directory or cache — that the reconcile
-    // pass would re-sync for the node's life; forget it instead (#4).
+    // pass would re-sync for the node's life; forget it instead.
     let response: Result<PairingResponse> = async {
         let ticket = own
             .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
@@ -392,10 +391,10 @@ pub(crate) async fn establish_via_dialogue(
     .await
 }
 
-/// Create-or-reuse this side's own metadata store toward `peer` (design
-/// D3): the cached pair first, then the directory's own-kind write ticket —
-/// so re-establishment and linked devices converge on one replica — and
-/// only then a fresh replica. The identity must be hosted here.
+/// Create-or-reuse this side's own metadata store toward `peer`: the
+/// cached pair first, then the directory's own-kind write ticket — so
+/// re-establishment and linked devices converge on one replica — and only
+/// then a fresh replica. The identity must be hosted here.
 ///
 /// The bool is `true` only when a fresh replica was created — so the caller
 /// can forget it if establishment then fails before commit, while a reused
@@ -460,6 +459,16 @@ async fn assemble_connection(
         .put_ticket(&peer_ticket_kind(&peer), &peer_ticket)
         .await?;
     directory.connect(peer).await?;
+
+    // This device asserts itself into `own` (the counterparty resolves
+    // callers through these records), and the pair registers for session
+    // classification. Assert-once, like every pair opening: a
+    // re-establishment onto a reused store leaves a live record untouched
+    // and never resurrects a withdrawn one.
+    own.ensure_device_published(state.node.node_id()).await?;
+    state
+        .node
+        .host_connection(identity, peer, &own, &peer_store)?;
 
     state.metadata_pairs.insert(
         (identity, peer),

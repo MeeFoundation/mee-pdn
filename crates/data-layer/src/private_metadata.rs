@@ -4,11 +4,9 @@
 //!
 //! A dedicated pdn-store replica, separate from data namespaces, that all
 //! devices of one identity replicate. It is device-internal by ticket alone
-//! (Invariant 1's remaining mechanism —
-//! `mia-docs/openspec/specs/components/pdn-node/invariants.md`): its ticket
-//! is handed only to the identity's own devices (over the device-linking
-//! dialogue), and no ingest filter runs. Three record families live here,
-//! under disjoint prefixes: `devices/` — the device set; `tickets/` — typed
+//! (Invariant 1): its ticket is handed only to the identity's own devices,
+//! over the device-linking dialogue. Three record families live here, under
+//! disjoint prefixes: `devices/` — the device set; `tickets/` — typed
 //! tickets to the identity's other stores and its connections' metadata
 //! pairs; `connections/` — one marker record per connection counterparty.
 //! One node holds the private metadata stores of any number of identities.
@@ -43,14 +41,20 @@ use crate::node::{read_payload, SyncNode};
 #[error("no successful sync session of the replica within the wait")]
 pub struct CatchUpTimeout;
 
-/// Key prefix for device records.
-const DEVICES_PREFIX: &str = "devices/";
+/// Key prefix for device records — the one shape shared by the directory's
+/// device set (Invariant 1), the connection metadata store's published
+/// device sets, and the access book's membership probe. One definition on
+/// purpose: this key decides who counts as an identity's own device, so a
+/// drifted copy would be an access-control bug.
+pub(crate) const DEVICES_PREFIX: &str = "devices/";
 /// Key prefix for typed tickets.
 const TICKETS_PREFIX: &str = "tickets/";
 /// Key prefix for connection records.
 const CONNECTIONS_PREFIX: &str = "connections/";
 
-fn device_key(device: &NodeId) -> String {
+/// The entry key of a device record: `devices/<node-id-hex>`
+/// ([`DEVICES_PREFIX`] is the one shared definition).
+pub(crate) fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
 }
 
@@ -63,7 +67,8 @@ fn connection_key(peer: &PdnId) -> String {
     format!("{CONNECTIONS_PREFIX}{peer}")
 }
 
-fn device_of(key: &[u8]) -> Option<NodeId> {
+/// Parse a `NodeId` back out of a `devices/<hex>` key, if it matches.
+pub(crate) fn device_of(key: &[u8]) -> Option<NodeId> {
     std::str::from_utf8(key)
         .ok()?
         .strip_prefix(DEVICES_PREFIX)?
@@ -123,6 +128,12 @@ impl PrivateMetadataStore {
     ) -> Result<DocTicket> {
         let ticket = self.doc.share(mode, addr_options).await?;
         Ok(ticket)
+    }
+
+    /// The backing doc handle, for registration with the node's access
+    /// book ([`SyncNode::host_identity`](crate::SyncNode::host_identity)).
+    pub(crate) fn doc_handle(&self) -> Doc {
+        self.doc.clone()
     }
 
     /// Record `device` as one of the identity's devices.
@@ -205,12 +216,33 @@ impl PrivateMetadataStore {
 
     /// Subscribe to this store's replica events (inserts, sync sessions).
     /// Crate-private on purpose: the fork's event type stays behind this
-    /// layer, and the one property consumers need is stated by
-    /// [`wait_caught_up`](Self::wait_caught_up).
+    /// layer; consumers get the two narrow properties stated by
+    /// [`wait_caught_up`](Self::wait_caught_up) and [`changes`](Self::changes).
     pub(crate) async fn events(
         &self,
     ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
         self.doc.subscribe().await
+    }
+
+    /// One item per observed change of this directory: an entry written
+    /// here, an entry arrived by sync, or a payload blob become readable.
+    /// The item carries no detail on purpose — the fork's event vocabulary
+    /// stays behind this layer, and "something changed, look again" is
+    /// exactly what a re-reading consumer needs. An `Err` item reports the
+    /// subscription failing; the stream ends when the node shuts down.
+    pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
+        let events = self.events().await?;
+        Ok(events.filter_map(|event| match event {
+            Ok(
+                LiveEvent::InsertLocal { .. }
+                | LiveEvent::InsertRemote { .. }
+                | LiveEvent::ContentReady { .. },
+            ) => Some(Ok(())),
+            // Sync-session and neighbor bookkeeping is not a change of the
+            // directory's contents.
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        }))
     }
 
     /// The namespace id of the backing replica — which replica this handle
@@ -228,10 +260,9 @@ impl PrivateMetadataStore {
     /// The property waited on is "this replica has caught up with a peer":
     /// a completed, successful exchange — not "some content arrived".
     /// Polling contents cannot state it: a replica that synced and found
-    /// nothing new and one that never synced read the same. No trigger is
-    /// offered or needed — importing a replica already starts its first
-    /// session and enrols it in the node's periodic reconcile pass with the
-    /// ticket's contacts, so a first exchange that fails is re-dialed
+    /// nothing new and one that never synced read the same. Importing a
+    /// replica already starts its first session and enrols it in the
+    /// periodic reconcile pass, so a failed first exchange is re-dialed
     /// within this wait's own budget.
     pub async fn wait_caught_up(&self, since: SystemTime, timeout: Duration) -> Result<()> {
         let mut events = self.events().await?;
@@ -254,13 +285,12 @@ impl PrivateMetadataStore {
         }
     }
 
-    /// List the kinds under which tickets are currently published
-    /// (record-level — available as soon as the records sync; a listed
-    /// kind's ticket may still be payload-waiting in
+    /// List the kinds under which tickets are published (record-level; a
+    /// listed kind's ticket may still be payload-waiting in
     /// [`get_ticket`](Self::get_ticket)). The directory's audit surface:
-    /// what routing the identity's devices can discover here — and, per the
-    /// routing/grants boundary, what must not appear (no tickets to another
-    /// identity's data stores; those live in connection metadata stores).
+    /// what routing the identity's devices can discover here — and what
+    /// must not appear (no tickets to another identity's data stores; those
+    /// live in connection metadata stores).
     pub async fn list_ticket_kinds(&self) -> Result<Vec<String>> {
         let query = Query::single_latest_per_key().key_prefix(TICKETS_PREFIX.as_bytes());
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);

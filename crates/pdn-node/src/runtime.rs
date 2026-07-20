@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{AuthorId, ConnectionMetadata, PrivateMetadataStore, SyncNode};
+use data_layer::{AuthorId, ConnectionMetadata, PrivateMetadataStore, SpawnOptions, SyncNode};
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 
@@ -35,8 +35,7 @@ const SHUTDOWN_RETRY: Duration = Duration::from_millis(10);
 
 /// A hosted identity's store handles — the runtime's own value, keyed by
 /// identity in [`State::identities`]. Data-layer keeps no such list: store
-/// handles stay with the caller, and the runtime is that caller. Today just
-/// the directory; the set grows as more stores join it.
+/// handles stay with the caller, and the runtime is that caller.
 #[derive(Debug)]
 pub(crate) struct HostedIdentity {
     /// The identity's private-metadata directory: devices, tickets, and
@@ -62,8 +61,8 @@ pub(crate) struct HostedIdentity {
 pub(crate) struct State {
     pub(crate) node: SyncNode,
     /// The author for this runtime's data-namespace writes. The author
-    /// dimension is not meaningful yet (see [`pdn_types::EntryInfo`]), so
-    /// one per runtime suffices.
+    /// dimension carries no meaning (see [`pdn_types::EntryInfo`]), so one
+    /// per runtime suffices.
     pub(crate) author: AuthorId,
     /// The hosted identities' store handles, keyed by identity: exactly
     /// those created or linked on this runtime.
@@ -79,8 +78,9 @@ pub(crate) struct State {
     pub(crate) pending_linking_invites: PendingInvites,
     /// Connection metadata pairs opened on this runtime, keyed by
     /// `(hosted identity, counterparty)`: filled by establishment on the
-    /// pairing device, and on demand from the directory's tickets
-    /// everywhere else — a cache; the directory is the durable lookup.
+    /// pairing device, by each hosted identity's connection armer as pair
+    /// records replicate in from its other devices, and on demand from the
+    /// directory's tickets — a cache; the directory is the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
 }
 
@@ -117,14 +117,23 @@ impl Runtime {
     /// gets its own state slot, filled immediately after the node comes up,
     /// so by the time an invite can exist both handlers are fully wired.
     pub async fn spawn() -> Result<Self> {
+        Self::spawn_with(SpawnOptions::default()).await
+    }
+
+    /// [`spawn`](Self::spawn), tuned by `options` — passed through to the
+    /// node assembly.
+    pub async fn spawn_with(options: SpawnOptions) -> Result<Self> {
         let pairing = PairingHandler::new();
         let pairing_slot = pairing.slot();
         let linking = LinkingHandler::new();
         let linking_slot = linking.slot();
-        let node = SyncNode::spawn_with_protocols(vec![
-            (PAIRING_ALPN.to_vec(), Box::new(pairing)),
-            (LINKING_ALPN.to_vec(), Box::new(linking)),
-        ])
+        let node = SyncNode::spawn_with(
+            vec![
+                (PAIRING_ALPN.to_vec(), Box::new(pairing)),
+                (LINKING_ALPN.to_vec(), Box::new(linking)),
+            ],
+            options,
+        )
         .await?;
         let author = node.create_author().await?;
         let node_id = node.node_id();
@@ -164,8 +173,8 @@ impl Runtime {
         RuntimeConnectionsService::new(self)
     }
 
-    /// The data service: entries by issuer and path, plus the interim
-    /// whole-store ticket handover.
+    /// The data service: entries by issuer and path, plus the whole-store
+    /// ticket handover.
     pub fn data(&self) -> RuntimeDataService<'_> {
         RuntimeDataService::new(self)
     }

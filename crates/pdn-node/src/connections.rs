@@ -1,11 +1,14 @@
 //! The connections service: establish a hosted identity's connections,
 //! list them, and carry grants over the connections' metadata pairs.
 
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use data_layer::{AddrInfoOptions, ConnectionMetadata, DocTicket, ShareMode};
-use pdn_types::PdnId;
+use data_layer::{AddrInfoOptions, ConnectionMetadata, DocTicket, ReadGrant, ShareMode};
+use futures_lite::{Stream, StreamExt};
+use pdn_types::{ClaimId, NonEmpty, PdnId};
+use tokio::sync::Mutex;
 
 use crate::pairing::{
     establish_via_dialogue, InvitePayload, UnsupportedInviteVersion, DEFAULT_INVITE_LIFETIME,
@@ -13,8 +16,27 @@ use crate::pairing::{
 };
 use crate::runtime::{Runtime, State};
 
+/// A grant publication named a data issuer other than the granting
+/// identity itself — refused: granting another identity's data is
+/// delegation, and delegation is not expressible. The classifier scans the
+/// connections of the *data issuer's* identity, so a grant recorded under
+/// a different granting identity could never be honored — the publish
+/// would succeed, replicate, and enforce as nothing, a silent no-op on
+/// both sides.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error(
+    "identity {identity} cannot grant data issued by {issuer}: granting another identity's data \
+     is delegation, which is not expressible"
+)]
+pub struct DelegationUnsupported {
+    /// The identity attempting the grant.
+    pub identity: PdnId,
+    /// The foreign data issuer it tried to grant.
+    pub issuer: PdnId,
+}
+
 /// A grant read from a connected peer's metadata store: the peer granted
-/// access to the data store `issuer` issues, and the ticket is the interim
+/// access to the data store `issuer` issues, and the ticket is the
 /// whole-store payload — importing it (an explicit data-service act) is how
 /// the granted namespace starts syncing here.
 #[derive(Debug, Clone)]
@@ -22,6 +44,20 @@ pub struct PeerGrant {
     /// The issuer of the granted data store.
     pub issuer: PdnId,
     /// The whole-store ticket the grant carries.
+    pub ticket: DocTicket,
+}
+
+/// A scoped grant read from a connected peer's metadata store: the
+/// capability naming the granted claims, and the ticket whose mode matches
+/// the grant's commands. Importing the namespace scoped
+/// ([`crate::DataService::import_scoped`]) is how the granted subset
+/// starts syncing here — outside the replica's gossip swarm.
+#[derive(Debug, Clone)]
+pub struct ScopedPeerGrant {
+    /// The capability: issuer, audience, exact claims, commands.
+    pub grant: ReadGrant,
+    /// The replica's ticket — addressing and contacts; read-mode for
+    /// read-only grants (no namespace secret), write-mode with write.
     pub ticket: DocTicket,
 }
 
@@ -35,10 +71,10 @@ pub struct PeerGrant {
 /// identity's own store toward the peer, reading opens the counterpart's
 /// store — from the directory's tickets on demand, so linked devices reach
 /// pairs established elsewhere. Reading hands back the ticket a grant
-/// carries; importing that namespace stays an explicit data-service act
-/// (the reactive cascade is a later change). The grant payload is the
-/// interim whole-store ticket; capability-scoped grants land with the
-/// read-capability mechanism.
+/// carries; importing that namespace stays an explicit data-service act.
+/// One grant record exists per granted issuer, carrying its width
+/// explicitly — a whole-store ticket, or a capability-scoped grant — so
+/// publishing either width replaces the other and a withdrawal is one act.
 #[allow(async_fn_in_trait)]
 pub trait ConnectionsService {
     /// Mint an invite for hosted `identity`: a one-time secret pending on
@@ -56,17 +92,18 @@ pub trait ConnectionsService {
     /// List the current connections of hosted `identity`.
     async fn list(&self, identity: PdnId) -> Result<Vec<PdnId>>;
 
-    /// Publish a grant of `issuer`'s data store — hosted on this node —
-    /// toward `peer`, into `identity`'s own metadata store of that
-    /// connection: the interim whole-store ticket, minted here.
+    /// Publish a grant of `issuer`'s data store toward `peer`, into
+    /// `identity`'s own metadata store of that connection: a whole-store
+    /// ticket, minted here. The issuer must be the granting identity itself
+    /// — anything else is refused ([`DelegationUnsupported`]). Replaces any
+    /// previous grant for this issuer whatever its width — publishing
+    /// whole-store over a scoped grant *is* the widening, one record per
+    /// issuer.
     ///
     /// The ticket is a **write** ticket, and deliberately so: the store's
     /// capability is not the access-control mechanism, it is swarm
-    /// membership. Read and write are `UWill`'s to decide, enforced at
-    /// ingest and egress; a read ticket here would only pretend to gate
-    /// access while the gates that matter are being built. Until they are, a
-    /// grant is whole-store and unscoped — the grantee can write into the
-    /// namespace, and nothing yet rejects what it writes.
+    /// membership. A whole-store grant is unscoped — the grantee can write
+    /// into the namespace, and nothing rejects what it writes.
     async fn publish_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()>;
 
     /// Read the grants `peer` has published toward hosted `identity`, from
@@ -77,6 +114,34 @@ pub trait ConnectionsService {
     /// siblings. An empty list also covers a pair whose directory tickets
     /// have not reached this device yet.
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>>;
+
+    /// Publish a scoped grant: `identity` grants `peer` read — and, with
+    /// `write`, write — on exactly `claims` of `issuer`'s data store. The
+    /// issuer must be the granting identity itself — anything else is
+    /// refused ([`DelegationUnsupported`]). Capability and ticket travel as
+    /// one record (replacing any previous grant of any width); the ticket
+    /// carries exactly the granted authority: read-only → a read ticket (no
+    /// namespace secret — the grantee cannot write at all), with `write` →
+    /// a write ticket (the namespace secret carries write authority — no
+    /// ingest hook is installed, ADR-0008).
+    async fn publish_scoped_grant(
+        &self,
+        identity: PdnId,
+        peer: PdnId,
+        issuer: PdnId,
+        claims: NonEmpty<ClaimId>,
+        write: bool,
+    ) -> Result<()>;
+
+    /// Read the scoped grants `peer` has published toward hosted
+    /// `identity` — capability and ticket together, with the same
+    /// payload-waiting and poll-friendly contract as
+    /// [`read_grants`](Self::read_grants).
+    async fn read_scoped_grants(
+        &self,
+        identity: PdnId,
+        peer: PdnId,
+    ) -> Result<Vec<ScopedPeerGrant>>;
 }
 
 /// The production [`ConnectionsService`], backed by the runtime's
@@ -131,6 +196,9 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
     async fn publish_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()> {
         let mut state = self.runtime.state.lock().await;
         state.hosted(identity)?;
+        if identity != issuer {
+            return Err(DelegationUnsupported { identity, issuer }.into());
+        }
         let pair = open_pair(&mut state, identity, peer)
             .await?
             .with_context(|| format!("no connection metadata pair toward {peer}"))?;
@@ -165,6 +233,124 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
             }
         }
         Ok(grants)
+    }
+
+    async fn publish_scoped_grant(
+        &self,
+        identity: PdnId,
+        peer: PdnId,
+        issuer: PdnId,
+        claims: NonEmpty<ClaimId>,
+        write: bool,
+    ) -> Result<()> {
+        let mut state = self.runtime.state.lock().await;
+        state.hosted(identity)?;
+        if identity != issuer {
+            return Err(DelegationUnsupported { identity, issuer }.into());
+        }
+        let pair = open_pair(&mut state, identity, peer)
+            .await?
+            .with_context(|| format!("no connection metadata pair toward {peer}"))?;
+        // The ticket carries exactly the granted authority.
+        let mode = if write {
+            ShareMode::Write
+        } else {
+            ShareMode::Read
+        };
+        let ticket = state
+            .node
+            .share_ticket(issuer, mode, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        let grant = ReadGrant {
+            issuer,
+            audience: peer,
+            claims,
+            write,
+        };
+        pair.own.publish_scoped_grant(&grant, &ticket).await
+    }
+
+    async fn read_scoped_grants(
+        &self,
+        identity: PdnId,
+        peer: PdnId,
+    ) -> Result<Vec<ScopedPeerGrant>> {
+        // Assembly under the lock, polling outside it, exactly as
+        // `read_grants`.
+        let pair = {
+            let mut state = self.runtime.state.lock().await;
+            state.hosted(identity)?;
+            open_pair(&mut state, identity, peer).await?
+        };
+        let Some(pair) = pair else {
+            return Ok(Vec::new());
+        };
+        let mut grants = Vec::new();
+        for issuer in pair.peer.list_grants().await? {
+            if let Some((grant, ticket)) = pair.peer.read_scoped_grant(issuer).await? {
+                grants.push(ScopedPeerGrant { grant, ticket });
+            }
+        }
+        Ok(grants)
+    }
+}
+
+/// Keep hosted `identity`'s connections armed for session classification:
+/// one sweep now, then one per directory change, each opening every
+/// directory-listed pair not yet cached. Hosting an identity thereby keeps
+/// its pairs registered — on the device that established them and on every
+/// linked device their records replicate to. Without the sweep a linked
+/// device would silently refuse grants its identity really issued until
+/// its first grant read, and stay invisible to the counterparty
+/// ([`open_pair`] is also what publishes the device record).
+///
+/// The task holds the runtime state weakly and upgrades per sweep, so
+/// shutdown's sole-ownership wait is never blocked for longer than one
+/// sweep's local acts; it exits when the runtime is gone or the directory's
+/// event stream ends with it.
+pub(crate) fn spawn_connection_armer(
+    state: Weak<Mutex<State>>,
+    identity: PdnId,
+    changes: impl Stream<Item = Result<()>> + Send + Unpin + 'static,
+) {
+    let mut changes = changes;
+    let _detached = tokio::spawn(async move {
+        loop {
+            {
+                let Some(state) = state.upgrade() else { return };
+                let mut state = state.lock().await;
+                arm_connections(&mut state, identity).await;
+            }
+            match changes.next().await {
+                Some(Ok(())) => {}
+                // A failed subscription or a stream ended by shutdown both
+                // end the armer; the grant surface's on-demand open remains
+                // as the backstop.
+                Some(Err(_)) | None => return,
+            }
+        }
+    });
+}
+
+/// One arming sweep: open every pair `identity`'s directory lists that is
+/// not in the cache yet. A pair that cannot open — its tickets still
+/// payload-waiting, or a transient store failure — stays cold until the
+/// next sweep; a sweep never fails as a whole.
+async fn arm_connections(state: &mut State, identity: PdnId) {
+    let peers = {
+        let Ok(hosted) = state.hosted(identity) else {
+            return;
+        };
+        match hosted.directory.list_connections().await {
+            Ok(peers) => peers,
+            Err(_directory_unreadable) => return,
+        }
+    };
+    for peer in peers {
+        if state.metadata_pairs.contains_key(&(identity, peer)) {
+            continue;
+        }
+        let _cold_until_next_sweep = open_pair(state, identity, peer).await;
     }
 }
 
@@ -201,7 +387,7 @@ async fn open_pair(
     };
     // Each side is judged on its own, so a superseded `peer` does not force a
     // needless re-import of a still-current `own` (which would leak a tracked
-    // doc and an author, as a blanket re-import used to).
+    // doc and an author).
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
@@ -217,6 +403,18 @@ async fn open_pair(
         own,
         peer: peer_store,
     };
+    // A device that opens the pair asserts itself into `own` once and
+    // registers the pair for session classification, so linked devices are
+    // resolvable by the counterparty and judge callers themselves.
+    // Assert-once, tombstones respected: opening is not a (re-)publication
+    // act — a live record is left untouched, and a withdrawn record is
+    // never resurrected as a side effect.
+    pair.own
+        .ensure_device_published(state.node.node_id())
+        .await?;
+    state
+        .node
+        .host_connection(identity, peer, &pair.own, &pair.peer)?;
     state.metadata_pairs.insert((identity, peer), pair.clone());
     Ok(Some(pair))
 }

@@ -8,8 +8,8 @@
 //! policy.
 //!
 //! Pure chain validation (proof-chain verification, expiry, revocation
-//! checks) belongs here as it lands; the node runtime resolves an entry
-//! to the relevant chain and calls into this module for the verdict.
+//! checks) belongs here; the node runtime resolves an entry to the
+//! relevant chain and calls into this module for the verdict.
 //!
 //! See `components/pdn-node/uwill.md` for the full specification.
 

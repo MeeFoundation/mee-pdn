@@ -108,7 +108,7 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
         {
             Ok(conn) => break conn,
             Err(err) if std::time::Instant::now() > deadline => return Err(err),
-            Err(_first_dial_stall) => {}
+            Err(_transient) => {}
         }
     };
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -118,12 +118,9 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     // away with no payload. Whether it learns that as a stream error or as a
     // clean empty end-of-stream is a teardown race, not the containment
     // property: the panic unwinds the handler's own future first, dropping
-    // its `SendStream` before the connection, and dropping one implicitly
-    // finishes the stream (`noq`'s `SendStream::drop` calls `finish()` unless
-    // the connection already carries an error). So a FIN is queued before the
-    // connection's close, and whichever reaches the dialer first decides what
-    // this read returns. Asserting `is_err()` here failed whenever the FIN
-    // won — under the load of a full-suite run, sometimes it does.
+    // its `SendStream` before the connection (drop implicitly finishes the
+    // stream), so a FIN is queued before the connection's close and
+    // whichever reaches the dialer first decides what this read returns.
     let response = recv.read_to_end(ECHO_LIMIT).await;
     let payload = response.as_deref().unwrap_or_default();
     assert!(
