@@ -27,17 +27,17 @@ pub mod ids {
     pub const DAVE: PdnId = PdnId::from_bytes([0xd0; 32]);
 }
 
-/// Generous liveness ceiling — a "must eventually replicate" bound, not a
-/// correctness one. Generosity is free: polls return the moment their
-/// condition holds, so a green run never pays this ceiling, and a larger
-/// value only tolerates slow environments — it never makes an assertion
-/// wrong. What it must absorb is the cold start every fresh process pays on
-/// its first dials — sockets, routes, and peers from zero, plus OS-level
-/// vetting of a newly built binary (worst observed: per-binary firewall and
-/// scan gating on macOS stalling early packets for tens of seconds when
-/// several nodes come up at once). Shrinking it makes no green run faster;
-/// it only turns slow-but-healthy cold starts into first-run-only flakes.
-pub const TIMEOUT: Duration = Duration::from_secs(120);
+/// Bounded liveness budget for scenario waits: how long a poll ([`eventually`])
+/// or a catch-up waits for a *remote* convergence before failing. Sized to what
+/// the product is expected to deliver by — a few of the node's periodic
+/// reconcile passes (data-layer's `SpawnOptions::reconcile_interval`, default
+/// 10s; suites probing refusals inject a sub-second cadence instead), so a
+/// convergence rescued by a reconcile pass still fits. Generosity is free —
+/// polls return the moment their condition holds, so a green run (tens of
+/// milliseconds on loopback) never approaches this — but the ceiling is tight
+/// enough that a real non-convergence fails in tens of seconds, with a named
+/// assertion, rather than hanging.
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll `check` every 100ms until it returns `true` or [`TIMEOUT`] elapses;
 /// the return says whether the condition was observed in time.

@@ -1,6 +1,7 @@
 //! The identity service: create an identity on its first device, link every
 //! further device over the linking dialogue.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,15 +20,13 @@ use crate::runtime::{HostedIdentity, Runtime};
 /// the dialogue's reply hands the bootstrap tickets over directly.
 const DATA_TICKET_KIND: &str = "data";
 
-/// Creating and linking identities on a runtime.
-///
-/// A trait because a second implementation is a live prospect: the
-/// production service mints placeholder identifiers with no key material
-/// behind them, and a KERI-backed service is the future replacement.
+/// Creating and linking identities on a runtime. The production
+/// implementation mints placeholder identifiers with no key material
+/// behind them.
 #[allow(async_fn_in_trait)]
 pub trait IdentityService {
     /// Create an identity on this runtime — its first device: mint a fresh
-    /// placeholder [`PdnId`] (a random identifier, no key material yet) and
+    /// placeholder [`PdnId`] (a random identifier, no key material) and
     /// provision its store set — the private-metadata directory with this
     /// device registered, and the data namespace, whose ticket is published
     /// in the directory under the `data` kind.
@@ -91,9 +90,23 @@ impl IdentityService for RuntimeIdentityService<'_> {
             )
             .await?;
         directory.put_ticket(DATA_TICKET_KIND, &data_ticket).await?;
+        // The directory arms session classification for this identity —
+        // its device records decide who is an own device, and its data
+        // namespace serves fail-closed. The armer's subscription is taken
+        // before the handle moves into the hosted set; connections this
+        // identity establishes or learns of by replication then register
+        // as their records arrive, not as a side effect of the first grant
+        // read.
+        let changes = directory.changes().await?;
+        state.node.host_identity(identity, &directory)?;
         state
             .identities
             .insert(identity, HostedIdentity { directory });
+        crate::connections::spawn_connection_armer(
+            Arc::downgrade(&self.runtime.state),
+            identity,
+            changes,
+        );
         Ok(identity)
     }
 

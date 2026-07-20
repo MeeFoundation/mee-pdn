@@ -3,7 +3,9 @@
 //! bootstraps, the non-founder chain, the refusal pairs of the
 //! verify-and-burn requirement — each probed for no observable state on
 //! either side — lost-reply convergence, the rollback of a link that could
-//! not catch up, and per-identity isolation across several linkings.
+//! not catch up, per-identity isolation across several linkings, and a
+//! linked device serving a grant its identity established and published
+//! elsewhere (connection arming by replication).
 
 use std::time::Duration;
 
@@ -25,13 +27,6 @@ use common::{
     dial_linking, dial_linking_without_reading, establish_patiently, granted_patiently,
     link_patiently, link_probe, read_frame, write_frame, LINKING_ALPN,
 };
-
-/// Serializes this file's tests: each spawns several runtimes, and letting
-/// them all bind their sockets at once maximizes the cold-start burst a
-/// freshly built binary's first dials already suffer (see
-/// `test_utils::TIMEOUT`). Run one at a time, each with the full liveness
-/// budget to itself.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Wait until the probe's directory lists exactly `devices` (order-free).
 async fn wait_devices_exactly(
@@ -88,7 +83,6 @@ async fn assert_directory_is(
 /// other.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let rt_peer = Runtime::spawn().await?;
@@ -177,7 +171,6 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
 /// data catches up transitively.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_through_a_non_founder_device() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_1 = Runtime::spawn().await?;
     let rt_2 = Runtime::spawn().await?;
     let rt_3 = Runtime::spawn().await?;
@@ -227,7 +220,6 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
 /// test below.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let rt_c = Runtime::spawn().await?;
@@ -337,7 +329,6 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
 /// had the refusal dialed and burned it.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let rt_c = Runtime::spawn().await?;
@@ -371,7 +362,6 @@ async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
 /// node id in the device set exactly once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let x = rt_a.identity().create().await?;
 
@@ -461,8 +451,6 @@ impl ProtocolHandler for DeadTicketInviter {
 /// errors against a dropped replica.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<()> {
-    let _serial = SERIAL.lock().await;
-
     // Mint real tickets from a scratch node, then take it away: the
     // namespaces they address end up hosted nowhere.
     let scratch = SyncNode::spawn().await?;
@@ -497,8 +485,8 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     };
 
     // The exchange completes, the imports land, the catch-up cannot: the
-    // wait's typed timeout surfaces (retried for the cold first dial, which
-    // fails before anything is imported and rolls back nothing).
+    // wait's typed timeout surfaces (retried in case the first dial fails
+    // before anything is imported, which rolls back nothing).
     let rt_b = Runtime::spawn().await?;
     let deadline = std::time::Instant::now() + TIMEOUT;
     let err = loop {
@@ -555,8 +543,6 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 /// is worse than no rollback at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() -> Result<()> {
-    let _serial = SERIAL.lock().await;
-
     // Two personas of one person, as `multi_identity` models them: X on the
     // phone, Y on the laptop, connected, with X granting Y its namespace.
     let rt_phone = Runtime::spawn().await?;
@@ -571,8 +557,8 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     rt_phone.data().write(x, &path, b"from-x").await?;
     let grant = granted_patiently(&rt_phone, x, &rt_laptop, y, x).await?;
 
-    // The documented interim access path: binds X in the node's issuer
-    // registry, and nowhere near the hosted set the link's guard consults.
+    // The whole-store grant path: binds X in the node's issuer registry,
+    // and nowhere near the hosted set the link's guard consults.
     rt_laptop.data().import(x, grant.ticket).await?;
     assert!(
         eventually(|| async {
@@ -657,7 +643,6 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 /// other — including on a runtime that hosts both sources side by side.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_identity_requires_its_own_linking() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let rt_peers = Runtime::spawn().await?;
@@ -726,7 +711,6 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
 /// exactly the created + linked ones afterwards, node id stable throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn hosted_identities_follow_create_and_link() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
 
@@ -750,5 +734,89 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 
     rt_a.shutdown().await?;
     rt_b.shutdown().await?;
+    Ok(())
+}
+
+/// Hosting an identity arms its connections by replication, not by
+/// grant-surface use. The connection and the grant are both made on the
+/// phone *after* the laptop linked, so everything the laptop knows of them
+/// arrived through the directory; the laptop never touches the grant
+/// surface, yet serves the granted counterparty — paired, per
+/// `code-practices/access-control-tests.md`, with the tightest
+/// unauthorized party: a holder of the replica's ticket with no grant gets
+/// nothing from the same device.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() -> Result<()> {
+    let rt_phone = Runtime::spawn().await?;
+    let rt_laptop = Runtime::spawn().await?;
+    let rt_bob = Runtime::spawn().await?;
+    let rt_carol = Runtime::spawn().await?;
+
+    // The laptop links first: everything about the connection below
+    // reaches it only by replication — the case where, without arming by
+    // replication, a linked device would silently refuse grants its
+    // identity really issued.
+    let alice = rt_phone.identity().create().await?;
+    link_patiently(&rt_laptop, &rt_phone, alice).await?;
+
+    // Established, written, and granted on the phone, after the link.
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    rt_phone
+        .data()
+        .write(alice, &email, b"alice@example.org")
+        .await?;
+    granted_patiently(&rt_phone, alice, &rt_bob, bob, alice).await?;
+
+    // Positive control on the laptop's replica: device replication has
+    // delivered the entry it is about to serve.
+    assert!(
+        eventually(|| async {
+            Ok(rt_laptop.data().read(alice, &email).await?.as_deref()
+                == Some(&b"alice@example.org"[..]))
+        })
+        .await?,
+        "the entry never replicated to the laptop — the premise of this test, not its subject"
+    );
+
+    // Both recipients aim at the laptop specifically: tickets minted there
+    // (read mode — addressing, not authority). Bob holds a recorded grant;
+    // Carol holds only the ticket.
+    let bob_ticket = rt_laptop.data().share(alice, ShareMode::Read).await?;
+    rt_bob.data().import(alice, bob_ticket).await?;
+    let carol_ticket = rt_laptop.data().share(alice, ShareMode::Read).await?;
+    rt_carol.data().import(alice, carol_ticket).await?;
+
+    // The laptop serves Bob under the grant published on the phone — no
+    // grant-surface call ever ran on the laptop; its armer opened the pair
+    // from the replicated directory. Carol's poll rides along inside the
+    // same wait, so her sync attempts against the same target accumulate
+    // exactly while Bob's do.
+    assert!(
+        eventually(|| async {
+            let _nudge = rt_carol.data().list(alice, None).await?;
+            Ok(rt_bob.data().read(alice, &email).await?.as_deref()
+                == Some(&b"alice@example.org"[..]))
+        })
+        .await?,
+        "the linked device never served the granted counterparty"
+    );
+
+    // Paired deny, the tightest unauthorized party: the ticket holder with
+    // no grant. Bob's convergence just above is the positive control that
+    // this very device is up and serving this very replica, so Carol's
+    // emptiness measures classification, not liveness.
+    assert!(
+        rt_carol.data().list(alice, None).await?.is_empty(),
+        "a bare ticket holder must get nothing from a linked device"
+    );
+    assert!(rt_carol.data().read(alice, &email).await?.is_none());
+
+    rt_phone.shutdown().await?;
+    rt_laptop.shutdown().await?;
+    rt_bob.shutdown().await?;
+    rt_carol.shutdown().await?;
     Ok(())
 }

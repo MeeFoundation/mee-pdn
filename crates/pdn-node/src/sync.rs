@@ -7,10 +7,6 @@ use pdn_types::{NodeId, PdnId};
 use crate::runtime::Runtime;
 
 /// Reporting the runtime's node id and hosted identities.
-///
-/// A test mock standing in for a live node is the second implementation
-/// this trait anticipates. Richer introspection — transfer progress,
-/// per-replica status, live events — arrives with later changes.
 #[allow(async_fn_in_trait)]
 pub trait SyncService {
     /// This runtime's node id — its endpoint id, stable for the runtime's

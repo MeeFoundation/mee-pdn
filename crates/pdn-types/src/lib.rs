@@ -60,6 +60,9 @@ macro_rules! define_byte_id {
         $vis:vis struct $Name:ident;
     ) => {
         $(#[$meta])*
+        // Deliberately no `Ord`: byte order of an opaque identifier carries
+        // no domain meaning, and a derive here is semver surface on every
+        // platform primitive. `Hash` covers set membership.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         $vis struct $Name([u8; 32]);
 

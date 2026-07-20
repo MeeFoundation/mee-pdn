@@ -54,6 +54,12 @@ RUN mise use -g rust@latest
 
 # END STACKS
 
+# Install cargo-nextest (pre-built, arch-aware) to ~/.local/bin (on PATH).
+# Required by `just test` / `just stress`. Local machines: `just setup-tooling`.
+RUN ARCH="$(uname -m)"; \
+    case "$ARCH" in aarch64|arm64) NX=linux-arm ;; *) NX=linux ;; esac; \
+    curl -LsSf "https://get.nexte.st/latest/$NX" | tar zxf - -C /home/vscode/.local/bin
+
 # Node.js + OpenSpec CLI (used by .claude/commands/opsx/* and .claude/skills/openspec-*).
 # Kept outside the sandcat-managed stacks block so `sandcat init --stacks` won't overwrite it.
 RUN mise use -g node@latest \

@@ -10,11 +10,10 @@
 //! protocols, riding the data-layer assembly slot on the node's endpoint.
 //!
 //! The runtime adds no sync or authorization mechanics of its own: every
-//! store operation delegates to a `data-layer` primitive, and access to a
-//! replica remains bounded by possession of its ticket — the interim
-//! posture of ADR-0008 — until subset-rbsr and `UWill` land. Hosts (HTTP
-//! today, mobile and wasm later) depend on this crate; the core depends on
-//! no host machinery.
+//! store operation delegates to a `data-layer` primitive, and session
+//! classification lives in data-layer's access book — the runtime
+//! registers what it hosts. Hosts depend on this crate; the core depends
+//! on no host machinery.
 //!
 //! [`create`]: IdentityService::create
 //! [`link`]: IdentityService::link
@@ -27,7 +26,10 @@ pub mod pairing;
 pub mod runtime;
 pub mod sync;
 
-pub use connections::{ConnectionsService, PeerGrant, RuntimeConnectionsService};
+pub use connections::{
+    ConnectionsService, DelegationUnsupported, PeerGrant, RuntimeConnectionsService,
+    ScopedPeerGrant,
+};
 pub use data::{DataService, RuntimeDataService};
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION};
@@ -36,5 +38,5 @@ pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};
 
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
-pub use data_layer::{DocTicket, ShareMode, UnknownIssuer};
-pub use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
+pub use data_layer::{claim_id_of, DocTicket, ReadGrant, ShareMode, SpawnOptions, UnknownIssuer};
+pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};

@@ -29,9 +29,6 @@ pub enum DataLayerError {
 ///
 /// Capability semantics (issuing, revocation, chain validation) live above
 /// this trait, in the PDN layer: tokens travel as ordinary entries.
-/// Enforcement below this trait arrives with subset-rbsr (egress filtering)
-/// and `UWill`; until then access to a replica is bounded by possession of
-/// its ticket.
 ///
 /// This authorization model requires pdn-store, our fork; plain
 /// namespace-key authorization cannot express PdnId-based write authority.

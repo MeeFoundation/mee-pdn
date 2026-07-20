@@ -9,8 +9,11 @@
 //! the directory perform.
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, ConnectionMetadataStore, DocTicket, ShareMode, SyncNode};
-use pdn_types::PdnId;
+use data_layer::{
+    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, ReadGrant, ShareMode,
+    SyncNode,
+};
+use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, ids};
 
 /// Create a data namespace for `issuer` on `node` and return its read
@@ -235,6 +238,152 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     a_laptop.shutdown().await?;
     b_phone.shutdown().await?;
     b_laptop.shutdown().await?;
+    Ok(())
+}
+
+/// One record per issuer, its width explicit.
+///
+/// Widening: a scoped grant then a whole-store grant to the same issuer —
+/// the counterparty's scoped read goes absent and the whole-store read
+/// takes effect, with no stale capability left to mask the widening.
+/// Narrowing back: a scoped publish replaces the whole-store record the
+/// same way. Withdrawal: one act removes the grant whatever its width, and
+/// at no point does either side read a grant wider than the last published
+/// record — a half-withdrawn state is unrepresentable.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_grant_record_widens_narrows_and_withdraws_atomically() -> Result<()> {
+    let mut alice = SyncNode::spawn().await?;
+    let bob = SyncNode::spawn().await?;
+
+    // Alice's own store toward Bob; Bob imports the read ticket.
+    let own = ConnectionMetadataStore::create(&alice).await?;
+    let b_peer = ConnectionMetadataStore::import(
+        &bob,
+        own.share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await?,
+    )
+    .await?;
+
+    let ticket = data_ticket(&mut alice, ids::ALICE).await?;
+    let email = EntryPath::new("contact/email")?;
+    let grant = ReadGrant {
+        issuer: ids::ALICE,
+        audience: ids::BOB,
+        claims: NonEmpty::new(claim_id_of(&ids::ALICE, &email)),
+        write: false,
+    };
+
+    // Scoped first: the counterparty reads the capability, and the
+    // whole-store read is absent — one record, one width at a time.
+    own.publish_scoped_grant(&grant, &ticket).await?;
+    assert!(
+        eventually(|| async { Ok(b_peer.read_scoped_grant(ids::ALICE).await?.is_some()) }).await?,
+        "the scoped grant did not converge to the counterparty"
+    );
+    assert!(b_peer.read_grant(ids::ALICE).await?.is_none());
+
+    // Widen: whole-store replaces the scoped record wholesale. The scoped
+    // read goes absent — no stale capability survives to mask the widening.
+    own.publish_grant(ids::ALICE, &ticket).await?;
+    assert!(
+        eventually(|| async { Ok(b_peer.read_grant(ids::ALICE).await?.is_some()) }).await?,
+        "the widened grant did not take effect on the counterparty"
+    );
+    assert!(b_peer.read_scoped_grant(ids::ALICE).await?.is_none());
+
+    // Narrow back: the scoped publish replaces the whole-store record the
+    // same way, in one write.
+    own.publish_scoped_grant(&grant, &ticket).await?;
+    assert!(
+        eventually(|| async { Ok(b_peer.read_scoped_grant(ids::ALICE).await?.is_some()) }).await?,
+        "the narrowed grant did not take effect on the counterparty"
+    );
+    assert!(b_peer.read_grant(ids::ALICE).await?.is_none());
+
+    // Withdraw: one tombstone removes the grant whatever its width — both
+    // reads absent, the issuer unlisted, on both sides.
+    own.withdraw_grant(ids::ALICE).await?;
+    assert!(own.read_scoped_grant(ids::ALICE).await?.is_none());
+    assert!(own.read_grant(ids::ALICE).await?.is_none());
+    assert!(
+        eventually(|| async {
+            Ok(b_peer.read_scoped_grant(ids::ALICE).await?.is_none()
+                && b_peer.read_grant(ids::ALICE).await?.is_none()
+                && !b_peer.list_grants().await?.contains(&ids::ALICE))
+        })
+        .await?,
+        "the withdrawal did not converge to the counterparty"
+    );
+
+    alice.shutdown().await?;
+    bob.shutdown().await?;
+    Ok(())
+}
+
+/// A device-shared replica refuses a data import: a connection metadata
+/// store — like a directory — is tracked but not data-bound, and a ticket
+/// naming its namespace must not repurpose it as a data namespace. Honoring
+/// it would overwrite the store's tracking (strategy and contacts) on the
+/// word of whoever minted the ticket, and the grantee downgrade would cut
+/// the store's live path by leaving the gossip swarm.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
+    let alice = SyncNode::spawn().await?;
+    let own = ConnectionMetadataStore::create(&alice).await?;
+    let ticket = own
+        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    assert!(
+        alice
+            .import_namespace_scoped(ids::BOB, ticket.clone())
+            .await
+            .is_err(),
+        "a scoped data import must refuse a device-shared replica's namespace"
+    );
+    assert!(
+        alice.import_namespace(ids::BOB, ticket).await.is_err(),
+        "a device data import must refuse a device-shared replica's namespace"
+    );
+    // The store is untouched: still writable through its own surface.
+    own.publish_device(alice.node_id()).await?;
+    assert_eq!(own.published_devices().await?, vec![alice.node_id()]);
+
+    alice.shutdown().await?;
+    Ok(())
+}
+
+/// Device records assert once. Opening machinery uses the ensure form: a
+/// first touch publishes, a live record is left untouched, and a
+/// *withdrawn* record is not resurrected — an unconditional publish would
+/// out-bid the tombstone by wall clock on every pair opening. Deliberate
+/// re-assertion stays a distinct act (`publish_device`). The tombstone is
+/// an agreement honest devices keep; this test pins that they keep it by
+/// default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Result<()> {
+    let alice = SyncNode::spawn().await?;
+    let own = ConnectionMetadataStore::create(&alice).await?;
+    let device = alice.node_id();
+
+    // First touch publishes.
+    own.ensure_device_published(device).await?;
+    assert_eq!(own.published_devices().await?, vec![device]);
+
+    // Withdrawn, then re-opened: the tombstone holds.
+    own.withdraw_device(device).await?;
+    assert!(own.published_devices().await?.is_empty());
+    own.ensure_device_published(device).await?;
+    assert!(
+        own.published_devices().await?.is_empty(),
+        "opening a pair must not re-assert a withdrawn device record"
+    );
+
+    // Deliberate re-assertion is a distinct act and still works.
+    own.publish_device(device).await?;
+    assert_eq!(own.published_devices().await?, vec![device]);
+
+    alice.shutdown().await?;
     Ok(())
 }
 

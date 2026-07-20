@@ -702,6 +702,7 @@ name = "data-layer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "futures-core",
  "futures-lite",
  "iroh",
@@ -709,6 +710,8 @@ dependencies = [
  "iroh-docs",
  "iroh-gossip",
  "pdn-types",
+ "serde",
+ "serde_json",
  "test-utils",
  "thiserror 2.0.18",
  "tokio",
@@ -1834,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.101.0"
-source = "git+https://github.com/MeeFoundation/pdn-store.git#0d263f5ed9668dab1dfa02dac6d8ab8e5cf9d386"
+source = "git+https://github.com/MeeFoundation/pdn-store.git#abcca04dcb2e88aa03aea3e306f3be0ffd59a98b"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2787,6 +2790,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "data-layer",
+ "futures-lite",
  "pdn-types",
  "postcard",
  "rand",

@@ -36,15 +36,18 @@ only `data-layer`; `pdn-layer` joins in a later change).
 Task runner is [just](https://github.com/casey/just). Key recipes:
 
 - `just build` — `cargo build --workspace`
-- `just test` — `cargo test --workspace --all-targets`
+- `just test` — `cargo nextest run` (workspace tests via nextest; extra args forwarded). This workspace has no doctests, so nextest covers everything.
+- `just stress` — flaky-hunt via nextest; all args forwarded to `cargo nextest run` (e.g. `just stress --stress-count 300 -E 'binary(linking)'`). See flaky-tests.md.
 - `just check` — `cargo fmt --check` + `cargo clippy --workspace --all-targets` + `cargo check`
 - `just check-fix` — auto-fix formatting/linting, then re-check
 - `just precommit-check` — `check` + `test`
 - `just precommit-fix` — `check-fix` + `test`
-- `just setup-tooling` — `cargo install cargo-watch` + add wasm targets
+- `just setup-tooling` — installs `cargo-watch`, `cargo-nextest`, and wasm targets
 
-Run a single crate's tests: `cargo test -p <crate-name>`.
-Run a single test: `cargo test -p <crate-name> <test_name>`.
+Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI installs it via `taiki-e/install-action`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
+
+Run a single crate's tests: `cargo nextest run -p <crate-name>`.
+Run a single test: `cargo nextest run -E 'test(<test_name>)'`.
 
 ## Lint rules
 
@@ -74,4 +77,4 @@ actual use in `iroh-docs-experiment`).
 Cross-cutting practices live in `mia-docs/openspec/specs/code-practices/`:
 
 - [`access-control-tests.md`](mia-docs/openspec/specs/code-practices/access-control-tests.md) — every test that asserts authorized access must, in the same place, assert the tightest unauthorized party is denied (read: an outsider, and a holder of the store's ticket but no read capability; write: a lower-level holder). A positive-only access test verifies nothing.
-- [`flaky-tests.md`](mia-docs/openspec/specs/code-practices/flaky-tests.md) — every substantial change ends with a flaky-test stress pass, before anything is built on top. After landing a change that touches sync, linking, engine wiring, or bumps iroh/pdn-store, stress the affected scenario tests in a counted loop and treat any failure as a defect of that change, diagnosed in isolation from other work. Full discipline — reproduction sizing (hundreds of runs, rule of three), fix minimization, deterministic pinning — in the spec. This exists so we never again build a feature first and then debug the previous implementation's flaky tests through it.
+- [`flaky-tests.md`](mia-docs/openspec/specs/code-practices/flaky-tests.md) — every substantial change ends with a flaky-test stress pass, before anything is built on top. After landing a change that touches sync, linking, engine wiring, or bumps iroh/pdn-store, stress the affected scenario tests under nextest (`--stress-count`) and treat any failure as a defect of that change, diagnosed in isolation from other work. Full discipline — reproduction sizing (hundreds of runs, rule of three), fix minimization, deterministic pinning — in the spec. This exists so we never again build a feature first and then debug the previous implementation's flaky tests through it.

@@ -10,21 +10,15 @@ use std::time::Duration;
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, ConnectionMetadataStore, PrivateMetadataStore, ShareMode};
 use pdn_node::{
-    ConnectionsService as _, DataService as _, IdentityService as _, InvitePayload, Runtime,
-    UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    claim_id_of, ConnectionsService as _, DataService as _, DelegationUnsupported,
+    IdentityService as _, InvitePayload, Runtime, UnknownIdentity, UnsupportedInviteVersion,
+    INVITE_FORMAT_VERSION,
 };
-use pdn_types::{EntryPath, NodeId};
+use pdn_types::{EntryPath, NodeId, NonEmpty};
 use test_utils::{eventually, ids, TIMEOUT};
 
 mod common;
 use common::{establish_patiently, granted_patiently, link_patiently, link_probe};
-
-/// Serializes this file's tests: each spawns several runtimes (up to a
-/// dozen endpoints per test), and letting four such tests bind their
-/// sockets at once maximizes the cold-start burst a freshly built binary's
-/// first dials already suffer (see `test_utils::TIMEOUT`). Run one at a
-/// time, each with the full liveness budget to itself.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Wait until the probe's directory lists exactly `kinds` (order-free).
 async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
@@ -47,7 +41,6 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
 /// ticket to the peer's data namespace.
 #[tokio::test(flavor = "multi_thread")]
 async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let rt_c = Runtime::spawn().await?;
@@ -101,10 +94,8 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     // asserting it: Y writes into X's namespace under its own author, and the
     // entry reaches X — the issuer — through ordinary sync. Nothing rejects
     // it: the store's capability is swarm membership, not access control, and
-    // the gates that would scope this write (ingest validation, egress
-    // filtering) are what UWill and subset-rbsr bring. Until then a grant is
-    // whole-store and unscoped in both directions, which is the posture
-    // recorded in `mee-noremote/fix-urgent.md`.
+    // no ingest hook is installed (ADR-0008) — a whole-store grant is
+    // unscoped in both directions.
     let peer_path = EntryPath::new("contact/note-from-y")?;
     rt_b.data().write(x, &peer_path, b"Y was here").await?;
     assert!(
@@ -161,7 +152,6 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
 /// published on either phone are read on the other identity's laptop.
 #[tokio::test(flavor = "multi_thread")]
 async fn connection_is_visible_from_linked_devices() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let a_phone = Runtime::spawn().await?;
     let a_laptop = Runtime::spawn().await?;
     let b_phone = Runtime::spawn().await?;
@@ -231,7 +221,6 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
 /// attempts), and keeps the already-published grants readable.
 #[tokio::test(flavor = "multi_thread")]
 async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let x = rt_a.identity().create().await?;
@@ -306,6 +295,66 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     Ok(())
 }
 
+/// Granting another identity's data is refused loudly as unsupported
+/// delegation. The classifier scans the connections of the *data issuer's*
+/// identity, so a grant recorded under a different granting identity could
+/// never be honored — an accepted publish would replicate, the recipient
+/// would read a live grant, and enforcement would deny everything: a
+/// silent no-op on both sides. The sharpest form is exercised here: the
+/// foreign issuer is *hosted on the same runtime*. Paired with the allowed
+/// side: the identity's own grant, published after the refusals, crosses —
+/// and nothing of the refused grant ever appears beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() -> Result<()> {
+    let rt_a = Runtime::spawn().await?;
+    let rt_b = Runtime::spawn().await?;
+    let x = rt_a.identity().create().await?;
+    let b = rt_a.identity().create().await?;
+    let y = rt_b.identity().create().await?;
+
+    let invite = rt_a.connections().invite(x, None).await?;
+    establish_patiently(&rt_b, y, &rt_a, x, invite).await?;
+
+    // Denied: the whole-store surface refuses a foreign issuer — even one
+    // hosted right here — before anything is minted or written.
+    let err = rt_a.connections().publish_grant(x, y, b).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<DelegationUnsupported>().is_some(),
+        "a foreign-issuer grant must refuse as unsupported delegation, got: {err:?}"
+    );
+
+    // Denied: the scoped surface refuses the same way.
+    let email = EntryPath::new("contact/email")?;
+    let err = rt_a
+        .connections()
+        .publish_scoped_grant(x, y, b, NonEmpty::new(claim_id_of(&b, &email)), false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<DelegationUnsupported>().is_some(),
+        "a foreign-issuer scoped grant must refuse as unsupported delegation, got: {err:?}"
+    );
+
+    // Allowed, and the proof nothing was recorded: the identity's own
+    // grant — published after the refusals — is the only one the peer ever
+    // reads over this pair.
+    rt_a.connections().publish_grant(x, y, x).await?;
+    assert!(
+        eventually(|| async { Ok(!rt_b.connections().read_grants(y, x).await?.is_empty()) })
+            .await?,
+        "the identity's own grant did not reach the peer"
+    );
+    let grants = rt_b.connections().read_grants(y, x).await?;
+    assert!(
+        grants.iter().all(|g| g.issuer == x),
+        "a refused foreign-issuer grant left a record behind: {grants:?}"
+    );
+
+    rt_a.shutdown().await?;
+    rt_b.shutdown().await?;
+    Ok(())
+}
+
 /// The refusal pairs of the verify-and-burn requirement, each next to its
 /// allowed counterpart and each probed for no observable state on the
 /// inviter: an expired secret, a wrong secret (which burns nothing — the
@@ -314,7 +363,6 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
 /// replayed secret after a completed establishment.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let rt_c = Runtime::spawn().await?;
@@ -429,13 +477,12 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
 /// its own lock while the peer's accept side blocks on that same lock. A
 /// regression would hang, so the bounded wait is the assertion.
 ///
-/// The path is warmed first (a normal establishment, patiently) so the
+/// The path is exercised once first (a normal establishment, patiently) so the
 /// concurrent probe below — which calls `establish` directly, no retry, to
-/// exercise the exact timing — is not exposed to the freshly-built-binary
-/// cold-start penalty, and reuses the already-cached replicas.
+/// exercise the exact timing — reuses the already-cached replicas rather than
+/// paying first-use setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let x = rt_a.identity().create().await?;
@@ -477,7 +524,6 @@ async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
 /// the superseded replica and silently miss every later grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
-    let _serial = SERIAL.lock().await;
     let rt_a = Runtime::spawn().await?;
     let rt_b = Runtime::spawn().await?;
     let x = rt_a.identity().create().await?;
