@@ -7,6 +7,13 @@ members = [
   "crates/pdn-node-http", # thin HTTP host embedding one runtime
   "crates/test-utils",    # shared scenario-test plumbing (dev-dependency only)
 ]
+exclude = [
+  # Nested checkouts carrying their own manifests — without this, cargo run from
+  # inside them walks up, finds this workspace, and refuses to build.
+  "pdn-store",
+  "mee-v1",
+  "mee-v3-single-device",
+]
 resolver = "2"
 
 [workspace.dependencies]
