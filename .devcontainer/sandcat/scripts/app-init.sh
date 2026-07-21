@@ -69,6 +69,11 @@ if [ -S /var/run/docker.sock ]; then
     fi
 fi
 
+# Volumes mounted over workspace paths are created root-owned, so the user the
+# build runs as cannot write there until this hands them over.
+find /workspaces -mindepth 2 -maxdepth 3 -type d -name target -user root \
+    -exec chown vscode:vscode {} + 2>/dev/null || true
+
 # Run vscode-user tasks: git identity, Java trust store, Claude Code update.
 su - vscode -c /usr/local/bin/app-user-init.sh
 

@@ -26,7 +26,7 @@ git config --global commit.gpgsign false
 git config --global --replace-all url."https://github.com/".insteadOf "git@github.com:" "git@github.com:"
 git config --global --replace-all url."https://github.com/".insteadOf "ssh://git@github.com/" "ssh://git@github.com/"
 
-git config --global --add safe.directory /workspaces/mee-pdn-sandbox
+git config --global --add safe.directory /workspaces/mee-pdn
 
 # When GITHUB_TOKEN is available (injected as a Sandcat placeholder),
 # register gh as git's credential helper so git sends the placeholder
