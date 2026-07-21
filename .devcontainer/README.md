@@ -1,6 +1,6 @@
 # Token Setup for Devcontainer
 
-One-time setup on the host machine to work with devcontainers.
+One-time setup on the host machine to work with devcontainers. The devcontainer runs in both VS Code and Zed.
 
 ## Required Tokens
 
@@ -115,7 +115,7 @@ If a token expires or is compromised:
 
 1. Generate a new token (following instructions above)
 2. Update the value in `~/.config/sandcat/settings.json`
-3. Restart devcontainer: **Dev Containers: Rebuild Container**
+3. Rebuild the devcontainer (in VS Code: **Dev Containers: Rebuild Container**)
 
 ---
 
@@ -162,7 +162,7 @@ Fix — wipe the home volume, then rebuild:
 docker volume rm mee-pdn-home
 ```
 
-Then **Dev Containers: Rebuild Container** in VS Code. The volume is
+Then rebuild the devcontainer. The volume is
 recreated from the fresh image, so the new tools land. You will lose
 container-local user state (shell history, anything cached only inside
 `/home/vscode`); Claude Code OAuth re-auths automatically from the host
