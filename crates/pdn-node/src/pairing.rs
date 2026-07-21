@@ -51,7 +51,7 @@ pub(crate) const PAIRING_ALPN: &[u8] = b"/pdn/pairing/0";
 pub const INVITE_FORMAT_VERSION: u8 = 0;
 
 /// How long a pending invite lives unless the invite overrides it.
-pub(crate) const DEFAULT_INVITE_LIFETIME: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_INVITE_LIFETIME: Duration = Duration::from_mins(2);
 
 /// Ceiling on one length-prefixed wire message, shared by both ceremonies
 /// on this framing (pairing and linking). Their dialogue messages carry

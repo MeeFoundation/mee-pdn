@@ -146,7 +146,7 @@ If a token expires or is compromised:
 ### Build-time installs from `Dockerfile.app` not visible after rebuild
 
 The `/home/vscode` directory is backed by the named Docker volume
-`mee-pdn-sandbox_app-home` so Claude Code auth, shell history, and similar
+`mee-pdn-home` so Claude Code auth, shell history, and similar
 user state survive rebuilds. The trade-off: the volume is populated from
 the image only on **first** container creation. Subsequent rebuilds keep
 the existing volume contents, so anything new the Dockerfile installs into
@@ -159,7 +159,7 @@ Fix — wipe the home volume, then rebuild:
 
 ```bash
 # On the host, with the devcontainer stopped:
-docker volume rm mee-pdn-sandbox_app-home
+docker volume rm mee-pdn-home
 ```
 
 Then **Dev Containers: Rebuild Container** in VS Code. The volume is

@@ -19,7 +19,7 @@ iroh-gossip = "0.101"
 # rebases), we alias it via `package`. To develop against a local
 # checkout, patch it in temporarily (patches address the real package name):
 #   [patch."https://github.com/MeeFoundation/pdn-store.git"]
-#   iroh-docs = { path = "../pdn-store" }
+#   iroh-docs = { path = "./pdn-store" }
 pdn-store = { git = "https://github.com/MeeFoundation/pdn-store.git", package = "iroh-docs" }
 
 [workspace.lints.rust]

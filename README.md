@@ -15,11 +15,18 @@ This repository is for version 3, previous version repos:
 
 To work with this project in a devcontainer, see [.devcontainer/README.md](.devcontainer/README.md) for token configuration instructions.
 
-### Mia-docs setup
+### `mia-docs` setup
 
 ```sh
 # Fetch mia-docs
 git clone git@github.com:MeeFoundation/mia-docs.git
+```
+
+### `pdn-store` setup
+
+```sh
+# Fetch pdn-store
+git clone git@github.com:MeeFoundation/pdn-store.git
 ```
 
 ### Development
@@ -28,16 +35,15 @@ git clone git@github.com:MeeFoundation/mia-docs.git
 - `just build`: build all workspace crates
 - `just test`: run tests for all workspace crates
 - `just check`: format & lint check
-- `just precommit-fix`: format & lint check + autofix, tests
+- `just fix`: format & lint check + autofix, tests
 
 ## Crates
 
-Core types and APIs
+Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the wire). Both layers see only `pdn-types`; `pdn-node` is the embeddable runtime built over them.
 
-- `crates/mee-types`: Shared domain types (byte-backed IDs, `MeeId`, `Aid`, `OperationalKey`, …)
-- `crates/mee-sync-api`: Backend-agnostic sync API (`NamespaceId`, `EntryPath`, `NamespaceKind`, …)
-
-Draft operation ASTs (material for discussion)
-
-- `crates/mee-pdn-layer`: PDN-layer operation AST (identity, connections, claims, delegation)
-- `crates/mee-willow-layer`: Willow/iroh-layer operation AST (namespaces, entries, UWill capabilities)
+- `crates/pdn-types`: platform primitives (`PdnId`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, …) plus the data vocabulary (`NamespaceId`, `EntryPath`, `EntryInfo`, `NamespaceRole`)
+- `crates/data-layer`: the data layer over the forked iroh-docs (`pdn-store`) — the entries-only `DataLayer` trait, node/stack assembly, and the metadata stores
+- `crates/pdn-layer`: the platform surface products consume — domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` capability-token module
+- `crates/pdn-node`: the embeddable runtime core — identity / connections / data / sync services, plus the pairing and device-linking ceremonies
+- `crates/pdn-node-http`: thin HTTP host for the demo stand — an axum binary embedding one runtime
+- `crates/test-utils`: shared test helpers

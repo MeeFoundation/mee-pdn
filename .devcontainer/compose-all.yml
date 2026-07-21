@@ -1,4 +1,4 @@
-name: mee-pdn-sandbox
+name: mee-pdn
 include:
   - path: sandcat/compose-proxy.yml
 services:
@@ -21,11 +21,17 @@ services:
       # containers should never write to this.
       - mitmproxy-config:/mitmproxy-config:ro
       # Mount the project's code
-      - ..:/workspaces/mee-pdn-sandbox
+      - ..:/workspaces/mee-pdn
+      # Keep host build artifacts out of the mount (host macOS/aarch64 vs Linux
+      # container; cargo/rust-analyzer/watchers must not traverse host target
+      # trees). The container builds into its own volume here.
+      - /workspaces/mee-pdn/target
+      - /workspaces/mee-pdn/mee-v3-single-device/target
+      - /workspaces/mee-pdn/pdn-store/target
       # Read-only devcontainer directory
-      - ../.devcontainer:/workspaces/mee-pdn-sandbox/.devcontainer:ro
+      - ../.devcontainer:/workspaces/mee-pdn/.devcontainer:ro
       # Read-only settings directory
-      - ../.sandcat:/workspaces/mee-pdn-sandbox/.sandcat:ro
+      - ../.sandcat:/workspaces/mee-pdn/.sandcat:ro
       # Host Claude config (optional)
       - ${HOME}/.claude/CLAUDE.md:/home/vscode/.claude/CLAUDE.md:ro
       - ${HOME}/.claude/agents:/home/vscode/.claude/agents:ro
@@ -40,7 +46,7 @@ services:
     depends_on:
       wg-client:
         condition: service_healthy
-    working_dir: /workspaces/mee-pdn-sandbox
+    working_dir: /workspaces/mee-pdn
   mitmproxy:
     volumes:
       - ../.sandcat:/config/project:ro
@@ -49,3 +55,4 @@ services:
       # simply finds no files — no error.
 volumes:
   app-home:
+    name: mee-pdn-home

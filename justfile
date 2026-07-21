@@ -46,7 +46,21 @@ test-release *args:
   export PDN_BIND_ADDR=127.0.0.1
   cargo nextest run --release "$@"
 
-# Stress / flaky-hunt via nextest — args forwarded to `cargo nextest run`. With no test selection it defaults to the scenario (integration) tests, `-E 'kind(test)'` — the unit tests are deterministic, so stressing them is wasted. Pass your own `-E`/`--filter-expr` or `-p`/`--package` to override (e.g. `just stress --stress-count 300 -E 'binary(linking)'`, `just stress --stress-count 300 -p pdn-node`). `--retries N --flaky-result fail` handles a known-flaky test. Note: on macOS a per-process node-startup cost serializes across processes, so parallel repeats gain little locally — `just hammer` amortizes it (a whole binary per process). See mia-docs flaky-tests.md.
+# Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.
+#
+# With no test selection it defaults to the scenario (integration) tests,
+# `-E 'kind(test)'` — the unit tests are deterministic, so stressing them is
+# wasted. Pass your own `-E`/`--filter-expr` or `-p`/`--package` to override:
+#
+#   just stress --stress-count 300 -E 'binary(linking)'
+#   just stress --stress-count 300 -p pdn-node
+#
+# `--retries N --flaky-result fail` handles a known-flaky test.
+#
+# On macOS a per-process node-startup cost serializes across processes, so
+# parallel repeats gain little locally — `just hammer` amortizes it (a whole
+# binary per process). See mia-docs flaky-tests.md.
+[doc("Stress / flaky-hunt via nextest — all args forwarded to cargo nextest run")]
 stress *args:
   #!/bin/sh
   set -eu
@@ -58,7 +72,19 @@ stress *args:
     *)                                                     cargo nextest run -E 'kind(test)' "$@" ;;
   esac
 
-# Local flaky-hunt: run one test BINARY in a loop (a fresh process per iteration, all its tests once via libtest). This amortizes the per-process node-startup cost across the binary's tests — unlike nextest's process-per-test, which pays it per test and, on macOS, serializes those payments (see mia-docs flaky-tests.md). `binary` matches a test target by substring (e.g. `just hammer linking 300`); `count` defaults to 100. Does not stop on failure; prints the failure log and the total.
+# Local flaky-hunt: run one test BINARY in a loop — a fresh process per
+# iteration, running all its tests once via libtest.
+#
+# This amortizes the per-process node-startup cost across the binary's tests,
+# unlike nextest's process-per-test, which pays it per test and, on macOS,
+# serializes those payments (see mia-docs flaky-tests.md).
+#
+# `binary` matches a test target by substring; `count` defaults to 100:
+#
+#   just hammer linking 300
+#
+# Does not stop on failure; prints the failure log and the total.
+[doc("Local flaky-hunt: loop one test binary, a fresh process per iteration")]
 hammer binary count="100":
   #!/bin/sh
   set -eu
@@ -124,7 +150,7 @@ precommit-check:
   just test
 
 # Lint, build, test, integration tests, attempt fixes
-precommit-fix:
+fix:
   #!/bin/sh
   set -eux
   just check-fix

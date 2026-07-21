@@ -1,4 +1,5 @@
 /mia-docs/
+/pdn-store/
 local-data
 .env
 target

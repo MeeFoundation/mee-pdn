@@ -1,14 +1,19 @@
 {
-  "name": "mee-pdn-sandbox",
+  "name": "mee-pdn",
   "dockerComposeFile": "compose-all.yml",
   "service": "agent",
-  "workspaceFolder": "/workspaces/mee-pdn-sandbox",
+  "workspaceFolder": "/workspaces/mee-pdn",
+  // Run the image ENTRYPOINT (sandcat app-init.sh: installs the mitmproxy CA,
+  // loads sandcat.env). Without this the dev-container tooling replaces it with
+  // a keep-alive wrapper, so nothing trusts the proxy CA and TLS through it
+  // fails (cargo/git/curl can't reach github, crates.io, …).
+  "overrideCommand": false,
   // Remove credential sockets that VS Code forwards into the container
   // (SSH agent, git credential helper).  Clearing env vars alone only
   // hides the paths — the socket files in /tmp can still be discovered
   // by scanning.  The post-start script deletes them as best-effort
   // hardening.
-  "postStartCommand": "bash /workspaces/mee-pdn-sandbox/.devcontainer/sandcat/scripts/app-post-start.sh",
+  "postStartCommand": "bash /workspaces/mee-pdn/.devcontainer/sandcat/scripts/app-post-start.sh",
   // VS Code forwards host credential sockets into containers by default.
   // Clear them so container code cannot use host SSH keys, GPG signing,
   // or VS Code's git credential helpers to authenticate as the host user.
