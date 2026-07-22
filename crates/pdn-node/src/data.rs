@@ -1,5 +1,5 @@
 //! The data service: entries in data namespaces hosted on this node, plus
-//! the whole-store ticket handover.
+//! the namespace ticket handover.
 
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, DocTicket, ShareMode};
@@ -12,7 +12,7 @@ use crate::runtime::Runtime;
 /// peer's.
 ///
 /// The connections service's grant surface is the sanctioned transport for
-/// namespace access between connected identities — whole-store or scoped.
+/// namespace access between connected identities.
 /// The out-of-band share/import here does not deliver from an armed
 /// issuer: creation arms fail-closed serving, so a bare ticket without a
 /// recorded grant is refused; the surface remains for un-armed assemblies
@@ -39,25 +39,27 @@ pub trait DataService {
     async fn list(&self, issuer: PdnId, path_prefix: Option<&EntryPath>) -> Result<Vec<EntryInfo>>;
 
     /// Share the data namespace of `issuer` as a ticket a peer runtime can
-    /// import: the whole-store handover.
+    /// import: the namespace handover.
     async fn share(&self, issuer: PdnId, mode: ShareMode) -> Result<DocTicket>;
 
-    /// Import a peer's data namespace from `ticket` as a whole-store grant,
-    /// registering it under `issuer` (named by the caller — the ticket
-    /// carries the namespace, not its issuer), after which its entries sync
-    /// whole. As a grantee the runtime never re-serves the replica to third
-    /// parties and never joins its gossip swarm: the swarm of a data
-    /// namespace is its issuer's device set, and delivery here is
-    /// classified reconciliation with the issuer's devices — what makes the
-    /// grant whole-store rather than scoped is the issuer's grant record,
-    /// not the import.
+    /// Import a peer's data namespace from a `ticket` obtained **out of
+    /// band**, registering it under `issuer` (named by the caller — the
+    /// ticket carries the namespace, not its issuer). For a namespace
+    /// reached through a connection's grant this is not needed: the runtime
+    /// binds grants by itself, and a namespace imported here is never
+    /// unbound by the grant sweep.
+    ///
+    /// The replica registers under `issuer`, stays outside the gossip swarm
+    /// — that swarm is the issuer's device set — and is re-served only to
+    /// the devices of the grant's audience identity, per the locally
+    /// replicated grant record. What the session actually delivers is the
+    /// issuer's grant record to decide, not the import: with no record
+    /// behind it this ticket delivers nothing.
     async fn import(&self, issuer: PdnId, ticket: DocTicket) -> Result<()>;
 
-    /// Import a peer's data namespace whose access arrived through a
-    /// scoped grant: the replica registers under `issuer`, stays outside
-    /// the gossip swarm, and syncs by capability-filtered reconciliation
-    /// only — the issuer's devices reveal exactly the granted claims.
-    /// Reads nudge a reconciliation and are served from the local replica.
+    /// [`import`](Self::import) for a ticket that arrived with a grant —
+    /// same registration, same stance. Reads nudge a reconciliation and are
+    /// served from the local replica.
     async fn import_scoped(&self, issuer: PdnId, ticket: DocTicket) -> Result<()>;
 }
 
@@ -118,9 +120,8 @@ impl DataService for RuntimeDataService<'_> {
     async fn import_scoped(&self, issuer: PdnId, ticket: DocTicket) -> Result<()> {
         let state = self.runtime.state.lock().await;
         // Same rebinding contract as `import` — and the same grantee stance
-        // below it (contacts-only sync, never re-serving); the two names
-        // keep the caller's intent readable, the issuer's grant record is
-        // what scopes the view.
+        // below it (contacts-only sync, audience-device re-serving); the
+        // issuer's grant record is what scopes the view.
         let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         Ok(())
     }

@@ -28,7 +28,6 @@ pub mod sync;
 
 pub use connections::{
     ConnectionsService, DelegationUnsupported, PeerGrant, RuntimeConnectionsService,
-    ScopedPeerGrant,
 };
 pub use data::{DataService, RuntimeDataService};
 pub use identity::{IdentityService, RuntimeIdentityService};

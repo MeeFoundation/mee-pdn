@@ -80,7 +80,7 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     // carried ticket, and reads the entries.
     let path = EntryPath::new("contact/name")?;
     rt_a.data().write(x, &path, b"X").await?;
-    let grant = granted_patiently(&rt_a, x, &rt_b, y, x).await?;
+    let grant = granted_patiently(&rt_a, x, &rt_b, y, x, common::claims_on(x, &path), true).await?;
     rt_b.data().import(x, grant.ticket).await?;
     assert!(
         eventually(|| async {
@@ -180,8 +180,14 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
     // ...and read the counterpart's metadata store from the pair their
     // directories carry: a grant published on either phone reaches the
     // other identity's laptop.
-    a_phone.connections().publish_grant(x, y, x).await?;
-    b_phone.connections().publish_grant(y, x, y).await?;
+    a_phone
+        .connections()
+        .publish_grant(x, y, x, common::nominal_claims(x), false)
+        .await?;
+    b_phone
+        .connections()
+        .publish_grant(y, x, y, common::nominal_claims(y), false)
+        .await?;
     assert!(
         eventually(|| async {
             Ok(b_laptop
@@ -189,7 +195,7 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
                 .read_grants(y, x)
                 .await?
                 .iter()
-                .any(|grant| grant.issuer == x))
+                .any(|g| g.grant.issuer == x))
         })
         .await?,
         "X's grant did not reach Y's laptop through the directory-opened pair"
@@ -201,7 +207,7 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
                 .read_grants(x, y)
                 .await?
                 .iter()
-                .any(|grant| grant.issuer == y))
+                .any(|g| g.grant.issuer == y))
         })
         .await?,
         "Y's grant did not reach X's laptop through the directory-opened pair"
@@ -229,7 +235,9 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     // First establishment, plus a grant that must survive everything below.
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_b, y, &rt_a, x, invite).await?;
-    rt_a.connections().publish_grant(x, y, x).await?;
+    rt_a.connections()
+        .publish_grant(x, y, x, common::nominal_claims(x), false)
+        .await?;
     assert!(
         eventually(|| async { Ok(!rt_b.connections().read_grants(y, x).await?.is_empty()) })
             .await?,
@@ -282,7 +290,9 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
         !rt_b.connections().read_grants(y, x).await?.is_empty(),
         "the pre-retry grant must survive re-establishment"
     );
-    rt_b.connections().publish_grant(y, x, y).await?;
+    rt_b.connections()
+        .publish_grant(y, x, y, common::nominal_claims(y), false)
+        .await?;
     assert!(
         eventually(|| async { Ok(!rt_a.connections().read_grants(x, y).await?.is_empty()) })
             .await?,
@@ -317,7 +327,11 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
 
     // Denied: the whole-store surface refuses a foreign issuer — even one
     // hosted right here — before anything is minted or written.
-    let err = rt_a.connections().publish_grant(x, y, b).await.unwrap_err();
+    let err = rt_a
+        .connections()
+        .publish_grant(x, y, b, common::nominal_claims(b), false)
+        .await
+        .unwrap_err();
     assert!(
         err.downcast_ref::<DelegationUnsupported>().is_some(),
         "a foreign-issuer grant must refuse as unsupported delegation, got: {err:?}"
@@ -327,7 +341,7 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
     let email = EntryPath::new("contact/email")?;
     let err = rt_a
         .connections()
-        .publish_scoped_grant(x, y, b, NonEmpty::new(claim_id_of(&b, &email)), false)
+        .publish_grant(x, y, b, NonEmpty::new(claim_id_of(&b, &email)), false)
         .await
         .unwrap_err();
     assert!(
@@ -338,7 +352,9 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
     // Allowed, and the proof nothing was recorded: the identity's own
     // grant — published after the refusals — is the only one the peer ever
     // reads over this pair.
-    rt_a.connections().publish_grant(x, y, x).await?;
+    rt_a.connections()
+        .publish_grant(x, y, x, common::nominal_claims(x), false)
+        .await?;
     assert!(
         eventually(|| async { Ok(!rt_b.connections().read_grants(y, x).await?.is_empty()) })
             .await?,
@@ -346,7 +362,7 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
     );
     let grants = rt_b.connections().read_grants(y, x).await?;
     assert!(
-        grants.iter().all(|g| g.issuer == x),
+        grants.iter().all(|g| g.grant.issuer == x),
         "a refused foreign-issuer grant left a record behind: {grants:?}"
     );
 
@@ -535,7 +551,9 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     // X grants toward Y and Y reads it: the pair is live, and now cached on B.
     let path = EntryPath::new("contact/name")?;
     rt_a.data().write(x, &path, b"X").await?;
-    rt_a.connections().publish_grant(x, y, x).await?;
+    rt_a.connections()
+        .publish_grant(x, y, x, common::nominal_claims(x), false)
+        .await?;
     assert!(
         eventually(|| async { Ok(!rt_b.connections().read_grants(y, x).await?.is_empty()) })
             .await?,

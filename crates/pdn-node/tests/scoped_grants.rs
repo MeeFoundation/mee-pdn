@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::Result;
 use pdn_node::{
     claim_id_of, ConnectionsService as _, DataService as _, IdentityService as _, NonEmpty,
-    Runtime, ScopedPeerGrant, SpawnOptions, UnknownIssuer,
+    PeerGrant, Runtime, SpawnOptions, UnknownIssuer,
 };
 use pdn_types::EntryPath;
 use test_utils::eventually;
@@ -41,12 +41,12 @@ async fn scoped_grant_patiently(
     receives_id: pdn_types::PdnId,
     gives_id: pdn_types::PdnId,
     issuer: pdn_types::PdnId,
-) -> Result<ScopedPeerGrant> {
+) -> Result<PeerGrant> {
     let mut found = None;
     let ok = eventually(|| async {
         Ok(receives
             .connections()
-            .read_scoped_grants(receives_id, gives_id)
+            .read_grants(receives_id, gives_id)
             .await?
             .into_iter()
             .any(|g| g.grant.issuer == issuer))
@@ -55,7 +55,7 @@ async fn scoped_grant_patiently(
     if ok {
         found = receives
             .connections()
-            .read_scoped_grants(receives_id, gives_id)
+            .read_grants(receives_id, gives_id)
             .await?
             .into_iter()
             .find(|g| g.grant.issuer == issuer);
@@ -106,7 +106,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
 
     // The scoped grant: read-only on exactly `contact/email`.
     rt_a.connections()
-        .publish_scoped_grant(x, y, x, NonEmpty::new(claim_id_of(&x, &email)), false)
+        .publish_grant(x, y, x, NonEmpty::new(claim_id_of(&x, &email)), false)
         .await?;
 
     // Y consumes it as the bootstrap cascade would: read the grant over

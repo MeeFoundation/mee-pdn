@@ -8,13 +8,30 @@
 //! travel by direct handover, exactly the store-level acts the dialogue and
 //! the directory perform.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, ReadGrant, ShareMode,
-    SyncNode,
+    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, PrivateMetadataStore,
+    ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
-use test_utils::{eventually, ids};
+use test_utils::{eventually, ids, wait_entry_is};
+
+/// The reconcile cadence the sibling-serving scenario runs at. A grantee
+/// replica has no gossip path, so every denial is "the reader retried over
+/// several intervals and was refused" — at the production default that is
+/// tens of seconds of pure sleep per assertion; injected here it is
+/// milliseconds, and the assertions wait out the same number of intervals.
+const RECONCILE: Duration = Duration::from_millis(500);
+
+/// Spawn a node with the sibling-serving scenario's short reconcile cadence.
+async fn spawn_node() -> Result<SyncNode> {
+    SyncNode::spawn_with_options(SpawnOptions {
+        reconcile_interval: RECONCILE,
+    })
+    .await
+}
 
 /// Create a data namespace for `issuer` on `node` and return its read
 /// ticket — a real whole-store ticket for grants to carry.
@@ -22,6 +39,19 @@ async fn data_ticket(node: &mut SyncNode, issuer: PdnId) -> Result<DocTicket> {
     node.create_namespace(issuer).await?;
     node.share_ticket(issuer, ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await
+}
+
+/// The nominal claim these store-level scenarios grant on: the store
+/// carries a capability, it never evaluates one, so one claim is enough to
+/// give every record its shape.
+fn nominal_grant(issuer: PdnId, audience: PdnId) -> ReadGrant {
+    let path = EntryPath::new("contact/email").expect("a valid path");
+    ReadGrant {
+        issuer,
+        audience,
+        claims: NonEmpty::new(claim_id_of(&issuer, &path)),
+        write: false,
+    }
 }
 
 /// Wait until `store` reads the grant for `issuer` as exactly `expected`.
@@ -35,7 +65,7 @@ async fn wait_grant_is(
         Ok(store
             .read_grant(issuer)
             .await?
-            .is_some_and(|t| t.to_string() == expected))
+            .is_some_and(|(_cap, ticket)| ticket.to_string() == expected))
     })
     .await
 }
@@ -108,9 +138,14 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     // Alice grants her data store toward Bob and a second one toward Carol.
     let ticket_for_bob = data_ticket(&mut alice, ids::ALICE).await?;
     let ticket_for_carol = data_ticket(&mut alice, ids::ALICE_AT_WORK).await?;
-    a_own_b.publish_grant(ids::ALICE, &ticket_for_bob).await?;
+    a_own_b
+        .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &ticket_for_bob)
+        .await?;
     a_own_c
-        .publish_grant(ids::ALICE_AT_WORK, &ticket_for_carol)
+        .publish_grant(
+            &nominal_grant(ids::ALICE_AT_WORK, ids::CAROL),
+            &ticket_for_carol,
+        )
         .await?;
 
     // The own→peer flip: the entry written into `own` is read from the
@@ -170,7 +205,9 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     // Written on the issuer's phone, read on the issuer's laptop and on
     // both of the counterparty's devices.
     let first = data_ticket(&mut a_phone, ids::ALICE).await?;
-    own_phone.publish_grant(ids::ALICE, &first).await?;
+    own_phone
+        .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &first)
+        .await?;
     for (name, store) in [
         ("issuer's laptop", &own_laptop),
         ("counterparty's phone", &peer_b_phone),
@@ -185,7 +222,9 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     // A grant published after the exchange crosses with no new tickets
     // handed over — the channel outlives the pairing moment.
     let second = data_ticket(&mut a_phone, ids::ALICE_AT_WORK).await?;
-    own_phone.publish_grant(ids::ALICE_AT_WORK, &second).await?;
+    own_phone
+        .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &second)
+        .await?;
     assert!(
         wait_grant_is(&peer_b_phone, ids::ALICE_AT_WORK, &second).await?,
         "a later grant did not reach the counterparty over the existing pair"
@@ -209,10 +248,13 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     let from_phone = data_ticket(&mut a_phone, ids::ALICE_AT_LEISURE).await?;
     let from_laptop = data_ticket(&mut a_laptop, ids::ALICE_AT_LEISURE).await?;
     own_phone
-        .publish_grant(ids::ALICE_AT_LEISURE, &from_phone)
+        .publish_grant(&nominal_grant(ids::ALICE_AT_LEISURE, ids::BOB), &from_phone)
         .await?;
     own_laptop
-        .publish_grant(ids::ALICE_AT_LEISURE, &from_laptop)
+        .publish_grant(
+            &nominal_grant(ids::ALICE_AT_LEISURE, ids::BOB),
+            &from_laptop,
+        )
         .await?;
     let stores = [&own_phone, &own_laptop, &peer_b_phone, &peer_b_laptop];
     assert!(
@@ -220,7 +262,7 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
             let mut seen = Vec::new();
             for store in stores {
                 match store.read_grant(ids::ALICE_AT_LEISURE).await? {
-                    Some(ticket) => seen.push(ticket.to_string()),
+                    Some((_cap, ticket)) => seen.push(ticket.to_string()),
                     None => return Ok(false),
                 }
             }
@@ -241,17 +283,13 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     Ok(())
 }
 
-/// One record per issuer, its width explicit.
-///
-/// Widening: a scoped grant then a whole-store grant to the same issuer —
-/// the counterparty's scoped read goes absent and the whole-store read
-/// takes effect, with no stale capability left to mask the widening.
-/// Narrowing back: a scoped publish replaces the whole-store record the
-/// same way. Withdrawal: one act removes the grant whatever its width, and
-/// at no point does either side read a grant wider than the last published
-/// record — a half-withdrawn state is unrepresentable.
+/// One record per issuer: a republication replaces the previous record in
+/// one write, and a withdrawal removes it in one tombstone. At no point can
+/// either side read a grant other than the last published one — a
+/// half-replaced or half-withdrawn state is unrepresentable, because there
+/// is only ever one entry to replace or delete.
 #[tokio::test(flavor = "multi_thread")]
-async fn one_grant_record_widens_narrows_and_withdraws_atomically() -> Result<()> {
+async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     let mut alice = SyncNode::spawn().await?;
     let bob = SyncNode::spawn().await?;
 
@@ -273,42 +311,30 @@ async fn one_grant_record_widens_narrows_and_withdraws_atomically() -> Result<()
         write: false,
     };
 
-    // Scoped first: the counterparty reads the capability, and the
-    // whole-store read is absent — one record, one width at a time.
-    own.publish_scoped_grant(&grant, &ticket).await?;
+    // Published: the counterparty reads the capability and its ticket.
+    own.publish_grant(&grant, &ticket).await?;
     assert!(
-        eventually(|| async { Ok(b_peer.read_scoped_grant(ids::ALICE).await?.is_some()) }).await?,
-        "the scoped grant did not converge to the counterparty"
+        wait_grant_is(&b_peer, ids::ALICE, &ticket).await?,
+        "the grant did not converge to the counterparty"
     );
-    assert!(b_peer.read_grant(ids::ALICE).await?.is_none());
 
-    // Widen: whole-store replaces the scoped record wholesale. The scoped
-    // read goes absent — no stale capability survives to mask the widening.
-    own.publish_grant(ids::ALICE, &ticket).await?;
+    // Republished onto a second replica: the one record is replaced
+    // wholesale, so the counterparty comes to read the new ticket and can
+    // never read a mix of the two.
+    let replacement = data_ticket(&mut alice, ids::ALICE_AT_WORK).await?;
+    own.publish_grant(&grant, &replacement).await?;
     assert!(
-        eventually(|| async { Ok(b_peer.read_grant(ids::ALICE).await?.is_some()) }).await?,
-        "the widened grant did not take effect on the counterparty"
+        wait_grant_is(&b_peer, ids::ALICE, &replacement).await?,
+        "the republished grant did not take effect on the counterparty"
     );
-    assert!(b_peer.read_scoped_grant(ids::ALICE).await?.is_none());
 
-    // Narrow back: the scoped publish replaces the whole-store record the
-    // same way, in one write.
-    own.publish_scoped_grant(&grant, &ticket).await?;
-    assert!(
-        eventually(|| async { Ok(b_peer.read_scoped_grant(ids::ALICE).await?.is_some()) }).await?,
-        "the narrowed grant did not take effect on the counterparty"
-    );
-    assert!(b_peer.read_grant(ids::ALICE).await?.is_none());
-
-    // Withdraw: one tombstone removes the grant whatever its width — both
-    // reads absent, the issuer unlisted, on both sides.
+    // Withdraw: one tombstone removes the grant — absent and unlisted, on
+    // both sides.
     own.withdraw_grant(ids::ALICE).await?;
-    assert!(own.read_scoped_grant(ids::ALICE).await?.is_none());
     assert!(own.read_grant(ids::ALICE).await?.is_none());
     assert!(
         eventually(|| async {
-            Ok(b_peer.read_scoped_grant(ids::ALICE).await?.is_none()
-                && b_peer.read_grant(ids::ALICE).await?.is_none()
+            Ok(b_peer.read_grant(ids::ALICE).await?.is_none()
                 && !b_peer.list_grants().await?.contains(&ids::ALICE))
         })
         .await?,
@@ -433,7 +459,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     // audience.
     let from_laptop = data_ticket(&mut a_laptop, ids::ALICE_AT_WORK).await?;
     own_b_laptop
-        .publish_grant(ids::ALICE_AT_WORK, &from_laptop)
+        .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &from_laptop)
         .await?;
     assert!(
         wait_grant_is(&b_peer, ids::ALICE_AT_WORK, &from_laptop).await?,
@@ -444,7 +470,10 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     // refused outright.
     let bob_ticket = data_ticket(&mut bob, ids::BOB).await?;
     assert!(
-        b_peer.publish_grant(ids::BOB, &bob_ticket).await.is_err(),
+        b_peer
+            .publish_grant(&nominal_grant(ids::BOB, ids::ALICE), &bob_ticket)
+            .await
+            .is_err(),
         "a write through a read-only ticket must be refused"
     );
 
@@ -452,7 +481,9 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     // replication demonstrably flowed after the refusal — while the refused
     // key reads absent at the issuer and at the counterparty itself.
     let sentinel = data_ticket(&mut a_phone, ids::ALICE).await?;
-    own_b_phone.publish_grant(ids::ALICE, &sentinel).await?;
+    own_b_phone
+        .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &sentinel)
+        .await?;
     assert!(
         wait_grant_is(&b_peer, ids::ALICE, &sentinel).await?,
         "the sentinel grant did not converge after the refused write"
@@ -466,7 +497,10 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     // carries exactly what Alice granted her, none of Bob's grants.
     let for_carol = data_ticket(&mut a_phone, ids::ALICE_AT_LEISURE).await?;
     own_toward_carol
-        .publish_grant(ids::ALICE_AT_LEISURE, &for_carol)
+        .publish_grant(
+            &nominal_grant(ids::ALICE_AT_LEISURE, ids::CAROL),
+            &for_carol,
+        )
         .await?;
     assert!(
         wait_grant_is(&c_peer, ids::ALICE_AT_LEISURE, &for_carol).await?,
@@ -494,5 +528,164 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     a_laptop.shutdown().await?;
     bob.shutdown().await?;
     carol.shutdown().await?;
+    Ok(())
+}
+
+/// The sibling path preserves the issuer's scope, honors his withdrawal,
+/// and admits only the audience it is addressed to. A scoped grant serves
+/// a sibling exactly the claim set — withheld entries stay hidden even
+/// though the serving device demonstrably holds them. A device listed only
+/// in a co-located identity's directory — hosted on the same serving node —
+/// is refused, probed after a fresh write demonstrably reaches the audience
+/// (so the refusal is ordered, not a poll that outran the first dial). Once
+/// the withdrawal tombstone reaches the serving device the next sibling
+/// session refuses, and what was delivered while granted is retained.
+///
+/// Nodes run at an injected sub-second reconcile interval: every denial
+/// below waits out several of the refused sibling's own intervals, so it
+/// asserts "retried and refused", not "not yet arrived".
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
+async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
+    let a_phone = spawn_node().await?;
+    let a_laptop = spawn_node().await?;
+    let intruder = spawn_node().await?;
+    let mut bob = spawn_node().await?;
+
+    // Alice's directory lists her devices. A co-located second identity's
+    // directory — hosted on the same phone — lists the intruder.
+    let directory = PrivateMetadataStore::create(&a_phone).await?;
+    directory.add_device(a_phone.node_id()).await?;
+    directory.add_device(a_laptop.node_id()).await?;
+    a_phone.host_identity(ids::ALICE, &directory)?;
+    let leisure_dir = PrivateMetadataStore::create(&a_phone).await?;
+    leisure_dir.add_device(intruder.node_id()).await?;
+    a_phone.host_identity(ids::ALICE_AT_LEISURE, &leisure_dir)?;
+
+    // Bob's namespace holds a granted claim and a withheld one; his store
+    // toward Alice carries a scoped grant on the granted claim alone.
+    let email = EntryPath::new("contact/email")?;
+    let withheld = EntryPath::new("contact/phone")?;
+    let data_read = data_ticket(&mut bob, ids::BOB).await?;
+    let author = bob.create_author().await?;
+    bob.write(ids::BOB, author, &email, b"bob@example.org")
+        .await?;
+    bob.write(ids::BOB, author, &withheld, b"+1-555-0100")
+        .await?;
+    let b_own = ConnectionMetadataStore::create(&bob).await?;
+    let grant = ReadGrant {
+        issuer: ids::BOB,
+        audience: ids::ALICE,
+        claims: NonEmpty::new(claim_id_of(&ids::BOB, &email)),
+        write: false,
+    };
+    b_own.publish_grant(&grant, &data_read).await?;
+
+    // The phone opens the pair and imports the namespace. Bob's node is
+    // unarmed — ticket possession serves him whole — so the phone holds
+    // the withheld entry too: the sibling filter below must narrow the
+    // session regardless of what the serving device holds.
+    let phone_peer = ConnectionMetadataStore::import(
+        &a_phone,
+        b_own
+            .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await?,
+    )
+    .await?;
+    let a_own = ConnectionMetadataStore::create(&a_phone).await?;
+    a_phone.host_connection(ids::ALICE, ids::BOB, &a_own, &phone_peer)?;
+    assert!(
+        eventually(|| async { Ok(phone_peer.read_grant(ids::BOB).await?.is_some()) }).await?,
+        "the scoped grant did not reach the phone"
+    );
+    a_phone
+        .import_namespace_scoped(ids::BOB, data_read.clone())
+        .await?;
+    for (name, path, payload) in [
+        ("granted", &email, b"bob@example.org".as_slice()),
+        ("withheld", &withheld, b"+1-555-0100".as_slice()),
+    ] {
+        assert!(
+            wait_entry_is(&a_phone, ids::BOB, path, payload).await?,
+            "the {name} entry did not reach the phone from the unarmed issuer"
+        );
+    }
+
+    // The laptop's only contact is the phone: the sibling session serves
+    // exactly the claim set.
+    let phone_ticket = a_phone
+        .share_ticket(
+            ids::BOB,
+            ShareMode::Read,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    a_laptop
+        .import_namespace_scoped(ids::BOB, phone_ticket.clone())
+        .await?;
+    assert!(
+        wait_entry_is(&a_laptop, ids::BOB, &email, b"bob@example.org").await?,
+        "the granted entry did not reach the laptop through the sibling"
+    );
+
+    // A proven second wave through the same sibling: the update arrives,
+    // the withheld entry still does not — hidden, not merely late.
+    bob.write(ids::BOB, author, &email, b"bob@new.example.org")
+        .await?;
+    assert!(
+        wait_entry_is(&a_laptop, ids::BOB, &email, b"bob@new.example.org").await?,
+        "the granted update did not reach the laptop through the sibling"
+    );
+    assert!(a_laptop.read(ids::BOB, &withheld).await?.is_none());
+
+    // Denied: the intruder resolves only in the co-located identity's
+    // directory — not the audience's. It imports the same sibling ticket the
+    // laptop rode, then Bob writes once more: the update reaches the laptop
+    // (the phone demonstrably serves the audience in this window), so after
+    // several of the intruder's own reconcile intervals its empty view is a
+    // refusal, not a slow first dial.
+    intruder
+        .import_namespace_scoped(ids::BOB, phone_ticket)
+        .await?;
+    bob.write(ids::BOB, author, &email, b"bob@sentinel.example.org")
+        .await?;
+    assert!(
+        wait_entry_is(&a_laptop, ids::BOB, &email, b"bob@sentinel.example.org").await?,
+        "the sentinel update did not reach the audience laptop"
+    );
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(intruder.read(ids::BOB, &email).await?.is_none());
+    assert!(intruder.list(ids::BOB, None).await?.is_empty());
+
+    // Withdrawal: once the tombstone reaches the serving device, the next
+    // sibling session refuses. Bob then writes again; the phone — granted
+    // directly by the unarmed issuer's ticket — still converges, while the
+    // laptop, after several of its own intervals against the now-refusing
+    // phone, keeps what it was delivered and never advances to the
+    // post-withdrawal value.
+    b_own.withdraw_grant(ids::BOB).await?;
+    assert!(
+        eventually(|| async { Ok(phone_peer.read_grant(ids::BOB).await?.is_none()) }).await?,
+        "the withdrawal did not reach the phone"
+    );
+    bob.write(ids::BOB, author, &email, b"bob@after-withdrawal")
+        .await?;
+    assert!(
+        wait_entry_is(&a_phone, ids::BOB, &email, b"bob@after-withdrawal").await?,
+        "the post-withdrawal write did not reach the phone"
+    );
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        a_laptop
+            .read(ids::BOB, &email)
+            .await?
+            .is_some_and(|p| p == b"bob@sentinel.example.org"),
+        "the laptop advanced past its last-granted value after withdrawal"
+    );
+
+    a_phone.shutdown().await?;
+    a_laptop.shutdown().await?;
+    intruder.shutdown().await?;
+    bob.shutdown().await?;
     Ok(())
 }

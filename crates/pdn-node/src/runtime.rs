@@ -1,12 +1,14 @@
 //! The runtime: single owner of the node assembly and the hosted-identity
 //! set.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{AuthorId, ConnectionMetadata, PrivateMetadataStore, SpawnOptions, SyncNode};
+use data_layer::{
+    AuthorId, ConnectionMetadata, NamespaceId, PrivateMetadataStore, SpawnOptions, SyncNode,
+};
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 
@@ -82,6 +84,20 @@ pub(crate) struct State {
     /// records replicate in from its other devices, and on demand from the
     /// directory's tickets — a cache; the directory is the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
+    /// Pairs that currently have a grant binder running, keyed by
+    /// `(hosted identity, counterparty)`. One binder per pair: the sweep
+    /// inserts before spawning and the binder removes itself as it exits, so
+    /// a pair whose replica was superseded gets a fresh binder on the next
+    /// sweep rather than two watching different replicas.
+    pub(crate) grant_binders: HashSet<(PdnId, PdnId)>,
+    /// Data namespaces a grant binder imported, keyed by
+    /// `(hosted identity, counterparty, issuer)` and holding the namespace
+    /// the grant named when it was imported. Two jobs: a grant whose ticket
+    /// still names this namespace is not re-imported every sweep, and a
+    /// grant that disappears is forgotten again — bounded to what an binder
+    /// itself brought in, so a namespace imported any other way is never
+    /// dropped from under its owner.
+    pub(crate) bound_grants: HashMap<(PdnId, PdnId, PdnId), NamespaceId>,
 }
 
 impl State {
@@ -144,6 +160,8 @@ impl Runtime {
             pending_invites: PendingInvites::default(),
             pending_linking_invites: PendingInvites::default(),
             metadata_pairs: HashMap::new(),
+            grant_binders: HashSet::new(),
+            bound_grants: HashMap::new(),
         }));
         pairing_slot
             .set(Arc::downgrade(&state))

@@ -18,7 +18,7 @@ use pdn_node::{
     ConnectionsService as _, IdentityService as _, InvitePayload, LinkingPayload, PeerGrant,
     Runtime,
 };
-use pdn_types::PdnId;
+use pdn_types::{ClaimId, EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, TIMEOUT};
 
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
@@ -141,9 +141,27 @@ pub async fn establish_patiently(
     scanner.connections().establish(scanner_id, invite).await
 }
 
-/// Publish a grant of `issuer`'s namespace from the giving side's hosted
-/// identity toward the receiving side's, and hand back the grant as the
-/// receiver reads it once it has crossed the connection's metadata pair.
+/// The nominal claim these scenarios grant on: every grant is
+/// capability-scoped, so a publish needs a claim set even where the
+/// scenario is about the record crossing rather than about what it covers.
+pub fn nominal_claims(issuer: PdnId) -> NonEmpty<ClaimId> {
+    claims_on(
+        issuer,
+        &EntryPath::new("contact/email").expect("a valid path"),
+    )
+}
+
+/// The claim set covering exactly `path` of `issuer`'s namespace — for a
+/// scenario whose subject is the data behind the grant rather than the
+/// record crossing.
+pub fn claims_on(issuer: PdnId, path: &EntryPath) -> NonEmpty<ClaimId> {
+    NonEmpty::new(pdn_node::claim_id_of(&issuer, path))
+}
+
+/// Publish a grant of `issuer`'s namespace on `claims` from the giving
+/// side's hosted identity toward the receiving side's, and hand back the
+/// grant as the receiver reads it once it has crossed the connection's
+/// metadata pair.
 ///
 /// The crossing is a poll, not a wait: a grant's ticket payload is a blob and
 /// lags the record that names it, so `read_grants` omits it until it lands.
@@ -153,10 +171,12 @@ pub async fn granted_patiently(
     receives: &Runtime,
     receives_id: PdnId,
     issuer: PdnId,
+    claims: NonEmpty<ClaimId>,
+    write: bool,
 ) -> Result<PeerGrant> {
     gives
         .connections()
-        .publish_grant(gives_id, receives_id, issuer)
+        .publish_grant(gives_id, receives_id, issuer, claims, write)
         .await?;
     let crossed = eventually(|| async {
         Ok(receives
@@ -164,7 +184,7 @@ pub async fn granted_patiently(
             .read_grants(receives_id, gives_id)
             .await?
             .iter()
-            .any(|grant| grant.issuer == issuer))
+            .any(|peer_grant| peer_grant.grant.issuer == issuer))
     })
     .await?;
     ensure!(crossed, "the grant did not reach the peer over the pair");
@@ -173,6 +193,6 @@ pub async fn granted_patiently(
         .read_grants(receives_id, gives_id)
         .await?
         .into_iter()
-        .find(|grant| grant.issuer == issuer)
+        .find(|peer_grant| peer_grant.grant.issuer == issuer)
         .context("grant just observed, then gone")
 }

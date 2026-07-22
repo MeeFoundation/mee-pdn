@@ -5,8 +5,9 @@
 //! `validate_entry` hook, ADR-0008) is not installed. Every reconciliation
 //! session is classified by the access book (`access`, internal) — full
 //! view for a replica identity's own devices, a capability-filtered view
-//! for granted counterparties, a refusal indistinguishable from not-hosted
-//! for everyone else. Enforcement arms per identity by registration
+//! for granted counterparties and for the devices of a grant's audience
+//! identity, a refusal indistinguishable from not-hosted for everyone
+//! else. Enforcement arms per identity by registration
 //! ([`SyncNode::host_identity`] / [`SyncNode::host_connection`]);
 //! an assembly that registers nothing is bounded by ticket possession
 //! alone. One node hosts the store sets of any number of identities.

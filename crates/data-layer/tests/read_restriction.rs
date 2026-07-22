@@ -152,7 +152,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
         .await?;
     serving
         .own_toward_peer
-        .publish_scoped_grant(&grant, &data_read_ticket)
+        .publish_grant(&grant, &data_read_ticket)
         .await?;
 
     // Alice consumes the grant as the bootstrap cascade would: reads it
@@ -261,6 +261,80 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
     Ok(())
 }
 
+/// The grant's capability names its audience, and the serving side honors
+/// that name — not the mere position of the record. A grant sitting in
+/// Bob's store toward Alice but whose capability names Carol as its
+/// audience serves Alice nothing: the record's place says who wrote it, the
+/// capability says whom it was written for, and only the second authorizes.
+///
+/// This is the one guard between "a device the connection is toward" and "a
+/// device the grant is addressed to". Without the `cap.audience` check the
+/// classifier would extend Alice the claim set on position alone, so a
+/// record misaddressed — by a bug, or by a replica shared into two
+/// connections — would serve the wrong identity's devices.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_addressed_to_another_identity_serves_nobody() -> Result<()> {
+    let bob = spawn_node().await?;
+    let alice = spawn_node().await?;
+
+    let alice_own = ConnectionMetadataStore::create(&alice).await?;
+    alice_own.publish_device(alice.node_id()).await?;
+    let serving = serving_side(&bob, ids::ALICE, &alice_own).await?;
+
+    bob.create_namespace(ids::BOB).await?;
+    write_bobs_entries(&bob).await?;
+
+    // Published into Bob's store toward Alice — but the capability names
+    // Carol, not Alice, as its audience.
+    let email = EntryPath::new(GRANTED)?;
+    let misaddressed = ReadGrant {
+        issuer: ids::BOB,
+        audience: ids::CAROL,
+        claims: NonEmpty::new(claim_id_of(&ids::BOB, &email)),
+        write: false,
+    };
+    let data_read_ticket = bob
+        .share_ticket(
+            ids::BOB,
+            ShareMode::Read,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    serving
+        .own_toward_peer
+        .publish_grant(&misaddressed, &data_read_ticket)
+        .await?;
+
+    // Alice opens the pair and imports the namespace exactly as a rightful
+    // grantee would — the ticket is addressing, so nothing here fails.
+    let alice_peer =
+        ConnectionMetadataStore::import(&alice, serving.own_read_ticket.clone()).await?;
+    alice.host_connection(ids::ALICE, ids::BOB, &alice_own, &alice_peer)?;
+    // The grant record converges to Alice — proof the two nodes replicate,
+    // so the data denial below is "refused", not "not yet connected".
+    let (_grant, received_ticket) = eventually_scoped_grant(&alice_peer, ids::BOB).await?;
+    alice
+        .import_namespace_scoped(ids::BOB, received_ticket)
+        .await?;
+
+    // Bob updates the claim; Alice re-dials Bob every reconcile interval,
+    // and after three past a fresh write "she asked repeatedly and was
+    // refused" is what holds this green.
+    let author = bob.create_author().await?;
+    bob.write(ids::BOB, author, &email, b"bob@new.example.org")
+        .await?;
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        alice.list(ids::BOB, None).await?.is_empty(),
+        "a grant naming another identity's audience must serve nothing"
+    );
+    assert!(alice.read(ids::BOB, &email).await?.is_none());
+
+    bob.shutdown().await?;
+    alice.shutdown().await?;
+    Ok(())
+}
+
 /// The write-grant scenario: a grant carrying write ships a write ticket,
 /// and the audience's write on the granted claim reaches the issuer —
 /// while the read filter still narrows what flows the other way.
@@ -312,7 +386,7 @@ async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
         .await?;
     serving
         .own_toward_peer
-        .publish_scoped_grant(&grant, &data_write_ticket)
+        .publish_grant(&grant, &data_write_ticket)
         .await?;
 
     let alice_peer =
@@ -432,7 +506,7 @@ async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> 
         .await?;
     serving
         .own_toward_peer
-        .publish_scoped_grant(&grant, &ticket)
+        .publish_grant(&grant, &ticket)
         .await?;
 
     let alice_peer =
@@ -461,7 +535,7 @@ async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> 
     serving.own_toward_peer.withdraw_grant(ids::BOB).await?;
     assert!(serving
         .own_toward_peer
-        .read_scoped_grant(ids::BOB)
+        .read_grant(ids::BOB)
         .await?
         .is_none());
 
@@ -503,7 +577,7 @@ async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> 
 ///
 /// Dave joins Bob's data-namespace swarm (a device-style import) and stays a
 /// member throughout. Positive control: while Bob's book carries a
-/// whole-store grant for Dave, Dave converges on Bob's write — proving the
+/// grant for Dave, Dave converges on Bob's write — proving the
 /// mesh is live and the delivery path works. Negative: once Bob withdraws
 /// the grant, a write made afterwards never reaches Dave — although Dave is
 /// still a swarm member.
@@ -538,7 +612,7 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
     // for the whole test — nothing below removes him from the swarm.
     dave.import_namespace(ids::BOB, ticket).await?;
 
-    // Bob's book carries a whole-store grant for Dave.
+    // Bob's book carries a grant for Dave on the granted claim.
     let grant_ticket = bob
         .share_ticket(
             ids::BOB,
@@ -546,9 +620,15 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
             AddrInfoOptions::RelayAndAddresses,
         )
         .await?;
+    let grant = ReadGrant {
+        issuer: ids::BOB,
+        audience: ids::DAVE,
+        claims: NonEmpty::new(claim_id_of(&ids::BOB, &email)),
+        write: false,
+    };
     serving
         .own_toward_peer
-        .publish_grant(ids::BOB, &grant_ticket)
+        .publish_grant(&grant, &grant_ticket)
         .await?;
 
     // Positive control: while granted, Dave converges on Bob's write — the
@@ -598,9 +678,9 @@ async fn eventually_scoped_grant(
     issuer: PdnId,
 ) -> Result<(ReadGrant, data_layer::DocTicket)> {
     let mut found = None;
-    let ok = eventually(|| async { Ok(store.read_scoped_grant(issuer).await?.is_some()) }).await?;
+    let ok = eventually(|| async { Ok(store.read_grant(issuer).await?.is_some()) }).await?;
     if ok {
-        found = store.read_scoped_grant(issuer).await?;
+        found = store.read_grant(issuer).await?;
     }
     found.ok_or_else(|| anyhow::anyhow!("scoped grant for {issuer} did not arrive"))
 }
