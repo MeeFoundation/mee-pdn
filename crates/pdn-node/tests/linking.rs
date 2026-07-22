@@ -555,7 +555,16 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 
     let path = EntryPath::new("shared/note")?;
     rt_phone.data().write(x, &path, b"from-x").await?;
-    let grant = granted_patiently(&rt_phone, x, &rt_laptop, y, x).await?;
+    let grant = granted_patiently(
+        &rt_phone,
+        x,
+        &rt_laptop,
+        y,
+        x,
+        common::claims_on(x, &path),
+        false,
+    )
+    .await?;
 
     // The whole-store grant path: binds X in the node's issuer registry,
     // and nowhere near the hosted set the link's guard consults.
@@ -677,7 +686,7 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
     let err = rt_b
         .connections()
-        .publish_grant(y, pc, y)
+        .publish_grant(y, pc, y, common::nominal_claims(y), false)
         .await
         .unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
@@ -768,7 +777,16 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         .data()
         .write(alice, &email, b"alice@example.org")
         .await?;
-    granted_patiently(&rt_phone, alice, &rt_bob, bob, alice).await?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_bob,
+        bob,
+        alice,
+        common::claims_on(alice, &email),
+        false,
+    )
+    .await?;
 
     // Positive control on the laptop's replica: device replication has
     // delivered the entry it is about to serve.

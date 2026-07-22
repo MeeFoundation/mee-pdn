@@ -173,7 +173,7 @@ pub struct SyncNode {
 /// posture. `Swarm` joins the replica's gossip swarm — the issuer's own
 /// devices and the device-shared stores. `ContactsOnly` re-syncs with the
 /// ticket's contacts alone and never joins the swarm — every grantee
-/// import, scoped and whole-store alike: gossip broadcasts entries past the
+/// import: gossip broadcasts entries past the
 /// access book, so the swarm of a data namespace is its issuer's device
 /// set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,11 +427,12 @@ impl SyncNode {
     /// Import a doc shared via `ticket` as a **whole-store grant** of
     /// `issuer`: access arrives through a grant, not through being a device
     /// of the issuer, so — unlike
-    /// [`import_namespace`](Self::import_namespace) — this node never
-    /// re-serves the replica to third parties and never joins the replica's
-    /// gossip swarm. Classified reconciliation with the ticket's contacts is
-    /// the only data path; what makes this grant whole-store rather than
-    /// scoped lives entirely in the issuer's book, not in the import.
+    /// [`import_namespace`](Self::import_namespace) — this node never joins
+    /// the replica's gossip swarm, and re-serves it only to the devices of
+    /// the grant's audience identity, per the locally replicated grant
+    /// record. Classified reconciliation with the tracked contacts is the
+    /// only data path; what makes this grant whole-store rather than scoped
+    /// lives entirely in the issuer's book, not in the import.
     ///
     /// Returns what the import did, undoable through
     /// [`undo_import_namespace`](Self::undo_import_namespace).
@@ -446,9 +447,10 @@ impl SyncNode {
     /// Import a doc shared via `ticket` as a **scoped** data namespace of
     /// `issuer`: access arrives through a grant, not through being a device
     /// of the issuer. A scoped import never joins the replica's gossip swarm
-    /// — capability-filtered reconciliation with the ticket's contacts is
-    /// its only data path — and this node never re-serves the slice to third
-    /// parties.
+    /// — capability-filtered reconciliation with the tracked contacts is its
+    /// only data path — and the slice is re-served only to the devices of
+    /// the grant's audience identity, per the locally replicated grant
+    /// record.
     ///
     /// Returns what the import did, undoable through
     /// [`undo_import_namespace`](Self::undo_import_namespace).
@@ -462,10 +464,10 @@ impl SyncNode {
 
     /// The one grantee import behind
     /// [`import_namespace_granted`](Self::import_namespace_granted) and
-    /// [`import_namespace_scoped`](Self::import_namespace_scoped): `Never`
-    /// re-serving, `ContactsOnly` sync. The two public names differ only in
-    /// what the caller was granted — a distinction the issuer's book
-    /// enforces per session.
+    /// [`import_namespace_scoped`](Self::import_namespace_scoped):
+    /// `AudienceDevices` re-serving, `ContactsOnly` sync. The two public
+    /// names differ only in what the caller was granted — a distinction the
+    /// issuer's book enforces per session.
     ///
     /// Like the device-replication import, refuses a ticket naming a
     /// tracked but not data-bound replica (a directory, a connection
@@ -489,7 +491,7 @@ impl SyncNode {
         let displaced =
             match self
                 .registry
-                .register_data(issuer, doc.clone(), ServingPosture::Never)
+                .register_data(issuer, doc.clone(), ServingPosture::AudienceDevices)
             {
                 Ok(displaced) => displaced,
                 Err(err) => {
@@ -526,6 +528,36 @@ impl SyncNode {
             return Err(err);
         }
         Ok(import)
+    }
+
+    /// Add reconciliation contacts for `issuer`'s data namespace — devices
+    /// of the grant's audience alongside the issuer's own from the import
+    /// ticket. The periodic reconcile pass and the before-access nudge dial
+    /// the merged set, so a granted replica catches up from a sibling while
+    /// the issuer is offline. Adding is idempotent per contact.
+    ///
+    /// Refuses with [`UnknownIssuer`] when `issuer` resolves to no tracked
+    /// replica — whether it was never bound or is bound-but-untracked (the
+    /// registry and the tracking map are separate: [`forget_doc`] untracks
+    /// without unregistering). Both are the same failure to the caller —
+    /// "nowhere to record these contacts" — so both surface, rather than a
+    /// silent `Ok` that drops them and starves the replica unattributably.
+    pub fn add_namespace_contacts(&self, issuer: PdnId, contacts: Vec<EndpointAddr>) -> Result<()> {
+        let doc = self
+            .registry
+            .data_doc(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        let mut docs = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+        let entry = docs.get_mut(&doc.id()).ok_or(UnknownIssuer { issuer })?;
+        for contact in contacts {
+            if !entry.contacts.contains(&contact) {
+                entry.contacts.push(contact);
+            }
+        }
+        Ok(())
     }
 
     /// The shared precondition of both data-namespace imports: hand back

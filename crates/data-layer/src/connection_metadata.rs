@@ -12,28 +12,29 @@
 //! The same replica is `own` at its issuer and `peer` at the counterparty.
 //!
 //! Grants ride inside as **one record per granted data store**, at
-//! `grants/<issuer-hex>` — a single entry whose payload names its own width
-//! ([`GrantRecord`]: whole-store, or scoped by a capability). At every
-//! moment exactly one grant of one width exists per issuer: every publish
-//! replaces it wholesale, and a withdrawal is one tombstone — no ordering
-//! between records to get wrong, locally or across devices.
+//! `grants/<issuer-hex>` — a single entry carrying the capability that
+//! scopes it to an exact claim set ([`GrantRecord`]). At every moment
+//! exactly one grant exists per issuer: every publish replaces it
+//! wholesale, and a withdrawal is one tombstone — no ordering between
+//! records to get wrong, locally or across devices.
 //!
 //! Grant payloads are blobs, so grant reads are payload-waiting:
 //! [`ConnectionMetadataStore::read_grant`] returns `None` until the payload
 //! bytes have arrived — and likewise for bytes this version cannot read,
 //! since the counterparty is what writes them here and one unreadable grant
 //! must not hide the readable ones beside it. The serving side derives a
-//! caller's width only from a present, decoded record: absence, a lagging
-//! payload, and an undecodable payload all classify as *no grant*, never as
-//! a wider one.
+//! caller's rights only from a present, decoded record: absence, a lagging
+//! payload, and an undecodable payload all classify as *no grant*.
 
 use anyhow::Result;
+use futures_core::Stream;
 use futures_lite::StreamExt;
 use pdn_store::{
     api::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
+    engine::LiveEvent,
     store::Query,
     AuthorId, DocTicket, NamespaceId,
 };
@@ -48,30 +49,25 @@ use crate::private_metadata::{device_key, device_of, DEVICES_PREFIX};
 const GRANTS_PREFIX: &str = "grants/";
 
 /// The entry key of the grant record for `issuer`'s data store:
-/// `grants/<issuer-hex>` — one record per issuer, whatever the grant's
-/// width. Shared with the access book, which reads the same record at
-/// session classification.
+/// `grants/<issuer-hex>` — one record per issuer. Shared with the access
+/// book, which reads the same record at session classification.
 pub(crate) fn grant_key(issuer: &PdnId) -> String {
     format!("{GRANTS_PREFIX}{issuer}")
 }
 
 /// The one grant record of one data store's issuer — the payload at
-/// `grants/<issuer-hex>`, carrying its own width explicitly. Serialized as
-/// tagged JSON: the tag is the structural version, so a record kind this
-/// build does not know fails to decode and reads as *no grant*
-/// (fail-closed) rather than as some default width. The ticket travels in
-/// its canonical string form in both variants; its `ShareMode` follows the
-/// grant's commands.
+/// `grants/<issuer-hex>`. Serialized as tagged JSON: the tag is the
+/// structural version, so a record kind this build does not know fails to
+/// decode and reads as *no grant* (fail-closed) rather than as something
+/// this build would act on. The ticket travels in its canonical string
+/// form; its `ShareMode` follows the grant's commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GrantRecord {
-    /// A whole-store grant: the whole replica, named by its ticket alone.
-    WholeStore {
-        /// The replica's ticket, canonical string form.
-        ticket: String,
-    },
     /// A capability-scoped grant: exactly the capability's claims, with the
-    /// ticket carrying addressing and contacts.
+    /// ticket carrying addressing and contacts. The one kind there is —
+    /// the tagged form stays so an unknown kind from a future version
+    /// decodes as no grant rather than as this one.
     Scoped {
         /// The capability: issuer, audience, exact claims, commands.
         cap: ReadGrant,
@@ -187,6 +183,30 @@ impl ConnectionMetadataStore {
         self.doc.clone()
     }
 
+    /// One item per observed change of this replica: an entry written here,
+    /// an entry arrived by sync, or a payload blob become readable. The item
+    /// carries no detail on purpose — the fork's event vocabulary stays
+    /// behind this layer, and "something changed, look again" is what a
+    /// re-reading consumer needs. `ContentReady` is one of the three because
+    /// grant payloads are blobs: a grant record whose entry arrived is not
+    /// yet readable, and only the payload event tells a consumer to re-read.
+    /// An `Err` item reports the subscription failing; the stream ends when
+    /// the node shuts down.
+    pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
+        let events = self.doc.subscribe().await?;
+        Ok(events.filter_map(|event| match event {
+            Ok(
+                LiveEvent::InsertLocal { .. }
+                | LiveEvent::InsertRemote { .. }
+                | LiveEvent::ContentReady { .. },
+            ) => Some(Ok(())),
+            // Sync-session and neighbor bookkeeping is not a change of the
+            // replica's contents.
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        }))
+    }
+
     /// Share this store as a ticket: `ShareMode::Read` for the counterparty
     /// (handed over inside the establishment dialogue), `ShareMode::Write`
     /// for the issuing identity's own directory (every device of the issuer
@@ -198,47 +218,6 @@ impl ConnectionMetadataStore {
     ) -> Result<DocTicket> {
         let ticket = self.doc.share(mode, addr_options).await?;
         Ok(ticket)
-    }
-
-    /// Publish a whole-store grant of `issuer`'s data store: one
-    /// [`GrantRecord::WholeStore`] at `grants/<issuer-hex>`. Replaces
-    /// whatever grant record is there, whatever its width: publishing
-    /// whole-store over a scoped grant *is* the widening, with no stale
-    /// capability left beside it.
-    pub async fn publish_grant(&self, issuer: PdnId, ticket: &DocTicket) -> Result<()> {
-        let record = GrantRecord::WholeStore {
-            ticket: ticket.to_string(),
-        };
-        self.doc
-            .set_bytes(
-                self.author,
-                grant_key(&issuer).into_bytes(),
-                serde_json::to_vec(&record)?,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Read the whole-store grant for `issuer`'s data store, if present and
-    /// readable. A scoped record reads as `None` here — its consumer is
-    /// [`read_scoped_grant`](Self::read_scoped_grant); the two widths never
-    /// coexist (one record).
-    ///
-    /// `Ok(None)` covers every "no usable whole-store grant here": no entry
-    /// at all, a payload that has not arrived (consumers poll), a payload
-    /// this version cannot read, or a scoped record. `Err` stays reserved
-    /// for this node's own failures, so one unreadable grant never hides
-    /// the readable ones beside it.
-    pub async fn read_grant(&self, issuer: PdnId) -> Result<Option<DocTicket>> {
-        let Some(bytes) =
-            read_payload(&self.doc, &self.blobs, grant_key(&issuer).as_bytes()).await?
-        else {
-            return Ok(None);
-        };
-        match decode_grant_record(&bytes) {
-            Some(GrantRecord::WholeStore { ticket }) => Ok(decode_grant_ticket(&ticket)),
-            Some(GrantRecord::Scoped { .. }) | None => Ok(None),
-        }
     }
 
     /// List the data-store issuers with a live grant (record-level —
@@ -257,13 +236,13 @@ impl ConnectionMetadataStore {
         Ok(issuers)
     }
 
-    /// Withdraw the grant for `issuer`'s data store, whatever its width —
-    /// one tombstone (empty entry) over the one record, replicating like
+    /// Withdraw the grant for `issuer`'s data store — one tombstone (empty
+    /// entry) over the one record, replicating like
     /// any other entry: the counterparty eventually reads the grant as
     /// absent, and the issuer's own devices stop admitting the audience at
     /// the next session setup (rights are frozen per session). One record
     /// means one tombstone: no state in which a classifier could read a
-    /// half-withdrawn grant. Whether data already delivered under the grant
+    /// half-withdrawn grant. Whether data already delivered under it
     /// is retained is outside this store — Invariant 2 governs acquisition,
     /// not retention.
     pub async fn withdraw_grant(&self, issuer: PdnId) -> Result<()> {
@@ -273,14 +252,14 @@ impl ConnectionMetadataStore {
         Ok(())
     }
 
-    /// Publish a scoped grant: one [`GrantRecord::Scoped`] carrying the
-    /// capability and its ticket at `grants/<issuer-hex>` — a single write,
-    /// so the capability and the ticket cannot exist without each other in
-    /// any order of replication. The ticket's mode is the caller's to mint
-    /// per the grant's commands — read-only → `ShareMode::Read`, with write
-    /// → `ShareMode::Write`; this store carries the pair, it does not check
+    /// Publish a grant: one [`GrantRecord::Scoped`] carrying the capability
+    /// and its ticket at `grants/<issuer-hex>` — a single write, so the
+    /// capability and the ticket cannot exist without each other in any
+    /// order of replication. The ticket's mode is the caller's to mint per
+    /// the grant's commands — read-only → `ShareMode::Read`, with write →
+    /// `ShareMode::Write`; this store carries the pair, it does not check
     /// it.
-    pub async fn publish_scoped_grant(&self, grant: &ReadGrant, ticket: &DocTicket) -> Result<()> {
+    pub async fn publish_grant(&self, grant: &ReadGrant, ticket: &DocTicket) -> Result<()> {
         let record = GrantRecord::Scoped {
             cap: grant.clone(),
             ticket: ticket.to_string(),
@@ -295,12 +274,15 @@ impl ConnectionMetadataStore {
         Ok(())
     }
 
-    /// Read the scoped grant for `issuer`'s data store — the capability and
-    /// its ticket — if present and readable. A whole-store record reads as
-    /// `None` here — its consumer is [`read_grant`](Self::read_grant);
-    /// payload-waiting and `None` for bytes this version cannot read, by
-    /// the same rules.
-    pub async fn read_scoped_grant(&self, issuer: PdnId) -> Result<Option<(ReadGrant, DocTicket)>> {
+    /// Read the grant for `issuer`'s data store — the capability and its
+    /// ticket — if present and readable.
+    ///
+    /// `Ok(None)` covers every "no usable grant here": no entry at all, a
+    /// payload that has not arrived (consumers poll), or a payload this
+    /// version cannot read. `Err` stays reserved for this node's own
+    /// failures, so one unreadable grant never hides the readable ones
+    /// beside it.
+    pub async fn read_grant(&self, issuer: PdnId) -> Result<Option<(ReadGrant, DocTicket)>> {
         let Some(bytes) =
             read_payload(&self.doc, &self.blobs, grant_key(&issuer).as_bytes()).await?
         else {
@@ -310,7 +292,7 @@ impl ConnectionMetadataStore {
             Some(GrantRecord::Scoped { cap, ticket }) => {
                 Ok(decode_grant_ticket(&ticket).map(|t| (cap, t)))
             }
-            Some(GrantRecord::WholeStore { .. }) | None => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -393,21 +375,16 @@ mod tests {
 
     /// A grant payload this version cannot read is absent, not an error —
     /// it withholds only itself, never the readable grants beside it, and
-    /// never classifies wider than absent. Both real record kinds decode,
-    /// so "absent" is a verdict on the bytes and not a decoder that never
-    /// says yes.
+    /// never classifies wider than absent. The real record kind decodes, so
+    /// "absent" is a verdict on the bytes and not a decoder that never says
+    /// yes; a tagged kind this version does not know reads as absent too,
+    /// which is what keeps a future width from classifying as this one.
     #[test]
     fn grant_records_decode_and_unreadable_ones_read_as_absent() {
-        let whole = serde_json::to_vec(&GrantRecord::WholeStore {
-            ticket: ticket().to_string(),
-        })
-        .expect("serializable");
+        let unknown_kind = br#"{"kind":"from_a_later_version","ticket":"x"}"#;
         assert!(
-            matches!(
-                decode_grant_record(&whole),
-                Some(GrantRecord::WholeStore { .. })
-            ),
-            "a whole-store record must decode"
+            decode_grant_record(unknown_kind).is_none(),
+            "a record kind this version does not know must read as absent"
         );
 
         let issuer = PdnId::from_bytes([0xa1; 32]);

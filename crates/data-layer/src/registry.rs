@@ -12,17 +12,19 @@ use pdn_types::PdnId;
 /// How this node serves a data replica whose issuer it does not host.
 /// `Serve` is the ticket-bounded stance: the whole replica to any ticket
 /// holder — the stance a device replicating a store re-serves the next
-/// device under. `Never` is a grantee's stance: the slice is never
-/// re-served to third parties, only the issuer's own devices are
-/// recognized. This axis is independent of the sync strategy (swarm vs
-/// contacts-only), which lives on the tracked doc.
+/// device under. `AudienceDevices` is a grantee's stance: the slice is
+/// served to the devices of the grant's audience identity, judged through
+/// that identity's directory and the locally replicated grant record;
+/// third parties are refused — their rights are not computable here. This
+/// axis is independent of the sync strategy (swarm vs contacts-only),
+/// which lives on the tracked doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServingPosture {
     /// Ticket-bounded: serve the whole replica to any ticket holder.
     Serve,
-    /// Grantee (scoped or whole-store): never re-serve the slice; only the
-    /// issuer's own devices are recognized.
-    Never,
+    /// Grantee (scoped or whole-store): serve the audience identity's
+    /// devices per the local grant record; refuse everyone else.
+    AudienceDevices,
 }
 
 /// One issuer's data-namespace binding: the backing doc and the serving
