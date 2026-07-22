@@ -2,20 +2,24 @@
   "folders": [
     {
       "name": "root",
-      "path": "."
+      "path": ".",
     },
     {
       "name": "crates",
-      "path": "crates"
+      "path": "crates",
     },
     {
       "name": "mia-docs",
-      "path": "mia-docs"
-    }
+      "path": "mia-docs",
+    },
+    {
+      "name": "pdn-store",
+      "path": "pdn-store",
+    },
   ],
   "settings": {
     "files.exclude": {
-      "**/target": true
+      "**/target": true,
     },
     "rust-analyzer.linkedProjects": [
       "Cargo.toml",
@@ -28,23 +32,18 @@
       "crates/mee-sync-api/Cargo.toml",
       "crates/mee-sync-iroh-willow/Cargo.toml",
       "crates/mee-demo/Cargo.toml",
-      "crates/mee-wasm/Cargo.toml"
+      "crates/mee-wasm/Cargo.toml",
     ],
     "rust-analyzer.cargo.features": "all",
     "rust-analyzer.checkOnSave": true,
     "rust-analyzer.check.command": "clippy",
     "rust-analyzer.procMacro.enable": true,
     "editor.formatOnSave": true,
-    "editor.rulers": [
-      100
-    ],
+    "editor.rulers": [100],
     "files.insertFinalNewline": true,
-    "files.trimTrailingWhitespace": true
+    "files.trimTrailingWhitespace": true,
   },
   "extensions": {
-    "recommendations": [
-      "rust-lang.rust-analyzer",
-      "fill-labs.dependi"
-    ]
-  }
+    "recommendations": ["rust-lang.rust-analyzer", "fill-labs.dependi"],
+  },
 }
