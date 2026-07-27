@@ -542,6 +542,7 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 /// the entries with it), and a rollback that destroys state it never created
 /// is worse than no rollback at all.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, the grant and the failed link in one place
 async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() -> Result<()> {
     // Two personas of one person, as `multi_identity` models them: X on the
     // phone, Y on the laptop, connected, with X granting Y its namespace.
@@ -561,8 +562,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
         &rt_laptop,
         y,
         x,
-        common::claims_on(x, &path),
-        false,
+        common::claims_on(x, &path, false),
     )
     .await?;
 
@@ -686,7 +686,7 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
     let err = rt_b
         .connections()
-        .publish_grant(y, pc, y, common::nominal_claims(y), false)
+        .publish_grant(y, pc, y, common::nominal_claims(y))
         .await
         .unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
@@ -783,8 +783,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         &rt_bob,
         bob,
         alice,
-        common::claims_on(alice, &email),
-        false,
+        common::claims_on(alice, &email, false),
     )
     .await?;
 

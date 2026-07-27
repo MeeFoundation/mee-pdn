@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, PrivateMetadataStore,
-    ReadGrant, ShareMode, SpawnOptions, SyncNode,
+    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, GrantedClaim,
+    PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, ids, wait_entry_is};
@@ -44,13 +44,17 @@ async fn data_ticket(node: &mut SyncNode, issuer: PdnId) -> Result<DocTicket> {
 /// The nominal claim these store-level scenarios grant on: the store
 /// carries a capability, it never evaluates one, so one claim is enough to
 /// give every record its shape.
+// Test-only helper: clippy.toml's expect relaxation reaches `#[test]` bodies only.
+#[allow(clippy::expect_used)]
 fn nominal_grant(issuer: PdnId, audience: PdnId) -> ReadGrant {
     let path = EntryPath::new("contact/email").expect("a valid path");
     ReadGrant {
         issuer,
         audience,
-        claims: NonEmpty::new(claim_id_of(&issuer, &path)),
-        write: false,
+        claims: NonEmpty::new(GrantedClaim {
+            claim: claim_id_of(&issuer, &path),
+            write: false,
+        }),
     }
 }
 
@@ -58,13 +62,15 @@ fn nominal_grant(issuer: PdnId, audience: PdnId) -> ReadGrant {
 async fn wait_grant_is(
     store: &ConnectionMetadataStore,
     issuer: PdnId,
+    audience: PdnId,
     expected: &DocTicket,
 ) -> Result<bool> {
     let expected = expected.to_string();
     eventually(|| async {
         Ok(store
-            .read_grant(issuer)
+            .read_grant(issuer, audience)
             .await?
+            .granted()
             .is_some_and(|(_cap, ticket)| ticket.to_string() == expected))
     })
     .await
@@ -132,7 +138,11 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
 
     // Import binds before content arrives: the handle is usable at once and
     // reads return absent — nothing has been published yet.
-    assert!(b_peer_a.read_grant(ids::ALICE).await?.is_none());
+    assert!(b_peer_a
+        .read_grant(ids::ALICE, ids::BOB)
+        .await?
+        .granted()
+        .is_none());
     assert!(b_peer_a.list_grants().await?.is_empty());
 
     // Alice grants her data store toward Bob and a second one toward Carol.
@@ -151,11 +161,11 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     // The own→peer flip: the entry written into `own` is read from the
     // counterpart's `peer` — the same replica at both sides, no re-import.
     assert!(
-        wait_grant_is(&b_peer_a, ids::ALICE, &ticket_for_bob).await?,
+        wait_grant_is(&b_peer_a, ids::ALICE, ids::BOB, &ticket_for_bob).await?,
         "grant did not converge from Alice's own store to Bob's peer store"
     );
     assert!(
-        wait_grant_is(&c_peer_a, ids::ALICE_AT_WORK, &ticket_for_carol).await?,
+        wait_grant_is(&c_peer_a, ids::ALICE_AT_WORK, ids::CAROL, &ticket_for_carol).await?,
         "grant did not converge from Alice's own store to Carol's peer store"
     );
 
@@ -164,7 +174,11 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     // vice versa — and nothing of Alice's stores leaked into Bob's own
     // reverse-direction replica.
     assert_eq!(c_peer_a.list_grants().await?, vec![ids::ALICE_AT_WORK]);
-    assert!(c_peer_a.read_grant(ids::ALICE).await?.is_none());
+    assert!(c_peer_a
+        .read_grant(ids::ALICE, ids::CAROL)
+        .await?
+        .granted()
+        .is_none());
     assert_eq!(b_peer_a.list_grants().await?, vec![ids::ALICE]);
     assert!(b_own_a.list_grants().await?.is_empty());
 
@@ -182,6 +196,7 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
 /// soon as its record syncs and reads absent until its payload arrives —
 /// the polls below ride exactly that contract.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, the pair's whole lifetime in one place
 async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     let mut a_phone = SyncNode::spawn().await?;
     let mut a_laptop = SyncNode::spawn().await?;
@@ -214,7 +229,7 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
         ("counterparty's laptop", &peer_b_laptop),
     ] {
         assert!(
-            wait_grant_is(store, ids::ALICE, &first).await?,
+            wait_grant_is(store, ids::ALICE, ids::BOB, &first).await?,
             "grant did not converge to the {name}"
         );
     }
@@ -226,7 +241,7 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
         .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &second)
         .await?;
     assert!(
-        wait_grant_is(&peer_b_phone, ids::ALICE_AT_WORK, &second).await?,
+        wait_grant_is(&peer_b_phone, ids::ALICE_AT_WORK, ids::BOB, &second).await?,
         "a later grant did not reach the counterparty over the existing pair"
     );
 
@@ -234,7 +249,14 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     // and no longer lists — on the counterparty.
     own_phone.withdraw_grant(ids::ALICE).await?;
     assert!(
-        eventually(|| async { Ok(peer_b_phone.read_grant(ids::ALICE).await?.is_none()) }).await?,
+        eventually(|| async {
+            Ok(peer_b_phone
+                .read_grant(ids::ALICE, ids::BOB)
+                .await?
+                .granted()
+                .is_none())
+        })
+        .await?,
         "withdrawn grant still reads on the counterparty"
     );
     assert!(
@@ -261,7 +283,11 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
         eventually(|| async {
             let mut seen = Vec::new();
             for store in stores {
-                match store.read_grant(ids::ALICE_AT_LEISURE).await? {
+                match store
+                    .read_grant(ids::ALICE_AT_LEISURE, ids::BOB)
+                    .await?
+                    .granted()
+                {
                     Some((_cap, ticket)) => seen.push(ticket.to_string()),
                     None => return Ok(false),
                 }
@@ -307,14 +333,16 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     let grant = ReadGrant {
         issuer: ids::ALICE,
         audience: ids::BOB,
-        claims: NonEmpty::new(claim_id_of(&ids::ALICE, &email)),
-        write: false,
+        claims: NonEmpty::new(GrantedClaim {
+            claim: claim_id_of(&ids::ALICE, &email),
+            write: false,
+        }),
     };
 
     // Published: the counterparty reads the capability and its ticket.
     own.publish_grant(&grant, &ticket).await?;
     assert!(
-        wait_grant_is(&b_peer, ids::ALICE, &ticket).await?,
+        wait_grant_is(&b_peer, ids::ALICE, ids::BOB, &ticket).await?,
         "the grant did not converge to the counterparty"
     );
 
@@ -324,17 +352,25 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     let replacement = data_ticket(&mut alice, ids::ALICE_AT_WORK).await?;
     own.publish_grant(&grant, &replacement).await?;
     assert!(
-        wait_grant_is(&b_peer, ids::ALICE, &replacement).await?,
+        wait_grant_is(&b_peer, ids::ALICE, ids::BOB, &replacement).await?,
         "the republished grant did not take effect on the counterparty"
     );
 
     // Withdraw: one tombstone removes the grant — absent and unlisted, on
     // both sides.
     own.withdraw_grant(ids::ALICE).await?;
-    assert!(own.read_grant(ids::ALICE).await?.is_none());
+    assert!(own
+        .read_grant(ids::ALICE, ids::BOB)
+        .await?
+        .granted()
+        .is_none());
     assert!(
         eventually(|| async {
-            Ok(b_peer.read_grant(ids::ALICE).await?.is_none()
+            Ok(b_peer
+                .read_grant(ids::ALICE, ids::BOB)
+                .await?
+                .granted()
+                .is_none()
                 && !b_peer.list_grants().await?.contains(&ids::ALICE))
         })
         .await?,
@@ -421,6 +457,7 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
 /// holds no replica of this pair, no ticket to it, and reads nothing that
 /// reveals its existence.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() -> Result<()> {
     let mut a_phone = SyncNode::spawn().await?;
     let mut a_laptop = SyncNode::spawn().await?;
@@ -462,7 +499,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
         .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &from_laptop)
         .await?;
     assert!(
-        wait_grant_is(&b_peer, ids::ALICE_AT_WORK, &from_laptop).await?,
+        wait_grant_is(&b_peer, ids::ALICE_AT_WORK, ids::BOB, &from_laptop).await?,
         "the issuer's second device's write did not reach the counterparty"
     );
 
@@ -485,11 +522,19 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
         .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &sentinel)
         .await?;
     assert!(
-        wait_grant_is(&b_peer, ids::ALICE, &sentinel).await?,
+        wait_grant_is(&b_peer, ids::ALICE, ids::BOB, &sentinel).await?,
         "the sentinel grant did not converge after the refused write"
     );
-    assert!(own_b_phone.read_grant(ids::BOB).await?.is_none());
-    assert!(b_peer.read_grant(ids::BOB).await?.is_none());
+    assert!(own_b_phone
+        .read_grant(ids::BOB, ids::ALICE)
+        .await?
+        .granted()
+        .is_none());
+    assert!(b_peer
+        .read_grant(ids::BOB, ids::BOB)
+        .await?
+        .granted()
+        .is_none());
 
     // Denied: Carol — connected to Alice herself — observes nothing of the
     // A→B store. Her pair is a different replica, she was handed no ticket
@@ -503,7 +548,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
         )
         .await?;
     assert!(
-        wait_grant_is(&c_peer, ids::ALICE_AT_LEISURE, &for_carol).await?,
+        wait_grant_is(&c_peer, ids::ALICE_AT_LEISURE, ids::CAROL, &for_carol).await?,
         "Alice's grant toward Carol did not converge"
     );
     let ns_toward_bob = own_b_phone
@@ -521,8 +566,16 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
         "Carol's pair must be a distinct replica"
     );
     assert_eq!(c_peer.list_grants().await?, vec![ids::ALICE_AT_LEISURE]);
-    assert!(c_peer.read_grant(ids::ALICE).await?.is_none());
-    assert!(c_peer.read_grant(ids::ALICE_AT_WORK).await?.is_none());
+    assert!(c_peer
+        .read_grant(ids::ALICE, ids::CAROL)
+        .await?
+        .granted()
+        .is_none());
+    assert!(c_peer
+        .read_grant(ids::ALICE_AT_WORK, ids::CAROL)
+        .await?
+        .granted()
+        .is_none());
 
     a_phone.shutdown().await?;
     a_laptop.shutdown().await?;
@@ -576,8 +629,10 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     let grant = ReadGrant {
         issuer: ids::BOB,
         audience: ids::ALICE,
-        claims: NonEmpty::new(claim_id_of(&ids::BOB, &email)),
-        write: false,
+        claims: NonEmpty::new(GrantedClaim {
+            claim: claim_id_of(&ids::BOB, &email),
+            write: false,
+        }),
     };
     b_own.publish_grant(&grant, &data_read).await?;
 
@@ -595,7 +650,14 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     let a_own = ConnectionMetadataStore::create(&a_phone).await?;
     a_phone.host_connection(ids::ALICE, ids::BOB, &a_own, &phone_peer)?;
     assert!(
-        eventually(|| async { Ok(phone_peer.read_grant(ids::BOB).await?.is_some()) }).await?,
+        eventually(|| async {
+            Ok(phone_peer
+                .read_grant(ids::BOB, ids::ALICE)
+                .await?
+                .granted()
+                .is_some())
+        })
+        .await?,
         "the scoped grant did not reach the phone"
     );
     a_phone
@@ -665,7 +727,14 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     // post-withdrawal value.
     b_own.withdraw_grant(ids::BOB).await?;
     assert!(
-        eventually(|| async { Ok(phone_peer.read_grant(ids::BOB).await?.is_none()) }).await?,
+        eventually(|| async {
+            Ok(phone_peer
+                .read_grant(ids::BOB, ids::ALICE)
+                .await?
+                .granted()
+                .is_none())
+        })
+        .await?,
         "the withdrawal did not reach the phone"
     );
     bob.write(ids::BOB, author, &email, b"bob@after-withdrawal")

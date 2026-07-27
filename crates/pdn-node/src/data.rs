@@ -2,10 +2,23 @@
 //! the namespace ticket handover.
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, DocTicket, ShareMode};
+use data_layer::{AddrInfoOptions, DocTicket, GrantRead, ShareMode};
 use pdn_types::{EntryInfo, EntryPath, PdnId};
 
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, State};
+
+/// A write addressed a granted namespace outside the write set of the
+/// locally replicated grant record — refused at the call site, before the
+/// replica is touched. A courtesy to honest writers: the enforcement proper
+/// is the issuer-side ingest gate, and a bypass ends in retraction.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("write to {issuer} at {path} is not covered by the local grant's write set")]
+pub struct WriteNotGranted {
+    /// The granted namespace's issuer.
+    pub issuer: PdnId,
+    /// The path the write addressed.
+    pub path: EntryPath,
+}
 
 /// Writing, reading, and listing entries by issuer and path, and the
 /// namespace-ticket handover: share a namespace hosted here, import a
@@ -74,11 +87,40 @@ impl<'rt> RuntimeDataService<'rt> {
     pub(crate) fn new(runtime: &'rt Runtime) -> Self {
         Self { runtime }
     }
+
+    /// Write past the courtesy refusal, letting the issuer's ingest gate be
+    /// the only boundary. Behind the `test-util` feature and absent from
+    /// every product build: it exists to let a scenario test deterministically
+    /// produce an entry the issuer refuses — the same entry that arises in
+    /// the field from a stale local grant (courtesy allows, the fresh gate
+    /// refuses) or an adversarial client that never calls the guarded
+    /// [`write`](DataService::write) at all. For a granted namespace the
+    /// write leaves this node's replica at once (the grant's write ticket
+    /// carries the namespace secret); the issuer admits it only if its own
+    /// grant record covers the claim, and refuses it otherwise, after which
+    /// the provisional entry is retracted here (Invariant 2, the write side).
+    #[cfg(feature = "test-util")]
+    pub async fn write_unguarded(
+        &self,
+        issuer: PdnId,
+        path: &EntryPath,
+        payload: &[u8],
+    ) -> Result<()> {
+        let state = self.runtime.state.lock().await;
+        state.node.write(issuer, state.author, path, payload).await
+    }
 }
 
 impl DataService for RuntimeDataService<'_> {
     async fn write(&self, issuer: PdnId, path: &EntryPath, payload: &[u8]) -> Result<()> {
         let state = self.runtime.state.lock().await;
+        // Courtesy refusal on a grant-bound namespace: judged from the
+        // locally replicated grant records, so the error arrives at the
+        // call site instead of a bounded number of sessions later. Not the
+        // enforcement — the issuer's gate is.
+        if let Some(refused) = write_refusal(&state, issuer, path).await? {
+            return Err(refused.into());
+        }
         state.node.write(issuer, state.author, path, payload).await
     }
 
@@ -125,4 +167,48 @@ impl DataService for RuntimeDataService<'_> {
         let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         Ok(())
     }
+}
+
+/// The courtesy verdict for a write at `path` under `issuer`: `None` allows.
+/// A namespace this runtime's grant binder bound is judged by the grants
+/// behind it — one grant whose write set covers the claim is enough to allow,
+/// and the refusal stands only when every grant on that issuer was read and
+/// none of them covers it. A namespace not bound by a grant — a hosted
+/// identity's own, or an out-of-band import — is not judged here at all: the
+/// issuer's gate is the boundary.
+///
+/// A grant this node cannot read *right now* allows: a record whose payload
+/// is still replicating (the window a republish opens) says nothing about
+/// what it covers, and a courtesy that guesses there refuses honest writes
+/// the issuer would keep. A record absent altogether does mean not covered —
+/// that is a withdrawal, and refusing spares the writer a retraction.
+async fn write_refusal(
+    state: &State,
+    issuer: PdnId,
+    path: &EntryPath,
+) -> Result<Option<WriteNotGranted>> {
+    let mut grant_bound = false;
+    for (bound_identity, bound_peer, bound_issuer) in state.bound_grants.keys() {
+        if *bound_issuer != issuer {
+            continue;
+        }
+        grant_bound = true;
+        let Some(pair) = state.metadata_pairs.get(&(*bound_identity, *bound_peer)) else {
+            continue;
+        };
+        match pair.peer.read_grant(issuer, *bound_identity).await {
+            Ok(GrantRead::Granted(grant, _ticket)) if grant.covers_write(path) => return Ok(None),
+            // Read whole and not covering the claim, or decidedly no grant
+            // here (withdrawn, or granting someone else); another pair may
+            // still cover it.
+            Ok(GrantRead::Granted(..) | GrantRead::None) => {}
+            // What this pair grants is not knowable right now, and a courtesy
+            // does not refuse on a guess.
+            Ok(GrantRead::Unreadable) | Err(_) => return Ok(None),
+        }
+    }
+    Ok(grant_bound.then(|| WriteNotGranted {
+        issuer,
+        path: path.clone(),
+    }))
 }

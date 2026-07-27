@@ -15,10 +15,10 @@
 use anyhow::{ensure, Context, Result};
 use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
 use pdn_node::{
-    ConnectionsService as _, IdentityService as _, InvitePayload, LinkingPayload, PeerGrant,
-    Runtime,
+    ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
+    PeerGrant, Runtime,
 };
-use pdn_types::{ClaimId, EntryPath, NonEmpty, PdnId};
+use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, TIMEOUT};
 
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
@@ -144,18 +144,24 @@ pub async fn establish_patiently(
 /// The nominal claim these scenarios grant on: every grant is
 /// capability-scoped, so a publish needs a claim set even where the
 /// scenario is about the record crossing rather than about what it covers.
-pub fn nominal_claims(issuer: PdnId) -> NonEmpty<ClaimId> {
+// Test-only helper: clippy.toml's expect relaxation reaches `#[test]` bodies only.
+#[allow(clippy::expect_used)]
+pub fn nominal_claims(issuer: PdnId) -> NonEmpty<GrantedClaim> {
     claims_on(
         issuer,
         &EntryPath::new("contact/email").expect("a valid path"),
+        false,
     )
 }
 
-/// The claim set covering exactly `path` of `issuer`'s namespace — for a
-/// scenario whose subject is the data behind the grant rather than the
-/// record crossing.
-pub fn claims_on(issuer: PdnId, path: &EntryPath) -> NonEmpty<ClaimId> {
-    NonEmpty::new(pdn_node::claim_id_of(&issuer, path))
+/// The claim set covering exactly `path` of `issuer`'s namespace — read
+/// always, write when `write` — for a scenario whose subject is the data
+/// behind the grant rather than the record crossing.
+pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<GrantedClaim> {
+    NonEmpty::new(GrantedClaim {
+        claim: pdn_node::claim_id_of(&issuer, path),
+        write,
+    })
 }
 
 /// Publish a grant of `issuer`'s namespace on `claims` from the giving
@@ -171,12 +177,11 @@ pub async fn granted_patiently(
     receives: &Runtime,
     receives_id: PdnId,
     issuer: PdnId,
-    claims: NonEmpty<ClaimId>,
-    write: bool,
+    claims: NonEmpty<GrantedClaim>,
 ) -> Result<PeerGrant> {
     gives
         .connections()
-        .publish_grant(gives_id, receives_id, issuer, claims, write)
+        .publish_grant(gives_id, receives_id, issuer, claims)
         .await?;
     let crossed = eventually(|| async {
         Ok(receives

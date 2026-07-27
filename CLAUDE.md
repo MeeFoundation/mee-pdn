@@ -46,8 +46,10 @@ Task runner is [just](https://github.com/casey/just). Key recipes:
 
 Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI installs it via `taiki-e/install-action`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
 
-Run a single crate's tests: `cargo nextest run -p <crate-name>`.
-Run a single test: `cargo nextest run -E 'test(<test_name>)'`.
+Run a single crate's tests: `just test -p <crate-name>`.
+Run a single test: `just test -E 'test(<test_name>)'`.
+
+Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/test-util`, the feature the write-retraction scenarios sit behind, and a bare cargo invocation matches zero of them without saying so. The recipes drop the flag when the caller narrows the package selection away from `pdn-node`, because cargo rejects a feature of an unselected package.
 
 ## Lint rules
 

@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.101.0"
-source = "git+https://github.com/MeeFoundation/pdn-store.git#abcca04dcb2e88aa03aea3e306f3be0ffd59a98b"
+source = "git+https://github.com/MeeFoundation/pdn-store.git#7bf27cb8eca73b16ced5932ff5d245dedefd4133"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2789,6 +2789,7 @@ name = "pdn-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "data-layer",
  "futures-lite",
  "pdn-types",
@@ -2798,6 +2799,7 @@ dependencies = [
  "test-utils",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

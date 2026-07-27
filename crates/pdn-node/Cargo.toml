@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Embeddable node runtime: identity, connections, data, and sync services over data-layer"
 
+[features]
+# Extra API surface that exists only to support scenario tests, never the
+# product: `RuntimeDataService::write_unguarded`, the courtesy-bypassing
+# write that lets a test deterministically produce an entry the issuer's
+# ingest gate refuses (a stale-grant race or an adversarial client in the
+# field; here, on demand). Off in every product build; the `just` dev
+# recipes turn it on. Named after tokio's `test-util` (and singular, so it
+# does not collide with the `test-utils` crate). Not `cfg(test)`:
+# integration tests compile the crate as an external dependency, where
+# `cfg(test)` is never set.
+test-util = []
+
 [dependencies]
 anyhow = "1"
 data-layer = { path = "../data-layer" }
@@ -19,8 +31,14 @@ thiserror = "2"
 # `rt` for the detached connection-armer task the runtime spawns per
 # hosted identity.
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+# Retraction verdicts warn through the ecosystem's subscriber; already in
+# the graph via iroh.
+tracing = "0.1"
 
 [dev-dependencies]
+# The retraction event's content hash is the payload's blake3 hash, and a
+# scenario asserts it against the bytes it wrote.
+blake3 = "1.8"
 # Scenario tests probe an identity's directory by running the linking
 # dialogue raw against a bare node — the store-level view of what the
 # ceremonies published, and the pin on the linking wire format.

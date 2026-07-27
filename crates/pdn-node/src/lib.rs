@@ -23,19 +23,23 @@ pub mod data;
 pub mod identity;
 pub mod linking;
 pub mod pairing;
+pub mod retraction;
 pub mod runtime;
 pub mod sync;
 
 pub use connections::{
     ConnectionsService, DelegationUnsupported, PeerGrant, RuntimeConnectionsService,
 };
-pub use data::{DataService, RuntimeDataService};
+pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION};
 pub use pairing::{InvitePayload, UnsupportedInviteVersion, INVITE_FORMAT_VERSION};
+pub use retraction::RetractionEvent;
 pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};
 
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
-pub use data_layer::{claim_id_of, DocTicket, ReadGrant, ShareMode, SpawnOptions, UnknownIssuer};
+pub use data_layer::{
+    claim_id_of, DocTicket, GrantedClaim, ReadGrant, ShareMode, SpawnOptions, UnknownIssuer,
+};
 pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
