@@ -42,7 +42,7 @@ use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 
 use crate::grant::ReadGrant;
-use crate::node::{read_payload, SyncNode};
+use crate::node::SyncNode;
 use crate::private_metadata::{device_key, device_of, DEVICES_PREFIX};
 
 /// Key prefix under which grant entries live.
@@ -74,6 +74,38 @@ pub(crate) enum GrantRecord {
         /// The replica's ticket, canonical string form.
         ticket: String,
     },
+}
+
+/// What one metadata replica says about the grant of one issuer's data toward
+/// one audience. Three answers, not two: a record that is absent and a record
+/// whose payload has not replicated yet are opposite facts for a caller
+/// deciding whether it may write, and collapsing them makes one of the two
+/// wrong.
+#[derive(Debug, Clone)]
+pub enum GrantRead {
+    /// A present, decoded capability naming this issuer and this audience,
+    /// with the granted store's ticket — boxed, as the ticket dwarfs the two
+    /// empty variants beside it.
+    Granted(ReadGrant, Box<DocTicket>),
+    /// No grant here, decidedly: no record at all (never published, or
+    /// withdrawn), or a record whose capability grants someone else.
+    None,
+    /// A record is here, but what it grants cannot be read yet: its payload
+    /// has not replicated, or its bytes are of a kind this build does not
+    /// know. Consumers poll; nothing may be concluded from it either way.
+    Unreadable,
+}
+
+impl GrantRead {
+    /// The capability and ticket of a [`Granted`](Self::Granted) read, and
+    /// nothing for the other two — the common case of a caller that acts only
+    /// on a grant it can see whole.
+    pub fn granted(self) -> Option<(ReadGrant, DocTicket)> {
+        match self {
+            GrantRead::Granted(cap, ticket) => Some((cap, *ticket)),
+            GrantRead::None | GrantRead::Unreadable => None,
+        }
+    }
 }
 
 /// Decode a grant record's payload, if it is one this version can read.
@@ -256,9 +288,9 @@ impl ConnectionMetadataStore {
     /// and its ticket at `grants/<issuer-hex>` — a single write, so the
     /// capability and the ticket cannot exist without each other in any
     /// order of replication. The ticket's mode is the caller's to mint per
-    /// the grant's commands — read-only → `ShareMode::Read`, with write →
-    /// `ShareMode::Write`; this store carries the pair, it does not check
-    /// it.
+    /// the grant's commands as a whole — no write on any claim →
+    /// `ShareMode::Read`, write on any claim → `ShareMode::Write`; this
+    /// store carries the pair, it does not check it.
     pub async fn publish_grant(&self, grant: &ReadGrant, ticket: &DocTicket) -> Result<()> {
         let record = GrantRecord::Scoped {
             cap: grant.clone(),
@@ -274,25 +306,46 @@ impl ConnectionMetadataStore {
         Ok(())
     }
 
-    /// Read the grant for `issuer`'s data store — the capability and its
-    /// ticket — if present and readable.
+    /// Read the grant for `issuer`'s data store toward `audience`.
     ///
-    /// `Ok(None)` covers every "no usable grant here": no entry at all, a
-    /// payload that has not arrived (consumers poll), or a payload this
-    /// version cannot read. `Err` stays reserved for this node's own
-    /// failures, so one unreadable grant never hides the readable ones
-    /// beside it.
-    pub async fn read_grant(&self, issuer: PdnId) -> Result<Option<(ReadGrant, DocTicket)>> {
-        let Some(bytes) =
-            read_payload(&self.doc, &self.blobs, grant_key(&issuer).as_bytes()).await?
-        else {
-            return Ok(None);
+    /// Nothing may be inferred from a record's position: which store it sits
+    /// in says who wrote it, and only the capability says over whose data and
+    /// toward whom. A record whose capability names another issuer or another
+    /// audience is no grant here, whatever key it was written under — the
+    /// counterparty writes this store, so the key is its word too. The
+    /// serving side applies the same test at classification, so both
+    /// directions read one record the same way.
+    ///
+    /// `Err` stays reserved for this node's own failures, so one unreadable
+    /// grant never hides the readable ones beside it.
+    pub async fn read_grant(&self, issuer: PdnId, audience: PdnId) -> Result<GrantRead> {
+        let key = grant_key(&issuer);
+        let query = Query::single_latest_per_key().key_exact(key.as_bytes());
+        // Record-level: a withdrawal is a tombstone, which this query skips,
+        // so "no entry" and "withdrawn" are the same absence — and both are a
+        // decided answer, unlike the record whose payload is still on its way.
+        let Some(entry) = self.doc.get_one(query).await? else {
+            return Ok(GrantRead::None);
         };
+        let hash = entry.content_hash();
+        if !self.blobs.has(hash).await? {
+            return Ok(GrantRead::Unreadable);
+        }
+        let bytes = self.blobs.get_bytes(hash).await?;
         match decode_grant_record(&bytes) {
-            Some(GrantRecord::Scoped { cap, ticket }) => {
-                Ok(decode_grant_ticket(&ticket).map(|t| (cap, t)))
+            Some(GrantRecord::Scoped { cap, ticket })
+                if cap.issuer == issuer && cap.audience == audience =>
+            {
+                Ok(match decode_grant_ticket(&ticket) {
+                    Some(ticket) => GrantRead::Granted(cap, Box::new(ticket)),
+                    None => GrantRead::Unreadable,
+                })
             }
-            None => Ok(None),
+            // Decoded, and it grants someone else: a decided answer.
+            Some(GrantRecord::Scoped { .. }) => Ok(GrantRead::None),
+            // Bytes of a kind this build does not know: what they grant is
+            // unknown, which is not the same as granting nothing.
+            None => Ok(GrantRead::Unreadable),
         }
     }
 
@@ -360,6 +413,7 @@ mod tests {
     use pdn_types::{ClaimId, NonEmpty};
 
     use super::*;
+    use crate::grant::GrantedClaim;
 
     fn ticket() -> DocTicket {
         // A ticket carries addressing info — a ticket without it does not
@@ -392,8 +446,10 @@ mod tests {
             cap: ReadGrant {
                 issuer,
                 audience: PdnId::from_bytes([0xb0; 32]),
-                claims: NonEmpty::new(ClaimId::from_bytes([0x11; 32])),
-                write: false,
+                claims: NonEmpty::new(GrantedClaim {
+                    claim: ClaimId::from_bytes([0x11; 32]),
+                    write: false,
+                }),
             },
             ticket: ticket().to_string(),
         })
@@ -404,6 +460,20 @@ mod tests {
                 Some(GrantRecord::Scoped { .. })
             ),
             "a scoped record must decode"
+        );
+
+        // A record whose capability carries the flat claim list with one
+        // grant-wide write flag: the claims fail to decode, so the whole
+        // record reads as no grant — fail-closed, never a default width.
+        let flat_cap_record = format!(
+            r#"{{"kind":"scoped","cap":{{"issuer":"{issuer}","audience":"{audience}","claims":["{claim}"],"write":true}},"ticket":"{ticket}"}}"#,
+            audience = PdnId::from_bytes([0xb0; 32]),
+            claim = ClaimId::from_bytes([0x11; 32]),
+            ticket = ticket(),
+        );
+        assert!(
+            decode_grant_record(flat_cap_record.as_bytes()).is_none(),
+            "a flat-claims capability payload must read as absent"
         );
 
         assert!(decode_grant_record(&[0xff, 0xfe]).is_none(), "not utf-8");

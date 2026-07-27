@@ -31,10 +31,11 @@ use pdn_store::{
 use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
 use tokio::sync::oneshot;
 
-use crate::access::{session_access_provider, AccessBook};
+use crate::access::{capability_ingest_validator, session_access_provider, AccessBook};
 use crate::connection_metadata::ConnectionMetadataStore;
 use crate::private_metadata::PrivateMetadataStore;
 use crate::registry::{Registry, ServingPosture};
+use crate::retraction::{RetractionTracker, RetractionVerdict};
 
 /// An operation addressed a data namespace this node does not host: `issuer`
 /// has no created or imported namespace here. Downcast from the
@@ -134,15 +135,18 @@ impl Default for SpawnOptions {
 /// their dial sides and the node's own address are reached through
 /// [`SyncNode::dial_handle`].
 ///
-/// No ingest filter is installed (the fork's `validate_entry` hook,
-/// ADR-0008, is unused): whatever a replica syncs from a peer holding its
-/// ticket is persisted. Every read session is classified through the node's
-/// access book — full for a replica identity's own devices and connection
-/// audiences, capability-filtered for granted counterparties, refused as
-/// not-hosted otherwise. Enforcement arms per identity by registration
-/// ([`SyncNode::host_identity`] / [`SyncNode::host_connection`]) and per
-/// replica by [`SyncNode::import_namespace_scoped`]; a node that registers
-/// nothing serves any ticket holder the whole replica.
+/// Both directions of a session are enforced through the node's access
+/// book. Reads: every session is classified — full for a replica identity's
+/// own devices and connection audiences, capability-filtered for granted
+/// counterparties, refused as not-hosted otherwise. Writes: the fork's
+/// ingest hook (ADR-0008) is installed with the book's validator — on a
+/// replica data-bound to a hosted identity, a synced entry is admitted only
+/// from the issuer's own devices or, per claim, per the sender's session
+/// write set; refused entries are dropped before persisting. Enforcement
+/// arms per identity by registration ([`SyncNode::host_identity`] /
+/// [`SyncNode::host_connection`]) and per replica by
+/// [`SyncNode::import_namespace_scoped`]; a node that registers nothing
+/// serves — and admits — any ticket holder the whole replica.
 ///
 /// Storage is in-memory.
 #[derive(Debug)]
@@ -164,6 +168,13 @@ pub struct SyncNode {
     /// per namespace at a time, so a tight poll loop cannot pile up
     /// concurrent attempts against one replica.
     nudges_in_flight: Arc<Mutex<HashSet<NamespaceId>>>,
+    /// Provisional-write tracking behind the fork's rejection observer; the
+    /// runtime deposits what it takes to judge one (granted namespaces, the
+    /// issuers' devices, own authors) and consumes the verdicts.
+    retraction: Arc<RetractionTracker>,
+    /// The verdict stream's receiving half, taken once by the runtime's
+    /// consumer ([`SyncNode::take_retraction_verdicts`]).
+    retraction_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>>>,
     /// Ends the periodic reconcile pass when dropped — with the node — or by
     /// the explicit send in [`SyncNode::shutdown`].
     reconciler_stop: oneshot::Sender<()>,
@@ -297,11 +308,21 @@ impl SyncNode {
         // set right after the spawn, before any session can arrive.
         let registry = Arc::new(Registry::default());
         let access = Arc::new(AccessBook::default());
+        let (retraction, retraction_verdicts) = RetractionTracker::new();
+        let retraction = Arc::new(retraction);
+        let observer_tracker = Arc::clone(&retraction);
         let docs = Docs::memory()
             .session_access_provider(session_access_provider(
                 Arc::clone(&access),
                 Arc::clone(&registry),
             ))
+            .capability_validator(capability_ingest_validator(
+                Arc::clone(&access),
+                Arc::clone(&registry),
+            ))
+            .rejection_observer(Arc::new(move |namespace, reject, peer| {
+                observer_tracker.record_rejection(namespace, reject, peer);
+            }))
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await?;
         let docs_api = docs.api().clone();
@@ -332,6 +353,8 @@ impl SyncNode {
             access,
             tracked_docs,
             nudges_in_flight: Arc::default(),
+            retraction,
+            retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
             reconciler_stop,
         })
     }
@@ -641,9 +664,125 @@ impl SyncNode {
             .registry
             .binding(issuer)?
             .ok_or(UnknownIssuer { issuer })?;
-        self.forget_doc(binding.doc.id()).await?;
+        let namespace = binding.doc.id();
+        self.forget_doc(namespace).await?;
         let _unregistered = self.registry.unregister_data(issuer)?;
+        // Retraction state leaves with the replica: the entries its markers
+        // address are gone, and a rejection naming them judges nothing.
+        self.access.disarm_retractions(namespace)?;
+        self.retraction.untrack_namespace(namespace);
         Ok(())
+    }
+
+    /// Record `author` as one of this node's own writers, so the
+    /// provisional-write tracker recognizes its entries.
+    pub fn track_writer_author(&self, author: AuthorId) {
+        self.retraction.track_author(author);
+    }
+
+    /// Track the granted namespace of `issuer` for provisional-write
+    /// verdicts, with exactly `devices` counting as the issuer's device set
+    /// — replacing any previous set. Refuses with [`UnknownIssuer`] when
+    /// the issuer resolves to no replica here.
+    pub fn track_retraction_peers(&self, issuer: PdnId, devices: Vec<NodeId>) -> Result<()> {
+        let doc = self
+            .registry
+            .data_doc(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        self.retraction
+            .track_namespace(doc.id(), devices.into_iter().collect());
+        Ok(())
+    }
+
+    /// Take the provisional-write verdict stream — once: the runtime's
+    /// consumer owns it, and a second take yields `None`.
+    pub fn take_retraction_verdicts(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>> {
+        self.retraction_verdicts
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Physically remove `author`'s record at `key` in `issuer`'s replica,
+    /// if its timestamp is at or below `bound` — the retraction act. No
+    /// tombstone: the set shrinks, and re-ingest of the removed entry is
+    /// refused only while a matching armed retraction says so
+    /// ([`arm_retraction`](Self::arm_retraction)). Returns whether a record
+    /// was removed.
+    pub async fn retract_entry(
+        &self,
+        issuer: PdnId,
+        author: AuthorId,
+        key: &[u8],
+        bound: u64,
+    ) -> Result<bool> {
+        let doc = self.doc(issuer)?;
+        doc.retract(author, key.to_vec(), bound).await
+    }
+
+    /// Arm the ingest refusal for `author`'s entries at `key` in `issuer`'s
+    /// replica up to `bound` — the marker's in-memory half, so a retracted
+    /// entry cannot flap back from a sibling that still holds it.
+    pub fn arm_retraction(
+        &self,
+        issuer: PdnId,
+        author: AuthorId,
+        key: Vec<u8>,
+        bound: u64,
+    ) -> Result<()> {
+        let doc = self
+            .registry
+            .data_doc(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        self.access.arm_retraction(doc.id(), author, key, bound)
+    }
+
+    /// Whether this node holds exactly the entry `verdict` names in
+    /// `issuer`'s replica: same author, same key, same timestamp, same
+    /// content hash.
+    ///
+    /// A verdict's fields arrive from the peer that refused the write, and
+    /// retraction is destructive, so nothing but the local record makes them
+    /// true. A fabricated timestamp names no record here; neither does one a
+    /// newer own write has already superseded — writing again after a refusal
+    /// is the way back, and it must not be undone by a rejection still in
+    /// flight for the version it replaced.
+    pub async fn holds_rejected_entry(
+        &self,
+        issuer: PdnId,
+        verdict: &RetractionVerdict,
+    ) -> Result<bool> {
+        let doc = self.doc(issuer)?;
+        let query = Query::author(verdict.author).key_exact(&verdict.key);
+        let Some(entry) = doc.get_one(query).await? else {
+            return Ok(false);
+        };
+        Ok(entry.timestamp() == verdict.timestamp && entry.content_hash() == verdict.content_hash)
+    }
+
+    /// Take down the ingest refusal armed for `author`'s entries at `key` in
+    /// `issuer`'s replica — what a dropped marker leaves behind. Arming is
+    /// in memory and only ever widens ([`arm_retraction`](Self::arm_retraction)),
+    /// so without this an aged-out marker would go on refusing until the
+    /// process restarts. An issuer that resolves to no replica here has
+    /// nothing armed; that is not an error.
+    pub fn disarm_retraction(&self, issuer: PdnId, author: AuthorId, key: &[u8]) -> Result<()> {
+        let Some(doc) = self.registry.data_doc(issuer)? else {
+            return Ok(());
+        };
+        self.access.disarm_retraction(doc.id(), author, key)
+    }
+
+    /// Which issuer `namespace` is bound to on this node, if any — the
+    /// reverse resolution a verdict consumer needs (verdicts carry the
+    /// replica's namespace).
+    pub fn issuer_of_namespace(&self, namespace: NamespaceId) -> Result<Option<PdnId>> {
+        Ok(self
+            .registry
+            .binding_of(namespace)?
+            .map(|(issuer, _)| issuer))
     }
 
     /// Create a fresh doc for a device-shared store; the doc joins the

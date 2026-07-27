@@ -5,11 +5,13 @@
 //! A dedicated pdn-store replica, separate from data namespaces, that all
 //! devices of one identity replicate. It is device-internal by ticket alone
 //! (Invariant 1): its ticket is handed only to the identity's own devices,
-//! over the device-linking dialogue. Three record families live here, under
+//! over the device-linking dialogue. Four record families live here, under
 //! disjoint prefixes: `devices/` — the device set; `tickets/` — typed
 //! tickets to the identity's other stores and its connections' metadata
-//! pairs; `connections/` — one marker record per connection counterparty.
-//! One node holds the private metadata stores of any number of identities.
+//! pairs; `connections/` — one marker record per connection counterparty;
+//! `retractions/` — write-retraction markers, keyed by granted issuer,
+//! author, and path. One node holds the private metadata stores of any
+//! number of identities.
 //!
 //! Device and connection records are record-level (visible as soon as the
 //! entry syncs — liveness never waits on payload bytes); ticket payloads are
@@ -30,6 +32,7 @@ use pdn_store::{
     AuthorId, DocTicket, NamespaceId,
 };
 use pdn_types::{NodeId, PdnId};
+use serde::{Deserialize, Serialize};
 
 use crate::node::{read_payload, SyncNode};
 
@@ -51,6 +54,8 @@ pub(crate) const DEVICES_PREFIX: &str = "devices/";
 const TICKETS_PREFIX: &str = "tickets/";
 /// Key prefix for connection records.
 const CONNECTIONS_PREFIX: &str = "connections/";
+/// Key prefix for write-retraction markers.
+const RETRACTIONS_PREFIX: &str = "retractions/";
 
 /// The entry key of a device record: `devices/<node-id-hex>`
 /// ([`DEVICES_PREFIX`] is the one shared definition).
@@ -83,6 +88,50 @@ fn connection_peer_of(key: &[u8]) -> Option<PdnId> {
         .strip_prefix(CONNECTIONS_PREFIX)?
         .parse()
         .ok()
+}
+
+/// The entry key of a retraction marker:
+/// `retractions/<issuer-hex>/<author-hex>/<path>` — the granted data
+/// store's issuer, the retracted entry's author, and its path.
+fn retraction_key(issuer: &PdnId, author: &AuthorId, path: &str) -> String {
+    format!("{RETRACTIONS_PREFIX}{issuer}/{author}/{path}")
+}
+
+/// Parse `(issuer, author, path)` back out of a
+/// `retractions/<issuer-hex>/<author-hex>/<path>` key, if it matches.
+fn retraction_of(key: &[u8]) -> Option<(PdnId, AuthorId, String)> {
+    let rest = std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix(RETRACTIONS_PREFIX)?;
+    let (issuer, rest) = rest.split_once('/')?;
+    let (author, path) = rest.split_once('/')?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((issuer.parse().ok()?, author.parse().ok()?, path.to_owned()))
+}
+
+/// One listed retraction marker: the entry it addresses — issuer, author,
+/// path — with the decoded marker.
+pub type ListedRetraction = (PdnId, AuthorId, String, RetractionMarker);
+
+/// One write-retraction verdict, as the directory records it: the exact
+/// entry it addresses lives in the key (issuer, author, path); the payload
+/// carries the bound and the provenance. Serialized as JSON; a payload this
+/// build cannot decode reads as no marker (fail-closed: nothing gets
+/// removed on its word).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetractionMarker {
+    /// Entries of the marker's author and path with a timestamp at or below
+    /// this bound are retracted.
+    pub bound: u64,
+    /// The device that reached the verdict.
+    pub decided_by: NodeId,
+    /// The content hash of the retracted entry — the address of what was
+    /// lost, recoverable from the blob store while the blob lives.
+    pub content_hash: [u8; 32],
+    /// The retracted entry's timestamp.
+    pub timestamp: u64,
 }
 
 /// Device-replicated directory of an identity's own state: its devices, the
@@ -199,6 +248,111 @@ impl PrivateMetadataStore {
             }
         }
         Ok(peers)
+    }
+
+    /// Record a write-retraction verdict: one marker at
+    /// `retractions/<issuer-hex>/<author-hex>/<path>`, replacing any
+    /// previous marker for the same entry address — the widest bound wins
+    /// at the consumer, so a replacement never un-retracts.
+    pub async fn record_retraction(
+        &self,
+        issuer: PdnId,
+        author: AuthorId,
+        path: &str,
+        marker: &RetractionMarker,
+    ) -> Result<()> {
+        self.doc
+            .set_bytes(
+                self.author,
+                retraction_key(&issuer, &author, path).into_bytes(),
+                serde_json::to_vec(marker)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The recorded retraction markers, payload-waiting: a marker lists
+    /// only once its payload — the bound lives in it — is readable, and a
+    /// payload this build cannot decode is skipped (fail-closed: nothing is
+    /// removed on its word). Each item is the addressed entry — issuer,
+    /// author, path — with its marker.
+    pub async fn list_retractions(&self) -> Result<Vec<ListedRetraction>> {
+        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
+        let mut keys = Vec::new();
+        {
+            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+            while let Some(entry) = stream.next().await {
+                if let Some(parsed) = retraction_of(entry?.key()) {
+                    keys.push(parsed);
+                }
+            }
+        }
+        let mut markers = Vec::new();
+        for (issuer, author, path) in keys {
+            let key = retraction_key(&issuer, &author, &path);
+            let Some(bytes) = read_payload(&self.doc, &self.blobs, key.as_bytes()).await? else {
+                continue;
+            };
+            let Ok(marker) = serde_json::from_slice::<RetractionMarker>(&bytes) else {
+                continue;
+            };
+            markers.push((issuer, author, path, marker));
+        }
+        Ok(markers)
+    }
+
+    /// Drop every retraction marker for `issuer` — the counterpart of
+    /// forgetting the granted namespace: the entries the markers address
+    /// left with the replica.
+    pub async fn prune_retractions(&self, issuer: PdnId) -> Result<()> {
+        self.doc
+            .del(
+                self.author,
+                format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The retention-window GC: drop the markers this device recorded whose
+    /// directory entry has aged past `retention` — a coarse proxy for "the
+    /// marked entry can no longer win" (the nack is the backstop, so a marker
+    /// dropped early self-heals). Only markers authored by this device are
+    /// pruned, since deletion is per directory-author; a sibling ages out what
+    /// it recorded. `now` and `retention` are microseconds, matching entry
+    /// timestamps. Deletion is by key prefix, so a marker whose path is a
+    /// prefix of another marker's path drops that one too — harmless: nested
+    /// marker paths are rare, and an over-drop self-heals through the nack.
+    ///
+    /// Returns the addresses dropped — issuer, author, path — so the caller
+    /// can take down the in-memory refusal each one armed: a marker that no
+    /// longer exists must not go on refusing entries, and nothing else in the
+    /// sweep would ever tell.
+    pub async fn prune_aged_retractions(
+        &self,
+        now: u64,
+        retention: u64,
+    ) -> Result<Vec<(PdnId, AuthorId, String)>> {
+        let cutoff = now.saturating_sub(retention);
+        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
+        let mut aged = Vec::new();
+        {
+            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+            while let Some(entry) = stream.next().await {
+                let entry = entry?;
+                if entry.author() == self.author && entry.timestamp() <= cutoff {
+                    aged.push(entry.key().to_vec());
+                }
+            }
+        }
+        let mut dropped = Vec::new();
+        for key in aged {
+            if let Some(address) = retraction_of(&key) {
+                dropped.push(address);
+            }
+            self.doc.del(self.author, key).await?;
+        }
+        Ok(dropped)
     }
 
     /// Store the `ticket` for store `kind` (e.g. `"data"`), so the

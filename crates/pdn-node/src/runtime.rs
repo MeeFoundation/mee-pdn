@@ -17,7 +17,12 @@ use crate::data::RuntimeDataService;
 use crate::identity::RuntimeIdentityService;
 use crate::linking::{LinkingHandler, LINKING_ALPN};
 use crate::pairing::{PairingHandler, PendingInvites, PAIRING_ALPN};
+use crate::retraction::{spawn_retraction_consumer, RetractionEvent};
 use crate::sync::RuntimeSyncService;
+
+/// How many retraction events the subscription buffers before a slow
+/// subscriber starts losing the oldest — the broadcast channel's capacity.
+const RETRACTION_EVENTS_CAPACITY: usize = 64;
 
 /// An operation addressed an identity this runtime does not host: `identity`
 /// was neither created nor linked here. Downcast from the `anyhow::Error`
@@ -98,6 +103,9 @@ pub(crate) struct State {
     /// itself brought in, so a namespace imported any other way is never
     /// dropped from under its owner.
     pub(crate) bound_grants: HashMap<(PdnId, PdnId, PdnId), NamespaceId>,
+    /// The retraction-event surface: the verdict consumer sends, and
+    /// [`Runtime::subscribe_retractions`] hands out receivers.
+    pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
 }
 
 impl State {
@@ -152,7 +160,15 @@ impl Runtime {
         )
         .await?;
         let author = node.create_author().await?;
+        // The provisional-write tracker recognizes this runtime's writes by
+        // their author, and the runtime's consumer owns the verdict stream.
+        node.track_writer_author(author);
+        let verdicts = node
+            .take_retraction_verdicts()
+            .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
         let node_id = node.node_id();
+        let (retraction_events, _no_subscribers_yet) =
+            tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
         let state = Arc::new(Mutex::new(State {
             node,
             author,
@@ -162,7 +178,9 @@ impl Runtime {
             metadata_pairs: HashMap::new(),
             grant_binders: HashSet::new(),
             bound_grants: HashMap::new(),
+            retraction_events,
         }));
+        spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
         pairing_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("pairing state slot filled twice"))?;
@@ -200,6 +218,14 @@ impl Runtime {
     /// The sync service: node id and hosted identities.
     pub fn sync(&self) -> RuntimeSyncService<'_> {
         RuntimeSyncService::new(self)
+    }
+
+    /// Subscribe to write-retraction events of this runtime's hosted
+    /// identities: one event per retracted entry, carrying its full address
+    /// — the host's hook for user-facing surfacing. A subscriber that lags
+    /// past the buffer loses the oldest events, never blocks the runtime.
+    pub async fn subscribe_retractions(&self) -> tokio::sync::broadcast::Receiver<RetractionEvent> {
+        self.state.lock().await.retraction_events.subscribe()
     }
 
     /// Shut the node down, closing the endpoint and all protocols.

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use pdn_node::{
-    claim_id_of, ConnectionsService as _, DataService as _, IdentityService as _, NonEmpty,
-    PeerGrant, Runtime, SpawnOptions, UnknownIssuer,
+    ConnectionsService as _, DataService as _, IdentityService as _, PeerGrant, Runtime,
+    SpawnOptions, UnknownIssuer,
 };
 use pdn_types::EntryPath;
 use test_utils::eventually;
@@ -81,6 +81,7 @@ async fn scoped_grant_patiently(
 /// Denied, read-only cannot write: the grant's ticket carries no namespace
 /// secret, so Y's local write into X's namespace is refused outright.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, allowed and every denied side in one place
 async fn scoped_grant_flows_through_the_services() -> Result<()> {
     let rt_a = spawn_runtime().await?;
     let rt_b = spawn_runtime().await?;
@@ -106,13 +107,13 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
 
     // The scoped grant: read-only on exactly `contact/email`.
     rt_a.connections()
-        .publish_grant(x, y, x, NonEmpty::new(claim_id_of(&x, &email)), false)
+        .publish_grant(x, y, x, common::claims_on(x, &email, false))
         .await?;
 
     // Y consumes it as the bootstrap cascade would: read the grant over
     // the pair, import the namespace scoped.
     let received = scoped_grant_patiently(&rt_b, y, x, x).await?;
-    assert!(!received.grant.write);
+    assert!(received.grant.claims.iter().all(|claim| !claim.write));
     let leaked_ticket = received.ticket.clone();
     rt_b.data().import_scoped(x, received.ticket).await?;
 
@@ -141,10 +142,23 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         "the granted entry did not reach the granted peer"
     );
 
-    // Denied (read-only cannot write): no namespace secret rode the grant.
+    // Denied (read-only cannot write): the write is refused, and — the part
+    // the refusal alone does not say — nothing is acquired by it. Neither
+    // side's value moves, so the denial holds whether it came from the
+    // courtesy or from the missing namespace secret.
     assert!(
         rt_b.data().write(x, &email, b"overwrite").await.is_err(),
         "a write through a read-only scoped grant must be refused"
+    );
+    assert_eq!(
+        rt_b.data().read(x, &email).await?.as_deref(),
+        Some(&b"x@example.org"[..]),
+        "the refused write must not touch the grantee's own replica"
+    );
+    assert_eq!(
+        rt_a.data().read(x, &email).await?.as_deref(),
+        Some(&b"x@example.org"[..]),
+        "the refused write must never reach the issuer"
     );
 
     // Sentinel: an update to the granted claim proves a second replication

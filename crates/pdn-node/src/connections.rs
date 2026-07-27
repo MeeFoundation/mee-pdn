@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use data_layer::{
     AddrInfoOptions, ConnectionMetadata, ConnectionMetadataStore, DocTicket, EndpointAddr,
-    EndpointId, ReadGrant, ShareMode,
+    EndpointId, GrantedClaim, ReadGrant, ShareMode,
 };
 use futures_lite::{Stream, StreamExt};
-use pdn_types::{ClaimId, NonEmpty, PdnId};
+use pdn_types::{NonEmpty, PdnId};
 use tokio::sync::Mutex;
 
 use crate::pairing::{
     establish_via_dialogue, InvitePayload, UnsupportedInviteVersion, DEFAULT_INVITE_LIFETIME,
     INVITE_FORMAT_VERSION,
 };
+use crate::retraction::apply_retractions;
 use crate::runtime::{Runtime, State};
 
 /// A grant publication named a data issuer other than the granting
@@ -90,22 +91,22 @@ pub trait ConnectionsService {
     /// bytes and not only the classification.
     async fn withdraw_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()>;
 
-    /// Publish a grant: `identity` grants `peer` read — and, with `write`,
+    /// Publish a grant: `identity` grants `peer` read — and, per claim,
     /// write — on exactly `claims` of `issuer`'s data store. The issuer must
     /// be the granting identity itself — anything else is refused
     /// ([`DelegationUnsupported`]). Capability and ticket travel as one
     /// record (replacing any previous grant for this issuer); the ticket
-    /// carries exactly the granted authority: read-only → a read ticket (no
-    /// namespace secret — the grantee cannot write at all), with `write` →
-    /// a write ticket (the namespace secret carries write authority — no
-    /// ingest hook is installed, ADR-0008).
+    /// follows the grant's commands as a whole: no write on any claim → a
+    /// read ticket (no namespace secret — the grantee cannot write at all),
+    /// write on any claim → a write ticket (the namespace secret is what
+    /// carries write authority over the wire; the ingest gate at the
+    /// issuer's devices scopes it per claim, ADR-0008).
     async fn publish_grant(
         &self,
         identity: PdnId,
         peer: PdnId,
         issuer: PdnId,
-        claims: NonEmpty<ClaimId>,
-        write: bool,
+        claims: NonEmpty<GrantedClaim>,
     ) -> Result<()>;
 
     /// Read the grants `peer` has published toward hosted `identity` —
@@ -181,8 +182,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         identity: PdnId,
         peer: PdnId,
         issuer: PdnId,
-        claims: NonEmpty<ClaimId>,
-        write: bool,
+        claims: NonEmpty<GrantedClaim>,
     ) -> Result<()> {
         let mut state = self.runtime.state.lock().await;
         state.hosted(identity)?;
@@ -192,8 +192,13 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         let pair = open_pair(&mut state, identity, peer)
             .await?
             .with_context(|| format!("no connection metadata pair toward {peer}"))?;
-        // The ticket carries exactly the granted authority.
-        let mode = if write {
+        let grant = ReadGrant {
+            issuer,
+            audience: peer,
+            claims,
+        };
+        // The ticket follows the grant's commands as a whole.
+        let mode = if grant.grants_any_write() {
             ShareMode::Write
         } else {
             ShareMode::Read
@@ -202,12 +207,6 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
             .node
             .share_ticket(issuer, mode, AddrInfoOptions::RelayAndAddresses)
             .await?;
-        let grant = ReadGrant {
-            issuer,
-            audience: peer,
-            claims,
-            write,
-        };
         pair.own.publish_grant(&grant, &ticket).await
     }
 
@@ -224,7 +223,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         };
         let mut grants = Vec::new();
         for issuer in pair.peer.list_grants().await? {
-            if let Some((grant, ticket)) = pair.peer.read_grant(issuer).await? {
+            if let Some((grant, ticket)) = pair.peer.read_grant(issuer, identity).await?.granted() {
                 grants.push(PeerGrant { grant, ticket });
             }
         }
@@ -363,6 +362,9 @@ async fn bind_grants(
             .is_ok();
     }
     unbind_withdrawn(state, identity, peer, &granted).await;
+    // Markers that arrived before their namespace bound act on the sweep
+    // after the binding — this one.
+    apply_retractions(state, identity).await;
     true
 }
 
@@ -377,9 +379,13 @@ async fn bind_one_grant(
     issuer: PdnId,
     peer_store: &ConnectionMetadataStore,
 ) -> Result<()> {
-    // No record, a payload still replicating, or a record kind this build
-    // cannot decode: nothing to act on until the next change.
-    let Some((_cap, ticket)) = peer_store.read_grant(issuer).await? else {
+    // No record, a payload still replicating, a record kind this build cannot
+    // decode, or a capability addressed to another issuer or another identity:
+    // nothing to act on until the next change. The capability is what says
+    // whose data this is — the key it was written under is the counterparty's
+    // word, and acting on it would let one counterparty hand this node a
+    // device set to trust over a third identity's namespace.
+    let Some((_cap, ticket)) = peer_store.read_grant(issuer, identity).await?.granted() else {
         return Ok(());
     };
     let namespace = ticket.capability.id();
@@ -387,6 +393,23 @@ async fn bind_one_grant(
     if state.bound_grants.get(&bound) != Some(&namespace) {
         let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         state.bound_grants.insert(bound, namespace);
+    }
+    // The provisional-write tracker follows the counterparty's published
+    // device set — refreshed even when the binding is unchanged, exactly
+    // like the sibling contacts below: the set moves independently of the
+    // grant.
+    //
+    // An empty read is not an empty set. A pair whose `devices/` records
+    // have not replicated yet reads exactly like a counterparty that
+    // published nothing, and taking it as the set would leave the tracker
+    // honoring no rejection at all — a provisional write that never
+    // retracts. The set is left as it was until a device appears in it.
+    match peer_store.published_devices().await {
+        Ok(devices) if !devices.is_empty() => {
+            let _unbound_meanwhile = state.node.track_retraction_peers(issuer, devices);
+        }
+        // Empty (not replicated yet, or nothing published) or unreadable.
+        Ok(_) | Err(_) => {}
     }
     // Contacts are refreshed even when the binding is unchanged: the
     // audience's device set moves independently of the grant.
@@ -435,7 +458,27 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
         .map(|(_identity, _peer, issuer)| *issuer)
         .collect();
     for issuer in withdrawn {
-        let _gone_or_already_gone = state.node.forget_namespace(issuer).await;
+        // Forget first, prune second, and drop the binding only if the forget
+        // went through. Forgetting is what unregisters the issuer, disarms
+        // its retractions and untracks it; a failed forget leaves all three
+        // standing, and markers pruned ahead of it would have taken away the
+        // only thing that could explain or re-arm them. Keeping the binding
+        // keeps the retry: the next sweep sees the grant still gone.
+        match state.node.forget_namespace(issuer).await {
+            // Forgotten here, or already gone — another binder of another
+            // identity dropped the shared replica first.
+            Ok(()) => {}
+            Err(err) if err.downcast_ref::<data_layer::UnknownIssuer>().is_some() => {}
+            Err(err) => {
+                tracing::warn!(%issuer, "failed to forget a withdrawn grant's namespace: {err:#}");
+                continue;
+            }
+        }
+        // Retraction markers leave with the grant binding: the entries they
+        // address left with the replica.
+        if let Ok(hosted) = state.hosted(identity) {
+            let _cold_until_next_sweep = hosted.directory.prune_retractions(issuer).await;
+        }
         state.bound_grants.remove(&(identity, peer, issuer));
     }
 }
@@ -450,6 +493,9 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
 /// opening, because establishment fills the cache directly: a pair this
 /// device paired itself would otherwise never be watched for grants.
 async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mutex<State>>) {
+    // Every directory change re-applies the retraction markers: a marker
+    // replicated from a sibling acts here, and re-application is idempotent.
+    apply_retractions(state, identity).await;
     let peers = {
         let Ok(hosted) = state.hosted(identity) else {
             return;

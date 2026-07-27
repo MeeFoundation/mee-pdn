@@ -1,8 +1,23 @@
 set dotenv-load
 set positional-arguments
 
+# Enables the write-retraction scenario tests' courtesy-bypass surface
+# (`pdn-node/test-util`). Dev builds only — never a product build.
+test_features := "--features pdn-node/test-util"
+
 _default:
   @ just --list --unsorted
+
+# The feature flag for a forwarded arg list, empty when the caller narrowed
+# cargo's package selection away from pdn-node: `pdn-node/test-util` names a
+# feature of one package, and cargo rejects it unless that package is selected.
+_features *args:
+  #!/bin/sh
+  case " $* " in
+    *" -p pdn-node "*|*" --package pdn-node "*|*" --package=pdn-node "*) echo '{{ test_features }}' ;;
+    *" -p "*|*" --package "*|*" --package="*) ;;
+    *) echo '{{ test_features }}' ;;
+  esac
 
 # Build the entire workspace
 build:
@@ -36,7 +51,7 @@ test *args:
   set -eu
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
   export PDN_BIND_ADDR=127.0.0.1
-  cargo nextest run "$@"
+  cargo nextest run $(just _features "$@") "$@"
 
 # Test in release mode via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs)
 test-release *args:
@@ -44,7 +59,7 @@ test-release *args:
   set -eu
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
   export PDN_BIND_ADDR=127.0.0.1
-  cargo nextest run --release "$@"
+  cargo nextest run --release $(just _features "$@") "$@"
 
 # Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.
 #
@@ -66,10 +81,11 @@ stress *args:
   set -eu
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
   export PDN_BIND_ADDR=127.0.0.1
+  features=$(just _features "$@")
   # Default to the scenario tests when the caller gave no selection; respect their filter otherwise.
   case " $* " in
-    *" -E "*|*" --filter-expr "*|*" -p "*|*" --package "*) cargo nextest run "$@" ;;
-    *)                                                     cargo nextest run -E 'kind(test)' "$@" ;;
+    *" -E "*|*" --filter-expr "*|*" -p "*|*" --package "*) cargo nextest run $features "$@" ;;
+    *)                                                     cargo nextest run $features -E 'kind(test)' "$@" ;;
   esac
 
 # Local flaky-hunt: run one test BINARY in a loop — a fresh process per
@@ -89,7 +105,7 @@ hammer binary count="100":
   #!/bin/sh
   set -eu
   export PDN_BIND_ADDR=127.0.0.1
-  exe=$(cargo test --workspace --no-run --message-format=json 2>/dev/null | python3 -c '
+  exe=$(cargo test --workspace {{ test_features }} --no-run --message-format=json 2>/dev/null | python3 -c '
   import json, sys
   want = "{{ binary }}"
   hits = []
@@ -130,17 +146,23 @@ check:
   #!/bin/sh
   set -eux
   cargo fmt --all -- --check
+  # Both configurations: the product build first — a break there is invisible
+  # to a run that only ever enables the dev feature.
   cargo clippy --workspace --all-targets
-  cargo check --workspace --all-targets
+  cargo clippy --workspace --all-targets {{ test_features }}
+  cargo check --workspace --all-targets {{ test_features }}
 
 # Lint and type-check, attempt fixes
 check-fix:
   #!/bin/sh
   set -eux
   cargo fmt --all
-  cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged
+  cargo clippy --workspace --all-targets {{ test_features }} --fix --allow-dirty --allow-staged
+  # Both configurations: the product build first — a break there is invisible
+  # to a run that only ever enables the dev feature.
   cargo clippy --workspace --all-targets
-  cargo check --workspace --all-targets
+  cargo clippy --workspace --all-targets {{ test_features }}
+  cargo check --workspace --all-targets {{ test_features }}
 
 # Lint, build, test, integration tests
 precommit-check:

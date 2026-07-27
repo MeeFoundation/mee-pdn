@@ -1,14 +1,17 @@
 //! The data layer: document sync over pdn-store, our iroh-docs fork.
 //!
 //! Everything platform-specific around the fork lives here, so the fork
-//! itself stays iroh-native and minimal. The fork's ingest filter (the
-//! `validate_entry` hook, ADR-0008) is not installed. Every reconciliation
-//! session is classified by the access book (`access`, internal) — full
-//! view for a replica identity's own devices, a capability-filtered view
-//! for granted counterparties and for the devices of a grant's audience
-//! identity, a refusal indistinguishable from not-hosted for everyone
-//! else. Enforcement arms per identity by registration
-//! ([`SyncNode::host_identity`] / [`SyncNode::host_connection`]);
+//! itself stays iroh-native and minimal. Both directions of a session are
+//! bounded by the access book (`access`, internal). Reads: every
+//! reconciliation session is classified — full view for a replica
+//! identity's own devices, a capability-filtered view for granted
+//! counterparties and for the devices of a grant's audience identity, a
+//! refusal indistinguishable from not-hosted for everyone else. Writes: the
+//! fork's ingest hook (the `validate_entry` hook, ADR-0008) is installed
+//! with the book's validator — a synced entry into a hosted issuer's
+//! replica is admitted only from that issuer's own devices or, per claim,
+//! per the sender's session write set. Enforcement arms per identity by
+//! registration ([`SyncNode::host_identity`] / [`SyncNode::host_connection`]);
 //! an assembly that registers nothing is bounded by ticket possession
 //! alone. One node hosts the store sets of any number of identities.
 //! This crate owns:
@@ -41,17 +44,19 @@ pub mod layer;
 pub mod node;
 pub mod private_metadata;
 mod registry;
+mod retraction;
 
 pub use connection_metadata::{
-    own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore,
+    own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
-pub use grant::{claim_id_of, ReadGrant};
+pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
     AlpnTaken, DialHandle, ExtraProtocol, NamespaceImport, SpawnOptions, SyncNode, UnknownIssuer,
     BUILT_IN_ALPNS,
 };
-pub use private_metadata::{CatchUpTimeout, PrivateMetadataStore};
+pub use private_metadata::{CatchUpTimeout, PrivateMetadataStore, RetractionMarker};
+pub use retraction::RetractionVerdict;
 
 // Re-exported pdn-store (iroh-docs fork) vocabulary for the common
 // share/import/write flows, so downstream crates don't need a direct

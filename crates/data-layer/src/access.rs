@@ -18,11 +18,14 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::Result;
 use iroh_blobs::Hash;
-use pdn_store::{api::Doc, store::Query, EntryFilter, NamespaceId, SessionAccess, SessionRole};
+use pdn_store::{
+    api::Doc, store::Query, AuthorId, EntryFilter, NamespaceId, SessionAccess, SessionRole,
+    ValidateOutcome,
+};
 use pdn_types::{ClaimId, NodeId, PdnId};
 
 use crate::connection_metadata::GrantRecord;
-use crate::grant::{claim_id_of_key, ReadGrant};
+use crate::grant::{claim_id_of_key, GrantedClaim, ReadGrant};
 use crate::registry::{Registry, ServingPosture};
 
 /// One hosted connection: the directional stores of `identity` toward
@@ -37,15 +40,56 @@ struct HostedConnection {
     peer_doc: Doc,
 }
 
-/// What one connection grants on one issuer's data: exactly these claims,
-/// or nothing. Every grant is capability-scoped, so a granted session is
-/// always a filtered one — no branch reaches the full view through a grant.
+/// What one connection grants on one issuer's data: exactly these claims —
+/// each with its own commands — or nothing. Every grant is
+/// capability-scoped, so a granted session is always a filtered one — no
+/// branch reaches the full view through a grant.
 enum GrantWidth {
-    /// A grant: exactly these claims.
-    Claims(Vec<ClaimId>),
+    /// A grant: exactly these claims, commands per claim.
+    Claims(Vec<GrantedClaim>),
     /// No grant recorded.
     None,
 }
+
+/// A caller's effective rights on one issuer's data: the union of the
+/// grants every matching connection carries. `read` drives the egress
+/// filter; `write` drives the ingest gate. Write never exceeds read — a
+/// granted claim always grants read.
+#[derive(Debug, Default)]
+pub(crate) struct EffectiveRights {
+    pub(crate) read: HashSet<ClaimId>,
+    pub(crate) write: HashSet<ClaimId>,
+}
+
+impl EffectiveRights {
+    fn extend(&mut self, claims: Vec<GrantedClaim>) {
+        for granted in claims {
+            self.read.insert(granted.claim);
+            if granted.write {
+                self.write.insert(granted.claim);
+            }
+        }
+    }
+}
+
+/// What one classified session may write into a hosted issuer's replica —
+/// the write-side half of a classification, deposited per `(replica,
+/// peer)` at session setup and consulted synchronously by the ingest gate.
+/// Rights are frozen per session for writes exactly as for reads: a later
+/// session overwrites the deposit.
+#[derive(Debug)]
+enum WriteAdmission {
+    /// The issuer's own device: every entry is admitted.
+    Full,
+    /// A granted audience device: exactly these claims.
+    Claims(HashSet<ClaimId>),
+}
+
+/// One armed retraction: the timestamp bound per retracted `(author, key)`
+/// of one granted namespace. An ingested entry matching an armed pair at
+/// or below its bound is refused, so a retracted provisional write cannot
+/// flap back from a sibling that still holds it.
+type ArmedRetractions = HashMap<(AuthorId, Vec<u8>), u64>;
 
 /// The classification material one node holds: directories of hosted
 /// identities and connection pairs, consulted per session by the access
@@ -68,6 +112,15 @@ pub(crate) struct AccessBook {
     /// "these bytes decode to no usable grant"; a payload not yet replicated
     /// is never cached, so it is re-checked until it lands.
     grant_cache: RwLock<HashMap<NamespaceId, (Hash, Option<ReadGrant>)>>,
+    /// Per-session write admissions, deposited by [`Self::classify`] for
+    /// hosted-issuer data replicas and consulted synchronously by the
+    /// ingest gate ([`Self::admit_ingest`]) — the classifier is the async
+    /// half that reads grant records, the gate the sync half that only
+    /// looks up.
+    write_sets: RwLock<HashMap<(NamespaceId, NodeId), WriteAdmission>>,
+    /// Armed retraction markers per namespace, consulted by the ingest gate
+    /// on data replicas — the only replicas whose entries a marker can name.
+    retractions: RwLock<HashMap<NamespaceId, ArmedRetractions>>,
 }
 
 impl AccessBook {
@@ -156,7 +209,9 @@ impl AccessBook {
 
         // A data replica known to the registry.
         if let Some((issuer, posture)) = registry.binding_of(namespace)? {
-            return self.classify_data(issuer, posture, caller, role).await;
+            return self
+                .classify_data(namespace, issuer, posture, caller, role)
+                .await;
         }
 
         // Unknown to the book entirely: ticket possession is the only
@@ -166,6 +221,7 @@ impl AccessBook {
 
     async fn classify_data(
         &self,
+        namespace: NamespaceId,
         issuer: PdnId,
         posture: ServingPosture,
         caller: NodeId,
@@ -178,9 +234,12 @@ impl AccessBook {
         let grant_key = crate::connection_metadata::grant_key(&issuer);
 
         // The issuer's own devices see everything, judged through the
-        // hosted directory.
+        // hosted directory. Each verdict deposits the session's write
+        // admission for the ingest gate — the async half computing what the
+        // sync half only looks up.
         if let Some(directory) = self.directory_of(issuer)? {
             if device_listed(&directory, caller_key.as_bytes()).await? {
+                self.deposit_write_admission(namespace, caller, WriteAdmission::Full)?;
                 return Ok(SessionAccess::Full);
             }
             // Granted counterparties: the union of the grants every matching
@@ -192,13 +251,14 @@ impl AccessBook {
                 .connections_of_identity(issuer)?
                 .into_iter()
                 .map(|c| (c.peer_doc, c.own, c.peer));
-            let claims = self
-                .union_claims(caller_key.as_bytes(), issuer, grant_key.as_bytes(), grants)
+            let rights = self
+                .union_rights(caller_key.as_bytes(), issuer, grant_key.as_bytes(), grants)
                 .await?;
-            if claims.is_empty() {
+            if rights.read.is_empty() {
                 return Ok(SessionAccess::Deny);
             }
-            return Ok(SessionAccess::Filtered(egress_filter(issuer, claims)));
+            self.deposit_write_admission(namespace, caller, WriteAdmission::Claims(rights.write))?;
+            return Ok(SessionAccess::Filtered(egress_filter(issuer, rights.read)));
         }
 
         // This node does not host the issuer. A grantee binding still
@@ -228,11 +288,11 @@ impl AccessBook {
                         grants.push((directory, connection.peer_doc, connection.identity));
                     }
                 }
-                let claims = self
-                    .union_claims(caller_key.as_bytes(), issuer, grant_key.as_bytes(), grants)
+                let rights = self
+                    .union_rights(caller_key.as_bytes(), issuer, grant_key.as_bytes(), grants)
                     .await?;
-                if !claims.is_empty() {
-                    return Ok(SessionAccess::Filtered(egress_filter(issuer, claims)));
+                if !rights.read.is_empty() {
+                    return Ok(SessionAccess::Filtered(egress_filter(issuer, rights.read)));
                 }
                 Ok(match role {
                     SessionRole::Accept => SessionAccess::Deny,
@@ -243,24 +303,25 @@ impl AccessBook {
         }
     }
 
-    /// The union of the claims every listed grant carries for the caller.
-    /// Each item is `(probe, grant_doc, audience)`: the caller must be a
-    /// device listed in `probe`, and the claims come from `grant_doc`'s one
-    /// grant record only when its capability names this `issuer` and this
-    /// `audience`. A caller absent from a probe, or a grant record absent /
-    /// still replicating / addressed elsewhere, contributes nothing; an
-    /// empty union means the caller has no computable grant. Both the hosted
+    /// The union of the rights every listed grant carries for the caller —
+    /// read and write claim sets side by side. Each item is `(probe,
+    /// grant_doc, audience)`: the caller must be a device listed in
+    /// `probe`, and the claims come from `grant_doc`'s one grant record
+    /// only when its capability names this `issuer` and this `audience`. A
+    /// caller absent from a probe, or a grant record absent / still
+    /// replicating / addressed elsewhere, contributes nothing; an empty
+    /// read union means the caller has no computable grant. Both the hosted
     /// side (classifying its counterparty) and the grantee side (classifying
     /// a sibling) reduce to this — they differ only in which doc probes and
     /// which carries the grant.
-    async fn union_claims(
+    async fn union_rights(
         &self,
         caller_key: &[u8],
         issuer: PdnId,
         grant_key: &[u8],
         grants: impl IntoIterator<Item = (Doc, Doc, PdnId)>,
-    ) -> Result<HashSet<ClaimId>> {
-        let mut claims: HashSet<ClaimId> = HashSet::new();
+    ) -> Result<EffectiveRights> {
+        let mut rights = EffectiveRights::default();
         for (probe, grant_doc, audience) in grants {
             if !device_listed(&probe, caller_key).await? {
                 continue;
@@ -269,10 +330,10 @@ impl AccessBook {
                 .grant_width_in(&grant_doc, issuer, audience, grant_key)
                 .await?
             {
-                claims.extend(grant_claims);
+                rights.extend(grant_claims);
             }
         }
-        Ok(claims)
+        Ok(rights)
     }
 
     /// What one metadata replica records as the grant on `issuer`'s data
@@ -350,6 +411,163 @@ impl AccessBook {
         Ok(cap)
     }
 
+    /// Record what a classified session may write into `namespace` —
+    /// overwriting any previous deposit for the same `(namespace, caller)`:
+    /// rights are frozen per session, and the newest session's setup is the
+    /// one whose entries can still arrive.
+    fn deposit_write_admission(
+        &self,
+        namespace: NamespaceId,
+        caller: NodeId,
+        admission: WriteAdmission,
+    ) -> Result<()> {
+        self.write_sets
+            .write()
+            .map_err(|_poisoned| anyhow::anyhow!("write admissions lock poisoned"))?
+            .insert((namespace, caller), admission);
+        Ok(())
+    }
+
+    /// The synchronous ingest verdict for one entry arriving from `from` —
+    /// the write-side counterpart of [`Self::classify`], consulted by the
+    /// fork inside its insert path, so nothing here may block or read a
+    /// replica. Data replicas are judged: their retraction markers refuse
+    /// their exact entries, and on the ones data-bound to an identity this
+    /// node hosts the caller's session deposit decides (its absence is
+    /// fail-closed — no classified session, no admission). Every other
+    /// replica — directories, connection metadata stores, and replicas held
+    /// under someone else's issuance — admits as it always has, bounded by
+    /// the serving side's egress and by ticket possession.
+    ///
+    /// Only a live capability verdict against the caller's deposit is
+    /// [`ValidateOutcome::Reject`], the outcome the fork echoes back for the
+    /// sender to retract on. Everything else this gate refuses is
+    /// [`ValidateOutcome::Drop`]: a marker match states what this node
+    /// already retracted rather than judging the sender, and a state this
+    /// node cannot read judges nobody at all — neither may cost a peer its
+    /// own legitimately written entry.
+    pub(crate) fn admit_ingest(
+        &self,
+        registry: &Registry,
+        entry: &pdn_store::SignedEntry,
+        from: &pdn_store::PeerIdBytes,
+    ) -> ValidateOutcome {
+        let id = entry.id();
+        let namespace = id.namespace();
+        let issuer = match registry.binding_of(namespace) {
+            Ok(Some((issuer, _posture))) => issuer,
+            // Not a data replica on this node: directories and connection
+            // metadata stores keep their ticket-bounded admission. Markers
+            // are consulted below this exit — they can only name entries of
+            // a data replica, and consulting them here would let one
+            // unreadable map silence the stores linking and pairing stand on.
+            Ok(None) => return ValidateOutcome::Accept,
+            Err(_poisoned) => return ValidateOutcome::Drop,
+        };
+        if self.retraction_names(namespace, entry) {
+            return ValidateOutcome::Drop;
+        }
+        match self.directory_of(issuer) {
+            // Not hosted here — a grantee-held or ticket-bounded replica:
+            // inbound entries are already bounded by the serving side's
+            // egress filter.
+            Ok(None) => return ValidateOutcome::Accept,
+            Ok(Some(_directory)) => {}
+            Err(_poisoned) => return ValidateOutcome::Drop,
+        }
+        let caller = NodeId::from_bytes(*from);
+        let Ok(admissions) = self.write_sets.read() else {
+            return ValidateOutcome::Drop;
+        };
+        match admissions.get(&(namespace, caller)) {
+            Some(WriteAdmission::Full) => ValidateOutcome::Accept,
+            Some(WriteAdmission::Claims(claims)) => {
+                if covers_key(claims, issuer, id.key()) {
+                    ValidateOutcome::Accept
+                } else {
+                    ValidateOutcome::Reject
+                }
+            }
+            // No classified session: this node's own state, not a verdict on
+            // the caller's authority.
+            None => ValidateOutcome::Drop,
+        }
+    }
+
+    /// Arm a retraction marker: entries of `author` at `key` in `namespace`
+    /// with a timestamp at or below `bound` are refused at ingest. A wider
+    /// bound replaces a narrower one, never the reverse — the widest known
+    /// retraction is the one that must hold.
+    pub(crate) fn arm_retraction(
+        &self,
+        namespace: NamespaceId,
+        author: AuthorId,
+        key: Vec<u8>,
+        bound: u64,
+    ) -> Result<()> {
+        let mut retractions = self
+            .retractions
+            .write()
+            .map_err(|_poisoned| anyhow::anyhow!("retractions lock poisoned"))?;
+        let armed = retractions.entry(namespace).or_default();
+        let slot = armed.entry((author, key)).or_insert(bound);
+        *slot = (*slot).max(bound);
+        Ok(())
+    }
+
+    /// Drop the armed retraction of one `(author, key)` in `namespace` — the
+    /// counterpart of the marker that armed it being dropped. An armed pair
+    /// outlives nothing else: the durable marker is what re-arms it on every
+    /// sweep, so a refusal left standing after its marker aged out would
+    /// answer for as long as the process runs.
+    pub(crate) fn disarm_retraction(
+        &self,
+        namespace: NamespaceId,
+        author: AuthorId,
+        key: &[u8],
+    ) -> Result<()> {
+        let mut retractions = self
+            .retractions
+            .write()
+            .map_err(|_poisoned| anyhow::anyhow!("retractions lock poisoned"))?;
+        if let Some(armed) = retractions.get_mut(&namespace) {
+            armed.remove(&(author, key.to_vec()));
+            if armed.is_empty() {
+                retractions.remove(&namespace);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop every armed retraction of `namespace` — the counterpart of
+    /// forgetting the granted namespace: the entries the markers address
+    /// left with the replica.
+    pub(crate) fn disarm_retractions(&self, namespace: NamespaceId) -> Result<()> {
+        self.retractions
+            .write()
+            .map_err(|_poisoned| anyhow::anyhow!("retractions lock poisoned"))?
+            .remove(&namespace);
+        Ok(())
+    }
+
+    /// Whether an armed retraction names this entry: same author, same key,
+    /// timestamp at or below the bound.
+    fn retraction_names(&self, namespace: NamespaceId, entry: &pdn_store::SignedEntry) -> bool {
+        let Ok(retractions) = self.retractions.read() else {
+            // Cannot read what was retracted: claiming a match is the
+            // fail-closed side, and it costs the sender nothing — the gate
+            // answers a marker match with a silent drop.
+            return true;
+        };
+        let Some(armed) = retractions.get(&namespace) else {
+            return false;
+        };
+        let id = entry.id();
+        armed
+            .get(&(id.author(), id.key().to_vec()))
+            .is_some_and(|bound| entry.timestamp() <= *bound)
+    }
+
     fn directory_by_namespace(&self, namespace: NamespaceId) -> Result<Option<Doc>> {
         Ok(self
             .directories
@@ -420,17 +638,25 @@ fn closed_egress() -> EntryFilter {
     Arc::new(|_entry: &pdn_store::SignedEntry| false)
 }
 
-/// The egress filter for a session: admit an entry iff the claim identity
-/// derived from its key is in the granted set — evaluated in the reverse
-/// direction, no id-to-location mapping. The fork requires this cheap (it
-/// runs on every entry a range scan touches), so the test is the raw-key
-/// derivation: no per-entry parse, no allocation — a key that is not a
-/// valid path derives an id no grant contains and is excluded, the same
-/// verdict parsing first would reach ([`claim_id_of_key`]).
+/// Whether a claim set covers the entry at raw `key` in `issuer`'s replica —
+/// evaluated in the reverse direction, no id-to-location mapping. The one
+/// derivation both directions of enforcement use: the egress filter admits by
+/// it, the ingest gate admits by it, and a drift between the two is exactly
+/// the read/write asymmetry the capability scoping exists to prevent.
+///
+/// The fork requires this cheap (it runs on every entry a range scan
+/// touches), so the test is the raw-key derivation: no per-entry parse, no
+/// allocation — a key that is not a valid path derives an id no grant
+/// contains and is excluded, the same verdict parsing first would reach
+/// ([`claim_id_of_key`]).
+fn covers_key(claims: &HashSet<ClaimId>, issuer: PdnId, key: &[u8]) -> bool {
+    claims.contains(&claim_id_of_key(&issuer, key))
+}
+
+/// The egress filter for a session: admit exactly the entries the session's
+/// read claims cover.
 fn egress_filter(issuer: PdnId, claims: HashSet<ClaimId>) -> EntryFilter {
-    Arc::new(move |entry: &pdn_store::SignedEntry| {
-        claims.contains(&claim_id_of_key(&issuer, entry.id().key()))
-    })
+    Arc::new(move |entry: &pdn_store::SignedEntry| covers_key(&claims, issuer, entry.id().key()))
 }
 
 /// Build the fork's session access provider over this node's book and
@@ -445,4 +671,139 @@ pub(crate) fn session_access_provider(
         let caller = NodeId::from_bytes(*peer.as_bytes());
         Box::pin(async move { book.classify(&registry, namespace, caller, role).await })
     })
+}
+
+/// Build the fork's ingest validator over the same book and registry — the
+/// write-side counterpart of [`session_access_provider`], installed beside
+/// it at spawn (ADR-0008). The classifier deposits each session's write
+/// admission; this validator only looks it up, per entry, synchronously.
+pub(crate) fn capability_ingest_validator(
+    book: Arc<AccessBook>,
+    registry: Arc<Registry>,
+) -> pdn_store::CapabilityValidator {
+    Arc::new(move |entry, from| book.admit_ingest(&registry, entry, from))
+}
+
+#[cfg(test)]
+mod tests {
+    use pdn_store::{Author, Entry, NamespaceSecret, Record, RecordIdentifier, SignedEntry};
+
+    use super::*;
+
+    fn signed(
+        namespace: &NamespaceSecret,
+        author: &Author,
+        key: &str,
+        timestamp: u64,
+    ) -> SignedEntry {
+        let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+        let record = Record::new(Hash::new(b"payload"), 7, timestamp);
+        SignedEntry::from_entry(Entry::new(id, record), namespace, author)
+    }
+
+    /// Make `lock` unreadable the only way it can become so: an unwind while
+    /// a write guard is held.
+    fn poison<T: Send>(lock: &RwLock<T>) {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().expect("not poisoned yet");
+            std::panic::resume_unwind(Box::new("poison"));
+        }));
+        assert!(unwound.is_err());
+        assert!(lock.read().is_err(), "the lock is poisoned");
+    }
+
+    /// A marker refuses its exact entry and nothing beyond it: the retracted
+    /// timestamp and everything under it match, a newer own write at the same
+    /// author and key does not — writing again after a retraction is the way
+    /// back — and an entry of another author at that path (the issuer's own)
+    /// is never matched.
+    #[test]
+    fn a_marker_names_its_entry_up_to_the_bound_only() {
+        let namespace = NamespaceSecret::from_bytes(&[7u8; 32]);
+        let author = Author::from_bytes(&[5u8; 32]);
+        let book = AccessBook::default();
+        book.arm_retraction(namespace.id(), author.id(), b"contact/email".to_vec(), 50)
+            .expect("arm");
+
+        let names = |key, timestamp| {
+            book.retraction_names(namespace.id(), &signed(&namespace, &author, key, timestamp))
+        };
+        assert!(names("contact/email", 50), "the retracted entry");
+        assert!(names("contact/email", 49), "an older one at the same key");
+        assert!(
+            !names("contact/email", 51),
+            "a newer own write gets through"
+        );
+        assert!(!names("contact/phone", 50), "another key is untouched");
+
+        // The marker addresses one author. The issuer's own entries at the
+        // very same path carry a different author and are never matched — the
+        // property the partial-withdrawal case leans on (a marker for a
+        // racing own write must not suppress the issuer's later value there).
+        let issuer_author = Author::from_bytes(&[6u8; 32]);
+        assert!(
+            !book.retraction_names(
+                namespace.id(),
+                &signed(&namespace, &issuer_author, "contact/email", 50)
+            ),
+            "another author's entry at the marked path is untouched"
+        );
+
+        book.disarm_retractions(namespace.id()).expect("disarm");
+        assert!(!names("contact/email", 50), "disarmed");
+    }
+
+    /// A wider bound replaces a narrower one, never the reverse.
+    #[test]
+    fn arming_widens_and_never_narrows() {
+        let namespace = NamespaceSecret::from_bytes(&[7u8; 32]);
+        let author = Author::from_bytes(&[5u8; 32]);
+        let book = AccessBook::default();
+        let arm = |bound| {
+            book.arm_retraction(
+                namespace.id(),
+                author.id(),
+                b"contact/email".to_vec(),
+                bound,
+            )
+            .expect("arm");
+        };
+        arm(50);
+        arm(10);
+        assert!(
+            book.retraction_names(
+                namespace.id(),
+                &signed(&namespace, &author, "contact/email", 50)
+            ),
+            "the wider bound of the two holds"
+        );
+    }
+
+    /// Markers are consulted only where they can name an entry — on data
+    /// replicas. A retraction map this node cannot read refuses those
+    /// (silently, costing the sender nothing), and leaves every other replica
+    /// — directories, connection metadata stores — admitting as before, so one
+    /// unreadable map cannot stop the records linking and pairing stand on.
+    #[test]
+    fn an_unreadable_retraction_map_reaches_no_further_than_data_replicas() {
+        let namespace = NamespaceSecret::from_bytes(&[7u8; 32]);
+        let author = Author::from_bytes(&[5u8; 32]);
+        let book = AccessBook::default();
+        poison(&book.retractions);
+        assert!(
+            book.retraction_names(namespace.id(), &signed(&namespace, &author, "devices/x", 1)),
+            "unreadable: claiming the match is the fail-closed side"
+        );
+
+        // No binding: the namespace is not a data replica of this node.
+        let registry = Registry::default();
+        assert_eq!(
+            book.admit_ingest(
+                &registry,
+                &signed(&namespace, &author, "devices/x", 1),
+                &[9u8; 32]
+            ),
+            ValidateOutcome::Accept
+        );
+    }
 }

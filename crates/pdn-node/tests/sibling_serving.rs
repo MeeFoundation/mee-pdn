@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use pdn_node::{
-    claim_id_of, ConnectionsService as _, DataService as _, IdentityService as _, NonEmpty,
-    Runtime, ShareMode, SpawnOptions,
+    ConnectionsService as _, DataService as _, IdentityService as _, Runtime, ShareMode,
+    SpawnOptions,
 };
 use pdn_types::{EntryPath, PdnId};
 use test_utils::{eventually, TIMEOUT};
@@ -112,13 +112,7 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     rt_bob.data().write(bob, &withheld, b"+1-555-0100").await?;
     rt_bob
         .connections()
-        .publish_grant(
-            bob,
-            alice,
-            bob,
-            NonEmpty::new(claim_id_of(&bob, &email)),
-            false,
-        )
+        .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
         .await?;
 
     // The phone converges on the granted claim while Bob is online — the
@@ -195,13 +189,7 @@ async fn a_withdrawn_grant_takes_the_namespace_back_out() -> Result<()> {
     rt_bob.data().write(bob, &email, b"bob@example.org").await?;
     rt_bob
         .connections()
-        .publish_grant(
-            bob,
-            alice,
-            bob,
-            NonEmpty::new(claim_id_of(&bob, &email)),
-            false,
-        )
+        .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
         .await?;
     assert!(
         claim_arrives(&rt_alice, bob, &email, b"bob@example.org").await?,
