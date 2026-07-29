@@ -10,8 +10,10 @@
 //! re-exported extension surface, the same way the pairing handler
 //! consumes it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, PoisonError,
+};
 
 use anyhow::Result;
 use data_layer::{

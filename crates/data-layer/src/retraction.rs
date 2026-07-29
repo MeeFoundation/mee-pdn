@@ -13,8 +13,10 @@
 //! consumes the verdicts: it records the directory marker, and the marker
 //! sweep performs the removal on every device.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use iroh_blobs::Hash;
 use pdn_store::{AuthorId, NamespaceId, PeerIdBytes, RejectId};

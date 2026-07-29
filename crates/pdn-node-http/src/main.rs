@@ -5,8 +5,7 @@
 //! routes (absent otherwise). The binary is glue only — assembly and
 //! authorization posture live in `pdn-node` (see the library crate docs).
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use pdn_node::Runtime;
 use pdn_node_http::router;

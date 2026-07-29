@@ -1,18 +1,22 @@
 //! The identity service: create an identity on its first device, link every
 //! further device over the linking dialogue.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, PrivateMetadataStore, ShareMode};
 use pdn_types::PdnId;
 
-use crate::linking::{
-    link_via_dialogue, LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+use crate::{
+    linking::{
+        link_via_dialogue, LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    },
+    pairing::DEFAULT_INVITE_LIFETIME,
+    runtime::{HostedIdentity, Runtime},
 };
-use crate::pairing::DEFAULT_INVITE_LIFETIME;
-use crate::runtime::{HostedIdentity, Runtime};
 
 /// The private-metadata directory kind under which an identity's own
 /// data-namespace ticket is published at creation — the flat bootstrap

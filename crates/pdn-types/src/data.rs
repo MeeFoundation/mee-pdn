@@ -3,9 +3,11 @@
 //! and the PDN layer (which speaks about them) without either depending
 //! on the other.
 
-use crate::{NodeId, PdnId};
-use serde::{Deserialize, Serialize};
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{NodeId, PdnId};
 
 // ---------------------------------------------------------------------------
 // EntryPath — validated entry path

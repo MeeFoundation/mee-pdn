@@ -5,9 +5,10 @@
 //! the [`uwill`] capability-token module live here; executing operations
 //! over a data layer is the node runtime's job.
 
+use std::collections::BTreeMap;
+
 use pdn_types::{ClaimId, OperationalKey, PdnId, PdnIdentityProof};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 pub mod uwill;
 

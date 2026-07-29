@@ -1,12 +1,10 @@
 //! Node-local addressing: the issuer-to-doc map data-namespace operations
 //! resolve through.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::{collections::HashMap, sync::RwLock};
 
 use anyhow::{anyhow, Result};
-use pdn_store::api::Doc;
-use pdn_store::NamespaceId;
+use pdn_store::{api::Doc, NamespaceId};
 use pdn_types::PdnId;
 
 /// How this node serves a data replica whose issuer it does not host.

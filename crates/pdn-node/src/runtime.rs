@@ -1,9 +1,11 @@
 //! The runtime: single owner of the node assembly and the hosted-identity
 //! set.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use data_layer::{
@@ -12,13 +14,15 @@ use data_layer::{
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 
-use crate::connections::RuntimeConnectionsService;
-use crate::data::RuntimeDataService;
-use crate::identity::RuntimeIdentityService;
-use crate::linking::{LinkingHandler, LINKING_ALPN};
-use crate::pairing::{PairingHandler, PendingInvites, PAIRING_ALPN};
-use crate::retraction::{spawn_retraction_consumer, RetractionEvent};
-use crate::sync::RuntimeSyncService;
+use crate::{
+    connections::RuntimeConnectionsService,
+    data::RuntimeDataService,
+    identity::RuntimeIdentityService,
+    linking::{LinkingHandler, LINKING_ALPN},
+    pairing::{PairingHandler, PendingInvites, PAIRING_ALPN},
+    retraction::{spawn_retraction_consumer, RetractionEvent},
+    sync::RuntimeSyncService,
+};
 
 /// How many retraction events the subscription buffers before a slow
 /// subscriber starts losing the oldest — the broadcast channel's capacity.

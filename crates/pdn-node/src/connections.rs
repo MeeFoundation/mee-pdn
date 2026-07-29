@@ -1,8 +1,10 @@
 //! The connections service: establish a hosted identity's connections,
 //! list them, and carry grants over the connections' metadata pairs.
 
-use std::sync::Weak;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Weak,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use data_layer::{
@@ -13,12 +15,14 @@ use futures_lite::{Stream, StreamExt};
 use pdn_types::{NonEmpty, PdnId};
 use tokio::sync::Mutex;
 
-use crate::pairing::{
-    establish_via_dialogue, InvitePayload, UnsupportedInviteVersion, DEFAULT_INVITE_LIFETIME,
-    INVITE_FORMAT_VERSION,
+use crate::{
+    pairing::{
+        establish_via_dialogue, InvitePayload, UnsupportedInviteVersion, DEFAULT_INVITE_LIFETIME,
+        INVITE_FORMAT_VERSION,
+    },
+    retraction::apply_retractions,
+    runtime::{Runtime, State},
 };
-use crate::retraction::apply_retractions;
-use crate::runtime::{Runtime, State};
 
 /// A grant publication named a data issuer other than the granting
 /// identity itself — refused: granting another identity's data is

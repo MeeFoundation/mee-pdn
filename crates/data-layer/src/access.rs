@@ -13,8 +13,10 @@
 //! A replica the book knows nothing about is served whole to any ticket
 //! holder.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, OnceLock, RwLock},
+};
 
 use anyhow::Result;
 use iroh_blobs::Hash;
@@ -24,9 +26,11 @@ use pdn_store::{
 };
 use pdn_types::{ClaimId, NodeId, PdnId};
 
-use crate::connection_metadata::GrantRecord;
-use crate::grant::{claim_id_of_key, GrantedClaim, ReadGrant};
-use crate::registry::{Registry, ServingPosture};
+use crate::{
+    connection_metadata::GrantRecord,
+    grant::{claim_id_of_key, GrantedClaim, ReadGrant},
+    registry::{Registry, ServingPosture},
+};
 
 /// One hosted connection: the directional stores of `identity` toward
 /// `peer`, registered for classification. `own` carries the grants this
