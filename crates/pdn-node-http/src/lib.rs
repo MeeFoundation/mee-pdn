@@ -13,10 +13,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::routing::get;
-use axum::Router;
+use axum::{extract::State, http::StatusCode, routing::get, Router};
 use pdn_node::{Runtime, SyncService as _};
 
 /// Build the host's router over the embedded runtime. Debug scaffolding

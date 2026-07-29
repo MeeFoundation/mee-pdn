@@ -23,9 +23,11 @@
 //! — deferred (ADR-0008): the exchange is bearer-level, secret plus
 //! tickets. Both peers must be online: there are no pending invitations.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock, Weak},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use data_layer::{

@@ -6,8 +6,10 @@
 //! permits the cycle: this crate depends on `data-layer`, whose tests
 //! dev-depend on this crate); never published.
 
-use std::future::Future;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use data_layer::{PrivateMetadataStore, SyncNode};

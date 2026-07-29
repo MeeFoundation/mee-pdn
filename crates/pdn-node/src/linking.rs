@@ -37,8 +37,10 @@
 //! deferred, exactly as in pairing (ADR-0008). Both devices must be online:
 //! there are no pending linking invites.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use anyhow::{bail, Context, Result};
 use data_layer::{
@@ -49,8 +51,10 @@ use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::pairing::{read_message, write_message, StateSlot};
-use crate::runtime::{HostedIdentity, State};
+use crate::{
+    pairing::{read_message, write_message, StateSlot},
+    runtime::{HostedIdentity, State},
+};
 
 /// The dedicated linking ALPN — the protocol the runtime registers at spawn
 /// next to pairing and the built-in stack, and the dial side connects under.

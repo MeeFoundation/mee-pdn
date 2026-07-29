@@ -50,22 +50,6 @@ pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
-pub use layer::{DataLayer, DataLayerError};
-pub use node::{
-    AlpnTaken, DialHandle, ExtraProtocol, NamespaceImport, SpawnOptions, SyncNode, UnknownIssuer,
-    BUILT_IN_ALPNS,
-};
-pub use private_metadata::{CatchUpTimeout, PrivateMetadataStore, RetractionMarker};
-pub use retraction::RetractionVerdict;
-
-// Re-exported pdn-store (iroh-docs fork) vocabulary for the common
-// share/import/write flows, so downstream crates don't need a direct
-// dependency on it.
-pub use pdn_store::{
-    api::protocol::{AddrInfoOptions, ShareMode},
-    AuthorId, DocTicket, NamespaceId,
-};
-
 // The ceremony registration point (ADR-0011, ADR-0012): pdn-node's pairing
 // and linking handlers are written against these and registered via
 // `SyncNode::spawn_with_protocols`. Re-exported so consumers need no direct
@@ -76,3 +60,17 @@ pub use iroh::{
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler},
     EndpointAddr, EndpointId,
 };
+pub use layer::{DataLayer, DataLayerError};
+pub use node::{
+    AlpnTaken, DialHandle, ExtraProtocol, NamespaceImport, SpawnOptions, SyncNode, UnknownIssuer,
+    BUILT_IN_ALPNS,
+};
+// Re-exported pdn-store (iroh-docs fork) vocabulary for the common
+// share/import/write flows, so downstream crates don't need a direct
+// dependency on it.
+pub use pdn_store::{
+    api::protocol::{AddrInfoOptions, ShareMode},
+    AuthorId, DocTicket, NamespaceId,
+};
+pub use private_metadata::{CatchUpTimeout, PrivateMetadataStore, RetractionMarker};
+pub use retraction::RetractionVerdict;

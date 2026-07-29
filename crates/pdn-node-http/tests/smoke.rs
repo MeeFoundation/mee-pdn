@@ -6,8 +6,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use pdn_node::Runtime;
 use pdn_node_http::router;
 use tower::ServiceExt as _;

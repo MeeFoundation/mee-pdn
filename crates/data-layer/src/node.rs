@@ -4,11 +4,13 @@
 //! spawn; a narrow dial handle serves their dial sides. The registration
 //! point is protocol-agnostic: the ceremonies' semantics live in pdn-node.
 
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
-use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use futures_lite::{FutureExt, StreamExt};
@@ -31,11 +33,13 @@ use pdn_store::{
 use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
 use tokio::sync::oneshot;
 
-use crate::access::{capability_ingest_validator, session_access_provider, AccessBook};
-use crate::connection_metadata::ConnectionMetadataStore;
-use crate::private_metadata::PrivateMetadataStore;
-use crate::registry::{Registry, ServingPosture};
-use crate::retraction::{RetractionTracker, RetractionVerdict};
+use crate::{
+    access::{capability_ingest_validator, session_access_provider, AccessBook},
+    connection_metadata::ConnectionMetadataStore,
+    private_metadata::PrivateMetadataStore,
+    registry::{Registry, ServingPosture},
+    retraction::{RetractionTracker, RetractionVerdict},
+};
 
 /// An operation addressed a data namespace this node does not host: `issuer`
 /// has no created or imported namespace here. Downcast from the

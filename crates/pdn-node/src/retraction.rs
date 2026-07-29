@@ -6,9 +6,11 @@
 //! every device shares, so a retraction happens the same way wherever the
 //! marker came from.
 
-use std::collections::HashSet;
-use std::sync::Weak;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    sync::Weak,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use data_layer::{AuthorId, RetractionMarker, RetractionVerdict};
 use pdn_types::{EntryPath, NodeId, PdnId};

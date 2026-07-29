@@ -41,9 +41,11 @@ use pdn_store::{
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 
-use crate::grant::ReadGrant;
-use crate::node::SyncNode;
-use crate::private_metadata::{device_key, device_of, DEVICES_PREFIX};
+use crate::{
+    grant::ReadGrant,
+    node::SyncNode,
+    private_metadata::{device_key, device_of, DEVICES_PREFIX},
+};
 
 /// Key prefix under which grant entries live.
 const GRANTS_PREFIX: &str = "grants/";

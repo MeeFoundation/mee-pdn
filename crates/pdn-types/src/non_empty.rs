@@ -2,8 +2,10 @@
 //!
 //! API mirrors the [`nonempty`](https://crates.io/crates/nonempty) crate.
 
-use serde::de::Deserializer;
-use serde::ser::{SerializeSeq, Serializer};
+use serde::{
+    de::Deserializer,
+    ser::{SerializeSeq, Serializer},
+};
 
 /// A non-empty Vec. Guaranteed to contain at least one element by
 /// construction — no runtime checks required at usage sites.
