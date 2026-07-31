@@ -42,8 +42,8 @@ pub use linking::{
     LINKING_FORMAT_VERSION,
 };
 pub use pairing::{
-    EstablishmentRefused, EstablishmentTimeout, InvitePayload, UnsupportedInviteVersion,
-    INVITE_FORMAT_VERSION,
+    EstablishmentRefused, EstablishmentTimeout, InvitePayload, InviterUnreachable,
+    UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
 pub use retraction::RetractionEvent;

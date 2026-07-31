@@ -99,7 +99,8 @@ pub struct UnsupportedLinkingVersion {
 }
 
 /// The linking dialogue reached the inviting device and ended without an
-/// answer — a refusal, distinct from never reaching the inviter (whose
+/// answer — a refusal, distinct from never reaching the inviter
+/// ([`InviterUnreachable`](crate::pairing::InviterUnreachable), whose
 /// failure precedes this point), from the dialogue outliving the caller's
 /// budget ([`DialogueTimeout`]), and from the catch-up timeout after a
 /// completed dialogue ([`data_layer::CatchUpTimeout`]). Deliberately
@@ -401,7 +402,7 @@ async fn run_linking_dialogue(
     let connection = dial
         .connect(payload.inviter_addr.clone(), LINKING_ALPN)
         .await
-        .context("could not reach the inviter")?;
+        .context(crate::pairing::InviterUnreachable)?;
     let response: LinkingResponse = async {
         let (mut send, mut recv) = connection.open_bi().await?;
         write_message(

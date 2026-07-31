@@ -93,8 +93,8 @@ pub struct UnsupportedInviteVersion {
 }
 
 /// The pairing dialogue reached the inviter and ended without an answer —
-/// a refusal, distinct from never reaching the inviter (whose failure
-/// precedes this point). Deliberately reasonless: which of wrong, expired,
+/// a refusal, distinct from never reaching the inviter
+/// ([`InviterUnreachable`], whose failure precedes this point). Deliberately reasonless: which of wrong, expired,
 /// or already burned applied is uniform toward the dialer by design, and a
 /// connection that died mid-dialogue or a handler that failed internally
 /// surfaces exactly the same way. Downcast from the `anyhow::Error` of the
@@ -121,6 +121,17 @@ pub struct EstablishmentTimeout;
 /// names no budget, and the dial that precedes the round-trip stays under
 /// the transport's own connect handling.
 pub const ESTABLISHMENT_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The dial reached no inviting device: the failure precedes the dialogue,
+/// so it is neither a refusal (whose dialogue ended without an answer) nor
+/// a timeout of a dialogue in flight. One type for both ceremonies —
+/// pairing and linking share the dial shape as they share the framing, and
+/// the caller knows which act it attempted. Downcast from the
+/// `anyhow::Error` of the connections service's `establish` and the
+/// identity service's `link`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("could not reach the inviter")]
+pub struct InviterUnreachable;
 
 /// The scanner's half of the dialogue: the secret, who is scanning, where
 /// to reach it, and the read ticket to the metadata store it issues toward
@@ -357,7 +368,7 @@ pub(crate) async fn establish_via_dialogue(
     let connection = dial
         .connect(payload.inviter_addr.clone(), PAIRING_ALPN)
         .await
-        .context("could not reach the inviter")?;
+        .context(InviterUnreachable)?;
 
     // Reachable: this side's half of the pair, created (or reused) under a
     // brief lock. Its read ticket rides in the request; the lock is released

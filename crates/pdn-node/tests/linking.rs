@@ -16,8 +16,8 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
-    LinkingPayload, LinkingRefused, Runtime, SyncService as _, UnknownIdentity, UnknownIssuer,
-    UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    InviterUnreachable, LinkingPayload, LinkingRefused, Runtime, SyncService as _, UnknownIdentity,
+    UnknownIssuer, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
 use test_utils::{eventually, ids, wait_devices, TIMEOUT};
@@ -395,6 +395,13 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
         .link(unreachable, TIMEOUT)
         .await
         .unwrap_err();
+    // The positive half of the same distinction: the unreachable dial is
+    // recognized as its own typed outcome — without it, the negation above
+    // would hold even with no marker attached anywhere.
+    assert!(
+        err.downcast_ref::<InviterUnreachable>().is_some(),
+        "an unreachable inviter must be recognized as its own outcome, got: {err:#}"
+    );
     assert!(
         err.downcast_ref::<LinkingRefused>().is_none(),
         "a dial that reaches no inviting device must not read as a refusal, got: {err:#}"

@@ -14,8 +14,8 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentRefused,
-    EstablishmentTimeout, IdentityService as _, InvitePayload, Runtime, UnknownIdentity,
-    UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    EstablishmentTimeout, IdentityService as _, InvitePayload, InviterUnreachable, Runtime,
+    UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, TIMEOUT};
@@ -610,6 +610,13 @@ async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<(
         .establish(y, unreachable)
         .await
         .unwrap_err();
+    // The positive half of the same distinction: the unreachable dial is
+    // recognized as its own typed outcome — without it, the negation above
+    // would hold even with no marker attached anywhere.
+    assert!(
+        err.downcast_ref::<InviterUnreachable>().is_some(),
+        "an unreachable inviter must be recognized as its own outcome, got: {err:#}"
+    );
     assert!(
         err.downcast_ref::<EstablishmentRefused>().is_none(),
         "a dial that reaches no inviter must not read as a refusal, got: {err:#}"
