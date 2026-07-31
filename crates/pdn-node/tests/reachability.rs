@@ -21,7 +21,7 @@
 //! dev recipes enable it; a bare `cargo build`/`check` omits the file.
 #![cfg(feature = "test-util")]
 
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration};
 
 use anyhow::{ensure, Context, Result};
 use data_layer::{own_ticket_kind, ConnectionMetadataStore, PrivateMetadataStore, SyncNode};
@@ -81,16 +81,24 @@ async fn withdraw_device_toward(
     device: NodeId,
 ) -> Result<()> {
     let own_kind = own_ticket_kind(&peer);
-    let arrived =
-        eventually(|| async { Ok(directory.get_ticket(&own_kind).await?.is_some()) }).await?;
+    // The ticket is accumulated inside the poll: a second read after it is
+    // not the same read — a payload momentarily unfetchable reads as no
+    // ticket at all, the very transient the poll exists for.
+    let observed = RefCell::new(None);
+    let arrived = eventually(|| async {
+        let found = directory.get_ticket(&own_kind).await?;
+        let seen = found.is_some();
+        *observed.borrow_mut() = found;
+        Ok(seen)
+    })
+    .await?;
     ensure!(
         arrived,
         "the pair's own-store ticket did not reach the probe's directory"
     );
-    let own_ticket = directory
-        .get_ticket(&own_kind)
-        .await?
-        .context("the own-store ticket was observed, then gone")?;
+    let own_ticket = observed
+        .into_inner()
+        .context("the poll reported the ticket and handed back nothing")?;
     ConnectionMetadataStore::import(node, own_ticket)
         .await?
         .withdraw_device(device)

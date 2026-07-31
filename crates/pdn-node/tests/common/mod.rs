@@ -12,13 +12,11 @@
 // helpers; what one binary leaves unused is not dead code of the crate.
 #![allow(dead_code)]
 
-use std::cell::RefCell;
-
 use anyhow::{ensure, Context, Result};
 use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
 use pdn_node::{
     ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
-    PeerGrant, Runtime,
+    Runtime,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, TIMEOUT};
@@ -170,17 +168,14 @@ pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<Grant
 }
 
 /// Publish a grant of `issuer`'s namespace on `claims` from the giving
-/// side's hosted identity toward the receiving side's, and hand back the
-/// grant as the receiver reads it once it has crossed the connection's
-/// metadata pair.
-///
-/// The crossing is a poll, not a wait: a grant's ticket payload is a blob and
-/// lags the record that names it, so `read_grants` omits it until it lands.
-///
-/// The poll hands back the grant it observed, because a second read is not
-/// the same read: a record whose payload is momentarily unfetchable reads as
-/// no grant at all — the very transient the poll exists for — so re-reading
-/// to fetch the value would put that transient back in front of every caller.
+/// side's hosted identity toward the receiving side's, and return once the
+/// receiver reads it whole over the connection's metadata pair. The
+/// crossing is a poll, not a wait: a grant's ticket payload is a blob and
+/// lags the record that names it, so `read_grants` omits it until it
+/// lands. Delivery alone is returned; a caller that needs the grant's
+/// value reads it inside its own poll (see `scoped_grant_patiently` in the
+/// scoped-grants scenarios) — a second read after this poll is not the
+/// same read.
 pub async fn granted_patiently(
     gives: &Runtime,
     gives_id: PdnId,
@@ -188,26 +183,20 @@ pub async fn granted_patiently(
     receives_id: PdnId,
     issuer: PdnId,
     claims: NonEmpty<GrantedClaim>,
-) -> Result<PeerGrant> {
+) -> Result<()> {
     gives
         .connections()
         .publish_grant(gives_id, receives_id, issuer, claims)
         .await?;
-    let observed = RefCell::new(None);
     let crossed = eventually(|| async {
-        let found = receives
+        Ok(receives
             .connections()
             .read_grants(receives_id, gives_id)
             .await?
             .into_iter()
-            .find(|peer_grant| peer_grant.grant.issuer == issuer);
-        let seen = found.is_some();
-        *observed.borrow_mut() = found;
-        Ok(seen)
+            .any(|peer_grant| peer_grant.grant.issuer == issuer))
     })
     .await?;
     ensure!(crossed, "the grant did not reach the peer over the pair");
-    observed
-        .into_inner()
-        .context("the poll reported the grant and handed back nothing")
+    Ok(())
 }

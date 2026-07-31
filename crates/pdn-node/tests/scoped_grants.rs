@@ -9,9 +9,9 @@
 //! existence-hidden withheld claims, and the read-only holder's refused
 //! write.
 
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration};
 
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, PeerGrant, Runtime,
     SpawnOptions, UnknownIssuer,
@@ -35,32 +35,34 @@ async fn spawn_runtime() -> Result<Runtime> {
     .await
 }
 
-/// Poll until the peer's scoped grant for `issuer` is readable.
+/// Poll until the peer's scoped grant for `issuer` is readable, handing
+/// back the grant the poll itself observed. A second read after the poll
+/// is not the same read: a record whose payload is momentarily
+/// unfetchable reads as no grant at all — the very transient the poll
+/// exists for — so the value is accumulated inside the poll instead.
 async fn scoped_grant_patiently(
     receives: &Runtime,
     receives_id: pdn_types::PdnId,
     gives_id: pdn_types::PdnId,
     issuer: pdn_types::PdnId,
 ) -> Result<PeerGrant> {
-    let mut found = None;
-    let ok = eventually(|| async {
-        Ok(receives
-            .connections()
-            .read_grants(receives_id, gives_id)
-            .await?
-            .into_iter()
-            .any(|g| g.grant.issuer == issuer))
-    })
-    .await?;
-    if ok {
-        found = receives
+    let observed = RefCell::new(None);
+    let arrived = eventually(|| async {
+        let found = receives
             .connections()
             .read_grants(receives_id, gives_id)
             .await?
             .into_iter()
             .find(|g| g.grant.issuer == issuer);
-    }
-    found.ok_or_else(|| anyhow::anyhow!("scoped grant for {issuer} did not arrive"))
+        let seen = found.is_some();
+        *observed.borrow_mut() = found;
+        Ok(seen)
+    })
+    .await?;
+    ensure!(arrived, "scoped grant for {issuer} did not arrive");
+    observed
+        .into_inner()
+        .context("the poll reported the grant and handed back nothing")
 }
 
 /// Allowed: X grants Y read on exactly one claim; Y's runtime receives the
