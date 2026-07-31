@@ -699,6 +699,17 @@ impl SyncNode {
         Ok(())
     }
 
+    /// The namespace `issuer` currently resolves to here, `None` when it is
+    /// unbound — the registration probe for importers that memoize their own
+    /// imports. A memo entry whose issuer no longer resolves marks an import
+    /// to redo, not one to skip; an issuer already resolving to the very
+    /// namespace at hand marks a registration to adopt, not to re-import —
+    /// each import holds one more open handle on the replica, and the drop
+    /// at the end of its life must find exactly one.
+    pub fn data_namespace_of(&self, issuer: PdnId) -> Result<Option<NamespaceId>> {
+        Ok(self.registry.data_doc(issuer)?.map(|doc| doc.id()))
+    }
+
     /// Record `author` as one of this node's own writers, so the
     /// provisional-write tracker recognizes its entries.
     pub fn track_writer_author(&self, author: AuthorId) {

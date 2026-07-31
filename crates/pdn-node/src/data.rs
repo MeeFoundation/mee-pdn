@@ -132,6 +132,17 @@ impl<'rt> RuntimeDataService<'rt> {
             .map(|contact| NodeId::from_bytes(*contact.id.as_bytes()))
             .collect())
     }
+
+    /// Forget `issuer`'s replica out from under the grant binder's memo —
+    /// the registry half of a memo/registry desync, hand-made because the
+    /// product paths keep the two together; the healing sweep it arranges
+    /// for is asserted through the product surface. Behind the `test-util`
+    /// feature and absent from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn forget_namespace(&self, issuer: PdnId) -> Result<()> {
+        let state = self.runtime.state.lock().await;
+        state.node.forget_namespace(issuer).await
+    }
 }
 
 impl DataService for RuntimeDataService<'_> {

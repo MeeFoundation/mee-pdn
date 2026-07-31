@@ -10,6 +10,12 @@
 //! bare ticket holder nothing, probed right after it demonstrably served
 //! the granted audience.
 //!
+//! The grant sweep's replica lifecycle is asserted on the same surface:
+//! the replica shared by co-hosted audiences (ADR-0009) leaves only with
+//! the last withdrawn grant, the unbind decision counts durable grant
+//! records rather than the binders' bookkeeping, and a replica forgotten
+//! out from under the bookkeeping re-imports on the pair's next sweep.
+//!
 //! The contact observation goes through `RuntimeDataService::contacts_of`,
 //! so this file compiles only under the `test-util` feature — the `just`
 //! dev recipes enable it; a bare `cargo build`/`check` omits the file.
@@ -712,6 +718,241 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     );
 
     rt_laptop.shutdown().await?;
+    rt_bob.shutdown().await?;
+    Ok(())
+}
+
+/// One replica, two hosted audiences (ADR-0009): withdrawing the grant
+/// toward one of them must not take the bytes from the other. The read
+/// below is ordered by the binder's own record (`grant_bound`), not by
+/// time — the unbind demonstrably ran before the survival is asserted. The
+/// surviving audience then also receives a fresh write: the replica is not
+/// merely present but still syncing. The denial half, per
+/// `code-practices/access-control-tests.md`, is the second withdrawal: the
+/// node that held two grants and lost both ends where an outsider starts —
+/// the issuer resolves to nothing, no bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_shared = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let y = rt_shared.identity().create().await?;
+    let z = rt_shared.identity().create().await?;
+
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_shared, y, &rt_phone, alice, invite).await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_shared, z, &rt_phone, alice, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    rt_phone.data().write(alice, &email, b"v1").await?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_shared,
+        y,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_shared,
+        z,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    assert!(claim_arrives(&rt_shared, alice, &email, b"v1").await?);
+
+    // Both binders imported — the state the withdrawal acts on.
+    assert!(
+        eventually(|| async {
+            Ok(rt_shared.connections().grant_bound(y, alice, alice).await
+                && rt_shared.connections().grant_bound(z, alice, alice).await)
+        })
+        .await?,
+        "both grants must be bound before the withdrawal"
+    );
+
+    // Withdrawn toward Y alone, asserted only once Y's binder has
+    // demonstrably unbound.
+    rt_phone
+        .connections()
+        .withdraw_grant(alice, y, alice)
+        .await?;
+    assert!(
+        eventually(|| async { Ok(!rt_shared.connections().grant_bound(y, alice, alice).await) })
+            .await?,
+        "the withdrawal toward Y was never processed"
+    );
+    assert_eq!(
+        rt_shared.data().read(alice, &email).await?.as_deref(),
+        Some(b"v1".as_slice()),
+        "the shared replica must survive a withdrawal that leaves another grant standing"
+    );
+    rt_phone.data().write(alice, &email, b"v2").await?;
+    assert!(
+        claim_arrives(&rt_shared, alice, &email, b"v2").await?,
+        "the surviving audience no longer converges"
+    );
+
+    // The last grant leaves, and the replica with it.
+    rt_phone
+        .connections()
+        .withdraw_grant(alice, z, alice)
+        .await?;
+    assert!(
+        eventually(|| async { Ok(!rt_shared.connections().grant_bound(z, alice, alice).await) })
+            .await?,
+        "the withdrawal toward Z was never processed"
+    );
+    assert!(
+        eventually(|| async { Ok(rt_shared.data().read(alice, &email).await.is_err()) }).await?,
+        "the replica must leave with the last withdrawn grant"
+    );
+
+    rt_phone.shutdown().await?;
+    rt_shared.shutdown().await?;
+    Ok(())
+}
+
+/// The unbind decision is grounded in the durable grant records, not in
+/// the binders' in-memory bookkeeping — which is exactly what a device
+/// restart clears and rebuilds sweep by sweep (operating-conditions: the
+/// device restarts). The record of Z's import is dropped by hand, the
+/// restart-shaped arrangement, while Z's grant sits live and readable in
+/// its pair; the withdrawal toward Y must find that grant and spare the
+/// replica. A decision read off the bookkeeping alone counts zero holders
+/// here and destroys it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawal_counts_grants_not_bookkeeping() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_shared = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let y = rt_shared.identity().create().await?;
+    let z = rt_shared.identity().create().await?;
+
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_shared, y, &rt_phone, alice, invite).await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_shared, z, &rt_phone, alice, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    rt_phone.data().write(alice, &email, b"v1").await?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_shared,
+        y,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_shared,
+        z,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    assert!(claim_arrives(&rt_shared, alice, &email, b"v1").await?);
+    assert!(
+        eventually(|| async {
+            Ok(rt_shared.connections().grant_bound(y, alice, alice).await
+                && rt_shared.connections().grant_bound(z, alice, alice).await)
+        })
+        .await?,
+        "both grants must be bound before the arrangement"
+    );
+
+    // The in-memory record a restart clears: the replica and Z's durable
+    // grant record both stand, the binder's memo of the import does not.
+    // Z's binder sweeps only on its own pair's changes, and the withdrawal
+    // below lands in Y's pair — nothing rebuilds the memo before the
+    // decision it is cleared for.
+    rt_shared
+        .connections()
+        .clear_grant_memo(z, alice, alice)
+        .await;
+    rt_phone
+        .connections()
+        .withdraw_grant(alice, y, alice)
+        .await?;
+    assert!(
+        eventually(|| async { Ok(!rt_shared.connections().grant_bound(y, alice, alice).await) })
+            .await?,
+        "the withdrawal toward Y was never processed"
+    );
+    assert_eq!(
+        rt_shared.data().read(alice, &email).await?.as_deref(),
+        Some(b"v1".as_slice()),
+        "the unbind decision must find Z's durable grant with the bookkeeping empty"
+    );
+
+    rt_phone.shutdown().await?;
+    rt_shared.shutdown().await?;
+    Ok(())
+}
+
+/// The binder's memo is an optimization, the registry the arbiter: a
+/// replica forgotten while the memo still names its import re-imports on
+/// the pair's next sweep instead of being skipped forever. The desync is
+/// hand-made (`forget_namespace` under `test-util`) as this test's subject
+/// per `code-practices/product-path-arrangement` — the product paths keep
+/// memo and registry together — and the recovery is asserted through the
+/// product surface: the issuer republishes the grant, the sweep
+/// re-imports, the entries return.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_bob = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    rt_phone.data().write(alice, &email, b"v1").await?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_bob,
+        bob,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    assert!(claim_arrives(&rt_bob, alice, &email, b"v1").await?);
+
+    // The desync: replica gone, memo still naming its import.
+    rt_bob.data().forget_namespace(alice).await?;
+    assert!(rt_bob.data().read(alice, &email).await.is_err());
+    assert!(
+        rt_bob.connections().grant_bound(bob, alice, alice).await,
+        "the memo must still name the import for the desync to be the one under test"
+    );
+
+    // The pair's next sweep re-imports — caused here by the issuer
+    // republishing the same grant; any change of the pair's replica does.
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_bob,
+        bob,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    assert!(
+        claim_arrives(&rt_bob, alice, &email, b"v1").await?,
+        "the memoized binding must not skip the re-import of a forgotten replica"
+    );
+
+    rt_phone.shutdown().await?;
     rt_bob.shutdown().await?;
     Ok(())
 }

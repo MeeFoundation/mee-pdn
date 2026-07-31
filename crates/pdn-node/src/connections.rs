@@ -91,9 +91,12 @@ pub trait ConnectionsService {
     /// Withdraw the grant of `issuer`'s data store toward `peer` — one
     /// tombstone over the single record. The issuer
     /// must be the granting identity itself, as for publishing. The grantee
-    /// side drops the namespace once the tombstone replicates: what its
-    /// grant binder imported it also forgets, so withdrawal reaches the
-    /// bytes and not only the classification.
+    /// side unbinds once the tombstone replicates, and the replica leaves
+    /// with the last grant that binds it: what the binders imported they
+    /// also forget, so withdrawal reaches the bytes and not only the
+    /// classification — but a node hosting several granted audiences of one
+    /// issuer holds one shared replica (ADR-0009), and it stays until the
+    /// last of their grants is withdrawn.
     async fn withdraw_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()>;
 
     /// Publish a grant: `identity` grants `peer` read — and, per claim,
@@ -148,6 +151,29 @@ impl<'rt> RuntimeConnectionsService<'rt> {
             return Ok(false);
         };
         Ok(pair.own.read_grant(issuer, peer).await?.granted().is_some())
+    }
+
+    /// Whether the grant binder of `(identity, peer)` holds an imported
+    /// binding for `issuer` — the sweep's own record of what it brought in.
+    /// Observation only, for scenarios that must order an assertion after
+    /// the sweep that acted on a grant change instead of sleeping and
+    /// guessing. Behind the `test-util` feature and absent from every
+    /// product build.
+    #[cfg(feature = "test-util")]
+    pub async fn grant_bound(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> bool {
+        let state = self.runtime.state.lock().await;
+        state.bound_grants.contains_key(&(identity, peer, issuer))
+    }
+
+    /// Drop the binder's record of an imported grant, replica untouched —
+    /// the in-memory bookkeeping a device restart clears, hand-made so a
+    /// scenario can put the unbind decision in front of a pair whose grant
+    /// is durable and readable while the bookkeeping says nothing. Behind
+    /// the `test-util` feature and absent from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn clear_grant_memo(&self, identity: PdnId, peer: PdnId, issuer: PdnId) {
+        let mut state = self.runtime.state.lock().await;
+        state.bound_grants.remove(&(identity, peer, issuer));
     }
 }
 
@@ -302,8 +328,9 @@ pub(crate) fn spawn_connection_armer(
 /// The binder owns exactly what it imported ([`State::bound_grants`]): a
 /// grant that appears is imported, a grant whose ticket comes to name a
 /// different replica is re-imported onto it, and a grant that disappears is
-/// forgotten again. A namespace that arrived any other way is never
-/// touched, so an out-of-band import is not dropped from under its owner.
+/// unbound again — the shared replica itself leaves only with the last pair
+/// bound to it. A namespace that arrived any other way is never touched, so
+/// an out-of-band import is not dropped from under its owner.
 ///
 /// Like the connection armer the task holds the state weakly and upgrades
 /// per sweep. It exits when the runtime is gone, when the event stream ends
@@ -413,7 +440,22 @@ async fn bind_one_grant(
     let namespace = ticket.capability.id();
     let ticket_nodes = ticket.nodes.clone();
     let bound = (identity, peer, issuer);
-    if state.bound_grants.get(&bound) != Some(&namespace) {
+    // The memo is an optimization, the registry the arbiter — in both
+    // directions. An issuer already resolving to the very namespace the
+    // grant names (another pair's binder imported the shared replica,
+    // ADR-0009) is adopted into the memo rather than re-imported: each
+    // import holds one more open handle on the replica, and the last
+    // unbind's forget must find exactly one to drop. An issuer resolving to
+    // nothing — forgotten while the memo survived — is re-imported even
+    // when the memo matches, so a desync between the two heals on this
+    // sweep instead of skipping the import forever.
+    let memo_current = state.bound_grants.get(&bound) == Some(&namespace);
+    let registered = state.node.data_namespace_of(issuer)?;
+    if registered == Some(namespace) {
+        if !memo_current {
+            state.bound_grants.insert(bound, namespace);
+        }
+    } else if !memo_current || registered.is_none() {
         let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         state.bound_grants.insert(bound, namespace);
     }
@@ -538,11 +580,47 @@ async fn refresh_replica_contacts(
     state.node.set_namespace_contacts(issuer, contacts)
 }
 
-/// Forget the namespaces whose grant this pair no longer carries — the
+/// Whether any pair other than `unbinding` still holds `issuer`'s replica:
+/// a binding another binder memoized, or a live readable grant record in an
+/// open pair's counterparty replica. The memo alone would undercount — it
+/// is in-memory bookkeeping, rebuilt sweep by sweep, and a pair whose
+/// binder has not swept since holds its grant durably while the memo says
+/// nothing (operating-conditions: the device restarts) — so the decision
+/// that destroys a replica consults the grant records too. `Unreadable`
+/// does not hold: a record whose payload never resolves would pin the
+/// replica forever, and a pair whose live grant goes uncounted re-imports
+/// on its next sweep ([`bind_one_grant`]'s registration check), refetching
+/// the bytes over the network.
+async fn held_by_another_pair(state: &State, unbinding: (PdnId, PdnId), issuer: PdnId) -> bool {
+    let memoized = state
+        .bound_grants
+        .keys()
+        .any(|(identity, peer, bound)| *bound == issuer && (*identity, *peer) != unbinding);
+    if memoized {
+        return true;
+    }
+    for ((audience, peer), open) in &state.metadata_pairs {
+        if (*audience, *peer) == unbinding {
+            continue;
+        }
+        match open.peer.read_grant(issuer, *audience).await {
+            Ok(data_layer::GrantRead::Granted(..)) => return true,
+            // Unreadable or unreachable is no evidence of holding either
+            // way; a grant that turns out live re-imports on its own sweep.
+            Ok(_) | Err(_) => {}
+        }
+    }
+    false
+}
+
+/// Unbind the namespaces whose grant this pair no longer carries — the
 /// counterpart of the import above, bounded to what this binder brought in.
-/// A republished grant imports afresh, so dropping the replica is not a
-/// one-way door for the connection, only for the bytes held under a grant
-/// that no longer exists.
+/// The replica itself leaves with the last bound pair: one namespace per
+/// issuer (ADR-0009) means every pair granted by this issuer binds the same
+/// replica, and forgetting it while another pair's grant stands would take
+/// the bytes from an audience nobody withdrew. A republished grant imports
+/// afresh, so dropping the replica is not a one-way door for the
+/// connection, only for the bytes held under the last withdrawn grant.
 async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live: &[PdnId]) {
     let withdrawn: Vec<PdnId> = state
         .bound_grants
@@ -554,23 +632,30 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
         .collect();
     for issuer in withdrawn {
         // Forget first, prune second, and drop the binding only if the forget
-        // went through. Forgetting is what unregisters the issuer, disarms
-        // its retractions and untracks it; a failed forget leaves all three
-        // standing, and markers pruned ahead of it would have taken away the
-        // only thing that could explain or re-arm them. Keeping the binding
-        // keeps the retry: the next sweep sees the grant still gone.
-        match state.node.forget_namespace(issuer).await {
-            // Forgotten here, or already gone — another binder of another
-            // identity dropped the shared replica first.
-            Ok(()) => {}
-            Err(err) if err.downcast_ref::<data_layer::UnknownIssuer>().is_some() => {}
-            Err(err) => {
-                tracing::warn!(%issuer, "failed to forget a withdrawn grant's namespace: {err:#}");
-                continue;
+        // went through (or was skipped for a surviving holder). Forgetting is
+        // what unregisters the issuer, disarms its retractions and untracks
+        // it; a failed forget leaves all three standing, and markers pruned
+        // ahead of it would have taken away the only thing that could explain
+        // or re-arm them. Keeping the binding keeps the retry: the next sweep
+        // sees the grant still gone.
+        if !held_by_another_pair(state, (identity, peer), issuer).await {
+            match state.node.forget_namespace(issuer).await {
+                // Forgotten here, or already resolving to nothing — the state
+                // this unbind drives at.
+                Ok(()) => {}
+                Err(err) if err.downcast_ref::<data_layer::UnknownIssuer>().is_some() => {}
+                Err(err) => {
+                    tracing::warn!(
+                        %issuer,
+                        "failed to forget a withdrawn grant's namespace: {err:#}"
+                    );
+                    continue;
+                }
             }
         }
-        // Retraction markers leave with the grant binding: the entries they
-        // address left with the replica.
+        // Retraction markers leave with the grant binding: this identity's
+        // verdicts have no grant to act under, whether the replica stayed
+        // with another pair or left with this one.
         if let Ok(hosted) = state.hosted(identity) {
             let _cold_until_next_sweep = hosted.directory.prune_retractions(issuer).await;
         }
