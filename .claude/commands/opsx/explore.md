@@ -171,3 +171,4 @@ When things crystallize, you might offer a summary - but it's optional. Sometime
 - **Do visualize** - A good diagram is worth many paragraphs
 - **Do explore the codebase** - Ground discussions in reality
 - **Do question assumptions** - Including the user's and your own
+- **Do walk the operating conditions** - `mia-docs/openspec/specs/code-practices/operating-conditions.md`: several identities per node, one device or several, a device linking before or during or after a process, a dropped connection, a full disk, a capability narrowed or revoked and granted again. Exploring is exactly when these are cheap to consider, and a design that meets one of them late is a design that gets rebuilt

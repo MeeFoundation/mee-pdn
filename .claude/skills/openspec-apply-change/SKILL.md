@@ -147,6 +147,8 @@ What would you like to do?
 - Update task checkbox immediately after completing each task
 - Pause on errors, blockers, or unclear requirements - don't guess
 - Use contextFiles from CLI output, don't assume specific file names
+- Hold the work to the repo's code practices in `mia-docs/openspec/specs/code-practices/`: `operating-conditions.md` — for the path you are implementing, which of several identities per node, one device or several, a device linking before or during or after, a dropped connection, a full disk, and a capability narrowed or revoked and re-granted actually change the outcome; each one that does needs a scenario and a test, and each one that does not is worth saying so once. `access-control-tests.md` — an authorized-access assertion carries its tightest denial beside it. `flaky-tests.md` — the change ends with a stress pass
+- A task that adds a scenario is not done until the test would fail with the mechanism removed
 
 **Fluid Workflow Integration**
 
