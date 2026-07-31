@@ -15,9 +15,9 @@ use data_layer::{
     ProtocolHandler, ShareMode, SyncNode,
 };
 use pdn_node::{
-    ConnectionsService as _, DataService as _, IdentityService as _, LinkingPayload, Runtime,
-    SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion,
-    LINKING_FORMAT_VERSION,
+    ConnectionsService as _, DataService as _, IdentityService as _, LinkingPayload,
+    LinkingRefused, Runtime, SyncService as _, UnknownIdentity, UnknownIssuer,
+    UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
 use test_utils::{eventually, ids, wait_devices, TIMEOUT};
@@ -323,6 +323,90 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     Ok(())
 }
 
+/// The dialer-side legibility of a linking refusal — the caller's half of
+/// the uniform-refusal requirement: a dialogue that reached the inviting
+/// device and got no answer downcasts to the reasonless [`LinkingRefused`],
+/// for an expired secret, a wrong one, and a replayed one alike (one unit
+/// value, nothing separating the three), while a dial that reaches no
+/// inviting device does not. Each refusal leaves no residue: the identity
+/// stays unhosted and its operations refuse as unknown. The catch-up
+/// timeout's distinctness has its own probe in the rollback test, which
+/// owns that harness.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Result<()> {
+    let rt_a = Runtime::spawn().await?;
+    let rt_b = Runtime::spawn().await?;
+    let rt_c = Runtime::spawn().await?;
+    let x = rt_a.identity().create().await?;
+    let path = EntryPath::new("contact/name")?;
+
+    // Expired: dialed, verified, refused — the marker, and no residue.
+    let tiny = Some(Duration::from_millis(1));
+    let expired = rt_a.identity().linking_invite(x, tiny).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = rt_b.identity().link(expired, TIMEOUT).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<LinkingRefused>().is_some(),
+        "an expired-secret refusal must downcast to the marker, got: {err:#}"
+    );
+    assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
+    let read_err = rt_b.data().read(x, &path).await.unwrap_err();
+    assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
+
+    // A wrong secret: the same reasonless value.
+    let live = rt_a.identity().linking_invite(x, None).await?;
+    let forged = LinkingPayload {
+        secret: [0x5a; 32],
+        ..live.clone()
+    };
+    let err = rt_c.identity().link(forged, TIMEOUT).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<LinkingRefused>().is_some(),
+        "a wrong-secret refusal must downcast to the marker, got: {err:#}"
+    );
+
+    // A replayed secret, after the live one links B: the same value, and
+    // no residue on the replayer.
+    rt_b.identity().link(live.clone(), TIMEOUT).await?;
+    let err = rt_c.identity().link(live, TIMEOUT).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<LinkingRefused>().is_some(),
+        "a replayed-secret refusal must downcast to the marker, got: {err:#}"
+    );
+    assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
+    let read_err = rt_c.data().read(x, &path).await.unwrap_err();
+    assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
+
+    // A dial that reaches no inviting device: the failure precedes the
+    // dialogue, so it is not the refusal. The address is a live bare node,
+    // which accepts no linking ALPN — the handshake is rejected at once,
+    // where the address of a node that is gone would cost the transport's
+    // whole connect timeout and leave the probe asserting nothing within any
+    // shorter bound.
+    let bystander = SyncNode::spawn().await?;
+    let unreachable = LinkingPayload {
+        version: LINKING_FORMAT_VERSION,
+        inviter_addr: bystander.dial_handle().addr(),
+        secret: [0x11; 32],
+        identity: ids::DAVE,
+    };
+    let err = rt_c
+        .identity()
+        .link(unreachable, TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<LinkingRefused>().is_none(),
+        "a dial that reaches no inviting device must not read as a refusal, got: {err:#}"
+    );
+
+    bystander.shutdown().await?;
+    rt_a.shutdown().await?;
+    rt_b.shutdown().await?;
+    rt_c.shutdown().await?;
+    Ok(())
+}
+
 /// Linking into an already-hosted identity is refused before dialing —
 /// proven by the secret surviving the refusal: the payload the hosting
 /// runtime refused still links a third runtime, which could not succeed
@@ -504,6 +588,12 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
         err.downcast_ref::<CatchUpTimeout>().is_some(),
         "the failure must be the catch-up timeout, got: {err:#}"
     );
+    // The timeout is not the refusal: the dialogue completed and the wait
+    // ran out, and a caller tells the two apart without reading text.
+    assert!(
+        err.downcast_ref::<LinkingRefused>().is_none(),
+        "a catch-up timeout must not read as a refusal"
+    );
 
     // No residue: the identity is not hosted, and its operations refuse as
     // unknown — the assertion the unregister half of the rollback exists to
@@ -556,7 +646,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 
     let path = EntryPath::new("shared/note")?;
     rt_phone.data().write(x, &path, b"from-x").await?;
-    let grant = granted_patiently(
+    granted_patiently(
         &rt_phone,
         x,
         &rt_laptop,
@@ -566,9 +656,10 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     )
     .await?;
 
-    // The whole-store grant path: binds X in the node's issuer registry,
-    // and nowhere near the hosted set the link's guard consults.
-    rt_laptop.data().import(x, grant.ticket).await?;
+    // The grant binder imports what the grant names — X binds in the
+    // node's issuer registry, nowhere near the hosted set the link's guard
+    // consults — so what the rollback below must not destroy is exactly
+    // what the product created.
     assert!(
         eventually(|| async {
             Ok(rt_laptop.data().read(x, &path).await?.as_deref() == Some(&b"from-x"[..]))
@@ -750,10 +841,24 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 /// grant-surface use. The connection and the grant are both made on the
 /// phone *after* the laptop linked, so everything the laptop knows of them
 /// arrived through the directory; the laptop never touches the grant
-/// surface, yet serves the granted counterparty — paired, per
-/// `code-practices/access-control-tests.md`, with the tightest
-/// unauthorized party: a holder of the replica's ticket with no grant gets
-/// nothing from the same device.
+/// surface, yet serves the granted counterparty. Bob is arranged through
+/// his recorded grant alone — the binder imports it — and the serving
+/// device is isolated the way `sibling_serving` isolates its own: the
+/// phone goes offline and the probed update exists on the laptop alone.
+/// Paired, per `code-practices/access-control-tests.md`, with the
+/// tightest unauthorized party: a holder of the replica's ticket with no
+/// grant gets nothing from the same device — Carol's laptop-minted ticket
+/// is the admitted instrument there, since the control needs addressing
+/// to the serving device and no grant exists toward her to carry it.
+///
+/// The scenario requires `test-util` as a whole, not only for the wait
+/// below. Its premise — the surviving device holds the grant record it
+/// will serve by — is closed by that wait alone, and the phone is shut
+/// down either way; without the feature the arrangement is the one the
+/// stress pass measured at about 2% flaky, so the scenario runs where its
+/// premise can be pinned and nowhere else. The `just` recipes enable the
+/// feature.
+#[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() -> Result<()> {
     let rt_phone = Runtime::spawn().await?;
@@ -788,7 +893,8 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     .await?;
 
     // Positive control on the laptop's replica: device replication has
-    // delivered the entry it is about to serve.
+    // delivered the entry it is about to serve. Bob's binder has imported
+    // what the grant names by now too — no import act anywhere.
     assert!(
         eventually(|| async {
             Ok(rt_laptop.data().read(alice, &email).await?.as_deref()
@@ -797,25 +903,51 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         .await?,
         "the entry never replicated to the laptop — the premise of this test, not its subject"
     );
+    assert!(
+        eventually(|| async {
+            Ok(rt_bob.data().read(alice, &email).await?.as_deref()
+                == Some(&b"alice@example.org"[..]))
+        })
+        .await?,
+        "the granted claim never reached Bob while the phone was up"
+    );
+    // The record the laptop will serve by has reached it — the grant rides
+    // best-effort replication, and killing the publisher races it.
+    assert!(
+        eventually(|| async {
+            rt_laptop
+                .connections()
+                .grant_visible(alice, bob, alice)
+                .await
+        })
+        .await?,
+        "the grant record never reached the device that must serve by it"
+    );
 
-    // Both recipients aim at the laptop specifically: tickets minted there
-    // (read mode — addressing, not authority). Bob holds a recorded grant;
-    // Carol holds only the ticket.
-    let bob_ticket = rt_laptop.data().share(alice, ShareMode::Read).await?;
-    rt_bob.data().import(alice, bob_ticket).await?;
+    // The serving device is isolated: the phone goes offline, and the
+    // probed update is written on the laptop alone. Carol holds only a
+    // ticket the laptop itself minted (read mode — addressing, not
+    // authority): the admitted instrument of the outsider control, which
+    // needs addressing to the serving device and has no grant to carry it.
+    rt_phone.shutdown().await?;
+    rt_laptop
+        .data()
+        .write(alice, &email, b"alice@moved.example.org")
+        .await?;
     let carol_ticket = rt_laptop.data().share(alice, ShareMode::Read).await?;
     rt_carol.data().import(alice, carol_ticket).await?;
 
     // The laptop serves Bob under the grant published on the phone — no
     // grant-surface call ever ran on the laptop; its armer opened the pair
-    // from the replicated directory. Carol's poll rides along inside the
-    // same wait, so her sync attempts against the same target accumulate
-    // exactly while Bob's do.
+    // from the replicated directory, and Bob's route to it is the
+    // published device set. Carol's poll rides along inside the same wait,
+    // so her sync attempts against the same target accumulate exactly
+    // while Bob's do.
     assert!(
         eventually(|| async {
             let _nudge = rt_carol.data().list(alice, None).await?;
             Ok(rt_bob.data().read(alice, &email).await?.as_deref()
-                == Some(&b"alice@example.org"[..]))
+                == Some(&b"alice@moved.example.org"[..]))
         })
         .await?,
         "the linked device never served the granted counterparty"
@@ -831,7 +963,6 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     );
     assert!(rt_carol.data().read(alice, &email).await?.is_none());
 
-    rt_phone.shutdown().await?;
     rt_laptop.shutdown().await?;
     rt_bob.shutdown().await?;
     rt_carol.shutdown().await?;

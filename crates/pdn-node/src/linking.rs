@@ -98,6 +98,19 @@ pub struct UnsupportedLinkingVersion {
     pub version: u8,
 }
 
+/// The linking dialogue reached the inviting device and ended without an
+/// answer — a refusal, distinct from never reaching the inviter (whose
+/// failure precedes this point) and from the catch-up timeout after a
+/// completed dialogue ([`data_layer::CatchUpTimeout`]). Deliberately
+/// reasonless: which of wrong, expired, or already burned applied is
+/// uniform toward the dialer by design, and a connection that died
+/// mid-dialogue or a handler that failed internally surfaces exactly the
+/// same way. Downcast from the `anyhow::Error` of the identity service's
+/// `link`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("linking refused by the inviter")]
+pub struct LinkingRefused;
+
 /// The new device's half of the dialogue: the format version and the
 /// secret — nothing else. In particular no node id: the inviter takes the
 /// newcomer's id from the connection's authenticated peer identity.
@@ -375,10 +388,9 @@ async fn run_linking_dialogue(
         .await?;
         send.finish()?;
         // Refusals are uniform by design: the connection just closes, and
-        // this read fails without saying why.
-        read_message(&mut recv)
-            .await
-            .context("linking refused by the inviter")
+        // this read fails without saying why — the typed marker says only
+        // that the inviter was reached and no answer came.
+        read_message(&mut recv).await.context(LinkingRefused)
     }
     .await?;
     connection.close(0u32.into(), b"done");

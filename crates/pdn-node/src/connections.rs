@@ -2,6 +2,7 @@
 //! list them, and carry grants over the connections' metadata pairs.
 
 use std::{
+    collections::HashSet,
     sync::Weak,
     time::{Duration, Instant},
 };
@@ -12,7 +13,7 @@ use data_layer::{
     EndpointId, GrantedClaim, ReadGrant, ShareMode,
 };
 use futures_lite::{Stream, StreamExt};
-use pdn_types::{NonEmpty, PdnId};
+use pdn_types::{NodeId, NonEmpty, PdnId};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -130,6 +131,23 @@ pub struct RuntimeConnectionsService<'rt> {
 impl<'rt> RuntimeConnectionsService<'rt> {
     pub(crate) fn new(runtime: &'rt Runtime) -> Self {
         Self { runtime }
+    }
+
+    /// Whether this runtime's own metadata store toward `peer` holds a
+    /// live, readable grant of `issuer`'s data — the record the serving
+    /// classifier reads. Observation only, for scenarios that shut the
+    /// publishing device down and must first know the record reached the
+    /// device that will serve: the record rides best-effort replication,
+    /// so killing the publisher races it. Behind the `test-util` feature
+    /// and absent from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn grant_visible(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<bool> {
+        let mut state = self.runtime.state.lock().await;
+        state.hosted(identity)?;
+        let Some(pair) = open_pair(&mut state, identity, peer).await? else {
+            return Ok(false);
+        };
+        Ok(pair.own.read_grant(issuer, peer).await?.granted().is_some())
     }
 }
 
@@ -393,58 +411,131 @@ async fn bind_one_grant(
         return Ok(());
     };
     let namespace = ticket.capability.id();
+    let ticket_nodes = ticket.nodes.clone();
     let bound = (identity, peer, issuer);
     if state.bound_grants.get(&bound) != Some(&namespace) {
         let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         state.bound_grants.insert(bound, namespace);
     }
-    // The provisional-write tracker follows the counterparty's published
-    // device set — refreshed even when the binding is unchanged, exactly
-    // like the sibling contacts below: the set moves independently of the
-    // grant.
+    // The provisional-write tracker and the replica's contacts both follow
+    // the issuer's published device set — refreshed even when the binding is
+    // unchanged: the set moves independently of the grant.
     //
     // An empty read is not an empty set. A pair whose `devices/` records
     // have not replicated yet reads exactly like a counterparty that
-    // published nothing, and taking it as the set would leave the tracker
-    // honoring no rejection at all — a provisional write that never
-    // retracts. The set is left as it was until a device appears in it.
-    match peer_store.published_devices().await {
-        Ok(devices) if !devices.is_empty() => {
-            let _unbound_meanwhile = state.node.track_retraction_peers(issuer, devices);
-        }
-        // Empty (not replicated yet, or nothing published) or unreadable.
-        Ok(_) | Err(_) => {}
+    // published nothing, so an empty union is "nobody has spoken yet", and
+    // taking it as the set would leave the tracker honoring no rejection at
+    // all — a provisional write that never retracts — and the contact set
+    // stripped of every route to the issuer. Both are left as they were
+    // until a device appears.
+    let bound_pairs = pairs_bound_to(state, issuer);
+    let devices = published_issuer_devices(state, &bound_pairs).await;
+    if devices.is_empty() {
+        return Ok(());
     }
-    // Contacts are refreshed even when the binding is unchanged: the
-    // audience's device set moves independently of the grant.
-    refresh_sibling_contacts(state, identity, issuer).await
+    let _unbound_meanwhile = state.node.track_retraction_peers(issuer, devices.clone());
+    refresh_replica_contacts(state, issuer, &ticket_nodes, &devices, &bound_pairs).await
 }
 
-/// Point the granted replica at the audience identity's other devices, so
-/// it catches up from a sibling while the issuer is away. Derived from the
-/// directory on every sweep rather than kept: the `devices/` records are
-/// the durable truth and they replicate, so a list stored beside them would
-/// be a second source of truth for one fact — and the one that goes stale.
-///
-/// A contact carries the endpoint id alone: the endpoint resolves paths it
-/// has spoken to, so a sibling this node has synced with is dialable and
-/// one it never reached stays inert until it is.
-async fn refresh_sibling_contacts(state: &mut State, identity: PdnId, issuer: PdnId) -> Result<()> {
-    let own = state.node.node_id();
-    let devices = state.hosted(identity)?.directory.list_devices().await?;
-    let mut contacts = Vec::new();
-    for device in devices {
-        if device == own {
-            continue;
+/// The pairs whose grant binds `issuer` here, as `(audience, counterparty)`.
+/// One namespace per issuer (ADR-0009) means several hosted audiences share
+/// one replica, so everything derived for that replica is derived across all
+/// of them: the tracked contact set and the retraction tracker's device set
+/// are both per replica, and deriving either from one pair would have each
+/// binder's sweep replace what the others established.
+fn pairs_bound_to(state: &State, issuer: PdnId) -> Vec<(PdnId, PdnId)> {
+    state
+        .bound_grants
+        .keys()
+        .filter(|(_identity, _peer, bound_issuer)| *bound_issuer == issuer)
+        .map(|(identity, peer, _issuer)| (*identity, *peer))
+        .collect()
+}
+
+/// The issuer's devices as every bound pair states them, unioned. The pairs
+/// replicate independently, so their views differ while one lags, and a pair
+/// whose records have not arrived reads exactly like one that published
+/// nothing — it contributes nothing here and the others still speak, where
+/// one pair's word taken alone would strip a device the issuer never
+/// withdrew. A device therefore leaves the union only once no bound pair
+/// publishes it.
+async fn published_issuer_devices(state: &State, bound_pairs: &[(PdnId, PdnId)]) -> Vec<NodeId> {
+    let stores: Vec<ConnectionMetadataStore> = bound_pairs
+        .iter()
+        .filter_map(|pair| state.metadata_pairs.get(pair).map(|open| open.peer.clone()))
+        .collect();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut devices = Vec::new();
+    for store in stores {
+        // Unreadable is indistinguishable from not-yet-replicated, and both
+        // are "this pair says nothing this sweep".
+        for device in store.published_devices().await.unwrap_or_default() {
+            if seen.insert(*device.as_bytes()) {
+                devices.push(device);
+            }
         }
-        contacts.push(EndpointAddr::new(EndpointId::from_bytes(
-            device.as_bytes(),
-        )?));
+    }
+    devices
+}
+
+/// Point the granted replica at every device authorized to serve it: the
+/// issuer's published devices — the same set the retraction tracker
+/// follows, unioned over every pair whose grant binds this issuer — and the
+/// audience siblings, with the grant ticket's addressing kept for the
+/// published devices it names. Derived whole from the device records on
+/// every sweep and set as the replica's entire contact list, never kept:
+/// the records are the durable truth and they replicate, so a list stored
+/// beside them would be a second source of truth for one fact — and the one
+/// that goes stale. Removal is re-derivation — a device withdrawn on either
+/// side stops appearing in its record set, so the next sweep's contact list
+/// simply lacks it, the publishing device included.
+///
+/// The siblings, like the issuer devices, are those of *every* hosted
+/// identity whose grant binds this issuer, not only the sweeping one: the
+/// replica — and its tracked contact set — is per issuer, so a per-identity
+/// set would have each binder's sweep strip the other identity's siblings.
+///
+/// A contact derived from a device record carries the endpoint id alone:
+/// the endpoint resolves paths it has spoken to — the audience's siblings
+/// sync with this node's device-shared stores, and the issuer's devices
+/// dial it to serve the connection's metadata pair.
+async fn refresh_replica_contacts(
+    state: &mut State,
+    issuer: PdnId,
+    ticket_nodes: &[EndpointAddr],
+    issuer_devices: &[NodeId],
+    bound_pairs: &[(PdnId, PdnId)],
+) -> Result<()> {
+    let own = state.node.node_id();
+    let mut siblings: Vec<NodeId> = Vec::new();
+    for (audience, _peer) in bound_pairs {
+        if let Ok(hosted) = state.hosted(*audience) {
+            siblings.extend(hosted.directory.list_devices().await?);
+        }
+    }
+    let mut covered: HashSet<[u8; 32]> = HashSet::new();
+    covered.insert(*own.as_bytes());
+    let mut contacts = Vec::new();
+    // The ticket's entries first: they carry address detail beyond the
+    // endpoint id, and stay only while the issuer still publishes the
+    // device they name.
+    for node in ticket_nodes {
+        let id = *node.id.as_bytes();
+        if issuer_devices.iter().any(|device| *device.as_bytes() == id) && covered.insert(id) {
+            contacts.push(node.clone());
+        }
+    }
+    for device in issuer_devices.iter().chain(siblings.iter()) {
+        if covered.insert(*device.as_bytes()) {
+            contacts.push(EndpointAddr::new(EndpointId::from_bytes(
+                device.as_bytes(),
+            )?));
+        }
     }
     if contacts.is_empty() {
         return Ok(());
     }
-    state.node.add_namespace_contacts(issuer, contacts)
+    state.node.set_namespace_contacts(issuer, contacts)
 }
 
 /// Forget the namespaces whose grant this pair no longer carries — the

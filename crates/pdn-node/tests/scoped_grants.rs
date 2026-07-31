@@ -110,12 +110,12 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         .publish_grant(x, y, x, common::claims_on(x, &email, false))
         .await?;
 
-    // Y consumes it as the bootstrap cascade would: read the grant over
-    // the pair, import the namespace scoped.
+    // Y reads the grant over the pair — the observation; the binder is
+    // what imports the namespace it names, so no import act follows. The
+    // ticket is kept only to leak it to the third runtime below.
     let received = scoped_grant_patiently(&rt_b, y, x, x).await?;
     assert!(received.grant.claims.iter().all(|claim| !claim.write));
-    let leaked_ticket = received.ticket.clone();
-    rt_b.data().import_scoped(x, received.ticket).await?;
+    let leaked_ticket = received.ticket;
 
     // Denied (outsider): before holding any ticket, the third runtime is
     // refused as specifically unknown — X was neither created nor imported

@@ -557,11 +557,15 @@ impl SyncNode {
         Ok(import)
     }
 
-    /// Add reconciliation contacts for `issuer`'s data namespace — devices
-    /// of the grant's audience alongside the issuer's own from the import
-    /// ticket. The periodic reconcile pass and the before-access nudge dial
-    /// the merged set, so a granted replica catches up from a sibling while
-    /// the issuer is offline. Adding is idempotent per contact.
+    /// Set the reconciliation contacts for `issuer`'s data namespace,
+    /// replacing the previous set — devices of the grant's audience and of
+    /// the issuer, derived by the caller from the durable device records on
+    /// every sweep. Replacement is what lets a contact leave: a device
+    /// withdrawn from the records is simply absent from the next derived
+    /// set, so it stops being dialed. The periodic reconcile pass and the
+    /// before-access nudge dial exactly this set (the engine unions in
+    /// peers it has recorded as useful), so a granted replica catches up
+    /// from any device in it while the others are offline.
     ///
     /// Refuses with [`UnknownIssuer`] when `issuer` resolves to no tracked
     /// replica — whether it was never bound or is bound-but-untracked (the
@@ -569,7 +573,7 @@ impl SyncNode {
     /// without unregistering). Both are the same failure to the caller —
     /// "nowhere to record these contacts" — so both surface, rather than a
     /// silent `Ok` that drops them and starves the replica unattributably.
-    pub fn add_namespace_contacts(&self, issuer: PdnId, contacts: Vec<EndpointAddr>) -> Result<()> {
+    pub fn set_namespace_contacts(&self, issuer: PdnId, contacts: Vec<EndpointAddr>) -> Result<()> {
         let doc = self
             .registry
             .data_doc(issuer)?
@@ -579,12 +583,29 @@ impl SyncNode {
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
         let entry = docs.get_mut(&doc.id()).ok_or(UnknownIssuer { issuer })?;
-        for contact in contacts {
-            if !entry.contacts.contains(&contact) {
-                entry.contacts.push(contact);
-            }
-        }
+        entry.contacts = contacts;
         Ok(())
+    }
+
+    /// The reconciliation contacts currently tracked for `issuer`'s data
+    /// namespace — the observation side of
+    /// [`set_namespace_contacts`](Self::set_namespace_contacts), so a
+    /// scenario asserts what a sweep derived instead of sleeping and
+    /// guessing. Behind the `test-util` feature and absent from every
+    /// product build. Empty when the issuer resolves to no tracked replica.
+    #[cfg(feature = "test-util")]
+    pub fn namespace_contacts(&self, issuer: PdnId) -> Result<Vec<EndpointAddr>> {
+        let Some(doc) = self.registry.data_doc(issuer)? else {
+            return Ok(Vec::new());
+        };
+        let docs = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+        Ok(docs
+            .get(&doc.id())
+            .map(|entry| entry.contacts.clone())
+            .unwrap_or_default())
     }
 
     /// The shared precondition of both data-namespace imports: hand back

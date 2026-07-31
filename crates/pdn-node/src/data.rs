@@ -4,6 +4,9 @@
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, DocTicket, GrantRead, ShareMode};
 use pdn_types::{EntryInfo, EntryPath, PdnId};
+// The observation surface's return type; the product build has no use for it.
+#[cfg(feature = "test-util")]
+use pdn_types::NodeId;
 
 use crate::runtime::{Runtime, State};
 
@@ -108,6 +111,26 @@ impl<'rt> RuntimeDataService<'rt> {
     ) -> Result<()> {
         let state = self.runtime.state.lock().await;
         state.node.write(issuer, state.author, path, payload).await
+    }
+
+    /// The devices among the reconciliation contacts tracked for `issuer`'s
+    /// namespace, as the grant sweep derived them — observation only, for
+    /// scenarios that assert a device entered or left the set instead of
+    /// sleeping and guessing. Behind the `test-util` feature and absent from
+    /// every product build.
+    ///
+    /// Device ids, not the tracked addresses: what the set states is which
+    /// devices the replica may dial, and the type keeps the crate nameable
+    /// by a host that depends on `pdn-node` alone.
+    #[cfg(feature = "test-util")]
+    pub async fn contacts_of(&self, issuer: PdnId) -> Result<Vec<NodeId>> {
+        let state = self.runtime.state.lock().await;
+        Ok(state
+            .node
+            .namespace_contacts(issuer)?
+            .iter()
+            .map(|contact| NodeId::from_bytes(*contact.id.as_bytes()))
+            .collect())
     }
 }
 

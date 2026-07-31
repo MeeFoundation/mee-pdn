@@ -13,8 +13,10 @@ description = "Embeddable node runtime: identity, connections, data, and sync se
 # recipes turn it on. Named after tokio's `test-util` (and singular, so it
 # does not collide with the `test-utils` crate). Not `cfg(test)`:
 # integration tests compile the crate as an external dependency, where
-# `cfg(test)` is never set.
-test-util = []
+# `cfg(test)` is never set. Enables data-layer's observation surface too
+# (`RuntimeDataService::contacts_of` reads the tracked contact set through
+# it).
+test-util = ["data-layer/test-util"]
 
 [dependencies]
 anyhow = "1"

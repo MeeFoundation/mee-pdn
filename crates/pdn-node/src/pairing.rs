@@ -92,6 +92,17 @@ pub struct UnsupportedInviteVersion {
     pub version: u8,
 }
 
+/// The pairing dialogue reached the inviter and ended without an answer —
+/// a refusal, distinct from never reaching the inviter (whose failure
+/// precedes this point). Deliberately reasonless: which of wrong, expired,
+/// or already burned applied is uniform toward the dialer by design, and a
+/// connection that died mid-dialogue or a handler that failed internally
+/// surfaces exactly the same way. Downcast from the `anyhow::Error` of the
+/// connections service's `establish`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("establishment refused by the inviter")]
+pub struct EstablishmentRefused;
+
 /// The scanner's half of the dialogue: the secret, who is scanning, where
 /// to reach it, and the read ticket to the metadata store it issues toward
 /// the inviter.
@@ -360,10 +371,9 @@ pub(crate) async fn establish_via_dialogue(
         .await?;
         send.finish()?;
         // Refusals are uniform by design: the connection just closes, and
-        // this read fails without saying why.
-        read_message(&mut recv)
-            .await
-            .context("establishment refused by the inviter")
+        // this read fails without saying why — the typed marker says only
+        // that the inviter was reached and no answer came.
+        read_message(&mut recv).await.context(EstablishmentRefused)
     }
     .await;
     let response = match response {

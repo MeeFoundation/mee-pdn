@@ -12,6 +12,8 @@
 // helpers; what one binary leaves unused is not dead code of the crate.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+
 use anyhow::{ensure, Context, Result};
 use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
 use pdn_node::{
@@ -171,6 +173,11 @@ pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<Grant
 ///
 /// The crossing is a poll, not a wait: a grant's ticket payload is a blob and
 /// lags the record that names it, so `read_grants` omits it until it lands.
+///
+/// The poll hands back the grant it observed, because a second read is not
+/// the same read: a record whose payload is momentarily unfetchable reads as
+/// no grant at all — the very transient the poll exists for — so re-reading
+/// to fetch the value would put that transient back in front of every caller.
 pub async fn granted_patiently(
     gives: &Runtime,
     gives_id: PdnId,
@@ -183,21 +190,21 @@ pub async fn granted_patiently(
         .connections()
         .publish_grant(gives_id, receives_id, issuer, claims)
         .await?;
+    let observed = RefCell::new(None);
     let crossed = eventually(|| async {
-        Ok(receives
+        let found = receives
             .connections()
             .read_grants(receives_id, gives_id)
             .await?
-            .iter()
-            .any(|peer_grant| peer_grant.grant.issuer == issuer))
+            .into_iter()
+            .find(|peer_grant| peer_grant.grant.issuer == issuer);
+        let seen = found.is_some();
+        *observed.borrow_mut() = found;
+        Ok(seen)
     })
     .await?;
     ensure!(crossed, "the grant did not reach the peer over the pair");
-    receives
-        .connections()
-        .read_grants(receives_id, gives_id)
-        .await?
-        .into_iter()
-        .find(|peer_grant| peer_grant.grant.issuer == issuer)
-        .context("grant just observed, then gone")
+    observed
+        .into_inner()
+        .context("the poll reported the grant and handed back nothing")
 }

@@ -8,10 +8,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, ConnectionMetadataStore, PrivateMetadataStore, ShareMode};
+use data_layer::{
+    AddrInfoOptions, ConnectionMetadataStore, PrivateMetadataStore, ShareMode, SyncNode,
+};
 use pdn_node::{
-    ConnectionsService as _, DataService as _, DelegationUnsupported, IdentityService as _,
-    InvitePayload, Runtime, UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentRefused,
+    IdentityService as _, InvitePayload, Runtime, UnknownIdentity, UnsupportedInviteVersion,
+    INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, TIMEOUT};
@@ -75,12 +78,12 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     assert_eq!(rt_c.connections().list(z).await?, vec![x]);
 
     // The grant flow: X writes data, grants its namespace toward Y after
-    // establishment — no new pairing — and Y reads the grant, imports the
-    // carried ticket, and reads the entries.
+    // establishment — no new pairing — and Y's binder imports what the
+    // grant names, unprompted: no import act anywhere, so the read below
+    // is a test of the grant path itself.
     let path = EntryPath::new("contact/name")?;
     rt_a.data().write(x, &path, b"X").await?;
-    let grant = granted_patiently(&rt_a, x, &rt_b, y, x, common::claims_on(x, &path, true)).await?;
-    rt_b.data().import(x, grant.ticket).await?;
+    granted_patiently(&rt_a, x, &rt_b, y, x, common::claims_on(x, &path, true)).await?;
     assert!(
         eventually(|| async {
             Ok(rt_b.data().read(x, &path).await?.as_deref() == Some(&b"X"[..]))
@@ -480,6 +483,78 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     rt_a.shutdown().await?;
     rt_b.shutdown().await?;
     rt_c.shutdown().await?;
+    Ok(())
+}
+
+/// The dialer-side legibility of a refusal — the caller's half of the
+/// uniform-refusal requirement: a dialogue that reached the inviter and
+/// got no answer downcasts to the reasonless [`EstablishmentRefused`], for
+/// an expired secret, a wrong one, and a replayed one alike (one unit
+/// value, nothing separating the three), while a dial that reaches no
+/// inviter does not — so a host tells refusal from unreachable without
+/// matching error text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<()> {
+    let rt_a = Runtime::spawn().await?;
+    let rt_b = Runtime::spawn().await?;
+    let x = rt_a.identity().create().await?;
+    let y = rt_b.identity().create().await?;
+
+    // Expired: dialed, verified, refused — the marker.
+    let tiny = Some(Duration::from_millis(1));
+    let expired = rt_a.connections().invite(x, tiny).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = rt_b.connections().establish(y, expired).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<EstablishmentRefused>().is_some(),
+        "an expired-secret refusal must downcast to the marker, got: {err:#}"
+    );
+
+    // A wrong secret: the same reasonless value.
+    let live = rt_a.connections().invite(x, None).await?;
+    let forged = InvitePayload {
+        secret: [0x5a; 32],
+        ..live.clone()
+    };
+    let err = rt_b.connections().establish(y, forged).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<EstablishmentRefused>().is_some(),
+        "a wrong-secret refusal must downcast to the marker, got: {err:#}"
+    );
+
+    // A replayed secret, after the live one establishes: the same value.
+    rt_b.connections().establish(y, live.clone()).await?;
+    let err = rt_b.connections().establish(y, live).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<EstablishmentRefused>().is_some(),
+        "a replayed-secret refusal must downcast to the marker, got: {err:#}"
+    );
+
+    // A dial that reaches no inviter: the failure precedes the dialogue, so
+    // it is not the refusal. The address is a live bare node, which accepts
+    // no pairing ALPN — the handshake is rejected at once, where the address
+    // of a node that is gone would cost the transport's whole connect
+    // timeout and leave the probe asserting nothing within any shorter bound.
+    let bystander = SyncNode::spawn().await?;
+    let unreachable = InvitePayload {
+        version: INVITE_FORMAT_VERSION,
+        inviter_addr: bystander.dial_handle().addr(),
+        secret: [0x11; 32],
+        inviter: x,
+    };
+    let err = rt_b
+        .connections()
+        .establish(y, unreachable)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<EstablishmentRefused>().is_none(),
+        "a dial that reaches no inviter must not read as a refusal, got: {err:#}"
+    );
+
+    bystander.shutdown().await?;
+    rt_a.shutdown().await?;
+    rt_b.shutdown().await?;
     Ok(())
 }
 
