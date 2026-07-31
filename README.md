@@ -39,6 +39,14 @@ git clone git@github.com:MeeFoundation/pdn-store.git
 
 Builds work as-is; enable the `[patch]` block next to the `pdn-store` dependency in the workspace [`Cargo.toml`](Cargo.toml) only when you are changing `pdn-store` and debugging it alongside `pdn-node`.
 
+#### `upstream` remote (optional)
+
+Needed only to pull a new `iroh-docs` release into the fork — the repository the fork is taken from is not wired up by the clone above:
+
+```sh
+git -C pdn-store remote add upstream git@github.com:n0-computer/iroh-docs.git
+```
+
 ## Development
 
 - `just`: full list of recipes
