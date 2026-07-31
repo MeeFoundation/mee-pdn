@@ -73,11 +73,11 @@ async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<(
         err.downcast_ref::<EstablishmentRefused>().is_none(),
         "a hung dialogue never ended, so it must not read as a refusal"
     );
-    // The ceiling is 15 seconds; the transport's idle timeout is what a
-    // wait far beyond it would mean.
+    // The bound is the ceiling itself plus slack; the transport's idle
+    // timeout is what a wait far beyond it would mean.
     assert!(
-        elapsed < Duration::from_secs(25),
-        "establish took {elapsed:?} against the 15s ceiling"
+        elapsed < pdn_node::pairing::ESTABLISHMENT_DIALOGUE_TIMEOUT + Duration::from_secs(10),
+        "establish took {elapsed:?} against the dialogue ceiling"
     );
 
     hung.shutdown().await?;
