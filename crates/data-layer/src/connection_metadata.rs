@@ -397,6 +397,11 @@ impl ConnectionMetadataStore {
             if let Some(device) = device_of(entry?.key()) {
                 if iroh::EndpointId::from_bytes(device.as_bytes()).is_ok() {
                     devices.push(device);
+                } else {
+                    // Debug, not warn: the record is counterparty-written
+                    // and re-read every sweep, so a warn would let one
+                    // garbage record fill operator logs at alarm level.
+                    tracing::debug!(%device, "withheld an unresolvable device record");
                 }
             }
         }
