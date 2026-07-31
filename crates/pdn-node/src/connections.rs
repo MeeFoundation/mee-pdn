@@ -606,6 +606,10 @@ async fn refresh_replica_contacts(
     for (audience, _peer) in bound_pairs {
         if let Ok(hosted) = state.hosted(*audience) {
             siblings.extend(hosted.directory.list_devices().await?);
+        } else {
+            // A bound pair whose audience is not hosted — the unlink
+            // window; its siblings leave the set by this very derivation.
+            tracing::debug!(%audience, "skipped a bound pair whose audience is not hosted");
         }
     }
     let mut covered: HashSet<[u8; 32]> = HashSet::new();

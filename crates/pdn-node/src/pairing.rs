@@ -383,14 +383,19 @@ pub(crate) async fn establish_via_dialogue(
     // failure here is before assemble commits, so a freshly created `own` is
     // an orphan — unreferenced by directory or cache — that the reconcile
     // pass would re-sync for the node's life; forget it instead.
+    // The ticket is minted ahead of the bounded round-trip: a local act
+    // with no dependency on the inviter, kept outside the ceiling so the
+    // ceiling bounds exactly the exchange with the peer; its failure takes
+    // the same cleanup path as any round-trip failure.
+    let ticket = own
+        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await;
     // Bounded by the ceiling: a hung inviter — dialed, but never answering
     // — surfaces as the typed dialogue timeout on the same cleanup path as
     // any other round-trip failure.
-    let response: Result<PairingResponse> =
-        match tokio::time::timeout(ESTABLISHMENT_DIALOGUE_TIMEOUT, async {
-            let ticket = own
-                .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-                .await?;
+    let response: Result<PairingResponse> = match ticket {
+        Err(err) => Err(err),
+        Ok(ticket) => match tokio::time::timeout(ESTABLISHMENT_DIALOGUE_TIMEOUT, async {
             let (mut send, mut recv) = connection.open_bi().await?;
             write_message(
                 &mut send,
@@ -413,7 +418,8 @@ pub(crate) async fn establish_via_dialogue(
         {
             Ok(result) => result,
             Err(_ceiling_passed) => Err(EstablishmentTimeout.into()),
-        };
+        },
+    };
     let response = match response {
         Ok(response) => response,
         Err(err) => {

@@ -56,7 +56,7 @@ pub trait IdentityService {
     /// dialed inviter that never answers fails as
     /// [`DialogueTimeout`](crate::linking::DialogueTimeout) — and the
     /// catch-up gets what remains
-    /// ([`CatchUpTimeout`](data_layer::CatchUpTimeout)); either way the
+    /// ([`CatchUpTimeout`](crate::CatchUpTimeout)); either way the
     /// failed attempt leaves nothing behind on this runtime. A payload
     /// version this runtime does not speak ([`UnsupportedLinkingVersion`])
     /// and an identity it already hosts are refused before dialing.

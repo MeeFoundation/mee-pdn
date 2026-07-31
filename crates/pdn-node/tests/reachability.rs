@@ -27,7 +27,7 @@ use anyhow::{ensure, Context, Result};
 use data_layer::{own_ticket_kind, ConnectionMetadataStore, PrivateMetadataStore, SyncNode};
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, Runtime, ShareMode,
-    SpawnOptions,
+    SpawnOptions, UnknownIssuer,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
 use test_utils::eventually;
@@ -703,7 +703,11 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
         .withdraw_grant(alice, bob, alice)
         .await?;
     assert!(
-        eventually(|| async { Ok(rt_bob.data().read(alice, &email).await.is_err()) }).await?,
+        eventually(|| async {
+            Ok(matches!(rt_bob.data().read(alice, &email).await,
+                Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()))
+        })
+        .await?,
         "the withdrawn namespace was still bound on the audience"
     );
 
@@ -833,7 +837,11 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
         "the withdrawal toward Z was never processed"
     );
     assert!(
-        eventually(|| async { Ok(rt_shared.data().read(alice, &email).await.is_err()) }).await?,
+        eventually(|| async {
+            Ok(matches!(rt_shared.data().read(alice, &email).await,
+                Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()))
+        })
+        .await?,
         "the replica must leave with the last withdrawn grant"
     );
 
@@ -954,7 +962,8 @@ async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
 
     // The desync: replica gone, memo still naming its import.
     rt_bob.data().forget_namespace(alice).await?;
-    assert!(rt_bob.data().read(alice, &email).await.is_err());
+    assert!(matches!(rt_bob.data().read(alice, &email).await,
+        Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()));
     assert!(
         rt_bob.connections().grant_bound(bob, alice, alice).await,
         "the memo must still name the import for the desync to be the one under test"
