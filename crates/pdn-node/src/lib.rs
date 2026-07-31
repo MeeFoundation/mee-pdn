@@ -33,14 +33,17 @@ pub use connections::{
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use data_layer::{
-    claim_id_of, DocTicket, GrantedClaim, ReadGrant, ShareMode, SpawnOptions, UnknownIssuer,
+    claim_id_of, CatchUpTimeout, DocTicket, GrantedClaim, ReadGrant, ShareMode, SpawnOptions,
+    UnknownIssuer,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
-    LinkingPayload, LinkingRefused, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    DialogueTimeout, LinkingPayload, LinkingRefused, UnsupportedLinkingVersion,
+    LINKING_FORMAT_VERSION,
 };
 pub use pairing::{
-    EstablishmentRefused, InvitePayload, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    EstablishmentRefused, EstablishmentTimeout, InvitePayload, UnsupportedInviteVersion,
+    INVITE_FORMAT_VERSION,
 };
 pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
 pub use retraction::RetractionEvent;

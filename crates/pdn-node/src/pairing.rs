@@ -103,6 +103,25 @@ pub struct UnsupportedInviteVersion {
 #[error("establishment refused by the inviter")]
 pub struct EstablishmentRefused;
 
+/// The establishment dialogue did not complete within its ceiling
+/// ([`ESTABLISHMENT_DIALOGUE_TIMEOUT`]): the inviter was dialed, and the
+/// exchange was still in flight when the ceiling passed — a hung
+/// counterparty, not a refusing one ([`EstablishmentRefused`] requires the
+/// dialogue to have *ended*). The ceiling is a module constant because
+/// `establish` names no budget; without it a hung inviter would hold the
+/// caller for the transport's idle timeout. Downcast from the
+/// `anyhow::Error` of the connections service's `establish`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("establishment dialogue did not complete in time")]
+pub struct EstablishmentTimeout;
+
+/// The ceiling on the establishment round-trip: generous against any live
+/// exchange over a real network, finite so a hung counterparty cannot hold
+/// the caller beyond it. A constant rather than a parameter — `establish`
+/// names no budget, and the dial that precedes the round-trip stays under
+/// the transport's own connect handling.
+pub const ESTABLISHMENT_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The scanner's half of the dialogue: the secret, who is scanning, where
 /// to reach it, and the read ticket to the metadata store it issues toward
 /// the inviter.
@@ -353,29 +372,37 @@ pub(crate) async fn establish_via_dialogue(
     // failure here is before assemble commits, so a freshly created `own` is
     // an orphan — unreferenced by directory or cache — that the reconcile
     // pass would re-sync for the node's life; forget it instead.
-    let response: Result<PairingResponse> = async {
-        let ticket = own
-            .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+    // Bounded by the ceiling: a hung inviter — dialed, but never answering
+    // — surfaces as the typed dialogue timeout on the same cleanup path as
+    // any other round-trip failure.
+    let response: Result<PairingResponse> =
+        match tokio::time::timeout(ESTABLISHMENT_DIALOGUE_TIMEOUT, async {
+            let ticket = own
+                .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+                .await?;
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write_message(
+                &mut send,
+                &PairingRequest {
+                    version: INVITE_FORMAT_VERSION,
+                    secret: payload.secret,
+                    scanner: identity,
+                    scanner_addr: dial.addr(),
+                    ticket,
+                },
+            )
             .await?;
-        let (mut send, mut recv) = connection.open_bi().await?;
-        write_message(
-            &mut send,
-            &PairingRequest {
-                version: INVITE_FORMAT_VERSION,
-                secret: payload.secret,
-                scanner: identity,
-                scanner_addr: dial.addr(),
-                ticket,
-            },
-        )
-        .await?;
-        send.finish()?;
-        // Refusals are uniform by design: the connection just closes, and
-        // this read fails without saying why — the typed marker says only
-        // that the inviter was reached and no answer came.
-        read_message(&mut recv).await.context(EstablishmentRefused)
-    }
-    .await;
+            send.finish()?;
+            // Refusals are uniform by design: the connection just closes,
+            // and this read fails without saying why — the typed marker
+            // says only that the inviter was reached and no answer came.
+            read_message(&mut recv).await.context(EstablishmentRefused)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_ceiling_passed) => Err(EstablishmentTimeout.into()),
+        };
     let response = match response {
         Ok(response) => response,
         Err(err) => {

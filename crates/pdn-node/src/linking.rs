@@ -100,7 +100,8 @@ pub struct UnsupportedLinkingVersion {
 
 /// The linking dialogue reached the inviting device and ended without an
 /// answer — a refusal, distinct from never reaching the inviter (whose
-/// failure precedes this point) and from the catch-up timeout after a
+/// failure precedes this point), from the dialogue outliving the caller's
+/// budget ([`DialogueTimeout`]), and from the catch-up timeout after a
 /// completed dialogue ([`data_layer::CatchUpTimeout`]). Deliberately
 /// reasonless: which of wrong, expired, or already burned applied is
 /// uniform toward the dialer by design, and a connection that died
@@ -110,6 +111,19 @@ pub struct UnsupportedLinkingVersion {
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("linking refused by the inviter")]
 pub struct LinkingRefused;
+
+/// The linking dialogue did not complete within the caller's budget: the
+/// exchange was still in flight — dialing, or a dialed inviter that never
+/// answered — when the budget ran out. Distinct from [`LinkingRefused`]
+/// (the inviter was reached and the dialogue *ended*) and from
+/// [`data_layer::CatchUpTimeout`] (the dialogue completed, and the
+/// catch-up spent the rest of the budget). Without this bound a hung
+/// inviter would hold the caller for the transport's idle timeout, however
+/// small a budget the caller named. Downcast from the `anyhow::Error` of
+/// the identity service's `link`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("linking dialogue did not complete within the caller's budget")]
+pub struct DialogueTimeout;
 
 /// The new device's half of the dialogue: the format version and the
 /// secret — nothing else. In particular no node id: the inviter takes the
@@ -279,9 +293,20 @@ pub(crate) async fn link_via_dialogue(
         state.node.dial_handle()
     };
 
+    // The budget covers the whole ceremony from here: the dialogue spends
+    // from it first, the catch-up below gets what remains.
+    let deadline = tokio::time::Instant::now() + timeout;
+
     // Network — no lock held, and nothing local minted yet, so a failure
-    // anywhere up to the reply rolls back nothing.
-    let response = run_linking_dialogue(&dial, payload).await?;
+    // anywhere up to the reply rolls back nothing. Bounded by the caller's
+    // budget: a hung inviter — dialed, but never answering — surfaces as
+    // the typed dialogue timeout instead of holding the caller for the
+    // transport's idle timeout.
+    let response =
+        match tokio::time::timeout_at(deadline, run_linking_dialogue(&dial, payload)).await {
+            Ok(response) => response?,
+            Err(_budget_spent) => return Err(DialogueTimeout.into()),
+        };
 
     // Import both replicas under a brief lock — local acts, no network
     // wait. Sessions the imports start count for the catch-up below: they
@@ -320,10 +345,11 @@ pub(crate) async fn link_via_dialogue(
         }
     };
 
-    // The one bounded wait, against a peer that answered the dialogue
-    // moments ago — no lock held. Beyond it, the node's periodic reconcile
-    // pass keeps the replicas converging.
-    if let Err(err) = directory.wait_caught_up(before_import, timeout).await {
+    // The rest of the budget bounds the catch-up, against a peer that
+    // answered the dialogue moments ago — no lock held. Beyond it, the
+    // node's periodic reconcile pass keeps the replicas converging.
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if let Err(err) = directory.wait_caught_up(before_import, remaining).await {
         let state = state.lock().await;
         undo_link(
             &state.node,

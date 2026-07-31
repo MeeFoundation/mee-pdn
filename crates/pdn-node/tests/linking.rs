@@ -15,8 +15,8 @@ use data_layer::{
     ProtocolHandler, ShareMode, SyncNode,
 };
 use pdn_node::{
-    ConnectionsService as _, DataService as _, IdentityService as _, LinkingPayload,
-    LinkingRefused, Runtime, SyncService as _, UnknownIdentity, UnknownIssuer,
+    ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
+    LinkingPayload, LinkingRefused, Runtime, SyncService as _, UnknownIdentity, UnknownIssuer,
     UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
@@ -495,6 +495,76 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     probe_node.shutdown().await?;
     vanisher.shutdown().await?;
     rt_a.shutdown().await?;
+    Ok(())
+}
+
+/// A linking "inviter" that accepts the dialogue, reads the request, and
+/// never answers — holding the connection open until the dialer goes away.
+/// The harness behind the dialogue-timeout scenario: without a budget over
+/// the dialogue, a dialer against this handler waits for the transport's
+/// idle timeout.
+#[derive(Debug)]
+struct HungInviter;
+
+impl ProtocolHandler for HungInviter {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if let Ok((_send, mut recv)) = connection.accept_bi().await {
+            let _request = read_frame(&mut recv).await;
+            // Never answer; hold until the dialer closes or gives up.
+            connection.closed().await;
+        }
+        Ok(())
+    }
+}
+
+/// A hung inviter costs the caller its budget and nothing more: `link`
+/// against an inviter that reads the request and never answers fails with
+/// the typed dialogue timeout, within the named budget rather than the
+/// transport's idle timeout. The positive marker is asserted beside the
+/// two it must not read as — the refusal (the dialogue never ended) and
+/// the catch-up timeout (nothing was imported) — and the dialing runtime
+/// keeps no residue.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_inviter_costs_the_caller_its_budget_and_nothing_more() -> Result<()> {
+    let hung = SyncNode::spawn_with_protocols(vec![(LINKING_ALPN.to_vec(), Box::new(HungInviter))])
+        .await?;
+    let payload = LinkingPayload {
+        version: LINKING_FORMAT_VERSION,
+        inviter_addr: hung.dial_handle().addr(),
+        secret: [0x77; 32],
+        identity: ids::DAVE,
+    };
+
+    let rt = Runtime::spawn().await?;
+    let started = std::time::Instant::now();
+    let err = rt
+        .identity()
+        .link(payload, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        err.downcast_ref::<DialogueTimeout>().is_some(),
+        "a hung dialogue must surface as the dialogue timeout, got: {err:#}"
+    );
+    assert!(
+        err.downcast_ref::<LinkingRefused>().is_none(),
+        "a hung dialogue never ended, so it must not read as a refusal"
+    );
+    assert!(
+        err.downcast_ref::<CatchUpTimeout>().is_none(),
+        "nothing was imported, so it must not read as a catch-up timeout"
+    );
+    // The budget was one second; a wait an order of magnitude beyond it
+    // means the dialogue was not bounded by it.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "link took {elapsed:?} against a 1s budget"
+    );
+    assert_eq!(rt.sync().hosted_identities().await?, vec![]);
+
+    hung.shutdown().await?;
+    rt.shutdown().await?;
     Ok(())
 }
 

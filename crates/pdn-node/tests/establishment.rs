@@ -9,18 +9,81 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, ConnectionMetadataStore, PrivateMetadataStore, ShareMode, SyncNode,
+    AcceptError, AddrInfoOptions, Connection, ConnectionMetadataStore, PrivateMetadataStore,
+    ProtocolHandler, ShareMode, SyncNode,
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentRefused,
-    IdentityService as _, InvitePayload, Runtime, UnknownIdentity, UnsupportedInviteVersion,
-    INVITE_FORMAT_VERSION,
+    EstablishmentTimeout, IdentityService as _, InvitePayload, Runtime, UnknownIdentity,
+    UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, TIMEOUT};
 
 mod common;
-use common::{establish_patiently, granted_patiently, link_patiently, link_probe};
+use common::{
+    establish_patiently, granted_patiently, link_patiently, link_probe, read_frame, PAIRING_ALPN,
+};
+
+/// A pairing "inviter" that accepts the dialogue, reads the request, and
+/// never answers — holding the connection open until the dialer goes away.
+/// The harness behind the dialogue-ceiling scenario: without the ceiling, a
+/// dialer against this handler waits for the transport's idle timeout.
+#[derive(Debug)]
+struct HungInviter;
+
+impl ProtocolHandler for HungInviter {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if let Ok((_send, mut recv)) = connection.accept_bi().await {
+            let _request = read_frame(&mut recv).await;
+            // Never answer; hold until the dialer closes or gives up.
+            connection.closed().await;
+        }
+        Ok(())
+    }
+}
+
+/// A hung pairing inviter costs the caller the dialogue ceiling and
+/// nothing more: `establish` against an inviter that reads the request and
+/// never answers fails with the typed establishment timeout — not the
+/// refusal, whose dialogue *ended* — and within the ceiling rather than
+/// the transport's idle timeout. `establish` names no budget, so the
+/// ceiling is the module constant the marker documents.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<()> {
+    let hung = SyncNode::spawn_with_protocols(vec![(PAIRING_ALPN.to_vec(), Box::new(HungInviter))])
+        .await?;
+    let rt = Runtime::spawn().await?;
+    let y = rt.identity().create().await?;
+    let invite = InvitePayload {
+        version: INVITE_FORMAT_VERSION,
+        inviter_addr: hung.dial_handle().addr(),
+        secret: [0x55; 32],
+        inviter: ids::DAVE,
+    };
+
+    let started = std::time::Instant::now();
+    let err = rt.connections().establish(y, invite).await.unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        err.downcast_ref::<EstablishmentTimeout>().is_some(),
+        "a hung dialogue must surface as the establishment timeout, got: {err:#}"
+    );
+    assert!(
+        err.downcast_ref::<EstablishmentRefused>().is_none(),
+        "a hung dialogue never ended, so it must not read as a refusal"
+    );
+    // The ceiling is 15 seconds; the transport's idle timeout is what a
+    // wait far beyond it would mean.
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "establish took {elapsed:?} against the 15s ceiling"
+    );
+
+    hung.shutdown().await?;
+    rt.shutdown().await?;
+    Ok(())
+}
 
 /// Wait until the probe's directory lists exactly `kinds` (order-free).
 async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {

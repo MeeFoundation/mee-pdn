@@ -26,6 +26,9 @@ use test_utils::{eventually, TIMEOUT};
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
 pub const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
 
+/// The pairing ALPN, pinned by the tests on purpose (ADR-0011).
+pub const PAIRING_ALPN: &[u8] = b"/pdn/pairing/0";
+
 /// Ceiling on one linking wire frame — mirrors the protocol's own bound.
 const MAX_FRAME_LEN: u32 = 64 * 1024;
 
