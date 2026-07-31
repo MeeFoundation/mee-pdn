@@ -495,6 +495,14 @@ async fn bind_one_grant(
     } else if !memo_current || registered.is_none() {
         let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
         state.bound_grants.insert(bound, namespace);
+    } else {
+        // The issuer resolves to a replica this grant does not name: an
+        // import that arrived another way owns it, and the binder defers —
+        // re-importing here would have two owners displace each other sweep
+        // by sweep, each opening one more replica handle. The deferral ends
+        // when that import is forgotten or the grant renames its replica;
+        // logged so the waiting state is diagnosable.
+        tracing::debug!(%issuer, "grant defers to a namespace imported another way");
     }
     // The provisional-write tracker and the replica's contacts both follow
     // the issuer's published device set — refreshed even when the binding is
@@ -547,8 +555,16 @@ async fn published_issuer_devices(state: &State, bound_pairs: &[(PdnId, PdnId)])
     let mut devices = Vec::new();
     for store in stores {
         // Unreadable is indistinguishable from not-yet-replicated, and both
-        // are "this pair says nothing this sweep".
-        for device in store.published_devices().await.unwrap_or_default() {
+        // are "this pair says nothing this sweep" — logged, so a pair that
+        // stays unreadable is diagnosable.
+        let published = match store.published_devices().await {
+            Ok(published) => published,
+            Err(err) => {
+                tracing::debug!("skipped an unreadable pair in the device union: {err:#}");
+                continue;
+            }
+        };
+        for device in published {
             if seen.insert(*device.as_bytes()) {
                 devices.push(device);
             }
