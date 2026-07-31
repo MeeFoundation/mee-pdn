@@ -51,11 +51,15 @@ pub trait IdentityService {
     /// explicit act per identity: dial the payload's address on the linking
     /// ALPN, present the secret, and import the directory and data
     /// namespace from the reply. Does not return success until the imported
-    /// directory has completed one successful sync exchange — bounded by
-    /// `timeout`, after which the attempt fails and leaves nothing behind
-    /// on this runtime. A payload version this runtime does not speak
-    /// ([`UnsupportedLinkingVersion`]) and an identity it already hosts are
-    /// refused before dialing.
+    /// directory has completed one successful sync exchange. `timeout` is
+    /// the budget of the whole act: the dialogue spends from it first — a
+    /// dialed inviter that never answers fails as
+    /// [`DialogueTimeout`](crate::linking::DialogueTimeout) — and the
+    /// catch-up gets what remains
+    /// ([`CatchUpTimeout`](crate::CatchUpTimeout)); either way the
+    /// failed attempt leaves nothing behind on this runtime. A payload
+    /// version this runtime does not speak ([`UnsupportedLinkingVersion`])
+    /// and an identity it already hosts are refused before dialing.
     async fn link(&self, payload: LinkingPayload, timeout: Duration) -> Result<()>;
 }
 

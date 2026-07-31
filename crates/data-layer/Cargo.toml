@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Data layer: capability-gated document sync over our iroh-docs variant"
 
+[features]
+# Extra observation surface for scenario tests, never the product:
+# `SyncNode::namespace_contacts`, the read side of the tracked contact set,
+# so a scenario can assert what the sweep derived instead of sleeping and
+# guessing. Off in every product build; `pdn-node/test-util` turns it on.
+test-util = []
+
 [dependencies]
 anyhow = "1"
 blake3 = "1.8"
@@ -18,6 +25,7 @@ pdn-store = { workspace = true }
 pdn-types = { path = "../pdn-types" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 test-utils = { path = "../test-utils" }

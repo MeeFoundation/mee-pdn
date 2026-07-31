@@ -121,3 +121,64 @@ jobs:
           # pull_request_target the action resolves them from the event.
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}
+
+      # Stamp a visible short id onto each of the bot's inline findings:
+      # GH<n>, where n is the comment's position among all the bot's
+      # top-level review comments on this PR, ordered by comment id.
+      # GitHub ids are allocation-ordered, so this is creation order, and a
+      # position never shifts as threads get resolved — resolved findings
+      # keep their number and new ones append. The local review workflow
+      # derives the same numbering, so a PR thread and its entry in the
+      # findings file carry the same name.
+      #
+      # The invisible ocr marker stays the first line (the action dedupes
+      # incremental runs by it); the stamp lands at the head of the visible
+      # text. Idempotent: stamped comments are left alone, so a number never
+      # moves once shown. Deleting a comment (rather than resolving it)
+      # would shift the computed positions of later *unstamped* ones —
+      # stamps are applied once and trusted thereafter, which contains that
+      # drift to comments that never got one.
+      # Best-effort as a whole: the step is cosmetics, so no failure in it —
+      # pagination included, not only the per-comment updates — may redden a
+      # job whose review succeeded.
+      - name: Stamp visible finding ids
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request?.number ?? context.issue?.number;
+            if (!prNumber) return;
+            const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+            const findings = comments
+              .filter(c => c.user?.type === 'Bot'
+                && c.user?.login?.includes('github-actions')
+                && !c.in_reply_to_id
+                && c.body?.includes('<!-- ocr-'))
+              .sort((a, b) => a.id - b.id);
+            for (const [index, comment] of findings.entries()) {
+              const label = `## GH${index + 1}`;
+              const marker = comment.body.match(/^<!-- ocr-[^>]*-->[ \t]*\r?\n?/);
+              const visible = marker ? comment.body.slice(marker[0].length) : comment.body;
+              if (/^## GH\d/.test(visible)) continue;
+              const head = marker ? marker[0].replace(/[ \t]*\r?\n?$/, '\n') : '';
+              // Best-effort per comment: one vanished or mutated comment
+              // must not abort the rest of the stamping, nor redden a job
+              // whose review succeeded.
+              try {
+                await github.rest.pulls.updateReviewComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                  body: `${head}${label}\n${visible}`,
+                });
+                core.info(`stamped GH${index + 1} onto review comment ${comment.id}`);
+              } catch (err) {
+                core.warning(`failed to stamp comment ${comment.id}: ${err.message}`);
+              }
+            }

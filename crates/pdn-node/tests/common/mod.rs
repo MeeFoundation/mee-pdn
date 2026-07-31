@@ -16,13 +16,16 @@ use anyhow::{ensure, Context, Result};
 use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
 use pdn_node::{
     ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
-    PeerGrant, Runtime,
+    Runtime,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, TIMEOUT};
 
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
 pub const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
+
+/// The pairing ALPN, pinned by the tests on purpose (ADR-0011).
+pub const PAIRING_ALPN: &[u8] = b"/pdn/pairing/0";
 
 /// Ceiling on one linking wire frame — mirrors the protocol's own bound.
 const MAX_FRAME_LEN: u32 = 64 * 1024;
@@ -165,12 +168,14 @@ pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<Grant
 }
 
 /// Publish a grant of `issuer`'s namespace on `claims` from the giving
-/// side's hosted identity toward the receiving side's, and hand back the
-/// grant as the receiver reads it once it has crossed the connection's
-/// metadata pair.
-///
-/// The crossing is a poll, not a wait: a grant's ticket payload is a blob and
-/// lags the record that names it, so `read_grants` omits it until it lands.
+/// side's hosted identity toward the receiving side's, and return once the
+/// receiver reads it whole over the connection's metadata pair. The
+/// crossing is a poll, not a wait: a grant's ticket payload is a blob and
+/// lags the record that names it, so `read_grants` omits it until it
+/// lands. Delivery alone is returned; a caller that needs the grant's
+/// value reads it inside its own poll (see `scoped_grant_patiently` in the
+/// scoped-grants scenarios) — a second read after this poll is not the
+/// same read.
 pub async fn granted_patiently(
     gives: &Runtime,
     gives_id: PdnId,
@@ -178,7 +183,7 @@ pub async fn granted_patiently(
     receives_id: PdnId,
     issuer: PdnId,
     claims: NonEmpty<GrantedClaim>,
-) -> Result<PeerGrant> {
+) -> Result<()> {
     gives
         .connections()
         .publish_grant(gives_id, receives_id, issuer, claims)
@@ -188,16 +193,10 @@ pub async fn granted_patiently(
             .connections()
             .read_grants(receives_id, gives_id)
             .await?
-            .iter()
+            .into_iter()
             .any(|peer_grant| peer_grant.grant.issuer == issuer))
     })
     .await?;
     ensure!(crossed, "the grant did not reach the peer over the pair");
-    receives
-        .connections()
-        .read_grants(receives_id, gives_id)
-        .await?
-        .into_iter()
-        .find(|peer_grant| peer_grant.grant.issuer == issuer)
-        .context("grant just observed, then gone")
+    Ok(())
 }

@@ -21,6 +21,7 @@ resolver = "2"
 iroh = "1.0.2"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
+tracing = "0.1"
 # `pdn-store` is our iroh-docs variant (capability-gated ingest); the
 # package inside the repo keeps the upstream name `iroh-docs` (cheap
 # rebases), we alias it via `package`. To develop against a local
