@@ -175,6 +175,43 @@ impl<'rt> RuntimeConnectionsService<'rt> {
         let mut state = self.runtime.state.lock().await;
         state.bound_grants.remove(&(identity, peer, issuer));
     }
+
+    /// The devices the counterparty of `(identity, peer)` publishes in its
+    /// half of the metadata pair, read as the grant sweep reads them.
+    /// Observation only, for scenarios that assert the union across bound
+    /// pairs against one pair's own word — a device withdrawn in one pair
+    /// demonstrably gone from that pair's reading while the union still
+    /// carries it — instead of sleeping and guessing whether the tombstone
+    /// arrived. An unopened pair reads as publishing nothing, the same
+    /// absence the sweep sees. Behind the `test-util` feature and absent
+    /// from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn published_devices_of(&self, identity: PdnId, peer: PdnId) -> Result<Vec<NodeId>> {
+        let state = self.runtime.state.lock().await;
+        state.hosted(identity)?;
+        match state.metadata_pairs.get(&(identity, peer)) {
+            Some(open) => open.peer.published_devices().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Run one grant sweep of `(identity, peer)` now — the very act the
+    /// binder performs on a change event, invoked synchronously so a
+    /// scenario can order an assertion after a sweep that has demonstrably
+    /// seen a given record state, instead of racing the event's delivery.
+    /// Arrangement only; an unopened pair sweeps as nothing. Behind the
+    /// `test-util` feature and absent from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn sweep_pair_now(&self, identity: PdnId, peer: PdnId) -> Result<()> {
+        let mut state = self.runtime.state.lock().await;
+        state.hosted(identity)?;
+        let Some(open) = state.metadata_pairs.get(&(identity, peer)) else {
+            return Ok(());
+        };
+        let peer_store = open.peer.clone();
+        let _still_current = bind_grants(&mut state, identity, peer, &peer_store).await;
+        Ok(())
+    }
 }
 
 impl ConnectionsService for RuntimeConnectionsService<'_> {

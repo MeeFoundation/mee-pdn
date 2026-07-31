@@ -618,11 +618,27 @@ async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Resul
     );
 
     // Withdrawn in the pair toward Y alone: the pair toward Z still
-    // publishes it, so it stays. Probed after several reconcile intervals,
-    // so the sweeps that would strip it have had their chance.
+    // publishes it, so it stays. Ordered by the two readings whose
+    // divergence is the scenario's subject: first Y's pair demonstrably
+    // stops publishing the device — the tombstone reached this node — then
+    // a sweep of exactly that pair is run against the tombstoned state, and
+    // only then the union is asserted to still carry the device. Without
+    // the forced sweep the assertion would race the event-driven one and
+    // could read a set derived before the tombstone.
     let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
     withdraw_device_toward(&probe_node, &probe_dir, y, laptop_id).await?;
-    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        eventually(|| async {
+            Ok(!rt_shared
+                .connections()
+                .published_devices_of(y, alice)
+                .await?
+                .contains(&laptop_id))
+        })
+        .await?,
+        "the withdrawal toward Y never reached the audience node"
+    );
+    rt_shared.connections().sweep_pair_now(y, alice).await?;
     assert!(
         contact_present(&rt_shared, alice, laptop_id).await?,
         "a device withdrawn in one audience's pair must stay while another's pair publishes it"
