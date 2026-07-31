@@ -138,8 +138,12 @@ jobs:
       # would shift the computed positions of later *unstamped* ones —
       # stamps are applied once and trusted thereafter, which contains that
       # drift to comments that never got one.
+      # Best-effort as a whole: the step is cosmetics, so no failure in it —
+      # pagination included, not only the per-comment updates — may redden a
+      # job whose review succeeded.
       - name: Stamp visible finding ids
         if: always()
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
