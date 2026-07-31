@@ -163,11 +163,18 @@ jobs:
               const visible = marker ? comment.body.slice(marker[0].length) : comment.body;
               if (/^## GH\d/.test(visible)) continue;
               const head = marker ? marker[0].replace(/[ \t]*\r?\n?$/, '\n') : '';
-              await github.rest.pulls.updateReviewComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: comment.id,
-                body: `${head}${label}\n${visible}`,
-              });
-              core.info(`stamped GH${index + 1} onto review comment ${comment.id}`);
+              // Best-effort per comment: one vanished or mutated comment
+              // must not abort the rest of the stamping, nor redden a job
+              // whose review succeeded.
+              try {
+                await github.rest.pulls.updateReviewComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                  body: `${head}${label}\n${visible}`,
+                });
+                core.info(`stamped GH${index + 1} onto review comment ${comment.id}`);
+              } catch (err) {
+                core.warning(`failed to stamp comment ${comment.id}: ${err.message}`);
+              }
             }
