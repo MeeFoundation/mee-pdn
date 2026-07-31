@@ -19,6 +19,7 @@ resolver = "2"
 [workspace.dependencies]
 # The iroh stack is pinned here so every consumer agrees.
 iroh = "1.0.2"
+tracing = "0.1"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 # `pdn-store` is our iroh-docs variant (capability-gated ingest); the

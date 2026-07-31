@@ -35,7 +35,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 # Retraction verdicts warn through the ecosystem's subscriber; already in
 # the graph via iroh.
-tracing = "0.1"
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The retraction event's content hash is the payload's blake3 hash, and a
