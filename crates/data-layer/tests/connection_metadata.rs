@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, GrantedClaim,
+    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, EndpointId, GrantedClaim,
     PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
-use pdn_types::{EntryPath, NonEmpty, PdnId};
+use pdn_types::{EntryPath, NodeId, NonEmpty, PdnId};
 use test_utils::{eventually, ids, wait_entry_is};
 
 /// The reconcile cadence the sibling-serving scenario runs at. A grantee
@@ -444,6 +444,39 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
     // Deliberate re-assertion is a distinct act and still works.
     own.publish_device(device).await?;
     assert_eq!(own.published_devices().await?, vec![device]);
+
+    alice.shutdown().await?;
+    Ok(())
+}
+
+/// A `devices/` key is the counterparty's word, and a `NodeId` carries any
+/// 32 bytes — about half of them decompress into no curve point. Such a
+/// record withholds itself and never the set: consumers convert the
+/// published set into endpoint ids without error handling, and without
+/// this boundary one garbage record would cost every audience of the
+/// replica its whole derived contact set. The garbage record is written
+/// through the product surface itself — `publish_device` accepts the
+/// opaque id — so the denial is the boundary's, not the writer's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
+    let alice = SyncNode::spawn().await?;
+    let own = ConnectionMetadataStore::create(&alice).await?;
+
+    let device = alice.node_id();
+    own.publish_device(device).await?;
+    // The first constant-byte pattern that decompresses into no curve
+    // point — deterministic, and the search ends within a few steps.
+    let garbage = (0u8..=255)
+        .map(|byte| [byte; 32])
+        .find(|bytes| EndpointId::from_bytes(bytes).is_err())
+        .expect("half of all byte strings are off-curve");
+    own.publish_device(NodeId::from_bytes(garbage)).await?;
+
+    assert_eq!(
+        own.published_devices().await?,
+        vec![device],
+        "an unresolvable device record must be withheld, and the resolvable one kept"
+    );
 
     alice.shutdown().await?;
     Ok(())

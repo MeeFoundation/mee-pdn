@@ -383,14 +383,21 @@ impl ConnectionMetadataStore {
     }
 
     /// The devices the issuing identity has published (record-level —
-    /// available as soon as the records sync).
+    /// available as soon as the records sync). Only devices that resolve
+    /// into endpoint ids leave here: the key is the counterparty's word,
+    /// and this boundary is what lets every consumer convert the set
+    /// without error handling — one garbage key withholds itself, never
+    /// the set, where a conversion failure downstream would cost the whole
+    /// derived contact set of everyone sharing the replica.
     pub async fn published_devices(&self) -> Result<Vec<NodeId>> {
         let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
         let mut devices = Vec::new();
         while let Some(entry) = stream.next().await {
             if let Some(device) = device_of(entry?.key()) {
-                devices.push(device);
+                if iroh::EndpointId::from_bytes(device.as_bytes()).is_ok() {
+                    devices.push(device);
+                }
             }
         }
         Ok(devices)
