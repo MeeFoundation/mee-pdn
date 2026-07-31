@@ -96,9 +96,10 @@ pub struct UnsupportedInviteVersion {
 /// a refusal, distinct from never reaching the inviter
 /// ([`InviterUnreachable`], whose failure precedes this point). Deliberately reasonless: which of wrong, expired,
 /// or already burned applied is uniform toward the dialer by design, and a
-/// connection that died mid-dialogue or a handler that failed internally
-/// surfaces exactly the same way. Downcast from the `anyhow::Error` of the
-/// connections service's `establish`.
+/// connection that dies once the request is away — or a handler that fails
+/// internally — surfaces exactly the same way; a death before the request
+/// is away fails the send instead, unmarked. Downcast from the
+/// `anyhow::Error` of the connections service's `establish`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("establishment refused by the inviter")]
 pub struct EstablishmentRefused;
