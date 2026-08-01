@@ -128,6 +128,12 @@ If a token expires or is compromised:
 - `gh` CLI (GitHub CLI)
 - Access to GitHub Packages / Container Registry
 
+Check:
+
+```sh
+gh repo view MeeFoundation/mia-docs --json name,visibility
+```
+
 ### CLAUDE_CODE_OAUTH_TOKEN
 
 - `claude` command inside devcontainer
