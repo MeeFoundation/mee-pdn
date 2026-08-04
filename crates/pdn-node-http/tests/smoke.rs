@@ -105,10 +105,10 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
         // The identifiers above are malformed and the bodies empty, so every
         // route refuses — what matters is that it is the handler refusing and
         // not the router.
-        assert_ne!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "{method} {path} must be served with the flag on"
+        assert!(
+            response.status().is_client_error(),
+            "{method} {path} must refuse with a client error when served with the flag on, got {}",
+            response.status()
         );
     }
 
