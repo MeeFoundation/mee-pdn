@@ -249,13 +249,14 @@ The template below is in English. When the review language is something else, th
 
 <One line, only when the run did not reach its own end: "Review cut at the 50-minute budget." or "Review finalized early on request.">
 
-**How to keep this file.** A closed finding is marked `[DONE <dd-mm>]` in its heading, the account of the fix is appended to it under a "What was done" block, and its line in the fixing order is struck through. The text of the finding is not deleted — it stays as the thing the fix is checked against. Finding numbers live only as long as this file: `.code-review/` is not under git, so nothing that is — no code, no documentation — may reference an `F<n>`, which would resolve to nothing for anyone without this file. A comment or a spec line that wants to cite a finding inlines its substance instead.
+**How to keep this file.** A closed finding is marked `[DONE <dd-mm>]` in its heading, the account of the fix is appended to it under a "What was done" block, and its line in the fixing order is struck through. The text of the finding is not deleted — it stays as the thing the fix is checked against. Finding numbers live only as long as this file: `.code-review/` is not under git, so nothing that is — no code, no documentation — may reference an `F<n>`, which would resolve to nothing for anyone without this file. A comment or a spec line that wants to cite a finding inlines its substance instead. Between one fix and the next the touched tests are stressed briefly and narrowly — a set cut down to what that fix reaches, minutes rather than tens of minutes — and what came back is recorded in that fix's "What was done" block; the full pass is its own item in the fixing order, never something a single fix claims in passing.
 
 ## Fixing order
 
 - **[F<n>](#f<n>) — <what>.** <One or two lines: why first, what is risked by deferring it.>
 - **[F<n>](#f<n>) + [F<m>](#f<m>) — <what>.** <Why in one pass.>
 - ...
+- **<A full stress pass — its own item, last, and sized in tens of minutes. Include it whenever the findings imply fixes deep enough for the flaky-test practice to bite — sync, the actor, engine wiring, storage, a dependency bump. Say what the set covers, why the short runs between fixes do not stand in for it, and that its failures only mean anything on a machine doing nothing else: a competing build or a laptop going to sleep turns a network-dependent integration test into noise.>**
 
 <A paragraph on couplings, if any: which fixes open other findings, which forks need a human decision before code is written.>
 
