@@ -2810,6 +2810,8 @@ dependencies = [
  "anyhow",
  "axum",
  "pdn-node",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
 ]
