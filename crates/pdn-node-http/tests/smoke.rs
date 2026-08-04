@@ -38,6 +38,15 @@ const DEBUG_ROUTES: &[(&str, &str)] = &[
     ("GET", "/debug/data/aa/contact/email"),
 ];
 
+/// The three routes above that carry no identifier to malform: they succeed
+/// unconditionally, so the gate-exists test below checks them for success
+/// rather than for the refusal every other route produces.
+const DEBUG_ROUTES_WITHOUT_IDENTIFIERS: &[(&str, &str)] = &[
+    ("GET", "/debug/status"),
+    ("POST", "/debug/identities"),
+    ("GET", "/debug/identities"),
+];
+
 /// Close the endpoint: the router goes first, because it holds the other
 /// reference to the runtime and shutdown needs sole ownership. Skipping the
 /// shutdown leaves the endpoint and every task a created identity spawned
@@ -103,13 +112,18 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
             )
             .await?;
         // The identifiers above are malformed and the bodies empty, so every
-        // route refuses — what matters is that it is the handler refusing and
-        // not the router.
-        assert!(
-            response.status().is_client_error(),
-            "{method} {path} must refuse with a client error when served with the flag on, got {}",
-            response.status()
-        );
+        // route with one refuses; the three without one succeed, and what
+        // matters for the rest is that it is the handler refusing and not
+        // the router.
+        if DEBUG_ROUTES_WITHOUT_IDENTIFIERS.contains(&(*method, *path)) {
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+        } else {
+            assert!(
+                response.status().is_client_error(),
+                "{method} {path} must refuse with a client error when served with the flag on, got {}",
+                response.status()
+            );
+        }
     }
 
     shutdown(runtime, app).await?;

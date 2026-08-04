@@ -49,7 +49,7 @@ async fn stop_signal() {
             }
             Err(e) => {
                 eprintln!("warn: failed to register SIGTERM handler: {e}; Ctrl-C only");
-                std::future::pending::<()>().await
+                std::future::pending::<()>().await;
             }
         }
     };
