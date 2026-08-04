@@ -47,8 +47,10 @@ async fn stop_signal() {
             Ok(mut term) => {
                 let _ = term.recv().await;
             }
-            // Nothing to listen on; the interrupt half still answers.
-            Err(_) => std::future::pending::<()>().await,
+            Err(e) => {
+                eprintln!("warn: failed to register SIGTERM handler: {e}; Ctrl-C only");
+                std::future::pending::<()>().await
+            }
         }
     };
     #[cfg(not(unix))]
