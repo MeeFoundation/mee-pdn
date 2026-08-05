@@ -83,8 +83,12 @@ async fn a_device_joins_over_http() -> Result<()> {
     );
 
     // Denied (a host that never linked): addressing the identity's namespace
-    // is refused as unknown, not answered as absent.
-    let outsider = bystander
+    // is refused as unknown, not answered as absent. A fresh host, not
+    // `bystander` — `bystander` already attempted a link, and a residual
+    // effect of that refused attempt could pass this check for the wrong
+    // reason.
+    let stranger = Host::spawn().await?;
+    let outsider = stranger
         .get(&format!("/debug/data/{identity}/contact/email"))
         .await?;
     assert_eq!(
@@ -95,6 +99,7 @@ async fn a_device_joins_over_http() -> Result<()> {
         outsider.text()
     );
 
+    stranger.shutdown().await?;
     bystander.shutdown().await?;
     second.shutdown().await?;
     first.shutdown().await?;

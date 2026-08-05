@@ -1045,3 +1045,123 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     rt_carol.shutdown().await?;
     Ok(())
 }
+
+/// An issuer linked onto the same node as its own grant's audience keeps its
+/// own access: the write is not judged by the grant it made, and withdrawing
+/// that grant narrows the audience's access without forgetting the issuer's
+/// own namespace — even though this node's grant-binder memo carries a
+/// record keyed by that same issuer once the sweep runs. Forces the sweep
+/// deterministically via `sweep_pair_now`/`grant_bound`, so this test compiles
+/// only under the `test-util` feature — the `just` recipes turn it on.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario: link, own access, withdrawal, negative control
+async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Result<()> {
+    let rt_x_device = Runtime::spawn().await?;
+    let rt_shared = Runtime::spawn().await?;
+
+    // X and Y connect and X grants Y read-only access to one path while each
+    // still lives on its own node — linking two identities directly onto one
+    // node is not reachable; the only path in is a connection made while
+    // apart, followed by a link that brings one of them over.
+    let x = rt_x_device.identity().create().await?;
+    let y = rt_shared.identity().create().await?;
+    let invite = rt_x_device.connections().invite(x, None).await?;
+    establish_patiently(&rt_shared, y, &rt_x_device, x, invite).await?;
+
+    let granted_path = EntryPath::new("contact/email")?;
+    rt_x_device
+        .data()
+        .write(x, &granted_path, b"x@example.org")
+        .await?;
+    granted_patiently(
+        &rt_x_device,
+        x,
+        &rt_shared,
+        y,
+        x,
+        common::claims_on(x, &granted_path, false),
+    )
+    .await?;
+    assert!(
+        eventually(|| async {
+            Ok(rt_shared.data().read(x, &granted_path).await?.as_deref()
+                == Some(&b"x@example.org"[..]))
+        })
+        .await?,
+        "the granted namespace never synced — the premise of this test, not its subject"
+    );
+
+    // X is now added to the same node Y lives on.
+    link_patiently(&rt_shared, &rt_x_device, x).await?;
+    let hosted = rt_shared.sync().hosted_identities().await?;
+    assert!(
+        hosted.len() == 2 && hosted.contains(&x) && hosted.contains(&y),
+        "the shared node must host both X and Y after the link: {hosted:?}"
+    );
+
+    // Force the memo adoption the grant binder would otherwise do on its own
+    // schedule, so the assertions below exercise the exact record shape the
+    // bug reproduced on — a `(y, x, x)` binding, keyed by X as issuer, that
+    // now sits beside X's own hosted namespace.
+    rt_shared.connections().sweep_pair_now(y, x).await?;
+    assert!(
+        rt_shared.connections().grant_bound(y, x, x).await,
+        "the sweep must have adopted the memo entry keyed by X as issuer — the premise of this test"
+    );
+
+    // X writes and reads its own data on the node it now shares with Y: the
+    // write is not refused by the grant courtesy check, even though that
+    // check's own key space now contains an entry naming X as issuer.
+    let own_path = EntryPath::new("notes/diary")?;
+    rt_shared.data().write(x, &own_path, b"dear diary").await?;
+    assert_eq!(
+        rt_shared.data().read(x, &own_path).await?.as_deref(),
+        Some(&b"dear diary"[..]),
+        "X's own write on the shared node must not be refused by its own grant to Y"
+    );
+
+    // Withdraw the grant on the shared node itself — X is hosted there too
+    // — and force the revoke sweep. Withdrawing on `rt_x_device` instead
+    // would race the same replication the setup above already waited out.
+    // It must narrow Y's access without forgetting X's own namespace.
+    rt_shared.connections().withdraw_grant(x, y, x).await?;
+    rt_shared.connections().sweep_pair_now(y, x).await?;
+    assert!(
+        !rt_shared.connections().grant_bound(y, x, x).await,
+        "the withdrawn grant must leave the binder's memo"
+    );
+    assert_eq!(
+        rt_shared.data().read(x, &own_path).await?.as_deref(),
+        Some(&b"dear diary"[..]),
+        "revoking the grant to Y must not forget X's own namespace"
+    );
+    let after_withdrawal = EntryPath::new("contact/phone")?;
+    rt_shared
+        .data()
+        .write(x, &after_withdrawal, b"still mine")
+        .await?;
+    assert_eq!(
+        rt_shared
+            .data()
+            .read(x, &after_withdrawal)
+            .await?
+            .as_deref(),
+        Some(&b"still mine"[..]),
+        "X must still be able to write its own data after the grant to Y is withdrawn"
+    );
+
+    // Paired deny, the tightest unauthorized party: a node with no
+    // connection to X at all is refused as unknown, not served an absence.
+    let rt_outsider = Runtime::spawn().await?;
+    let err = rt_outsider.data().read(x, &own_path).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<UnknownIssuer>().is_some(),
+        "an outsider must be refused as unknown, got: {err:#}"
+    );
+
+    rt_outsider.shutdown().await?;
+    rt_x_device.shutdown().await?;
+    rt_shared.shutdown().await?;
+    Ok(())
+}

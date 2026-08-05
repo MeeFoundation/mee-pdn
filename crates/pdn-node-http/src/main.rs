@@ -7,31 +7,25 @@
 
 use std::sync::Arc;
 
-use anyhow::anyhow;
 use pdn_node::Runtime;
-use pdn_node_http::{bind_addr_from_env, router};
+use pdn_node_http::{bind_addr_from_env, debug_enabled_from_env, router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(Runtime::spawn().await?);
 
-    let debug = std::env::var("PDN_DEBUG").is_ok_and(|v| v == "1" || v == "true");
-    let app = router(Arc::clone(&runtime), debug);
+    let app = router(Arc::clone(&runtime), debug_enabled_from_env()?);
 
     let listener = tokio::net::TcpListener::bind(bind_addr_from_env()?).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(stop_signal())
         .await?;
 
-    // Serve has returned and every handler with it, so the runtime is ours
-    // again; close the endpoint cleanly. Sole ownership is required, not
-    // hoped for: skipping the shutdown leaves the endpoint and every task a
-    // hosted identity spawned running while the process tries to exit,
-    // which holds the exit for minutes.
-    Arc::try_unwrap(runtime)
-        .map_err(|_| anyhow!("a handler still holds the runtime"))?
-        .shutdown()
-        .await
+    // Close the endpoint cleanly. `shutdown` needs no exclusive ownership —
+    // skipping it anyway leaves the endpoint and every task a hosted
+    // identity spawned running while the process tries to exit, which holds
+    // the exit for minutes.
+    runtime.shutdown().await
 }
 
 /// Whichever of Ctrl-C and SIGTERM arrives first. A container stop sends
@@ -39,7 +33,15 @@ async fn main() -> anyhow::Result<()> {
 /// deployment that has it.
 async fn stop_signal() {
     let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "failed to install Ctrl-C handler: {e}; waiting on other signals only"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
     };
     #[cfg(unix)]
     let terminate = async {
@@ -48,7 +50,7 @@ async fn stop_signal() {
                 let _ = term.recv().await;
             }
             Err(e) => {
-                eprintln!("warn: failed to register SIGTERM handler: {e}; Ctrl-C only");
+                tracing::warn!("failed to register SIGTERM handler: {e}; Ctrl-C only");
                 std::future::pending::<()>().await;
             }
         }

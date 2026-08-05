@@ -41,6 +41,27 @@ pub fn bind_addr_from_env() -> Result<SocketAddr> {
     bind_addr(host.as_deref(), port.as_deref())
 }
 
+/// Resolve the debug-surface flag from `PDN_DEBUG`, `None` being unset —
+/// the surface stays off. A closed set of values means on (`"1"`, `"true"`)
+/// or off (`"0"`, `"false"`); anything else fails rather than falling back,
+/// for the same reason [`bind_addr`] does: a typo that silently read as
+/// "off" would turn the whole `/debug/` subtree into what looks like a
+/// renamed route, not an unset flag.
+pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        Some("1" | "true") => Ok(true),
+        None | Some("0" | "false") => Ok(false),
+        Some(other) => Err(anyhow::anyhow!(
+            "PDN_DEBUG must be one of 1, true, 0, false, or unset — got {other:?}"
+        )),
+    }
+}
+
+/// [`debug_enabled`] over this process's own environment: `PDN_DEBUG`.
+pub fn debug_enabled_from_env() -> Result<bool> {
+    debug_enabled(std::env::var("PDN_DEBUG").ok().as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +93,25 @@ mod tests {
     fn an_unparseable_value_fails_instead_of_defaulting() {
         assert!(bind_addr(None, Some("http")).is_err());
         assert!(bind_addr(Some("not a host"), None).is_err());
+    }
+
+    #[test]
+    fn nothing_configured_is_off() {
+        assert!(!debug_enabled(None).unwrap());
+    }
+
+    #[test]
+    fn a_configured_value_is_taken_as_given() {
+        assert!(debug_enabled(Some("1")).unwrap());
+        assert!(debug_enabled(Some("true")).unwrap());
+        assert!(!debug_enabled(Some("0")).unwrap());
+        assert!(!debug_enabled(Some("false")).unwrap());
+    }
+
+    #[test]
+    fn an_unrecognized_value_fails_instead_of_defaulting_to_off() {
+        assert!(debug_enabled(Some("yes")).is_err());
+        assert!(debug_enabled(Some("TRUE")).is_err());
+        assert!(debug_enabled(Some(" 1")).is_err());
     }
 }

@@ -77,6 +77,7 @@ pub const LINKING_FORMAT_VERSION: u8 = 0;
 /// access; a photographed payload expires with its secret. The bootstrap
 /// tickets ride the dialogue's encrypted reply instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkingPayload {
     /// Payload format version ([`LINKING_FORMAT_VERSION`]).
     pub version: u8,
@@ -314,7 +315,9 @@ pub(crate) async fn link_via_dialogue(
     // wait. Sessions the imports start count for the catch-up below: they
     // start after this instant.
     let before_import = SystemTime::now();
-    let (directory, data_import) = {
+    let rollback_state = Arc::clone(state);
+    let mut rollback;
+    let directory = {
         let state = state.lock().await;
         // The inviter's address is a live first-sync contact for the
         // imported directory, exactly as a peer's address is in
@@ -322,6 +325,7 @@ pub(crate) async fn link_via_dialogue(
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
         let directory = PrivateMetadataStore::import(&state.node, directory_ticket).await?;
+        rollback = LinkRollbackGuard::new(rollback_state, payload.identity, directory.namespace());
         // Armed before the data namespace exists: the moment the import
         // below registers the binding, sessions are judged through this
         // directory — a still-catching-up book refuses callers it cannot
@@ -330,6 +334,7 @@ pub(crate) async fn link_via_dialogue(
         // long-lived namespace id.
         if let Err(err) = state.node.host_identity(payload.identity, &directory) {
             undo_link(&state.node, payload.identity, directory.namespace(), None).await;
+            rollback.disarm();
             return Err(err);
         }
         match state
@@ -337,19 +342,24 @@ pub(crate) async fn link_via_dialogue(
             .import_namespace(payload.identity, response.data)
             .await
         {
-            Ok(data_import) => (directory, data_import),
+            Ok(data_import) => rollback.set_data_import(data_import),
             Err(err) => {
                 // The rollback begins with the import: a directory whose
                 // sibling import failed must not survive it.
                 undo_link(&state.node, payload.identity, directory.namespace(), None).await;
+                rollback.disarm();
                 return Err(err);
             }
         }
+        directory
     };
 
     // The rest of the budget bounds the catch-up, against a peer that
     // answered the dialogue moments ago — no lock held. Beyond it, the
-    // node's periodic reconcile pass keeps the replicas converging.
+    // node's periodic reconcile pass keeps the replicas converging. No lock
+    // is held here either, so a cancellation in this stretch is exactly
+    // what `rollback`'s `Drop` exists for — the explicit branch below only
+    // covers a *completed* wait that came back `Err`.
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if let Err(err) = directory.wait_caught_up(before_import, remaining).await {
         let state = state.lock().await;
@@ -357,9 +367,10 @@ pub(crate) async fn link_via_dialogue(
             &state.node,
             payload.identity,
             directory.namespace(),
-            Some(data_import),
+            rollback.take_data_import(),
         )
         .await;
+        rollback.disarm();
         return Err(err).context("the imported directory did not catch up in time");
     }
 
@@ -380,9 +391,10 @@ pub(crate) async fn link_via_dialogue(
                 &guard.node,
                 payload.identity,
                 directory.namespace(),
-                Some(data_import),
+                rollback.take_data_import(),
             )
             .await;
+            rollback.disarm();
             return Err(err);
         }
     };
@@ -390,7 +402,71 @@ pub(crate) async fn link_via_dialogue(
         .identities
         .insert(payload.identity, HostedIdentity { directory });
     crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
+    rollback.disarm();
     Ok(())
+}
+
+/// Rolls back a link's local effects if the future driving [`link_via_dialogue`]
+/// is dropped before it disarms — a caller giving up or a task aborted skips
+/// every explicit `if let Err`/success branch above, so this is the only
+/// thing that runs [`undo_link`] in that case. `Drop` is synchronous and the
+/// rollback is not, so a still-armed guard spawns a detached task to run it
+/// — a new, explicit dependency on an ambient Tokio runtime this ceremony
+/// did not need before.
+struct LinkRollbackGuard {
+    state: Arc<Mutex<State>>,
+    identity: PdnId,
+    directory_namespace: NamespaceId,
+    data_import: Option<NamespaceImport>,
+    armed: bool,
+}
+
+impl LinkRollbackGuard {
+    fn new(state: Arc<Mutex<State>>, identity: PdnId, directory_namespace: NamespaceId) -> Self {
+        Self {
+            state,
+            identity,
+            directory_namespace,
+            data_import: None,
+            armed: true,
+        }
+    }
+
+    /// Record that the data-namespace import has succeeded, so a rollback
+    /// from here on undoes it too.
+    fn set_data_import(&mut self, data_import: NamespaceImport) {
+        self.data_import = Some(data_import);
+    }
+
+    /// Hand the data import to a caller running its own synchronous
+    /// rollback — the guard no longer needs to carry it once that rollback
+    /// runs.
+    fn take_data_import(&mut self) -> Option<NamespaceImport> {
+        self.data_import.take()
+    }
+
+    /// The ceremony reached a normal return — commit or an error branch
+    /// with its own already-`await`ed cleanup — so the drop below must do
+    /// nothing.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LinkRollbackGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let identity = self.identity;
+        let directory_namespace = self.directory_namespace;
+        let data_import = self.data_import.take();
+        tokio::spawn(async move {
+            let state = state.lock().await;
+            undo_link(&state.node, identity, directory_namespace, data_import).await;
+        });
+    }
 }
 
 /// The network half of `link`: dial the inviter on the linking ALPN,

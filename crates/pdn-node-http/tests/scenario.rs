@@ -27,7 +27,7 @@ use std::cell::RefCell;
 
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node_http::shapes::{Connections, Entries, PeerGrants};
+use pdn_node_http::shapes::{Connections, Entries, GrantCapability, PeerGrants};
 
 mod common;
 use common::{body, entry_answers, entry_reads, eventually, grant_on, Host};
@@ -117,20 +117,26 @@ async fn the_whole_scenario_runs_over_http() -> Result<()> {
     let raw = observed
         .into_inner()
         .context("the poll reported the grant and handed back nothing")?;
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    assert!(
-        !text.contains("ticket"),
-        "no namespace ticket may cross the surface: {text}"
-    );
-    let grants: PeerGrants = serde_json::from_slice(&raw)?;
+    // No namespace ticket may cross the surface, whatever a leaked field
+    // happened to be named: `GrantCapability` denies unknown fields, so a
+    // response carrying anything beyond issuer/audience/claims — ticket
+    // included — fails to decode here rather than passing unnoticed.
+    let grants: PeerGrants = serde_json::from_slice(&raw).context(
+        "the grants response carried an unexpected field — a namespace ticket, most likely",
+    )?;
     let capability = grants
         .grants
         .iter()
         .find(|grant| grant.issuer == x)
         .context("the poll's answer must carry the grant it reported")?;
-    assert_eq!(capability.audience, y);
+    let GrantCapability {
+        issuer: _,
+        audience,
+        claims,
+    } = capability;
+    assert_eq!(*audience, y);
     assert!(
-        capability.claims.iter().all(|claim| !claim.write),
+        claims.iter().all(|claim| !claim.write),
         "the published grant is read-only: {capability:?}"
     );
 
@@ -215,6 +221,18 @@ async fn the_whole_scenario_runs_over_http() -> Result<()> {
         "an unknown query parameter must be refused, got {}: {}",
         mistyped.status,
         mistyped.text()
+    );
+    // The same rule holds on a route that takes no query parameter of its
+    // own: an unknown one is still refused, not silently ignored.
+    let unexpected = inviter
+        .get(&format!("/debug/identities/{x}/connections?oops=1"))
+        .await?;
+    assert_eq!(
+        unexpected.status,
+        StatusCode::BAD_REQUEST,
+        "an unknown query parameter on a parameter-less route must be refused, got {}: {}",
+        unexpected.status,
+        unexpected.text()
     );
 
     // Withdrawal, the counterpart of the grant above: the grantee's binder

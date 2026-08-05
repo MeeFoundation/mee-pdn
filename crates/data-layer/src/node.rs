@@ -180,8 +180,10 @@ pub struct SyncNode {
     /// consumer ([`SyncNode::take_retraction_verdicts`]).
     retraction_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>>>,
     /// Ends the periodic reconcile pass when dropped — with the node — or by
-    /// the explicit send in [`SyncNode::shutdown`].
-    reconciler_stop: oneshot::Sender<()>,
+    /// the explicit send in [`SyncNode::shutdown`]. Taken once: a second
+    /// `shutdown` call finds `None` and skips the send, making the method
+    /// idempotent under a shared reference.
+    reconciler_stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 /// How a tracked doc re-syncs — independent of the binding's serving
@@ -359,7 +361,7 @@ impl SyncNode {
             nudges_in_flight: Arc::default(),
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
-            reconciler_stop,
+            reconciler_stop: Mutex::new(Some(reconciler_stop)),
         })
     }
 
@@ -1029,11 +1031,21 @@ impl SyncNode {
         Ok(entries)
     }
 
-    /// Shut the node down, closing the endpoint and all protocols.
-    pub async fn shutdown(self) -> Result<()> {
+    /// Shut the node down, closing the endpoint and all protocols. Takes
+    /// `&self`: no exclusive ownership is required, and a repeat call is a
+    /// no-op (the reconcile-stop send only fires once; the router's own
+    /// shutdown is already idempotent).
+    pub async fn shutdown(&self) -> Result<()> {
         // Stop the reconcile pass first so it does not race the docs
         // engine's shutdown with fresh sync requests.
-        let _ = self.reconciler_stop.send(());
+        if let Some(stop) = self
+            .reconciler_stop
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            let _ = stop.send(());
+        }
         self.router.shutdown().await?;
         Ok(())
     }

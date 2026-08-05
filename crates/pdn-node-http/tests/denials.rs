@@ -176,13 +176,28 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         Bytes::from_static(b"x@example.org"),
         "the refused write must not touch the grantee's own replica"
     );
+    // Sentinel: a control write to the same path proves a completed
+    // two-way session ran after the refusal, before the issuer-side read
+    // below is trusted to say anything about delivery rather than about
+    // timing — an unpolled read right after the refusal could pass whether
+    // or not the bad write was ever going to arrive.
+    inviter
+        .put(
+            &format!("/debug/data/{x}/contact/email"),
+            body(b"x@new.example.org"),
+        )
+        .await?
+        .ok()?;
+    entry_reads(&scanner, x, "contact/email", b"x@new.example.org")
+        .await
+        .context("the sentinel update did not reach the grantee")?;
     let issuer_side = inviter
         .get(&format!("/debug/data/{x}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
         issuer_side,
-        Bytes::from_static(b"x@example.org"),
+        Bytes::from_static(b"x@new.example.org"),
         "the refused write must never reach the issuer"
     );
 

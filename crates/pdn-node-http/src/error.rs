@@ -56,10 +56,16 @@ impl HostError {
 
 impl From<anyhow::Error> for HostError {
     fn from(err: anyhow::Error) -> Self {
-        Self {
-            status: status_of(&err),
-            message: format!("{err:#}"),
+        let status = status_of(&err);
+        let message = format!("{err:#}");
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            // The pessimistic default means this host does not understand
+            // what happened; the response carries the same text it always
+            // has, but with no logging facility in this crate, this is the
+            // only server-side record of the failure an operator gets.
+            tracing::error!("unmapped host error: {message}");
         }
+        Self { status, message }
     }
 }
 

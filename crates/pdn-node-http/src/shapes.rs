@@ -19,9 +19,35 @@ use std::time::Duration;
 use pdn_node::{EntryInfo, GrantedClaim, PdnId, ReadGrant};
 use serde::{Deserialize, Serialize};
 
+use crate::error::HostError;
+
 /// The budget of a whole `link` act — its dialogue and its catch-up — when
 /// the caller names none.
 const DEFAULT_LINK_BUDGET: Duration = Duration::from_secs(30);
+
+/// The widest duration a caller may name for a lifetime or a budget —
+/// generous, and nowhere near the point where adding it to the runtime's
+/// current instant would overflow.
+const MAX_DURATION_SECS: u64 = 24 * 60 * 60;
+
+/// A caller-supplied duration in seconds, rejecting the two values that
+/// would otherwise produce a confusing no-op or a downstream panic instead
+/// of a clean refusal: zero (an already-expired invite, a budget that times
+/// out immediately) and anything past [`MAX_DURATION_SECS`] (which would
+/// overflow `Instant + Duration` in the runtime rather than fail here).
+fn duration_in_range(secs: u64) -> Result<Duration, HostError> {
+    if secs == 0 {
+        return Err(HostError::bad_request(
+            "a duration of 0 seconds is not allowed",
+        ));
+    }
+    if secs > MAX_DURATION_SECS {
+        return Err(HostError::bad_request(format!(
+            "a duration must be at most {MAX_DURATION_SECS} seconds, got {secs}"
+        )));
+    }
+    Ok(Duration::from_secs(secs))
+}
 
 /// The identity a create call minted.
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,8 +81,9 @@ pub struct Lifetime {
 
 impl Lifetime {
     /// The lifetime as the service takes it: `None` means "your default".
-    pub fn as_duration(&self) -> Option<Duration> {
-        self.lifetime_secs.map(Duration::from_secs)
+    /// Rejects a caller-supplied `0` or a value past [`MAX_DURATION_SECS`].
+    pub fn as_duration(&self) -> Result<Option<Duration>, HostError> {
+        self.lifetime_secs.map(duration_in_range).transpose()
     }
 }
 
@@ -70,18 +97,47 @@ pub struct LinkBudget {
 
 impl LinkBudget {
     /// The budget as the service takes it — the caller's, or the default.
-    pub fn as_duration(&self) -> Duration {
+    /// Rejects a caller-supplied `0` or a value past [`MAX_DURATION_SECS`].
+    pub fn as_duration(&self) -> Result<Duration, HostError> {
         self.timeout_secs
-            .map_or(DEFAULT_LINK_BUDGET, Duration::from_secs)
+            .map_or(Ok(DEFAULT_LINK_BUDGET), duration_in_range)
     }
 }
 
 /// A grant publication: whose data, and exactly which claims with which
 /// commands. An empty claim set is malformed — every grant is claim-scoped.
+/// A mistyped field is refused rather than silently ignored, for the reason
+/// [`Lifetime`] states.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantPublication {
     pub issuer: PdnId,
     pub claims: Vec<GrantedClaim>,
+}
+
+/// One grant's capability, without its ticket — an HTTP-owned shape,
+/// deliberately distinct from [`ReadGrant`] (the durable, internal record
+/// type): `deny_unknown_fields` here rejects a field the surface never
+/// promised, ticket included, whatever it is named — a property `ReadGrant`
+/// itself must not carry, since it is also the wire format the store
+/// replicates and a future internal field there must not become a hard
+/// deserialization error for every past record.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantCapability {
+    pub issuer: PdnId,
+    pub audience: PdnId,
+    pub claims: Vec<GrantedClaim>,
+}
+
+impl From<ReadGrant> for GrantCapability {
+    fn from(grant: ReadGrant) -> Self {
+        Self {
+            issuer: grant.issuer,
+            audience: grant.audience,
+            claims: grant.claims.into_iter().collect(),
+        }
+    }
 }
 
 /// The grants a peer published toward a hosted identity — the capability
@@ -94,7 +150,7 @@ pub struct GrantPublication {
 /// passing after the grant binder breaks.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PeerGrants {
-    pub grants: Vec<ReadGrant>,
+    pub grants: Vec<GrantCapability>,
 }
 
 /// Entry metadata under one issuer — no payload bytes.
@@ -112,3 +168,10 @@ pub struct Entries {
 pub struct ListingPrefix {
     pub prefix: Option<String>,
 }
+
+/// No query parameters at all — for a route with none of its own, so an
+/// unknown parameter is refused here exactly as it would be on a route that
+/// does take one, for the reason [`Lifetime`] states.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoQuery {}

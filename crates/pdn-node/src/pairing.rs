@@ -71,6 +71,7 @@ pub(crate) const MAX_WIRE_MESSAGE_LEN: u32 = 64 * 1024;
 /// semi-public (shown on a screen, photographable), so nothing in it may
 /// grant durable access; the secret it carries is one-time and short-lived.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvitePayload {
     /// Payload format version ([`INVITE_FORMAT_VERSION`]).
     pub version: u8,
@@ -352,7 +353,7 @@ impl ProtocolHandler for PairingHandler {
 /// shared [`Mutex`] rather than a guard so it can lock and unlock around
 /// each phase.
 pub(crate) async fn establish_via_dialogue(
-    state: &Mutex<State>,
+    state: &Arc<Mutex<State>>,
     identity: PdnId,
     payload: &InvitePayload,
 ) -> Result<()> {
@@ -378,6 +379,13 @@ pub(crate) async fn establish_via_dialogue(
         let state = state.lock().await;
         own_store_toward(&state, identity, payload.inviter).await?
     };
+    // A freshly created `own` becomes an orphan replica if this future is
+    // dropped anywhere from here to `assemble_connection`'s commit — the
+    // explicit cleanup below only covers a *completed* round-trip that came
+    // back `Err`; a cancellation skips it the same way it skips every other
+    // early return, so this guard is the only thing that forgets `own` in
+    // that case.
+    let mut rollback = EstablishGuard::new(Arc::clone(state), own.namespace(), created_fresh);
 
     // The round-trip — no lock held, so the accept side can take the lock to
     // answer (this is what breaks the reciprocal-establishment deadlock). Any
@@ -428,6 +436,7 @@ pub(crate) async fn establish_via_dialogue(
                 let state = state.lock().await;
                 let _ = state.node.forget_doc(own.namespace()).await;
             }
+            rollback.disarm();
             return Err(err);
         }
     };
@@ -436,16 +445,67 @@ pub(crate) async fn establish_via_dialogue(
     // Commit under a brief lock. The inviter's address is a live first-sync
     // contact for the imported pair, exactly as the scanner's address is on
     // the accept side.
-    let mut state = state.lock().await;
-    assemble_connection(
-        &mut state,
+    let mut state_guard = state.lock().await;
+    let result = assemble_connection(
+        &mut state_guard,
         identity,
         payload.inviter,
         own,
         response.ticket,
         Some(payload.inviter_addr.clone()),
     )
-    .await
+    .await;
+    rollback.disarm();
+    result
+}
+
+/// Forgets a freshly created `own` replica if the future driving
+/// [`establish_via_dialogue`] is dropped before it disarms — the orphan case
+/// the comment above `own`'s creation already reasons about for a
+/// *completed* round-trip that came back `Err`, extended here to
+/// cancellation. `Drop` is synchronous and the forget is not, so a
+/// still-armed guard spawns a detached task to run it.
+struct EstablishGuard {
+    state: Arc<Mutex<State>>,
+    own_namespace: data_layer::NamespaceId,
+    created_fresh: bool,
+    armed: bool,
+}
+
+impl EstablishGuard {
+    fn new(
+        state: Arc<Mutex<State>>,
+        own_namespace: data_layer::NamespaceId,
+        created_fresh: bool,
+    ) -> Self {
+        Self {
+            state,
+            own_namespace,
+            created_fresh,
+            armed: true,
+        }
+    }
+
+    /// The ceremony reached a normal return — commit or an error branch
+    /// with its own already-`await`ed cleanup — so the drop below must do
+    /// nothing.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EstablishGuard {
+    fn drop(&mut self) {
+        if !self.armed || !self.created_fresh {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let own_namespace = self.own_namespace;
+        tokio::spawn(async move {
+            let state = state.lock().await;
+            let _ = state.node.forget_doc(own_namespace).await;
+        });
+    }
 }
 
 /// Create-or-reuse this side's own metadata store toward `peer`: the

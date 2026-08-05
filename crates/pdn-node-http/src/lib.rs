@@ -42,14 +42,17 @@ pub mod shapes;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     routing::{delete, get, post, put},
     Router,
 };
 use pdn_node::{Runtime, SyncService as _};
 
 pub use crate::{
-    bind::{bind_addr, bind_addr_from_env, DEFAULT_HOST, DEFAULT_PORT},
+    bind::{
+        bind_addr, bind_addr_from_env, debug_enabled, debug_enabled_from_env, DEFAULT_HOST,
+        DEFAULT_PORT,
+    },
     error::HostError,
 };
 
@@ -67,9 +70,19 @@ pub fn router(runtime: Arc<Runtime>, debug: bool) -> Router {
     app.with_state(runtime)
 }
 
-/// Liveness: the process is up with its embedded runtime.
-async fn live() -> &'static str {
-    "ok"
+/// The liveness probe's own budget for touching the runtime — short, so a
+/// stalled coarse lock reads as down promptly rather than hanging the one
+/// route a container orchestrator polls.
+const LIVENESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Liveness: the process is up with its embedded runtime — touching it, not
+/// just the process, so a stalled runtime (its coarse state lock held by a
+/// task that never releases it) reads as down rather than as healthy.
+async fn live(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, HostError> {
+    tokio::time::timeout(LIVENESS_BUDGET, runtime.sync().hosted_identities())
+        .await
+        .map_err(|_| HostError::from(anyhow::anyhow!("liveness check timed out")))??;
+    Ok("ok")
 }
 
 /// The scaffolding subtree: the embedded runtime's service operations, one
@@ -142,7 +155,10 @@ fn debug_routes() -> Router<Arc<Runtime>> {
 /// The one human-readable probe: the node id and hosted identities. The
 /// identity list above reports the same hosted set as JSON, and this stays
 /// beside it because the demo script leans on it.
-async fn debug_status(State(runtime): State<Arc<Runtime>>) -> Result<String, HostError> {
+async fn debug_status(
+    State(runtime): State<Arc<Runtime>>,
+    Query(shapes::NoQuery {}): Query<shapes::NoQuery>,
+) -> Result<String, HostError> {
     let sync = runtime.sync();
     let hosted = sync.hosted_identities().await?;
     let mut lines = vec![format!("node {}", sync.node_id())];

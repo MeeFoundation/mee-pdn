@@ -4,7 +4,6 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::Result;
@@ -39,10 +38,6 @@ pub struct UnknownIdentity {
     /// The identity the operation addressed.
     pub identity: PdnId,
 }
-
-/// How often shutdown re-checks that a protocol handler has released its
-/// transient hold on the shared state.
-const SHUTDOWN_RETRY: Duration = Duration::from_millis(10);
 
 /// A hosted identity's store handles — the runtime's own value, keyed by
 /// identity in [`State::identities`]. Data-layer keeps no such list: store
@@ -118,6 +113,12 @@ impl State {
         self.identities
             .get(&identity)
             .ok_or(UnknownIdentity { identity })
+    }
+
+    /// Whether `identity` is one of this runtime's own hosted identities —
+    /// as opposed to a peer known only through a grant or a connection.
+    pub(crate) fn is_hosted(&self, identity: PdnId) -> bool {
+        self.identities.contains_key(&identity)
     }
 }
 
@@ -232,25 +233,11 @@ impl Runtime {
         self.state.lock().await.retraction_events.subscribe()
     }
 
-    /// Shut the node down, closing the endpoint and all protocols.
-    /// Consumes the runtime; services borrow it, so none can outlive this.
-    pub async fn shutdown(self) -> Result<()> {
-        // The protocol handlers hold the state only weakly, upgrading it
-        // per connection for the accept's local verify-and-commit alone
-        // (not across the network reply), so sole ownership returns as soon
-        // as any in-flight accept finishes that local work — a bounded
-        // wait, never one that hangs on a dialer that completes the
-        // dialogue but does not close.
-        let mut shared = self.state;
-        let state = loop {
-            match Arc::try_unwrap(shared) {
-                Ok(mutex) => break mutex.into_inner(),
-                Err(still_shared) => {
-                    shared = still_shared;
-                    tokio::time::sleep(SHUTDOWN_RETRY).await;
-                }
-            }
-        };
-        state.node.shutdown().await
+    /// Shut the node down, closing the endpoint and all protocols. Takes
+    /// `&self`: no exclusive ownership is required — a clone held by a
+    /// router, a handler, or another caller does not block this, and
+    /// `SyncNode::shutdown`'s own idempotence makes a repeat call harmless.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.state.lock().await.node.shutdown().await
     }
 }

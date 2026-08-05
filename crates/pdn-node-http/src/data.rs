@@ -23,7 +23,7 @@ use pdn_node::{DataService as _, Runtime};
 use crate::{
     error::HostError,
     parse,
-    shapes::{Entries, ListingPrefix},
+    shapes::{Entries, ListingPrefix, NoQuery},
 };
 
 /// `PUT /debug/data/{issuer}/{*path}` — the body's bytes become the entry.
@@ -37,6 +37,7 @@ use crate::{
 pub(crate) async fn write(
     State(runtime): State<Arc<Runtime>>,
     Path((issuer, path)): Path<(String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
     let issuer = parse::id(&issuer, "issuer")?;
@@ -61,6 +62,7 @@ pub(crate) async fn write(
 pub(crate) async fn read(
     State(runtime): State<Arc<Runtime>>,
     Path((issuer, path)): Path<(String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Bytes, HostError> {
     let issuer = parse::id(&issuer, "issuer")?;
     let path = parse::entry_path(&path)?;

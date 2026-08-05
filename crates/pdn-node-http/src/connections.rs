@@ -19,7 +19,7 @@ use pdn_node::{ConnectionsService as _, InvitePayload, NonEmpty, Runtime};
 use crate::{
     error::HostError,
     parse,
-    shapes::{Connections, GrantPublication, Lifetime, PeerGrants},
+    shapes::{Connections, GrantPublication, Lifetime, NoQuery, PeerGrants},
 };
 
 /// `POST /debug/identities/{identity}/invite` — mint the payload a
@@ -34,7 +34,7 @@ pub(crate) async fn invite(
     let identity = parse::id(&identity, "identity")?;
     let payload = runtime
         .connections()
-        .invite(identity, lifetime.as_duration())
+        .invite(identity, lifetime.as_duration()?)
         .await?;
     Ok(Json(payload))
 }
@@ -44,6 +44,7 @@ pub(crate) async fn invite(
 pub(crate) async fn establish(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
+    Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
     let identity = parse::id(&identity, "identity")?;
@@ -56,6 +57,7 @@ pub(crate) async fn establish(
 pub(crate) async fn list(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<Connections>, HostError> {
     let identity = parse::id(&identity, "identity")?;
     let connections = runtime.connections().list(identity).await?;
@@ -67,6 +69,7 @@ pub(crate) async fn list(
 pub(crate) async fn publish_grant(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer)): Path<(String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
     let identity = parse::id(&identity, "identity")?;
@@ -86,6 +89,7 @@ pub(crate) async fn publish_grant(
 pub(crate) async fn read_grants(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer)): Path<(String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<PeerGrants>, HostError> {
     let identity = parse::id(&identity, "identity")?;
     let peer = parse::id(&peer, "peer")?;
@@ -94,7 +98,7 @@ pub(crate) async fn read_grants(
         .read_grants(identity, peer)
         .await?
         .into_iter()
-        .map(|peer_grant| peer_grant.grant)
+        .map(|peer_grant| peer_grant.grant.into())
         .collect();
     Ok(Json(PeerGrants { grants }))
 }
@@ -104,6 +108,7 @@ pub(crate) async fn read_grants(
 pub(crate) async fn withdraw_grant(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer, issuer)): Path<(String, String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<StatusCode, HostError> {
     let identity = parse::id(&identity, "identity")?;
     let peer = parse::id(&peer, "peer")?;

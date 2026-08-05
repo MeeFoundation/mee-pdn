@@ -695,7 +695,12 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
         // ahead of it would have taken away the only thing that could explain
         // or re-arm them. Keeping the binding keeps the retry: the next sweep
         // sees the grant still gone.
-        if !held_by_another_pair(state, (identity, peer), issuer).await {
+        // A hosted identity's own namespace predates every grant binding and
+        // outlives them all — the last grant toward it disappearing must
+        // never destroy it, same as `linking.rs`'s rollback never destroys a
+        // namespace an import displaced rather than created.
+        if !state.is_hosted(issuer) && !held_by_another_pair(state, (identity, peer), issuer).await
+        {
             match state.node.forget_namespace(issuer).await {
                 // Forgotten here, or already resolving to nothing — the state
                 // this unbind drives at.

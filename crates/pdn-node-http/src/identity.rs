@@ -19,12 +19,13 @@ use pdn_node::{IdentityService as _, LinkingPayload, Runtime, SyncService as _};
 use crate::{
     error::HostError,
     parse,
-    shapes::{CreatedIdentity, HostedIdentities, Lifetime, LinkBudget},
+    shapes::{CreatedIdentity, HostedIdentities, Lifetime, LinkBudget, NoQuery},
 };
 
 /// `POST /debug/identities` — an identity on its first device.
 pub(crate) async fn create(
     State(runtime): State<Arc<Runtime>>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<CreatedIdentity>, HostError> {
     let identity = runtime.identity().create().await?;
     Ok(Json(CreatedIdentity { identity }))
@@ -33,6 +34,7 @@ pub(crate) async fn create(
 /// `GET /debug/identities` — the identities this runtime hosts.
 pub(crate) async fn hosted(
     State(runtime): State<Arc<Runtime>>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<HostedIdentities>, HostError> {
     let identities = runtime.sync().hosted_identities().await?;
     Ok(Json(HostedIdentities { identities }))
@@ -49,7 +51,7 @@ pub(crate) async fn linking_invite(
     let identity = parse::id(&identity, "identity")?;
     let payload = runtime
         .identity()
-        .linking_invite(identity, lifetime.as_duration())
+        .linking_invite(identity, lifetime.as_duration()?)
         .await?;
     Ok(Json(payload))
 }
@@ -65,7 +67,7 @@ pub(crate) async fn link(
     let payload: LinkingPayload = parse::json(&body, "linking payload")?;
     runtime
         .identity()
-        .link(payload, budget.as_duration())
+        .link(payload, budget.as_duration()?)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

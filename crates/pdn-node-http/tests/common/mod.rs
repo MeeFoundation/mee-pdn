@@ -128,11 +128,8 @@ impl Host {
         .await
     }
 
-    pub async fn shutdown(self) -> Result<()> {
-        drop(self.app);
-        let runtime = Arc::try_unwrap(self.runtime)
-            .map_err(|_| anyhow::anyhow!("a handler still holds the runtime"))?;
-        runtime.shutdown().await
+    pub async fn shutdown(&self) -> Result<()> {
+        self.runtime.shutdown().await
     }
 
     async fn send(&self, request: Request<Body>) -> Result<Answer> {
@@ -140,6 +137,21 @@ impl Host {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         Ok(Answer { status, body })
+    }
+}
+
+impl Drop for Host {
+    /// A safety net for the panic or early-`?`-return path: a test that
+    /// never reaches its explicit `shutdown().await` would otherwise leak
+    /// the embedded runtime's endpoint and every task a hosted identity
+    /// spawned. Spawned detached, because `Drop` is synchronous and
+    /// shutdown is not; harmless to run twice, since `Runtime::shutdown`
+    /// (Fix 2) needs no exclusive ownership and is idempotent.
+    fn drop(&mut self) {
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move {
+            let _ = runtime.shutdown().await;
+        });
     }
 }
 
