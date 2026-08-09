@@ -135,6 +135,20 @@ pub const ESTABLISHMENT_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
 #[error("could not reach the inviter")]
 pub struct InviterUnreachable;
 
+/// `establish` was refused before dialing: another `establish` toward the
+/// same `(identity, inviter)` pair is already in flight on this runtime —
+/// the pre-dial guard against two concurrent attempts committing the same
+/// pair twice. Downcast from the `anyhow::Error` of the connections
+/// service's `establish`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("an establishment toward {peer} from {identity} is already in flight on this runtime")]
+pub struct EstablishmentInProgress {
+    /// The identity attempting the establishment.
+    pub identity: PdnId,
+    /// The inviter it is establishing toward.
+    pub peer: PdnId,
+}
+
 /// The scanner's half of the dialogue: the secret, who is scanning, where
 /// to reach it, and the read ticket to the metadata store it issues toward
 /// the inviter.
@@ -218,17 +232,31 @@ impl PendingInvites {
 
 /// A clonable slot for the runtime state the pairing handler serves: filled
 /// once, right after the node spawns (the handler is built before the node
-/// exists), and held weakly so the runtime's shutdown can reclaim sole
-/// ownership of the state. A connection arriving before the slot is filled
-/// is refused — unreachable in the honest flow, because no invite payload
-/// exists before spawn returns.
+/// exists), and held weakly so a runtime kept alive only by this handler's
+/// clone does not itself keep the state alive. A connection arriving before
+/// the slot is filled is refused — unreachable in the honest flow, because
+/// no invite payload exists before spawn returns.
 pub(crate) type StateSlot = Arc<OnceLock<Weak<Mutex<State>>>>;
+
+/// A generous ceiling on concurrent establishments, never meant to bound
+/// anything in practice — it exists only so `shutdown`'s `acquire_many` has
+/// a fixed permit count to wait for all of.
+const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1 << 20;
+
+/// How long `PairingHandler::shutdown` waits for in-flight `accept` calls
+/// to release their permit before giving up and letting the router close
+/// the endpoint anyway.
+pub const SHUTDOWN_ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(10);
 
 /// The accept side of the pairing dialogue, registered at `Runtime::spawn`
 /// through the data-layer assembly slot.
 #[derive(Debug, Clone)]
 pub(crate) struct PairingHandler {
     state: StateSlot,
+    /// One permit held for the duration of each `accept` call; `shutdown`
+    /// waits for every permit to come back, bounding shutdown's wait on an
+    /// in-flight establishment instead of the router aborting it outright.
+    in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 impl PairingHandler {
@@ -239,6 +267,7 @@ impl PairingHandler {
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::default(),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ESTABLISHMENTS)),
         }
     }
 
@@ -260,16 +289,16 @@ impl PairingHandler {
 
         // The runtime state is held only for the local verify-and-assemble,
         // inside this block: both the guard and the strong `Arc` drop at its
-        // end, before the network reply below. So a `shutdown` racing this
-        // accept reclaims sole ownership as soon as the local work finishes,
-        // never waiting on the dialer to close — were the `Arc` held across
-        // `connection.closed()`, `shutdown` would busy-spin until the
-        // transport's idle timeout.
+        // end, before the network reply below — so a concurrent operation on
+        // the same coarse lock is never blocked by this accept's wait on the
+        // dialer to close. `shutdown`'s own bound on an in-flight accept
+        // comes from the handler's own semaphore-based wait, not from this
+        // scoping.
         let response_ticket = {
             // The late-bound slot: unfilled (no invite can exist yet) or a
             // runtime already gone both refuse.
-            let state = self.state.get()?.upgrade()?;
-            let mut state = state.lock().await;
+            let state_arc = self.state.get()?.upgrade()?;
+            let mut state = state_arc.lock().await;
 
             // The atomic verify-and-burn, before any state change. Everything
             // below only runs for a live, unburned secret.
@@ -284,6 +313,12 @@ impl PairingHandler {
             let (own, created_fresh) = own_store_toward(&state, identity, request.scanner)
                 .await
                 .ok()?;
+            // Armed as soon as a fresh replica might exist, symmetric with
+            // the dial side's guard: a cancellation of this `serve` future
+            // from here on (the dialer disconnects, or a bounded shutdown
+            // wait) forgets it, the same as a completed failure below.
+            let mut rollback =
+                EstablishGuard::new(Arc::clone(&state_arc), own.namespace(), created_fresh);
             let Ok(ticket) = own
                 .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
                 .await
@@ -294,9 +329,11 @@ impl PairingHandler {
                 if created_fresh {
                     let _ = state.node.forget_doc(own.namespace()).await;
                 }
+                rollback.disarm();
                 return None;
             };
-            assemble_connection(
+            let own_namespace = own.namespace();
+            let result = assemble_connection(
                 &mut state,
                 identity,
                 request.scanner,
@@ -304,8 +341,16 @@ impl PairingHandler {
                 request.ticket,
                 Some(request.scanner_addr),
             )
-            .await
-            .ok()?;
+            .await;
+            if let Ok(()) = result {
+                rollback.disarm();
+            } else {
+                if created_fresh {
+                    let _ = state.node.forget_doc(own_namespace).await;
+                }
+                rollback.disarm();
+                return None;
+            }
             ticket
         };
 
@@ -330,6 +375,15 @@ impl PairingHandler {
 
 impl ProtocolHandler for PairingHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        // Held for the whole call: `shutdown` waits for this permit to
+        // return before it does, so an establishment in flight when
+        // shutdown starts bounds its wait rather than being aborted
+        // outright. `acquire` only errs once the semaphore is closed, which
+        // this handler never does — the `let else` is exhaustiveness, not a
+        // reachable refusal.
+        let Ok(_permit) = self.in_flight.acquire().await else {
+            return Ok(());
+        };
         if self.serve(&connection).await.is_none() {
             // The one uniform refusal, whatever the reason: close without a
             // distinguishing answer, so a prober cannot separate wrong from
@@ -337,6 +391,21 @@ impl ProtocolHandler for PairingHandler {
             connection.close(0u32.into(), b"");
         }
         Ok(())
+    }
+
+    /// Waits, bounded by [`SHUTDOWN_ESTABLISHMENT_BUDGET`], for every
+    /// in-flight `accept` to finish and release its permit — event-based,
+    /// no polling. `Router::shutdown` (iroh) stops dispatching new `accept`
+    /// calls before awaiting this, so no new acquisition can race the wait
+    /// once it starts: `acquire_many` reaching every permit means every
+    /// `accept` in flight when shutdown began has returned.
+    async fn shutdown(&self) {
+        let permits = u32::try_from(MAX_CONCURRENT_ESTABLISHMENTS).unwrap_or(u32::MAX);
+        let _ = tokio::time::timeout(
+            SHUTDOWN_ESTABLISHMENT_BUDGET,
+            self.in_flight.acquire_many(permits),
+        )
+        .await;
     }
 }
 
@@ -357,14 +426,46 @@ pub(crate) async fn establish_via_dialogue(
     identity: PdnId,
     payload: &InvitePayload,
 ) -> Result<()> {
-    // A brief lock for the hosted check and the dial handle (a cheap
-    // snapshot); released before any network I/O.
+    // A brief lock for the hosted check, the in-flight reservation, and the
+    // dial handle (a cheap snapshot); released before any network I/O.
     let dial = {
-        let state = state.lock().await;
-        state.hosted(identity)?;
-        state.node.dial_handle()
+        let mut state_guard = state.lock().await;
+        state_guard.hosted(identity)?;
+        if !state_guard
+            .establishing_in_flight
+            .insert((identity, payload.inviter))
+        {
+            return Err(EstablishmentInProgress {
+                identity,
+                peer: payload.inviter,
+            }
+            .into());
+        }
+        state_guard.node.dial_handle()
     };
+    // Reserved for the whole ceremony from here. Released synchronously
+    // right after `establish_via_dialogue_inner` below settles, on every
+    // one of its outcomes — a caller retrying immediately after a
+    // completed attempt must never race a still-pending detached release.
+    // Only a genuine cancellation of *this* function skips that release,
+    // and `reservation`'s own `Drop` (spawned detached, since `Drop` is
+    // synchronous) is exactly the fallback for that case.
+    let reservation = EstablishReservation::new(Arc::clone(state), identity, payload.inviter);
+    let result = establish_via_dialogue_inner(state, identity, payload, dial).await;
+    reservation.release().await;
+    result
+}
 
+/// The body of [`establish_via_dialogue`] from the dial onward, factored
+/// out so the reservation wrapping it releases synchronously around every
+/// exit — the `?` early returns included — without threading the release
+/// through each one by hand.
+async fn establish_via_dialogue_inner(
+    state: &Arc<Mutex<State>>,
+    identity: PdnId,
+    payload: &InvitePayload,
+    dial: data_layer::DialHandle,
+) -> Result<()> {
     // Network — no lock held. Dial before minting `own`, so an unreachable
     // inviter never leaves a replica behind.
     let connection = dial
@@ -446,6 +547,7 @@ pub(crate) async fn establish_via_dialogue(
     // contact for the imported pair, exactly as the scanner's address is on
     // the accept side.
     let mut state_guard = state.lock().await;
+    let own_namespace = own.namespace();
     let result = assemble_connection(
         &mut state_guard,
         identity,
@@ -455,8 +557,83 @@ pub(crate) async fn establish_via_dialogue(
         Some(payload.inviter_addr.clone()),
     )
     .await;
-    rollback.disarm();
-    result
+    match result {
+        Ok(()) => {
+            rollback.disarm();
+            Ok(())
+        }
+        Err(err) => {
+            if created_fresh {
+                let _ = state_guard.node.forget_doc(own_namespace).await;
+            }
+            rollback.disarm();
+            Err(err)
+        }
+    }
+}
+
+/// Reserves an `(identity, peer)` pair against a concurrent `establish`
+/// while this one is in flight, releasing the reservation on every exit
+/// path of [`establish_via_dialogue`] — success, every explicit failure,
+/// and cancellation alike — the establishment analog of `grant_binders`'
+/// insert-before-spawn/remove-on-exit pattern (`connections.rs`) and of
+/// linking's own `LinkingReservation`. Held for the whole function, unlike
+/// [`EstablishGuard`] below (constructed only once `own` exists): a
+/// cancellation during the dial, before any rollback guard exists, must
+/// still release this one.
+struct EstablishReservation {
+    state: Arc<Mutex<State>>,
+    identity: PdnId,
+    peer: PdnId,
+    armed: bool,
+}
+
+impl EstablishReservation {
+    fn new(state: Arc<Mutex<State>>, identity: PdnId, peer: PdnId) -> Self {
+        Self {
+            state,
+            identity,
+            peer,
+            armed: true,
+        }
+    }
+
+    /// Release the reservation now, synchronously — the normal path for
+    /// every outcome of [`establish_via_dialogue_inner`]. A caller retrying
+    /// immediately after this one returns must see the pair free, not race
+    /// a detached release that has not run yet.
+    async fn release(mut self) {
+        self.state
+            .lock()
+            .await
+            .establishing_in_flight
+            .remove(&(self.identity, self.peer));
+        self.armed = false;
+    }
+}
+
+impl Drop for EstablishReservation {
+    /// Only fires on genuine cancellation — the future driving
+    /// [`establish_via_dialogue`] dropped before [`Self::release`] ran.
+    /// `Drop` is synchronous and the removal is not, so this spawns a
+    /// detached task; unlike the normal path, a cancelled attempt leaves no
+    /// caller waiting to retry immediately, so a slight delay here is
+    /// harmless.
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let identity = self.identity;
+        let peer = self.peer;
+        tokio::spawn(async move {
+            state
+                .lock()
+                .await
+                .establishing_in_flight
+                .remove(&(identity, peer));
+        });
+    }
 }
 
 /// Forgets a freshly created `own` replica if the future driving

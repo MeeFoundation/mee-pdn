@@ -175,3 +175,37 @@ pub struct ListingPrefix {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoQuery {}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+
+    /// The boundary `duration_in_range` exists to enforce: `0` is a request
+    /// error, not a downstream panic; `MAX_DURATION_SECS` is the last value
+    /// still accepted; one past it refuses the same way `0` does. A
+    /// regression here (the `0` check dropped, the ceiling raised, the
+    /// comparison flipped) would not fail any existing HTTP-level test —
+    /// this is the only place these three values are asserted directly.
+    #[test]
+    fn duration_in_range_rejects_zero_and_anything_past_the_ceiling() {
+        assert!(duration_in_range(0).is_err());
+        assert_eq!(
+            duration_in_range(0).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(duration_in_range(MAX_DURATION_SECS).is_ok());
+        assert_eq!(
+            duration_in_range(MAX_DURATION_SECS).unwrap(),
+            Duration::from_secs(MAX_DURATION_SECS)
+        );
+        assert!(duration_in_range(MAX_DURATION_SECS + 1).is_err());
+        assert_eq!(
+            duration_in_range(MAX_DURATION_SECS + 1)
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}

@@ -26,6 +26,7 @@
     "vscode": {
       "extensions": [
         "anthropic.claude-code",
+        "openai.chatgpt",
         "github.vscode-pull-request-github",
         "rust-lang.rust-analyzer"
       ],

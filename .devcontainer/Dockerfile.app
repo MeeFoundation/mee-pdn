@@ -60,10 +60,10 @@ RUN ARCH="$(uname -m)"; \
     case "$ARCH" in aarch64|arm64) NX=linux-arm ;; *) NX=linux ;; esac; \
     curl -LsSf "https://get.nexte.st/latest/$NX" | tar zxf - -C /home/vscode/.local/bin
 
-# Node.js + OpenSpec CLI (used by .claude/commands/opsx/* and .claude/skills/openspec-*).
+# Node.js + OpenSpec CLI + Codex CLI (used by the repo-scoped agent skills).
 # Kept outside the sandcat-managed stacks block so `sandcat init --stacks` won't overwrite it.
 RUN mise use -g node@latest \
-    && npm install -g @fission-ai/openspec
+    && npm install -g @fission-ai/openspec @openai/codex
 
 # If Java was installed above, bake JAVA_HOME and JAVA_TOOL_OPTIONS into
 # .bashrc so VS Code's env probe picks them up before the entrypoint runs.
@@ -84,11 +84,13 @@ RUN if MISE_JAVA=$(mise where java 2>/dev/null); then \
     } >> "$HOME/.bashrc"; \
     fi
 
-# Pre-create ~/.claude so Docker bind-mounts (CLAUDE.md, agents/, commands/)
-# don't cause it to be created as root-owned.
-RUN mkdir -p /home/vscode/.claude
+# Pre-create agent state directories so bind mounts and first-run setup do not
+# create them as root-owned. Both live on the persistent app-home volume.
+RUN mkdir -p /home/vscode/.claude /home/vscode/.codex
 
 RUN echo 'alias claude-yolo="claude --dangerously-skip-permissions"' >> /home/vscode/.bashrc
+RUN echo 'alias codex-yolo="codex --dangerously-bypass-approvals-and-sandbox"' >> /home/vscode/.bashrc
 
 USER root
+COPY codex/config.toml /etc/codex/config.toml
 ENTRYPOINT ["/usr/local/bin/app-init.sh"]

@@ -141,12 +141,18 @@ impl Host {
 }
 
 impl Drop for Host {
-    /// A safety net for the panic or early-`?`-return path: a test that
-    /// never reaches its explicit `shutdown().await` would otherwise leak
-    /// the embedded runtime's endpoint and every task a hosted identity
-    /// spawned. Spawned detached, because `Drop` is synchronous and
-    /// shutdown is not; harmless to run twice, since `Runtime::shutdown`
-    /// (Fix 2) needs no exclusive ownership and is idempotent.
+    /// A best-effort net for the panic or early-`?`-return path, not a
+    /// guarantee: `Drop` is synchronous and shutdown is not, so this spawns
+    /// a detached task that may never get polled if the test's own runtime
+    /// tears down first — which is exactly what happens when the process
+    /// itself is exiting. It works in practice under `cargo-nextest`
+    /// because each test runs in its own process and the OS reclaims the
+    /// endpoint and every task a hosted identity spawned at exit either
+    /// way; a shared-process test runner (bare `cargo test`, several tests
+    /// per binary) would leak for real. Harmless to run twice regardless,
+    /// since `Runtime::shutdown` needs no exclusive ownership and is
+    /// idempotent — prefer the explicit `shutdown().await` on every test's
+    /// own exit path over relying on this.
     fn drop(&mut self) {
         let runtime = Arc::clone(&self.runtime);
         tokio::spawn(async move {

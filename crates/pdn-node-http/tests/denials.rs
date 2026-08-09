@@ -272,3 +272,105 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     inviter.shutdown().await?;
     Ok(())
 }
+
+/// Denied (a peer with no connection metadata pair): a grant publish toward
+/// an identity this issuer never established with, or received one from,
+/// refuses as a conflict rather than a 500 — the runtime knows exactly why
+/// (there is no pair to carry the grant), so the host must say so too.
+#[tokio::test(flavor = "multi_thread")]
+async fn publishing_toward_an_unconnected_peer_is_refused_as_a_conflict() -> Result<()> {
+    let inviter = Host::spawn().await?;
+    let bystander = Host::spawn().await?;
+    let x = inviter.create_identity().await?;
+    let never_connected = bystander.create_identity().await?;
+
+    let refused = inviter
+        .publish_grant(x, never_connected, &grant_on(x, "contact/email", false)?)
+        .await?;
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "a grant toward an unconnected peer must be refused, got {}: {}",
+        refused.status,
+        refused.text()
+    );
+    assert!(
+        refused.text().contains(&never_connected.to_string()),
+        "the refusal must name the unconnected peer: {}",
+        refused.text()
+    );
+
+    bystander.shutdown().await?;
+    inviter.shutdown().await?;
+    Ok(())
+}
+
+/// Denied (linking into an already-hosted identity): `link`'s pre-dial
+/// guard refuses before ever dialing, so a linking-invite payload for an
+/// identity already hosted right here on the target is refused without
+/// needing a reachable address.
+#[tokio::test(flavor = "multi_thread")]
+async fn linking_into_an_already_hosted_identity_is_refused_as_a_conflict() -> Result<()> {
+    let host = Host::spawn().await?;
+    let x = host.create_identity().await?;
+
+    let self_invite = host
+        .post(
+            &format!("/debug/identities/{x}/linking-invite"),
+            Bytes::new(),
+        )
+        .await?
+        .ok()?;
+    let already_hosted = host.post("/debug/link", self_invite).await?;
+    assert_eq!(
+        already_hosted.status,
+        StatusCode::CONFLICT,
+        "linking into an already-hosted identity must be refused, got {}: {}",
+        already_hosted.status,
+        already_hosted.text()
+    );
+
+    host.shutdown().await?;
+    Ok(())
+}
+
+/// Denied (a concurrent link toward the same not-yet-hosted identity): two
+/// `link` attempts racing toward two independent invites of the same
+/// identity let exactly one commit — the loser refuses as a conflict
+/// (another link already in flight, or, if the winner finished first,
+/// already hosted) instead of both racing to register the identity twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Result<()> {
+    let inviter = Host::spawn().await?;
+    let linker = Host::spawn().await?;
+    let w = inviter.create_identity().await?;
+
+    let first_invite = inviter
+        .post(
+            &format!("/debug/identities/{w}/linking-invite"),
+            Bytes::new(),
+        )
+        .await?
+        .ok()?;
+    let second_invite = inviter
+        .post(
+            &format!("/debug/identities/{w}/linking-invite"),
+            Bytes::new(),
+        )
+        .await?
+        .ok()?;
+
+    let (first, second) = tokio::join!(
+        linker.post("/debug/link", first_invite),
+        linker.post("/debug/link", second_invite)
+    );
+    let statuses = [first?.status, second?.status];
+    assert!(
+        statuses.contains(&StatusCode::NO_CONTENT) && statuses.contains(&StatusCode::CONFLICT),
+        "exactly one of two concurrent links toward the same identity must succeed, got {statuses:?}"
+    );
+
+    linker.shutdown().await?;
+    inviter.shutdown().await?;
+    Ok(())
+}

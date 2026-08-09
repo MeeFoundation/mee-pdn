@@ -8,13 +8,21 @@
 //! runtime refused you" and "you asked wrong" makes every paired denial
 //! vacuous. An unmapped error is therefore 500, the pessimistic reading:
 //! reporting it as a clean refusal would launder a host bug into a verdict.
+//!
+//! One request-shape limit sits outside this table by construction: the
+//! router's request-body ceiling (64 MB — comfortably above a realistic
+//! demo entry, far short of `pdn-store`'s own 1 GB wire ceiling) answers
+//! axum's own 413 before a handler, and so before `HostError`, ever runs —
+//! the same footing as the two statuses this type decides on its own
+//! (`bad_request`, `not_found`).
 
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use pdn_node::{
-    DelegationUnsupported, EstablishmentRefused, LinkingRefused, UnknownIdentity, UnknownIssuer,
+    DelegationUnsupported, EstablishmentInProgress, EstablishmentRefused, IdentityAlreadyHosted,
+    LinkingInProgress, LinkingRefused, PeerNotConnected, UnknownIdentity, UnknownIssuer,
     UnsupportedInviteVersion, UnsupportedLinkingVersion, WriteNotGranted,
 };
 
@@ -87,8 +95,14 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
         StatusCode::FORBIDDEN
     } else if err.downcast_ref::<UnknownIdentity>().is_some()
         || err.downcast_ref::<UnknownIssuer>().is_some()
+        || err.downcast_ref::<PeerNotConnected>().is_some()
+        || err.downcast_ref::<IdentityAlreadyHosted>().is_some()
+        || err.downcast_ref::<LinkingInProgress>().is_some()
+        || err.downcast_ref::<EstablishmentInProgress>().is_some()
     {
-        // The runtime does not host what the request addressed.
+        // The runtime does not host what the request addressed, or already
+        // has a conflicting act of its own committed or in flight against
+        // it.
         StatusCode::CONFLICT
     } else if err.downcast_ref::<UnsupportedInviteVersion>().is_some()
         || err.downcast_ref::<UnsupportedLinkingVersion>().is_some()
@@ -144,6 +158,28 @@ mod tests {
         );
         assert_eq!(
             status(UnknownIssuer { issuer: ISSUER }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(PeerNotConnected {
+                identity: ISSUER,
+                peer: PEER,
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(IdentityAlreadyHosted { identity: ISSUER }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(LinkingInProgress { identity: ISSUER }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(EstablishmentInProgress {
+                identity: ISSUER,
+                peer: PEER,
+            }),
             StatusCode::CONFLICT
         );
     }

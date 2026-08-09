@@ -610,6 +610,21 @@ impl SyncNode {
             .unwrap_or_default())
     }
 
+    /// The number of documents currently tracked by the periodic reconcile
+    /// pass — every doc registered by a create/import and not yet
+    /// forgotten. Behind the `test-util` feature and absent from every
+    /// product build: a scenario asserts this count is unchanged after a
+    /// cancelled or failed attempt, the only anchor available when the
+    /// attempt's replica has no other name a scenario can check by.
+    #[cfg(feature = "test-util")]
+    pub fn tracked_doc_count(&self) -> Result<usize> {
+        let docs = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("tracked docs lock poisoned"))?;
+        Ok(docs.len())
+    }
+
     /// The shared precondition of both data-namespace imports: hand back
     /// the tracking entry the import is about to replace, refusing when the
     /// namespace is tracked but not data-bound — that replica is a

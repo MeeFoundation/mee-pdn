@@ -22,10 +22,12 @@ cp "$CA_CERT" /usr/local/share/ca-certificates/mitmproxy.crt
 update-ca-certificates
 
 # Node.js ignores the system trust store and bundles its own CA certs.
-# Point it at the mitmproxy CA so TLS verification works for Node-based
-# tools (e.g. Anthropic SDK).
+# Codex also supports an explicit CA bundle for HTTPS, WebSockets, and login.
+# Point both at the mitmproxy CA used by sandcat.
 export NODE_EXTRA_CA_CERTS="$CA_CERT"
+export CODEX_CA_CERTIFICATE="$CA_CERT"
 echo "export NODE_EXTRA_CA_CERTS=\"$CA_CERT\"" > /etc/profile.d/sandcat-node-ca.sh
+echo "export CODEX_CA_CERTIFICATE=\"$CA_CERT\"" > /etc/profile.d/sandcat-codex-ca.sh
 
 # GPG keys are not forwarded into the container (credential isolation),
 # so commit signing would always fail.  Git env vars have the highest
@@ -74,7 +76,7 @@ fi
 find /workspaces -mindepth 2 -maxdepth 3 -type d -name target -user root \
     -exec chown vscode:vscode {} + 2>/dev/null || true
 
-# Run vscode-user tasks: git identity, Java trust store, Claude Code update.
+# Run vscode-user tasks: git identity, trust stores, and agent authentication.
 su - vscode -c /usr/local/bin/app-user-init.sh
 
 # Source all sandcat profile.d scripts from /etc/bash.bashrc so env vars

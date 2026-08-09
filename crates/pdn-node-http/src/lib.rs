@@ -39,7 +39,7 @@ mod identity;
 mod parse;
 pub mod shapes;
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use axum::{
     extract::{Query, State},
@@ -56,6 +56,15 @@ pub use crate::{
     error::HostError,
 };
 
+/// The request body ceiling for the whole router, replacing axum's
+/// undocumented 2 MB default with a named, documented one: comfortably
+/// above a realistic demo entry, far short of `pdn-store`'s own 1 GB wire
+/// ceiling, so a caller pushing a production-sized entry through this
+/// surface meets a deliberate demo-stand limit rather than the engine's.
+/// Past it, axum answers 413 directly — outside the closed error table,
+/// same as the two statuses [`HostError`] decides on its own.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Build the host's router over the embedded runtime. The scaffolding
 /// routes exist only when `debug` is set — this one branch gates the whole
 /// `/debug/` subtree, so off means absent and requests there fall through
@@ -67,21 +76,36 @@ pub fn router(runtime: Arc<Runtime>, debug: bool) -> Router {
     } else {
         app
     };
-    app.with_state(runtime)
+    app.layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(runtime)
 }
 
-/// The liveness probe's own budget for touching the runtime — short, so a
-/// stalled coarse lock reads as down promptly rather than hanging the one
-/// route a container orchestrator polls.
+/// The budget every route touching the runtime's coarse state lock gets —
+/// short, so a stalled lock (held by a task that never releases it) reads
+/// as a prompt refusal instead of hanging the caller. Named for `/live`,
+/// the route it was introduced for; shared by every other route that reads
+/// through the same lock via [`with_runtime_budget`].
 const LIVENESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bounds `fut` by [`LIVENESS_BUDGET`]: a timeout becomes a `HostError`
+/// naming it, same as an error `fut` itself returns. Used by every route
+/// that reads the runtime's hosted set through the coarse state lock —
+/// `/live`, `/debug/status`, and `/debug/identities` — so a stalled lock
+/// reads as down uniformly across all three rather than only on `/live`.
+pub(crate) async fn with_runtime_budget<T>(
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> Result<T, HostError> {
+    tokio::time::timeout(LIVENESS_BUDGET, fut)
+        .await
+        .map_err(|_elapsed| HostError::from(anyhow::anyhow!("runtime lock check timed out")))?
+        .map_err(HostError::from)
+}
 
 /// Liveness: the process is up with its embedded runtime — touching it, not
 /// just the process, so a stalled runtime (its coarse state lock held by a
 /// task that never releases it) reads as down rather than as healthy.
 async fn live(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, HostError> {
-    tokio::time::timeout(LIVENESS_BUDGET, runtime.sync().hosted_identities())
-        .await
-        .map_err(|_| HostError::from(anyhow::anyhow!("liveness check timed out")))??;
+    with_runtime_budget(runtime.sync().hosted_identities()).await?;
     Ok("ok")
 }
 
@@ -160,7 +184,7 @@ async fn debug_status(
     Query(shapes::NoQuery {}): Query<shapes::NoQuery>,
 ) -> Result<String, HostError> {
     let sync = runtime.sync();
-    let hosted = sync.hosted_identities().await?;
+    let hosted = with_runtime_budget(sync.hosted_identities()).await?;
     let mut lines = vec![format!("node {}", sync.node_id())];
     lines.extend(
         hosted
@@ -168,4 +192,35 @@ async fn debug_status(
             .map(|identity| format!("hosts {identity}")),
     );
     Ok(lines.join("\n") + "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+
+    /// The one piece of logic that decides `/live`'s (and `/debug/status`'s
+    /// and `/debug/identities`'s) pass/fail on a stuck runtime lock: a
+    /// future that outlives [`LIVENESS_BUDGET`] must answer non-200 within
+    /// a bounded margin, not hang. Deliberately not an end-to-end HTTP
+    /// test — there is no legitimate way to make the real coarse lock
+    /// stall for the budget's duration through the public surface, since
+    /// every runtime call this budget guards is, by design, never held
+    /// across I/O. Wiring this into a non-200 response is covered by the
+    /// existing `/live` success test (`tests/smoke.rs`) plus `error.rs`'s
+    /// `HostError` unit tests.
+    #[tokio::test]
+    async fn a_stalled_runtime_call_times_out_within_its_budget() {
+        let started = std::time::Instant::now();
+        let result: Result<(), HostError> =
+            with_runtime_budget(std::future::pending::<anyhow::Result<()>>()).await;
+        let elapsed = started.elapsed();
+        let err = result.expect_err("a pending future must time out, not resolve");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            elapsed < LIVENESS_BUDGET + std::time::Duration::from_secs(2),
+            "with_runtime_budget took {elapsed:?} against a {LIVENESS_BUDGET:?} budget"
+        );
+    }
 }

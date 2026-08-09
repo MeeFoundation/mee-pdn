@@ -36,7 +36,7 @@ pub(crate) async fn hosted(
     State(runtime): State<Arc<Runtime>>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<HostedIdentities>, HostError> {
-    let identities = runtime.sync().hosted_identities().await?;
+    let identities = crate::with_runtime_budget(runtime.sync().hosted_identities()).await?;
     Ok(Json(HostedIdentities { identities }))
 }
 

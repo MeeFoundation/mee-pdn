@@ -63,6 +63,9 @@ fn granted(issuer: PdnId, audience: PdnId, path: &EntryPath, write: bool) -> Rea
 struct ServingSide {
     own_toward_peer: ConnectionMetadataStore,
     own_read_ticket: data_layer::DocTicket,
+    /// Bob's directory — the device set the access book probes, handed back
+    /// for the scenarios that vary who is in it.
+    directory: PrivateMetadataStore,
 }
 
 async fn serving_side(
@@ -96,6 +99,7 @@ async fn serving_side(
     Ok(ServingSide {
         own_toward_peer,
         own_read_ticket,
+        directory,
     })
 }
 
@@ -267,6 +271,102 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
     bob.shutdown().await?;
     alice.shutdown().await?;
     carol.shutdown().await?;
+    Ok(())
+}
+
+/// A pending device registration confers nothing; the confirmation is the
+/// whole difference. Linking registers its newcomer before it can know the
+/// reply arrived, so what it writes is pending — and the access book probes
+/// the confirmed set alone. Alice, a scoped grantee of Bob who is also
+/// pending in his directory, receives exactly her granted claim: the
+/// registration adds not one entry to what her grant already allows. The
+/// same node, once Bob's directory carries its confirmation, reads the
+/// replica whole — so the denial above is the record's doing, not a path
+/// that was never live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_device_registration_confers_nothing() -> Result<()> {
+    let bob = spawn_node().await?;
+    let alice = spawn_node().await?;
+
+    let alice_own = ConnectionMetadataStore::create(&alice).await?;
+    alice_own.publish_device(alice.node_id()).await?;
+    let serving = serving_side(&bob, ids::ALICE, &alice_own).await?;
+
+    bob.create_namespace(ids::BOB).await?;
+    write_bobs_entries(&bob).await?;
+
+    // The registration a linking dialogue leaves on the inviter before —
+    // and, when the reply is lost, instead of — the newcomer's own
+    // confirmation.
+    serving
+        .directory
+        .add_pending_device(alice.node_id())
+        .await?;
+
+    // Alice's grant on one claim, consumed the way the bootstrap does.
+    let email = EntryPath::new(GRANTED)?;
+    let grant = granted(ids::BOB, ids::ALICE, &email, false);
+    let data_read_ticket = bob
+        .share_ticket(
+            ids::BOB,
+            ShareMode::Read,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    serving
+        .own_toward_peer
+        .publish_grant(&grant, &data_read_ticket)
+        .await?;
+    let alice_peer =
+        ConnectionMetadataStore::import(&alice, serving.own_read_ticket.clone()).await?;
+    alice.host_connection(ids::ALICE, ids::BOB, &alice_own, &alice_peer)?;
+    let (_grant, received_ticket) =
+        eventually_scoped_grant(&alice_peer, ids::BOB, ids::ALICE).await?;
+    alice
+        .import_namespace_scoped(ids::BOB, received_ticket)
+        .await?;
+
+    // Allowed, by the grant alone: the granted entry arrives, which also
+    // proves the reconciliation path is live for the denial below.
+    assert!(
+        eventually(|| async {
+            Ok(alice
+                .read(ids::BOB, &email)
+                .await?
+                .is_some_and(|p| p == b"bob@example.org"))
+        })
+        .await?,
+        "the granted entry did not reach the granted peer"
+    );
+
+    // Denied: pending is not membership. Waited out over three more of
+    // Alice's reconcile intervals after the granted entry proved the path
+    // live, so this is "she reconciled repeatedly and was served nothing
+    // more", not a poll that outran her first session.
+    tokio::time::sleep(RECONCILE * 3).await;
+    for withheld in [WITHHELD_A, WITHHELD_B] {
+        assert!(
+            alice
+                .read(ids::BOB, &EntryPath::new(withheld)?)
+                .await?
+                .is_none(),
+            "a pending registration served a withheld entry: {withheld}"
+        );
+    }
+
+    // The confirmation, and nothing else about Alice, changes: she is a
+    // device of Bob's identity now, and the whole replica is hers.
+    serving.directory.confirm_device(alice.node_id()).await?;
+    for withheld in [WITHHELD_A, WITHHELD_B] {
+        let path = EntryPath::new(withheld)?;
+        assert!(
+            eventually(|| async { Ok(alice.read(ids::BOB, &path).await?.is_some()) }).await?,
+            "a confirmed device must be served the replica whole: {withheld}"
+        );
+    }
+
+    bob.shutdown().await?;
+    alice.shutdown().await?;
     Ok(())
 }
 

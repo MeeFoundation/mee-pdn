@@ -43,6 +43,20 @@ async fn wait_devices_exactly(
     .await
 }
 
+/// Wait until the probe's directory lists every id in `devices` as pending
+/// — registered by an inviter, conferring nothing until the device itself
+/// confirms.
+async fn wait_pending_devices(
+    directory: &PrivateMetadataStore,
+    devices: &[NodeId],
+) -> Result<bool> {
+    eventually(|| async {
+        let have = directory.list_pending_devices().await?;
+        Ok(devices.iter().all(|d| have.contains(d)))
+    })
+    .await
+}
+
 /// Wait until the probe's directory lists exactly `kinds` (order-free).
 async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
     let mut expected: Vec<String> = kinds.to_vec();
@@ -77,10 +91,10 @@ async fn assert_directory_is(
 /// The positive ceremony: create on A, invite on A, link on B. The payload
 /// is bearer-free with a distinct secret per invite; link's return means
 /// the directory is caught up (a connection recorded before the invite
-/// lists immediately, with no poll); the inviter registered the newcomer
-/// itself; and the newcomer comes up with the full store set — an entry
-/// written under the identity on either runtime becomes readable on the
-/// other.
+/// lists immediately, with no poll); the newcomer is a device of the
+/// identity by the time link returns; and it comes up with the full store
+/// set — an entry written under the identity on either runtime becomes
+/// readable on the other.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     let rt_a = Runtime::spawn().await?;
@@ -123,13 +137,14 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
         "a caught-up directory must already hold the pre-linking connection record"
     );
 
-    // The inviter registered the newcomer: B never writes its own device
-    // record in this ceremony, so B's id in the device set can only be A's
-    // write. Probed from a raw linked node (which registers itself too).
+    // A completed link leaves the newcomer a confirmed device: A registered
+    // it as pending, B's own confirmation made it one, and both writes have
+    // reached a third replica. Probed from a raw linked node (which
+    // confirms itself the same way).
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     assert!(
         wait_devices(&probe_dir, &[rt_a.node_id(), rt_b.node_id()]).await?,
-        "the inviter-side registration did not appear in the device set"
+        "the linked device did not appear in the device set"
     );
 
     // The full store set: B hosts the data namespace from the reply — the
@@ -447,10 +462,13 @@ async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
     Ok(())
 }
 
-/// Lost-reply convergence: a raw dialer presents a live secret and never
-/// reads the reply. The inviter holds the registration — commit precedes
-/// the reply — and a fresh invite links the same device cleanly, with its
-/// node id in the device set exactly once.
+/// Lost-reply convergence, and what a lost reply does not confer: a raw
+/// dialer presents a live secret and never reads the reply. The inviter
+/// holds the registration — it precedes the reply — but as pending, so a
+/// device that cannot prove the tickets reached it is in no device set and
+/// admitted nowhere. A fresh invite then links the same device cleanly,
+/// with its node id in the device set exactly once and nothing left
+/// pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()> {
     let rt_a = Runtime::spawn().await?;
@@ -470,33 +488,47 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     let payload = rt_a.identity().linking_invite(x, None).await?;
     let connection = dial_linking_without_reading(&vanisher, &payload).await?;
 
-    // The inviter committed before replying: the registration appears in
-    // the device set while the reply sits unread on the wire.
+    // The registration precedes the reply: it appears while the reply sits
+    // unread on the wire — as pending.
     assert!(
-        wait_devices(&probe_dir, &[rt_a.node_id(), vanisher_id]).await?,
+        wait_pending_devices(&probe_dir, &[vanisher_id]).await?,
         "the registration must exist on the inviter although the reply was never read"
+    );
+    // And pending is all it is: the device set — the one thing the access
+    // book probes — still holds the founder and the probe alone, so a
+    // dialer that never read its tickets is served nothing.
+    assert!(
+        wait_devices_exactly(&probe_dir, &[rt_a.node_id(), probe_node.node_id()]).await?,
+        "a device that never read its tickets must not be in the device set"
     );
     connection.close(0u32.into(), b"");
 
-    // A fresh invite links the same device cleanly...
+    // A fresh invite links the same device cleanly — confirming itself, as
+    // any linking device does, once the tickets are in hand...
     let retry = rt_a.identity().linking_invite(x, None).await?;
     let (directory_ticket, _data_ticket) = dial_linking(&vanisher, &retry).await?;
     let vanisher_dir = PrivateMetadataStore::import(&vanisher, directory_ticket).await?;
+    vanisher_dir.confirm_device(vanisher_id).await?;
     assert!(
         wait_devices(&vanisher_dir, &[rt_a.node_id(), vanisher_id]).await?,
         "the re-link did not bring the directory up on the once-vanished device"
     );
 
-    // ...and the device set holds its node id once.
-    let occurrences = probe_dir
-        .list_devices()
-        .await?
-        .into_iter()
-        .filter(|d| *d == vanisher_id)
-        .count();
-    assert_eq!(
-        occurrences, 1,
-        "the re-link must not duplicate the device record"
+    // ...and the device set holds its node id once, with the pending
+    // registration cleared by the confirmation that superseded it.
+    assert!(
+        eventually(|| async {
+            let occurrences = probe_dir
+                .list_devices()
+                .await?
+                .into_iter()
+                .filter(|d| *d == vanisher_id)
+                .count();
+            let pending = probe_dir.list_pending_devices().await?;
+            Ok(occurrences == 1 && !pending.contains(&vanisher_id))
+        })
+        .await?,
+        "the re-link must record the device once and leave nothing pending"
     );
 
     probe_node.shutdown().await?;
@@ -694,6 +726,56 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 
     rt_b.shutdown().await?;
     fake_inviter.shutdown().await?;
+    Ok(())
+}
+
+/// Cancelling `link` — dropping its future outright, at any point from the
+/// dial through the local commit — must leave no residue: neither a
+/// registered-but-abandoned directory or data namespace, nor a
+/// half-committed hosted identity. `LinkRollbackGuard`'s `Drop` (and, for
+/// the data import, `SelfCleaningImport`'s own) are the only things that
+/// catch this; the rollback test above only exercises a *completed*
+/// catch-up failure, never a genuine future-drop. The sweep of delays
+/// covers the window from before the dial through well after a real link
+/// against a live counterpart normally completes, without needing to land
+/// on one exact instruction.
+// `tracked_doc_count` gates this the same way as the pairing-side
+// cancellation test — see the doc comment above.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_link_leaves_no_residue() -> Result<()> {
+    let rt_inviter = Runtime::spawn().await?;
+    let x = rt_inviter.identity().create().await?;
+    let rt = Runtime::spawn().await?;
+
+    for delay in [
+        Duration::from_millis(0),
+        Duration::from_millis(2),
+        Duration::from_millis(10),
+        Duration::from_millis(40),
+    ] {
+        let payload = rt_inviter.identity().linking_invite(x, None).await?;
+        let identity = rt.identity();
+        let attempt = identity.link(payload, TIMEOUT);
+        tokio::select! {
+            _ = attempt => {}
+            () = tokio::time::sleep(delay) => {}
+        }
+        if rt.sync().hosted_identities().await?.is_empty() {
+            assert!(
+                eventually(|| async { Ok(rt.sync().tracked_doc_count().await? == 0) }).await?,
+                "cancelling link at {delay:?} left a tracked replica behind with no hosted identity"
+            );
+        } else {
+            // A long-enough delay let this attempt complete: the identity
+            // is hosted, no further attempt can retry (already-hosted
+            // refuses), and there is nothing further to probe.
+            break;
+        }
+    }
+
+    rt_inviter.shutdown().await?;
+    rt.shutdown().await?;
     Ok(())
 }
 

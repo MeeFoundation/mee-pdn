@@ -65,7 +65,7 @@ pub(crate) struct HostedIdentity {
 /// each other would deadlock, each holding its own lock while the peer's
 /// accept side blocks on that same lock.
 pub(crate) struct State {
-    pub(crate) node: SyncNode,
+    pub(crate) node: Arc<SyncNode>,
     /// The author for this runtime's data-namespace writes. The author
     /// dimension carries no meaning (see [`pdn_types::EntryInfo`]), so one
     /// per runtime suffices.
@@ -102,6 +102,17 @@ pub(crate) struct State {
     /// itself brought in, so a namespace imported any other way is never
     /// dropped from under its owner.
     pub(crate) bound_grants: HashMap<(PdnId, PdnId, PdnId), NamespaceId>,
+    /// Identities with a `link` currently in flight on this runtime — the
+    /// linking analog of `grant_binders`: reserved right after the
+    /// already-hosted check, in the same lock scope, so a second concurrent
+    /// `link` toward the same not-yet-hosted identity refuses instead of
+    /// racing the first to commit. Released on every exit path of
+    /// `link_via_dialogue`, success and failure alike.
+    pub(crate) linking_in_flight: HashSet<PdnId>,
+    /// Pairs with an `establish` currently in flight, keyed by `(scanning
+    /// identity, inviter)` — the establishment analog of
+    /// `linking_in_flight`.
+    pub(crate) establishing_in_flight: HashSet<(PdnId, PdnId)>,
     /// The retraction-event surface: the verdict consumer sends, and
     /// [`Runtime::subscribe_retractions`] hands out receivers.
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
@@ -175,7 +186,7 @@ impl Runtime {
         let (retraction_events, _no_subscribers_yet) =
             tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
         let state = Arc::new(Mutex::new(State {
-            node,
+            node: Arc::new(node),
             author,
             identities: HashMap::new(),
             pending_invites: PendingInvites::default(),
@@ -183,6 +194,8 @@ impl Runtime {
             metadata_pairs: HashMap::new(),
             grant_binders: HashSet::new(),
             bound_grants: HashMap::new(),
+            linking_in_flight: HashSet::new(),
+            establishing_in_flight: HashSet::new(),
             retraction_events,
         }));
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
@@ -237,7 +250,14 @@ impl Runtime {
     /// `&self`: no exclusive ownership is required — a clone held by a
     /// router, a handler, or another caller does not block this, and
     /// `SyncNode::shutdown`'s own idempotence makes a repeat call harmless.
+    /// Clones the node handle and drops the state lock before awaiting the
+    /// shutdown itself: `SyncNode::shutdown` now waits, bounded, for every
+    /// in-flight pairing/linking accept to release its permit, and holding
+    /// the coarse lock across that wait would stall every other operation
+    /// on it — including an accept trying to take the very lock this
+    /// shutdown is waiting on.
     pub async fn shutdown(&self) -> Result<()> {
-        self.state.lock().await.node.shutdown().await
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.shutdown().await
     }
 }
