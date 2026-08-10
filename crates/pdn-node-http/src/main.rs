@@ -67,7 +67,10 @@ async fn run(runtime: &Arc<Runtime>) -> anyhow::Result<()> {
 
     tokio::select! {
         served = serve => served.map_err(Into::into),
-        () = drain_budget_spent => Ok(()),
+        () = drain_budget_spent => {
+            tracing::warn!(?GRACEFUL_DRAIN_BUDGET, "HTTP graceful-drain budget expired");
+            Ok(())
+        },
     }
 }
 

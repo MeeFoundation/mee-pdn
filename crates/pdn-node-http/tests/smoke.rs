@@ -9,7 +9,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -126,16 +126,18 @@ async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
     let runtime = Arc::new(Runtime::spawn().await?);
     let app = router(Arc::clone(&runtime), false);
     let acquired = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
     let lock_holder = {
         let runtime = Arc::clone(&runtime);
         let acquired = Arc::clone(&acquired);
+        let release = Arc::clone(&release);
         tokio::spawn(async move {
-            runtime
-                .hold_state_lock_for_test(Duration::from_secs(3), acquired)
-                .await;
+            runtime.hold_state_lock_for_test(acquired, release).await;
         })
     };
-    acquired.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), acquired.notified())
+        .await
+        .context("state-lock holder did not acquire the lock")?;
 
     let live = app
         .clone()
@@ -148,6 +150,7 @@ async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
         .await?;
     assert_eq!(ready.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
+    release.notify_one();
     lock_holder.await?;
     shutdown(runtime, app).await?;
     Ok(())

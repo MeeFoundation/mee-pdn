@@ -343,12 +343,12 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn hold_state_lock_for_test(
         &self,
-        duration: std::time::Duration,
         acquired: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     ) {
         let _state = self.state.lock().await;
         acquired.notify_one();
-        tokio::time::sleep(duration).await;
+        release.notified().await;
     }
 
     #[cfg(feature = "test-util")]

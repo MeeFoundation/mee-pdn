@@ -227,18 +227,15 @@ mod tests {
     /// across I/O. Wiring this into a non-200 response is covered by the
     /// existing `/live` success test (`tests/smoke.rs`) plus `error.rs`'s
     /// `HostError` unit tests.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_runtime_call_times_out_within_its_budget() {
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let result: Result<(), HostError> =
             with_runtime_budget(std::future::pending::<anyhow::Result<()>>()).await;
         let elapsed = started.elapsed();
         let err = result.expect_err("a pending future must time out, not resolve");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            elapsed < READINESS_BUDGET + std::time::Duration::from_secs(2),
-            "with_runtime_budget took {elapsed:?} against a {READINESS_BUDGET:?} budget"
-        );
+        assert_eq!(elapsed, READINESS_BUDGET);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{Connections, GrantPublication, PeerGrants};
+use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, PeerGrants};
 
 mod common;
 use common::{body, claims_on, entry_reads, grant_on, Host};
@@ -387,6 +387,16 @@ async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Resu
     assert!(
         statuses.contains(&StatusCode::NO_CONTENT) && statuses.contains(&StatusCode::CONFLICT),
         "exactly one of two concurrent links toward the same identity must succeed, got {statuses:?}"
+    );
+    let hosted: HostedIdentities = linker.get("/debug/identities").await?.json()?;
+    assert_eq!(
+        hosted
+            .identities
+            .iter()
+            .filter(|identity| **identity == w)
+            .count(),
+        1,
+        "the concurrent loser must not leave duplicate or missing hosted state: {hosted:?}"
     );
 
     linker.shutdown().await?;
