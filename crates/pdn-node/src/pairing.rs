@@ -241,7 +241,8 @@ pub(crate) type StateSlot = Arc<OnceLock<Weak<Mutex<State>>>>;
 /// A generous ceiling on concurrent establishments, never meant to bound
 /// anything in practice — it exists only so `shutdown`'s `acquire_many` has
 /// a fixed permit count to wait for all of.
-const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1 << 20;
+pub(crate) const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1 << 20;
+const MAX_CONCURRENT_ESTABLISHMENTS_U32: u32 = 1 << 20;
 
 /// How long `PairingHandler::shutdown` waits for in-flight `accept` calls
 /// to release their permit before giving up and letting the router close
@@ -274,6 +275,11 @@ impl PairingHandler {
     /// The slot to fill with the spawned runtime's state.
     pub(crate) fn slot(&self) -> StateSlot {
         Arc::clone(&self.state)
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn in_flight_probe(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.in_flight)
     }
 
     /// Run the inviter's side of one establishment. `None` is a refusal —
@@ -404,10 +410,10 @@ impl ProtocolHandler for PairingHandler {
     /// once it starts: `acquire_many` reaching every permit means every
     /// `accept` in flight when shutdown began has returned.
     async fn shutdown(&self) {
-        let permits = u32::try_from(MAX_CONCURRENT_ESTABLISHMENTS).unwrap_or(u32::MAX);
         let _ = tokio::time::timeout(
             SHUTDOWN_ESTABLISHMENT_BUDGET,
-            self.in_flight.acquire_many(permits),
+            self.in_flight
+                .acquire_many(MAX_CONCURRENT_ESTABLISHMENTS_U32),
         )
         .await;
     }

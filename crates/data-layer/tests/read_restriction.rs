@@ -357,10 +357,16 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     // The confirmation, and nothing else about Alice, changes: she is a
     // device of Bob's identity now, and the whole replica is hers.
     serving.directory.confirm_device(alice.node_id()).await?;
-    for withheld in [WITHHELD_A, WITHHELD_B] {
+    for (withheld, expected) in [
+        (WITHHELD_A, &b"+1-555-0100"[..]),
+        (WITHHELD_B, &b"dear diary"[..]),
+    ] {
         let path = EntryPath::new(withheld)?;
         assert!(
-            eventually(|| async { Ok(alice.read(ids::BOB, &path).await?.is_some()) }).await?,
+            eventually(|| async {
+                Ok(alice.read(ids::BOB, &path).await?.as_deref() == Some(expected))
+            })
+            .await?,
             "a confirmed device must be served the replica whole: {withheld}"
         );
     }

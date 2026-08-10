@@ -13,8 +13,7 @@ use pdn_node_http::{bind_addr_from_env, debug_enabled_from_env, router};
 /// How long `main` waits for axum's graceful drain — in-flight requests,
 /// e.g. a long-running `/debug/link` — before giving up on them and moving
 /// on to `runtime.shutdown()` regardless. Independent of any ceremony's own
-/// budget (which can run up to a day): this bounds how long a stop signal
-/// takes to actually stop the process.
+/// budget (which can run up to a day). Runtime shutdown has its own bounds.
 const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 
 #[tokio::main]
@@ -28,8 +27,15 @@ async fn main() -> anyhow::Result<()> {
     // identity spawned running while the process tries to exit, which holds
     // the exit for minutes. `Runtime::shutdown` takes `&self` and is
     // idempotent, so nothing here needs `runtime` back afterward.
-    runtime.shutdown().await?;
-    result
+    let shutdown = runtime.shutdown().await;
+    match (result, shutdown) {
+        (Err(primary), Err(shutdown)) => Err(anyhow::anyhow!(
+            "{primary:#}; runtime shutdown also failed: {shutdown:#}"
+        )),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// The fallible part of serving: read configuration, bind, and serve until

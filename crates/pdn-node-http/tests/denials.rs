@@ -17,7 +17,7 @@
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{Connections, GrantPublication};
+use pdn_node_http::shapes::{Connections, GrantPublication, PeerGrants};
 
 mod common;
 use common::{body, claims_on, entry_reads, grant_on, Host};
@@ -99,8 +99,22 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         foreign.status,
         foreign.text()
     );
+    let after_foreign: PeerGrants = inviter
+        .get(&format!("/debug/identities/{x}/grants/{y}"))
+        .await?
+        .json()?;
+    assert!(after_foreign.grants.is_empty());
+    let mut allowed_claims = claims_on(x, "contact/email", false)?;
+    allowed_claims.extend(claims_on(x, "contact/sentinel", false)?);
     inviter
-        .publish_grant(x, y, &grant_on(x, "contact/email", false)?)
+        .publish_grant(
+            x,
+            y,
+            &GrantPublication {
+                issuer: x,
+                claims: allowed_claims,
+            },
+        )
         .await?
         .ok()?;
 
@@ -146,6 +160,11 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         vec![y],
         "a refused establishment must leave no connection behind"
     );
+    let replayer_recorded: Connections = replayer
+        .get(&format!("/debug/identities/{z}/connections"))
+        .await?
+        .json()?;
+    assert!(replayer_recorded.connections.is_empty());
 
     // Allowed, then denied on the same claim: the grantee reads the granted
     // entry, and its write into the same claim is refused because the grant
@@ -176,19 +195,19 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         Bytes::from_static(b"x@example.org"),
         "the refused write must not touch the grantee's own replica"
     );
-    // Sentinel: a control write to the same path proves a completed
+    // Sentinel: a control write to another path proves a completed
     // two-way session ran after the refusal, before the issuer-side read
     // below is trusted to say anything about delivery rather than about
     // timing — an unpolled read right after the refusal could pass whether
     // or not the bad write was ever going to arrive.
     inviter
         .put(
-            &format!("/debug/data/{x}/contact/email"),
+            &format!("/debug/data/{x}/contact/sentinel"),
             body(b"x@new.example.org"),
         )
         .await?
         .ok()?;
-    entry_reads(&scanner, x, "contact/email", b"x@new.example.org")
+    entry_reads(&scanner, x, "contact/sentinel", b"x@new.example.org")
         .await
         .context("the sentinel update did not reach the grantee")?;
     let issuer_side = inviter
@@ -197,7 +216,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         .ok()?;
     assert_eq!(
         issuer_side,
-        Bytes::from_static(b"x@new.example.org"),
+        Bytes::from_static(b"x@example.org"),
         "the refused write must never reach the issuer"
     );
 

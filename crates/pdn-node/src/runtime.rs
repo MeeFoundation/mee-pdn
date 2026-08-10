@@ -76,6 +76,7 @@ use crate::{
 /// How many retraction events the subscription buffers before a slow
 /// subscriber starts losing the oldest — the broadcast channel's capacity.
 const RETRACTION_EVENTS_CAPACITY: usize = 64;
+const LINKING_FAILURES_CAPACITY: usize = 16;
 
 /// An operation addressed an identity this runtime does not host: `identity`
 /// was neither created nor linked here. Downcast from the `anyhow::Error`
@@ -168,6 +169,8 @@ pub(crate) struct State {
     pub(crate) cleanup_tasks: CleanupSupervisor,
     pub(crate) linking_failures: tokio::sync::broadcast::Sender<LinkingLocalFailure>,
     #[cfg(feature = "test-util")]
+    pub(crate) pairing_in_flight: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "test-util")]
     pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
@@ -223,6 +226,8 @@ impl Runtime {
     pub async fn spawn_with(options: SpawnOptions) -> Result<Self> {
         let pairing = PairingHandler::new();
         let pairing_slot = pairing.slot();
+        #[cfg(feature = "test-util")]
+        let pairing_in_flight = pairing.in_flight_probe();
         let linking = LinkingHandler::new();
         let linking_slot = linking.slot();
         let node = SyncNode::spawn_with(
@@ -243,7 +248,8 @@ impl Runtime {
         let node_id = node.node_id();
         let (retraction_events, _no_subscribers_yet) =
             tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
-        let (linking_failures, _no_failure_subscribers_yet) = tokio::sync::broadcast::channel(16);
+        let (linking_failures, _no_failure_subscribers_yet) =
+            tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
         let state = Arc::new(Mutex::new(State {
             node: Arc::new(node),
             author,
@@ -257,6 +263,8 @@ impl Runtime {
             establishing_in_flight: HashSet::new(),
             cleanup_tasks: CleanupSupervisor::new(),
             linking_failures,
+            #[cfg(feature = "test-util")]
+            pairing_in_flight,
             #[cfg(feature = "test-util")]
             link_after_import_pause: None,
             #[cfg(feature = "test-util")]
@@ -323,8 +331,23 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
-    pub async fn hold_state_lock_for_test(&self, duration: std::time::Duration) {
+    pub async fn pairing_accept_in_flight_for_test(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .pairing_in_flight
+            .available_permits()
+            < crate::pairing::MAX_CONCURRENT_ESTABLISHMENTS
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn hold_state_lock_for_test(
+        &self,
+        duration: std::time::Duration,
+        acquired: Arc<tokio::sync::Notify>,
+    ) {
         let _state = self.state.lock().await;
+        acquired.notify_one();
         tokio::time::sleep(duration).await;
     }
 

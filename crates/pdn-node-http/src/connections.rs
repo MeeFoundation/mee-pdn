@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::StatusCode,
     Json,
 };
@@ -29,8 +29,9 @@ use crate::{
 pub(crate) async fn invite(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
-    Query(lifetime): Query<Lifetime>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<InvitePayload>, HostError> {
+    let lifetime: Lifetime = parse::query(raw_query.as_deref(), "invite query")?;
     let identity = parse::id(&identity, "identity")?;
     let payload = runtime
         .connections()

@@ -113,14 +113,18 @@ async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
     let (mut send, _recv) = connection.open_bi().await?;
     send.write_all(&64u32.to_le_bytes()).await?;
     send.write_all(b"partial").await?;
-    // The accept is dispatched on the inviter only once these bytes land.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(TIMEOUT, async {
+        while !rt.pairing_accept_in_flight_for_test().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the inviter never dispatched the parked accept")?;
 
     let started = std::time::Instant::now();
     let mut shutting_down = tokio::spawn(async move { rt.shutdown().await });
 
-    // Still waiting: the accept has not returned, so neither has shutdown.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
     assert!(
         !shutting_down.is_finished(),
         "shutdown must wait for the accept in flight rather than abort it"

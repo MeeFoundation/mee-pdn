@@ -23,8 +23,6 @@
 //! them through this test — the caller — as a code moves between two screens
 //! through a person.
 
-use std::cell::RefCell;
-
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node_http::shapes::{Connections, Entries, GrantCapability, PeerGrants};
@@ -99,7 +97,6 @@ async fn the_whole_scenario_runs_over_http() -> Result<()> {
     // accumulated inside the poll: a record whose ticket payload is still
     // arriving reads as no grant at all — the very transient the poll exists
     // for — so a second read afterwards would not be the same read.
-    let observed = RefCell::new(None::<Bytes>);
     let arrived = eventually(|| async {
         let raw = scanner
             .get(&format!("/debug/identities/{y}/grants/{x}"))
@@ -107,16 +104,14 @@ async fn the_whole_scenario_runs_over_http() -> Result<()> {
             .ok()?;
         let grants: PeerGrants = serde_json::from_slice(&raw)?;
         let found = grants.grants.iter().any(|grant| grant.issuer == x);
-        if found {
-            *observed.borrow_mut() = Some(raw);
-        }
         Ok(found)
     })
     .await?;
     assert!(arrived, "the grant did not reach the grantee over the pair");
-    let raw = observed
-        .into_inner()
-        .context("the poll reported the grant and handed back nothing")?;
+    let raw = scanner
+        .get(&format!("/debug/identities/{y}/grants/{x}"))
+        .await?
+        .ok()?;
     // No namespace ticket may cross the surface, whatever a leaked field
     // happened to be named: `GrantCapability` denies unknown fields, so a
     // response carrying anything beyond issuer/audience/claims — ticket

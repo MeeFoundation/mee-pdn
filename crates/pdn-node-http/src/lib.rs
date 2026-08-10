@@ -65,7 +65,7 @@ pub use crate::{
 /// surface meets a deliberate demo-stand limit rather than the engine's.
 /// Past it, axum answers 413 directly — outside the closed error table,
 /// same as the two statuses [`HostError`] decides on its own.
-const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 /// Build the host's router over the embedded runtime. The scaffolding
@@ -77,16 +77,16 @@ pub fn router(runtime: Arc<Runtime>, debug: bool) -> Router {
         .route("/live", get(live))
         .route("/ready", get(ready));
     let app = if debug {
-        app.merge(debug_routes())
+        let debug = debug_routes().layer(middleware::from_fn_with_state(
+            Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            admit_request,
+        ));
+        app.merge(debug)
     } else {
         app
     };
-    app.layer(middleware::from_fn_with_state(
-        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
-        admit_request,
-    ))
-    .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-    .with_state(runtime)
+    app.layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(runtime)
 }
 
 async fn admit_request(
@@ -243,13 +243,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_above_the_concurrency_limit_is_shed() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));
         let app = Router::new()
             .route(
                 "/",
                 get(|| async { std::future::pending::<&'static str>().await }),
             )
             .layer(middleware::from_fn_with_state(
-                Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+                Arc::clone(&limit),
                 admit_request,
             ));
         let mut admitted = Vec::new();
@@ -261,7 +262,13 @@ mod tests {
                     .await
             }));
         }
-        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while limit.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all permits must be acquired");
 
         let shed = app
             .oneshot(Request::get("/").body(Body::empty()).expect("request"))

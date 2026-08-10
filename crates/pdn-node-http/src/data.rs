@@ -85,6 +85,8 @@ pub(crate) async fn list(
     let prefix = prefix
         .prefix
         .as_deref()
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
         .map(parse::entry_path)
         .transpose()?;
     let entries = runtime.data().list(issuer, prefix.as_ref()).await?;

@@ -542,7 +542,10 @@ async fn link_via_dialogue_inner(
         rollback.roll_back().await;
         return Err(err).context("the imported directory did not catch up in time");
     }
-    directory.cleanup_pending_devices().await?;
+    if let Err(err) = directory.cleanup_pending_devices().await {
+        rollback.roll_back().await;
+        return Err(err).context("pending-device cleanup failed after import");
+    }
 
     // The armer's subscription, taken before the handle moves into the
     // hosted set: pairs established on the identity's other devices —
@@ -728,6 +731,8 @@ impl LinkRollbackGuard {
     /// after `link_via_dialogue` reported it caught up.
     fn disarm(&mut self) {
         self.armed = false;
+        self.owns_reservation_cleanup
+            .store(false, Ordering::Release);
         if let Some(import) = self.data_import.take() {
             import.commit();
         }

@@ -16,26 +16,62 @@ use axum::{
     Router,
 };
 use pdn_node::Runtime;
-use pdn_node_http::router;
+use pdn_node_http::{router, MAX_REQUEST_BODY_BYTES};
 use tower::ServiceExt as _;
 
 /// One of every debug route, by method and path — a hosted identity is not
 /// needed, because the gate decides before any handler runs.
-const DEBUG_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/debug/status"),
-    ("POST", "/debug/identities"),
-    ("GET", "/debug/identities"),
-    ("POST", "/debug/identities/aa/linking-invite"),
-    ("POST", "/debug/link"),
-    ("POST", "/debug/identities/aa/invite"),
-    ("POST", "/debug/identities/aa/establish"),
-    ("GET", "/debug/identities/aa/connections"),
-    ("POST", "/debug/identities/aa/grants/bb"),
-    ("GET", "/debug/identities/aa/grants/bb"),
-    ("DELETE", "/debug/identities/aa/grants/bb/cc"),
-    ("GET", "/debug/data/aa"),
-    ("PUT", "/debug/data/aa/contact/email"),
-    ("GET", "/debug/data/aa/contact/email"),
+const DEBUG_ROUTES: &[(&str, &str, StatusCode)] = &[
+    ("GET", "/debug/status", StatusCode::OK),
+    ("POST", "/debug/identities", StatusCode::OK),
+    ("GET", "/debug/identities", StatusCode::OK),
+    (
+        "POST",
+        "/debug/identities/aa/linking-invite",
+        StatusCode::BAD_REQUEST,
+    ),
+    ("POST", "/debug/link", StatusCode::BAD_REQUEST),
+    (
+        "POST",
+        "/debug/identities/aa/invite",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "POST",
+        "/debug/identities/aa/establish",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "GET",
+        "/debug/identities/aa/connections",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "POST",
+        "/debug/identities/aa/grants/bb",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "GET",
+        "/debug/identities/aa/grants/bb",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "DELETE",
+        "/debug/identities/aa/grants/bb/cc",
+        StatusCode::BAD_REQUEST,
+    ),
+    ("GET", "/debug/data/aa", StatusCode::BAD_REQUEST),
+    (
+        "PUT",
+        "/debug/data/aa/contact/email",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "GET",
+        "/debug/data/aa/contact/email",
+        StatusCode::BAD_REQUEST,
+    ),
 ];
 
 /// Close the endpoint. `shutdown` needs no exclusive ownership, but skipping
@@ -64,7 +100,7 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
     assert_eq!(ready.status(), StatusCode::OK);
 
     // Paired deny: without the flag not one `/debug/` route exists.
-    for (method, path) in DEBUG_ROUTES {
+    for (method, path, _expected) in DEBUG_ROUTES {
         let response = app
             .clone()
             .oneshot(
@@ -89,15 +125,17 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
 async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
     let runtime = Arc::new(Runtime::spawn().await?);
     let app = router(Arc::clone(&runtime), false);
+    let acquired = Arc::new(tokio::sync::Notify::new());
     let lock_holder = {
         let runtime = Arc::clone(&runtime);
+        let acquired = Arc::clone(&acquired);
         tokio::spawn(async move {
             runtime
-                .hold_state_lock_for_test(Duration::from_secs(3))
+                .hold_state_lock_for_test(Duration::from_secs(3), acquired)
                 .await;
         })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    acquired.notified().await;
 
     let live = app
         .clone()
@@ -128,7 +166,7 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
     let runtime = Arc::new(Runtime::spawn().await?);
     let app = router(Arc::clone(&runtime), true);
 
-    for (method, path) in DEBUG_ROUTES {
+    for (method, path, expected) in DEBUG_ROUTES {
         let response = app
             .clone()
             .oneshot(
@@ -138,10 +176,10 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
                     .body(Body::empty())?,
             )
             .await?;
-        assert!(
-            response.status() != StatusCode::NOT_FOUND,
-            "{method} {path} must be a served route when the flag is on, got {}",
-            response.status()
+        assert_eq!(
+            response.status(),
+            *expected,
+            "unexpected answer from {method} {path}"
         );
     }
 
@@ -151,13 +189,14 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
-    const MAX_BODY: usize = 16 * 1024 * 1024;
-
     let runtime = Arc::new(Runtime::spawn().await?);
     let app = router(Arc::clone(&runtime), true);
     let response = app
         .clone()
-        .oneshot(Request::post("/debug/link").body(Body::from(vec![0_u8; MAX_BODY + 1]))?)
+        .oneshot(
+            Request::post("/debug/link")
+                .body(Body::from(vec![0_u8; MAX_REQUEST_BODY_BYTES + 1]))?,
+        )
         .await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 

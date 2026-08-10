@@ -14,14 +14,21 @@ use crate::error::HostError;
 
 /// A `PdnId` from a path segment — `what` names the segment in the refusal.
 pub fn id(raw: &str, what: &str) -> Result<PdnId, HostError> {
+    let preview: String = raw.chars().take(64).collect();
     raw.parse()
-        .map_err(|err| HostError::bad_request(format!("malformed {what} {raw:?}: {err}")))
+        .map_err(|err| HostError::bad_request(format!("malformed {what} {preview:?}: {err}")))
 }
 
 /// An `EntryPath` from the wildcard segment of a data route.
 pub fn entry_path(raw: &str) -> Result<EntryPath, HostError> {
+    let preview: String = raw.chars().take(64).collect();
     EntryPath::new(raw)
-        .map_err(|err| HostError::bad_request(format!("malformed entry path {raw:?}: {err}")))
+        .map_err(|err| HostError::bad_request(format!("malformed entry path {preview:?}: {err}")))
+}
+
+pub fn query<T: DeserializeOwned>(raw: Option<&str>, what: &str) -> Result<T, HostError> {
+    serde_urlencoded::from_str(raw.unwrap_or_default())
+        .map_err(|err| HostError::bad_request(format!("malformed {what}: {err}")))
 }
 
 /// A JSON request body.
@@ -53,6 +60,13 @@ mod tests {
     #[test]
     fn a_body_of_the_wrong_shape_is_400() {
         let err = json::<PdnId>(&Bytes::from_static(b"{\"a\":1}"), "an identity").unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_malformed_query_is_400() {
+        let err = query::<crate::shapes::Lifetime>(Some("lifetime_secs=nope"), "invite query")
+            .unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -10,7 +10,7 @@
 // helpers; what one binary leaves unused is not dead code of the crate.
 #![allow(dead_code)]
 
-use std::{cell::RefCell, future::Future, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{ensure, Context as _, Result};
 use axum::{
@@ -135,7 +135,11 @@ impl Host {
     async fn send(&self, request: Request<Body>) -> Result<Answer> {
         let response = self.app.clone().oneshot(request).await?;
         let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = axum::body::to_bytes(
+            response.into_body(),
+            pdn_node_http::MAX_REQUEST_BODY_BYTES + 1024 * 1024,
+        )
+        .await?;
         Ok(Answer { status, body })
     }
 }
@@ -155,7 +159,10 @@ impl Drop for Host {
     /// own exit path over relying on this.
     fn drop(&mut self) {
         let runtime = Arc::clone(&self.runtime);
-        tokio::spawn(async move {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
             let _ = runtime.shutdown().await;
         });
     }
@@ -237,17 +244,27 @@ async fn poll_read(
     path: &str,
     holds: impl Fn(&Answer) -> bool,
 ) -> Result<()> {
-    let last = RefCell::new(None::<(StatusCode, String)>);
-    let observed = eventually(|| async {
-        let answer = host.get(&format!("/debug/data/{issuer}/{path}")).await?;
-        let held = holds(&answer);
-        *last.borrow_mut() = Some((answer.status, answer.text()));
-        Ok(held)
-    })
-    .await?;
-    match (observed, last.into_inner()) {
-        (true, _) => Ok(()),
-        (false, Some((status, body))) => Err(anyhow::anyhow!("last answer was {status}: {body}")),
-        (false, None) => Err(anyhow::anyhow!("the read was never attempted")),
+    let encoded = path
+        .split('/')
+        .map(|component| {
+            percent_encoding::utf8_percent_encode(component, percent_encoding::NON_ALPHANUMERIC)
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let answer = host.get(&format!("/debug/data/{issuer}/{encoded}")).await?;
+        if holds(&answer) {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "last answer was {}: {}",
+                answer.status,
+                answer.text()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

@@ -13,12 +13,14 @@ serde = { version = "1", features = ["derive"] }
 # Request bodies are decoded here rather than by axum's `Json` extractor, so
 # a malformed body lands on the error table's 400 instead of axum's 422.
 serde_json = "1"
+serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
 pdn-node = { path = "../pdn-node", features = ["test-util"] }
+percent-encoding = "2"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

@@ -743,41 +743,26 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 async fn cancelling_link_leaves_no_residue() -> Result<()> {
     let rt_inviter = Runtime::spawn().await?;
     let x = rt_inviter.identity().create().await?;
-    let rt = Runtime::spawn().await?;
-
-    for delay in [
-        Duration::from_millis(0),
-        Duration::from_millis(2),
-        Duration::from_millis(10),
-        Duration::from_millis(40),
-    ] {
-        let payload = rt_inviter.identity().linking_invite(x, None).await?;
-        let identity = rt.identity();
-        let attempt = identity.link(payload, TIMEOUT);
-        let outcome = tokio::select! {
-            result = attempt => Some(result),
-            () = tokio::time::sleep(delay) => None,
-        };
-        if let Some(result) = outcome {
-            result?;
-            break;
-        }
-        if rt.sync().hosted_identities().await?.is_empty() {
-            assert!(
-                eventually(|| async {
-                    Ok(rt.sync().tracked_doc_count().await? == 0
-                        && !rt.sync().linking_in_flight_for_test(x).await)
-                })
-                .await?,
-                "cancelling link at {delay:?} left a tracked replica behind with no hosted identity"
-            );
-        } else {
-            // A long-enough delay let this attempt complete: the identity
-            // is hosted, no further attempt can retry (already-hosted
-            // refuses), and there is nothing further to probe.
-            break;
-        }
-    }
+    let rt = Arc::new(Runtime::spawn().await?);
+    let pause = rt.pause_next_link_after_import().await;
+    let payload = rt_inviter.identity().linking_invite(x, None).await?;
+    let attempt = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.identity().link(payload, TIMEOUT).await })
+    };
+    pause.wait_until_reached().await;
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    pause.release();
+    assert!(
+        eventually(|| async {
+            Ok(rt.sync().hosted_identities().await?.is_empty()
+                && rt.sync().tracked_doc_count().await? == 0
+                && !rt.sync().linking_in_flight_for_test(x).await)
+        })
+        .await?,
+        "cancelled link left hosted state, a replica, or a reservation"
+    );
 
     rt_inviter.shutdown().await?;
     rt.shutdown().await?;

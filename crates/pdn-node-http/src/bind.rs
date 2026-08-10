@@ -5,7 +5,7 @@
 //! live ceremony secrets and authenticates nobody: reaching it is reaching
 //! the node.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context as _, Result};
 
@@ -28,16 +28,27 @@ pub fn bind_addr(host: Option<&str>, port: Option<&str>) -> Result<SocketAddr> {
             .with_context(|| format!("PDN_PORT is not a port number: {port:?}"))?,
         None => DEFAULT_PORT,
     };
-    format!("{host}:{port}")
+    let host: IpAddr = host
         .parse()
-        .with_context(|| format!("not a bind address: {host}:{port}"))
+        .with_context(|| format!("PDN_HOST is not an IP address: {host:?}"))?;
+    Ok(SocketAddr::new(host, port))
+}
+
+fn env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err @ std::env::VarError::NotUnicode(_)) => {
+            Err(err).with_context(|| format!("{name} is not valid Unicode"))
+        }
+    }
 }
 
 /// [`bind_addr`] over this process's own environment: `PDN_HOST` and
 /// `PDN_PORT`.
 pub fn bind_addr_from_env() -> Result<SocketAddr> {
-    let host = std::env::var("PDN_HOST").ok();
-    let port = std::env::var("PDN_PORT").ok();
+    let host = env("PDN_HOST")?;
+    let port = env("PDN_PORT")?;
     bind_addr(host.as_deref(), port.as_deref())
 }
 
@@ -59,7 +70,7 @@ pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
 
 /// [`debug_enabled`] over this process's own environment: `PDN_DEBUG`.
 pub fn debug_enabled_from_env() -> Result<bool> {
-    debug_enabled(std::env::var("PDN_DEBUG").ok().as_deref())
+    debug_enabled(env("PDN_DEBUG")?.as_deref())
 }
 
 #[cfg(test)]
@@ -86,6 +97,14 @@ mod tests {
         assert_eq!(
             bind_addr(None, Some("9000")).unwrap().to_string(),
             "127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn bare_ipv6_is_accepted() {
+        assert_eq!(
+            bind_addr(Some("::1"), None).unwrap(),
+            "[::1]:3011".parse().unwrap()
         );
     }
 
