@@ -58,4 +58,14 @@ impl RuntimeSyncService<'_> {
         let state = self.runtime.state.lock().await;
         state.node.tracked_doc_count()
     }
+
+    #[cfg(feature = "test-util")]
+    pub async fn linking_in_flight_for_test(&self, identity: PdnId) -> bool {
+        self.runtime
+            .state
+            .lock()
+            .await
+            .linking_in_flight
+            .contains(&identity)
+    }
 }

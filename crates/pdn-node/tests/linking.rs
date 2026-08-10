@@ -754,13 +754,21 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
         let payload = rt_inviter.identity().linking_invite(x, None).await?;
         let identity = rt.identity();
         let attempt = identity.link(payload, TIMEOUT);
-        tokio::select! {
-            _ = attempt => {}
-            () = tokio::time::sleep(delay) => {}
+        let outcome = tokio::select! {
+            result = attempt => Some(result),
+            () = tokio::time::sleep(delay) => None,
+        };
+        if let Some(result) = outcome {
+            result?;
+            break;
         }
         if rt.sync().hosted_identities().await?.is_empty() {
             assert!(
-                eventually(|| async { Ok(rt.sync().tracked_doc_count().await? == 0) }).await?,
+                eventually(|| async {
+                    Ok(rt.sync().tracked_doc_count().await? == 0
+                        && !rt.sync().linking_in_flight_for_test(x).await)
+                })
+                .await?,
                 "cancelling link at {delay:?} left a tracked replica behind with no hosted identity"
             );
         } else {
