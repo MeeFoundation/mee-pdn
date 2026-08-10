@@ -57,7 +57,6 @@ use data_layer::{
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio_util::task::TaskTracker;
 
 use crate::{
     pairing::{read_message, write_message, StateSlot},
@@ -455,7 +454,7 @@ async fn link_via_dialogue_inner(
     timeout: Duration,
     dial: data_layer::DialHandle,
     rollback_owns_cleanup: Arc<AtomicBool>,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
 ) -> Result<()> {
     // The budget covers the whole ceremony from here: the dialogue spends
     // from it first, the catch-up below gets what remains.
@@ -601,12 +600,16 @@ struct LinkingReservation {
     state: Arc<Mutex<State>>,
     identity: PdnId,
     rollback_owns_cleanup: Arc<AtomicBool>,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
     armed: bool,
 }
 
 impl LinkingReservation {
-    fn new(state: Arc<Mutex<State>>, identity: PdnId, cleanup_tasks: TaskTracker) -> Self {
+    fn new(
+        state: Arc<Mutex<State>>,
+        identity: PdnId,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
+    ) -> Self {
         Self {
             state,
             identity,
@@ -661,7 +664,7 @@ struct LinkRollbackGuard {
     directory_namespace: NamespaceId,
     data_import: Option<SelfCleaningImport>,
     owns_reservation_cleanup: Arc<AtomicBool>,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
     armed: bool,
 }
 
@@ -671,7 +674,7 @@ impl LinkRollbackGuard {
         identity: PdnId,
         directory_namespace: NamespaceId,
         owns_reservation_cleanup: Arc<AtomicBool>,
-        cleanup_tasks: TaskTracker,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
         owns_reservation_cleanup.store(true, Ordering::Release);
         Self {
@@ -760,11 +763,15 @@ impl Drop for LinkRollbackGuard {
 struct SelfCleaningImport {
     state: Arc<Mutex<State>>,
     import: Option<NamespaceImport>,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
 }
 
 impl SelfCleaningImport {
-    fn new(state: Arc<Mutex<State>>, import: NamespaceImport, cleanup_tasks: TaskTracker) -> Self {
+    fn new(
+        state: Arc<Mutex<State>>,
+        import: NamespaceImport,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
+    ) -> Self {
         Self {
             state,
             import: Some(import),

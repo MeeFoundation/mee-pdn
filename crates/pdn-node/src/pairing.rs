@@ -39,7 +39,6 @@ use pdn_types::PdnId;
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio_util::task::TaskTracker;
 
 use crate::runtime::State;
 
@@ -478,7 +477,7 @@ async fn establish_via_dialogue_inner(
     identity: PdnId,
     payload: &InvitePayload,
     dial: data_layer::DialHandle,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
 ) -> Result<()> {
     // Network — no lock held. Dial before minting `own`, so an unreachable
     // inviter never leaves a replica behind.
@@ -605,7 +604,7 @@ struct EstablishReservation {
     identity: PdnId,
     peer: PdnId,
     armed: bool,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
 }
 
 impl EstablishReservation {
@@ -613,7 +612,7 @@ impl EstablishReservation {
         state: Arc<Mutex<State>>,
         identity: PdnId,
         peer: PdnId,
-        cleanup_tasks: TaskTracker,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
         Self {
             state,
@@ -673,7 +672,7 @@ struct EstablishGuard {
     own_namespace: data_layer::NamespaceId,
     created_fresh: bool,
     armed: bool,
-    cleanup_tasks: TaskTracker,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
 }
 
 impl EstablishGuard {
@@ -681,7 +680,7 @@ impl EstablishGuard {
         state: Arc<Mutex<State>>,
         own_namespace: data_layer::NamespaceId,
         created_fresh: bool,
-        cleanup_tasks: TaskTracker,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
         Self {
             state,
@@ -708,8 +707,8 @@ impl Drop for EstablishGuard {
         let state = Arc::clone(&self.state);
         let own_namespace = self.own_namespace;
         self.cleanup_tasks.spawn(async move {
-            let state = state.lock().await;
-            let _ = state.node.forget_doc(own_namespace).await;
+            let node = Arc::clone(&state.lock().await.node);
+            let _ = node.forget_doc(own_namespace).await;
         });
     }
 }

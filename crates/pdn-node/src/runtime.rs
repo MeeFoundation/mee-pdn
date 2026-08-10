@@ -3,6 +3,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::Arc,
 };
 
@@ -13,6 +14,36 @@ use data_layer::{
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
+
+#[derive(Clone)]
+pub(crate) struct CleanupSupervisor {
+    tasks: TaskTracker,
+    runtime: tokio::runtime::Handle,
+}
+
+impl CleanupSupervisor {
+    fn new() -> Self {
+        Self {
+            tasks: TaskTracker::new(),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    pub(crate) fn spawn<F>(&self, task: F) -> tokio::task::JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.tasks.spawn_on(task, &self.runtime)
+    }
+
+    fn close(&self) {
+        self.tasks.close();
+    }
+
+    async fn wait(&self) {
+        self.tasks.wait().await;
+    }
+}
 
 #[cfg(feature = "test-util")]
 pub struct LinkAfterImportPause {
@@ -134,7 +165,7 @@ pub(crate) struct State {
     pub(crate) establishing_in_flight: HashSet<(PdnId, PdnId)>,
     /// Asynchronous rollback work created by cancellation. Shutdown closes
     /// and joins this tracker before stopping the node underneath it.
-    pub(crate) cleanup_tasks: TaskTracker,
+    pub(crate) cleanup_tasks: CleanupSupervisor,
     pub(crate) linking_failures: tokio::sync::broadcast::Sender<LinkingLocalFailure>,
     #[cfg(feature = "test-util")]
     pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
@@ -224,7 +255,7 @@ impl Runtime {
             bound_grants: HashMap::new(),
             linking_in_flight: HashSet::new(),
             establishing_in_flight: HashSet::new(),
-            cleanup_tasks: TaskTracker::new(),
+            cleanup_tasks: CleanupSupervisor::new(),
             linking_failures,
             #[cfg(feature = "test-util")]
             link_after_import_pause: None,
