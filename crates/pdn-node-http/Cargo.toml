@@ -18,6 +18,7 @@ tracing = { workspace = true }
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
+pdn-node = { path = "../pdn-node", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

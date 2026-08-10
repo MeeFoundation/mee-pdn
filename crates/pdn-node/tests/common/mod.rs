@@ -13,7 +13,9 @@
 #![allow(dead_code)]
 
 use anyhow::{ensure, Context, Result};
-use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
+use data_layer::{
+    Connection, DialHandle, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode,
+};
 use pdn_node::{
     ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
     Runtime,
@@ -87,8 +89,14 @@ pub async fn dial_linking_without_reading(
     node: &SyncNode,
     payload: &LinkingPayload,
 ) -> Result<Connection> {
-    let connection = node
-        .dial_handle()
+    dial_linking_without_reading_from(&node.dial_handle(), payload).await
+}
+
+pub async fn dial_linking_without_reading_from(
+    dial: &DialHandle,
+    payload: &LinkingPayload,
+) -> Result<Connection> {
+    let connection = dial
         .connect(payload.inviter_addr.clone(), LINKING_ALPN)
         .await?;
     let (mut send, _dropped_recv) = connection.open_bi().await?;

@@ -65,13 +65,14 @@ impl HostError {
 impl From<anyhow::Error> for HostError {
     fn from(err: anyhow::Error) -> Self {
         let status = status_of(&err);
-        let message = format!("{err:#}");
+        let internal = format!("{err:#}");
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "internal server error".to_owned()
+        } else {
+            err.to_string()
+        };
         if status == StatusCode::INTERNAL_SERVER_ERROR {
-            // The pessimistic default means this host does not understand
-            // what happened; the response carries the same text it always
-            // has, but with no logging facility in this crate, this is the
-            // only server-side record of the failure an operator gets.
-            tracing::error!("unmapped host error: {message}");
+            tracing::error!("unmapped host error: {internal}");
         }
         Self { status, message }
     }
@@ -200,10 +201,9 @@ mod tests {
     /// launder into a refusal.
     #[test]
     fn an_unmapped_error_is_500() {
-        assert_eq!(
-            status(anyhow!("the inviter was never reached")),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        let err = HostError::from(anyhow!("the inviter was never reached"));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, "internal server error");
     }
 
     /// Service errors arrive wrapped in context; the table still reads
@@ -226,6 +226,15 @@ mod tests {
             "the message must name the identity: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn an_internal_cause_chain_never_reaches_the_response() {
+        let err = anyhow!("private storage path /secret/node.db")
+            .context("failed to open the identity directory");
+        let host = HostError::from(err);
+        assert_eq!(host.message, "internal server error");
+        assert!(!host.message.contains("/secret/node.db"));
     }
 
     /// The two statuses the host decides on its own, not by downcast.

@@ -39,6 +39,7 @@ use pdn_types::PdnId;
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 
 use crate::runtime::State;
 
@@ -317,8 +318,12 @@ impl PairingHandler {
             // the dial side's guard: a cancellation of this `serve` future
             // from here on (the dialer disconnects, or a bounded shutdown
             // wait) forgets it, the same as a completed failure below.
-            let mut rollback =
-                EstablishGuard::new(Arc::clone(&state_arc), own.namespace(), created_fresh);
+            let mut rollback = EstablishGuard::new(
+                Arc::clone(&state_arc),
+                own.namespace(),
+                created_fresh,
+                state.cleanup_tasks.clone(),
+            );
             let Ok(ticket) = own
                 .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
                 .await
@@ -428,7 +433,7 @@ pub(crate) async fn establish_via_dialogue(
 ) -> Result<()> {
     // A brief lock for the hosted check, the in-flight reservation, and the
     // dial handle (a cheap snapshot); released before any network I/O.
-    let dial = {
+    let (dial, cleanup_tasks) = {
         let mut state_guard = state.lock().await;
         state_guard.hosted(identity)?;
         if !state_guard
@@ -441,7 +446,10 @@ pub(crate) async fn establish_via_dialogue(
             }
             .into());
         }
-        state_guard.node.dial_handle()
+        (
+            state_guard.node.dial_handle(),
+            state_guard.cleanup_tasks.clone(),
+        )
     };
     // Reserved for the whole ceremony from here. Released synchronously
     // right after `establish_via_dialogue_inner` below settles, on every
@@ -450,8 +458,13 @@ pub(crate) async fn establish_via_dialogue(
     // Only a genuine cancellation of *this* function skips that release,
     // and `reservation`'s own `Drop` (spawned detached, since `Drop` is
     // synchronous) is exactly the fallback for that case.
-    let reservation = EstablishReservation::new(Arc::clone(state), identity, payload.inviter);
-    let result = establish_via_dialogue_inner(state, identity, payload, dial).await;
+    let reservation = EstablishReservation::new(
+        Arc::clone(state),
+        identity,
+        payload.inviter,
+        cleanup_tasks.clone(),
+    );
+    let result = establish_via_dialogue_inner(state, identity, payload, dial, cleanup_tasks).await;
     reservation.release().await;
     result
 }
@@ -465,6 +478,7 @@ async fn establish_via_dialogue_inner(
     identity: PdnId,
     payload: &InvitePayload,
     dial: data_layer::DialHandle,
+    cleanup_tasks: TaskTracker,
 ) -> Result<()> {
     // Network — no lock held. Dial before minting `own`, so an unreachable
     // inviter never leaves a replica behind.
@@ -486,7 +500,12 @@ async fn establish_via_dialogue_inner(
     // back `Err`; a cancellation skips it the same way it skips every other
     // early return, so this guard is the only thing that forgets `own` in
     // that case.
-    let mut rollback = EstablishGuard::new(Arc::clone(state), own.namespace(), created_fresh);
+    let mut rollback = EstablishGuard::new(
+        Arc::clone(state),
+        own.namespace(),
+        created_fresh,
+        cleanup_tasks,
+    );
 
     // The round-trip — no lock held, so the accept side can take the lock to
     // answer (this is what breaks the reciprocal-establishment deadlock). Any
@@ -586,15 +605,22 @@ struct EstablishReservation {
     identity: PdnId,
     peer: PdnId,
     armed: bool,
+    cleanup_tasks: TaskTracker,
 }
 
 impl EstablishReservation {
-    fn new(state: Arc<Mutex<State>>, identity: PdnId, peer: PdnId) -> Self {
+    fn new(
+        state: Arc<Mutex<State>>,
+        identity: PdnId,
+        peer: PdnId,
+        cleanup_tasks: TaskTracker,
+    ) -> Self {
         Self {
             state,
             identity,
             peer,
             armed: true,
+            cleanup_tasks,
         }
     }
 
@@ -626,7 +652,7 @@ impl Drop for EstablishReservation {
         let state = Arc::clone(&self.state);
         let identity = self.identity;
         let peer = self.peer;
-        tokio::spawn(async move {
+        self.cleanup_tasks.spawn(async move {
             state
                 .lock()
                 .await
@@ -647,6 +673,7 @@ struct EstablishGuard {
     own_namespace: data_layer::NamespaceId,
     created_fresh: bool,
     armed: bool,
+    cleanup_tasks: TaskTracker,
 }
 
 impl EstablishGuard {
@@ -654,12 +681,14 @@ impl EstablishGuard {
         state: Arc<Mutex<State>>,
         own_namespace: data_layer::NamespaceId,
         created_fresh: bool,
+        cleanup_tasks: TaskTracker,
     ) -> Self {
         Self {
             state,
             own_namespace,
             created_fresh,
             armed: true,
+            cleanup_tasks,
         }
     }
 
@@ -678,7 +707,7 @@ impl Drop for EstablishGuard {
         }
         let state = Arc::clone(&self.state);
         let own_namespace = self.own_namespace;
-        tokio::spawn(async move {
+        self.cleanup_tasks.spawn(async move {
             let state = state.lock().await;
             let _ = state.node.forget_doc(own_namespace).await;
         });

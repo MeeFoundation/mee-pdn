@@ -42,7 +42,10 @@
 //! there are no pending linking invites.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -54,6 +57,7 @@ use data_layer::{
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 
 use crate::{
     pairing::{read_message, write_message, StateSlot},
@@ -152,6 +156,13 @@ pub struct IdentityAlreadyHosted {
 pub struct LinkingInProgress {
     /// The identity a concurrent `link` is already attempting.
     pub identity: PdnId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkingLocalFailure {
+    PendingDeviceWrite { identity: PdnId, newcomer: NodeId },
+    DirectoryTicketMint { identity: PdnId, newcomer: NodeId },
+    DataTicketMint { identity: PdnId, newcomer: NodeId },
 }
 
 /// The new device's half of the dialogue: the format version and the
@@ -255,18 +266,48 @@ impl LinkingHandler {
             // below may never arrive, and a device registered without its
             // tickets must not be served as one. The newcomer confirms
             // itself once it holds them.
+            #[cfg(feature = "test-util")]
+            let inject_pending_write_failure = if state.fail_next_pending_device_write {
+                state.fail_next_pending_device_write = false;
+                true
+            } else {
+                false
+            };
             let directory = &state.hosted(identity).ok()?.directory;
-            directory.add_pending_device(newcomer).await.ok()?;
+            #[cfg(feature = "test-util")]
+            let pending_write = if inject_pending_write_failure {
+                Err(anyhow::anyhow!("injected pending-device storage failure"))
+            } else {
+                directory.add_pending_device(newcomer).await
+            };
+            #[cfg(not(feature = "test-util"))]
+            let pending_write = directory.add_pending_device(newcomer).await;
+            if let Err(err) = pending_write {
+                let _ = state
+                    .linking_failures
+                    .send(LinkingLocalFailure::PendingDeviceWrite { identity, newcomer });
+                tracing::error!(%identity, %newcomer, "linking failed after invite burn while recording the pending device: {err:#}");
+                return None;
+            }
 
             // Both bootstrap tickets, minted fresh from local replicas:
             // every device that can mint an invite hosts both — the first
             // device by creation, every further one by its own linking
             // reply.
-            let directory_ticket = directory
+            let directory_ticket = match directory
                 .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
                 .await
-                .ok()?;
-            let data = state
+            {
+                Ok(ticket) => ticket,
+                Err(err) => {
+                    let _ = state
+                        .linking_failures
+                        .send(LinkingLocalFailure::DirectoryTicketMint { identity, newcomer });
+                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the directory ticket: {err:#}");
+                    return None;
+                }
+            };
+            let data = match state
                 .node
                 .share_ticket(
                     identity,
@@ -274,7 +315,16 @@ impl LinkingHandler {
                     AddrInfoOptions::RelayAndAddresses,
                 )
                 .await
-                .ok()?;
+            {
+                Ok(ticket) => ticket,
+                Err(err) => {
+                    let _ = state
+                        .linking_failures
+                        .send(LinkingLocalFailure::DataTicketMint { identity, newcomer });
+                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the data ticket: {err:#}");
+                    return None;
+                }
+            };
             LinkingResponse {
                 directory: directory_ticket,
                 data,
@@ -354,7 +404,7 @@ pub(crate) async fn link_via_dialogue(
 ) -> Result<()> {
     // A brief lock for the hosted check, the in-flight reservation, and the
     // dial handle (a cheap snapshot); released before any network I/O.
-    let dial = {
+    let (dial, cleanup_tasks) = {
         let mut state_guard = state.lock().await;
         if state_guard.identities.contains_key(&payload.identity) {
             return Err(IdentityAlreadyHosted {
@@ -368,7 +418,10 @@ pub(crate) async fn link_via_dialogue(
             }
             .into());
         }
-        state_guard.node.dial_handle()
+        (
+            state_guard.node.dial_handle(),
+            state_guard.cleanup_tasks.clone(),
+        )
     };
     // Reserved for the whole ceremony from here. Released synchronously
     // right after `run` below settles, on every one of its outcomes — a
@@ -377,8 +430,17 @@ pub(crate) async fn link_via_dialogue(
     // *this* function skips that release, and `reservation`'s own `Drop`
     // (spawned detached, since `Drop` is synchronous) is exactly the
     // fallback for that case.
-    let reservation = LinkingReservation::new(Arc::clone(state), payload.identity);
-    let result = link_via_dialogue_inner(state, payload, timeout, dial).await;
+    let reservation =
+        LinkingReservation::new(Arc::clone(state), payload.identity, cleanup_tasks.clone());
+    let result = link_via_dialogue_inner(
+        state,
+        payload,
+        timeout,
+        dial,
+        Arc::clone(&reservation.rollback_owns_cleanup),
+        cleanup_tasks,
+    )
+    .await;
     reservation.release().await;
     result
 }
@@ -392,6 +454,8 @@ async fn link_via_dialogue_inner(
     payload: &LinkingPayload,
     timeout: Duration,
     dial: data_layer::DialHandle,
+    rollback_owns_cleanup: Arc<AtomicBool>,
+    cleanup_tasks: TaskTracker,
 ) -> Result<()> {
     // The budget covers the whole ceremony from here: the dialogue spends
     // from it first, the catch-up below gets what remains.
@@ -425,7 +489,13 @@ async fn link_via_dialogue_inner(
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
         let directory = PrivateMetadataStore::import(&state_guard.node, directory_ticket).await?;
-        rollback = LinkRollbackGuard::new(rollback_state, payload.identity, directory.namespace());
+        rollback = LinkRollbackGuard::new(
+            rollback_state,
+            payload.identity,
+            directory.namespace(),
+            rollback_owns_cleanup,
+            cleanup_tasks,
+        );
         // Armed before the data namespace exists: the moment the import
         // below registers the binding, sessions are judged through this
         // directory — a still-catching-up book refuses callers it cannot
@@ -456,6 +526,12 @@ async fn link_via_dialogue_inner(
         directory
     };
 
+    #[cfg(feature = "test-util")]
+    if let Some(pause) = state.lock().await.link_after_import_pause.take() {
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
+
     // The rest of the budget bounds the catch-up, against a peer that
     // answered the dialogue moments ago — no lock held. Beyond it, the
     // node's periodic reconcile pass keeps the replicas converging. No lock
@@ -467,6 +543,7 @@ async fn link_via_dialogue_inner(
         rollback.roll_back().await;
         return Err(err).context("the imported directory did not catch up in time");
     }
+    directory.cleanup_pending_devices().await?;
 
     // The armer's subscription, taken before the handle moves into the
     // hosted set: pairs established on the identity's other devices —
@@ -523,14 +600,18 @@ async fn link_via_dialogue_inner(
 struct LinkingReservation {
     state: Arc<Mutex<State>>,
     identity: PdnId,
+    rollback_owns_cleanup: Arc<AtomicBool>,
+    cleanup_tasks: TaskTracker,
     armed: bool,
 }
 
 impl LinkingReservation {
-    fn new(state: Arc<Mutex<State>>, identity: PdnId) -> Self {
+    fn new(state: Arc<Mutex<State>>, identity: PdnId, cleanup_tasks: TaskTracker) -> Self {
         Self {
             state,
             identity,
+            rollback_owns_cleanup: Arc::new(AtomicBool::new(false)),
+            cleanup_tasks,
             armed: true,
         }
     }
@@ -556,12 +637,12 @@ impl Drop for LinkingReservation {
     /// task; unlike the normal path, a cancelled attempt leaves no caller
     /// waiting to retry immediately, so a slight delay here is harmless.
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || self.rollback_owns_cleanup.load(Ordering::Acquire) {
             return;
         }
         let state = Arc::clone(&self.state);
         let identity = self.identity;
-        tokio::spawn(async move {
+        self.cleanup_tasks.spawn(async move {
             state.lock().await.linking_in_flight.remove(&identity);
         });
     }
@@ -579,16 +660,27 @@ struct LinkRollbackGuard {
     identity: PdnId,
     directory_namespace: NamespaceId,
     data_import: Option<SelfCleaningImport>,
+    owns_reservation_cleanup: Arc<AtomicBool>,
+    cleanup_tasks: TaskTracker,
     armed: bool,
 }
 
 impl LinkRollbackGuard {
-    fn new(state: Arc<Mutex<State>>, identity: PdnId, directory_namespace: NamespaceId) -> Self {
+    fn new(
+        state: Arc<Mutex<State>>,
+        identity: PdnId,
+        directory_namespace: NamespaceId,
+        owns_reservation_cleanup: Arc<AtomicBool>,
+        cleanup_tasks: TaskTracker,
+    ) -> Self {
+        owns_reservation_cleanup.store(true, Ordering::Release);
         Self {
             state,
             identity,
             directory_namespace,
             data_import: None,
+            owns_reservation_cleanup,
+            cleanup_tasks,
             armed: true,
         }
     }
@@ -599,6 +691,7 @@ impl LinkRollbackGuard {
         self.data_import = Some(SelfCleaningImport::new(
             Arc::clone(&self.state),
             data_import,
+            self.cleanup_tasks.clone(),
         ));
     }
 
@@ -647,8 +740,11 @@ impl Drop for LinkRollbackGuard {
         let identity = self.identity;
         let directory_namespace = self.directory_namespace;
         let data_import = self.data_import.take();
-        tokio::spawn(async move {
+        let owns_reservation_cleanup = Arc::clone(&self.owns_reservation_cleanup);
+        self.cleanup_tasks.spawn(async move {
             undo_link(&state, identity, directory_namespace, data_import).await;
+            state.lock().await.linking_in_flight.remove(&identity);
+            owns_reservation_cleanup.store(false, Ordering::Release);
         });
     }
 }
@@ -664,13 +760,15 @@ impl Drop for LinkRollbackGuard {
 struct SelfCleaningImport {
     state: Arc<Mutex<State>>,
     import: Option<NamespaceImport>,
+    cleanup_tasks: TaskTracker,
 }
 
 impl SelfCleaningImport {
-    fn new(state: Arc<Mutex<State>>, import: NamespaceImport) -> Self {
+    fn new(state: Arc<Mutex<State>>, import: NamespaceImport, cleanup_tasks: TaskTracker) -> Self {
         Self {
             state,
             import: Some(import),
+            cleanup_tasks,
         }
     }
 
@@ -685,7 +783,7 @@ impl SelfCleaningImport {
             return;
         };
         let state = Arc::clone(&self.state);
-        let handle = tokio::spawn(async move {
+        let handle = self.cleanup_tasks.spawn(async move {
             let state = state.lock().await;
             let _ = state.node.undo_import_namespace(import).await;
         });
@@ -713,7 +811,7 @@ impl Drop for SelfCleaningImport {
             return;
         };
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        self.cleanup_tasks.spawn(async move {
             let state = state.lock().await;
             let _ = state.node.undo_import_namespace(import).await;
         });
@@ -825,7 +923,12 @@ mod tests {
             (import, before)
         };
 
-        drop(SelfCleaningImport::new(Arc::clone(&state), import));
+        let cleanup_tasks = state.lock().await.cleanup_tasks.clone();
+        drop(SelfCleaningImport::new(
+            Arc::clone(&state),
+            import,
+            cleanup_tasks,
+        ));
 
         let settled = test_utils::eventually(|| async {
             let guard = state.lock().await;

@@ -43,6 +43,11 @@ impl SyncService for RuntimeSyncService<'_> {
 }
 
 impl RuntimeSyncService<'_> {
+    #[cfg(feature = "test-util")]
+    pub async fn dial_handle_for_test(&self) -> data_layer::DialHandle {
+        self.runtime.state.lock().await.node.dial_handle()
+    }
+
     /// The number of documents the node's reconcile pass currently tracks —
     /// pairing's own-replica has no hosted-identity-style handle a scenario
     /// can check by, so a cancelled or failed establishment attempt is

@@ -12,7 +12,26 @@ use data_layer::{
 };
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 
+#[cfg(feature = "test-util")]
+pub struct LinkAfterImportPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-util")]
+impl LinkAfterImportPause {
+    pub async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+use crate::linking::LinkingLocalFailure;
 use crate::{
     connections::RuntimeConnectionsService,
     data::RuntimeDataService,
@@ -113,6 +132,14 @@ pub(crate) struct State {
     /// identity, inviter)` — the establishment analog of
     /// `linking_in_flight`.
     pub(crate) establishing_in_flight: HashSet<(PdnId, PdnId)>,
+    /// Asynchronous rollback work created by cancellation. Shutdown closes
+    /// and joins this tracker before stopping the node underneath it.
+    pub(crate) cleanup_tasks: TaskTracker,
+    pub(crate) linking_failures: tokio::sync::broadcast::Sender<LinkingLocalFailure>,
+    #[cfg(feature = "test-util")]
+    pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
+    #[cfg(feature = "test-util")]
+    pub(crate) fail_next_pending_device_write: bool,
     /// The retraction-event surface: the verdict consumer sends, and
     /// [`Runtime::subscribe_retractions`] hands out receivers.
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
@@ -185,6 +212,7 @@ impl Runtime {
         let node_id = node.node_id();
         let (retraction_events, _no_subscribers_yet) =
             tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
+        let (linking_failures, _no_failure_subscribers_yet) = tokio::sync::broadcast::channel(16);
         let state = Arc::new(Mutex::new(State {
             node: Arc::new(node),
             author,
@@ -196,6 +224,12 @@ impl Runtime {
             bound_grants: HashMap::new(),
             linking_in_flight: HashSet::new(),
             establishing_in_flight: HashSet::new(),
+            cleanup_tasks: TaskTracker::new(),
+            linking_failures,
+            #[cfg(feature = "test-util")]
+            link_after_import_pause: None,
+            #[cfg(feature = "test-util")]
+            fail_next_pending_device_write: false,
             retraction_events,
         }));
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
@@ -246,6 +280,33 @@ impl Runtime {
         self.state.lock().await.retraction_events.subscribe()
     }
 
+    pub async fn subscribe_linking_failures(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<LinkingLocalFailure> {
+        self.state.lock().await.linking_failures.subscribe()
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn fail_next_pending_device_write_for_test(&self) {
+        self.state.lock().await.fail_next_pending_device_write = true;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn hold_state_lock_for_test(&self, duration: std::time::Duration) {
+        let _state = self.state.lock().await;
+        tokio::time::sleep(duration).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn pause_next_link_after_import(&self) -> Arc<LinkAfterImportPause> {
+        let pause = Arc::new(LinkAfterImportPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        self.state.lock().await.link_after_import_pause = Some(Arc::clone(&pause));
+        pause
+    }
+
     /// Shut the node down, closing the endpoint and all protocols. Takes
     /// `&self`: no exclusive ownership is required — a clone held by a
     /// router, a handler, or another caller does not block this, and
@@ -257,7 +318,13 @@ impl Runtime {
     /// on it — including an accept trying to take the very lock this
     /// shutdown is waiting on.
     pub async fn shutdown(&self) -> Result<()> {
-        let node = Arc::clone(&self.state.lock().await.node);
+        const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        let (node, cleanup_tasks) = {
+            let state = self.state.lock().await;
+            (Arc::clone(&state.node), state.cleanup_tasks.clone())
+        };
+        cleanup_tasks.close();
+        let _ = tokio::time::timeout(CLEANUP_BUDGET, cleanup_tasks.wait()).await;
         node.shutdown().await
     }
 }

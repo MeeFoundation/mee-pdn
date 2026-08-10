@@ -7,7 +7,7 @@
 //! stay unpinned scaffolding — this test moves with them, and nothing
 //! outside this repository may depend on them.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -57,6 +57,11 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
         .oneshot(Request::get("/live").body(Body::empty())?)
         .await?;
     assert_eq!(live.status(), StatusCode::OK);
+    let ready = app
+        .clone()
+        .oneshot(Request::get("/ready").body(Body::empty())?)
+        .await?;
+    assert_eq!(ready.status(), StatusCode::OK);
 
     // Paired deny: without the flag not one `/debug/` route exists.
     for (method, path) in DEBUG_ROUTES {
@@ -76,6 +81,36 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
         );
     }
 
+    shutdown(runtime, app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let app = router(Arc::clone(&runtime), false);
+    let lock_holder = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            runtime
+                .hold_state_lock_for_test(Duration::from_secs(3))
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let live = app
+        .clone()
+        .oneshot(Request::get("/live").body(Body::empty())?)
+        .await?;
+    assert_eq!(live.status(), StatusCode::OK);
+    let ready = app
+        .clone()
+        .oneshot(Request::get("/ready").body(Body::empty())?)
+        .await?;
+    assert_eq!(ready.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    lock_holder.await?;
     shutdown(runtime, app).await?;
     Ok(())
 }
@@ -109,6 +144,22 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
             response.status()
         );
     }
+
+    shutdown(runtime, app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
+    const MAX_BODY: usize = 16 * 1024 * 1024;
+
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let app = router(Arc::clone(&runtime), true);
+    let response = app
+        .clone()
+        .oneshot(Request::post("/debug/link").body(Body::from(vec![0_u8; MAX_BODY + 1]))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
     shutdown(runtime, app).await?;
     Ok(())

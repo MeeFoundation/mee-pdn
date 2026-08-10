@@ -7,7 +7,7 @@
 //! linked device serving a grant its identity established and published
 //! elsewhere (connection arming by replication).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use data_layer::{
@@ -16,16 +16,17 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
-    InviterUnreachable, LinkingPayload, LinkingRefused, Runtime, SyncService as _, UnknownIdentity,
-    UnknownIssuer, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, Runtime,
+    SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion,
+    LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
 use test_utils::{eventually, ids, wait_devices, TIMEOUT};
 
 mod common;
 use common::{
-    dial_linking, dial_linking_without_reading, establish_patiently, granted_patiently,
-    link_patiently, link_probe, read_frame, write_frame, LINKING_ALPN,
+    dial_linking_without_reading_from, establish_patiently, granted_patiently, link_patiently,
+    link_probe, read_frame, write_frame, LINKING_ALPN,
 };
 
 /// Wait until the probe's directory lists exactly `devices` (order-free).
@@ -483,10 +484,11 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     );
 
     // The vanishing dialer: presents a live secret, never reads the reply.
-    let vanisher = SyncNode::spawn().await?;
+    let vanisher = Runtime::spawn().await?;
     let vanisher_id = vanisher.node_id();
     let payload = rt_a.identity().linking_invite(x, None).await?;
-    let connection = dial_linking_without_reading(&vanisher, &payload).await?;
+    let dial = vanisher.sync().dial_handle_for_test().await;
+    let connection = dial_linking_without_reading_from(&dial, &payload).await?;
 
     // The registration precedes the reply: it appears while the reply sits
     // unread on the wire — as pending.
@@ -506,13 +508,8 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     // A fresh invite links the same device cleanly — confirming itself, as
     // any linking device does, once the tickets are in hand...
     let retry = rt_a.identity().linking_invite(x, None).await?;
-    let (directory_ticket, _data_ticket) = dial_linking(&vanisher, &retry).await?;
-    let vanisher_dir = PrivateMetadataStore::import(&vanisher, directory_ticket).await?;
-    vanisher_dir.confirm_device(vanisher_id).await?;
-    assert!(
-        wait_devices(&vanisher_dir, &[rt_a.node_id(), vanisher_id]).await?,
-        "the re-link did not bring the directory up on the once-vanished device"
-    );
+    vanisher.identity().link(retry, TIMEOUT).await?;
+    assert_eq!(vanisher.sync().hosted_identities().await?, vec![x]);
 
     // ...and the device set holds its node id once, with the pending
     // registration cleared by the confirmation that superseded it.
@@ -776,6 +773,81 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
 
     rt_inviter.shutdown().await?;
     rt.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()> {
+    let inviter = Runtime::spawn().await?;
+    let identity = inviter.identity().create().await?;
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let pause = runtime.pause_next_link_after_import().await;
+    let first_payload = inviter.identity().linking_invite(identity, None).await?;
+    let first = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.identity().link(first_payload, TIMEOUT).await })
+    };
+
+    pause.wait_until_reached().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    pause.release();
+
+    let retry = inviter.identity().linking_invite(identity, None).await?;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if runtime
+                .identity()
+                .link(retry.clone(), TIMEOUT)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(runtime.sync().hosted_identities().await?, vec![identity]);
+
+    inviter.shutdown().await?;
+    runtime.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothing() -> Result<()> {
+    let inviter = Runtime::spawn().await?;
+    let identity = inviter.identity().create().await?;
+    let (probe, directory) = link_probe(&inviter, identity).await?;
+    let dialer = Runtime::spawn().await?;
+    let newcomer = dialer.node_id();
+    let mut failures = inviter.subscribe_linking_failures().await;
+    inviter.fail_next_pending_device_write_for_test().await;
+    let payload = inviter.identity().linking_invite(identity, None).await?;
+
+    let first = dialer.identity().link(payload.clone(), TIMEOUT).await;
+    assert!(first
+        .unwrap_err()
+        .downcast_ref::<LinkingRefused>()
+        .is_some());
+    assert_eq!(
+        failures.recv().await?,
+        LinkingLocalFailure::PendingDeviceWrite { identity, newcomer }
+    );
+    let replay = dialer.identity().link(payload, TIMEOUT).await;
+    assert!(replay
+        .unwrap_err()
+        .downcast_ref::<LinkingRefused>()
+        .is_some());
+    assert!(!directory.list_pending_devices().await?.contains(&newcomer));
+    assert!(!directory.list_devices().await?.contains(&newcomer));
+
+    dialer.shutdown().await?;
+    probe.shutdown().await?;
+    inviter.shutdown().await?;
     Ok(())
 }
 

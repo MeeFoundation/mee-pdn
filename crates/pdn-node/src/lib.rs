@@ -39,8 +39,8 @@ pub use data_layer::{
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
-    DialogueTimeout, IdentityAlreadyHosted, LinkingInProgress, LinkingPayload, LinkingRefused,
-    UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    DialogueTimeout, IdentityAlreadyHosted, LinkingInProgress, LinkingLocalFailure, LinkingPayload,
+    LinkingRefused, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
 pub use pairing::{
     EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, InvitePayload,
