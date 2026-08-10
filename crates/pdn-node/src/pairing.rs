@@ -241,8 +241,8 @@ pub(crate) type StateSlot = Arc<OnceLock<Weak<Mutex<State>>>>;
 /// A generous ceiling on concurrent establishments, never meant to bound
 /// anything in practice — it exists only so `shutdown`'s `acquire_many` has
 /// a fixed permit count to wait for all of.
-pub(crate) const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1 << 20;
-const MAX_CONCURRENT_ESTABLISHMENTS_U32: u32 = 1 << 20;
+pub(crate) const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1_048_576;
+const MAX_CONCURRENT_ESTABLISHMENTS_U32: u32 = 1_048_576;
 
 /// How long `PairingHandler::shutdown` waits for in-flight `accept` calls
 /// to release their permit before giving up and letting the router close

@@ -187,7 +187,7 @@ struct LinkingResponse {
 /// A generous ceiling on concurrent linkings, never meant to bound anything
 /// in practice — it exists only so `shutdown`'s `acquire_many` has a fixed
 /// permit count to wait for all of.
-const MAX_CONCURRENT_LINKINGS: usize = 1 << 20;
+const MAX_CONCURRENT_LINKINGS: usize = 1_048_576;
 
 /// How long `LinkingHandler::shutdown` waits for in-flight `accept` calls
 /// to release their permit before giving up and letting the router close
