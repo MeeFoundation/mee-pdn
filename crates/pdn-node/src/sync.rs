@@ -41,3 +41,31 @@ impl SyncService for RuntimeSyncService<'_> {
         Ok(state.identities.keys().copied().collect())
     }
 }
+
+impl RuntimeSyncService<'_> {
+    #[cfg(feature = "test-util")]
+    pub async fn dial_handle_for_test(&self) -> data_layer::DialHandle {
+        self.runtime.state.lock().await.node.dial_handle()
+    }
+
+    /// The number of documents the node's reconcile pass currently tracks —
+    /// pairing's own-replica has no hosted-identity-style handle a scenario
+    /// can check by, so a cancelled or failed establishment attempt is
+    /// asserted against this count instead. Behind the `test-util` feature
+    /// and absent from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn tracked_doc_count(&self) -> Result<usize> {
+        let state = self.runtime.state.lock().await;
+        state.node.tracked_doc_count()
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn linking_in_flight_for_test(&self, identity: PdnId) -> bool {
+        self.runtime
+            .state
+            .lock()
+            .await
+            .linking_in_flight
+            .contains(&identity)
+    }
+}

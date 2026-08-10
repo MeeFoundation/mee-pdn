@@ -2800,6 +2800,7 @@ dependencies = [
  "test-utils",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2810,8 +2811,14 @@ dependencies = [
  "anyhow",
  "axum",
  "pdn-node",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "tokio",
  "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -221,6 +221,14 @@ async fn write_refusal(
     issuer: PdnId,
     path: &EntryPath,
 ) -> Result<Option<WriteNotGranted>> {
+    // A hosted identity's own writes are never judged by grant courtesy,
+    // even if this runtime also holds a grant record keyed by the same
+    // issuer (a peer that is itself hosted here, granting to another
+    // identity hosted here) — that record describes what was shared with
+    // someone else, not a bound-in copy of this issuer's own namespace.
+    if state.is_hosted(issuer) {
+        return Ok(None);
+    }
     let mut grant_bound = false;
     for (bound_identity, bound_peer, bound_issuer) in state.bound_grants.keys() {
         if *bound_issuer != issuer {

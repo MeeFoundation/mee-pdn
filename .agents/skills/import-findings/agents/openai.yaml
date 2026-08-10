@@ -1,0 +1,4 @@
+interface:
+  display_name: "Import Review Findings"
+  short_description: "Re-verify and import GitHub bot findings"
+  default_prompt: "Use $import-findings to import review-bot findings from the current pull request."

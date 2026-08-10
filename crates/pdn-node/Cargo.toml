@@ -33,6 +33,7 @@ thiserror = "2"
 # `rt` for the detached connection-armer task the runtime spawns per
 # hosted identity.
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 # Retraction verdicts warn through the ecosystem's subscriber; already in
 # the graph via iroh.
 tracing = { workspace = true }

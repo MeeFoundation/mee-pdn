@@ -7,7 +7,7 @@
 //! linked device serving a grant its identity established and published
 //! elsewhere (connection arming by replication).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use data_layer::{
@@ -16,16 +16,17 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
-    InviterUnreachable, LinkingPayload, LinkingRefused, Runtime, SyncService as _, UnknownIdentity,
-    UnknownIssuer, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, Runtime,
+    SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion,
+    LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
 use test_utils::{eventually, ids, wait_devices, TIMEOUT};
 
 mod common;
 use common::{
-    dial_linking, dial_linking_without_reading, establish_patiently, granted_patiently,
-    link_patiently, link_probe, read_frame, write_frame, LINKING_ALPN,
+    dial_linking_without_reading_from, establish_patiently, granted_patiently, link_patiently,
+    link_probe, read_frame, write_frame, LINKING_ALPN,
 };
 
 /// Wait until the probe's directory lists exactly `devices` (order-free).
@@ -39,6 +40,20 @@ async fn wait_devices_exactly(
         let mut have = directory.list_devices().await?;
         have.sort_by_key(|d| *d.as_bytes());
         Ok(have == expected)
+    })
+    .await
+}
+
+/// Wait until the probe's directory lists every id in `devices` as pending
+/// — registered by an inviter, conferring nothing until the device itself
+/// confirms.
+async fn wait_pending_devices(
+    directory: &PrivateMetadataStore,
+    devices: &[NodeId],
+) -> Result<bool> {
+    eventually(|| async {
+        let have = directory.list_pending_devices().await?;
+        Ok(devices.iter().all(|d| have.contains(d)))
     })
     .await
 }
@@ -77,10 +92,10 @@ async fn assert_directory_is(
 /// The positive ceremony: create on A, invite on A, link on B. The payload
 /// is bearer-free with a distinct secret per invite; link's return means
 /// the directory is caught up (a connection recorded before the invite
-/// lists immediately, with no poll); the inviter registered the newcomer
-/// itself; and the newcomer comes up with the full store set — an entry
-/// written under the identity on either runtime becomes readable on the
-/// other.
+/// lists immediately, with no poll); the newcomer is a device of the
+/// identity by the time link returns; and it comes up with the full store
+/// set — an entry written under the identity on either runtime becomes
+/// readable on the other.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     let rt_a = Runtime::spawn().await?;
@@ -123,13 +138,14 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
         "a caught-up directory must already hold the pre-linking connection record"
     );
 
-    // The inviter registered the newcomer: B never writes its own device
-    // record in this ceremony, so B's id in the device set can only be A's
-    // write. Probed from a raw linked node (which registers itself too).
+    // A completed link leaves the newcomer a confirmed device: A registered
+    // it as pending, B's own confirmation made it one, and both writes have
+    // reached a third replica. Probed from a raw linked node (which
+    // confirms itself the same way).
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     assert!(
         wait_devices(&probe_dir, &[rt_a.node_id(), rt_b.node_id()]).await?,
-        "the inviter-side registration did not appear in the device set"
+        "the linked device did not appear in the device set"
     );
 
     // The full store set: B hosts the data namespace from the reply — the
@@ -447,10 +463,13 @@ async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
     Ok(())
 }
 
-/// Lost-reply convergence: a raw dialer presents a live secret and never
-/// reads the reply. The inviter holds the registration — commit precedes
-/// the reply — and a fresh invite links the same device cleanly, with its
-/// node id in the device set exactly once.
+/// Lost-reply convergence, and what a lost reply does not confer: a raw
+/// dialer presents a live secret and never reads the reply. The inviter
+/// holds the registration — it precedes the reply — but as pending, so a
+/// device that cannot prove the tickets reached it is in no device set and
+/// admitted nowhere. A fresh invite then links the same device cleanly,
+/// with its node id in the device set exactly once and nothing left
+/// pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()> {
     let rt_a = Runtime::spawn().await?;
@@ -465,38 +484,48 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     );
 
     // The vanishing dialer: presents a live secret, never reads the reply.
-    let vanisher = SyncNode::spawn().await?;
+    let vanisher = Runtime::spawn().await?;
     let vanisher_id = vanisher.node_id();
     let payload = rt_a.identity().linking_invite(x, None).await?;
-    let connection = dial_linking_without_reading(&vanisher, &payload).await?;
+    let dial = vanisher.sync().dial_handle_for_test().await;
+    let connection = dial_linking_without_reading_from(&dial, &payload).await?;
 
-    // The inviter committed before replying: the registration appears in
-    // the device set while the reply sits unread on the wire.
+    // The registration precedes the reply: it appears while the reply sits
+    // unread on the wire — as pending.
     assert!(
-        wait_devices(&probe_dir, &[rt_a.node_id(), vanisher_id]).await?,
+        wait_pending_devices(&probe_dir, &[vanisher_id]).await?,
         "the registration must exist on the inviter although the reply was never read"
+    );
+    // And pending is all it is: the device set — the one thing the access
+    // book probes — still holds the founder and the probe alone, so a
+    // dialer that never read its tickets is served nothing.
+    assert!(
+        wait_devices_exactly(&probe_dir, &[rt_a.node_id(), probe_node.node_id()]).await?,
+        "a device that never read its tickets must not be in the device set"
     );
     connection.close(0u32.into(), b"");
 
-    // A fresh invite links the same device cleanly...
+    // A fresh invite links the same device cleanly — confirming itself, as
+    // any linking device does, once the tickets are in hand...
     let retry = rt_a.identity().linking_invite(x, None).await?;
-    let (directory_ticket, _data_ticket) = dial_linking(&vanisher, &retry).await?;
-    let vanisher_dir = PrivateMetadataStore::import(&vanisher, directory_ticket).await?;
-    assert!(
-        wait_devices(&vanisher_dir, &[rt_a.node_id(), vanisher_id]).await?,
-        "the re-link did not bring the directory up on the once-vanished device"
-    );
+    vanisher.identity().link(retry, TIMEOUT).await?;
+    assert_eq!(vanisher.sync().hosted_identities().await?, vec![x]);
 
-    // ...and the device set holds its node id once.
-    let occurrences = probe_dir
-        .list_devices()
-        .await?
-        .into_iter()
-        .filter(|d| *d == vanisher_id)
-        .count();
-    assert_eq!(
-        occurrences, 1,
-        "the re-link must not duplicate the device record"
+    // ...and the device set holds its node id once, with the pending
+    // registration cleared by the confirmation that superseded it.
+    assert!(
+        eventually(|| async {
+            let occurrences = probe_dir
+                .list_devices()
+                .await?
+                .into_iter()
+                .filter(|d| *d == vanisher_id)
+                .count();
+            let pending = probe_dir.list_pending_devices().await?;
+            Ok(occurrences == 1 && !pending.contains(&vanisher_id))
+        })
+        .await?,
+        "the re-link must record the device once and leave nothing pending"
     );
 
     probe_node.shutdown().await?;
@@ -694,6 +723,124 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 
     rt_b.shutdown().await?;
     fake_inviter.shutdown().await?;
+    Ok(())
+}
+
+/// Cancelling `link` — dropping its future outright, at any point from the
+/// dial through the local commit — must leave no residue: neither a
+/// registered-but-abandoned directory or data namespace, nor a
+/// half-committed hosted identity. `LinkRollbackGuard`'s `Drop` (and, for
+/// the data import, `SelfCleaningImport`'s own) are the only things that
+/// catch this; the rollback test above only exercises a *completed*
+/// catch-up failure, never a genuine future-drop. The sweep of delays
+/// covers the window from before the dial through well after a real link
+/// against a live counterpart normally completes, without needing to land
+/// on one exact instruction.
+// `tracked_doc_count` gates this the same way as the pairing-side
+// cancellation test — see the doc comment above.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_link_leaves_no_residue() -> Result<()> {
+    let rt_inviter = Runtime::spawn().await?;
+    let x = rt_inviter.identity().create().await?;
+    let rt = Arc::new(Runtime::spawn().await?);
+    let pause = rt.pause_next_link_after_import().await;
+    let payload = rt_inviter.identity().linking_invite(x, None).await?;
+    let attempt = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.identity().link(payload, TIMEOUT).await })
+    };
+    pause.wait_until_reached().await;
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    pause.release();
+    assert!(
+        eventually(|| async {
+            Ok(rt.sync().hosted_identities().await?.is_empty()
+                && rt.sync().tracked_doc_count().await? == 0
+                && !rt.sync().linking_in_flight_for_test(x).await)
+        })
+        .await?,
+        "cancelled link left hosted state, a replica, or a reservation"
+    );
+
+    rt_inviter.shutdown().await?;
+    rt.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()> {
+    let inviter = Runtime::spawn().await?;
+    let identity = inviter.identity().create().await?;
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let pause = runtime.pause_next_link_after_import().await;
+    let first_payload = inviter.identity().linking_invite(identity, None).await?;
+    let first = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.identity().link(first_payload, TIMEOUT).await })
+    };
+
+    pause.wait_until_reached().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    pause.release();
+
+    let retry = inviter.identity().linking_invite(identity, None).await?;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if runtime
+                .identity()
+                .link(retry.clone(), TIMEOUT)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(runtime.sync().hosted_identities().await?, vec![identity]);
+
+    inviter.shutdown().await?;
+    runtime.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothing() -> Result<()> {
+    let inviter = Runtime::spawn().await?;
+    let identity = inviter.identity().create().await?;
+    let (probe, directory) = link_probe(&inviter, identity).await?;
+    let dialer = Runtime::spawn().await?;
+    let newcomer = dialer.node_id();
+    let mut failures = inviter.subscribe_linking_failures().await;
+    inviter.fail_next_pending_device_write_for_test().await;
+    let payload = inviter.identity().linking_invite(identity, None).await?;
+
+    let first = dialer.identity().link(payload.clone(), TIMEOUT).await;
+    assert!(first
+        .unwrap_err()
+        .downcast_ref::<LinkingRefused>()
+        .is_some());
+    assert_eq!(
+        failures.recv().await?,
+        LinkingLocalFailure::PendingDeviceWrite { identity, newcomer }
+    );
+    let replay = dialer.identity().link(payload, TIMEOUT).await;
+    assert!(replay
+        .unwrap_err()
+        .downcast_ref::<LinkingRefused>()
+        .is_some());
+    assert!(!directory.list_pending_devices().await?.contains(&newcomer));
+    assert!(!directory.list_devices().await?.contains(&newcomer));
+
+    dialer.shutdown().await?;
+    probe.shutdown().await?;
+    inviter.shutdown().await?;
     Ok(())
 }
 
@@ -1043,5 +1190,125 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     rt_laptop.shutdown().await?;
     rt_bob.shutdown().await?;
     rt_carol.shutdown().await?;
+    Ok(())
+}
+
+/// An issuer linked onto the same node as its own grant's audience keeps its
+/// own access: the write is not judged by the grant it made, and withdrawing
+/// that grant narrows the audience's access without forgetting the issuer's
+/// own namespace — even though this node's grant-binder memo carries a
+/// record keyed by that same issuer once the sweep runs. Forces the sweep
+/// deterministically via `sweep_pair_now`/`grant_bound`, so this test compiles
+/// only under the `test-util` feature — the `just` recipes turn it on.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario: link, own access, withdrawal, negative control
+async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Result<()> {
+    let rt_x_device = Runtime::spawn().await?;
+    let rt_shared = Runtime::spawn().await?;
+
+    // X and Y connect and X grants Y read-only access to one path while each
+    // still lives on its own node — linking two identities directly onto one
+    // node is not reachable; the only path in is a connection made while
+    // apart, followed by a link that brings one of them over.
+    let x = rt_x_device.identity().create().await?;
+    let y = rt_shared.identity().create().await?;
+    let invite = rt_x_device.connections().invite(x, None).await?;
+    establish_patiently(&rt_shared, y, &rt_x_device, x, invite).await?;
+
+    let granted_path = EntryPath::new("contact/email")?;
+    rt_x_device
+        .data()
+        .write(x, &granted_path, b"x@example.org")
+        .await?;
+    granted_patiently(
+        &rt_x_device,
+        x,
+        &rt_shared,
+        y,
+        x,
+        common::claims_on(x, &granted_path, false),
+    )
+    .await?;
+    assert!(
+        eventually(|| async {
+            Ok(rt_shared.data().read(x, &granted_path).await?.as_deref()
+                == Some(&b"x@example.org"[..]))
+        })
+        .await?,
+        "the granted namespace never synced — the premise of this test, not its subject"
+    );
+
+    // X is now added to the same node Y lives on.
+    link_patiently(&rt_shared, &rt_x_device, x).await?;
+    let hosted = rt_shared.sync().hosted_identities().await?;
+    assert!(
+        hosted.len() == 2 && hosted.contains(&x) && hosted.contains(&y),
+        "the shared node must host both X and Y after the link: {hosted:?}"
+    );
+
+    // Force the memo adoption the grant binder would otherwise do on its own
+    // schedule, so the assertions below exercise the exact record shape the
+    // bug reproduced on — a `(y, x, x)` binding, keyed by X as issuer, that
+    // now sits beside X's own hosted namespace.
+    rt_shared.connections().sweep_pair_now(y, x).await?;
+    assert!(
+        rt_shared.connections().grant_bound(y, x, x).await,
+        "the sweep must have adopted the memo entry keyed by X as issuer — the premise of this test"
+    );
+
+    // X writes and reads its own data on the node it now shares with Y: the
+    // write is not refused by the grant courtesy check, even though that
+    // check's own key space now contains an entry naming X as issuer.
+    let own_path = EntryPath::new("notes/diary")?;
+    rt_shared.data().write(x, &own_path, b"dear diary").await?;
+    assert_eq!(
+        rt_shared.data().read(x, &own_path).await?.as_deref(),
+        Some(&b"dear diary"[..]),
+        "X's own write on the shared node must not be refused by its own grant to Y"
+    );
+
+    // Withdraw the grant on the shared node itself — X is hosted there too
+    // — and force the revoke sweep. Withdrawing on `rt_x_device` instead
+    // would race the same replication the setup above already waited out.
+    // It must narrow Y's access without forgetting X's own namespace.
+    rt_shared.connections().withdraw_grant(x, y, x).await?;
+    rt_shared.connections().sweep_pair_now(y, x).await?;
+    assert!(
+        !rt_shared.connections().grant_bound(y, x, x).await,
+        "the withdrawn grant must leave the binder's memo"
+    );
+    assert_eq!(
+        rt_shared.data().read(x, &own_path).await?.as_deref(),
+        Some(&b"dear diary"[..]),
+        "revoking the grant to Y must not forget X's own namespace"
+    );
+    let after_withdrawal = EntryPath::new("contact/phone")?;
+    rt_shared
+        .data()
+        .write(x, &after_withdrawal, b"still mine")
+        .await?;
+    assert_eq!(
+        rt_shared
+            .data()
+            .read(x, &after_withdrawal)
+            .await?
+            .as_deref(),
+        Some(&b"still mine"[..]),
+        "X must still be able to write its own data after the grant to Y is withdrawn"
+    );
+
+    // Paired deny, the tightest unauthorized party: a node with no
+    // connection to X at all is refused as unknown, not served an absence.
+    let rt_outsider = Runtime::spawn().await?;
+    let err = rt_outsider.data().read(x, &own_path).await.unwrap_err();
+    assert!(
+        err.downcast_ref::<UnknownIssuer>().is_some(),
+        "an outsider must be refused as unknown, got: {err:#}"
+    );
+
+    rt_outsider.shutdown().await?;
+    rt_x_device.shutdown().await?;
+    rt_shared.shutdown().await?;
     Ok(())
 }

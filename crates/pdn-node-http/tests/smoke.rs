@@ -1,18 +1,87 @@
 //! Host smoke tests: liveness while the embedded runtime runs, and the
-//! debug gate — off means absent. The debug routes themselves are demo
-//! scaffolding with an unpinned shape, so only the gate is asserted, not
-//! their existence or form.
+//! debug gate — off means absent.
+//!
+//! The gate is asserted route by route, and absent is the whole point: a
+//! route that answered "unauthorized" instead of 404 would be a surface
+//! present in a build that must not have one. The route names themselves
+//! stay unpinned scaffolding — this test moves with them, and nothing
+//! outside this repository may depend on them.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    Router,
 };
 use pdn_node::Runtime;
-use pdn_node_http::router;
+use pdn_node_http::{router, MAX_REQUEST_BODY_BYTES};
 use tower::ServiceExt as _;
+
+/// One of every debug route, by method and path — a hosted identity is not
+/// needed, because the gate decides before any handler runs.
+const DEBUG_ROUTES: &[(&str, &str, StatusCode)] = &[
+    ("GET", "/debug/status", StatusCode::OK),
+    ("POST", "/debug/identities", StatusCode::OK),
+    ("GET", "/debug/identities", StatusCode::OK),
+    (
+        "POST",
+        "/debug/identities/aa/linking-invite",
+        StatusCode::BAD_REQUEST,
+    ),
+    ("POST", "/debug/link", StatusCode::BAD_REQUEST),
+    (
+        "POST",
+        "/debug/identities/aa/invite",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "POST",
+        "/debug/identities/aa/establish",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "GET",
+        "/debug/identities/aa/connections",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "POST",
+        "/debug/identities/aa/grants/bb",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "GET",
+        "/debug/identities/aa/grants/bb",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "DELETE",
+        "/debug/identities/aa/grants/bb/cc",
+        StatusCode::BAD_REQUEST,
+    ),
+    ("GET", "/debug/data/aa", StatusCode::BAD_REQUEST),
+    (
+        "PUT",
+        "/debug/data/aa/contact/email",
+        StatusCode::BAD_REQUEST,
+    ),
+    (
+        "GET",
+        "/debug/data/aa/contact/email",
+        StatusCode::BAD_REQUEST,
+    ),
+];
+
+/// Close the endpoint. `shutdown` needs no exclusive ownership, but skipping
+/// it anyway leaves the endpoint and every task a created identity spawned
+/// running while the process tries to exit, which under load holds the exit
+/// for minutes.
+async fn shutdown(runtime: Arc<Runtime>, app: Router) -> Result<()> {
+    drop(app);
+    runtime.shutdown().await
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
@@ -24,15 +93,116 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
         .oneshot(Request::get("/live").body(Body::empty())?)
         .await?;
     assert_eq!(live.status(), StatusCode::OK);
-
-    // Paired deny: without the flag no `/debug/` route exists at all.
-    let debug = app
-        .oneshot(Request::get("/debug/status").body(Body::empty())?)
+    let ready = app
+        .clone()
+        .oneshot(Request::get("/ready").body(Body::empty())?)
         .await?;
-    assert_eq!(debug.status(), StatusCode::NOT_FOUND);
+    assert_eq!(ready.status(), StatusCode::OK);
 
-    if let Ok(runtime) = Arc::try_unwrap(runtime) {
-        runtime.shutdown().await?;
+    // Paired deny: without the flag not one `/debug/` route exists.
+    for (method, path, _expected) in DEBUG_ROUTES {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(*method)
+                    .uri(*path)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {path} must be absent without the flag"
+        );
     }
+
+    shutdown(runtime, app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let app = router(Arc::clone(&runtime), false);
+    let acquired = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let lock_holder = {
+        let runtime = Arc::clone(&runtime);
+        let acquired = Arc::clone(&acquired);
+        let release = Arc::clone(&release);
+        tokio::spawn(async move {
+            runtime.hold_state_lock_for_test(acquired, release).await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), acquired.notified())
+        .await
+        .context("state-lock holder did not acquire the lock")?;
+
+    let live = app
+        .clone()
+        .oneshot(Request::get("/live").body(Body::empty())?)
+        .await?;
+    assert_eq!(live.status(), StatusCode::OK);
+    let ready = app
+        .clone()
+        .oneshot(Request::get("/ready").body(Body::empty())?)
+        .await?;
+    assert_eq!(ready.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    release.notify_one();
+    lock_holder.await?;
+    shutdown(runtime, app).await?;
+    Ok(())
+}
+
+/// The same routes answer something other than 404 with the flag on — so the
+/// list above is a list of real routes, not of typos that would pass the
+/// gate assertion for the wrong reason. Some of them (`/debug/status`,
+/// `POST /debug/identities`, `GET /debug/identities`) carry no identifier to
+/// malform and legitimately answer 200 on a fresh runtime; the rest answer a
+/// client error. A served route is neither, so the one property common to
+/// all of them — and the one a typo'd, unregistered route would fail — is
+/// simply not being absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_gated_route_exists_with_the_flag() -> Result<()> {
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let app = router(Arc::clone(&runtime), true);
+
+    for (method, path, expected) in DEBUG_ROUTES {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(*method)
+                    .uri(*path)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            *expected,
+            "unexpected answer from {method} {path}"
+        );
+    }
+
+    shutdown(runtime, app).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
+    let runtime = Arc::new(Runtime::spawn().await?);
+    let app = router(Arc::clone(&runtime), true);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/debug/link")
+                .body(Body::from(vec![0_u8; MAX_REQUEST_BODY_BYTES + 1]))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    shutdown(runtime, app).await?;
     Ok(())
 }

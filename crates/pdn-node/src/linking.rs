@@ -10,13 +10,17 @@
 //! one-time secret and a self-contained [`LinkingPayload`]; the new device
 //! dials the payload's address and presents the secret; the inviter
 //! atomically verifies-and-burns it *before any state change*, registers
-//! the newcomer in its own directory replica — the node id taken from the
-//! connection's authenticated peer identity, never from a claimed field —
-//! and answers with freshly minted write tickets to the directory and the
-//! identity's data namespace. Commit precedes the reply: a response lost
-//! from there on leaves a registered-but-absent device record (harmless —
-//! device records carry no liveness semantics), and a fresh invite
-//! converges.
+//! the newcomer in its own directory replica as **pending** — the node id
+//! taken from the connection's authenticated peer identity, never from a
+//! claimed field — and answers with freshly minted write tickets to the
+//! directory and the identity's data namespace. Registration precedes the
+//! reply, and confers nothing on its own: the access book probes the
+//! confirmed device set alone, so a response lost from there on leaves a
+//! device that is visible to the identity's other devices and admitted
+//! nowhere, and a fresh invite converges. The newcomer confirms itself once
+//! the tickets are in hand — a write only a holder of the directory's write
+//! ticket can make, which is why the inviter, unable to know its reply
+//! arrived, does not make it.
 //!
 //! The dial side arms the identity for session classification the moment
 //! its directory is imported — before the data namespace exists, so no
@@ -38,14 +42,17 @@
 //! there are no pending linking invites.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use data_layer::{
     AcceptError, AddrInfoOptions, Connection, DocTicket, EndpointAddr, NamespaceId,
-    NamespaceImport, PrivateMetadataStore, ProtocolHandler, ShareMode, SyncNode,
+    NamespaceImport, PrivateMetadataStore, ProtocolHandler, ShareMode,
 };
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
@@ -77,6 +84,7 @@ pub const LINKING_FORMAT_VERSION: u8 = 0;
 /// access; a photographed payload expires with its secret. The bootstrap
 /// tickets ride the dialogue's encrypted reply instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkingPayload {
     /// Payload format version ([`LINKING_FORMAT_VERSION`]).
     pub version: u8,
@@ -127,6 +135,35 @@ pub struct LinkingRefused;
 #[error("linking dialogue did not complete within the caller's budget")]
 pub struct DialogueTimeout;
 
+/// `link` was refused before dialing: the identity is already hosted on
+/// this runtime. Downcast from the `anyhow::Error` of the identity
+/// service's `link`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("identity already hosted on this runtime: {identity}")]
+pub struct IdentityAlreadyHosted {
+    /// The identity `link` was attempted for.
+    pub identity: PdnId,
+}
+
+/// `link` was refused before dialing: another `link` toward the same
+/// identity is already in flight on this runtime — the pre-dial guard
+/// against two concurrent attempts committing the same not-yet-hosted
+/// identity twice. Downcast from the `anyhow::Error` of the identity
+/// service's `link`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("a link toward identity {identity} is already in flight on this runtime")]
+pub struct LinkingInProgress {
+    /// The identity a concurrent `link` is already attempting.
+    pub identity: PdnId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkingLocalFailure {
+    PendingDeviceWrite { identity: PdnId, newcomer: NodeId },
+    DirectoryTicketMint { identity: PdnId, newcomer: NodeId },
+    DataTicketMint { identity: PdnId, newcomer: NodeId },
+}
+
 /// The new device's half of the dialogue: the format version and the
 /// secret — nothing else. In particular no node id: the inviter takes the
 /// newcomer's id from the connection's authenticated peer identity.
@@ -147,11 +184,25 @@ struct LinkingResponse {
     data: DocTicket,
 }
 
+/// A generous ceiling on concurrent linkings, never meant to bound anything
+/// in practice — it exists only so `shutdown`'s `acquire_many` has a fixed
+/// permit count to wait for all of.
+const MAX_CONCURRENT_LINKINGS: usize = 1_048_576;
+
+/// How long `LinkingHandler::shutdown` waits for in-flight `accept` calls
+/// to release their permit before giving up and letting the router close
+/// the endpoint anyway.
+const SHUTDOWN_LINKING_BUDGET: Duration = Duration::from_secs(10);
+
 /// The accept side of the linking dialogue, registered at `Runtime::spawn`
 /// through the data-layer assembly slot, next to pairing's handler.
 #[derive(Debug, Clone)]
 pub(crate) struct LinkingHandler {
     state: StateSlot,
+    /// One permit held for the duration of each `accept` call; `shutdown`
+    /// waits for every permit to come back, bounding shutdown's wait on an
+    /// in-flight linking instead of the router aborting it outright.
+    in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 impl LinkingHandler {
@@ -162,6 +213,7 @@ impl LinkingHandler {
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::default(),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LINKINGS)),
         }
     }
 
@@ -206,22 +258,55 @@ impl LinkingHandler {
                 .pending_linking_invites
                 .verify_and_burn(&request.secret, Instant::now())?;
 
-            // The commit: register the newcomer in this device's own
-            // replica — a local write on a device that already holds the
-            // directory, so no cross-node delivery sits in the linking
-            // critical path.
+            // The registration: the newcomer enters this device's own
+            // replica as pending — a local write on a device that already
+            // holds the directory, so no cross-node delivery sits in the
+            // linking critical path. Pending confers nothing: the reply
+            // below may never arrive, and a device registered without its
+            // tickets must not be served as one. The newcomer confirms
+            // itself once it holds them.
+            #[cfg(feature = "test-util")]
+            let inject_pending_write_failure = if state.fail_next_pending_device_write {
+                state.fail_next_pending_device_write = false;
+                true
+            } else {
+                false
+            };
             let directory = &state.hosted(identity).ok()?.directory;
-            directory.add_device(newcomer).await.ok()?;
+            #[cfg(feature = "test-util")]
+            let pending_write = if inject_pending_write_failure {
+                Err(anyhow::anyhow!("injected pending-device storage failure"))
+            } else {
+                directory.add_pending_device(newcomer).await
+            };
+            #[cfg(not(feature = "test-util"))]
+            let pending_write = directory.add_pending_device(newcomer).await;
+            if let Err(err) = pending_write {
+                let _ = state
+                    .linking_failures
+                    .send(LinkingLocalFailure::PendingDeviceWrite { identity, newcomer });
+                tracing::error!(%identity, %newcomer, "linking failed after invite burn while recording the pending device: {err:#}");
+                return None;
+            }
 
             // Both bootstrap tickets, minted fresh from local replicas:
             // every device that can mint an invite hosts both — the first
             // device by creation, every further one by its own linking
             // reply.
-            let directory_ticket = directory
+            let directory_ticket = match directory
                 .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
                 .await
-                .ok()?;
-            let data = state
+            {
+                Ok(ticket) => ticket,
+                Err(err) => {
+                    let _ = state
+                        .linking_failures
+                        .send(LinkingLocalFailure::DirectoryTicketMint { identity, newcomer });
+                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the directory ticket: {err:#}");
+                    return None;
+                }
+            };
+            let data = match state
                 .node
                 .share_ticket(
                     identity,
@@ -229,16 +314,27 @@ impl LinkingHandler {
                     AddrInfoOptions::RelayAndAddresses,
                 )
                 .await
-                .ok()?;
+            {
+                Ok(ticket) => ticket,
+                Err(err) => {
+                    let _ = state
+                        .linking_failures
+                        .send(LinkingLocalFailure::DataTicketMint { identity, newcomer });
+                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the data ticket: {err:#}");
+                    return None;
+                }
+            };
             LinkingResponse {
                 directory: directory_ticket,
                 data,
             }
         };
 
-        // Commit precedes the reply: a response lost from here on leaves a
-        // registered-but-absent device record, and a fresh invite
-        // converges (the lost-reply posture).
+        // Registration precedes the reply: a response lost from here on
+        // leaves the newcomer pending — visible to the identity's other
+        // devices, admitted nowhere — and a fresh invite converges (the
+        // lost-reply posture). What the newcomer cannot prove it received,
+        // this side does not grant.
         write_message(&mut send, &response).await.ok()?;
         send.finish().ok()?;
         // Hold the connection until the dialer closes it, so the response
@@ -250,6 +346,15 @@ impl LinkingHandler {
 
 impl ProtocolHandler for LinkingHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        // Held for the whole call: `shutdown` waits for this permit to
+        // return before it does, so a linking in flight when shutdown
+        // starts bounds its wait rather than being aborted outright.
+        // `acquire` only errs once the semaphore is closed, which this
+        // handler never does — the `let else` is exhaustiveness, not a
+        // reachable refusal.
+        let Ok(_permit) = self.in_flight.acquire().await else {
+            return Ok(());
+        };
         if self.serve(&connection).await.is_none() {
             // The one uniform refusal, whatever the reason: close without a
             // distinguishing answer, so a prober cannot separate wrong from
@@ -257,6 +362,20 @@ impl ProtocolHandler for LinkingHandler {
             connection.close(0u32.into(), b"");
         }
         Ok(())
+    }
+
+    /// Waits, bounded by [`SHUTDOWN_LINKING_BUDGET`], for every in-flight
+    /// `accept` to finish and release its permit — event-based, no
+    /// polling. `Router::shutdown` (iroh) stops dispatching new `accept`
+    /// calls before awaiting this, so no new acquisition can race the wait
+    /// once it starts — the same reasoning as pairing's handler.
+    async fn shutdown(&self) {
+        let permits = u32::try_from(MAX_CONCURRENT_LINKINGS).unwrap_or(u32::MAX);
+        let _ = tokio::time::timeout(
+            SHUTDOWN_LINKING_BUDGET,
+            self.in_flight.acquire_many(permits),
+        )
+        .await;
     }
 }
 
@@ -282,19 +401,61 @@ pub(crate) async fn link_via_dialogue(
     payload: &LinkingPayload,
     timeout: Duration,
 ) -> Result<()> {
-    // A brief lock for the hosted check and the dial handle (a cheap
-    // snapshot); released before any network I/O.
-    let dial = {
-        let state = state.lock().await;
-        if state.identities.contains_key(&payload.identity) {
-            bail!(
-                "identity already hosted on this runtime: {}",
-                payload.identity
-            );
+    // A brief lock for the hosted check, the in-flight reservation, and the
+    // dial handle (a cheap snapshot); released before any network I/O.
+    let (dial, cleanup_tasks) = {
+        let mut state_guard = state.lock().await;
+        if state_guard.identities.contains_key(&payload.identity) {
+            return Err(IdentityAlreadyHosted {
+                identity: payload.identity,
+            }
+            .into());
         }
-        state.node.dial_handle()
+        if !state_guard.linking_in_flight.insert(payload.identity) {
+            return Err(LinkingInProgress {
+                identity: payload.identity,
+            }
+            .into());
+        }
+        (
+            state_guard.node.dial_handle(),
+            state_guard.cleanup_tasks.clone(),
+        )
     };
+    // Reserved for the whole ceremony from here. Released synchronously
+    // right after `run` below settles, on every one of its outcomes — a
+    // caller retrying immediately after a completed attempt must never
+    // race a still-pending detached release. Only a genuine cancellation of
+    // *this* function skips that release, and `reservation`'s own `Drop`
+    // (spawned detached, since `Drop` is synchronous) is exactly the
+    // fallback for that case.
+    let reservation =
+        LinkingReservation::new(Arc::clone(state), payload.identity, cleanup_tasks.clone());
+    let result = link_via_dialogue_inner(
+        state,
+        payload,
+        timeout,
+        dial,
+        Arc::clone(&reservation.rollback_owns_cleanup),
+        cleanup_tasks,
+    )
+    .await;
+    reservation.release().await;
+    result
+}
 
+/// The body of [`link_via_dialogue`] from the dial onward, factored out so
+/// the reservation wrapping it releases synchronously around every exit —
+/// the `?` early returns included — without threading the release through
+/// each one by hand.
+async fn link_via_dialogue_inner(
+    state: &Arc<Mutex<State>>,
+    payload: &LinkingPayload,
+    timeout: Duration,
+    dial: data_layer::DialHandle,
+    rollback_owns_cleanup: Arc<AtomicBool>,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
+) -> Result<()> {
     // The budget covers the whole ceremony from here: the dialogue spends
     // from it first, the catch-up below gets what remains.
     let deadline = tokio::time::Instant::now() + timeout;
@@ -312,85 +473,361 @@ pub(crate) async fn link_via_dialogue(
 
     // Import both replicas under a brief lock — local acts, no network
     // wait. Sessions the imports start count for the catch-up below: they
-    // start after this instant.
+    // start after this instant. The lock is dropped before every call to
+    // `undo_link` below: `undo_link` locks `state` itself (so a detached
+    // `Drop`-driven rollback can call it too), and a caller still holding
+    // the guard while it re-locks would deadlock.
     let before_import = SystemTime::now();
-    let (directory, data_import) = {
-        let state = state.lock().await;
+    let rollback_state = Arc::clone(state);
+    let mut rollback;
+    let directory = {
+        let state_guard = state.lock().await;
         // The inviter's address is a live first-sync contact for the
         // imported directory, exactly as a peer's address is in
         // establishment's assembly.
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
-        let directory = PrivateMetadataStore::import(&state.node, directory_ticket).await?;
+        let directory = PrivateMetadataStore::import(&state_guard.node, directory_ticket).await?;
+        rollback = LinkRollbackGuard::new(
+            rollback_state,
+            payload.identity,
+            directory.namespace(),
+            rollback_owns_cleanup,
+            cleanup_tasks,
+        );
         // Armed before the data namespace exists: the moment the import
         // below registers the binding, sessions are judged through this
         // directory — a still-catching-up book refuses callers it cannot
         // resolve (fail-closed, re-served a reconcile pass after their
         // device records land), and no serving window opens on the
         // long-lived namespace id.
-        if let Err(err) = state.node.host_identity(payload.identity, &directory) {
-            undo_link(&state.node, payload.identity, directory.namespace(), None).await;
+        if let Err(err) = state_guard.node.host_identity(payload.identity, &directory) {
+            drop(state_guard);
+            undo_link(state, payload.identity, directory.namespace(), None).await;
+            rollback.disarm();
             return Err(err);
         }
-        match state
+        let data_import = state_guard
             .node
             .import_namespace(payload.identity, response.data)
-            .await
-        {
-            Ok(data_import) => (directory, data_import),
+            .await;
+        match data_import {
+            Ok(data_import) => rollback.set_data_import(data_import),
             Err(err) => {
                 // The rollback begins with the import: a directory whose
                 // sibling import failed must not survive it.
-                undo_link(&state.node, payload.identity, directory.namespace(), None).await;
+                drop(state_guard);
+                undo_link(state, payload.identity, directory.namespace(), None).await;
+                rollback.disarm();
                 return Err(err);
             }
         }
+        directory
     };
+
+    #[cfg(feature = "test-util")]
+    if let Some(pause) = state.lock().await.link_after_import_pause.take() {
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
 
     // The rest of the budget bounds the catch-up, against a peer that
     // answered the dialogue moments ago — no lock held. Beyond it, the
-    // node's periodic reconcile pass keeps the replicas converging.
+    // node's periodic reconcile pass keeps the replicas converging. No lock
+    // is held here either, so a cancellation in this stretch is exactly
+    // what `rollback`'s `Drop` exists for — the explicit branch below only
+    // covers a *completed* wait that came back `Err`.
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if let Err(err) = directory.wait_caught_up(before_import, remaining).await {
-        let state = state.lock().await;
-        undo_link(
-            &state.node,
-            payload.identity,
-            directory.namespace(),
-            Some(data_import),
-        )
-        .await;
+        rollback.roll_back().await;
         return Err(err).context("the imported directory did not catch up in time");
+    }
+    if let Err(err) = directory.cleanup_pending_devices().await {
+        rollback.roll_back().await;
+        return Err(err).context("pending-device cleanup failed after import");
+    }
+
+    // The armer's subscription, taken before the handle moves into the
+    // hosted set: pairs established on the identity's other devices —
+    // already replicated or arriving later — register here as their records
+    // and ticket payloads land, so this device serves and is servable
+    // without ever touching the grant surface itself. Taken before the
+    // confirmation below, so that confirmation is the last thing that can
+    // fail: a rollback that ran after it would forget the directory here
+    // while the record it wrote had already replicated to the inviter.
+    let changes = match directory.changes().await {
+        Ok(changes) => changes,
+        Err(err) => {
+            rollback.roll_back().await;
+            return Err(err);
+        }
+    };
+
+    // The tickets are in hand and the directory has caught up, so this
+    // device — its id read from the dial's own authenticated identity, the
+    // one the inviter registered as pending — converts that registration
+    // into a confirmed one. Only a holder of the directory's write ticket
+    // can write this record, which is why the newcomer writes it: the
+    // inviter, having sent the reply into a connection that may drop,
+    // cannot establish that it arrived. Until it replicates, the identity's
+    // other devices refuse this one's sessions and re-serve it later.
+    let own_device = NodeId::from_bytes(*dial.id().as_bytes());
+    if let Err(err) = directory.confirm_device(own_device).await {
+        rollback.roll_back().await;
+        return Err(err).context("the linked device could not confirm itself in the directory");
     }
 
     // Success: the identity joins the runtime's hosted set. Classification
     // was armed before the imports (above), and by now the caught-up
-    // directory carries the identity's device records, this device included
-    // (the inviter registered it during the dialogue). The armer's
-    // subscription is taken before the handle moves into the hosted set:
-    // pairs established on the identity's other devices — already
-    // replicated or arriving later — register here as their records and
-    // ticket payloads land, so this device serves and is servable without
-    // ever touching the grant surface itself.
+    // directory carries the identity's device records, this device's own
+    // confirmation included. Nothing below can fail.
     let mut guard = state.lock().await;
-    let changes = match directory.changes().await {
-        Ok(changes) => changes,
-        Err(err) => {
-            undo_link(
-                &guard.node,
-                payload.identity,
-                directory.namespace(),
-                Some(data_import),
-            )
-            .await;
-            return Err(err);
-        }
-    };
     guard
         .identities
         .insert(payload.identity, HostedIdentity { directory });
     crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
+    rollback.disarm();
     Ok(())
+}
+
+/// Reserves an identity against a concurrent `link` while this one is in
+/// flight, releasing the reservation on every exit path of
+/// [`link_via_dialogue`] — success, every explicit failure, and
+/// cancellation alike — the linking analog of `grant_binders`'
+/// insert-before-spawn/remove-on-exit pattern (`connections.rs`). Held for
+/// the whole function, unlike [`LinkRollbackGuard`] (constructed only once
+/// the directory import succeeds): a cancellation during the dial or the
+/// round trip, before any rollback guard exists, must still release this
+/// one.
+struct LinkingReservation {
+    state: Arc<Mutex<State>>,
+    identity: PdnId,
+    rollback_owns_cleanup: Arc<AtomicBool>,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
+    armed: bool,
+}
+
+impl LinkingReservation {
+    fn new(
+        state: Arc<Mutex<State>>,
+        identity: PdnId,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
+    ) -> Self {
+        Self {
+            state,
+            identity,
+            rollback_owns_cleanup: Arc::new(AtomicBool::new(false)),
+            cleanup_tasks,
+            armed: true,
+        }
+    }
+
+    /// Release the reservation now, synchronously — the normal path for
+    /// every outcome of [`link_via_dialogue_inner`]. A caller retrying
+    /// immediately after this one returns must see the identity free, not
+    /// race a detached release that has not run yet.
+    async fn release(mut self) {
+        self.state
+            .lock()
+            .await
+            .linking_in_flight
+            .remove(&self.identity);
+        self.armed = false;
+    }
+}
+
+impl Drop for LinkingReservation {
+    /// Only fires on genuine cancellation — the future driving
+    /// [`link_via_dialogue`] dropped before [`Self::release`] ran. `Drop`
+    /// is synchronous and the removal is not, so this spawns a detached
+    /// task; unlike the normal path, a cancelled attempt leaves no caller
+    /// waiting to retry immediately, so a slight delay here is harmless.
+    fn drop(&mut self) {
+        if !self.armed || self.rollback_owns_cleanup.load(Ordering::Acquire) {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let identity = self.identity;
+        self.cleanup_tasks.spawn(async move {
+            state.lock().await.linking_in_flight.remove(&identity);
+        });
+    }
+}
+
+/// Rolls back a link's local effects if the future driving [`link_via_dialogue`]
+/// is dropped before it disarms — a caller giving up or a task aborted skips
+/// every explicit `if let Err`/success branch above, so this is the only
+/// thing that runs [`undo_link`] in that case. `Drop` is synchronous and the
+/// rollback is not, so a still-armed guard spawns a detached task to run it
+/// — a new, explicit dependency on an ambient Tokio runtime this ceremony
+/// did not need before.
+struct LinkRollbackGuard {
+    state: Arc<Mutex<State>>,
+    identity: PdnId,
+    directory_namespace: NamespaceId,
+    data_import: Option<SelfCleaningImport>,
+    owns_reservation_cleanup: Arc<AtomicBool>,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
+    armed: bool,
+}
+
+impl LinkRollbackGuard {
+    fn new(
+        state: Arc<Mutex<State>>,
+        identity: PdnId,
+        directory_namespace: NamespaceId,
+        owns_reservation_cleanup: Arc<AtomicBool>,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
+    ) -> Self {
+        owns_reservation_cleanup.store(true, Ordering::Release);
+        Self {
+            state,
+            identity,
+            directory_namespace,
+            data_import: None,
+            owns_reservation_cleanup,
+            cleanup_tasks,
+            armed: true,
+        }
+    }
+
+    /// Record that the data-namespace import has succeeded, so a rollback
+    /// from here on undoes it too.
+    fn set_data_import(&mut self, data_import: NamespaceImport) {
+        self.data_import = Some(SelfCleaningImport::new(
+            Arc::clone(&self.state),
+            data_import,
+            self.cleanup_tasks.clone(),
+        ));
+    }
+
+    /// Hand the data import to a caller running its own synchronous
+    /// rollback — the guard does not retain it afterward.
+    fn take_data_import(&mut self) -> Option<SelfCleaningImport> {
+        self.data_import.take()
+    }
+
+    /// Undo everything the link did, then disarm — the tail every failure
+    /// after the imports shares. The undo consumes the data import, so what
+    /// is left for [`disarm`](Self::disarm) to commit is nothing.
+    async fn roll_back(&mut self) {
+        let data_import = self.take_data_import();
+        undo_link(
+            &self.state,
+            self.identity,
+            self.directory_namespace,
+            data_import,
+        )
+        .await;
+        self.disarm();
+    }
+
+    /// The ceremony reached a normal return — commit or an error branch
+    /// with its own already-`await`ed cleanup — so the drop below must do
+    /// nothing. Commits any still-held `data_import` too: implementing
+    /// `Drop` on the guard does not stop its fields from being dropped in
+    /// turn once the guard itself is — a `SelfCleaningImport` left in
+    /// `Some` here would still self-undo on the success path, moments
+    /// after `link_via_dialogue` reported it caught up.
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.owns_reservation_cleanup
+            .store(false, Ordering::Release);
+        if let Some(import) = self.data_import.take() {
+            import.commit();
+        }
+    }
+}
+
+impl Drop for LinkRollbackGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let identity = self.identity;
+        let directory_namespace = self.directory_namespace;
+        let data_import = self.data_import.take();
+        let owns_reservation_cleanup = Arc::clone(&self.owns_reservation_cleanup);
+        self.cleanup_tasks.spawn(async move {
+            undo_link(&state, identity, directory_namespace, data_import).await;
+            state.lock().await.linking_in_flight.remove(&identity);
+            owns_reservation_cleanup.store(false, Ordering::Release);
+        });
+    }
+}
+
+/// A `NamespaceImport` that undoes itself if dropped before [`Self::undo`]
+/// runs — the obligation to undo an import must travel with the value
+/// itself, not only with whichever guard minted it: moving the bare import
+/// into a local ahead of an `.await` (as the explicit rollback branches in
+/// [`link_via_dialogue`] do, via [`LinkRollbackGuard::take_data_import`])
+/// loses the obligation the instant that local's own future is dropped
+/// mid-`.await` — exactly the race [`LinkRollbackGuard`]'s own `Drop`
+/// cannot see, since the field it would check is already empty by then.
+struct SelfCleaningImport {
+    state: Arc<Mutex<State>>,
+    import: Option<NamespaceImport>,
+    cleanup_tasks: crate::runtime::CleanupSupervisor,
+}
+
+impl SelfCleaningImport {
+    fn new(
+        state: Arc<Mutex<State>>,
+        import: NamespaceImport,
+        cleanup_tasks: crate::runtime::CleanupSupervisor,
+    ) -> Self {
+        Self {
+            state,
+            import: Some(import),
+            cleanup_tasks,
+        }
+    }
+
+    /// Undo now, on a spawned task, and wait for it: `tokio::spawn` hands
+    /// the future to the runtime with no `.await` gap of its own, so the
+    /// undo keeps running to completion even if whatever awaits this method
+    /// is itself dropped mid-await. Awaiting the spawned task's handle
+    /// makes this mean "undone" for a caller that runs to completion, the
+    /// same as a direct `.await` would.
+    async fn undo(mut self) {
+        let Some(import) = self.import.take() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        let handle = self.cleanup_tasks.spawn(async move {
+            let state = state.lock().await;
+            let _ = state.node.undo_import_namespace(import).await;
+        });
+        let _ = handle.await;
+    }
+
+    /// The import succeeded and is now owned by the runtime's registry:
+    /// disable self-cleaning without running it. Implementing `Drop` does
+    /// not stop a value's fields from being dropped once it is — clearing
+    /// `import` here is what makes the coming `Drop` a no-op, not the fact
+    /// that this method was called at all.
+    fn commit(mut self) {
+        self.import = None;
+    }
+}
+
+impl Drop for SelfCleaningImport {
+    /// Only fires when `undo` was never called at all — cancellation before
+    /// this value's own cleanup ever started. Belt-and-suspenders for any
+    /// future refactor that holds the value across some other `.await`
+    /// first; today every caller of `take_data_import` calls `undo`
+    /// immediately.
+    fn drop(&mut self) {
+        let Some(import) = self.import.take() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        self.cleanup_tasks.spawn(async move {
+            let state = state.lock().await;
+            let _ = state.node.undo_import_namespace(import).await;
+        });
+    }
 }
 
 /// The network half of `link`: dial the inviter on the linking ALPN,
@@ -440,15 +877,83 @@ async fn run_linking_dialogue(
 /// issuer registry). Forgetting by issuer would delete a replica this link
 /// never imported, permanently: a rollback must restore what it displaced,
 /// never destroy state that predates it.
+///
+/// Takes the state `Arc` rather than an already-held guard, and locks only
+/// after the import is undone: [`SelfCleaningImport::undo`] locks `state`
+/// itself to survive its own cancellation, so a caller passing in a guard
+/// held across this call would deadlock against it.
 async fn undo_link(
-    node: &SyncNode,
+    state: &Arc<Mutex<State>>,
     identity: PdnId,
     directory_namespace: NamespaceId,
-    data_import: Option<NamespaceImport>,
+    data_import: Option<SelfCleaningImport>,
 ) {
     if let Some(import) = data_import {
-        let _ = node.undo_import_namespace(import).await;
+        import.undo().await;
     }
-    let _ = node.unhost_identity(identity);
-    let _ = node.forget_doc(directory_namespace).await;
+    let state = state.lock().await;
+    let _ = state.node.unhost_identity(identity);
+    let _ = state.node.forget_doc(directory_namespace).await;
+}
+
+// `tracked_doc_count` is behind `test-util`; this module's one test needs
+// it, so the module does too.
+#[cfg(all(test, feature = "test-util"))]
+mod tests {
+    use data_layer::SyncNode;
+    use test_utils::ids;
+
+    use super::*;
+    use crate::runtime::Runtime;
+
+    /// `SelfCleaningImport` undoes its import when dropped without
+    /// [`SelfCleaningImport::undo`] ever being called — the one-instruction
+    /// race `LinkRollbackGuard`'s own `Drop` cannot see, since the field it
+    /// would check is already empty by the time ownership has moved out via
+    /// `take_data_import`. Deterministic, unlike the integration-level
+    /// cancellation sweep in `tests/linking.rs`, which cannot reliably land
+    /// on this exact race.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_without_undo_still_undoes_the_import() -> Result<()> {
+        let rt = Runtime::spawn().await?;
+        let state = Arc::clone(&rt.state);
+
+        let scratch = SyncNode::spawn().await?;
+        scratch.create_namespace(ids::DAVE).await?;
+        let ticket = scratch
+            .share_ticket(
+                ids::DAVE,
+                ShareMode::Write,
+                AddrInfoOptions::RelayAndAddresses,
+            )
+            .await?;
+
+        let (import, before) = {
+            let guard = state.lock().await;
+            let import = guard.node.import_namespace(ids::DAVE, ticket).await?;
+            let before = guard.node.tracked_doc_count()?;
+            (import, before)
+        };
+
+        let cleanup_tasks = state.lock().await.cleanup_tasks.clone();
+        drop(SelfCleaningImport::new(
+            Arc::clone(&state),
+            import,
+            cleanup_tasks,
+        ));
+
+        let settled = test_utils::eventually(|| async {
+            let guard = state.lock().await;
+            Ok(guard.node.tracked_doc_count()? < before)
+        })
+        .await?;
+        assert!(
+            settled,
+            "dropping SelfCleaningImport without calling undo() must still undo the import"
+        );
+
+        rt.shutdown().await?;
+        scratch.shutdown().await?;
+        Ok(())
+    }
 }

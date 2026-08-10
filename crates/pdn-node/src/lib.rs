@@ -28,7 +28,8 @@ pub mod runtime;
 pub mod sync;
 
 pub use connections::{
-    ConnectionsService, DelegationUnsupported, PeerGrant, RuntimeConnectionsService,
+    ConnectionsService, DelegationUnsupported, PeerGrant, PeerNotConnected,
+    RuntimeConnectionsService,
 };
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
@@ -38,12 +39,12 @@ pub use data_layer::{
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
-    DialogueTimeout, LinkingPayload, LinkingRefused, UnsupportedLinkingVersion,
-    LINKING_FORMAT_VERSION,
+    DialogueTimeout, IdentityAlreadyHosted, LinkingInProgress, LinkingLocalFailure, LinkingPayload,
+    LinkingRefused, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
 pub use pairing::{
-    EstablishmentRefused, EstablishmentTimeout, InvitePayload, InviterUnreachable,
-    UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, InvitePayload,
+    InviterUnreachable, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
 pub use retraction::RetractionEvent;

@@ -7,6 +7,26 @@
     },
     {
       "action": "allow",
+      "host": "*.openai.com",
+      "comment": "Allow Codex API and authentication traffic"
+    },
+    {
+      "action": "allow",
+      "host": "*.openai.org",
+      "comment": "Allow Codex authentication traffic"
+    },
+    {
+      "action": "allow",
+      "host": "*.chatgpt.com",
+      "comment": "Allow Codex ChatGPT login and subscription traffic"
+    },
+    {
+      "action": "allow",
+      "host": "chatgpt.com",
+      "comment": "Allow Codex ChatGPT login and subscription traffic"
+    },
+    {
+      "action": "allow",
       "host": "172.17.*",
       "comment": "Allow all traffic to Docker bridge network (testcontainers)"
     },

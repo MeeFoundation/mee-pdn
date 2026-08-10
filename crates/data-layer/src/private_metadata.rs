@@ -17,7 +17,11 @@
 //! entry syncs — liveness never waits on payload bytes); ticket payloads are
 //! blobs, so `get_ticket` returns `None` until the payload has arrived.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use futures_core::Stream;
@@ -49,7 +53,20 @@ pub struct CatchUpTimeout;
 /// device sets, and the access book's membership probe. One definition on
 /// purpose: this key decides who counts as an identity's own device, so a
 /// drifted copy would be an access-control bug.
+///
+/// A record here is a *confirmed* device: one that holds this directory's
+/// write ticket. Linking registers its newcomer under
+/// [`PENDING_DEVICES_PREFIX`] first, so a dialogue cut off before the
+/// tickets arrive confers nothing.
 pub(crate) const DEVICES_PREFIX: &str = "devices/";
+/// Key prefix for pending device records — a linking that registered its
+/// newcomer but cannot yet know whether the tickets reached it. Deliberately
+/// disjoint from [`DEVICES_PREFIX`]: the access book probes that prefix
+/// alone, so a pending record grants nothing until the newcomer confirms
+/// itself ([`PrivateMetadataStore::confirm_device`]).
+const PENDING_DEVICES_PREFIX: &str = "pending-devices/";
+const PENDING_DEVICE_MARKER_VERSION: u8 = 1;
+pub const PENDING_DEVICE_TTL: Duration = Duration::from_hours(24);
 /// Key prefix for typed tickets.
 const TICKETS_PREFIX: &str = "tickets/";
 /// Key prefix for connection records.
@@ -61,6 +78,12 @@ const RETRACTIONS_PREFIX: &str = "retractions/";
 /// ([`DEVICES_PREFIX`] is the one shared definition).
 pub(crate) fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
+}
+
+/// The entry key of a pending device record:
+/// `pending-devices/<node-id-hex>`.
+fn pending_device_key(device: &NodeId) -> String {
+    format!("{PENDING_DEVICES_PREFIX}{device}")
 }
 
 fn ticket_key(kind: &str) -> String {
@@ -79,6 +102,41 @@ pub(crate) fn device_of(key: &[u8]) -> Option<NodeId> {
         .strip_prefix(DEVICES_PREFIX)?
         .parse()
         .ok()
+}
+
+/// Parse a `NodeId` back out of a `pending-devices/<hex>` key, if it
+/// matches.
+fn pending_device_of(key: &[u8]) -> Option<NodeId> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix(PENDING_DEVICES_PREFIX)?
+        .parse()
+        .ok()
+}
+
+enum PendingMarker {
+    Legacy,
+    Timestamp(SystemTime),
+    UnknownVersion,
+    Malformed,
+}
+
+fn pending_device_marker(marker: &[u8]) -> PendingMarker {
+    if marker == [PENDING_DEVICE_MARKER_VERSION] {
+        return PendingMarker::Legacy;
+    }
+    let Some((&version, timestamp)) = marker.split_first() else {
+        return PendingMarker::Malformed;
+    };
+    if version != PENDING_DEVICE_MARKER_VERSION {
+        return PendingMarker::UnknownVersion;
+    }
+    let Ok(timestamp) = <[u8; 8]>::try_from(timestamp) else {
+        return PendingMarker::Malformed;
+    };
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(u64::from_be_bytes(timestamp)))
+        .map_or(PendingMarker::Malformed, PendingMarker::Timestamp)
 }
 
 /// Parse a `PdnId` back out of a `connections/<hex>` key, if it matches.
@@ -142,29 +200,38 @@ pub struct PrivateMetadataStore {
     doc: Doc,
     author: AuthorId,
     blobs: iroh_blobs::api::Store,
+    pending_mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl PrivateMetadataStore {
     /// Create a fresh private metadata store on `node`.
     pub async fn create(node: &SyncNode) -> Result<Self> {
-        let doc = node.new_doc().await?;
+        // The author is minted first, and the doc — tracked by `new_doc`
+        // the moment it exists — last: nothing awaits between the tracking
+        // and the handle reaching the caller, so a future dropped in here
+        // cannot leave a tracked replica no handle refers to. The author is
+        // a standalone keypair, so the order costs nothing.
         let author = node.create_author().await?;
+        let doc = node.new_doc().await?;
         Ok(Self {
             doc,
             author,
             blobs: node.blobs(),
+            pending_mutations: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     /// Import an existing private metadata store via `ticket` (the write
     /// ticket handed to a newly linked device over the linking dialogue).
     pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
-        let doc = node.import_doc(ticket).await?;
+        // Author first, tracked doc last — see [`create`](Self::create).
         let author = node.create_author().await?;
+        let doc = node.import_doc(ticket).await?;
         Ok(Self {
             doc,
             author,
             blobs: node.blobs(),
+            pending_mutations: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -185,7 +252,11 @@ impl PrivateMetadataStore {
         self.doc.clone()
     }
 
-    /// Record `device` as one of the identity's devices.
+    /// Record `device` as one of the identity's confirmed devices — one
+    /// that holds this directory's write ticket, and so reads and writes
+    /// the identity's data whole (Invariant 1). A device that has not
+    /// demonstrated that possession is registered with
+    /// [`add_pending_device`](Self::add_pending_device) instead.
     pub async fn add_device(&self, device: NodeId) -> Result<()> {
         self.doc
             .set_bytes(self.author, device_key(&device).into_bytes(), vec![1u8])
@@ -193,18 +264,133 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// List the identity's known devices (record-level — available as soon as
-    /// the records sync).
+    /// Record that `device` has begun linking into the identity, without
+    /// conferring anything: the access book probes the confirmed set alone,
+    /// so a dialogue cut off before its reply arrives leaves a device that
+    /// is visible to the identity's other devices and admitted nowhere. The
+    /// newcomer promotes itself with [`confirm_device`](Self::confirm_device)
+    /// once the tickets are in hand.
+    pub async fn add_pending_device(&self, device: NodeId) -> Result<()> {
+        let _mutation = self.pending_mutations.lock().await;
+        self.write_pending_device_at(device, SystemTime::now())
+            .await
+    }
+
+    async fn write_pending_device_at(&self, device: NodeId, created_at: SystemTime) -> Result<()> {
+        let created_at = created_at
+            .duration_since(UNIX_EPOCH)
+            .context("pending-device creation time predates the Unix epoch")?
+            .as_secs();
+        let mut marker = Vec::with_capacity(9);
+        marker.push(PENDING_DEVICE_MARKER_VERSION);
+        marker.extend_from_slice(&created_at.to_be_bytes());
+        self.doc
+            .set_bytes(
+                self.author,
+                pending_device_key(&device).into_bytes(),
+                marker,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn add_pending_device_at_for_test(
+        &self,
+        device: NodeId,
+        created_at: SystemTime,
+    ) -> Result<()> {
+        let _mutation = self.pending_mutations.lock().await;
+        self.write_pending_device_at(device, created_at).await
+    }
+
+    pub async fn cleanup_pending_devices(&self) -> Result<()> {
+        self.cleanup_pending_devices_at(SystemTime::now()).await
+    }
+
+    async fn cleanup_pending_devices_at(&self, now: SystemTime) -> Result<()> {
+        let _mutation = self.pending_mutations.lock().await;
+        let query = Query::single_latest_per_key().key_prefix(PENDING_DEVICES_PREFIX.as_bytes());
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut records = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            if let Some(device) = pending_device_of(entry.key()) {
+                records.push(device);
+            }
+        }
+        for device in records {
+            let key = pending_device_key(&device);
+            let Some(marker) = read_payload(&self.doc, &self.blobs, key.as_bytes()).await? else {
+                continue;
+            };
+            let created_at = match pending_device_marker(&marker) {
+                PendingMarker::Legacy => {
+                    self.write_pending_device_at(device, now).await?;
+                    continue;
+                }
+                PendingMarker::Timestamp(created_at) => created_at,
+                PendingMarker::UnknownVersion => continue,
+                PendingMarker::Malformed => {
+                    self.doc.del(self.author, key.into_bytes()).await?;
+                    continue;
+                }
+            };
+            if now.duration_since(created_at).unwrap_or_default() >= PENDING_DEVICE_TTL {
+                self.doc.del(self.author, key.into_bytes()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn cleanup_pending_devices_at_for_test(&self, now: SystemTime) -> Result<()> {
+        self.cleanup_pending_devices_at(now).await
+    }
+
+    /// Promote `device` from pending to confirmed, clearing the pending
+    /// record. Written by the newcomer itself: only a device that imported
+    /// this directory holds the write ticket that lets it, so the record is
+    /// evidence the linking reply arrived — which the inviter, having sent
+    /// it into a connection that may drop, cannot establish on its own.
+    pub async fn confirm_device(&self, device: NodeId) -> Result<()> {
+        let _mutation = self.pending_mutations.lock().await;
+        self.doc
+            .del(self.author, pending_device_key(&device).into_bytes())
+            .await?;
+        self.add_device(device).await?;
+        Ok(())
+    }
+
+    /// List the identity's confirmed devices (record-level — available as
+    /// soon as the records sync). Pending registrations are excluded: they
+    /// are not yet devices anywhere the set is consulted, from the access
+    /// book to the device sets published over a connection.
     pub async fn list_devices(&self) -> Result<Vec<NodeId>> {
         let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        let mut devices = Vec::new();
+        let mut devices = HashSet::new();
         while let Some(entry) = stream.next().await {
             if let Some(device) = device_of(entry?.key()) {
-                devices.push(device);
+                devices.insert(device);
             }
         }
-        Ok(devices)
+        Ok(devices.into_iter().collect())
+    }
+
+    /// List the devices that began linking and have not confirmed —
+    /// registrations that confer nothing ([`add_pending_device`](Self::add_pending_device)).
+    pub async fn list_pending_devices(&self) -> Result<Vec<NodeId>> {
+        self.cleanup_pending_devices().await?;
+        let query = Query::single_latest_per_key().key_prefix(PENDING_DEVICES_PREFIX.as_bytes());
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut devices = HashSet::new();
+        while let Some(entry) = stream.next().await {
+            if let Some(device) = pending_device_of(entry?.key()) {
+                devices.insert(device);
+            }
+        }
+        Ok(devices.into_iter().collect())
     }
 
     /// Record a live connection to `peer`. The payload is an opaque marker
@@ -476,5 +662,24 @@ impl PrivateMetadataStore {
         };
         let ticket = std::str::from_utf8(&bytes)?.parse::<DocTicket>()?;
         Ok(Some(ticket))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_marker_rejects_overflow_and_preserves_unknown_versions() {
+        let mut overflow = vec![PENDING_DEVICE_MARKER_VERSION];
+        overflow.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(matches!(
+            pending_device_marker(&overflow),
+            PendingMarker::Malformed
+        ));
+        assert!(matches!(
+            pending_device_marker(&[PENDING_DEVICE_MARKER_VERSION + 1, 0]),
+            PendingMarker::UnknownVersion
+        ));
     }
 }

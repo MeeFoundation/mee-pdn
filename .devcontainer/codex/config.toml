@@ -1,0 +1,4 @@
+# Docker and Sandcat provide the isolation boundary for this devcontainer.
+# Run Codex without an additional inner sandbox or approval prompts.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"

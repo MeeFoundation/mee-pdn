@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenSpec Explore"
+  short_description: "Explore requirements and architecture without coding"
+  default_prompt: "Use $openspec-explore to investigate this idea before implementation."

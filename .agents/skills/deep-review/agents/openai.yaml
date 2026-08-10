@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deep Review"
+  short_description: "Run a rigorous multi-agent working-tree review"
+  default_prompt: "Use $deep-review to review all uncommitted changes and write a findings file."

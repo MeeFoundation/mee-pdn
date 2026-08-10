@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use data_layer::{
     AddrInfoOptions, ConnectionMetadata, ConnectionMetadataStore, DocTicket, EndpointAddr,
     EndpointId, GrantedClaim, ReadGrant, ShareMode,
@@ -42,6 +42,19 @@ pub struct DelegationUnsupported {
     pub identity: PdnId,
     /// The foreign data issuer it tried to grant.
     pub issuer: PdnId,
+}
+
+/// A grant publish or withdrawal named a peer `identity` has no connection
+/// metadata pair toward — established with, or replicated in from another
+/// of its devices. Downcast from the `anyhow::Error` of the connections
+/// service's `publish_grant`/`withdraw_grant`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("no connection metadata pair toward {peer}")]
+pub struct PeerNotConnected {
+    /// The identity the grant was attempted from.
+    pub identity: PdnId,
+    /// The peer no metadata pair addresses.
+    pub peer: PdnId,
 }
 
 /// A grant read from a connected peer's metadata store: the capability
@@ -258,7 +271,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         }
         let pair = open_pair(&mut state, identity, peer)
             .await?
-            .with_context(|| format!("no connection metadata pair toward {peer}"))?;
+            .ok_or(PeerNotConnected { identity, peer })?;
         pair.own.withdraw_grant(issuer).await
     }
 
@@ -276,7 +289,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         }
         let pair = open_pair(&mut state, identity, peer)
             .await?
-            .with_context(|| format!("no connection metadata pair toward {peer}"))?;
+            .ok_or(PeerNotConnected { identity, peer })?;
         let grant = ReadGrant {
             issuer,
             audience: peer,
@@ -695,7 +708,12 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
         // ahead of it would have taken away the only thing that could explain
         // or re-arm them. Keeping the binding keeps the retry: the next sweep
         // sees the grant still gone.
-        if !held_by_another_pair(state, (identity, peer), issuer).await {
+        // A hosted identity's own namespace predates every grant binding and
+        // outlives them all — the last grant toward it disappearing must
+        // never destroy it, same as `linking.rs`'s rollback never destroys a
+        // namespace an import displaced rather than created.
+        if !state.is_hosted(issuer) && !held_by_another_pair(state, (identity, peer), issuer).await
+        {
             match state.node.forget_namespace(issuer).await {
                 // Forgotten here, or already resolving to nothing — the state
                 // this unbind drives at.

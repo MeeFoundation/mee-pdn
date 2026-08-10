@@ -99,9 +99,18 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     echo '{"hasCompletedOnboarding":true}' > "$HOME/.claude.json"
 fi
 
+# Keep only the sandcat placeholder in Codex's persistent auth cache. The proxy
+# substitutes the real API key on requests to the hosts allowed by the secret's
+# settings entry, so the real key never enters the app container or its volume.
+if command -v codex >/dev/null 2>&1 \
+    && [ -n "${OPENAI_API_KEY:-}" ] \
+    && ! codex login status >/dev/null 2>&1; then
+    printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null
+fi
+
 # Ensure WASM targets are available (volume mount overwrites Dockerfile results).
 rustup target add wasm32-unknown-unknown wasm32-wasip1 2>/dev/null || true
 
-# Claude Code is installed at build time (Dockerfile.app).
+# Claude Code and Codex are installed at build time (Dockerfile.app).
 # Background update so it doesn't block startup.
 (claude install >/dev/null 2>&1 &)

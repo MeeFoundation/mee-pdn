@@ -13,7 +13,9 @@
 #![allow(dead_code)]
 
 use anyhow::{ensure, Context, Result};
-use data_layer::{Connection, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode};
+use data_layer::{
+    Connection, DialHandle, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode,
+};
 use pdn_node::{
     ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
     Runtime,
@@ -87,8 +89,14 @@ pub async fn dial_linking_without_reading(
     node: &SyncNode,
     payload: &LinkingPayload,
 ) -> Result<Connection> {
-    let connection = node
-        .dial_handle()
+    dial_linking_without_reading_from(&node.dial_handle(), payload).await
+}
+
+pub async fn dial_linking_without_reading_from(
+    dial: &DialHandle,
+    payload: &LinkingPayload,
+) -> Result<Connection> {
+    let connection = dial
         .connect(payload.inviter_addr.clone(), LINKING_ALPN)
         .await?;
     let (mut send, _dropped_recv) = connection.open_bi().await?;
@@ -104,10 +112,12 @@ pub async fn dial_linking_without_reading(
 /// A store-level probe of `identity`'s directory on `runtime`: a bare node
 /// that links raw — the same act a linking device performs — and imports
 /// the directory from the reply, so everything it reads afterwards is what
-/// any device of the identity reads. One attempt — a single dial succeeds
-/// reliably in the loopback test setup. Note the inviter registers the probe as
-/// a device, so device-set assertions use contains/exact-with-probe, never
-/// counts that forget it.
+/// any device of the identity reads. Confirming itself is part of that act:
+/// the inviter registers a newcomer as pending, and only the newcomer's own
+/// write — which its write ticket is what permits — makes it a device.
+/// One attempt — a single dial succeeds reliably in the loopback test
+/// setup. Note the probe ends up in the device set, so device-set
+/// assertions use contains/exact-with-probe, never counts that forget it.
 pub async fn link_probe(
     runtime: &Runtime,
     identity: PdnId,
@@ -116,6 +126,7 @@ pub async fn link_probe(
     let payload = runtime.identity().linking_invite(identity, None).await?;
     let (directory_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
     let directory = PrivateMetadataStore::import(&node, directory_ticket).await?;
+    directory.confirm_device(node.node_id()).await?;
     Ok((node, directory))
 }
 

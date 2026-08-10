@@ -11,8 +11,8 @@ services:
     # so processes inside cannot modify routing, iptables, or the tunnel.
     network_mode: "service:wg-client"
     volumes:
-      # Named volume for the home directory so Claude Code auth state,
-      # shell history, and other user-level config persist across rebuilds.
+      # Named volume for the home directory so Claude/Codex auth state, shell
+      # history, and other user-level config persist across rebuilds.
       - app-home:/home/vscode
       # Mount Docker socket for testcontainers (integration tests)
       - /var/run/docker.sock:/var/run/docker.sock

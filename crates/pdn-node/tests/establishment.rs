@@ -7,15 +7,15 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use data_layer::{
     AcceptError, AddrInfoOptions, Connection, ConnectionMetadataStore, PrivateMetadataStore,
     ProtocolHandler, ShareMode, SyncNode,
 };
 use pdn_node::{
-    ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentRefused,
-    EstablishmentTimeout, IdentityService as _, InvitePayload, InviterUnreachable, Runtime,
-    UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentInProgress,
+    EstablishmentRefused, EstablishmentTimeout, IdentityService as _, InvitePayload,
+    InviterUnreachable, Runtime, UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, TIMEOUT};
@@ -81,6 +81,210 @@ async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<(
     );
 
     hung.shutdown().await?;
+    rt.shutdown().await?;
+    Ok(())
+}
+
+/// Shutdown waits for an accept in flight instead of cutting it off, and
+/// stops waiting once that accept returns. A raw dialer opens the pairing
+/// ALPN and leaves the inviter's `accept` parked mid-request, so the
+/// handler holds its permit; `shutdown` started against that is still
+/// running a second later, and returns promptly once the dialer goes away
+/// — well inside the handler's own budget, so what ended the wait is the
+/// accept finishing, not the budget running out. Without the permit the
+/// first assertion fails: shutdown would return with the accept still in
+/// flight, which is the abort this bounded wait exists to replace.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
+    let rt = Runtime::spawn().await?;
+    let x = rt.identity().create().await?;
+    // Minted for its address alone — the dialogue below is never completed,
+    // so the secret is spent on nothing.
+    let invite = rt.connections().invite(x, None).await?;
+
+    // The dialer parks the accept: a frame header promising more bytes than
+    // it sends leaves the inviter's `serve` blocked reading the rest, with
+    // the handler's permit held for as long as the connection lives.
+    let dialer = SyncNode::spawn().await?;
+    let connection = dialer
+        .dial_handle()
+        .connect(invite.inviter_addr.clone(), PAIRING_ALPN)
+        .await?;
+    let (mut send, _recv) = connection.open_bi().await?;
+    send.write_all(&64u32.to_le_bytes()).await?;
+    send.write_all(b"partial").await?;
+    tokio::time::timeout(TIMEOUT, async {
+        while !rt.pairing_accept_in_flight_for_test().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the inviter never dispatched the parked accept")?;
+
+    let started = std::time::Instant::now();
+    let mut shutting_down = tokio::spawn(async move { rt.shutdown().await });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !shutting_down.is_finished(),
+        "shutdown must wait for the accept in flight rather than abort it"
+    );
+
+    // The accept returns the moment its connection goes away, and shutdown
+    // with it.
+    connection.close(0u32.into(), b"");
+    let waited = tokio::time::timeout(TIMEOUT, &mut shutting_down).await;
+    let elapsed = started.elapsed();
+    waited
+        .context("shutdown never returned after the accept it waited for finished")?
+        .context("the shutdown task panicked")??;
+    assert!(
+        elapsed < pdn_node::pairing::SHUTDOWN_ESTABLISHMENT_BUDGET,
+        "shutdown took {elapsed:?} — its budget elapsing, not the accept finishing, ended the wait"
+    );
+
+    dialer.shutdown().await?;
+    Ok(())
+}
+
+/// Denied (a second establishment toward the same peer while one is in
+/// flight): the reservation is keyed by the pair, so a second `establish`
+/// from the same identity toward the same inviter refuses as a conflict
+/// rather than racing the first to assemble the same connection twice. The
+/// hung inviter is what makes the overlap the subject rather than a race:
+/// the first attempt is parked in the dialogue for its whole ceiling, so
+/// the second meets the reservation with certainty, and the two secrets
+/// differ — what refuses the second is the pair already in flight, not a
+/// burnt secret.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_establishment_toward_the_same_peer_is_refused_while_one_is_in_flight(
+) -> Result<()> {
+    let hung = SyncNode::spawn_with_protocols(vec![(PAIRING_ALPN.to_vec(), Box::new(HungInviter))])
+        .await?;
+    let rt = Runtime::spawn().await?;
+    let y = rt.identity().create().await?;
+    let toward_dave = |secret| InvitePayload {
+        version: INVITE_FORMAT_VERSION,
+        inviter_addr: hung.dial_handle().addr(),
+        secret,
+        inviter: ids::DAVE,
+    };
+
+    let connections = rt.connections();
+    let (first, second) = tokio::join!(
+        connections.establish(y, toward_dave([0x55; 32])),
+        connections.establish(y, toward_dave([0x66; 32]))
+    );
+
+    // One of the two held the reservation and paid the dialogue ceiling
+    // against an inviter that never answers; the other met the reservation
+    // and was refused at once. Which is which is the scheduler's business.
+    let errors = [first.unwrap_err(), second.unwrap_err()];
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|e| e.downcast_ref::<EstablishmentInProgress>().is_some())
+            .count(),
+        1,
+        "exactly one of two concurrent establishments toward the same peer must refuse as a \
+         conflict, got: {errors:#?}"
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|e| e.downcast_ref::<EstablishmentTimeout>().is_some())
+            .count(),
+        1,
+        "the attempt that held the reservation must be the one that ran the dialogue, got: \
+         {errors:#?}"
+    );
+
+    // The reservation is released on both outcomes: a later attempt toward
+    // the same peer reaches the dialogue again rather than meeting a
+    // reservation nobody holds.
+    let after = rt
+        .connections()
+        .establish(y, toward_dave([0x77; 32]))
+        .await
+        .unwrap_err();
+    assert!(
+        after.downcast_ref::<EstablishmentInProgress>().is_none(),
+        "the reservation must not outlive the attempts that took it, got: {after:#}"
+    );
+
+    hung.shutdown().await?;
+    rt.shutdown().await?;
+    Ok(())
+}
+
+/// A pairing "inviter" that reads the request and then blocks forever,
+/// never accepting a release — the harness for cancelling the scanner's
+/// `establish` future itself (a genuine future-drop) rather than letting the
+/// dialogue run to a completed failure the way [`HungInviter`]'s timeout
+/// does.
+#[cfg(feature = "test-util")]
+#[derive(Debug)]
+struct NeverAnsweringInviter;
+
+#[cfg(feature = "test-util")]
+impl ProtocolHandler for NeverAnsweringInviter {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if let Ok((_send, mut recv)) = connection.accept_bi().await {
+            let _request = read_frame(&mut recv).await;
+            connection.closed().await;
+        }
+        Ok(())
+    }
+}
+
+/// Cancelling `establish` — dropping its future outright, before the
+/// dialogue can ever complete — must leave no replica behind, at any point
+/// in its lifetime from the dial through the round trip. `EstablishGuard`'s
+/// `Drop` is the only thing that can catch this; a completed-failure test
+/// like the hung-inviter timeout above never exercises it, since `disarm`
+/// already ran by the time such a test's `.await` returns.
+// `tracked_doc_count` is the pairing side's only observable anchor for
+// this assertion — see the doc comment above.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
+    let inviter = SyncNode::spawn_with_protocols(vec![(
+        PAIRING_ALPN.to_vec(),
+        Box::new(NeverAnsweringInviter),
+    )])
+    .await?;
+    let rt = Runtime::spawn().await?;
+    let y = rt.identity().create().await?;
+    let before = rt.sync().tracked_doc_count().await?;
+
+    // The inviter never answers, so every one of these delays cancels the
+    // future somewhere between the dial and the round trip's reply —
+    // sweeping the window without needing to land on one exact instruction.
+    for delay in [
+        Duration::from_millis(0),
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+        Duration::from_millis(80),
+    ] {
+        let invite = InvitePayload {
+            version: INVITE_FORMAT_VERSION,
+            inviter_addr: inviter.dial_handle().addr(),
+            secret: [0x77; 32],
+            inviter: ids::DAVE,
+        };
+        let connections = rt.connections();
+        let attempt = connections.establish(y, invite);
+        tokio::select! {
+            _ = attempt => {}
+            () = tokio::time::sleep(delay) => {}
+        }
+        assert!(
+            eventually(|| async { Ok(rt.sync().tracked_doc_count().await? == before) }).await?,
+            "cancelling establish at {delay:?} left a tracked replica behind"
+        );
+    }
+
+    inviter.shutdown().await?;
     rt.shutdown().await?;
     Ok(())
 }
