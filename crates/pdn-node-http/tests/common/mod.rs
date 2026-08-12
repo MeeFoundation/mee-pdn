@@ -32,7 +32,7 @@ use pdn_node::PdnId;
 use pdn_node_http::shapes::{CreatedIdentity, GrantPublication};
 use serde::de::DeserializeOwned;
 use testcontainers::{
-    core::{ContainerPort, WaitFor},
+    core::{ContainerPort, ExecCommand, WaitFor},
     runners::AsyncRunner as _,
     ContainerAsync, GenericImage, ImageExt as _,
 };
@@ -44,11 +44,32 @@ pub const IMAGE_TAG: &str = "dev";
 /// The port the image serves on, published to the test host by the container
 /// runtime. The runtime's own endpoint port is never published: everything
 /// between nodes stays on the container network.
-const HTTP_PORT: ContainerPort = ContainerPort::Tcp(3011);
+const HTTP_PORT_NUM: u16 = 3011;
+const HTTP_PORT: ContainerPort = ContainerPort::Tcp(HTTP_PORT_NUM);
 
-/// How long a node has to answer `/live` after its container starts.
-const READY_BUDGET: Duration = Duration::from_secs(60);
+/// How long a node has to answer `/live` after its container starts. Not a
+/// margin for slowness: a healthy node binds its listener within a
+/// millisecond of its store opening, so this is what a container that will
+/// never answer costs before it is replaced.
+const READY_BUDGET: Duration = Duration::from_secs(20);
 const READY_POLL: Duration = Duration::from_millis(250);
+
+/// How many containers one node is worth. A published port that never
+/// answers is an arrangement that failed, not a scenario that did, so the
+/// container is replaced rather than reported.
+const SPAWN_ATTEMPTS: usize = 2;
+
+/// Where a replaced container is recorded. A replacement leaves no other
+/// trace on a run that then passes: printing is not available here, and the
+/// runner keeps a passing test's output to itself. Without this file a green
+/// suite cannot be told apart from one whose failures were all absorbed —
+/// which is the difference between a guard that works and a symptom that
+/// went away on its own.
+///
+/// The path is absolute and fixed at build time. A relative one would follow
+/// each test process's own directory, which is the package root rather than
+/// the workspace, and scatter the evidence beside the crate.
+const REPLACEMENT_LOG: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/stand-replacements.log");
 
 /// How long a wait for convergence may take. Wide enough to cover several of
 /// the runtime's own reconciliation periods, since nothing here shortens that
@@ -92,32 +113,62 @@ impl Stand {
     }
 
     async fn spawn_with_debug(&self, label: &str, debug: bool) -> Result<Host> {
-        let mut image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
-            .with_exposed_port(HTTP_PORT)
-            .with_wait_for(WaitFor::Nothing)
-            // The environment is stated, never inherited: a bind value
-            // meant for a node in a test's own process would have this one
-            // publish an address no other container can reach. The runtime's
-            // endpoint bind stays unset, so the endpoint binds every
-            // interface and publishes the container's own address.
-            .with_env_var("RUST_LOG", "info,pdn_node=debug,data_layer=debug")
-            .with_network(&self.network)
-            .with_container_name(format!("{}-{label}", self.network));
-        if debug {
-            image = image.with_env_var("PDN_DEBUG", "1");
+        let mut failed = None;
+        let mut replaced = String::new();
+        for attempt in 1..=SPAWN_ATTEMPTS {
+            // The name carries the attempt, so a replacement never collides
+            // with a predecessor the daemon has not finished removing.
+            let name = match attempt {
+                1 => format!("{}-{label}", self.network),
+                n => format!("{}-{label}-{n}", self.network),
+            };
+            let mut image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+                .with_exposed_port(HTTP_PORT)
+                .with_wait_for(WaitFor::Nothing)
+                // The environment is stated, never inherited: a bind value
+                // meant for a node in a test's own process would have this
+                // one publish an address no other container can reach. The
+                // runtime's endpoint bind stays unset, so the endpoint binds
+                // every interface and publishes the container's own address.
+                .with_env_var("RUST_LOG", "info,pdn_node=debug,data_layer=debug")
+                .with_network(&self.network)
+                .with_container_name(name);
+            if debug {
+                image = image.with_env_var("PDN_DEBUG", "1");
+            }
+            let container = image
+                .start()
+                .await
+                .with_context(|| format!("starting {label}: is {IMAGE_NAME}:{IMAGE_TAG} built?"))?;
+            let client = reqwest::Client::new();
+            match wait_live(&container, label, &client).await {
+                Ok(base) => {
+                    return Ok(Host {
+                        label: label.to_owned(),
+                        base,
+                        client,
+                        container,
+                        replaced,
+                    })
+                }
+                Err(err) => {
+                    // Recorded twice, for two different readers: on the node,
+                    // where it surfaces in diagnostics if something fails
+                    // afterwards, and in a file, which is the only trace a
+                    // run that then passes leaves behind.
+                    let note = format!(
+                        "[{label}] container {attempt} of {SPAWN_ATTEMPTS} never answered and was \
+                         replaced. {err:#}\n"
+                    );
+                    record_replacement(&note);
+                    replaced.push_str(&note);
+                    let _ = container.rm().await;
+                    failed = Some(err);
+                }
+            }
         }
-        let container = image
-            .start()
-            .await
-            .with_context(|| format!("starting {label}: is {IMAGE_NAME}:{IMAGE_TAG} built?"))?;
-        let client = reqwest::Client::new();
-        let base = wait_live(&container, label, &client).await?;
-        Ok(Host {
-            label: label.to_owned(),
-            base,
-            client,
-            container,
-        })
+        Err(failed
+            .unwrap_or_else(|| anyhow::anyhow!("{label} was never given a container to start")))
     }
 }
 
@@ -166,6 +217,8 @@ pub struct Host {
     base: String,
     client: reqwest::Client,
     container: ContainerAsync<GenericImage>,
+    /// What it took to get this node up, empty when it came up first try.
+    replaced: String,
 }
 
 impl Host {
@@ -233,7 +286,11 @@ impl Host {
     /// answer alone says the value never arrived, and the log says what the
     /// node was doing instead.
     pub async fn diagnostics(&self) -> String {
-        log_tail(&self.container, &self.label).await
+        format!(
+            "{}{}",
+            self.replaced,
+            log_tail(&self.container, &self.label).await
+        )
     }
 
     /// Send one request to this node's surface.
@@ -271,6 +328,50 @@ async fn log_tail(container: &ContainerAsync<GenericImage>, label: &str) -> Stri
     format!("[{label}] last {} bytes of log:\n{text}", text.len())
 }
 
+/// Append one replacement to [`REPLACEMENT_LOG`], best effort: the file is
+/// evidence about the harness, and failing to write it must never decide the
+/// outcome of a scenario. Tests run a process each and append, so the line is
+/// written whole in one call rather than built up across several.
+fn record_replacement(note: &str) {
+    use std::io::Write as _;
+    let Some(dir) = std::path::Path::new(REPLACEMENT_LOG).parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(REPLACEMENT_LOG)
+    {
+        let _ = file.write_all(note.as_bytes());
+    }
+}
+
+/// Whether the node accepts a connection on its own loopback, asked from
+/// inside the container — the one thing an outside observer cannot see.
+/// The log says the listener bound; a forward that never came up and an
+/// accept loop that died look identical from the test host, and this tells
+/// them apart. `bash` is in the image and `/dev/tcp` is one of its builtins,
+/// so asking needs nothing installed.
+async fn accepts_from_inside(container: &ContainerAsync<GenericImage>) -> String {
+    let probe = ExecCommand::new([
+        "bash",
+        "-c",
+        &format!("exec 3<>/dev/tcp/127.0.0.1/{HTTP_PORT_NUM}"),
+    ]);
+    match container.exec(probe).await {
+        Ok(result) => match result.exit_code().await {
+            Ok(Some(0)) => "yes".to_owned(),
+            Ok(Some(code)) => format!("no, refused (exit {code})"),
+            Ok(None) => "unknown, probe still running".to_owned(),
+            Err(err) => format!("unknown, probe unreadable ({err})"),
+        },
+        Err(err) => format!("unknown, probe unrunnable ({err})"),
+    }
+}
+
 /// Wait until this node answers liveness, and hand back the address that
 /// answered.
 ///
@@ -287,21 +388,36 @@ async fn wait_live(
     client: &reqwest::Client,
 ) -> Result<String> {
     let deadline = std::time::Instant::now() + READY_BUDGET;
-    let first = base_url(container).await?;
+    // An address the daemon cannot state yet is waited for like any other
+    // unready thing, inside the same budget. Asked once at the top, this
+    // answers "does not expose port 3011/tcp" often enough to be seen in
+    // fifty runs: the port state is not always settled by the time `start`
+    // returns, and a container is a costly thing to throw away over it.
+    let mut first = None;
     loop {
-        let base = base_url(container).await.unwrap_or_else(|_| first.clone());
-        if let Ok(response) = client.get(format!("{base}/live")).send().await {
-            if response.status().as_u16() == StatusCode::OK.as_u16() {
-                return Ok(base);
+        let resolved = base_url(container).await;
+        if first.is_none() {
+            if let Ok(ref base) = resolved {
+                first = Some(base.clone());
+            }
+        }
+        if let Ok(ref base) = resolved {
+            if let Ok(response) = client.get(format!("{base}/live")).send().await {
+                if response.status().as_u16() == StatusCode::OK.as_u16() {
+                    return Ok(base.clone());
+                }
             }
         }
         if std::time::Instant::now() > deadline {
             let now = base_url(container)
                 .await
                 .unwrap_or_else(|err| format!("<unresolvable: {err}>"));
+            let first = first.unwrap_or_else(|| "<never resolved>".to_owned());
             return Err(anyhow::anyhow!(
                 "{label} never answered /live within {READY_BUDGET:?} \
-                 (first dialed {first}, now resolves to {now})\n{}",
+                 (first dialed {first}, now resolves to {now}, \
+                 accepts on its own loopback: {})\n{}",
+                accepts_from_inside(container).await,
                 log_tail(container, label).await
             ));
         }
