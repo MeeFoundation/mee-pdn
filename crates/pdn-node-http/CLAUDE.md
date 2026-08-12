@@ -1,0 +1,9 @@
+# crates/pdn-node-http
+
+The thin HTTP host for the demo stand: an axum binary embedding one runtime. `GET /live` always on; the `/debug/` subtree is scaffolding behind `PDN_DEBUG=1` (absent otherwise, route names unpinned) and covers the runtime's four services — identities, the pairing and linking ceremonies, connections and grants, entries — one route to one service call, with entry payloads as raw bodies and everything else as JSON. Refusals arrive as refusals: one closed error table maps the runtime's typed errors to statuses (403 refused, 409 not hosted, 400 malformed, 404 absent, 500 unrecognized).
+
+Deliberately absent, and to stay absent: any namespace ticket handover (a grant read hands back the capability alone), anything that forces reconciliation or resets state, and any handler addressing another host — the crate carries no HTTP client, and inter-node traffic is the runtime's own protocols.
+
+Env: `PDN_HOST` / `PDN_PORT` (default `127.0.0.1:3011`, loopback so a wider bind is deliberate). Depends on `pdn-node` only — no direct `data-layer` dependency.
+
+Its tests drive the surface across containers and nowhere else (`tests/stand*.rs` over the harness in `tests/common/`): the runtime's own behaviour is proven by `pdn-node`'s scenarios, so a second in-process run of the same flow through HTTP would be a third copy of it. The stand (`ops/Dockerfile`, `just test-docker`, and its own CI job) runs each node as its own process in its own container on one network per test, with HTTP published to the test host and nothing but the runtime's own protocols between nodes. One test stays in this process — `tests/readiness.rs`, which holds the runtime's coarse state lock from inside to show `/live` answering while `/ready` reports the wait; no request on the surface can stall that lock.

@@ -61,6 +61,52 @@ test-release *args:
   export PDN_BIND_ADDR=127.0.0.1
   cargo nextest run --release $(just _features "$@") "$@"
 
+# The image the stand runs. The scenarios look for exactly this tag.
+image := "pdn-node-http:dev"
+
+# Build the stand's image from the workspace as it resolves — a store fork
+# pointed at the checkout beside it included.
+[doc("Build the stand's node image")]
+build-image:
+  #!/bin/sh
+  set -eux
+  DOCKER_BUILDKIT=1 docker build -f ops/Dockerfile -t {{ image }} .
+
+# What the build context actually carries, listed against the allowed set in
+# .dockerignore. The criterion is presence — anything outside that set is a
+# leak whatever it weighs; the sizes say which leak is expensive.
+[doc("List what the docker build context carries")]
+check-context:
+  #!/bin/sh
+  set -eu
+  DOCKER_BUILDKIT=1 docker build -q -f ops/Dockerfile.context -t pdn-context-check:dev . >/dev/null
+  docker run --rm pdn-context-check:dev
+
+# Run one node by hand: debug surface on, HTTP port published. PORT overrides
+# the published port.
+[doc("Run one stand node in the foreground")]
+run-image:
+  #!/bin/sh
+  set -eux
+  PORT=${PORT:-3011}
+  docker run --rm -e PDN_DEBUG=1 -p ${PORT}:3011 {{ image }}
+
+# The stand: build the image, then run the container scenarios against it.
+# Extra args are forwarded to `cargo nextest run`.
+#
+# Deliberately outside `just test` and outside the flaky hunt's default
+# selection: it needs the image built first, and it waits on convergence at
+# the runtime's own cadence, so it runs in minutes where the in-process suite
+# runs in seconds. Needs a container daemon.
+[doc("Build the image and run the container scenarios (needs docker)")]
+test-docker *args:
+  #!/bin/sh
+  set -eu
+  command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "no container daemon — the stand needs one"; exit 1; }
+  just build-image
+  cargo nextest run -p pdn-node-http -E 'binary(~stand)' --run-ignored all "$@"
+
 # Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.
 #
 # With no test selection it defaults to the scenario (integration) tests,
@@ -164,19 +210,26 @@ check-fix:
   cargo clippy --workspace --all-targets {{ test_features }}
   cargo check --workspace --all-targets {{ test_features }}
 
-# Lint, build, test, integration tests
+# Includes the container suite, as `fix` does: every test of the HTTP surface
+# is one. Needs a container daemon, and builds the image.
+[doc("Lint, build, test, container suite (needs docker)")]
 precommit-check:
   #!/bin/sh
   set -eux
   just check
   just test
+  just test-docker
 
-# Lint, build, test, integration tests, attempt fixes
+# Includes the container suite: every test of the HTTP surface is one, so a
+# pass without it says nothing about that crate. Needs a container daemon,
+# and builds the image.
+[doc("Lint, build, test, container suite, attempt fixes (needs docker)")]
 fix:
   #!/bin/sh
   set -eux
   just check-fix
   just test
+  just test-docker
 
 pr-review branch:
   #!/bin/sh

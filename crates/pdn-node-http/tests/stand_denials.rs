@@ -20,26 +20,28 @@ use pdn_node::PdnId;
 use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, PeerGrants};
 
 mod common;
-use common::{body, claims_on, entry_reads, grant_on, Host};
+use common::{body, claims_on, entry_reads, grant_on, Stand};
 
 /// An identity no runtime in this test creates or links.
 const UNHOSTED: PdnId = PdnId::from_bytes([0x77; 32]);
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // the denials of one surface, kept beside their positives
 async fn refusals_arrive_as_refusals() -> Result<()> {
-    let inviter = Host::spawn().await?;
-    let scanner = Host::spawn().await?;
-    let replayer = Host::spawn().await?;
+    let stand = Stand::new();
+    let inviter = stand.spawn("inviter").await?;
+    let scanner = stand.spawn("scanner").await?;
+    let replayer = stand.spawn("replayer").await?;
 
-    let x = inviter.create_identity().await?;
-    let y = scanner.create_identity().await?;
-    let z = replayer.create_identity().await?;
+    let alice = inviter.create_identity().await?;
+    let bob = scanner.create_identity().await?;
+    let carol = replayer.create_identity().await?;
 
     inviter
         .put(
-            &format!("/debug/data/{x}/contact/email"),
-            body(b"x@example.org"),
+            &format!("/debug/data/{alice}/contact/email"),
+            body(b"alice@example.org"),
         )
         .await?
         .ok()?;
@@ -64,18 +66,21 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         unhosted.text()
     );
     inviter
-        .get(&format!("/debug/identities/{x}/connections"))
+        .get(&format!("/debug/identities/{alice}/connections"))
         .await?
         .ok()?;
 
     // The connection the grant denials need. The payload is kept for the
     // replay below.
     let payload = inviter
-        .post(&format!("/debug/identities/{x}/invite"), Bytes::new())
+        .post(&format!("/debug/identities/{alice}/invite"), Bytes::new())
         .await?
         .ok()?;
     scanner
-        .post(&format!("/debug/identities/{y}/establish"), payload.clone())
+        .post(
+            &format!("/debug/identities/{bob}/establish"),
+            payload.clone(),
+        )
         .await?
         .ok()?;
 
@@ -84,11 +89,11 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // publication naming its own issuer is accepted.
     let foreign = inviter
         .publish_grant(
-            x,
-            y,
+            alice,
+            bob,
             &GrantPublication {
-                issuer: y,
-                claims: claims_on(y, "contact/email", false)?,
+                issuer: bob,
+                claims: claims_on(bob, "contact/email", false)?,
             },
         )
         .await?;
@@ -100,18 +105,18 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         foreign.text()
     );
     let after_foreign: PeerGrants = inviter
-        .get(&format!("/debug/identities/{x}/grants/{y}"))
+        .get(&format!("/debug/identities/{alice}/grants/{bob}"))
         .await?
         .json()?;
     assert!(after_foreign.grants.is_empty());
-    let mut allowed_claims = claims_on(x, "contact/email", false)?;
-    allowed_claims.extend(claims_on(x, "contact/sentinel", false)?);
+    let mut allowed_claims = claims_on(alice, "contact/email", false)?;
+    allowed_claims.extend(claims_on(alice, "contact/sentinel", false)?);
     inviter
         .publish_grant(
-            x,
-            y,
+            alice,
+            bob,
             &GrantPublication {
-                issuer: x,
+                issuer: alice,
                 claims: allowed_claims,
             },
         )
@@ -122,10 +127,10 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // empty claim set is a malformed request rather than a refusal.
     let claimless = inviter
         .publish_grant(
-            x,
-            y,
+            alice,
+            bob,
             &GrantPublication {
-                issuer: x,
+                issuer: alice,
                 claims: Vec::new(),
             },
         )
@@ -142,7 +147,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // secret, so presenting it again is refused — and the inviter records no
     // second connection, which is what says the refusal left no state.
     let refused_replay = replayer
-        .post(&format!("/debug/identities/{z}/establish"), payload)
+        .post(&format!("/debug/identities/{carol}/establish"), payload)
         .await?;
     assert_eq!(
         refused_replay.status,
@@ -152,16 +157,16 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         refused_replay.text()
     );
     let recorded: Connections = inviter
-        .get(&format!("/debug/identities/{x}/connections"))
+        .get(&format!("/debug/identities/{alice}/connections"))
         .await?
         .json()?;
     assert_eq!(
         recorded.connections,
-        vec![y],
+        vec![bob],
         "a refused establishment must leave no connection behind"
     );
     let replayer_recorded: Connections = replayer
-        .get(&format!("/debug/identities/{z}/connections"))
+        .get(&format!("/debug/identities/{carol}/connections"))
         .await?
         .json()?;
     assert!(replayer_recorded.connections.is_empty());
@@ -170,12 +175,12 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // entry, and its write into the same claim is refused because the grant
     // covers it read-only — with the value that was there before still what
     // reads back on both sides.
-    entry_reads(&scanner, x, "contact/email", b"x@example.org")
+    entry_reads(&scanner, alice, "contact/email", b"alice@example.org")
         .await
         .context("the granted entry did not reach the grantee")?;
     let refused_write = scanner
         .put(
-            &format!("/debug/data/{x}/contact/email"),
+            &format!("/debug/data/{alice}/contact/email"),
             body(b"overwrite"),
         )
         .await?;
@@ -187,12 +192,12 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         refused_write.text()
     );
     let grantee_side = scanner
-        .get(&format!("/debug/data/{x}/contact/email"))
+        .get(&format!("/debug/data/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
         grantee_side,
-        Bytes::from_static(b"x@example.org"),
+        Bytes::from_static(b"alice@example.org"),
         "the refused write must not touch the grantee's own replica"
     );
     // Sentinel: a control write to another path proves a completed
@@ -202,28 +207,33 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // or not the bad write was ever going to arrive.
     inviter
         .put(
-            &format!("/debug/data/{x}/contact/sentinel"),
-            body(b"x@new.example.org"),
+            &format!("/debug/data/{alice}/contact/sentinel"),
+            body(b"alice@new.example.org"),
         )
         .await?
         .ok()?;
-    entry_reads(&scanner, x, "contact/sentinel", b"x@new.example.org")
-        .await
-        .context("the sentinel update did not reach the grantee")?;
+    entry_reads(
+        &scanner,
+        alice,
+        "contact/sentinel",
+        b"alice@new.example.org",
+    )
+    .await
+    .context("the sentinel update did not reach the grantee")?;
     let issuer_side = inviter
-        .get(&format!("/debug/data/{x}/contact/email"))
+        .get(&format!("/debug/data/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
         issuer_side,
-        Bytes::from_static(b"x@example.org"),
+        Bytes::from_static(b"alice@example.org"),
         "the refused write must never reach the issuer"
     );
 
     // Denied (an absent entry): 404, the one status reserved for nothing
     // being there — the issuer is hosted, so this is not a refusal.
     let absent = inviter
-        .get(&format!("/debug/data/{x}/contact/phone"))
+        .get(&format!("/debug/data/{alice}/contact/phone"))
         .await?;
     assert_eq!(
         absent.status,
@@ -248,7 +258,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // that is the request being wrong rather than the host not knowing what
     // happened. Beside it, one byte at the same path is accepted.
     let empty = inviter
-        .put(&format!("/debug/data/{x}/contact/note"), body(b""))
+        .put(&format!("/debug/data/{alice}/contact/note"), body(b""))
         .await?;
     assert_eq!(
         empty.status,
@@ -258,7 +268,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         empty.text()
     );
     inviter
-        .put(&format!("/debug/data/{x}/contact/note"), body(b"."))
+        .put(&format!("/debug/data/{alice}/contact/note"), body(b"."))
         .await?
         .ok()?;
 
@@ -267,7 +277,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // spelled parameter is accepted.
     let mistyped = inviter
         .post(
-            &format!("/debug/identities/{x}/invite?lifetime_sec=60"),
+            &format!("/debug/identities/{alice}/invite?lifetime_sec=60"),
             Bytes::new(),
         )
         .await?;
@@ -280,15 +290,12 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     );
     inviter
         .post(
-            &format!("/debug/identities/{x}/invite?lifetime_secs=60"),
+            &format!("/debug/identities/{alice}/invite?lifetime_secs=60"),
             Bytes::new(),
         )
         .await?
         .ok()?;
 
-    replayer.shutdown().await?;
-    scanner.shutdown().await?;
-    inviter.shutdown().await?;
     Ok(())
 }
 
@@ -297,14 +304,16 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
 /// refuses as a conflict rather than a 500 — the runtime knows exactly why
 /// (there is no pair to carry the grant), so the host must say so too.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn publishing_toward_an_unconnected_peer_is_refused_as_a_conflict() -> Result<()> {
-    let inviter = Host::spawn().await?;
-    let bystander = Host::spawn().await?;
-    let x = inviter.create_identity().await?;
-    let never_connected = bystander.create_identity().await?;
+    let stand = Stand::new();
+    let inviter = stand.spawn("inviter").await?;
+    let bystander = stand.spawn("bystander").await?;
+    let alice = inviter.create_identity().await?;
+    let bob = bystander.create_identity().await?;
 
     let refused = inviter
-        .publish_grant(x, never_connected, &grant_on(x, "contact/email", false)?)
+        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false)?)
         .await?;
     assert_eq!(
         refused.status,
@@ -314,13 +323,11 @@ async fn publishing_toward_an_unconnected_peer_is_refused_as_a_conflict() -> Res
         refused.text()
     );
     assert!(
-        refused.text().contains(&never_connected.to_string()),
+        refused.text().contains(&bob.to_string()),
         "the refusal must name the unconnected peer: {}",
         refused.text()
     );
 
-    bystander.shutdown().await?;
-    inviter.shutdown().await?;
     Ok(())
 }
 
@@ -329,13 +336,15 @@ async fn publishing_toward_an_unconnected_peer_is_refused_as_a_conflict() -> Res
 /// identity already hosted right here on the target is refused without
 /// needing a reachable address.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn linking_into_an_already_hosted_identity_is_refused_as_a_conflict() -> Result<()> {
-    let host = Host::spawn().await?;
-    let x = host.create_identity().await?;
+    let stand = Stand::new();
+    let host = stand.spawn("host").await?;
+    let alice = host.create_identity().await?;
 
     let self_invite = host
         .post(
-            &format!("/debug/identities/{x}/linking-invite"),
+            &format!("/debug/identities/{alice}/linking-invite"),
             Bytes::new(),
         )
         .await?
@@ -349,7 +358,6 @@ async fn linking_into_an_already_hosted_identity_is_refused_as_a_conflict() -> R
         already_hosted.text()
     );
 
-    host.shutdown().await?;
     Ok(())
 }
 
@@ -359,21 +367,23 @@ async fn linking_into_an_already_hosted_identity_is_refused_as_a_conflict() -> R
 /// (another link already in flight, or, if the winner finished first,
 /// already hosted) instead of both racing to register the identity twice.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Result<()> {
-    let inviter = Host::spawn().await?;
-    let linker = Host::spawn().await?;
-    let w = inviter.create_identity().await?;
+    let stand = Stand::new();
+    let inviter = stand.spawn("inviter").await?;
+    let linker = stand.spawn("linker").await?;
+    let alice = inviter.create_identity().await?;
 
     let first_invite = inviter
         .post(
-            &format!("/debug/identities/{w}/linking-invite"),
+            &format!("/debug/identities/{alice}/linking-invite"),
             Bytes::new(),
         )
         .await?
         .ok()?;
     let second_invite = inviter
         .post(
-            &format!("/debug/identities/{w}/linking-invite"),
+            &format!("/debug/identities/{alice}/linking-invite"),
             Bytes::new(),
         )
         .await?
@@ -393,13 +403,11 @@ async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Resu
         hosted
             .identities
             .iter()
-            .filter(|identity| **identity == w)
+            .filter(|identity| **identity == alice)
             .count(),
         1,
         "the concurrent loser must not leave duplicate or missing hosted state: {hosted:?}"
     );
 
-    linker.shutdown().await?;
-    inviter.shutdown().await?;
     Ok(())
 }

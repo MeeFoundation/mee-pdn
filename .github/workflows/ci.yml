@@ -37,3 +37,41 @@ jobs:
 
       - name: Run tests
         run: just test
+
+  stand:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The image the scenarios look for, built with a layer cache so a run
+      # pays for the dependency stage once. Built here rather than through
+      # `just test-docker`, which builds without that cache.
+      - name: Build the stand's image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ops/Dockerfile
+          tags: pdn-node-http:dev
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the container scenarios
+        run: cargo nextest run -p pdn-node-http -E 'binary(~stand)' --run-ignored all

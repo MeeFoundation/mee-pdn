@@ -1,42 +1,133 @@
-//! An HTTP client over one host's router — the scenarios' only way to reach
-//! a runtime.
+//! The stand: nodes as containers on one network, reached over their
+//! published HTTP ports.
 //!
-//! The router is driven in process, so no listener and no port are
-//! involved; everything above the socket is the path a container's request
-//! takes. Nothing here calls a runtime service directly: a scenario that
-//! did would prove the service works and leave the surface it claims to
-//! test unexercised.
+//! Each node is its own process in its own container, and the only thing
+//! that crosses between a test and a node is HTTP. Between nodes nothing
+//! HTTP travels: a container is never told another container's address, and
+//! establishment, linking and replication run over the runtimes' own
+//! protocols on the container network.
+//!
+//! Nothing here calls a runtime service directly — a test that did would
+//! prove the service works and leave the surface it claims to test
+//! unexercised. The one property this arrangement cannot reach is a runtime
+//! held from inside its own process; that test builds its own runtime and
+//! does not come through here.
+//!
+//! The image is not built here. `just test-docker` builds it first, and a
+//! test that finds it missing says so rather than running against a stale
+//! one silently.
 // Each test binary includes this module and uses its own subset of the
 // helpers; what one binary leaves unused is not dead code of the crate.
 #![allow(dead_code)]
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use anyhow::{ensure, Context as _, Result};
-use axum::{
-    body::{Body, Bytes},
-    http::{Request, StatusCode},
-    Router,
-};
-use pdn_node::{PdnId, Runtime, SpawnOptions};
-use pdn_node_http::{
-    router,
-    shapes::{CreatedIdentity, GrantPublication},
-};
+use axum::{body::Bytes, http::StatusCode};
+use pdn_node::PdnId;
+use pdn_node_http::shapes::{CreatedIdentity, GrantPublication};
 use serde::de::DeserializeOwned;
-use tower::ServiceExt as _;
+use testcontainers::{
+    core::{ContainerPort, WaitFor},
+    runners::AsyncRunner as _,
+    ContainerAsync, GenericImage, ImageExt as _,
+};
 
-/// The reconcile cadence these scenarios inject. Convergence is waited for
-/// by repeating a read — the only means the surface offers — and a
-/// sub-second cadence keeps that wait short.
-pub const RECONCILE: Duration = Duration::from_millis(500);
+/// The image `just test-docker` builds.
+pub const IMAGE_NAME: &str = "pdn-node-http";
+pub const IMAGE_TAG: &str = "dev";
 
-/// Ceiling on one poll. Generous, since a poll returns the moment its
-/// condition holds; finite, so a real non-convergence fails with a named
-/// assertion in tens of seconds instead of hanging.
-pub const TIMEOUT: Duration = Duration::from_secs(30);
+/// The port the image serves on, published to the test host by the container
+/// runtime. The runtime's own endpoint port is never published: everything
+/// between nodes stays on the container network.
+const HTTP_PORT: ContainerPort = ContainerPort::Tcp(3011);
 
-/// One answer from the surface: what a container-level assertion sees.
+/// How long a node has to answer `/live` after its container starts.
+const READY_BUDGET: Duration = Duration::from_secs(60);
+const READY_POLL: Duration = Duration::from_millis(250);
+
+/// How long a wait for convergence may take. Wide enough to cover several of
+/// the runtime's own reconciliation periods, since nothing here shortens that
+/// cadence and a lost dial is retried by the periodic pass.
+pub const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
+
+/// How much of a node's log a failing wait carries into its error.
+const LOG_TAIL_BYTES: usize = 4 * 1024;
+
+/// One test's container network. Every node of the test joins it, and it
+/// exists only for that test: a container left behind by a failed run cannot
+/// be dialed by the next one, where an isolation defect would read as a
+/// pass. The network is created with the first node and removed with the
+/// last, by the container client itself.
+pub struct Stand {
+    network: String,
+}
+
+impl Stand {
+    /// A network of this test's own. The name carries the process id, so
+    /// tests running side by side under the test runner — a process each —
+    /// never share one.
+    pub fn new() -> Self {
+        static STANDS: AtomicUsize = AtomicUsize::new(0);
+        let ordinal = STANDS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            network: format!("pdn-stand-{}-{ordinal}", std::process::id()),
+        }
+    }
+
+    /// Start a node with the debug surface on, and wait until it answers
+    /// liveness.
+    pub async fn spawn(&self, label: &str) -> Result<Host> {
+        self.spawn_with_debug(label, true).await
+    }
+
+    /// Start a node with the debug surface off — the gate's other side, and
+    /// the image's own default.
+    pub async fn spawn_without_debug(&self, label: &str) -> Result<Host> {
+        self.spawn_with_debug(label, false).await
+    }
+
+    async fn spawn_with_debug(&self, label: &str, debug: bool) -> Result<Host> {
+        let mut image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+            .with_exposed_port(HTTP_PORT)
+            .with_wait_for(WaitFor::Nothing)
+            // The environment is stated, never inherited: a bind value
+            // meant for a node in a test's own process would have this one
+            // publish an address no other container can reach. The runtime's
+            // endpoint bind stays unset, so the endpoint binds every
+            // interface and publishes the container's own address.
+            .with_env_var("RUST_LOG", "info,pdn_node=debug,data_layer=debug")
+            .with_network(&self.network)
+            .with_container_name(format!("{}-{label}", self.network));
+        if debug {
+            image = image.with_env_var("PDN_DEBUG", "1");
+        }
+        let container = image
+            .start()
+            .await
+            .with_context(|| format!("starting {label}: is {IMAGE_NAME}:{IMAGE_TAG} built?"))?;
+        let host = Host {
+            label: label.to_owned(),
+            base: base_url(&container).await?,
+            client: reqwest::Client::new(),
+            container,
+        };
+        host.wait_live().await?;
+        Ok(host)
+    }
+}
+
+impl Default for Stand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One answer from the surface: what an assertion sees.
 pub struct Answer {
     pub status: StatusCode,
     pub body: Bytes,
@@ -69,42 +160,29 @@ impl Answer {
     }
 }
 
-/// One host: a runtime with the debug surface mounted over it.
+/// One node of the stand: a container and the client that reaches it.
 pub struct Host {
-    runtime: Arc<Runtime>,
-    app: Router,
+    label: String,
+    base: String,
+    client: reqwest::Client,
+    container: ContainerAsync<GenericImage>,
 }
 
 impl Host {
-    /// Spawn a host with the debug surface on — the flag's other side is
-    /// asserted by the gate test.
-    pub async fn spawn() -> Result<Self> {
-        let runtime = Arc::new(
-            Runtime::spawn_with(SpawnOptions {
-                reconcile_interval: RECONCILE,
-            })
-            .await?,
-        );
-        let app = router(Arc::clone(&runtime), true);
-        Ok(Self { runtime, app })
-    }
-
     pub async fn get(&self, path: &str) -> Result<Answer> {
-        self.send(Request::get(path).body(Body::empty())?).await
+        self.request(Method::Get, path, Bytes::new()).await
     }
 
     pub async fn post(&self, path: &str, body: impl Into<Bytes>) -> Result<Answer> {
-        self.send(Request::post(path).body(Body::from(body.into()))?)
-            .await
+        self.request(Method::Post, path, body.into()).await
     }
 
     pub async fn put(&self, path: &str, body: impl Into<Bytes>) -> Result<Answer> {
-        self.send(Request::put(path).body(Body::from(body.into()))?)
-            .await
+        self.request(Method::Put, path, body.into()).await
     }
 
     pub async fn delete(&self, path: &str) -> Result<Answer> {
-        self.send(Request::delete(path).body(Body::empty())?).await
+        self.request(Method::Delete, path, Bytes::new()).await
     }
 
     /// Create an identity here and hand back what the surface named.
@@ -128,44 +206,120 @@ impl Host {
         .await
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
-        self.runtime.shutdown().await
+    /// Stop this node — the process ends and, with storage in memory, its
+    /// state ends with it. Nothing restarts a stopped node: a restarted
+    /// container is a different node with a new node id.
+    pub async fn stop(&self) -> Result<()> {
+        self.container
+            .stop()
+            .await
+            .with_context(|| format!("stopping {}", self.label))
     }
 
-    async fn send(&self, request: Request<Body>) -> Result<Answer> {
-        let response = self.app.clone().oneshot(request).await?;
-        let status = response.status();
-        let body = axum::body::to_bytes(
-            response.into_body(),
-            pdn_node_http::MAX_REQUEST_BODY_BYTES + 1024 * 1024,
-        )
-        .await?;
+    /// Whether this node's process is still running, as the daemon sees it.
+    ///
+    /// Asked of the daemon rather than of the network: a stopped container's
+    /// published port is released, and the next container to start can be
+    /// given it, so a request to the address this node used can be answered
+    /// by a live node of another test.
+    pub async fn is_running(&self) -> Result<bool> {
+        self.container
+            .is_running()
+            .await
+            .with_context(|| format!("asking whether {} still runs", self.label))
+    }
+
+    /// The tail of this node's log, for a wait that ran out of budget: the
+    /// answer alone says the value never arrived, and the log says what the
+    /// node was doing instead.
+    pub async fn diagnostics(&self) -> String {
+        let mut out = Vec::new();
+        for stream in [
+            self.container.stdout_to_vec().await,
+            self.container.stderr_to_vec().await,
+        ] {
+            match stream {
+                Ok(bytes) => out.extend_from_slice(&bytes),
+                Err(err) => return format!("[{}] log unavailable: {err}", self.label),
+            }
+        }
+        let tail = out.len().saturating_sub(LOG_TAIL_BYTES);
+        let text = String::from_utf8_lossy(out.get(tail..).unwrap_or(&out)).into_owned();
+        format!("[{}] last {} bytes of log:\n{text}", self.label, text.len())
+    }
+
+    /// Send one request to this node's surface.
+    pub async fn request(&self, method: Method, path: &str, body: Bytes) -> Result<Answer> {
+        let method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+        let response = self
+            .client
+            .request(method, format!("{}{path}", self.base))
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("{} did not answer {path}", self.label))?;
+        let status = StatusCode::from_u16(response.status().as_u16())?;
+        let body = response.bytes().await?;
         Ok(Answer { status, body })
+    }
+
+    async fn wait_live(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + READY_BUDGET;
+        loop {
+            if let Ok(answer) = self.request(Method::Get, "/live", Bytes::new()).await {
+                if answer.status == StatusCode::OK {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow::anyhow!(
+                    "{} never answered /live within {READY_BUDGET:?}\n{}",
+                    self.label,
+                    self.diagnostics().await
+                ));
+            }
+            tokio::time::sleep(READY_POLL).await;
+        }
     }
 }
 
-impl Drop for Host {
-    /// A best-effort net for the panic or early-`?`-return path, not a
-    /// guarantee: `Drop` is synchronous and shutdown is not, so this spawns
-    /// a detached task that may never get polled if the test's own runtime
-    /// tears down first — which is exactly what happens when the process
-    /// itself is exiting. It works in practice under `cargo-nextest`
-    /// because each test runs in its own process and the OS reclaims the
-    /// endpoint and every task a hosted identity spawned at exit either
-    /// way; a shared-process test runner (bare `cargo test`, several tests
-    /// per binary) would leak for real. Harmless to run twice regardless,
-    /// since `Runtime::shutdown` needs no exclusive ownership and is
-    /// idempotent — prefer the explicit `shutdown().await` on every test's
-    /// own exit path over relying on this.
-    fn drop(&mut self) {
-        let runtime = Arc::clone(&self.runtime);
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
-            let _ = runtime.shutdown().await;
-        });
+/// The verbs the surface answers to.
+#[derive(Clone, Copy)]
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+impl Method {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+        }
     }
+}
+
+/// Where a test reaches a container. The address comes from the container
+/// client's own host resolution rather than an assumed loopback, because the
+/// two are not always the same host: a suite run inside the development
+/// container talks to a sibling container on the host's daemon, and that
+/// sibling's published port is on the host's loopback, not on the
+/// development container's. The client reads `TESTCONTAINERS_HOST_OVERRIDE`
+/// for exactly that case; from the host itself nothing needs setting.
+async fn base_url(container: &ContainerAsync<GenericImage>) -> Result<String> {
+    let host = container.get_host().await?.to_string();
+    let port = container.get_host_port_ipv4(HTTP_PORT).await?;
+    // A bare IPv6 address needs brackets before it can carry a port.
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!("http://{host}:{port}"))
 }
 
 /// The claim set covering exactly `path` of `issuer`'s namespace — read
@@ -191,16 +345,15 @@ pub fn body(payload: &[u8]) -> Bytes {
     Bytes::copy_from_slice(payload)
 }
 
-/// Poll `check` every 100ms until it holds or [`TIMEOUT`] elapses; the
-/// return says whether it was observed in time. Repeating the read is the
-/// only wait the surface offers, by design — nothing here forces a
-/// reconciliation.
-pub async fn eventually<F, Fut>(mut check: F) -> Result<bool>
+/// Poll `check` every 100ms until it holds or `budget` elapses; the return
+/// says whether it was observed in time. Repeating the read is the only wait
+/// the surface offers, by design — nothing here forces a reconciliation.
+pub async fn eventually<F, Fut>(budget: Duration, mut check: F) -> Result<bool>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let deadline = std::time::Instant::now() + budget;
     loop {
         if check().await? {
             return Ok(true);
@@ -244,15 +397,8 @@ async fn poll_read(
     path: &str,
     holds: impl Fn(&Answer) -> bool,
 ) -> Result<()> {
-    let encoded = path
-        .split('/')
-        .map(|component| {
-            percent_encoding::utf8_percent_encode(component, percent_encoding::NON_ALPHANUMERIC)
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let encoded = encode_path(path);
+    let deadline = std::time::Instant::now() + CONVERGENCE_BUDGET;
     loop {
         let answer = host.get(&format!("/debug/data/{issuer}/{encoded}")).await?;
         if holds(&answer) {
@@ -267,4 +413,16 @@ async fn poll_read(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// An entry path as a URL path: every component percent-encoded, the
+/// separators kept.
+pub fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(|component| {
+            percent_encoding::utf8_percent_encode(component, percent_encoding::NON_ALPHANUMERIC)
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }

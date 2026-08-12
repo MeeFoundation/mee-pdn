@@ -1,0 +1,23 @@
+# What the build context actually carries. This image is not part of the
+# stand: `just check-context` builds and runs it, and its listing is read
+# against the allowed set in `.dockerignore`.
+#
+# The criterion is presence. Anything outside the allowed set is a leak
+# whatever it weighs — a private note weighs nothing and matters more than a
+# large directory the list already excludes. `-a` lists dotfiles, which is
+# where the repository directories, the environment files and the cargo
+# configuration live, so without it the check hides exactly what it exists to
+# find; `--du -h` accumulates sizes in the same pass, so an expensive leak is
+# visible as one too.
+#
+# The builder reads the ignore file named after the Dockerfile it builds —
+# `Dockerfile.context.dockerignore` here — and the context root's
+# `.dockerignore` when there is none. That fallback is what makes this check
+# read the same list the stand's image builds under. Give the stand's image
+# its own ignore file and this check keeps reading the root one, checking a
+# list nothing builds under.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y tree && rm -rf /var/lib/apt/lists/*
+WORKDIR /context
+COPY . .
+CMD ["tree", "-a", "--du", "-h"]

@@ -21,6 +21,10 @@ tracing-subscriber = "0.3"
 [dev-dependencies]
 pdn-node = { path = "../pdn-node", features = ["test-util"] }
 percent-encoding = "2"
+# The stand's transport: a client over a container's published port. No TLS
+# backend — the stand speaks plain HTTP to loopback and nothing else.
+reqwest = { version = "0.12", default-features = false }
+testcontainers = "0.26"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

@@ -1,0 +1,13 @@
+# One node of the stand is a container, and one test starts three or four
+# of them. Left to the default, the runner schedules a test per core of
+# *this* machine while the container daemon runs on a fixed share of it, so a
+# run wide enough saturates the daemon and a node then misses its readiness
+# budget — a failure that says nothing about the product. The group below
+# bounds the stand's scenarios to what the daemon can start at once;
+# everything else keeps the default, since an in-process node costs a task.
+[test-groups]
+stand = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'binary(~stand)'
+test-group = 'stand'
