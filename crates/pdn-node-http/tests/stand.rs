@@ -18,10 +18,14 @@
 
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node_http::shapes::{Connections, Entries, GrantCapability, HostedIdentities, PeerGrants};
+use pdn_node_http::shapes::{
+    Connections, Entries, GrantCapability, GrantPublication, HostedIdentities, PeerGrants,
+};
 
 mod common;
-use common::{body, entry_answers, entry_reads, eventually, grant_on, Stand, CONVERGENCE_BUDGET};
+use common::{
+    body, claims_on, entry_answers, entry_reads, eventually, grant_on, Stand, CONVERGENCE_BUDGET,
+};
 
 /// The whole stand scenario with its paired denials: two identities meet,
 /// one grants a subset of its data, the grantee reads exactly that subset,
@@ -437,5 +441,289 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
         refused.status,
         refused.text()
     );
+    Ok(())
+}
+
+/// A grant that names a claim writable lets the grantee write there, and the
+/// write reaches the issuer: the granted peer is a writer of that claim, not
+/// only a reader of it.
+///
+/// The write set is per claim, which is what the paired denial holds the
+/// grant to. The same publication names a second path read-only, and the
+/// grantee's write there is refused — the tightest unauthorized party for a
+/// write is not an outsider but this very peer, one claim over. The refusal
+/// is ordered against a later replication wave, so "the issuer never saw it"
+/// says the write was rejected rather than that it had not arrived yet.
+///
+/// What that refusal proves is the courtesy check on the grantee's own side
+/// (`write_refusal`, the sole caller of `covers_write`): the write never
+/// leaves. The issuer's gate — `admit_ingest`, which derives its write set
+/// independently — is the enforcement, and no test here reaches it, because
+/// the courtesy always answers first and the bypass that skips it is a
+/// runtime feature this surface does not expose.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+#[allow(clippy::too_many_lines)] // one write grant, with its denial in the same place
+async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
+    let stand = Stand::new();
+    let issuer = stand.spawn("issuer").await?;
+    let grantee = stand.spawn("grantee").await?;
+
+    let alice = issuer.create_identity().await?;
+    let bob = grantee.create_identity().await?;
+
+    let payload = issuer
+        .post(
+            &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
+            Bytes::new(),
+        )
+        .await?
+        .ok()?;
+    grantee
+        .post(&format!("/debug/identities/{bob}/establish"), payload)
+        .await?
+        .ok()?;
+
+    // Alice's data: the claim the grant makes writable, and one it keeps
+    // read-only.
+    issuer
+        .put(
+            &format!("/debug/data/{alice}/contact/phone"),
+            body(b"+1-555-0100"),
+        )
+        .await?
+        .ok()?;
+    issuer
+        .put(
+            &format!("/debug/data/{alice}/contact/email"),
+            body(b"alice@example.org"),
+        )
+        .await?
+        .ok()?;
+
+    // One publication, two claims, one of them writable.
+    let mut claims = claims_on(alice, "contact/phone", true)?;
+    claims.extend(claims_on(alice, "contact/email", false)?);
+    issuer
+        .publish_grant(
+            alice,
+            bob,
+            &GrantPublication {
+                issuer: alice,
+                claims,
+            },
+        )
+        .await?
+        .ok()?;
+
+    // The grantee holding the value is the precondition of writing over it:
+    // it says the grant arrived and the namespace is bound here.
+    entry_reads(&grantee, alice, "contact/phone", b"+1-555-0100")
+        .await
+        .context("the granted entry did not reach the grantee")?;
+
+    // Allowed: the grantee writes the claim the grant made writable, and the
+    // value reads back on both sides — on the issuer's, which is what says
+    // the write crossed rather than stopping in the grantee's own replica.
+    grantee
+        .put(
+            &format!("/debug/data/{alice}/contact/phone"),
+            body(b"+1-555-0199"),
+        )
+        .await?
+        .ok()?;
+    entry_reads(&grantee, alice, "contact/phone", b"+1-555-0199")
+        .await
+        .context("the grantee's own write did not read back on the grantee")?;
+    entry_reads(&issuer, alice, "contact/phone", b"+1-555-0199")
+        .await
+        .context("the grantee's write never reached the issuer")?;
+
+    // Denied (one claim over): the same peer, under the same publication,
+    // writing the claim that publication kept read-only.
+    let refused = grantee
+        .put(
+            &format!("/debug/data/{alice}/contact/email"),
+            body(b"bob@example.org"),
+        )
+        .await?;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "a write outside the grant's write set must be refused, got {}: {}",
+        refused.status,
+        refused.text()
+    );
+
+    // Sentinel: a write on the granted claim, observed arriving, proves a
+    // completed session ran after the refusal — without it the issuer-side
+    // read below would pass whether or not the refused write was ever going
+    // to arrive.
+    issuer
+        .put(
+            &format!("/debug/data/{alice}/contact/phone"),
+            body(b"+1-555-0300"),
+        )
+        .await?
+        .ok()?;
+    entry_reads(&grantee, alice, "contact/phone", b"+1-555-0300")
+        .await
+        .context("the sentinel did not reach the grantee")?;
+
+    let issuer_side = issuer
+        .get(&format!("/debug/data/{alice}/contact/email"))
+        .await?
+        .ok()?;
+    assert_eq!(
+        issuer_side,
+        Bytes::from_static(b"alice@example.org"),
+        "the refused write must never reach the issuer"
+    );
+    let grantee_side = grantee
+        .get(&format!("/debug/data/{alice}/contact/email"))
+        .await?
+        .ok()?;
+    assert_eq!(
+        grantee_side,
+        Bytes::from_static(b"alice@example.org"),
+        "the refused write must not touch the grantee's own replica"
+    );
+    Ok(())
+}
+
+/// Two personas of one person on one node, each with an audience of its own:
+/// Alice at work is known to Bob, Alice at leisure to Carol, and both
+/// connections carry data.
+///
+/// The node hosts both identities, which is the one arrangement the rest of
+/// this suite never builds — every other test puts one identity on one
+/// container. What it holds is that sharing a process is not sharing an
+/// audience: connections and grants are keyed by the hosting identity, so
+/// Bob is a peer of the work persona and a stranger to the leisure one.
+///
+/// The paired denials are read from the peers' side on purpose. There each
+/// node hosts a single identity, so "Bob asks for the leisure namespace" is
+/// an unambiguous question; asked on Alice's own node it would not be, since
+/// the read names the namespace and never the reader. Both denials are
+/// ordered after both positive reads, so an absence cannot pass for a value
+/// that has not replicated yet.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+#[allow(clippy::too_many_lines)] // two personas and two audiences, kept in one place
+async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
+    let stand = Stand::new();
+    let alice_node = stand.spawn("alice").await?;
+    let bob_node = stand.spawn("bob").await?;
+    let carol_node = stand.spawn("carol").await?;
+
+    // One node, two identities.
+    let at_work = alice_node.create_identity().await?;
+    let at_leisure = alice_node.create_identity().await?;
+    assert_ne!(at_work, at_leisure);
+    let hosted: HostedIdentities = alice_node.get("/debug/identities").await?.json()?;
+    assert!(
+        hosted.identities.contains(&at_work) && hosted.identities.contains(&at_leisure),
+        "the node must report both personas: {hosted:?}"
+    );
+
+    let bob = bob_node.create_identity().await?;
+    let carol = carol_node.create_identity().await?;
+
+    // Each persona meets its own peer.
+    for (persona, peer_node, peer) in [(at_work, &bob_node, bob), (at_leisure, &carol_node, carol)]
+    {
+        let payload = alice_node
+            .post(
+                &format!("/debug/identities/{persona}/invite?lifetime_secs=120"),
+                Bytes::new(),
+            )
+            .await?
+            .ok()?;
+        peer_node
+            .post(&format!("/debug/identities/{peer}/establish"), payload)
+            .await?
+            .ok()?;
+    }
+
+    // The same path under each persona, holding different data — so a read
+    // that reached the wrong namespace would answer the wrong bytes rather
+    // than nothing.
+    alice_node
+        .put(
+            &format!("/debug/data/{at_work}/contact/email"),
+            body(b"alice@acme.example"),
+        )
+        .await?
+        .ok()?;
+    alice_node
+        .put(
+            &format!("/debug/data/{at_leisure}/contact/email"),
+            body(b"alice@bridgeclub.example"),
+        )
+        .await?
+        .ok()?;
+
+    alice_node
+        .publish_grant(at_work, bob, &grant_on(at_work, "contact/email", false)?)
+        .await?
+        .ok()?;
+    alice_node
+        .publish_grant(
+            at_leisure,
+            carol,
+            &grant_on(at_leisure, "contact/email", false)?,
+        )
+        .await?
+        .ok()?;
+
+    // Allowed, both ways: each peer reads its own persona's data.
+    entry_reads(&bob_node, at_work, "contact/email", b"alice@acme.example")
+        .await
+        .context("Bob did not read the work persona's entry")?;
+    entry_reads(
+        &carol_node,
+        at_leisure,
+        "contact/email",
+        b"alice@bridgeclub.example",
+    )
+    .await
+    .context("Carol did not read the leisure persona's entry")?;
+
+    // Each persona's connections carry its own peer and not the other's —
+    // read on Alice's node, where the route names which persona is asked.
+    let work_side: Connections = alice_node
+        .get(&format!("/debug/identities/{at_work}/connections"))
+        .await?
+        .json()?;
+    assert!(
+        work_side.connections.contains(&bob) && !work_side.connections.contains(&carol),
+        "the work persona knows Bob and not Carol: {work_side:?}"
+    );
+    let leisure_side: Connections = alice_node
+        .get(&format!("/debug/identities/{at_leisure}/connections"))
+        .await?
+        .json()?;
+    assert!(
+        leisure_side.connections.contains(&carol) && !leisure_side.connections.contains(&bob),
+        "the leisure persona knows Carol and not Bob: {leisure_side:?}"
+    );
+
+    // Denied, both ways: a peer of one persona is a stranger to the other,
+    // and is refused as unknown rather than answered as absent.
+    for (peer_node, other_persona, who) in [
+        (&bob_node, at_leisure, "Bob"),
+        (&carol_node, at_work, "Carol"),
+    ] {
+        let refused = peer_node
+            .get(&format!("/debug/data/{other_persona}/contact/email"))
+            .await?;
+        assert_eq!(
+            refused.status,
+            StatusCode::CONFLICT,
+            "{who} must be refused the other persona's namespace, got {}: {}",
+            refused.status,
+            refused.text()
+        );
+    }
     Ok(())
 }
