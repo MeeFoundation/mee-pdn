@@ -21,6 +21,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let runtime = Arc::new(Runtime::spawn().await?);
+    // The two startup markers below bracket the only silent stretch of a
+    // node's life. Without them a node stuck in `Runtime::spawn` and one
+    // serving happily but unreachable leave byte-identical logs, and the
+    // difference between them is the difference between a defect here and a
+    // defect in whatever publishes the port.
+    tracing::info!("runtime spawned");
     let result = run(&runtime).await;
     // Always runs, on every outcome of `run` above, `?`-early-returns
     // included: skipping it leaves the endpoint and every task a hosted
@@ -47,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run(runtime: &Arc<Runtime>) -> anyhow::Result<()> {
     let app = router(Arc::clone(runtime), debug_enabled_from_env()?);
     let listener = tokio::net::TcpListener::bind(bind_addr_from_env()?).await?;
+    tracing::info!(addr = ?listener.local_addr()?, "HTTP listening");
 
     // The drain budget starts counting only once a stop signal actually
     // arrives — `stopped` stays pending, and `serve` runs unbounded, for as

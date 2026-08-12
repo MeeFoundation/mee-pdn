@@ -110,14 +110,14 @@ impl Stand {
             .start()
             .await
             .with_context(|| format!("starting {label}: is {IMAGE_NAME}:{IMAGE_TAG} built?"))?;
-        let host = Host {
+        let client = reqwest::Client::new();
+        let base = wait_live(&container, label, &client).await?;
+        Ok(Host {
             label: label.to_owned(),
-            base: base_url(&container).await?,
-            client: reqwest::Client::new(),
+            base,
+            client,
             container,
-        };
-        host.wait_live().await?;
-        Ok(host)
+        })
     }
 }
 
@@ -233,19 +233,7 @@ impl Host {
     /// answer alone says the value never arrived, and the log says what the
     /// node was doing instead.
     pub async fn diagnostics(&self) -> String {
-        let mut out = Vec::new();
-        for stream in [
-            self.container.stdout_to_vec().await,
-            self.container.stderr_to_vec().await,
-        ] {
-            match stream {
-                Ok(bytes) => out.extend_from_slice(&bytes),
-                Err(err) => return format!("[{}] log unavailable: {err}", self.label),
-            }
-        }
-        let tail = out.len().saturating_sub(LOG_TAIL_BYTES);
-        let text = String::from_utf8_lossy(out.get(tail..).unwrap_or(&out)).into_owned();
-        format!("[{}] last {} bytes of log:\n{text}", self.label, text.len())
+        log_tail(&self.container, &self.label).await
     }
 
     /// Send one request to this node's surface.
@@ -262,24 +250,62 @@ impl Host {
         let body = response.bytes().await?;
         Ok(Answer { status, body })
     }
+}
 
-    async fn wait_live(&self) -> Result<()> {
-        let deadline = std::time::Instant::now() + READY_BUDGET;
-        loop {
-            if let Ok(answer) = self.request(Method::Get, "/live", Bytes::new()).await {
-                if answer.status == StatusCode::OK {
-                    return Ok(());
-                }
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(anyhow::anyhow!(
-                    "{} never answered /live within {READY_BUDGET:?}\n{}",
-                    self.label,
-                    self.diagnostics().await
-                ));
-            }
-            tokio::time::sleep(READY_POLL).await;
+/// The tail of a container's log, for a wait that ran out of budget: the
+/// answer alone says the value never arrived, and the log says what the node
+/// was doing instead.
+async fn log_tail(container: &ContainerAsync<GenericImage>, label: &str) -> String {
+    let mut out = Vec::new();
+    for stream in [
+        container.stdout_to_vec().await,
+        container.stderr_to_vec().await,
+    ] {
+        match stream {
+            Ok(bytes) => out.extend_from_slice(&bytes),
+            Err(err) => return format!("[{label}] log unavailable: {err}"),
         }
+    }
+    let tail = out.len().saturating_sub(LOG_TAIL_BYTES);
+    let text = String::from_utf8_lossy(out.get(tail..).unwrap_or(&out)).into_owned();
+    format!("[{label}] last {} bytes of log:\n{text}", text.len())
+}
+
+/// Wait until this node answers liveness, and hand back the address that
+/// answered.
+///
+/// The address is resolved on every attempt rather than once before the
+/// loop. What the daemon reports at start is not always the mapping that
+/// ends up serving, and an address fixed before the first probe leaves the
+/// wait dialing a dead port for the whole budget with no way back — a node
+/// that came up in under a millisecond then reads as one that never came up
+/// at all. The failure names both addresses, so a mapping that moved is
+/// visible in the error instead of having to be guessed at.
+async fn wait_live(
+    container: &ContainerAsync<GenericImage>,
+    label: &str,
+    client: &reqwest::Client,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + READY_BUDGET;
+    let first = base_url(container).await?;
+    loop {
+        let base = base_url(container).await.unwrap_or_else(|_| first.clone());
+        if let Ok(response) = client.get(format!("{base}/live")).send().await {
+            if response.status().as_u16() == StatusCode::OK.as_u16() {
+                return Ok(base);
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            let now = base_url(container)
+                .await
+                .unwrap_or_else(|err| format!("<unresolvable: {err}>"));
+            return Err(anyhow::anyhow!(
+                "{label} never answered /live within {READY_BUDGET:?} \
+                 (first dialed {first}, now resolves to {now})\n{}",
+                log_tail(container, label).await
+            ));
+        }
+        tokio::time::sleep(READY_POLL).await;
     }
 }
 
