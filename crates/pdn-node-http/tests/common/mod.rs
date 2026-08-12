@@ -306,10 +306,16 @@ impl Method {
 /// Where a test reaches a container. The address comes from the container
 /// client's own host resolution rather than an assumed loopback, because the
 /// two are not always the same host: a suite run inside the development
-/// container talks to a sibling container on the host's daemon, and that
-/// sibling's published port is on the host's loopback, not on the
-/// development container's. The client reads `TESTCONTAINERS_HOST_OVERRIDE`
-/// for exactly that case; from the host itself nothing needs setting.
+/// container talks to a sibling on the host's daemon, whose published port is
+/// on the host, not on the development container.
+///
+/// The client resolves this itself, with nothing set by hand: over a socket
+/// it answers loopback, unless it finds itself inside a container, and then
+/// it answers the gateway of the daemon's `bridge` network — the host's
+/// address on that bridge. That address carries the sibling's port only
+/// because the daemon publishes it on every interface, so narrowing the
+/// daemon's default publish address to loopback would cut the path from the
+/// development container while leaving the one from the host intact.
 async fn base_url(container: &ContainerAsync<GenericImage>) -> Result<String> {
     let host = container.get_host().await?.to_string();
     let port = container.get_host_port_ipv4(HTTP_PORT).await?;

@@ -83,13 +83,20 @@ check-context:
   docker run --rm pdn-context-check:dev
 
 # Run one node by hand: debug surface on, HTTP port published. PORT overrides
-# the published port.
+# the published port, BIND the interface it is published on.
+#
+# BIND defaults to loopback because the surface this publishes is
+# unauthenticated and mints live ceremony secrets: the host binds every
+# interface inside the container, and without an address here the daemon
+# would carry that to every interface of the machine. A node reachable from
+# another machine is asked for explicitly — `BIND=0.0.0.0 just run-image`.
 [doc("Run one stand node in the foreground")]
 run-image:
   #!/bin/sh
   set -eux
   PORT=${PORT:-3011}
-  docker run --rm -e PDN_DEBUG=1 -p ${PORT}:3011 {{ image }}
+  BIND=${BIND:-127.0.0.1}
+  docker run --rm -e PDN_DEBUG=1 -p ${BIND}:${PORT}:3011 {{ image }}
 
 # The stand: build the image, then run the container scenarios against it.
 # Extra args are forwarded to `cargo nextest run`.
