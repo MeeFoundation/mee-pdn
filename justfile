@@ -119,9 +119,11 @@ stand-profile:
 # Extra args are forwarded to `cargo nextest run`.
 #
 # Deliberately outside `just test` and outside the flaky hunt's default
-# selection: it needs the image built first, and it waits on convergence at
-# the runtime's own cadence, so it runs in minutes where the in-process suite
-# runs in seconds. Needs a container daemon.
+# selection, for two reasons that do not depend on how long the scenarios
+# take: the image has to be built first, or a run tests whatever image is
+# lying around, and the flaky hunt selects the integration binaries by
+# default, which would put a container binary into every stress run. Needs a
+# container daemon.
 [doc("Build the image and run the container scenarios (needs docker)")]
 test-docker *args:
   #!/bin/sh

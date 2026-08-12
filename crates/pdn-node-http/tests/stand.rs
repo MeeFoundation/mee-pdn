@@ -607,6 +607,18 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
 /// the read names the namespace and never the reader. Both denials are
 /// ordered after both positive reads, so an absence cannot pass for a value
 /// that has not replicated yet.
+///
+/// What no test here asserts is the other half of co-location: that one
+/// persona cannot read the other's data on the node they share. The
+/// principal every enforcement point names is the device — a serving node
+/// resolves a caller's rights from its transport-authenticated node id
+/// through the published device sets, the ingest gate keys write admission
+/// by namespace and node id, and a namespace secret is a bearer ticket
+/// scoped to neither persona. A device publishing one node id in two device
+/// sets therefore resolves to both, and its rights are the union by design.
+/// An assertion here would name a boundary that no layer draws, and the
+/// surface it would be written against — a read that names the namespace and
+/// never the reader — is the shape of that same fact, not its cause.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // two personas and two audiences, kept in one place
