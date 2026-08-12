@@ -319,9 +319,16 @@ async fn a_device_joins_across_containers() -> Result<()> {
 /// The property is that the issuer's whole device set is reachable, not only
 /// the publishing one, and this is the only place it is proven across
 /// processes: a contact derived from a device record carries an endpoint id
-/// alone, and whether that resolves is a question about a real network. A
-/// failure to converge after the stop is not answered by a longer budget —
-/// it says device records must carry addresses, which is a change of its own.
+/// alone, and whether that resolves is a question about a real network.
+///
+/// A failure to converge after the stop is not answered by a longer budget,
+/// and two causes produce it — told apart before either is acted on. One:
+/// a device record carries an endpoint id alone, so a contact derived from
+/// it does not resolve, which is a change of its own. Two: the sibling does
+/// not hold the grant yet when the publisher stops. Nothing between the
+/// publication and the stop asserts the second — the wait there is the
+/// audience's read, and the audience and the sibling receive that record by
+/// separate paths from the publisher.
 ///
 /// The denial beside it: the failover must not widen access. A node that
 /// never connected to the issuer is still refused afterwards, so "the peer
