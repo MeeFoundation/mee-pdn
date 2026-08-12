@@ -96,7 +96,7 @@ run-image:
   set -eux
   PORT=${PORT:-3011}
   BIND=${BIND:-127.0.0.1}
-  docker run --rm -e PDN_DEBUG=1 -p ${BIND}:${PORT}:3011 {{ image }}
+  docker run --rm -e PDN_DEBUG=1 -p "${BIND}:${PORT}:3011" {{ image }}
 
 # The nextest profile bounding the stand's parallelism, chosen from what the
 # container daemon reports about itself rather than from this machine's

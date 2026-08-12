@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: ["**"]
 
+# The image build is the expensive step, and a series of pushes would run
+# several of them side by side for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository; the container job additionally
+# reaches a layer cache, which needs no repository scope of its own.
+permissions:
+  contents: read
+
 jobs:
   lint-test-wasm:
     runs-on: ubuntu-latest
@@ -40,6 +51,9 @@ jobs:
 
   stand:
     runs-on: ubuntu-latest
+    # A release image build plus the container suite. Past this the job is
+    # stuck rather than slow, and the runner's own ceiling is six hours.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4

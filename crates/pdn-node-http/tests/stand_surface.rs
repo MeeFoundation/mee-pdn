@@ -53,7 +53,7 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
         assert_eq!(
             answer.status,
             StatusCode::NOT_FOUND,
-            "{path} must be absent without the flag"
+            "{method:?} {path} must be absent without the flag"
         );
     }
     Ok(())
@@ -77,7 +77,7 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
         assert_ne!(
             answer.status,
             StatusCode::NOT_FOUND,
-            "{path} must exist with the flag: {}",
+            "{method:?} {path} must exist with the flag: {}",
             answer.text()
         );
     }

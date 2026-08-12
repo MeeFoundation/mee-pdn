@@ -279,7 +279,7 @@ async fn a_device_joins_across_containers() -> Result<()> {
     let hosted: HostedIdentities = second.get("/debug/identities").await?.json()?;
     assert!(
         hosted.identities.contains(&alice),
-        "the linked node must report the alice: {hosted:?}"
+        "the linked node must report Alice: {hosted:?}"
     );
 
     // And reads what the first device wrote before it joined.

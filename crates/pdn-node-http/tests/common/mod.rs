@@ -54,6 +54,14 @@ const HTTP_PORT: ContainerPort = ContainerPort::Tcp(HTTP_PORT_NUM);
 const READY_BUDGET: Duration = Duration::from_secs(20);
 const READY_POLL: Duration = Duration::from_millis(250);
 
+/// A ceiling on one liveness probe. The budget above is checked between
+/// requests, so without this a probe that connects and then never answers
+/// holds the wait open past any budget. A node that is up answers in
+/// milliseconds; nothing legitimate takes seconds here. The scenarios' own
+/// requests are deliberately left unbounded — a ceremony route may honestly
+/// run for the lifetime its caller asked for.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How many containers one node is worth. A published port that never
 /// answers is an arrangement that failed, not a scenario that did, so the
 /// container is replaced rather than reported.
@@ -369,8 +377,10 @@ fn stream_to_file(container_name: &str) -> impl Fn(&LogFrame) + Send + Sync {
 
 /// Append one replacement to [`REPLACEMENT_LOG`], best effort: the file is
 /// evidence about the harness, and failing to write it must never decide the
-/// outcome of a scenario. Tests run a process each and append, so the line is
-/// written whole in one call rather than built up across several.
+/// outcome of a scenario. Tests run a process each and append; a note is
+/// handed over in one call, which keeps short ones whole in practice without
+/// the file format depending on it — every line stands alone, so an
+/// interleaving costs legibility rather than meaning.
 fn record_replacement(note: &str) {
     use std::io::Write as _;
     let Some(dir) = std::path::Path::new(REPLACEMENT_LOG).parent() else {
@@ -401,12 +411,21 @@ async fn accepts_from_inside(container: &ContainerAsync<GenericImage>) -> String
         &format!("exec 3<>/dev/tcp/127.0.0.1/{HTTP_PORT_NUM}"),
     ]);
     match container.exec(probe).await {
-        Ok(result) => match result.exit_code().await {
-            Ok(Some(0)) => "yes".to_owned(),
-            Ok(Some(code)) => format!("no, refused (exit {code})"),
-            Ok(None) => "unknown, probe still running".to_owned(),
-            Err(err) => format!("unknown, probe unreadable ({err})"),
-        },
+        Ok(mut result) => {
+            // The daemon reports an exit code only once the exec's output
+            // streams are consumed; asking straight away answers "still
+            // running" forever, which is what this probe used to report.
+            use tokio::io::AsyncReadExt as _;
+            let mut drained = Vec::new();
+            let _ = result.stdout().read_to_end(&mut drained).await;
+            let _ = result.stderr().read_to_end(&mut drained).await;
+            match result.exit_code().await {
+                Ok(Some(0)) => "yes".to_owned(),
+                Ok(Some(code)) => format!("no, refused (exit {code})"),
+                Ok(None) => "unknown, probe still running".to_owned(),
+                Err(err) => format!("unknown, probe unreadable ({err})"),
+            }
+        }
         Err(err) => format!("unknown, probe unrunnable ({err})"),
     }
 }
@@ -441,7 +460,12 @@ async fn wait_live(
             }
         }
         if let Ok(ref base) = resolved {
-            if let Ok(response) = client.get(format!("{base}/live")).send().await {
+            if let Ok(response) = client
+                .get(format!("{base}/live"))
+                .timeout(READY_PROBE_TIMEOUT)
+                .send()
+                .await
+            {
                 if response.status().as_u16() == StatusCode::OK.as_u16() {
                     return Ok(base.clone());
                 }
@@ -465,7 +489,7 @@ async fn wait_live(
 }
 
 /// The verbs the surface answers to.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum Method {
     Get,
     Post,
