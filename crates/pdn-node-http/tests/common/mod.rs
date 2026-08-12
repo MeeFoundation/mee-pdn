@@ -29,7 +29,7 @@ use std::{
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{CreatedIdentity, GrantPublication};
+use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath};
 use serde::de::DeserializeOwned;
 use testcontainers::{
     core::{logs::LogFrame, ContainerPort, ExecCommand, WaitFor},
@@ -533,22 +533,22 @@ async fn base_url(container: &ContainerAsync<GenericImage>) -> Result<String> {
     Ok(format!("http://{host}:{port}"))
 }
 
-/// The claim set covering exactly `path` of `issuer`'s namespace — read
-/// always, write when `write`. Deriving a claim identity is arithmetic on
-/// the issuer and the path, not a reach into the runtime.
-pub fn claims_on(issuer: PdnId, path: &str, write: bool) -> Result<Vec<pdn_node::GrantedClaim>> {
-    Ok(vec![pdn_node::GrantedClaim {
-        claim: pdn_node::claim_id_of(&issuer, &pdn_node::EntryPath::new(path)?),
+/// The claim set covering exactly `path` of the issuer's namespace — read
+/// always, write when `write`. The surface names a claim by its path and
+/// derives the identity itself, so a test names what a person would.
+pub fn claims_on(path: &str, write: bool) -> Vec<GrantedPath> {
+    vec![GrantedPath {
+        path: path.to_owned(),
         write,
-    }])
+    }]
 }
 
 /// A grant publication of `issuer`'s own data on exactly `path`.
-pub fn grant_on(issuer: PdnId, path: &str, write: bool) -> Result<GrantPublication> {
-    Ok(GrantPublication {
+pub fn grant_on(issuer: PdnId, path: &str, write: bool) -> GrantPublication {
+    GrantPublication {
         issuer,
-        claims: claims_on(issuer, path, write)?,
-    })
+        claims: claims_on(path, write),
+    }
 }
 
 /// The body a caller must send to write nothing but bytes.

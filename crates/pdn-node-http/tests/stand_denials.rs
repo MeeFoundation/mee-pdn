@@ -93,7 +93,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
             bob,
             &GrantPublication {
                 issuer: bob,
-                claims: claims_on(bob, "contact/email", false)?,
+                claims: claims_on("contact/email", false),
             },
         )
         .await?;
@@ -109,8 +109,8 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         .await?
         .json()?;
     assert!(after_foreign.grants.is_empty());
-    let mut allowed_claims = claims_on(alice, "contact/email", false)?;
-    allowed_claims.extend(claims_on(alice, "contact/sentinel", false)?);
+    let mut allowed_claims = claims_on("contact/email", false);
+    allowed_claims.extend(claims_on("contact/sentinel", false));
     inviter
         .publish_grant(
             alice,
@@ -313,7 +313,7 @@ async fn publishing_toward_an_unconnected_peer_is_refused_as_a_conflict() -> Res
     let bob = bystander.create_identity().await?;
 
     let refused = inviter
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false)?)
+        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
         .await?;
     assert_eq!(
         refused.status,

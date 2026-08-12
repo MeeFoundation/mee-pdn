@@ -98,6 +98,32 @@ run-image:
   BIND=${BIND:-127.0.0.1}
   docker run --rm -e PDN_DEBUG=1 -p "${BIND}:${PORT}:3011" {{ image }}
 
+# The live demo: several nodes on one network — Alice with two personas on a
+# phone plus a laptop, Bob and Carol with a phone and a laptop each — driven
+# through their debug surfaces while everything between them runs over the
+# runtimes' own protocols.
+#
+# The nodes are torn down on every exit, the failing one included: a demo
+# that leaves containers behind has the next run meeting the last run's
+# state, which is the one thing a demo must never do.
+[doc("Run the live demo across containers (needs docker)")]
+demo:
+  #!/bin/sh
+  set -eu
+  docker info >/dev/null 2>&1 || { echo "no container daemon — the demo needs one"; exit 1; }
+  # The build and the bring-up are stagehands: their output is kept back so
+  # the narration reads as one thing, and produced in full if either fails.
+  log=$(mktemp)
+  trap 'docker compose -f ops/compose.yml down --remove-orphans >/dev/null 2>&1; rm -f "$log"' EXIT
+  # The count comes from the compose file rather than from this line: a
+  # number written here goes stale the first time a node is added, and it
+  # already did.
+  nodes=$(docker compose -f ops/compose.yml config --services | wc -l | tr -d ' ')
+  printf 'Building the node image and bringing %s of them up...\n' "$nodes"
+  just build-image >"$log" 2>&1 || { cat "$log"; exit 1; }
+  docker compose -f ops/compose.yml up -d --wait >"$log" 2>&1 || { cat "$log"; exit 1; }
+  sh ops/demo.sh
+
 # The nextest profile bounding the stand's parallelism, chosen from what the
 # container daemon reports about itself rather than from this machine's
 # cores: the two differ whenever the daemon runs on a virtual machine or the

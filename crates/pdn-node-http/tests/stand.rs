@@ -95,7 +95,7 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
 
     // The grant: read-only on exactly `contact/email`.
     inviter
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false)?)
+        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
         .await?
         .ok()?;
 
@@ -388,7 +388,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
         .await?
         .ok()?;
     publisher
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false)?)
+        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
         .await?
         .ok()?;
     entry_reads(
@@ -507,8 +507,8 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
         .ok()?;
 
     // One publication, two claims, one of them writable.
-    let mut claims = claims_on(alice, "contact/phone", true)?;
-    claims.extend(claims_on(alice, "contact/email", false)?);
+    let mut claims = claims_on("contact/phone", true);
+    claims.extend(claims_on("contact/email", false));
     issuer
         .publish_grant(
             alice,
@@ -681,14 +681,14 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
         .ok()?;
 
     alice_node
-        .publish_grant(at_work, bob, &grant_on(at_work, "contact/email", false)?)
+        .publish_grant(at_work, bob, &grant_on(at_work, "contact/email", false))
         .await?
         .ok()?;
     alice_node
         .publish_grant(
             at_leisure,
             carol,
-            &grant_on(at_leisure, "contact/email", false)?,
+            &grant_on(at_leisure, "contact/email", false),
         )
         .await?
         .ok()?;

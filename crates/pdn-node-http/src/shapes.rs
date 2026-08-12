@@ -112,7 +112,21 @@ impl LinkBudget {
 #[serde(deny_unknown_fields)]
 pub struct GrantPublication {
     pub issuer: PdnId,
-    pub claims: Vec<GrantedClaim>,
+    pub claims: Vec<GrantedPath>,
+}
+
+/// One claim of a publication, named by the path it covers.
+///
+/// A claim's identity is arithmetic on the issuer and the path, and the host
+/// does it: every other route of this surface addresses an entry by path, so
+/// a caller that had to derive the identity itself would be reproducing a
+/// rule of the product to talk to it. What crosses is what a person can
+/// write down.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantedPath {
+    pub path: String,
+    pub write: bool,
 }
 
 /// One grant's capability, without its ticket — an HTTP-owned shape,

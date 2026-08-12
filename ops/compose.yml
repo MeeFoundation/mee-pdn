@@ -1,0 +1,47 @@
+# The demo's seven nodes: three people, and a device per identity rather than
+# per person — Alice keeps a laptop for work and another for leisure, which
+# is what makes a device's belonging visible.
+#
+# One network, and HTTP published to the host only — a demo drives the nodes
+# from outside, the way the container suite does, while everything between
+# them runs over the runtimes' own protocols on this network. Ports are bound
+# to loopback: the debug surface is unauthenticated and mints live ceremony
+# secrets, so a wider bind is never the default.
+#
+# Storage is in memory, so a node that goes away takes its state with it and
+# the demo starts clean every time.
+
+name: pdn-demo
+
+x-node: &node
+  image: pdn-node-http:dev
+  environment:
+    PDN_DEBUG: "1"
+    RUST_LOG: "info,pdn_node=debug,data_layer=debug"
+  networks: [demo]
+
+services:
+  alice-phone:
+    <<: *node
+    ports: ["127.0.0.1:3011:3011"]
+  alice-work-laptop:
+    <<: *node
+    ports: ["127.0.0.1:3012:3011"]
+  alice-leisure-laptop:
+    <<: *node
+    ports: ["127.0.0.1:3013:3011"]
+  bob-phone:
+    <<: *node
+    ports: ["127.0.0.1:3014:3011"]
+  bob-laptop:
+    <<: *node
+    ports: ["127.0.0.1:3015:3011"]
+  carol-phone:
+    <<: *node
+    ports: ["127.0.0.1:3016:3011"]
+  carol-laptop:
+    <<: *node
+    ports: ["127.0.0.1:3017:3011"]
+
+networks:
+  demo:
