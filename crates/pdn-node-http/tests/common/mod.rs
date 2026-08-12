@@ -532,21 +532,26 @@ pub fn body(payload: &[u8]) -> Bytes {
     Bytes::copy_from_slice(payload)
 }
 
-/// Poll `check` every 100ms until it holds or `budget` elapses; the return
-/// says whether it was observed in time. Repeating the read is the only wait
-/// the surface offers, by design — nothing here forces a reconciliation.
-pub async fn eventually<F, Fut>(budget: Duration, mut check: F) -> Result<bool>
+/// Poll `check` every 100ms until it yields a value or `budget` elapses.
+/// Repeating the read is the only wait the surface offers, by design —
+/// nothing here forces a reconciliation.
+///
+/// The value comes out of the poll, so what a caller asserts on is the
+/// observation that satisfied the wait. A read taken afterwards is a second
+/// observation of a moving replica, and the transient this poll exists for
+/// is precisely one where the two differ.
+pub async fn eventually<F, Fut, T>(budget: Duration, mut check: F) -> Result<Option<T>>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<bool>>,
+    Fut: Future<Output = Result<Option<T>>>,
 {
     let deadline = std::time::Instant::now() + budget;
     loop {
-        if check().await? {
-            return Ok(true);
+        if let Some(value) = check().await? {
+            return Ok(Some(value));
         }
         if std::time::Instant::now() > deadline {
-            return Ok(false);
+            return Ok(None);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

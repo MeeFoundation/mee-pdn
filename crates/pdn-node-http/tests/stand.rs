@@ -99,45 +99,43 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         .await?
         .ok()?;
 
-    // The grantee reads the capability over the surface. The answer is
-    // accumulated inside the poll: a record whose ticket payload is still
-    // arriving reads as no grant at all — the very transient the poll exists
-    // for — so a second read afterwards would not be the same read.
-    let arrived = eventually(CONVERGENCE_BUDGET, || async {
+    // The capability comes out of the poll, not out of a read that follows
+    // it: a record whose ticket payload is still arriving reads as no grant
+    // at all — the transient this wait exists for — so a later read is a
+    // second observation rather than the same one.
+    //
+    // Three guards keep a namespace ticket off this surface, and each closes
+    // a different door. A field added to `GrantCapability` stops the
+    // conversion from `ReadGrant` compiling; a field added and filled stops
+    // the destructuring below compiling; and `deny_unknown_fields` refuses a
+    // response some other producer built, which is the only one of the three
+    // that can fail at run time — here, with the message this decode carries.
+    let capability = eventually(CONVERGENCE_BUDGET, || async {
         let raw = scanner
             .get(&format!("/debug/identities/{bob}/grants/{alice}"))
             .await?
             .ok()?;
-        let grants: PeerGrants = serde_json::from_slice(&raw)?;
-        Ok(grants.grants.iter().any(|grant| grant.issuer == alice))
+        let grants: PeerGrants = serde_json::from_slice(&raw).context(
+            "the grants response carried an unexpected field — a namespace ticket, most likely",
+        )?;
+        Ok(grants
+            .grants
+            .into_iter()
+            .find(|grant| grant.issuer == alice))
     })
     .await?;
-    assert!(
-        arrived,
-        "the grant did not reach the grantee over the pair\n{}",
-        scanner.diagnostics().await
-    );
-    let raw = scanner
-        .get(&format!("/debug/identities/{bob}/grants/{alice}"))
-        .await?
-        .ok()?;
-    // No namespace ticket may cross the surface, whatever a leaked field
-    // happened to be named: `GrantCapability` denies unknown fields, so a
-    // response carrying anything beyond issuer/audience/claims — ticket
-    // included — fails to decode here rather than passing unnoticed.
-    let grants: PeerGrants = serde_json::from_slice(&raw).context(
-        "the grants response carried an unexpected field — a namespace ticket, most likely",
-    )?;
-    let capability = grants
-        .grants
-        .iter()
-        .find(|grant| grant.issuer == alice)
-        .context("the poll's answer must carry the grant it reported")?;
+    let capability = match capability {
+        Some(capability) => capability,
+        None => anyhow::bail!(
+            "the grant did not reach the grantee over the pair\n{}",
+            scanner.diagnostics().await
+        ),
+    };
     let GrantCapability {
         issuer: _,
         audience,
         claims,
-    } = capability;
+    } = &capability;
     assert_eq!(*audience, bob);
     assert!(
         claims.iter().all(|claim| !claim.write),
