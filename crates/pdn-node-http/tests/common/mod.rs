@@ -32,7 +32,7 @@ use pdn_node::PdnId;
 use pdn_node_http::shapes::{CreatedIdentity, GrantPublication};
 use serde::de::DeserializeOwned;
 use testcontainers::{
-    core::{ContainerPort, ExecCommand, WaitFor},
+    core::{logs::LogFrame, ContainerPort, ExecCommand, WaitFor},
     runners::AsyncRunner as _,
     ContainerAsync, GenericImage, ImageExt as _,
 };
@@ -70,6 +70,18 @@ const SPAWN_ATTEMPTS: usize = 2;
 /// each test process's own directory, which is the package root rather than
 /// the workspace, and scatter the evidence beside the crate.
 const REPLACEMENT_LOG: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/stand-replacements.log");
+
+/// Where every node's whole log is streamed, one file per container.
+///
+/// The tail carried into a failing wait covers the failures that are waits.
+/// A plain assertion in a test body produces no tail at all, and a container
+/// replaced after never answering takes its log with it — so the paths most
+/// likely to need a post-mortem are the ones the tail does not reach. The
+/// stream is written as it arrives and outlives the container.
+///
+/// The directory is cleared by whoever clears `target`: these are build
+/// artifacts of a run, kept for reading a failure that already happened.
+const NODE_LOG_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/stand-logs");
 
 /// How long a wait for convergence may take. Wide enough to cover several of
 /// the runtime's own reconciliation periods, since nothing here shortens that
@@ -132,6 +144,7 @@ impl Stand {
                 // every interface and publishes the container's own address.
                 .with_env_var("RUST_LOG", "info,pdn_node=debug,data_layer=debug")
                 .with_network(&self.network)
+                .with_log_consumer(stream_to_file(&name))
                 .with_container_name(name);
             if debug {
                 image = image.with_env_var("PDN_DEBUG", "1");
@@ -326,6 +339,32 @@ async fn log_tail(container: &ContainerAsync<GenericImage>, label: &str) -> Stri
     let tail = out.len().saturating_sub(LOG_TAIL_BYTES);
     let text = String::from_utf8_lossy(out.get(tail..).unwrap_or(&out)).into_owned();
     format!("[{label}] last {} bytes of log:\n{text}", text.len())
+}
+
+/// A consumer that writes one container's whole log to a file named after
+/// it, under [`NODE_LOG_DIR`]. Best effort throughout: a log that cannot be
+/// written must never decide the outcome of a scenario. The file is opened
+/// once and held, rather than reopened per frame, because a node under
+/// `debug` produces frames steadily for as long as it lives.
+fn stream_to_file(container_name: &str) -> impl Fn(&LogFrame) + Send + Sync {
+    let _ = std::fs::create_dir_all(NODE_LOG_DIR);
+    let path = std::path::Path::new(NODE_LOG_DIR).join(format!("{container_name}.log"));
+    let sink = std::sync::Mutex::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok(),
+    );
+    move |frame| {
+        use std::io::Write as _;
+        let (LogFrame::StdOut(bytes) | LogFrame::StdErr(bytes)) = frame;
+        if let Ok(mut guard) = sink.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.write_all(bytes);
+            }
+        }
+    }
 }
 
 /// Append one replacement to [`REPLACEMENT_LOG`], best effort: the file is
@@ -554,9 +593,13 @@ async fn poll_read(
         }
         if std::time::Instant::now() > deadline {
             return Err(anyhow::anyhow!(
-                "last answer was {}: {}",
+                "last answer was {}: {}\n{}",
                 answer.status,
-                answer.text()
+                answer.text(),
+                // The node that was read from, not the one written to: the
+                // answer says the value never arrived, and this says what
+                // this node was doing instead of receiving it.
+                host.diagnostics().await
             ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

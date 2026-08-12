@@ -112,7 +112,11 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         Ok(grants.grants.iter().any(|grant| grant.issuer == alice))
     })
     .await?;
-    assert!(arrived, "the grant did not reach the grantee over the pair");
+    assert!(
+        arrived,
+        "the grant did not reach the grantee over the pair\n{}",
+        scanner.diagnostics().await
+    );
     let raw = scanner
         .get(&format!("/debug/identities/{bob}/grants/{alice}"))
         .await?
@@ -458,9 +462,12 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
 /// What that refusal proves is the courtesy check on the grantee's own side
 /// (`write_refusal`, the sole caller of `covers_write`): the write never
 /// leaves. The issuer's gate — `admit_ingest`, which derives its write set
-/// independently — is the enforcement, and no test here reaches it, because
-/// the courtesy always answers first and the bypass that skips it is a
-/// runtime feature this surface does not expose.
+/// independently — is the enforcement, and no test here reaches it: the
+/// courtesy always answers first, and the only way past it is a runtime
+/// feature this surface does not expose and should not. The gate is proven
+/// where that bypass lives, in `pdn-node`'s `scoped_writes.rs`, which forces
+/// a write outside the write set and asserts it never reaches the issuer and
+/// that the provisional entry is retracted.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // one write grant, with its denial in the same place
