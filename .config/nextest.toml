@@ -1,13 +1,54 @@
-# One node of the stand is a container, and one test starts three or four
-# of them. Left to the default, the runner schedules a test per core of
-# *this* machine while the container daemon runs on a fixed share of it, so a
-# run wide enough saturates the daemon and a node then misses its readiness
-# budget — a failure that says nothing about the product. The group below
-# bounds the stand's scenarios to what the daemon can start at once;
-# everything else keeps the default, since an in-process node costs a task.
+# One node of the stand is a container, and one test starts up to four of
+# them. Left to the default, the runner schedules a test per core of *this*
+# machine, which is not the machine the daemon runs on — a suite run inside a
+# development container talks to the host's daemon, and a daemon on a virtual
+# machine reports its own share rather than the host's cores. So the bound
+# comes from what the daemon says about itself: `just test-docker` reads its
+# CPU count and picks the matching profile below.
+#
+# The rungs are a ladder rather than an expression because the runner reads
+# this file before any code of ours runs, and its group bound takes a number,
+# not a computation. A caller that names no profile gets `stand-2`, which is
+# measured safe: one costs about 70 seconds on a 16-core host, two lands
+# within two seconds of the floor, four and eight buy nothing further.
+#
+# That last part holds while the suite's tests spend most of their time
+# waiting and so overlap well; the sum of their times already exceeds twice
+# the longest one, so a suite several times this size would be bounded by
+# this number rather than by its longest test, and the rungs would be worth
+# measuring again.
 [test-groups]
-stand = { max-threads = 2 }
+stand-1 = { max-threads = 1 }
+stand-2 = { max-threads = 2 }
+stand-4 = { max-threads = 4 }
+stand-8 = { max-threads = 8 }
+stand-16 = { max-threads = 16 }
 
 [[profile.default.overrides]]
 filter = 'binary(~stand)'
-test-group = 'stand'
+test-group = 'stand-2'
+
+[profile.cap-1]
+[[profile.cap-1.overrides]]
+filter = 'binary(~stand)'
+test-group = 'stand-1'
+
+[profile.cap-2]
+[[profile.cap-2.overrides]]
+filter = 'binary(~stand)'
+test-group = 'stand-2'
+
+[profile.cap-4]
+[[profile.cap-4.overrides]]
+filter = 'binary(~stand)'
+test-group = 'stand-4'
+
+[profile.cap-8]
+[[profile.cap-8.overrides]]
+filter = 'binary(~stand)'
+test-group = 'stand-8'
+
+[profile.cap-16]
+[[profile.cap-16.overrides]]
+filter = 'binary(~stand)'
+test-group = 'stand-16'

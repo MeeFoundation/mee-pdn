@@ -98,6 +98,23 @@ run-image:
   BIND=${BIND:-127.0.0.1}
   docker run --rm -e PDN_DEBUG=1 -p ${BIND}:${PORT}:3011 {{ image }}
 
+# The nextest profile bounding the stand's parallelism, chosen from what the
+# container daemon reports about itself rather than from this machine's
+# cores: the two differ whenever the daemon runs on a virtual machine or the
+# suite runs inside a development container. Falls back to the profile's own
+# default when no daemon answers, so a caller without one still gets a
+# runnable command rather than an error from arithmetic on an empty string.
+[doc("Print the nextest profile matching the daemon's CPU count")]
+stand-profile:
+  #!/bin/sh
+  set -eu
+  cpus=$(docker info 2>/dev/null | awk '/^ *CPUs:/{print $2}')
+  case "$cpus" in ''|*[!0-9]*) echo "cap-2"; exit 0 ;; esac
+  for rung in 16 8 4 2; do
+    [ "$cpus" -ge "$rung" ] && { echo "cap-$rung"; exit 0; }
+  done
+  echo "cap-1"
+
 # The stand: build the image, then run the container scenarios against it.
 # Extra args are forwarded to `cargo nextest run`.
 #
@@ -112,7 +129,7 @@ test-docker *args:
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
   docker info >/dev/null 2>&1 || { echo "no container daemon — the stand needs one"; exit 1; }
   just build-image
-  cargo nextest run -p pdn-node-http -E 'binary(~stand)' --run-ignored all "$@"
+  cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all "$@"
 
 # Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.
 #
