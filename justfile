@@ -121,6 +121,11 @@ demo:
   nodes=$(docker compose -f ops/compose.yml config --services | wc -l | tr -d ' ')
   printf 'Building the node image and bringing %s of them up...\n' "$nodes"
   just build-image >"$log" 2>&1 || { cat "$log"; exit 1; }
+  # The nodes come up from what was just built, named by its content id: the
+  # show and the gate then run one artifact rather than one tag.
+  PDN_STAND_IMAGE=$(just stand-image)
+  [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
+  export PDN_STAND_IMAGE
   docker compose -f ops/compose.yml up -d --wait >"$log" 2>&1 || { cat "$log"; exit 1; }
   sh ops/demo.sh
 
@@ -130,6 +135,18 @@ demo:
 # suite runs inside a development container. Falls back to the profile's own
 # default when no daemon answers, so a caller without one still gets a
 # runnable command rather than an error from arithmetic on an empty string.
+# The identity of the image a run tests: the content id the daemon gave the
+# build, rather than the tag that also names it. A tag is a name any build
+# moves — a second worktree rebuilding it mid-run would otherwise put two
+# revisions into one scenario — and an id cannot be moved. Prints nothing
+# when no daemon answers or nothing is built, so a caller reads an empty
+# answer rather than an error from a missing image.
+[doc("Print the image id the stand's scenarios run against")]
+stand-image:
+  #!/bin/sh
+  set -eu
+  docker images --no-trunc --quiet {{ image }} 2>/dev/null | head -n 1
+
 [doc("Print the nextest profile matching the daemon's CPU count")]
 stand-profile:
   #!/bin/sh
@@ -157,6 +174,12 @@ test-docker *args:
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
   docker info >/dev/null 2>&1 || { echo "no container daemon — the stand needs one"; exit 1; }
   just build-image
+  # What was just built, named by its content id: every container of this run
+  # starts from it, so a rebuild of the tag while the run is under way cannot
+  # mix two revisions into one scenario.
+  PDN_STAND_IMAGE=$(just stand-image)
+  [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it — refusing to run against a tag that can move"; exit 1; }
+  export PDN_STAND_IMAGE
   cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all "$@"
 
 # Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.

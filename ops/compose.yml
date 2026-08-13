@@ -14,7 +14,10 @@
 name: pdn-demo
 
 x-node: &node
-  image: pdn-node-http:dev
+  # The image by the content id the recipe resolved after building it, so
+  # every node of one show comes from one artifact even if another build
+  # moves the tag meanwhile. Brought up by hand, this is the tag itself.
+  image: ${PDN_STAND_IMAGE:-pdn-node-http:dev}
   environment:
     PDN_DEBUG: "1"
     RUST_LOG: "info,pdn_node=debug,data_layer=debug"

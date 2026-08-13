@@ -13,9 +13,9 @@
 //! held from inside its own process; that test builds its own runtime and
 //! does not come through here.
 //!
-//! The image is not built here. `just test-docker` builds it first, and a
-//! test that finds it missing says so rather than running against a stale
-//! one silently.
+//! The image is not built here. `just test-docker` builds it first, resolves
+//! what it built to a content id, and hands that id over; a test that finds
+//! it missing says so rather than running against a stale one silently.
 // Each test binary includes this module and uses its own subset of the
 // helpers; what one binary leaves unused is not dead code of the crate.
 #![allow(dead_code)]
@@ -40,6 +40,31 @@ use testcontainers::{
 /// The image `just test-docker` builds.
 pub const IMAGE_NAME: &str = "pdn-node-http";
 pub const IMAGE_TAG: &str = "dev";
+
+/// Where the recipe hands over the identity of the image this run tests.
+const IMAGE_ENV: &str = "PDN_STAND_IMAGE";
+
+/// The image every container of this run starts from.
+///
+/// A tag is a name, and a build moves it — including in the middle of this
+/// run, from another worktree sharing the daemon. Resolving the tag once per
+/// container would then put two revisions into one scenario and report a
+/// verdict about neither, so the recipe resolves it once before the runner
+/// starts and hands over the content id here, which nothing can move.
+///
+/// Unset, this falls back to the tag: a run started by hand still works, and
+/// tests whatever the tag names at the moment each container starts.
+fn image_ref() -> String {
+    std::env::var(IMAGE_ENV).unwrap_or_else(|_| format!("{IMAGE_NAME}:{IMAGE_TAG}"))
+}
+
+/// A reference split the way the container client wants it — everything
+/// before the last colon, and everything after — which it then puts back
+/// together unchanged. A content id (`sha256:…`) splits like a tag does, and
+/// a reference carrying neither is the daemon's own default tag.
+fn split_ref(image: &str) -> (&str, &str) {
+    image.rsplit_once(':').unwrap_or((image, "latest"))
+}
 
 /// The port the image serves on, published to the test host by the container
 /// runtime. The runtime's own endpoint port is never published: everything
@@ -136,6 +161,10 @@ impl Stand {
     async fn spawn_with_debug(&self, label: &str, debug: bool) -> Result<Host> {
         let mut failed = None;
         let mut replaced = String::new();
+        // Resolved once for every container this node is given: a replacement
+        // is the same node's second attempt, not a second artifact.
+        let reference = image_ref();
+        let (image_name, image_tag) = split_ref(&reference);
         for attempt in 1..=SPAWN_ATTEMPTS {
             // The name carries the attempt, so a replacement never collides
             // with a predecessor the daemon has not finished removing.
@@ -143,7 +172,7 @@ impl Stand {
                 1 => format!("{}-{label}", self.network),
                 n => format!("{}-{label}-{n}", self.network),
             };
-            let mut image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+            let mut image = GenericImage::new(image_name, image_tag)
                 .with_exposed_port(HTTP_PORT)
                 .with_wait_for(WaitFor::Nothing)
                 // The environment is stated, never inherited: a bind value
@@ -161,7 +190,7 @@ impl Stand {
             let container = image
                 .start()
                 .await
-                .with_context(|| format!("starting {label}: is {IMAGE_NAME}:{IMAGE_TAG} built?"))?;
+                .with_context(|| format!("starting {label}: is {reference} built?"))?;
             let client = reqwest::Client::new();
             match wait_live(&container, label, &client).await {
                 Ok(base) => {

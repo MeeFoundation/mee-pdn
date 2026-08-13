@@ -87,8 +87,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The parallelism bound comes from the daemon on this runner, not from
-      # the number baked in for a development machine — same recipe the local
-      # run uses, so the two cannot drift apart.
+      # Both of the run's own inputs come from recipes the local run uses too,
+      # so the two cannot drift apart: the parallelism bound from the daemon
+      # on this runner rather than a number baked in for a development
+      # machine, and the image by the content id of what the step above built
+      # rather than by the tag that also names it.
       - name: Run the container scenarios
-        run: cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all
+        run: |
+          PDN_STAND_IMAGE="$(just stand-image)"
+          [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
+          export PDN_STAND_IMAGE
+          cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all
