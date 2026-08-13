@@ -182,6 +182,56 @@ test-docker *args:
   export PDN_STAND_IMAGE
   cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all "$@"
 
+# The container flaky hunt: the stand's suite repeated, with everything a
+# failure needs kept and everything a clean run leaves behind thrown away.
+#
+# Three things this encodes, each learnt from a hunt that lost evidence:
+# the sweep runs to its end (`--no-fail-fast`), because one container that
+# never gets its port published would otherwise cancel the remaining
+# iterations; a failure keeps the nodes' logs, because the assertion says a
+# value never arrived and only the logs say what the node was doing instead;
+# and the count of replaced containers is printed either way, because a
+# green run that replaced a dozen of them is not the same as a green run.
+#
+# Extra args are forwarded to `cargo nextest run`. Needs a container daemon.
+[doc("Hunt flaky container scenarios: repeat the stand's suite, keep what a failure needs")]
+stress-docker count="100" *args:
+  #!/bin/sh
+  set -eu
+  command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "no container daemon — the stand needs one"; exit 1; }
+  just build-image
+  PDN_STAND_IMAGE=$(just stand-image)
+  [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
+  export PDN_STAND_IMAGE
+  # The paths the harness writes to (`common/mod.rs`).
+  logs=target/tmp/stand-logs
+  replaced_log=target/tmp/stand-replacements.log
+  kept="target/tmp/stand-hunt-$(date +%Y%m%d-%H%M%S)"
+  # Emptied first, so what is counted and kept belongs to this hunt alone —
+  # a day of runs leaves a hundred megabytes of logs behind otherwise.
+  rm -rf "$logs"
+  : > "$replaced_log"
+  status=0
+  # `set positional-arguments` puts every parameter in "$@", `count` first —
+  # left in, it reaches nextest as a filter and the hunt selects nothing.
+  shift
+  cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' \
+    --run-ignored all --stress-count {{ count }} --no-fail-fast "$@" || status=$?
+  replaced=$(grep -c 'never answered and was replaced' "$replaced_log" 2>/dev/null || true)
+  echo
+  echo "hunt: {{ count }} iterations requested, containers replaced: ${replaced:-0}"
+  if [ "$status" -eq 0 ]; then
+    rm -rf "$logs"
+    echo "hunt: nothing caught"
+  else
+    mkdir -p "$kept"
+    mv "$logs" "$kept/" 2>/dev/null || true
+    cp "$replaced_log" "$kept/" 2>/dev/null || true
+    echo "hunt: caught something — the nodes' logs are in $kept"
+  fi
+  exit "$status"
+
 # Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.
 #
 # With no test selection it defaults to the scenario (integration) tests,

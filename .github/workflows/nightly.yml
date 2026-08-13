@@ -1,0 +1,95 @@
+# The container flaky hunt, run without anyone deciding to look.
+#
+# The stand's scenarios cost seconds each and pass on any given run; the
+# failures worth finding here show up once in tens or hundreds of them, which
+# no pull request can afford and no person remembers to do. So the suite is
+# repeated nightly, and a night that catches something keeps the nodes' logs
+# as an artifact — the assertion says a value never arrived, and only those
+# logs say what the node was doing instead.
+name: nightly
+
+on:
+  schedule:
+    # Nothing depends on the hour; it is off the hour because every scheduled
+    # workflow in the world asks for :00 and the runner queue shows it.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "How many times to repeat the stand's suite"
+        default: "100"
+      scenario_iterations:
+        description: "How many times to repeat the in-process scenarios"
+        default: "15"
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    # A hundred iterations of a suite whose own wall clock is seconds, plus
+    # one image build from cold. Past this the job is stuck rather than slow.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just + nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # The recipe builds the image itself, without the pull request job's
+      # layer cache: a nightly can afford the cold build, and paying it here
+      # keeps one command doing the same thing locally and in the pipeline.
+      - name: Hunt
+        run: just stress-docker "${{ github.event.inputs.iterations || '100' }}"
+
+      - name: Keep what the failure needs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stand-hunt
+          path: target/tmp/stand-hunt-*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The in-process scenarios, hunted the same way and in parallel with the
+  # stand's — they share nothing, and a public repository's runners are free.
+  scenarios:
+    runs-on: ubuntu-latest
+    # One pass of the scenario tests is about two minutes on a development
+    # machine and slower on a runner's four cores. The repeat count is the
+    # number to revisit once a first night has measured that: the budget is
+    # what the job is allowed to take, not what the hunt is worth.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just + nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # `--no-fail-fast` for the reason the container hunt has it: an early
+      # failure must not cancel the remaining repeats, or one flake hides
+      # how often it happens and whether anything else fails too. The
+      # selection is the recipe's own default — the scenario tests, with the
+      # stand's container binaries skipped as they are everywhere else.
+      - name: Hunt
+        run: just stress --stress-count "${{ github.event.inputs.scenario_iterations || '15' }}" --no-fail-fast

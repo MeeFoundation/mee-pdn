@@ -328,13 +328,24 @@ async fn a_device_joins_across_containers() -> Result<()> {
 /// alone, and whether that resolves is a question about a real network.
 ///
 /// A failure to converge after the stop is not answered by a longer budget,
-/// and two causes produce it — told apart before either is acted on. One:
-/// a device record carries an endpoint id alone, so a contact derived from
-/// it does not resolve, which is a change of its own. Two: the sibling does
-/// not hold the grant yet when the publisher stops. Nothing between the
-/// publication and the stop asserts the second — the wait there is the
-/// audience's read, and the audience and the sibling receive that record by
-/// separate paths from the publisher.
+/// and three causes produce it — told apart before any of them is acted on,
+/// from the log this harness streams per node. Which peers the audience
+/// dialled is what separates them, and the counts come out of its log:
+/// `grep -o "peer=[0-9a-f]*" <log> | sort | uniq -c`.
+///
+/// One: the audience holds no contact for the sibling at all, so the
+/// stopped device stays the only address it ever tries. Two: it holds one
+/// that leads nowhere — a device record carries an endpoint id alone, and
+/// this stand has neither relay nor discovery to turn one into a path,
+/// which is a change of its own. Three: the sibling holds no grant record
+/// when the publisher stops, so it refuses the audience fail-closed.
+///
+/// The waits before the stop cover what this surface can see: the audience
+/// reads the entry, and so does the sibling, which says replication between
+/// the issuer's two devices has run. The audience's contact set and the
+/// sibling's grant record are not visible from here; `pdn-node`'s
+/// `reachability.rs` waits on both, where a scenario reaches every runtime
+/// it arranged.
 ///
 /// The denial beside it: the failover must not widen access. A node that
 /// never connected to the issuer is still refused afterwards, so "the peer
@@ -399,6 +410,20 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     )
     .await
     .context("the audience never read the granted entry before the stop")?;
+
+    // And the sibling holds the same claim: the one precondition of the
+    // failover this surface can observe, read the way any caller reads. It
+    // says replication between the issuer's devices has run — not that the
+    // sibling can serve, which needs its grant record and is not visible
+    // here.
+    entry_reads(
+        &sibling,
+        alice,
+        "contact/email",
+        b"published from the first device",
+    )
+    .await
+    .context("the sibling never caught up on the granted claim before the stop")?;
 
     // The device that published the grant goes away — and is gone: a device
     // still running would leave the convergence below provable by the very
