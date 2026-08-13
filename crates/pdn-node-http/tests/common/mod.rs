@@ -57,9 +57,10 @@ const READY_POLL: Duration = Duration::from_millis(250);
 /// A ceiling on one liveness probe. The budget above is checked between
 /// requests, so without this a probe that connects and then never answers
 /// holds the wait open past any budget. A node that is up answers in
-/// milliseconds; nothing legitimate takes seconds here. The scenarios' own
-/// requests are deliberately left unbounded — a ceremony route may honestly
-/// run for the lifetime its caller asked for.
+/// milliseconds; nothing legitimate takes seconds here. A ceremony request
+/// is deliberately left unbounded — a route like `link` may honestly run for
+/// the lifetime its caller asked for; a wait for convergence bounds its own
+/// reads by its own budget instead ([`eventually`], [`poll_read`]).
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many containers one node is worth. A published port that never
@@ -564,17 +565,31 @@ pub fn body(payload: &[u8]) -> Bytes {
 /// observation that satisfied the wait. A read taken afterwards is a second
 /// observation of a moving replica, and the transient this poll exists for
 /// is precisely one where the two differ.
+///
+/// `check` is a read, and the budget bounds each observation as well as the
+/// wait: a check still in flight at the deadline is dropped. A mutating call
+/// waited on here would be dropped mid-request, which is why nothing but a
+/// read goes through this helper.
 pub async fn eventually<F, Fut, T>(budget: Duration, mut check: F) -> Result<Option<T>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Option<T>>>,
 {
-    let deadline = std::time::Instant::now() + budget;
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if let Some(value) = check().await? {
-            return Ok(Some(value));
+        // The budget covers the observation and not only the gap between
+        // two of them: the deadline below is reached only once an awaited
+        // check returns, so one check that never returns would hold this
+        // wait open past any budget.
+        match tokio::time::timeout_at(deadline, check()).await {
+            Ok(result) => {
+                if let Some(value) = result? {
+                    return Ok(Some(value));
+                }
+            }
+            Err(_elapsed) => return Ok(None),
         }
-        if std::time::Instant::now() > deadline {
+        if tokio::time::Instant::now() > deadline {
             return Ok(None);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -607,20 +622,32 @@ pub async fn entry_answers(
 }
 
 /// Repeat the read until `holds`, carrying the last answer into the error.
+/// A read still in flight at the deadline is dropped and reported as one:
+/// "no answer at all" and "the wrong answer" are different diagnoses, and a
+/// wait that reported neither would hold the runner's slot until whatever
+/// bounds the whole run.
 async fn poll_read(
     host: &Host,
     issuer: PdnId,
     path: &str,
     holds: impl Fn(&Answer) -> bool,
 ) -> Result<()> {
-    let encoded = encode_path(path);
-    let deadline = std::time::Instant::now() + CONVERGENCE_BUDGET;
+    let route = format!("/debug/data/{issuer}/{}", encode_path(path));
+    let deadline = tokio::time::Instant::now() + CONVERGENCE_BUDGET;
     loop {
-        let answer = host.get(&format!("/debug/data/{issuer}/{encoded}")).await?;
+        let answer = match tokio::time::timeout_at(deadline, host.get(&route)).await {
+            Ok(answer) => answer?,
+            Err(_elapsed) => {
+                return Err(anyhow::anyhow!(
+                    "no answer at all within {CONVERGENCE_BUDGET:?}\n{}",
+                    host.diagnostics().await
+                ))
+            }
+        };
         if holds(&answer) {
             return Ok(());
         }
-        if std::time::Instant::now() > deadline {
+        if tokio::time::Instant::now() > deadline {
             return Err(anyhow::anyhow!(
                 "last answer was {}: {}\n{}",
                 answer.status,
