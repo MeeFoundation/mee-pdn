@@ -5,7 +5,7 @@
 # the runtimes' own traffic, and a ceremony payload travels through here the
 # way a code travels between two screens through a person.
 #
-# Reads the six base URLs from the environment so the same narration can be
+# Reads the seven base URLs from the environment so the same narration can be
 # pointed at containers, at processes, or at anything else that serves the
 # surface.
 set -eu
