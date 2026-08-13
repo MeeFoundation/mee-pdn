@@ -9,14 +9,16 @@
 # The rungs are a ladder rather than an expression because the runner reads
 # this file before any code of ours runs, and its group bound takes a number,
 # not a computation. A caller that names no profile gets `stand-2`, which is
-# measured safe: one costs about 70 seconds on a 16-core host, two lands
-# within two seconds of the floor, four and eight buy nothing further.
+# safe on any daemon; the recipe names a wider rung when the daemon has the
+# cores to back it.
 #
-# That last part holds while the suite's tests spend most of their time
-# waiting and so overlap well; the sum of their times already exceeds twice
-# the longest one, so a suite several times this size would be bounded by
-# this number rather than by its longest test, and the rungs would be worth
-# measuring again.
+# Measured on a daemon holding 8 CPUs, over 12 tests in 3 binaries: 1 slot
+# takes 28 seconds, 2 takes 14, 4 takes 11.5, 8 takes 11.6. The floor is the
+# suite's longest single test, which 4 already reaches — past it a wider
+# bound neither costs nor buys anything here, and the rung the daemon's size
+# selects is the one that matters. No container misses its readiness budget
+# at any rung, 5 stress iterations at 8 included. The figures follow the
+# suite's size and shape, so a growth worth noticing is worth measuring.
 [test-groups]
 stand-1 = { max-threads = 1 }
 stand-2 = { max-threads = 2 }
