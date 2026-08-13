@@ -18,7 +18,14 @@
 //! nothing granting durable access — yet live until burnt or expired, so
 //! whoever captures one can consume the invitation in the intended
 //! recipient's place. No namespace ticket crosses the surface at all. Hence
-//! the flag, and the loopback default bind ([`bind_addr`]).
+//! the flag, and the loopback default bind ([`bind_addr`]) — a default the
+//! stand's image overrides on purpose, since a node in a container has to
+//! serve every interface to be reachable at all. Where the surface is
+//! published is therefore its whole boundary: on the stand's network every
+//! node reaches every other's surface, and a run publishes each node's port
+//! to the machine running it. The nodes a run exposes that way are its own,
+//! they hold nothing but what the scenario just wrote, and they are gone
+//! with it.
 //!
 //! **The host is off the product path.** It exists so a test can reach a
 //! node from outside its process — the container stand and the demo are its
