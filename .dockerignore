@@ -1,25 +1,31 @@
-# VCS and metadata
-.git
-.git/*
-.gitignore
-*.code-workspace
+# An allowed set: everything is excluded, and the build's inputs are named.
+# A list of exclusions is silent about whatever appears beside the workspace
+# next; this one is wrong only when a build fails for a missing input, which
+# is the failure that gets noticed. `just check-context` lists what the
+# context actually carries.
+*
 
-# Editor/OS files
-.vscode
-.idea
-*.swp
-*.swo
-.DS_Store
+# The workspace.
+!Cargo.toml
+!Cargo.lock
+!crates
 
-# Build artifacts
-target
+# The store fork, for a workspace that resolves it from the checkout beside
+# it, and the cargo configuration that points there. A clean checkout has no
+# such configuration and resolves the fork from its git source.
+!pdn-store
+!.cargo/config.toml
+
+# Excluded again at any depth, since the entries above carry them: build
+# artifacts, repository directories, environment files (a checkout may hold
+# one at any level), editor droppings, and the agent instruction files each
+# crate and each nested checkout carries — one of which is machine-local and
+# private. Named rather than excluded as markdown, because a crate's README
+# can be a build input: the store fork's lands in its own rustdoc through
+# `include_str!`.
 **/target
-
-# Local runtime/demo data
-var
-tmp
-local-data
-
-# Env and secrets
-.env
-.env.*
+**/.git
+**/.env
+**/.env.*
+**/.DS_Store
+**/CLAUDE*.md

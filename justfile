@@ -61,6 +61,127 @@ test-release *args:
   export PDN_BIND_ADDR=127.0.0.1
   cargo nextest run --release $(just _features "$@") "$@"
 
+# The image the stand runs. The scenarios look for exactly this tag.
+image := "pdn-node-http:dev"
+
+# Build the stand's image from the workspace as it resolves — a store fork
+# pointed at the checkout beside it included.
+[doc("Build the stand's node image")]
+build-image:
+  #!/bin/sh
+  set -eux
+  DOCKER_BUILDKIT=1 docker build -f ops/Dockerfile -t {{ image }} .
+
+# What the build context actually carries, listed against the allowed set in
+# .dockerignore. The criterion is presence — anything outside that set is a
+# leak whatever it weighs; the sizes say which leak is expensive.
+[doc("List what the docker build context carries")]
+check-context:
+  #!/bin/sh
+  set -eu
+  DOCKER_BUILDKIT=1 docker build -q -f ops/Dockerfile.context -t pdn-context-check:dev . >/dev/null
+  docker run --rm pdn-context-check:dev
+
+# Run one node by hand: debug surface on, HTTP port published. PORT overrides
+# the published port, BIND the interface it is published on.
+#
+# BIND defaults to loopback because the surface this publishes is
+# unauthenticated and mints live ceremony secrets: the host binds every
+# interface inside the container, and without an address here the daemon
+# would carry that to every interface of the machine. A node reachable from
+# another machine is asked for explicitly — `BIND=0.0.0.0 just run-image`.
+[doc("Run one stand node in the foreground")]
+run-image:
+  #!/bin/sh
+  set -eux
+  PORT=${PORT:-3011}
+  BIND=${BIND:-127.0.0.1}
+  docker run --rm -e PDN_DEBUG=1 -p "${BIND}:${PORT}:3011" {{ image }}
+
+# The live demo: several nodes on one network — Alice with two personas on a
+# phone plus a laptop, Bob and Carol with a phone and a laptop each — driven
+# through their debug surfaces while everything between them runs over the
+# runtimes' own protocols.
+#
+# The nodes are torn down on every exit, the failing one included: a demo
+# that leaves containers behind has the next run meeting the last run's
+# state, which is the one thing a demo must never do.
+[doc("Run the live demo across containers (needs docker)")]
+demo:
+  #!/bin/sh
+  set -eu
+  docker info >/dev/null 2>&1 || { echo "no container daemon — the demo needs one"; exit 1; }
+  # The build and the bring-up are stagehands: their output is kept back so
+  # the narration reads as one thing, and produced in full if either fails.
+  log=$(mktemp)
+  trap 'docker compose -f ops/compose.yml down --remove-orphans >/dev/null 2>&1; rm -f "$log"' EXIT
+  # The count comes from the compose file rather than from this line: a
+  # number written here goes stale the first time a node is added, and it
+  # already did.
+  nodes=$(docker compose -f ops/compose.yml config --services | wc -l | tr -d ' ')
+  printf 'Building the node image and bringing %s of them up...\n' "$nodes"
+  just build-image >"$log" 2>&1 || { cat "$log"; exit 1; }
+  # The nodes come up from what was just built, named by its content id: the
+  # show and the gate then run one artifact rather than one tag.
+  PDN_STAND_IMAGE=$(just stand-image)
+  [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
+  export PDN_STAND_IMAGE
+  docker compose -f ops/compose.yml up -d --wait >"$log" 2>&1 || { cat "$log"; exit 1; }
+  sh ops/demo.sh
+
+# The nextest profile bounding the stand's parallelism, chosen from what the
+# container daemon reports about itself rather than from this machine's
+# cores: the two differ whenever the daemon runs on a virtual machine or the
+# suite runs inside a development container. Falls back to the profile's own
+# default when no daemon answers, so a caller without one still gets a
+# runnable command rather than an error from arithmetic on an empty string.
+# The identity of the image a run tests: the content id the daemon gave the
+# build, rather than the tag that also names it. A tag is a name any build
+# moves — a second worktree rebuilding it mid-run would otherwise put two
+# revisions into one scenario — and an id cannot be moved. Prints nothing
+# when no daemon answers or nothing is built, so a caller reads an empty
+# answer rather than an error from a missing image.
+[doc("Print the image id the stand's scenarios run against")]
+stand-image:
+  #!/bin/sh
+  set -eu
+  docker images --no-trunc --quiet {{ image }} 2>/dev/null | head -n 1
+
+[doc("Print the nextest profile matching the daemon's CPU count")]
+stand-profile:
+  #!/bin/sh
+  set -eu
+  cpus=$(docker info 2>/dev/null | awk '/^ *CPUs:/{print $2}')
+  case "$cpus" in ''|*[!0-9]*) echo "cap-2"; exit 0 ;; esac
+  for rung in 16 8 4 2; do
+    [ "$cpus" -ge "$rung" ] && { echo "cap-$rung"; exit 0; }
+  done
+  echo "cap-1"
+
+# The stand: build the image, then run the container scenarios against it.
+# Extra args are forwarded to `cargo nextest run`.
+#
+# Deliberately outside `just test` and outside the flaky hunt's default
+# selection, for two reasons that do not depend on how long the scenarios
+# take: the image has to be built first, or a run tests whatever image is
+# lying around, and the flaky hunt selects the integration binaries by
+# default, which would put a container binary into every stress run. Needs a
+# container daemon.
+[doc("Build the image and run the container scenarios (needs docker)")]
+test-docker *args:
+  #!/bin/sh
+  set -eu
+  command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "no container daemon — the stand needs one"; exit 1; }
+  just build-image
+  # What was just built, named by its content id: every container of this run
+  # starts from it, so a rebuild of the tag while the run is under way cannot
+  # mix two revisions into one scenario.
+  PDN_STAND_IMAGE=$(just stand-image)
+  [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it — refusing to run against a tag that can move"; exit 1; }
+  export PDN_STAND_IMAGE
+  cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all "$@"
+
 # Stress / flaky-hunt via nextest. All args are forwarded to `cargo nextest run`.
 #
 # With no test selection it defaults to the scenario (integration) tests,
@@ -164,19 +285,26 @@ check-fix:
   cargo clippy --workspace --all-targets {{ test_features }}
   cargo check --workspace --all-targets {{ test_features }}
 
-# Lint, build, test, integration tests
+# Includes the container suite, as `fix` does: every test of the HTTP surface
+# is one. Needs a container daemon, and builds the image.
+[doc("Lint, build, test, container suite (needs docker)")]
 precommit-check:
   #!/bin/sh
   set -eux
   just check
   just test
+  just test-docker
 
-# Lint, build, test, integration tests, attempt fixes
+# Includes the container suite: every test of the HTTP surface is one, so a
+# pass without it says nothing about that crate. Needs a container daemon,
+# and builds the image.
+[doc("Lint, build, test, container suite, attempt fixes (needs docker)")]
 fix:
   #!/bin/sh
   set -eux
   just check-fix
   just test
+  just test-docker
 
 pr-review branch:
   #!/bin/sh

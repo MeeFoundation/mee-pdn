@@ -76,7 +76,18 @@ pub(crate) async fn publish_grant(
     let identity = parse::id(&identity, "identity")?;
     let peer = parse::id(&peer, "peer")?;
     let publication: GrantPublication = parse::json(&body, "grant publication")?;
-    let claims = NonEmpty::from_vec(publication.claims)
+    let named = publication
+        .claims
+        .into_iter()
+        .map(|granted| {
+            let path = parse::entry_path(&granted.path)?;
+            Ok(pdn_node::GrantedClaim {
+                claim: pdn_node::claim_id_of(&publication.issuer, &path),
+                write: granted.write,
+            })
+        })
+        .collect::<Result<Vec<_>, HostError>>()?;
+    let claims = NonEmpty::from_vec(named)
         .ok_or_else(|| HostError::bad_request("a grant names at least one claim"))?;
     runtime
         .connections()

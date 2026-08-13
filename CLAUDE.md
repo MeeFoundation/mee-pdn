@@ -4,12 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Directory layout
 
-Top of `/Users/theman/work/mee-pdn/`:
-
-| Path        | What it is                                                              |
-| ----------- | ----------------------------------------------------------------------- |
-| `crates/`   | The rebuilt workspace — draft crates (see below).                       |
-| `mia-docs/` | Sibling repo cloned in-place (gitignored) — UWill ADRs, openspec specs. |
+`mia-docs/` is a sibling repo cloned in-place at the top of the workspace (gitignored) — UWill ADRs, openspec specs.
 
 ## Project
 
@@ -25,24 +20,24 @@ only `data-layer`; `pdn-layer` joins in a later change).
 
 ### Crates
 
-- [`crates/pdn-types`](crates/pdn-types/) — platform primitives (`define_byte_id!`, `PdnId`, `PdnIdentityProof`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, `NonEmpty<T>`) plus the data vocabulary (`NamespaceId` = `(about, issued_by)`, `EntryPath`, `EntryInfo`, `NamespaceRole`, `NodeAddr`).
-- [`crates/data-layer`](crates/data-layer/) — the data layer over the forked iroh-docs (git dependency on `github.com/MeeFoundation/pdn-store`; the fork's `validate_entry` hook per ADR-0008 stays available but uninstalled): the entries-only `DataLayer` trait, `SyncNode` stack assembly (one node hosts the store sets of any number of identities; access is bounded by ticket possession until subset-rbsr and UWill land; the ceremony slot — spawn-time registration of externally supplied protocols plus a narrow dial handle — is consumed by pdn-node's two handlers, pairing per ADR-0011 and linking per ADR-0012, and stays protocol-agnostic here because the ceremonies' semantics live in pdn-node), the device-replicated `PrivateMetadataStore` (the one directory of an identity's own state: its devices, the typed tickets to its other stores, and its connections records — plus the namespace accessor and the bounded catch-up wait the linking ceremony stands on), the cross-identity `ConnectionMetadataStore` (one replica per connection direction, issuer-written / counterparty-read per Invariant 3, carrying grants keyed by data-store issuer), and `forget_namespace` (the rollback counterpart of `import_namespace` — unregisters the issuer, not just drops the replica). Scenario tests in its `tests/`. Capability _semantics_ stay above: tokens are opaque payloads here. Invariants are numbered in `mia-docs/openspec/specs/components/pdn-node/invariants.md` (referenced by number, never name). To hack on the fork locally, `[patch]` it to `./pdn-store` (see the workspace `Cargo.toml` comment).
-- [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` module (capability-token format, future chain validation). No iroh dependencies.
-- [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / connections / data / sync services as thin glue over `data-layer`, plus the runtime's two ceremonies. Pairing (ADR-0011): connections are produced by establishment — `invite` mints a bearer-free payload carrying a one-time secret (no ticket, no identity proof — nothing grants durable access; the secret burns on first use), `establish` dials the pairing ALPN and runs the verify-and-burn dialogue, and the grant surface publishes/reads whole-store tickets over the connection's metadata pair (no manual recording). Device linking (ADR-0012, the `linking` module next to `pairing`): `linking_invite` mints the same kind of bearer-free payload (one-time secret inside, nothing durable), `link` dials the linking ALPN — the inviter verifies-and-burns, registers the newcomer's device record itself (from the connection's authenticated peer id), and replies with fresh directory and data-namespace write tickets; `link` imports both and returns caught up, rolling both back on failure. Each `Runtime` is one running node hosting any number of identities, each added by an explicit act (create, or link from a payload); the runtime is the single owner of node assembly — both protocol handlers thread through `spawn` into data-layer's protocol slot — and of the hosted identities' store handles. Services are traits with one production implementation (`IdentityService` — a KERI-backed second implementation is the live prospect; the current one mints placeholder `PdnId`s). Whole-store ticket share/import in the data service is the interim access model for cross-identity namespaces, replaced when capability-scoped sharing lands. Scenario tests in its `tests/`. No host or HTTP dependencies.
-- [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime. `GET /live` always on; the `/debug/` subtree is scaffolding behind `PDN_DEBUG=1` (absent otherwise, route names unpinned) and covers the runtime's four services — identities, the pairing and linking ceremonies, connections and grants, entries — one route to one service call, with entry payloads as raw bodies and everything else as JSON. Refusals arrive as refusals: one closed error table maps the runtime's typed errors to statuses (403 refused, 409 not hosted, 400 malformed, 404 absent, 500 unrecognized). Deliberately absent, and to stay absent: any namespace ticket handover (a grant read hands back the capability alone), anything that forces reconciliation or resets state, and any handler addressing another host — the crate carries no HTTP client, and inter-node traffic is the runtime's own protocols. Env: `PDN_HOST` / `PDN_PORT` (default `127.0.0.1:3011`, loopback so a wider bind is deliberate). Depends on `pdn-node` only — no direct `data-layer` dependency.
+Each crate carries its own `CLAUDE.md` with its contracts and what is deliberately absent from it — read that file when working inside the crate.
+
+- [`crates/pdn-types`](crates/pdn-types/) — platform primitives and the data vocabulary. The only crate `pdn-layer` and `data-layer` share.
+- [`crates/data-layer`](crates/data-layer/) — the data layer over the forked iroh-docs (`github.com/MeeFoundation/pdn-store`): the entries-only `DataLayer` trait, `SyncNode` stack assembly, the metadata stores, the protocol-agnostic ceremony slot.
+- [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model, the `PdnOp` operation AST, the `uwill` module. No iroh dependencies.
+- [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / connections / data / sync services over `data-layer`, plus the pairing (ADR-0011) and linking (ADR-0012) ceremonies. No host or HTTP dependencies.
+- [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime, with the `/debug/` subtree behind `PDN_DEBUG=1`.
 
 ## Commands
 
-Task runner is [just](https://github.com/casey/just). Key recipes:
+Task runner is [just](https://github.com/casey/just) — `just --list` prints every recipe with its doc comment.
 
-- `just build` — `cargo build --workspace`
-- `just test` — `cargo nextest run` (workspace tests via nextest; extra args forwarded). This workspace has no doctests, so nextest covers everything.
-- `just stress` — flaky-hunt via nextest; all args forwarded to `cargo nextest run` (e.g. `just stress --stress-count 300 -E 'binary(linking)'`). See flaky-tests.md.
-- `just check` — `cargo fmt --check` + `cargo clippy --workspace --all-targets` + `cargo check`
-- `just check-fix` — auto-fix formatting/linting, then re-check
-- `just precommit-check` — `check` + `test`
-- `just fix` — `check-fix` + `test`
-- `just setup-tooling` — installs `cargo-watch`, `cargo-nextest`, and wasm targets
+Every test of the HTTP surface is a container test. They carry `#[ignore]`, so
+`just test` on a machine without a daemon or an image stays green and reports
+them skipped; `just test-docker` and the pipeline's own job run them with
+`--run-ignored all`. A test group in `.config/nextest.toml` bounds their
+parallelism: the daemon holds a fixed share of the machine, and the runner's
+default width would saturate it.
 
 Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI installs it via `taiki-e/install-action`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
 
@@ -53,26 +48,7 @@ Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/te
 
 ## Lint rules
 
-Strict safety-first linting via workspace `Cargo.toml`. These are **denied**:
-
-- `unwrap_used`, `panic`, `todo`, `unimplemented` — no panicking in non-test code
-- `dbg_macro`, `print_stdout`, `print_stderr` — no debug output
-- `unsafe_code`, `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`
-- `exit` — no `process::exit`
-- `mem_forget`, `string_to_string`, `infinite_loop`, `unused_must_use`,
-  `non_ascii_idents`
-
-Relaxed in test code via `clippy.toml` (allows unwrap/expect/print/dbg/indexing).
-
-`expect_used`, `indexing_slicing`, `as_conversions`, `str_to_string`,
-`unwrap_in_result`, `redundant_clone`, `large_futures` are **warnings** —
-use `.get()` and `TryFrom`/`TryInto` where possible.
-
-Formatting: `max_width = 100` (rustfmt.toml). Cognitive complexity threshold: 15.
-Max lines per function: 80. Future-size threshold: 16384 (clippy's default;
-iroh's `Endpoint::bind`/`spawn` futures are ~10KB structurally, so the
-earlier 8192 threshold flagged every iroh await point once iroh came into
-actual use in `iroh-docs-experiment`).
+Strict safety-first linting, configured in the workspace `Cargo.toml`, `clippy.toml` and `rustfmt.toml`, enforced by `just check`. Prefer `.get()` and `TryFrom`/`TryInto` over indexing and `as`.
 
 ## Code practices
 
@@ -87,10 +63,6 @@ Cross-cutting practices live in `mia-docs/openspec/specs/code-practices/`:
 
 All git operations that change state — `commit`, `push`, `checkout`, `add`, `rebase`, etc. — are performed **by a human, never by Claude**, in this repo and in the nested `./pdn-store` checkout. Read-only commands (`status`, `diff`, `log`, `show`) are fine.
 
-## pdn-store checks
-
-Any modification of `./pdn-store` ends with running its pre-push checklist (`./pdn-store/CLAUDE.md`, section "Pre-push checklist") before committing: fmt, clippy for all three feature sets, `cargo +nightly docs-rs`, `cargo deny`, tests plus doctests, and the wasm build — all with warnings treated as errors, exactly as that repo's CI runs them.
-
 ## Code comments
 
 - **Maximally brief, critical-only.** A comment earns its place by flagging an invariant, a contract edge, or a non-obvious why. Narrative, alternatives, and process history go.
@@ -100,17 +72,13 @@ Any modification of `./pdn-store` ends with running its pre-push checklist (`./p
 
 - **Each paragraph stands alone — the read-aloud test.** Understanding a paragraph must not require jumping to another text. The prose itself has to survive being read aloud: English is not the first language of every maintainer, and many sound the text out in their head while re-reading, so clumsy phrasing cuts reading speed several times over. Allowed bare references: ADR numbers, Invariant numbers, and D1..Dn where it is unambiguous which spec's decisions are meant — inside the change's own bundle (design/proposal/tasks) bare Dn is fine; in delta specs qualify it ("subset-rbsr D3"), since deltas archive away from the design. Review-finding numbers and dates like "19-07" stay out of specs (no findings doc exists in the tree) — inline the substance instead.
 - **No undefined abbreviations or notation in prose.** Don't invent shorthand or mathematical notation (`F`, `|F|`, `O(|F|)`, `A_P`, …) — spell it out in plain words, or define the term on first use. Established names (UWill, ClaimId, pdn-store) are fine; gratuitous jargon (e.g. "seam") is not. A colleague should read it without decoding anything.
-- **A mechanism is named by the word the code gives it.** Prose that describes an operation the code already names takes that name — `reclaim` for `reclaim_abandoned_sessions`, whose metric is `sync_sessions_reclaimed` — rather than a metaphor coined for the occasion. A coined word cannot be grepped, is defined nowhere, and drifts: «подметание» ended up standing for three different things in one document — that reclaim pass, the removal of a namespace's sessions when its replica closes, and a sweep of stuck peer state that does not exist. An operation the code does not name is described in plain words, not given a new one.
+- **Platform terms keep their English names in every language.** Never translated, in docs or in chat: audience, author, binder, binding, book, capability, catch-up, claim, connection, connection metadata store (CMS), directory, entry, EntryPath, grant, host, hosted, identity, invite, key, linking, lock, memo, namespace, node, orphan, pairing, peer, private metadata store (PMS), race, registry, replica, retract, revoke, scope, session, snapshot, store, surface, swarm, sweep, sync, ticket, tombstone, withdraw. Spelling a term in the local alphabet is translating it too. Where the surrounding language inflects nouns, attach the ending after an apostrophe instead of reshaping the word, and never coin a derived adjective or verb from one of these terms: write "a namespace received under a grant", not "a granted namespace".
+- **One term in the code, one word in the text.** Each term of that list keeps a single spelling throughout a document, and no two of them ever share one. Translation fails in both directions at once: it collapses terms the code separates (revoke, withdraw and retract; entry and write; the author of an entry and the person who wrote the document), and it splits a single term across several words, one of which usually already belongs to another term. Either way the prose stops matching the code it describes.
+- **A mechanism is named by the word the code gives it.** Prose that describes an operation the code already names takes that name — `reclaim` for `reclaim_abandoned_sessions`, whose metric is `sync_sessions_reclaimed` — rather than a metaphor coined for the occasion. A coined word cannot be grepped, is defined nowhere, and drifts: one invented sweeping-metaphor ended up standing for three different things in one document — that reclaim pass, the removal of a namespace's sessions when its replica closes, and a sweep of stuck peer state that does not exist. An operation the code does not name is described in plain words, not given a new one.
 - **Markdown paragraphs are single-line.** Write each paragraph as one physical line (no hard wrapping); the renderer wraps it. Lists and headings stay one item per line.
 - **Numbers: digits with thousands separators** (`10,000,000 records`, `1,000 peers`), not words — applies to every number in the docs, so the text scans at a glance.
-- **Prototype generations: never bare «v3».** The pre-pivot prototype (`mee-v3-single-device/`: iroh-willow stack, `mee-*` names) is called **v3-single-device** everywhere — mia-docs, mee-noremote, chat. The current rebuild is informally **v3-multi-device** (calling it v4 was not approved), so an unqualified "v3" is ambiguous between the two.
+- **Prototype generations: never bare «v3».** The pre-pivot prototype (`mee-v3-single-device/`: iroh-willow stack, `mee-*` names) is called **v3-single-device** everywhere — mia-docs, chat. The current rebuild is informally **v3-multi-device** (calling it v4 was not approved), so an unqualified "v3" is ambiguous between the two.
 
-## OpenSpec (mia-docs)
+## Path-scoped rules
 
-- **`openspec validate --all --strict` before archiving a change.** It is a parser gate for change deltas, not a review: it checks that delta files parse (`## ADDED/MODIFIED/REMOVED/RENAMED Requirements` sections) and that every requirement keeps at least one `#### Scenario:` block. It does not check content — SHALL wording, WHEN/THEN completeness, or truthfulness.
-- **Scenario headers must be exactly `#### Scenario:` (four hashes).** A wrong heading level drops the scenario from parsing _silently_ — validation still passes if the requirement retains another scenario. Heading levels are checked by eye, not by the tool.
-- **The main spec tree is not validated at all.** `openspec validate --specs` finds nothing in our layout (`openspec/specs/components/**`, `architecture/**` — the tool expects flat `specs/<name>/spec.md`). Everything below is therefore maintained by hand:
-  - **Sweep the whole tree when a change removes or renames things.** A change's own deltas are not enough — grep `openspec/specs/**` for names of removed types/tests/mechanisms (precedent: multi-identity-node removed `Binding`/`BindingIndex`, and `pdn-node/namespace-addressing.md` kept naming them until noticed by accident).
-  - **Sweep other active changes too.** A change landing first can invalidate assumptions in a sibling change's proposal/design (precedent: subset-rbsr referenced the removed ingest gate, a deleted test, and one-identity phrasing in D4 long after multi-identity-node landed).
-  - **Keep `architecture/language/` in sync.** A term used by specs (e.g. swarm) gets a glossary entry there, and the spec links the term's first use to it.
-  - **Verify spec scenarios against running code before writing them down.** A plausible formulation once claimed a zero-length write degenerates into deletion; the engine actually rejects it (`AttemptedToInsertEmptyEntry`). Each scenario should correspond to a test or a checked property of the fork.
+[`.claude/rules/`](.claude/rules/) holds guidance that loads only when the matching files are in play: `openspec.md` for the `mia-docs/` spec tree, `pdn-store.md` for the nested `./pdn-store` checkout.
