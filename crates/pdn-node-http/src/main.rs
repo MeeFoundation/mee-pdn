@@ -14,7 +14,14 @@ use pdn_node_http::{bind_addr_from_env, debug_enabled_from_env, router};
 /// e.g. a long-running `/debug/link` — before giving up on them and moving
 /// on to `runtime.shutdown()` regardless. Independent of any ceremony's own
 /// budget (which can run up to a day). Runtime shutdown has its own bounds.
-const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+///
+/// This budget and that shutdown together have to fit inside the grace the
+/// stopper allows, or the process is killed part-way and the drain promised
+/// here is the first thing lost: a container runtime sends SIGTERM and
+/// follows it with SIGKILL about 10 seconds later unless it is told
+/// otherwise. Sized against that default, rather than against a wider grace
+/// every deployment would have to remember to configure.
+const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
