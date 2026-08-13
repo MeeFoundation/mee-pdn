@@ -5,8 +5,11 @@
 # shows. Dependencies are compiled in their own layer (cargo-chef), so a
 # source edit rebuilds the workspace alone.
 
+# The recipe tool is pinned to a release, not a range: it decides how the
+# dependency layer is planned, so a range lets one commit build through two
+# different tools and produce two different images.
 FROM rust:1.93-bookworm AS chef
-RUN cargo install cargo-chef --locked --version ^0.1
+RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /app
 
 FROM chef AS planner
