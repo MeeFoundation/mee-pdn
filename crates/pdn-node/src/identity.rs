@@ -105,7 +105,9 @@ impl IdentityService for RuntimeIdentityService<'_> {
         // before this line leaves replicas nothing points at, and a failed
         // write (a full disk) fails the create while the previous record,
         // and every identity it names, stays intact.
-        state.commit_hosting(identity, directory.namespace())?;
+        state
+            .commit_hosting(identity, directory.namespace())
+            .await?;
         // The directory arms session classification for this identity —
         // its device records decide who is an own device, and its data
         // namespace serves fail-closed. The armer's subscription is taken

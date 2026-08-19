@@ -209,10 +209,23 @@ impl State {
     /// failure — a full disk above all — leaves the previous record intact
     /// and surfaces as the failed create or link, so recording a second
     /// identity cannot lose the first. A no-op on a memory node.
-    pub(crate) fn commit_hosting(&self, identity: PdnId, directory: NamespaceId) -> Result<()> {
+    ///
+    /// The record never names a replica the store has not committed. The
+    /// file becomes durable inside `write_record`, while the replicas it
+    /// names sit in the store's open write transaction, committed on the
+    /// store's own schedule; a process killed between the two comes back
+    /// to a line whose replica does not open, and that start fails rather
+    /// than host less than the record names. Flushing first closes the
+    /// window for every path that records hosting, present and future.
+    pub(crate) async fn commit_hosting(
+        &self,
+        identity: PdnId,
+        directory: NamespaceId,
+    ) -> Result<()> {
         let Some(dir) = &self.data_dir else {
             return Ok(());
         };
+        self.node.flush_replicas(directory).await?;
         let mut lines: Vec<HostedLine> = self
             .identities
             .iter()

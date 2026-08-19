@@ -1004,6 +1004,30 @@ impl SyncNode {
         Ok(())
     }
 
+    /// Commit the replica store's open write transaction, so what this node
+    /// wrote through it is on disk before anything durable points at it.
+    /// Writes are batched into one transaction the store commits on its own
+    /// schedule, so a replica created a moment ago is not on disk yet; a
+    /// read takes a snapshot, and taking one commits the batch first.
+    /// Store-wide although it names a namespace: the snapshot covers every
+    /// replica, and the namespace only says which open replica the read
+    /// addresses. The read matches nothing — the commit is the point.
+    pub async fn flush_replicas(&self, namespace: NamespaceId) -> Result<()> {
+        let doc = {
+            let docs = self
+                .tracked_docs
+                .lock()
+                .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+            docs.get(&namespace)
+                .map(|tracked| tracked.doc.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("namespace {namespace} is not tracked on this node")
+                })?
+        };
+        let _committed = doc.get_many(Query::all().limit(0)).await?;
+        Ok(())
+    }
+
     /// Handle to the node's blob store, for stores that read entry payloads.
     pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
         self.blobs.clone()

@@ -583,7 +583,10 @@ async fn link_via_dialogue_inner(
     // failure rolls the link back whole and the previous record stays
     // intact, so replicas nothing points at are never hosted.
     let mut guard = state.lock().await;
-    if let Err(err) = guard.commit_hosting(payload.identity, directory.namespace()) {
+    if let Err(err) = guard
+        .commit_hosting(payload.identity, directory.namespace())
+        .await
+    {
         drop(guard);
         rollback.roll_back().await;
         return Err(err).context("the hosted-identities record could not be written");
