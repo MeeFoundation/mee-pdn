@@ -103,9 +103,10 @@ run-image:
 # through their debug surfaces while everything between them runs over the
 # runtimes' own protocols.
 #
-# The nodes are torn down on every exit, the failing one included: a demo
-# that leaves containers behind has the next run meeting the last run's
-# state, which is the one thing a demo must never do.
+# The nodes and their volumes are torn down on every exit, the failing one
+# included: a demo that leaves containers — or, now that each node keeps its
+# state on a volume, volumes — behind has the next run meeting the last
+# run's state, which is the one thing a demo must never do.
 [doc("Run the live demo across containers (needs docker)")]
 demo:
   #!/bin/sh
@@ -114,7 +115,7 @@ demo:
   # The build and the bring-up are stagehands: their output is kept back so
   # the narration reads as one thing, and produced in full if either fails.
   log=$(mktemp)
-  trap 'docker compose -f ops/compose.yml down --remove-orphans >/dev/null 2>&1; rm -f "$log"' EXIT
+  trap 'docker compose -f ops/compose.yml down --remove-orphans --volumes >/dev/null 2>&1; rm -f "$log"' EXIT
   # The count comes from the compose file rather than from this line: a
   # number written here goes stale the first time a node is added, and it
   # already did.
@@ -216,8 +217,24 @@ stress-docker count="100" *args:
   # `set positional-arguments` puts every parameter in "$@", `count` first —
   # left in, it reaches nextest as a filter and the hunt selects nothing.
   shift
+  # The runner's output is captured beside being shown: under
+  # `--stress-count` with `--no-fail-fast` the runner has been seen exiting
+  # zero while its own summary counted failed iterations, and a hunt that
+  # trusted the exit code alone then threw away exactly the evidence it
+  # exists to keep. The file is read back below; the `tail` is the live
+  # view, ended once the run is.
+  run_log="target/tmp/stand-hunt-run.log"
+  : > "$run_log"
+  tail -f "$run_log" &
+  tail_pid=$!
   cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' \
-    --run-ignored all --stress-count {{ count }} --no-fail-fast "$@" || status=$?
+    --run-ignored all --stress-count {{ count }} --no-fail-fast "$@" >"$run_log" 2>&1 || status=$?
+  kill "$tail_pid" 2>/dev/null || true
+  wait "$tail_pid" 2>/dev/null || true
+  if [ "$status" -eq 0 ] && grep -qE '[1-9][0-9]* failed' "$run_log"; then
+    echo "hunt: the runner exited clean while its summary counted failures — counting them"
+    status=1
+  fi
   replaced=$(grep -c 'never answered and was replaced' "$replaced_log" 2>/dev/null || true)
   echo
   echo "hunt: {{ count }} iterations requested, containers replaced: ${replaced:-0}"
@@ -228,6 +245,7 @@ stress-docker count="100" *args:
     mkdir -p "$kept"
     mv "$logs" "$kept/" 2>/dev/null || true
     cp "$replaced_log" "$kept/" 2>/dev/null || true
+    cp "$run_log" "$kept/" 2>/dev/null || true
     echo "hunt: caught something — the nodes' logs are in $kept"
   fi
   exit "$status"

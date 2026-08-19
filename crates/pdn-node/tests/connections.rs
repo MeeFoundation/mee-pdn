@@ -3,11 +3,11 @@
 //! side keep disjoint connection lists.
 
 use anyhow::Result;
-use pdn_node::{ConnectionsService as _, IdentityService as _, Runtime};
+use pdn_node::{ConnectionsService as _, IdentityService as _};
 use test_utils::eventually;
 
 mod common;
-use common::{establish_patiently, link_patiently};
+use common::{establish_patiently, link_patiently, memory_runtime};
 
 /// One runtime hosts two identities; only one of them establishes a
 /// connection. The established connection lists under that identity alone
@@ -16,9 +16,9 @@ use common::{establish_patiently, link_patiently};
 #[tokio::test(flavor = "multi_thread")]
 async fn established_on_one_device_listed_on_the_linked_one_and_disjoint_per_identity() -> Result<()>
 {
-    let a = Runtime::spawn().await?;
-    let peer = Runtime::spawn().await?;
-    let device = Runtime::spawn().await?;
+    let a = memory_runtime().await?;
+    let peer = memory_runtime().await?;
+    let device = memory_runtime().await?;
 
     // A hosts both identities; only X establishes (with P, hosted on the
     // peer runtime — the invite payload travels as a value).

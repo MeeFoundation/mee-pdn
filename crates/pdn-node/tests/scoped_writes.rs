@@ -35,8 +35,9 @@ use common::establish_patiently;
 const RECONCILE: Duration = Duration::from_millis(300);
 
 async fn spawn_runtime() -> Result<Runtime> {
-    Runtime::spawn_with(SpawnOptions {
+    Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
+        ..SpawnOptions::memory()
     })
     .await
 }

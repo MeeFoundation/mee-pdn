@@ -673,11 +673,12 @@ async fn held_by_another_pair(state: &State, unbinding: (PdnId, PdnId), issuer: 
         if (*audience, *peer) == unbinding {
             continue;
         }
-        match open.peer.read_grant(issuer, *audience).await {
-            Ok(data_layer::GrantRead::Granted(..)) => return true,
-            // Unreadable or unreachable is no evidence of holding either
-            // way; a grant that turns out live re-imports on its own sweep.
-            Ok(_) | Err(_) => {}
+        // Unreadable or unreachable is no evidence of holding either way;
+        // a grant that turns out live re-imports on its own sweep.
+        if let Ok(data_layer::GrantRead::Granted(..)) =
+            open.peer.read_grant(issuer, *audience).await
+        {
+            return true;
         }
     }
     false
@@ -751,6 +752,12 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
     // Every directory change re-applies the retraction markers: a marker
     // replicated from a sibling acts here, and re-application is idempotent.
     apply_retractions(state, identity).await;
+    // The identity's data namespace follows the directory's `data` ticket:
+    // bound already on the device that created or linked the identity, and
+    // re-bound here when the node holds the directory alone — a restart. A
+    // ticket whose payload has not landed yet leaves the issuer unbound
+    // until a later sweep; a read meanwhile refuses as unknown, fail-closed.
+    bind_data_namespace(state, identity).await;
     let peers = {
         let Ok(hosted) = state.hosted(identity) else {
             return;
@@ -771,6 +778,38 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
         if state.grant_binders.insert((identity, peer)) {
             spawn_grant_binder(runtime.clone(), identity, peer, peer_store);
         }
+    }
+}
+
+/// Bind hosted `identity`'s data namespace from its directory's `data`
+/// ticket when nothing is bound for it — the recovery half of the binding:
+/// creation and linking bind it themselves, and a restarted node holds the
+/// replica and the ticket while its in-memory registry starts empty. The
+/// import is idempotent against a replica the store already holds (the
+/// capability merges), so re-running it on every sweep converges. Nothing
+/// here dials by itself; the import's sync attempts ride the ordinary
+/// reconcile machinery.
+async fn bind_data_namespace(state: &mut State, identity: PdnId) {
+    match state.node.data_namespace_of(identity) {
+        Ok(None) => {}
+        // Bound already, or a registry failure this sweep cannot judge —
+        // the next sweep retries.
+        Ok(Some(_)) | Err(_) => return,
+    }
+    let Ok(hosted) = state.hosted(identity) else {
+        return;
+    };
+    // Absent, payload-waiting, or unreadable: cold until the payload's
+    // arrival fires the next sweep.
+    let Ok(Some(ticket)) = hosted
+        .directory
+        .get_ticket(crate::identity::DATA_TICKET_KIND)
+        .await
+    else {
+        return;
+    };
+    if let Err(err) = state.node.import_namespace(identity, ticket).await {
+        tracing::debug!(%identity, "re-binding the data namespace failed: {err:#}");
     }
 }
 

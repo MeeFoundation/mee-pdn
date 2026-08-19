@@ -16,17 +16,17 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
-    InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, Runtime,
+    InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, SpawnOptions,
     SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion,
     LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
-use test_utils::{eventually, ids, wait_devices, TIMEOUT};
+use test_utils::{eventually, ids, memory_node, wait_devices, TIMEOUT};
 
 mod common;
 use common::{
     dial_linking_without_reading_from, establish_patiently, granted_patiently, link_patiently,
-    link_probe, read_frame, write_frame, LINKING_ALPN,
+    link_probe, memory_runtime, read_frame, write_frame, LINKING_ALPN,
 };
 
 /// Wait until the probe's directory lists exactly `devices` (order-free).
@@ -98,9 +98,9 @@ async fn assert_directory_is(
 /// readable on the other.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_peer = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_peer = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let p = rt_peer.identity().create().await?;
 
@@ -187,9 +187,9 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
 /// data catches up transitively.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_through_a_non_founder_device() -> Result<()> {
-    let rt_1 = Runtime::spawn().await?;
-    let rt_2 = Runtime::spawn().await?;
-    let rt_3 = Runtime::spawn().await?;
+    let rt_1 = memory_runtime().await?;
+    let rt_2 = memory_runtime().await?;
+    let rt_3 = memory_runtime().await?;
     let x = rt_1.identity().create().await?;
     let path = EntryPath::new("affiliation/group")?;
     rt_1.data().write(x, &path, b"Acme Engineering").await?;
@@ -236,9 +236,9 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
 /// test below.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_c = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_c = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let path = EntryPath::new("contact/name")?;
 
@@ -350,9 +350,9 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
 /// owns that harness.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_c = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_c = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let path = EntryPath::new("contact/name")?;
 
@@ -399,7 +399,7 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
     // where the address of a node that is gone would cost the transport's
     // whole connect timeout and leave the probe asserting nothing within any
     // shorter bound.
-    let bystander = SyncNode::spawn().await?;
+    let bystander = memory_node().await?;
     let unreachable = LinkingPayload {
         version: LINKING_FORMAT_VERSION,
         inviter_addr: bystander.dial_handle().addr(),
@@ -436,9 +436,9 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
 /// had the refusal dialed and burned it.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_c = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_c = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     link_patiently(&rt_b, &rt_a, x).await?;
 
@@ -472,7 +472,7 @@ async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
 /// pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
 
     // The probe first: it watches the device set and warms the path for
@@ -484,7 +484,7 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     );
 
     // The vanishing dialer: presents a live secret, never reads the reply.
-    let vanisher = Runtime::spawn().await?;
+    let vanisher = memory_runtime().await?;
     let vanisher_id = vanisher.node_id();
     let payload = rt_a.identity().linking_invite(x, None).await?;
     let dial = vanisher.sync().dial_handle_for_test().await;
@@ -562,8 +562,11 @@ impl ProtocolHandler for HungInviter {
 /// keeps no residue.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_inviter_costs_the_caller_its_budget_and_nothing_more() -> Result<()> {
-    let hung = SyncNode::spawn_with_protocols(vec![(LINKING_ALPN.to_vec(), Box::new(HungInviter))])
-        .await?;
+    let hung = SyncNode::spawn_with(
+        vec![(LINKING_ALPN.to_vec(), Box::new(HungInviter))],
+        SpawnOptions::memory(),
+    )
+    .await?;
     let payload = LinkingPayload {
         version: LINKING_FORMAT_VERSION,
         inviter_addr: hung.dial_handle().addr(),
@@ -571,7 +574,7 @@ async fn a_hung_inviter_costs_the_caller_its_budget_and_nothing_more() -> Result
         identity: ids::DAVE,
     };
 
-    let rt = Runtime::spawn().await?;
+    let rt = memory_runtime().await?;
     let started = std::time::Instant::now();
     let err = rt
         .identity()
@@ -643,7 +646,7 @@ impl ProtocolHandler for DeadTicketInviter {
 async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<()> {
     // Mint real tickets from a scratch node, then take it away: the
     // namespaces they address end up hosted nowhere.
-    let scratch = SyncNode::spawn().await?;
+    let scratch = memory_node().await?;
     let dead_directory = PrivateMetadataStore::create(&scratch).await?;
     let directory_ticket = dead_directory
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -659,13 +662,16 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     scratch.shutdown().await?;
 
     // An inviter that answers the dialogue with those dead tickets.
-    let fake_inviter = SyncNode::spawn_with_protocols(vec![(
-        LINKING_ALPN.to_vec(),
-        Box::new(DeadTicketInviter {
-            directory: directory_ticket,
-            data: data_ticket,
-        }),
-    )])
+    let fake_inviter = SyncNode::spawn_with(
+        vec![(
+            LINKING_ALPN.to_vec(),
+            Box::new(DeadTicketInviter {
+                directory: directory_ticket,
+                data: data_ticket,
+            }),
+        )],
+        SpawnOptions::memory(),
+    )
     .await?;
     let payload = LinkingPayload {
         version: LINKING_FORMAT_VERSION,
@@ -677,7 +683,7 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     // The exchange completes, the imports land, the catch-up cannot: the
     // wait's typed timeout surfaces (retried in case the first dial fails
     // before anything is imported, which rolls back nothing).
-    let rt_b = Runtime::spawn().await?;
+    let rt_b = memory_runtime().await?;
     let deadline = std::time::Instant::now() + TIMEOUT;
     let err = loop {
         let err = rt_b
@@ -741,9 +747,9 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_link_leaves_no_residue() -> Result<()> {
-    let rt_inviter = Runtime::spawn().await?;
+    let rt_inviter = memory_runtime().await?;
     let x = rt_inviter.identity().create().await?;
-    let rt = Arc::new(Runtime::spawn().await?);
+    let rt = Arc::new(memory_runtime().await?);
     let pause = rt.pause_next_link_after_import().await;
     let payload = rt_inviter.identity().linking_invite(x, None).await?;
     let attempt = {
@@ -771,9 +777,9 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()> {
-    let inviter = Runtime::spawn().await?;
+    let inviter = memory_runtime().await?;
     let identity = inviter.identity().create().await?;
-    let runtime = Arc::new(Runtime::spawn().await?);
+    let runtime = Arc::new(memory_runtime().await?);
     let pause = runtime.pause_next_link_after_import().await;
     let first_payload = inviter.identity().linking_invite(identity, None).await?;
     let first = {
@@ -812,10 +818,10 @@ async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothing() -> Result<()> {
-    let inviter = Runtime::spawn().await?;
+    let inviter = memory_runtime().await?;
     let identity = inviter.identity().create().await?;
     let (probe, directory) = link_probe(&inviter, identity).await?;
-    let dialer = Runtime::spawn().await?;
+    let dialer = memory_runtime().await?;
     let newcomer = dialer.node_id();
     let mut failures = inviter.subscribe_linking_failures().await;
     inviter.fail_next_pending_device_write_for_test().await;
@@ -860,8 +866,8 @@ async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothi
 async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() -> Result<()> {
     // Two personas of one person, as `multi_identity` models them: X on the
     // phone, Y on the laptop, connected, with X granting Y its namespace.
-    let rt_phone = Runtime::spawn().await?;
-    let rt_laptop = Runtime::spawn().await?;
+    let rt_phone = memory_runtime().await?;
+    let rt_laptop = memory_runtime().await?;
     let x = rt_phone.identity().create().await?;
     let y = rt_laptop.identity().create().await?;
 
@@ -894,7 +900,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 
     // The person now adds X to the laptop too. The link fails: its tickets
     // address replicas hosted nowhere, so the catch-up cannot complete.
-    let scratch = SyncNode::spawn().await?;
+    let scratch = memory_node().await?;
     let dead_directory = PrivateMetadataStore::create(&scratch).await?;
     let directory_ticket = dead_directory
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -909,13 +915,16 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
         .await?;
     scratch.shutdown().await?;
 
-    let fake_inviter = SyncNode::spawn_with_protocols(vec![(
-        LINKING_ALPN.to_vec(),
-        Box::new(DeadTicketInviter {
-            directory: directory_ticket,
-            data: data_ticket,
-        }),
-    )])
+    let fake_inviter = SyncNode::spawn_with(
+        vec![(
+            LINKING_ALPN.to_vec(),
+            Box::new(DeadTicketInviter {
+                directory: directory_ticket,
+                data: data_ticket,
+            }),
+        )],
+        SpawnOptions::memory(),
+    )
     .await?;
     let payload = LinkingPayload {
         version: LINKING_FORMAT_VERSION,
@@ -967,9 +976,9 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 /// other — including on a runtime that hosts both sources side by side.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_identity_requires_its_own_linking() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_peers = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_peers = memory_runtime().await?;
 
     // A hosts two identities; each establishes its own connection before
     // any linking, so what B receives is attributable.
@@ -1035,8 +1044,8 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
 /// exactly the created + linked ones afterwards, node id stable throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn hosted_identities_follow_create_and_link() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
 
     // Fresh runtime: no identities, a node id already.
     let node_id = rt_b.sync().node_id();
@@ -1085,10 +1094,10 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() -> Result<()> {
-    let rt_phone = Runtime::spawn().await?;
-    let rt_laptop = Runtime::spawn().await?;
-    let rt_bob = Runtime::spawn().await?;
-    let rt_carol = Runtime::spawn().await?;
+    let rt_phone = memory_runtime().await?;
+    let rt_laptop = memory_runtime().await?;
+    let rt_bob = memory_runtime().await?;
+    let rt_carol = memory_runtime().await?;
 
     // The laptop links first: everything about the connection below
     // reaches it only by replication — the case where, without arming by
@@ -1204,8 +1213,8 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario: link, own access, withdrawal, negative control
 async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Result<()> {
-    let rt_x_device = Runtime::spawn().await?;
-    let rt_shared = Runtime::spawn().await?;
+    let rt_x_device = memory_runtime().await?;
+    let rt_shared = memory_runtime().await?;
 
     // X and Y connect and X grants Y read-only access to one path while each
     // still lives on its own node — linking two identities directly onto one
@@ -1300,7 +1309,7 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
 
     // Paired deny, the tightest unauthorized party: a node with no
     // connection to X at all is refused as unknown, not served an absence.
-    let rt_outsider = Runtime::spawn().await?;
+    let rt_outsider = memory_runtime().await?;
     let err = rt_outsider.data().read(x, &own_path).await.unwrap_err();
     assert!(
         err.downcast_ref::<UnknownIssuer>().is_some(),

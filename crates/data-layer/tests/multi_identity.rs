@@ -14,7 +14,7 @@ use data_layer::{
     AddrInfoOptions, AuthorId, DocTicket, PrivateMetadataStore, ShareMode, SyncNode, UnknownIssuer,
 };
 use pdn_types::{EntryPath, PdnId};
-use test_utils::{ids, wait_connected, wait_devices, wait_entry_is};
+use test_utils::{ids, memory_node, wait_connected, wait_devices, wait_entry_is};
 
 /// Bring one identity up on `node` and lay down its test fixtures: a
 /// directory with the node registered and a connection to `peer`, and a data
@@ -52,8 +52,8 @@ async fn multi_identity_two_devices() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;
 
     // Phone hosts both identities' store sets side by side.
-    let mut phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let mut phone = memory_node().await?;
+    let laptop = memory_node().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
     let (work_phone_dir, work_author, work_ticket, work_data) = provision_identity_with_data(
@@ -147,8 +147,8 @@ async fn forgetting_a_namespace_unregisters_its_issuer() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;
 
     // Phone issues both namespaces; the laptop imports both.
-    let mut phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let mut phone = memory_node().await?;
+    let laptop = memory_node().await?;
     let (_work_dir, _work_author, _work_ticket, work_data) = provision_identity_with_data(
         &mut phone,
         ids::ALICE_AT_WORK,

@@ -17,9 +17,12 @@ use futures_lite::{FutureExt, StreamExt};
 use iroh::{
     endpoint::{presets, Connection},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
-    Endpoint, EndpointAddr, EndpointId, Watcher as _,
+    Endpoint, EndpointAddr, EndpointId, SecretKey, Watcher as _,
 };
-use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
+use iroh_blobs::{
+    store::{fs::FsStore, mem::MemStore},
+    BlobsProtocol, ALPN as BLOBS_ALPN,
+};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
     api::{
@@ -52,7 +55,7 @@ pub struct UnknownIssuer {
     pub issuer: PdnId,
 }
 
-/// A protocol supplied to [`SyncNode::spawn_with_protocols`]: the ALPN it
+/// A protocol supplied to [`SyncNode::spawn_with`]: the ALPN it
 /// answers under, and the handler dispatched for connections arriving on it.
 pub type ExtraProtocol = (Vec<u8>, Box<dyn DynProtocolHandler>);
 
@@ -63,13 +66,24 @@ pub const BUILT_IN_ALPNS: [&[u8]; 3] = [BLOBS_ALPN, GOSSIP_ALPN, DOCS_ALPN];
 
 /// A spawn was handed an extra protocol whose ALPN is already taken — by a
 /// built-in protocol ([`BUILT_IN_ALPNS`]) or by another extra in the same
-/// call. Downcast from the `anyhow::Error` of
-/// [`SyncNode::spawn_with_protocols`].
+/// call. Downcast from the `anyhow::Error` of [`SyncNode::spawn_with`].
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("protocol ALPN already taken: {}", String::from_utf8_lossy(.alpn))]
 pub struct AlpnTaken {
     /// The colliding ALPN.
     pub alpn: Vec<u8>,
+}
+
+/// A spawn addressed a directory another running node holds: the replica
+/// store inside takes an exclusive lock, and it is taken. The refused start
+/// leaves the running node untouched. Downcast from the `anyhow::Error` of
+/// the spawn entries; the underlying lock error stays in the chain as the
+/// cause.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("storage directory {} is held by another running node", directory.display())]
+pub struct DirectoryHeld {
+    /// The directory both nodes were pointed at.
+    pub directory: std::path::PathBuf,
 }
 
 /// Wraps an externally supplied protocol handler so a panic in its `accept`
@@ -113,29 +127,65 @@ impl ProtocolHandler for PanicGuarded {
 /// them a replica whose initial exchange died would starve permanently.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Spawn-time tuning of the node stack ([`SyncNode::spawn_with`]).
-/// `Default` is the production posture.
+/// Where a node keeps its state — chosen by name at spawn, with no default:
+/// the runtime's production consumer is a mobile application that embeds it
+/// and passes a directory inside its own sandbox, and the workspace's suites
+/// want memory and say so. Deliberately not read from the process
+/// environment: several nodes spawn in one process, and a directory belongs
+/// to one node.
+#[derive(Debug, Clone)]
+pub enum StorageConfig {
+    /// Everything in memory; the node's state ends with the process.
+    Memory,
+    /// The node's state lives under this directory: `docs/` holds the
+    /// fork's replica store and its persisted author, `blobs/` the payload
+    /// bytes, `node.key` the endpoint's secret key. Created with owner-only
+    /// permissions when absent — the replica store holds namespace secrets
+    /// and the blobs payload bytes in the clear, so the boundary sits on
+    /// the directory. One running node per directory: the replica store's
+    /// exclusive lock refuses a second ([`DirectoryHeld`]).
+    Directory(std::path::PathBuf),
+}
+
+/// Spawn-time configuration of the node stack ([`SyncNode::spawn_with`]):
+/// where the node stores its state — required, no default — plus tuning.
+/// Build with [`SpawnOptions::memory`] or [`SpawnOptions::on_directory`].
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
+    /// Where the node keeps its state. Required: a spawn that names
+    /// neither memory nor a directory is not expressible.
+    pub storage: StorageConfig,
     /// How often the periodic reconcile pass re-requests a sync for every
     /// doc this node holds open (default [`RECONCILE_INTERVAL`]).
     pub reconcile_interval: Duration,
 }
 
-impl Default for SpawnOptions {
-    fn default() -> Self {
+impl SpawnOptions {
+    /// Options for a node whose state lives in memory and ends with the
+    /// process — what the workspace's in-process suites run on.
+    pub fn memory() -> Self {
         Self {
+            storage: StorageConfig::Memory,
+            reconcile_interval: RECONCILE_INTERVAL,
+        }
+    }
+
+    /// Options for a node whose state lives under `directory`
+    /// ([`StorageConfig::Directory`]).
+    pub fn on_directory(directory: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            storage: StorageConfig::Directory(directory.into()),
             reconcile_interval: RECONCILE_INTERVAL,
         }
     }
 }
 
-/// One running node: iroh endpoint, gossip, in-memory blob store, and the
-/// docs engine, with data replicas addressed by their issuer [`PdnId`] and
+/// One running node: iroh endpoint, gossip, blob store, and the docs
+/// engine, with data replicas addressed by their issuer [`PdnId`] and
 /// entries by [`EntryPath`]s. One node hosts the store sets of any number of
 /// identities. Every doc the node opens joins a periodic reconcile pass
 /// ([`SpawnOptions::reconcile_interval`]). Externally supplied protocols
-/// join the same endpoint at spawn ([`SyncNode::spawn_with_protocols`]);
+/// join the same endpoint at spawn ([`SyncNode::spawn_with`]);
 /// their dial sides and the node's own address are reached through
 /// [`SyncNode::dial_handle`].
 ///
@@ -152,7 +202,10 @@ impl Default for SpawnOptions {
 /// [`SyncNode::import_namespace_scoped`]; a node that registers nothing
 /// serves — and admits — any ticket holder the whole replica.
 ///
-/// Storage is in-memory.
+/// Storage is chosen at spawn ([`SpawnOptions::storage`]), by name: in
+/// memory, ending with the process, or under a directory — the replicas,
+/// the blobs, the node's one author and its endpoint key all live there, so
+/// a node spawned on the same directory comes back as the same node.
 #[derive(Debug)]
 pub struct SyncNode {
     router: Router,
@@ -184,6 +237,11 @@ pub struct SyncNode {
     /// `shutdown` call finds `None` and skips the send, making the method
     /// idempotent under a shared reference.
     reconciler_stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// The node's exclusive hold on its storage directory
+    /// ([`lock_directory`]) — released by [`shutdown`](Self::shutdown),
+    /// with the stores, or when the node is dropped or the process ends.
+    /// `None` on a memory node.
+    directory_lock: Option<std::fs::File>,
 }
 
 /// How a tracked doc re-syncs — independent of the binding's serving
@@ -263,34 +321,24 @@ impl DialHandle {
 }
 
 impl SyncNode {
-    /// Spawn the full stack with no externally supplied protocols and
-    /// default [`SpawnOptions`].
-    pub async fn spawn() -> Result<Self> {
-        Self::spawn_with(Vec::new(), SpawnOptions::default()).await
-    }
-
-    /// Spawn the full stack with no externally supplied protocols, tuned by
-    /// `options`.
-    pub async fn spawn_with_options(options: SpawnOptions) -> Result<Self> {
+    /// Spawn the full stack with no externally supplied protocols,
+    /// configured by `options` — where the state lives is a required part
+    /// of it ([`SpawnOptions::storage`]).
+    pub async fn spawn(options: SpawnOptions) -> Result<Self> {
         Self::spawn_with(Vec::new(), options).await
     }
 
-    /// Spawn the full stack, serving `extra_protocols` on the same endpoint
-    /// next to the built-in ones (ADR-0011, ADR-0012). A connection arriving
-    /// under a registered extra ALPN is dispatched to its handler as a raw
-    /// bidirectional connection — not a document-sync session. ALPNs must be
-    /// unique across [`BUILT_IN_ALPNS`] and the extras; a collision fails
-    /// the spawn with [`AlpnTaken`] before anything binds.
+    /// The full-control spawn: extra protocols plus configuration, served
+    /// on the same endpoint next to the built-in ones (ADR-0011, ADR-0012).
+    /// A connection arriving under a registered extra ALPN is dispatched to
+    /// its handler as a raw bidirectional connection — not a document-sync
+    /// session. ALPNs must be unique across [`BUILT_IN_ALPNS`] and the
+    /// extras; a collision fails the spawn with [`AlpnTaken`] before
+    /// anything binds.
     ///
     /// A handler's `accept` should return `Err(AcceptError)` rather than
     /// panic: a panic is contained per connection, but a `panic = "abort"`
     /// build still aborts the process.
-    pub async fn spawn_with_protocols(extra_protocols: Vec<ExtraProtocol>) -> Result<Self> {
-        Self::spawn_with(extra_protocols, SpawnOptions::default()).await
-    }
-
-    /// The full-control spawn: extra protocols plus tuning. The other spawn
-    /// entries are thin wrappers over this one.
     pub async fn spawn_with(
         extra_protocols: Vec<ExtraProtocol>,
         options: SpawnOptions,
@@ -305,8 +353,29 @@ impl SyncNode {
             }
         }
 
-        let endpoint = bind_endpoint().await?;
-        let blobs = MemStore::default();
+        // A configured directory is provisioned before anything binds, and
+        // the endpoint's key comes out of it — a node that persists its
+        // stores but not its key would come back under a fresh wire id
+        // while its device records and tickets all name the old one. The
+        // directory lock comes first of all: one running node per
+        // directory, refused by name ([`DirectoryHeld`]).
+        let (secret_key, directory_lock) = match &options.storage {
+            StorageConfig::Memory => (None, None),
+            StorageConfig::Directory(directory) => {
+                provision_directory(directory)?;
+                let lock = lock_directory(directory)?;
+                (Some(read_or_generate_node_key(directory)?), Some(lock))
+            }
+        };
+
+        let endpoint = bind_endpoint(secret_key).await?;
+        let blobs_store: iroh_blobs::api::Store = match &options.storage {
+            StorageConfig::Memory => MemStore::default().into(),
+            StorageConfig::Directory(directory) => FsStore::load(directory.join(BLOBS_DIR))
+                .await
+                .with_context(|| format!("cannot open the blob store in {}", directory.display()))?
+                .into(),
+        };
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         // The access book and registry exist before the engine so the
@@ -317,7 +386,11 @@ impl SyncNode {
         let (retraction, retraction_verdicts) = RetractionTracker::new();
         let retraction = Arc::new(retraction);
         let observer_tracker = Arc::clone(&retraction);
-        let docs = Docs::memory()
+        let docs_builder = match &options.storage {
+            StorageConfig::Memory => Docs::memory(),
+            StorageConfig::Directory(directory) => Docs::persistent(directory.join(DOCS_DIR)),
+        };
+        let docs = docs_builder
             .session_access_provider(session_access_provider(
                 Arc::clone(&access),
                 Arc::clone(&registry),
@@ -329,13 +402,13 @@ impl SyncNode {
             .rejection_observer(Arc::new(move |namespace, reject, peer| {
                 observer_tracker.record_rejection(namespace, reject, peer);
             }))
-            .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
-            .await?;
+            .spawn(endpoint.clone(), blobs_store.clone(), gossip.clone())
+            .await
+            .map_err(|err| annotate_store_error(err, &options.storage))?;
         let docs_api = docs.api().clone();
-        let blobs_store: iroh_blobs::api::Store = (*blobs).clone();
         access.set_blobs(blobs_store.clone());
         let mut router = Router::builder(endpoint)
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs, None))
+            .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs_store, None))
             .accept(GOSSIP_ALPN, gossip)
             .accept(DOCS_ALPN, docs);
         // Wrapped so a panic in a handler cannot escape into iroh's accept
@@ -362,6 +435,7 @@ impl SyncNode {
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
+            directory_lock,
         })
     }
 
@@ -625,6 +699,25 @@ impl SyncNode {
         Ok(docs.len())
     }
 
+    /// How many live records `issuer`'s replica holds at `path`, across
+    /// all authors — where every ordinary read collapses to the latest one.
+    /// Behind the `test-util` feature and absent from every product build:
+    /// a scenario asserts a rewrite after a restart replaced its
+    /// predecessor rather than accreting beside it under a second author,
+    /// which no latest-wins read can tell apart.
+    #[cfg(feature = "test-util")]
+    pub async fn live_record_count(&self, issuer: PdnId, path: &EntryPath) -> Result<usize> {
+        let doc = self.doc(issuer)?;
+        let query = Query::all().key_exact(path.as_str().as_bytes());
+        let mut stream = std::pin::pin!(doc.get_many(query).await?);
+        let mut count = 0usize;
+        while let Some(entry) = stream.next().await {
+            let _live = entry?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// The shared precondition of both data-namespace imports: hand back
     /// the tracking entry the import is about to replace, refusing when the
     /// namespace is tracked but not data-bound — that replica is a
@@ -846,6 +939,23 @@ impl SyncNode {
         Ok(doc)
     }
 
+    /// Open a device-shared store's doc this node's store already holds,
+    /// and enrol it in the periodic reconcile pass — recovery's
+    /// counterpart of [`new_doc`](Self::new_doc) and
+    /// [`import_doc`](Self::import_doc): no ticket is consumed and nothing
+    /// is created, so a namespace the store does not hold is an error, not
+    /// a fresh replica.
+    pub(crate) async fn open_doc(&self, namespace: NamespaceId) -> Result<Doc> {
+        let doc = self
+            .docs
+            .open(namespace)
+            .await
+            .with_context(|| format!("namespace {namespace} is not in this node's store"))?
+            .ok_or_else(|| anyhow::anyhow!("namespace {namespace} is not in this node's store"))?;
+        self.track(&doc, Vec::new(), SyncStrategy::Swarm)?;
+        Ok(doc)
+    }
+
     /// Import a device-shared store's doc from `ticket`; the doc joins the
     /// periodic reconcile pass together with the ticket's contacts, so a
     /// replica whose initial exchange died is re-dialed rather than starved.
@@ -910,9 +1020,23 @@ impl SyncNode {
         Ok(ticket)
     }
 
-    /// Create a new author keypair on this node.
+    /// Create a new author keypair on this node — a standalone writer
+    /// identity. The node's own stores do not write with these: they share
+    /// the one author of [`default_author`](Self::default_author).
     pub async fn create_author(&self) -> Result<AuthorId> {
         let author = self.docs.author_create().await?;
+        Ok(author)
+    }
+
+    /// The node's one author — the fork's default author, persisted with
+    /// the replicas on a directory-configured node, so a restarted node
+    /// writes as the author it wrote as before. Every store on the node
+    /// writes with it: an author minted per store would make a rewritten
+    /// key accumulate one live record per author, and leave a device record
+    /// written under one author standing after a withdrawal written under
+    /// another.
+    pub async fn default_author(&self) -> Result<AuthorId> {
+        let author = self.docs.author_default().await?;
         Ok(author)
     }
 
@@ -1062,6 +1186,21 @@ impl SyncNode {
             let _ = stop.send(());
         }
         self.router.shutdown().await?;
+        // The blob store is shut down explicitly rather than left to its
+        // last handle's drop: on a directory-configured node it holds its
+        // database open, and a node respawned on the same directory would
+        // meet its predecessor's lock. Best-effort, keeping the repeat call
+        // a no-op: a store already shut down answers with an error, not
+        // with a hang.
+        let _ = self.blobs.shutdown().await;
+        // The directory lock leaves with the stores, not with this value's
+        // drop: a detached task holding the node alive a moment longer —
+        // an armer mid-sweep — must not make a spawn on the same directory
+        // read as a second running node. Best-effort for the same
+        // idempotence reason as above.
+        if let Some(lock) = &self.directory_lock {
+            let _ = lock.unlock();
+        }
         Ok(())
     }
 
@@ -1072,12 +1211,243 @@ impl SyncNode {
     }
 }
 
-/// Bind the node's endpoint. If `PDN_BIND_ADDR` holds an IP address the
-/// endpoint binds that address with an ephemeral port; unset, it binds all
-/// interfaces. Scenario tests bind `127.0.0.1` (the just recipes set it) to
-/// keep test traffic on loopback; production spawns leave it unset.
-async fn bind_endpoint() -> Result<Endpoint> {
+/// The layout of a configured storage directory
+/// ([`StorageConfig::Directory`]). What a person finds on a volume: `docs/`
+/// — the fork's replica store (`docs.redb`) and its persisted author
+/// (`default-author`); `blobs/` — payload bytes; `node.key` — the
+/// endpoint's secret key, hex-encoded; `lock` — the running node's
+/// exclusive hold on the directory, content-free.
+const DOCS_DIR: &str = "docs";
+/// See [`DOCS_DIR`].
+const BLOBS_DIR: &str = "blobs";
+/// See [`DOCS_DIR`].
+const NODE_KEY_FILE: &str = "node.key";
+/// See [`DOCS_DIR`].
+const LOCK_FILE: &str = "lock";
+
+/// Owner-only permissions for the storage directory: the replica store
+/// inside holds namespace secrets and the blob store payload bytes in the
+/// clear, so the boundary sits on the directory rather than on the key file
+/// alone.
+#[cfg(unix)]
+const DIR_MODE: u32 = 0o700;
+/// Owner-only permissions for the key file.
+#[cfg(unix)]
+const KEY_MODE: u32 = 0o600;
+
+/// Create the storage directory with owner-only permissions when it is
+/// absent, verifying the permissions of what was created; a directory that
+/// already exists — a mounted volume, a re-open — is taken as the caller
+/// gave it. The `docs/` and `blobs/` subdirectories are created either way:
+/// the stores expect their paths to exist, and the boundary sits on the
+/// directory itself.
+fn provision_directory(directory: &std::path::Path) -> Result<()> {
+    if !directory.exists() {
+        create_owner_only_dir(directory)?;
+    }
+    for sub in [DOCS_DIR, BLOBS_DIR] {
+        std::fs::create_dir_all(directory.join(sub)).with_context(|| {
+            format!(
+                "cannot create {sub}/ in storage directory {}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_owner_only_dir(directory: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(directory)
+        .with_context(|| format!("cannot create storage directory {}", directory.display()))?;
+    // Checked, not assumed: the process umask can strip permission bits at
+    // creation, and a directory wider than owner-only exposes namespace
+    // secrets.
+    let mode = std::fs::metadata(directory)?.permissions().mode() & 0o777;
+    if mode != DIR_MODE {
+        return Err(anyhow::anyhow!(
+            "storage directory {} was created with permissions {mode:o}, expected {DIR_MODE:o}",
+            directory.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_dir(directory: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("cannot create storage directory {}", directory.display()))?;
+    Ok(())
+}
+
+/// Take the node's exclusive hold on the directory: an advisory lock on the
+/// `lock` file, held for the node's lifetime and released with the process.
+/// The stores below take exclusive locks of their own, but this one comes
+/// first, for two reasons: the refusal names the directory and its cause
+/// rather than arriving as a lock error from three layers down that reads
+/// as corruption — and the blob store's open on a database another node
+/// holds waits instead of failing, so a start that reached it would hang
+/// rather than refuse.
+fn lock_directory(directory: &std::path::Path) -> Result<std::fs::File> {
+    let path = directory.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("cannot open the lock file {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::Error::new(DirectoryHeld {
+            directory: directory.to_path_buf(),
+        })),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("cannot lock the lock file {}", path.display()))
+        }
+    }
+}
+
+/// Read the endpoint's secret key from `node.key`, or generate and store
+/// one on the first start. A key file that is present but cannot be read or
+/// parsed stops the start with an error naming it — never a regenerated
+/// key: regenerating would silently change the node id, which is the exact
+/// failure the stored key exists to prevent.
+fn read_or_generate_node_key(directory: &std::path::Path) -> Result<SecretKey> {
+    let path = directory.join(NODE_KEY_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_node_key(&text)
+            .with_context(|| format!("cannot parse the node key file {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            generate_node_key(directory, &path)
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("cannot read the node key file {}", path.display()))
+        }
+    }
+}
+
+fn parse_node_key(text: &str) -> Result<SecretKey> {
+    text.trim()
+        .parse::<SecretKey>()
+        .map_err(|err| anyhow::anyhow!("not a secret key: {err}"))
+}
+
+/// Lowercase hex, the encoding `SecretKey`'s own parser accepts back.
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(64), |mut out, b| {
+        // Writing into a `String` cannot fail.
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// Generate a fresh key and commit it to `path` — written beside and linked
+/// into place, so no half-written key can exist, and created exclusively,
+/// so two starts racing on one directory cannot mint different keys: the
+/// loser reads the winner's file instead.
+#[cfg(unix)]
+fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Result<SecretKey> {
+    use std::{
+        io::Write,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let fresh = SecretKey::generate();
+    let encoded = encode_hex(&fresh.to_bytes());
+    let staged = directory.join(format!("{NODE_KEY_FILE}.{}.tmp", std::process::id()));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(KEY_MODE)
+            .open(&staged)
+            .with_context(|| format!("cannot stage the node key beside {}", path.display()))?;
+        file.write_all(encoded.as_bytes())?;
+        file.sync_all()?;
+    }
+    let committed = match std::fs::hard_link(&staged, path) {
+        Ok(()) => Ok(fresh),
+        // Another start committed first; its key is the node's key.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read the node key file {}", path.display()))?;
+            parse_node_key(&text)
+                .with_context(|| format!("cannot parse the node key file {}", path.display()))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("cannot commit the node key file {}", path.display()))
+        }
+    };
+    let _staged_gone = std::fs::remove_file(&staged);
+    // Checked, not assumed — the same reason as the directory's own check.
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode != KEY_MODE {
+        return Err(anyhow::anyhow!(
+            "node key file {} has permissions {mode:o}, expected {KEY_MODE:o}",
+            path.display()
+        ));
+    }
+    committed
+}
+
+#[cfg(not(unix))]
+fn generate_node_key(_directory: &std::path::Path, path: &std::path::Path) -> Result<SecretKey> {
+    use std::io::Write;
+    let fresh = SecretKey::generate();
+    let encoded = encode_hex(&fresh.to_bytes());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("cannot create the node key file {}", path.display()))?;
+    file.write_all(encoded.as_bytes())?;
+    file.sync_all()?;
+    Ok(fresh)
+}
+
+/// Name the directory in a failed store open, and tell the one failure that
+/// is not corruption apart from the rest: a replica store whose exclusive
+/// lock another running node holds surfaces as [`DirectoryHeld`] rather
+/// than as a lock error from three layers down that reads as a corrupt
+/// store. The underlying error stays in the chain either way.
+fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::Error {
+    let StorageConfig::Directory(directory) = storage else {
+        return err;
+    };
+    let held = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<redb::DatabaseError>(),
+            Some(redb::DatabaseError::DatabaseAlreadyOpen)
+        )
+    });
+    if held {
+        err.context(DirectoryHeld {
+            directory: directory.clone(),
+        })
+    } else {
+        err.context(format!(
+            "cannot open the node's stores in {}",
+            directory.display()
+        ))
+    }
+}
+
+/// Bind the node's endpoint, with `secret_key` when the node's storage
+/// holds one — the node id is then the one it had before — and a fresh key
+/// otherwise. If `PDN_BIND_ADDR` holds an IP address the endpoint binds
+/// that address with an ephemeral port; unset, it binds all interfaces.
+/// Scenario tests bind `127.0.0.1` (the just recipes set it) to keep test
+/// traffic on loopback; production spawns leave it unset.
+async fn bind_endpoint(secret_key: Option<SecretKey>) -> Result<Endpoint> {
     let builder = Endpoint::builder(presets::Minimal);
+    let builder = match secret_key {
+        Some(key) => builder.secret_key(key),
+        None => builder,
+    };
     let builder = match std::env::var("PDN_BIND_ADDR") {
         Ok(addr) if !addr.is_empty() => {
             let ip: IpAddr = addr

@@ -32,7 +32,7 @@ use pdn_node::PdnId;
 use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath};
 use serde::de::DeserializeOwned;
 use testcontainers::{
-    core::{logs::LogFrame, ContainerPort, ExecCommand, WaitFor},
+    core::{logs::LogFrame, ContainerPort, ExecCommand, Mount, WaitFor},
     runners::AsyncRunner as _,
     ContainerAsync, GenericImage, ImageExt as _,
 };
@@ -78,6 +78,17 @@ const HTTP_PORT: ContainerPort = ContainerPort::Tcp(HTTP_PORT_NUM);
 /// never answer costs before it is replaced.
 const READY_BUDGET: Duration = Duration::from_secs(20);
 const READY_POLL: Duration = Duration::from_millis(250);
+
+/// How long a restarted node has to answer `/live`. Wider than
+/// [`READY_BUDGET`] for two reasons: a restarted node opens its stores and
+/// recovers its hosted identities before the listener binds, and a restart
+/// cannot be answered by replacement — the container's state directory is
+/// the subject, so there is no second container to hand the scenario to.
+/// Generosity is free (the wait returns the moment liveness answers, about
+/// a second on an idle daemon); the stress pass is where the narrow budget
+/// was measured failing, with the daemon juggling every other test's
+/// containers.
+const RESTART_BUDGET: Duration = Duration::from_secs(60);
 
 /// A ceiling on one liveness probe. The budget above is checked between
 /// requests, so without this a probe that connects and then never answers
@@ -149,16 +160,29 @@ impl Stand {
     /// Start a node with the debug surface on, and wait until it answers
     /// liveness.
     pub async fn spawn(&self, label: &str) -> Result<Host> {
-        self.spawn_with_debug(label, true).await
+        self.spawn_configured(label, true, None).await
     }
 
     /// Start a node with the debug surface off — the gate's other side, and
     /// the image's own default.
     pub async fn spawn_without_debug(&self, label: &str) -> Result<Host> {
-        self.spawn_with_debug(label, false).await
+        self.spawn_configured(label, false, None).await
     }
 
-    async fn spawn_with_debug(&self, label: &str, debug: bool) -> Result<Host> {
+    /// Start a node whose state directory is a size-bounded filesystem: a
+    /// tmpfs of `state_bytes` mounted over the image's state directory, so
+    /// the store meets a disk that fills — which an in-memory node cannot,
+    /// failing by exhausting the process instead.
+    pub async fn spawn_with_bounded_state(&self, label: &str, state_bytes: i64) -> Result<Host> {
+        self.spawn_configured(label, true, Some(state_bytes)).await
+    }
+
+    async fn spawn_configured(
+        &self,
+        label: &str,
+        debug: bool,
+        state_bytes: Option<i64>,
+    ) -> Result<Host> {
         let mut failed = None;
         let mut replaced = String::new();
         // Resolved once for every container this node is given: a replacement
@@ -187,16 +211,26 @@ impl Stand {
             if debug {
                 image = image.with_env_var("PDN_DEBUG", "1");
             }
+            if let Some(state_bytes) = state_bytes {
+                // A tmpfs over the image's state directory, sized to the
+                // scenario. Mode 1777 because the tmpfs arrives root-owned
+                // and the binary runs as the image's non-root user.
+                image = image.with_mount(
+                    Mount::tmpfs_mount("/var/lib/pdn")
+                        .with_size_bytes(state_bytes)
+                        .with_mode(0o1777),
+                );
+            }
             let container = image
                 .start()
                 .await
                 .with_context(|| format!("starting {label}: is {reference} built?"))?;
             let client = reqwest::Client::new();
-            match wait_live(&container, label, &client).await {
+            match wait_live(&container, label, &client, READY_BUDGET).await {
                 Ok(base) => {
                     return Ok(Host {
                         label: label.to_owned(),
-                        base,
+                        base: std::sync::Mutex::new(base),
                         client,
                         container,
                         replaced,
@@ -265,7 +299,11 @@ impl Answer {
 /// One node of the stand: a container and the client that reaches it.
 pub struct Host {
     label: String,
-    base: String,
+    /// Where this node is reached — behind a lock because a restart moves
+    /// it: a stopped container's published-port mapping is released, and
+    /// the port it comes back on is a different one, re-read from the
+    /// daemon by [`start`](Self::start).
+    base: std::sync::Mutex<String>,
     client: reqwest::Client,
     container: ContainerAsync<GenericImage>,
     /// What it took to get this node up, empty when it came up first try.
@@ -310,14 +348,81 @@ impl Host {
         .await
     }
 
-    /// Stop this node — the process ends and, with storage in memory, its
-    /// state ends with it. Nothing restarts a stopped node: a restarted
-    /// container is a different node with a new node id.
+    /// Stop this node cleanly — the process ends; the container's
+    /// filesystem, and with it the state directory, stays for a later
+    /// [`start`](Self::start).
     pub async fn stop(&self) -> Result<()> {
         self.container
             .stop()
             .await
             .with_context(|| format!("stopping {}", self.label))
+    }
+
+    /// Kill this node — no grace and no shutdown path (`SIGKILL`), the
+    /// ordinary end of a process. Through the CLI on purpose: the client's
+    /// own stop-with-zero-timeout still leads with the stop signal, and a
+    /// process that glimpses it is a process that said goodbye.
+    pub fn kill(&self) -> Result<()> {
+        let output = std::process::Command::new("docker")
+            .args(["kill", self.container.id()])
+            .output()
+            .with_context(|| format!("killing {}", self.label))?;
+        ensure!(
+            output.status.success(),
+            "killing {} failed: {}",
+            self.label,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    /// Start this node's stopped container and wait until it answers
+    /// liveness again. The published-port mapping was released by the stop
+    /// and the port it comes back on is a different one — which may by
+    /// then belong to another test's container — so the address is re-read
+    /// from the daemon here, and every URL handed out afterwards comes
+    /// from that read.
+    ///
+    /// One start is worth two attempts, the restart counterpart of a
+    /// replaced container: the daemon has been seen re-using the previous
+    /// host port after a restart while its forwarder black-holes it — the
+    /// node answers on its own loopback and nothing reaches it from the
+    /// host. A second stop and start re-rolls the mapping; the state
+    /// directory, the scenario's subject, persists across any number of
+    /// restarts. Recorded like a replacement, so a green run that needed
+    /// the retry stays visible.
+    pub async fn start(&self) -> Result<()> {
+        let mut last = None;
+        for attempt in 1..=SPAWN_ATTEMPTS {
+            self.container
+                .start()
+                .await
+                .with_context(|| format!("starting {}", self.label))?;
+            match wait_live(&self.container, &self.label, &self.client, RESTART_BUDGET).await {
+                Ok(base) => {
+                    *self
+                        .base
+                        .lock()
+                        .map_err(|_poisoned| anyhow::anyhow!("base-url lock poisoned"))? = base;
+                    return Ok(());
+                }
+                Err(err) => {
+                    if attempt < SPAWN_ATTEMPTS {
+                        record_replacement(&format!(
+                            "[{}] restarted container's published port never answered; \
+                             stopped and started again. {err:#}\n",
+                            self.label
+                        ));
+                        self.container
+                            .stop()
+                            .await
+                            .with_context(|| format!("re-stopping {}", self.label))?;
+                    }
+                    last = Some(err);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("{} was never started", self.label)))
     }
 
     /// Whether this node's process is still running, as the daemon sees it.
@@ -347,9 +452,14 @@ impl Host {
     /// Send one request to this node's surface.
     pub async fn request(&self, method: Method, path: &str, body: Bytes) -> Result<Answer> {
         let method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+        let base = self
+            .base
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("base-url lock poisoned"))?
+            .clone();
         let response = self
             .client
-            .request(method, format!("{}{path}", self.base))
+            .request(method, format!("{base}{path}"))
             .body(body)
             .send()
             .await
@@ -474,8 +584,9 @@ async fn wait_live(
     container: &ContainerAsync<GenericImage>,
     label: &str,
     client: &reqwest::Client,
+    budget: Duration,
 ) -> Result<String> {
-    let deadline = std::time::Instant::now() + READY_BUDGET;
+    let deadline = std::time::Instant::now() + budget;
     // An address the daemon cannot state yet is waited for like any other
     // unready thing, inside the same budget. Asked once at the top, this
     // answers "does not expose port 3011/tcp" often enough to be seen in
@@ -507,7 +618,7 @@ async fn wait_live(
                 .unwrap_or_else(|err| format!("<unresolvable: {err}>"));
             let first = first.unwrap_or_else(|| "<never resolved>".to_owned());
             return Err(anyhow::anyhow!(
-                "{label} never answered /live within {READY_BUDGET:?} \
+                "{label} never answered /live within {budget:?} \
                  (first dialed {first}, now resolves to {now}, \
                  accepts on its own loopback: {})\n{}",
                 accepts_from_inside(container).await,
@@ -663,29 +774,38 @@ async fn poll_read(
 ) -> Result<()> {
     let route = format!("/debug/data/{issuer}/{}", encode_path(path));
     let deadline = tokio::time::Instant::now() + CONVERGENCE_BUDGET;
+    // The last answer that arrived, carried into the failure: a deadline
+    // that trips mid-request must still report what the node had been
+    // answering — "no answer at all" is reserved for a wait that truly
+    // never got one, because the two are different diagnoses.
+    let mut last: Option<Answer> = None;
     loop {
-        let answer = match tokio::time::timeout_at(deadline, host.get(&route)).await {
-            Ok(answer) => answer?,
-            Err(_elapsed) => {
-                return Err(anyhow::anyhow!(
-                    "no answer at all within {CONVERGENCE_BUDGET:?}\n{}",
-                    host.diagnostics().await
-                ))
+        let cut_mid_request = match tokio::time::timeout_at(deadline, host.get(&route)).await {
+            Ok(answer) => {
+                let answer = answer?;
+                if holds(&answer) {
+                    return Ok(());
+                }
+                last = Some(answer);
+                false
             }
+            Err(_elapsed) => true,
         };
-        if holds(&answer) {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() > deadline {
-            return Err(anyhow::anyhow!(
-                "last answer was {}: {}\n{}",
-                answer.status,
-                answer.text(),
-                // The node that was read from, not the one written to: the
-                // answer says the value never arrived, and this says what
-                // this node was doing instead of receiving it.
-                host.diagnostics().await
-            ));
+        if cut_mid_request || tokio::time::Instant::now() > deadline {
+            // The node that was read from, not the one written to: the
+            // answer says the value never arrived, and this says what this
+            // node was doing instead of receiving it.
+            let diagnostics = host.diagnostics().await;
+            return Err(match last {
+                Some(answer) => anyhow::anyhow!(
+                    "last answer was {}: {}\n{diagnostics}",
+                    answer.status,
+                    answer.text()
+                ),
+                None => {
+                    anyhow::anyhow!("no answer at all within {CONVERGENCE_BUDGET:?}\n{diagnostics}")
+                }
+            });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

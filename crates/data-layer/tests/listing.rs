@@ -6,13 +6,13 @@
 //! `UnknownIssuer`.
 
 use anyhow::Result;
-use data_layer::{SyncNode, UnknownIssuer};
+use data_layer::UnknownIssuer;
 use pdn_types::{EntryInfo, EntryPath};
-use test_utils::ids;
+use test_utils::{ids, memory_node};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> Result<()> {
-    let node = SyncNode::spawn().await?;
+    let node = memory_node().await?;
     let author = node.create_author().await?;
     node.create_namespace(ids::ALICE).await?;
 

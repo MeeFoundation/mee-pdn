@@ -17,11 +17,11 @@ use std::sync::{
 
 use anyhow::Result;
 use data_layer::{
-    AcceptError, AddrInfoOptions, AlpnTaken, Connection, ProtocolHandler, ShareMode, SyncNode,
-    BUILT_IN_ALPNS,
+    AcceptError, AddrInfoOptions, AlpnTaken, Connection, ProtocolHandler, ShareMode, SpawnOptions,
+    SyncNode, BUILT_IN_ALPNS,
 };
 use pdn_types::{EntryPath, NodeId};
-use test_utils::{ids, wait_entry_is};
+use test_utils::{ids, memory_node, wait_entry_is};
 
 /// The test protocol's ALPN — deliberately not a built-in one.
 const ECHO_ALPN: &[u8] = b"/pdn-test/echo/0";
@@ -91,10 +91,12 @@ impl ProtocolHandler for PanickingHandler {
 #[tokio::test(flavor = "multi_thread")]
 async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     let panicker = PanickingHandler::default();
-    let node_a =
-        SyncNode::spawn_with_protocols(vec![(PANIC_ALPN.to_vec(), Box::new(panicker.clone()))])
-            .await?;
-    let node_b = SyncNode::spawn().await?;
+    let node_a = SyncNode::spawn_with(
+        vec![(PANIC_ALPN.to_vec(), Box::new(panicker.clone()))],
+        SpawnOptions::memory(),
+    )
+    .await?;
+    let node_b = memory_node().await?;
 
     // Dial the panicking protocol and drive a stream so its handler runs.
     // The handler panics after reading, so our side must see an error rather
@@ -163,9 +165,12 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn unregistered_alpn_is_refused() -> Result<()> {
     let echo = EchoHandler::default();
-    let node_a =
-        SyncNode::spawn_with_protocols(vec![(ECHO_ALPN.to_vec(), Box::new(echo.clone()))]).await?;
-    let node_b = SyncNode::spawn().await?;
+    let node_a = SyncNode::spawn_with(
+        vec![(ECHO_ALPN.to_vec(), Box::new(echo.clone()))],
+        SpawnOptions::memory(),
+    )
+    .await?;
+    let node_b = memory_node().await?;
 
     let refused = node_b
         .dial_handle()
@@ -193,20 +198,23 @@ async fn unregistered_alpn_is_refused() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn alpn_collisions_are_refused_at_spawn() -> Result<()> {
     for reserved in BUILT_IN_ALPNS {
-        let err = SyncNode::spawn_with_protocols(vec![(
-            reserved.to_vec(),
-            Box::new(EchoHandler::default()),
-        )])
+        let err = SyncNode::spawn_with(
+            vec![(reserved.to_vec(), Box::new(EchoHandler::default()))],
+            SpawnOptions::memory(),
+        )
         .await
         .expect_err("a built-in ALPN must be refused at spawn");
         let taken: &AlpnTaken = err.downcast_ref().expect("typed AlpnTaken error");
         assert_eq!(taken.alpn, reserved);
     }
 
-    let err = SyncNode::spawn_with_protocols(vec![
-        (ECHO_ALPN.to_vec(), Box::new(EchoHandler::default())),
-        (ECHO_ALPN.to_vec(), Box::new(EchoHandler::default())),
-    ])
+    let err = SyncNode::spawn_with(
+        vec![
+            (ECHO_ALPN.to_vec(), Box::new(EchoHandler::default())),
+            (ECHO_ALPN.to_vec(), Box::new(EchoHandler::default())),
+        ],
+        SpawnOptions::memory(),
+    )
     .await
     .expect_err("a duplicate extra ALPN must be refused at spawn");
     let taken: &AlpnTaken = err.downcast_ref().expect("typed AlpnTaken error");

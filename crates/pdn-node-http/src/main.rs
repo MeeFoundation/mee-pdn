@@ -1,14 +1,16 @@
 //! Entry point: serve one embedded runtime over HTTP.
 //!
-//! Environment: `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default
-//! `3011`), and `PDN_DEBUG=1` to mount the scaffolding `/debug/` routes
-//! (absent otherwise). The binary is glue only — assembly and authorization
+//! Environment: `PDN_DATA_DIR` (required — the runtime's storage directory;
+//! the host offers no in-memory mode, and unset stops the start),
+//! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`), and
+//! `PDN_DEBUG=1` to mount the scaffolding `/debug/` routes (absent
+//! otherwise). The binary is glue only — assembly and authorization
 //! posture live in `pdn-node` (see the library crate docs).
 
 use std::{sync::Arc, time::Duration};
 
-use pdn_node::Runtime;
-use pdn_node_http::{bind_addr_from_env, debug_enabled_from_env, router};
+use pdn_node::{Runtime, SpawnOptions};
+use pdn_node_http::{bind_addr_from_env, data_dir_from_env, debug_enabled_from_env, router};
 
 /// How long `main` waits for axum's graceful drain — in-flight requests,
 /// e.g. a long-running `/debug/link` — before giving up on them and moving
@@ -27,7 +29,12 @@ const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let runtime = Arc::new(Runtime::spawn().await?);
+    // The directory is resolved and the runtime spawned before the listener
+    // binds: an unset variable or an unusable directory — held by another
+    // node, unwritable — exits here, serving neither liveness nor the debug
+    // surface, and never falls back to memory.
+    let data_dir = data_dir_from_env()?;
+    let runtime = Arc::new(Runtime::spawn(SpawnOptions::on_directory(data_dir)).await?);
     // The two startup markers below bracket the only silent stretch of a
     // node's life. Without them a node stuck in `Runtime::spawn` and one
     // serving happily but unreachable leave byte-identical logs, and the

@@ -14,7 +14,7 @@ use data_layer::{
     AddrInfoOptions, DocTicket, PrivateMetadataStore, ShareMode, SyncNode, UnknownIssuer,
 };
 use pdn_types::{EntryPath, PdnId};
-use test_utils::{ids, wait_connected, wait_devices, wait_entry_is};
+use test_utils::{ids, memory_node, wait_connected, wait_devices, wait_entry_is};
 
 /// Bring one identity up on `phone` with its fixtures: a directory with the
 /// phone registered and a connection to `peer`, plus `value` at `path` in
@@ -60,9 +60,9 @@ async fn import_data_from(from: &SyncNode, to: &mut SyncNode, issuer: PdnId) -> 
 async fn three_devices_two_identities() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;
 
-    let mut phone = SyncNode::spawn().await?;
-    let mut laptop = SyncNode::spawn().await?;
-    let mut tablet = SyncNode::spawn().await?;
+    let mut phone = memory_node().await?;
+    let mut laptop = memory_node().await?;
+    let mut tablet = memory_node().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
     let tablet_id = tablet.node_id();

@@ -8,8 +8,11 @@
 # to loopback: the debug surface is unauthenticated and mints live ceremony
 # secrets, so a wider bind is never the default.
 #
-# Storage is in memory, so a node that goes away takes its state with it and
-# the demo starts clean every time.
+# Each node keeps its state on a named volume of its own, mounted over the
+# image's state directory (the image's PDN_DATA_DIR already points there) —
+# a stopped node started again mid-show is the same node. The demo recipe
+# removes the volumes with the containers on every exit, so a run still
+# never meets the previous run's state.
 
 name: pdn-demo
 
@@ -27,24 +30,40 @@ services:
   alice-phone:
     <<: *node
     ports: ["127.0.0.1:3011:3011"]
+    volumes: ["alice-phone-state:/var/lib/pdn"]
   alice-work-laptop:
     <<: *node
     ports: ["127.0.0.1:3012:3011"]
+    volumes: ["alice-work-laptop-state:/var/lib/pdn"]
   alice-leisure-laptop:
     <<: *node
     ports: ["127.0.0.1:3013:3011"]
+    volumes: ["alice-leisure-laptop-state:/var/lib/pdn"]
   bob-phone:
     <<: *node
     ports: ["127.0.0.1:3014:3011"]
+    volumes: ["bob-phone-state:/var/lib/pdn"]
   bob-laptop:
     <<: *node
     ports: ["127.0.0.1:3015:3011"]
+    volumes: ["bob-laptop-state:/var/lib/pdn"]
   carol-phone:
     <<: *node
     ports: ["127.0.0.1:3016:3011"]
+    volumes: ["carol-phone-state:/var/lib/pdn"]
   carol-laptop:
     <<: *node
     ports: ["127.0.0.1:3017:3011"]
+    volumes: ["carol-laptop-state:/var/lib/pdn"]
 
 networks:
   demo:
+
+volumes:
+  alice-phone-state:
+  alice-work-laptop-state:
+  alice-leisure-laptop-state:
+  bob-phone-state:
+  bob-laptop-state:
+  carol-phone-state:
+  carol-laptop-state:

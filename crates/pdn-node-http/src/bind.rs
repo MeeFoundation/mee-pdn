@@ -73,6 +73,27 @@ pub fn debug_enabled_from_env() -> Result<bool> {
     debug_enabled(env("PDN_DEBUG")?.as_deref())
 }
 
+/// Resolve the runtime's storage directory from `PDN_DATA_DIR`, `None`
+/// being unset. Required: the host exists for the container stand, offers
+/// no in-memory mode and carries no path of its own — a host that started
+/// without a directory would promise persistence while holding everything
+/// in RAM, which from outside looks like a working node until its state is
+/// gone.
+pub fn data_dir(raw: Option<&str>) -> Result<std::path::PathBuf> {
+    match raw {
+        Some(dir) if !dir.is_empty() => Ok(std::path::PathBuf::from(dir)),
+        Some(_) | None => Err(anyhow::anyhow!(
+            "PDN_DATA_DIR is not set — the host requires the runtime's storage directory \
+             and offers no in-memory mode"
+        )),
+    }
+}
+
+/// [`data_dir`] over this process's own environment: `PDN_DATA_DIR`.
+pub fn data_dir_from_env() -> Result<std::path::PathBuf> {
+    data_dir(env("PDN_DATA_DIR")?.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +153,26 @@ mod tests {
         assert!(debug_enabled(Some("yes")).is_err());
         assert!(debug_enabled(Some("TRUE")).is_err());
         assert!(debug_enabled(Some(" 1")).is_err());
+    }
+
+    /// The host has no in-memory mode and no path of its own: unset — or
+    /// set to nothing — stops the start, naming the variable.
+    #[test]
+    fn an_unset_data_dir_fails_naming_the_variable() {
+        for raw in [None, Some("")] {
+            let err = data_dir(raw).unwrap_err();
+            assert!(
+                err.to_string().contains("PDN_DATA_DIR"),
+                "the refusal must name the variable: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_data_dir_is_taken_as_given() {
+        assert_eq!(
+            data_dir(Some("/var/lib/pdn")).unwrap(),
+            std::path::PathBuf::from("/var/lib/pdn")
+        );
     }
 }

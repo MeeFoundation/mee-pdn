@@ -52,7 +52,7 @@ pub use connection_metadata::{
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
 // The ceremony registration point (ADR-0011, ADR-0012): pdn-node's pairing
 // and linking handlers are written against these and registered via
-// `SyncNode::spawn_with_protocols`. Re-exported so consumers need no direct
+// `SyncNode::spawn_with`. Re-exported so consumers need no direct
 // iroh dependency and the iroh version stays pinned in one place. The raw
 // `Endpoint` is deliberately not re-exported — the dial handle wraps it.
 pub use iroh::{
@@ -62,8 +62,8 @@ pub use iroh::{
 };
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
-    AlpnTaken, DialHandle, ExtraProtocol, NamespaceImport, SpawnOptions, SyncNode, UnknownIssuer,
-    BUILT_IN_ALPNS,
+    AlpnTaken, DialHandle, DirectoryHeld, ExtraProtocol, NamespaceImport, SpawnOptions,
+    StorageConfig, SyncNode, UnknownIssuer, BUILT_IN_ALPNS,
 };
 // Re-exported pdn-store (iroh-docs fork) vocabulary for the common
 // share/import/write flows, so downstream crates don't need a direct

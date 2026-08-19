@@ -18,10 +18,18 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
-    Runtime,
+    Runtime, SpawnOptions,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
-use test_utils::{eventually, TIMEOUT};
+use test_utils::{eventually, memory_node, TIMEOUT};
+
+/// A runtime on memory storage — what this crate's in-process scenarios run
+/// on. Storage is a required choice of every spawn, and this helper is
+/// where the suite names it, so no scenario gains a temporary directory or
+/// filesystem I/O.
+pub async fn memory_runtime() -> Result<Runtime> {
+    Runtime::spawn(SpawnOptions::memory()).await
+}
 
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
 pub const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
@@ -122,7 +130,7 @@ pub async fn link_probe(
     runtime: &Runtime,
     identity: PdnId,
 ) -> Result<(SyncNode, PrivateMetadataStore)> {
-    let node = SyncNode::spawn().await?;
+    let node = memory_node().await?;
     let payload = runtime.identity().linking_invite(identity, None).await?;
     let (directory_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
     let directory = PrivateMetadataStore::import(&node, directory_ticket).await?;

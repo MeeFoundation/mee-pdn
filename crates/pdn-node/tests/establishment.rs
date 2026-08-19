@@ -15,14 +15,16 @@ use data_layer::{
 use pdn_node::{
     ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentInProgress,
     EstablishmentRefused, EstablishmentTimeout, IdentityService as _, InvitePayload,
-    InviterUnreachable, Runtime, UnknownIdentity, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
+    InviterUnreachable, SpawnOptions, UnknownIdentity, UnsupportedInviteVersion,
+    INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
-use test_utils::{eventually, ids, TIMEOUT};
+use test_utils::{eventually, ids, memory_node, TIMEOUT};
 
 mod common;
 use common::{
-    establish_patiently, granted_patiently, link_patiently, link_probe, read_frame, PAIRING_ALPN,
+    establish_patiently, granted_patiently, link_patiently, link_probe, memory_runtime, read_frame,
+    PAIRING_ALPN,
 };
 
 /// A pairing "inviter" that accepts the dialogue, reads the request, and
@@ -51,9 +53,12 @@ impl ProtocolHandler for HungInviter {
 /// ceiling is the module constant the marker documents.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<()> {
-    let hung = SyncNode::spawn_with_protocols(vec![(PAIRING_ALPN.to_vec(), Box::new(HungInviter))])
-        .await?;
-    let rt = Runtime::spawn().await?;
+    let hung = SyncNode::spawn_with(
+        vec![(PAIRING_ALPN.to_vec(), Box::new(HungInviter))],
+        SpawnOptions::memory(),
+    )
+    .await?;
+    let rt = memory_runtime().await?;
     let y = rt.identity().create().await?;
     let invite = InvitePayload {
         version: INVITE_FORMAT_VERSION,
@@ -96,7 +101,7 @@ async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<(
 /// flight, which is the abort this bounded wait exists to replace.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
-    let rt = Runtime::spawn().await?;
+    let rt = memory_runtime().await?;
     let x = rt.identity().create().await?;
     // Minted for its address alone — the dialogue below is never completed,
     // so the secret is spent on nothing.
@@ -105,7 +110,7 @@ async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
     // The dialer parks the accept: a frame header promising more bytes than
     // it sends leaves the inviter's `serve` blocked reading the rest, with
     // the handler's permit held for as long as the connection lives.
-    let dialer = SyncNode::spawn().await?;
+    let dialer = memory_node().await?;
     let connection = dialer
         .dial_handle()
         .connect(invite.inviter_addr.clone(), PAIRING_ALPN)
@@ -159,9 +164,12 @@ async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_establishment_toward_the_same_peer_is_refused_while_one_is_in_flight(
 ) -> Result<()> {
-    let hung = SyncNode::spawn_with_protocols(vec![(PAIRING_ALPN.to_vec(), Box::new(HungInviter))])
-        .await?;
-    let rt = Runtime::spawn().await?;
+    let hung = SyncNode::spawn_with(
+        vec![(PAIRING_ALPN.to_vec(), Box::new(HungInviter))],
+        SpawnOptions::memory(),
+    )
+    .await?;
+    let rt = memory_runtime().await?;
     let y = rt.identity().create().await?;
     let toward_dave = |secret| InvitePayload {
         version: INVITE_FORMAT_VERSION,
@@ -248,12 +256,12 @@ impl ProtocolHandler for NeverAnsweringInviter {
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
-    let inviter = SyncNode::spawn_with_protocols(vec![(
-        PAIRING_ALPN.to_vec(),
-        Box::new(NeverAnsweringInviter),
-    )])
+    let inviter = SyncNode::spawn_with(
+        vec![(PAIRING_ALPN.to_vec(), Box::new(NeverAnsweringInviter))],
+        SpawnOptions::memory(),
+    )
     .await?;
-    let rt = Runtime::spawn().await?;
+    let rt = memory_runtime().await?;
     let y = rt.identity().create().await?;
     let before = rt.sync().tracked_doc_count().await?;
 
@@ -310,9 +318,9 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
 /// ticket to the peer's data namespace.
 #[tokio::test(flavor = "multi_thread")]
 async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_c = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_c = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
     let z = rt_c.identity().create().await?;
@@ -418,10 +426,10 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
 /// published on either phone are read on the other identity's laptop.
 #[tokio::test(flavor = "multi_thread")]
 async fn connection_is_visible_from_linked_devices() -> Result<()> {
-    let a_phone = Runtime::spawn().await?;
-    let a_laptop = Runtime::spawn().await?;
-    let b_phone = Runtime::spawn().await?;
-    let b_laptop = Runtime::spawn().await?;
+    let a_phone = memory_runtime().await?;
+    let a_laptop = memory_runtime().await?;
+    let b_phone = memory_runtime().await?;
+    let b_laptop = memory_runtime().await?;
 
     // Two identities, each with a laptop linked before the pairing.
     let x = a_phone.identity().create().await?;
@@ -493,8 +501,8 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
 /// attempts), and keeps the already-published grants readable.
 #[tokio::test(flavor = "multi_thread")]
 async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
 
@@ -582,8 +590,8 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
 /// and nothing of the refused grant ever appears beside it.
 #[tokio::test(flavor = "multi_thread")]
 async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let b = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
@@ -645,9 +653,9 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
 /// replayed secret after a completed establishment.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
-    let rt_c = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let rt_c = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
     let z = rt_c.identity().create().await?;
@@ -762,8 +770,8 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
 /// matching error text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
 
@@ -802,7 +810,7 @@ async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<(
     // no pairing ALPN — the handshake is rejected at once, where the address
     // of a node that is gone would cost the transport's whole connect
     // timeout and leave the probe asserting nothing within any shorter bound.
-    let bystander = SyncNode::spawn().await?;
+    let bystander = memory_node().await?;
     let unreachable = InvitePayload {
         version: INVITE_FORMAT_VERSION,
         inviter_addr: bystander.dial_handle().addr(),
@@ -844,8 +852,8 @@ async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<(
 /// paying first-use setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
 
@@ -885,8 +893,8 @@ async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
 /// the superseded replica and silently miss every later grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
-    let rt_a = Runtime::spawn().await?;
-    let rt_b = Runtime::spawn().await?;
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
 

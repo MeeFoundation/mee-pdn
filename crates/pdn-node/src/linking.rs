@@ -448,6 +448,7 @@ pub(crate) async fn link_via_dialogue(
 /// the reservation wrapping it releases synchronously around every exit —
 /// the `?` early returns included — without threading the release through
 /// each one by hand.
+#[allow(clippy::too_many_lines)] // one ceremony, each rollback branch beside the step it guards
 async fn link_via_dialogue_inner(
     state: &Arc<Mutex<State>>,
     payload: &LinkingPayload,
@@ -577,11 +578,16 @@ async fn link_via_dialogue_inner(
         return Err(err).context("the linked device could not confirm itself in the directory");
     }
 
-    // Success: the identity joins the runtime's hosted set. Classification
-    // was armed before the imports (above), and by now the caught-up
-    // directory carries the identity's device records, this device's own
-    // confirmation included. Nothing below can fail.
+    // Success: the identity joins the runtime's hosted set. The record
+    // write is the commit point — after the catch-up, before hosting: a
+    // failure rolls the link back whole and the previous record stays
+    // intact, so replicas nothing points at are never hosted.
     let mut guard = state.lock().await;
+    if let Err(err) = guard.commit_hosting(payload.identity, directory.namespace()) {
+        drop(guard);
+        rollback.roll_back().await;
+        return Err(err).context("the hosted-identities record could not be written");
+    }
     guard
         .identities
         .insert(payload.identity, HostedIdentity { directory });
@@ -915,10 +921,10 @@ mod tests {
     /// on this exact race.
     #[tokio::test(flavor = "multi_thread")]
     async fn dropping_without_undo_still_undoes_the_import() -> Result<()> {
-        let rt = Runtime::spawn().await?;
+        let rt = Runtime::spawn(data_layer::SpawnOptions::memory()).await?;
         let state = Arc::clone(&rt.state);
 
-        let scratch = SyncNode::spawn().await?;
+        let scratch = SyncNode::spawn(data_layer::SpawnOptions::memory()).await?;
         scratch.create_namespace(ids::DAVE).await?;
         let ticket = scratch
             .share_ticket(

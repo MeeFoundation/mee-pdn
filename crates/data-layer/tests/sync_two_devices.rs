@@ -11,15 +11,15 @@
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, CatchUpTimeout, PrivateMetadataStore, ShareMode, SyncNode};
+use data_layer::{AddrInfoOptions, CatchUpTimeout, PrivateMetadataStore, ShareMode};
 use pdn_types::EntryPath;
-use test_utils::{eventually, ids, wait_connected, wait_entry_is, TIMEOUT};
+use test_utils::{eventually, ids, memory_node, wait_connected, wait_entry_is, TIMEOUT};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_two_devices() -> Result<()> {
     // Two devices of Alice
-    let phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
 
     // Phone owns the directory and already has a connection to Bob recorded
     // before the laptop imports — so the laptop must catch this up via the
@@ -88,8 +88,8 @@ async fn sync_two_devices() -> Result<()> {
 /// and is deliberately not asserted — only that the devices agree.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_converge() -> Result<()> {
-    let phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
 
     let phone_author = phone.create_author().await?;
     let laptop_author = laptop.create_author().await?;
@@ -159,8 +159,8 @@ async fn concurrent_writes_converge() -> Result<()> {
 /// publishes — the identity's own data-namespace ticket.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_carries_arbitrary_tickets() -> Result<()> {
-    let phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
 
     // Any ticket serves as payload — here, another fresh replica's.
     let phone_dir = PrivateMetadataStore::create(&phone).await?;
@@ -198,8 +198,8 @@ async fn directory_carries_arbitrary_tickets() -> Result<()> {
 /// the wait must.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_wait_returns_on_a_session_not_on_content() -> Result<()> {
-    let phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
 
     let phone_dir = PrivateMetadataStore::create(&phone).await?;
     phone_dir.connect(ids::BOB).await?;
@@ -232,8 +232,8 @@ async fn directory_wait_returns_on_a_session_not_on_content() -> Result<()> {
 /// the distinguishable timeout, not a hang and not a success.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_wait_times_out_without_a_reachable_peer() -> Result<()> {
-    let phone = SyncNode::spawn().await?;
-    let laptop = SyncNode::spawn().await?;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
 
     let phone_dir = PrivateMetadataStore::create(&phone).await?;
     let ticket = phone_dir
@@ -262,7 +262,7 @@ async fn directory_wait_times_out_without_a_reachable_peer() -> Result<()> {
 /// stores an "empty file" nor deletes the previous value.
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_payload_write_is_rejected() -> Result<()> {
-    let node = SyncNode::spawn().await?;
+    let node = memory_node().await?;
     let author = node.create_author().await?;
     node.create_namespace(ids::ALICE).await?;
     let path = EntryPath::new("contact/email")?;

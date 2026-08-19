@@ -21,8 +21,10 @@ use crate::{
 /// The private-metadata directory kind under which an identity's own
 /// data-namespace ticket is published at creation — the flat bootstrap
 /// model's durable record. Nothing in the linking critical path reads it:
-/// the dialogue's reply hands the bootstrap tickets over directly.
-const DATA_TICKET_KIND: &str = "data";
+/// the dialogue's reply hands the bootstrap tickets over directly. Restart
+/// recovery does read it: the connection armer's sweep re-binds the data
+/// namespace from this ticket when the node holds the directory alone.
+pub(crate) const DATA_TICKET_KIND: &str = "data";
 
 /// Creating and linking identities on a runtime. The production
 /// implementation mints placeholder identifiers with no key material
@@ -98,6 +100,12 @@ impl IdentityService for RuntimeIdentityService<'_> {
             )
             .await?;
         directory.put_ticket(DATA_TICKET_KIND, &data_ticket).await?;
+        // The commit point: the store set is provisioned, and the record is
+        // written before the identity is hosted — a process that dies
+        // before this line leaves replicas nothing points at, and a failed
+        // write (a full disk) fails the create while the previous record,
+        // and every identity it names, stays intact.
+        state.commit_hosting(identity, directory.namespace())?;
         // The directory arms session classification for this identity —
         // its device records decide who is an own device, and its data
         // namespace serves fail-closed. The armer's subscription is taken

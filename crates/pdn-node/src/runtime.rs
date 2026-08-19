@@ -4,16 +4,20 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    path::PathBuf,
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use data_layer::{
-    AuthorId, ConnectionMetadata, NamespaceId, PrivateMetadataStore, SpawnOptions, SyncNode,
+    AuthorId, ConnectionMetadata, NamespaceId, PrivateMetadataStore, SpawnOptions, StorageConfig,
+    SyncNode,
 };
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
+
+use crate::hosted::{self, HostedLine};
 
 #[derive(Clone)]
 pub(crate) struct CleanupSupervisor {
@@ -177,6 +181,9 @@ pub(crate) struct State {
     /// The retraction-event surface: the verdict consumer sends, and
     /// [`Runtime::subscribe_retractions`] hands out receivers.
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
+    /// Where the hosted-identities record lives — `None` on a memory node,
+    /// whose hosting ends with the process and records nothing.
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl State {
@@ -191,6 +198,35 @@ impl State {
     /// as opposed to a peer known only through a grant or a connection.
     pub(crate) fn is_hosted(&self, identity: PdnId) -> bool {
         self.identities.contains_key(&identity)
+    }
+
+    /// Commit `identity` to the hosted-identities record: the record is
+    /// replaced whole with the currently hosted set plus this identity.
+    /// Called after the identity's store set is provisioned and before it
+    /// is hosted — a process that dies before this leaves replicas nothing
+    /// points at, never registered and never served, and one that dies
+    /// after leaves a fully provisioned identity a restart picks up. A
+    /// failure — a full disk above all — leaves the previous record intact
+    /// and surfaces as the failed create or link, so recording a second
+    /// identity cannot lose the first. A no-op on a memory node.
+    pub(crate) fn commit_hosting(&self, identity: PdnId, directory: NamespaceId) -> Result<()> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let mut lines: Vec<HostedLine> = self
+            .identities
+            .iter()
+            .map(|(hosted_identity, hosted)| HostedLine {
+                identity: *hosted_identity,
+                directory: hosted.directory.namespace(),
+            })
+            .collect();
+        lines.retain(|line| line.identity != identity);
+        lines.push(HostedLine {
+            identity,
+            directory,
+        });
+        hosted::write_record(dir, &lines)
     }
 }
 
@@ -213,17 +249,28 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Spawn the node stack, hosting no identities yet. The pairing and
-    /// linking handlers register on the node's endpoint here; each handler
-    /// gets its own state slot, filled immediately after the node comes up,
-    /// so by the time an invite can exist both handlers are fully wired.
-    pub async fn spawn() -> Result<Self> {
-        Self::spawn_with(SpawnOptions::default()).await
-    }
-
-    /// [`spawn`](Self::spawn), tuned by `options` — passed through to the
-    /// node assembly.
-    pub async fn spawn_with(options: SpawnOptions) -> Result<Self> {
+    /// Spawn the node stack, configured by `options` — where the state
+    /// lives is a required part of it ([`SpawnOptions::storage`]). The
+    /// pairing and linking handlers register on the node's endpoint here;
+    /// each handler gets its own state slot, filled immediately after the
+    /// node comes up, so by the time an invite can exist both handlers are
+    /// fully wired.
+    ///
+    /// On a directory-configured runtime, every identity the directory's
+    /// hosted-identities record names is hosted again before the spawn
+    /// returns, through the same tail `create` runs after provisioning:
+    /// the private metadata directory opens from the replica the node
+    /// already holds, arms session classification, and its connection
+    /// armer starts — whose sweeps bring the data namespace, the metadata
+    /// pairs and the granted namespaces back from the directory's own
+    /// records. Recovery performs no ceremony and dials no peer; an
+    /// unreadable record stops the spawn with an error naming it, and an
+    /// absent record is a first start.
+    pub async fn spawn(options: SpawnOptions) -> Result<Self> {
+        let data_dir = match &options.storage {
+            StorageConfig::Directory(directory) => Some(directory.clone()),
+            StorageConfig::Memory => None,
+        };
         let pairing = PairingHandler::new();
         let pairing_slot = pairing.slot();
         #[cfg(feature = "test-util")]
@@ -238,14 +285,21 @@ impl Runtime {
             options,
         )
         .await?;
-        let author = node.create_author().await?;
-        // The provisional-write tracker recognizes this runtime's writes by
-        // their author, and the runtime's consumer owns the verdict stream.
+        // The node's one author: the fork's persisted default author, so a
+        // directory-configured runtime writes as the author it wrote as
+        // before. The provisional-write tracker recognizes this runtime's
+        // writes by it, and the runtime's consumer owns the verdict stream.
+        let author = node.default_author().await?;
         node.track_writer_author(author);
         let verdicts = node
             .take_retraction_verdicts()
             .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
         let node_id = node.node_id();
+
+        // Recovery: host what the record names, before the state exists —
+        // the armers spawn right after it does.
+        let (identities, armers) = recover_hosted_identities(&node, data_dir.as_deref()).await?;
+
         let (retraction_events, _no_subscribers_yet) =
             tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
         let (linking_failures, _no_failure_subscribers_yet) =
@@ -253,7 +307,7 @@ impl Runtime {
         let state = Arc::new(Mutex::new(State {
             node: Arc::new(node),
             author,
-            identities: HashMap::new(),
+            identities,
             pending_invites: PendingInvites::default(),
             pending_linking_invites: PendingInvites::default(),
             metadata_pairs: HashMap::new(),
@@ -270,7 +324,11 @@ impl Runtime {
             #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
             retraction_events,
+            data_dir,
         }));
+        for (identity, changes) in armers {
+            crate::connections::spawn_connection_armer(Arc::downgrade(&state), identity, changes);
+        }
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
         pairing_slot
             .set(Arc::downgrade(&state))
@@ -381,4 +439,48 @@ impl Runtime {
         let _ = tokio::time::timeout(CLEANUP_BUDGET, cleanup_tasks.wait()).await;
         node.shutdown().await
     }
+}
+
+/// A recovered directory's changes stream, boxed so the recovery helper can
+/// return it beside the handle; consumed by that identity's connection
+/// armer once the state exists.
+type DirectoryChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static>;
+
+/// Host every identity the hosted-identities record names: open each
+/// directory from the replica the node already holds and perform the same
+/// registration a newly created identity performs — no ceremony, no dial,
+/// no peer. Everything else re-derives from the directory once the armers
+/// run: the data namespace from its `data` ticket, the pairs from their
+/// published tickets, the granted namespaces from the counterparty's grant
+/// records. A record line whose directory replica does not open fails the
+/// start: a runtime that silently hosted less than its record names would
+/// look healthy while refusing everything.
+async fn recover_hosted_identities(
+    node: &SyncNode,
+    data_dir: Option<&std::path::Path>,
+) -> Result<(
+    HashMap<PdnId, HostedIdentity>,
+    Vec<(PdnId, DirectoryChanges)>,
+)> {
+    let recovered = match data_dir {
+        Some(directory) => hosted::read_record(directory)?,
+        None => Vec::new(),
+    };
+    let mut identities = HashMap::new();
+    let mut armers: Vec<(PdnId, DirectoryChanges)> = Vec::new();
+    for line in recovered {
+        let directory = PrivateMetadataStore::open(node, line.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot recover hosted identity {}: its directory replica did not open",
+                    line.identity
+                )
+            })?;
+        let changes = directory.changes().await?;
+        node.host_identity(line.identity, &directory)?;
+        identities.insert(line.identity, HostedIdentity { directory });
+        armers.push((line.identity, Box::new(changes)));
+    }
+    Ok((identities, armers))
 }

@@ -9,11 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, PrivateMetadataStore, RetractionMarker, RetractionVerdict, ShareMode, SyncNode,
+    AddrInfoOptions, PrivateMetadataStore, RetractionMarker, RetractionVerdict, ShareMode,
 };
 use iroh_blobs::Hash;
 use pdn_types::{EntryPath, NodeId, PdnId};
-use test_utils::{eventually, ids};
+use test_utils::{eventually, ids, memory_node};
 
 fn marker(bound: u64) -> RetractionMarker {
     RetractionMarker {
@@ -29,7 +29,7 @@ fn marker(bound: u64) -> RetractionMarker {
 /// leaves another issuer's standing.
 #[tokio::test(flavor = "multi_thread")]
 async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
-    let node = SyncNode::spawn().await?;
+    let node = memory_node().await?;
     let directory = PrivateMetadataStore::create(&node).await?;
     let author = node.create_author().await?;
     let other_issuer: PdnId = ids::CAROL;
@@ -93,7 +93,7 @@ async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
 /// holds whatever the marker's bound is.
 #[tokio::test(flavor = "multi_thread")]
 async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
-    let node = SyncNode::spawn().await?;
+    let node = memory_node().await?;
     let directory = PrivateMetadataStore::create(&node).await?;
     let author = node.create_author().await?;
 
@@ -164,7 +164,7 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
 /// refused entry, which this check must admit for that scenario to pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_verdict_naming_no_local_record_is_not_honored() -> Result<()> {
-    let node = SyncNode::spawn().await?;
+    let node = memory_node().await?;
     node.create_namespace(ids::BOB).await?;
     let author = node.create_author().await?;
     let stranger = node.create_author().await?;

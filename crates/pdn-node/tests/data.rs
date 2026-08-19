@@ -29,9 +29,10 @@ const SWARM_WINDOW: Duration = Duration::from_secs(15);
 async fn writes_read_back_list_exactly_and_hand_over_by_ticket() -> Result<()> {
     let options = SpawnOptions {
         reconcile_interval: RECONCILE,
+        ..SpawnOptions::memory()
     };
-    let a = Runtime::spawn_with(options.clone()).await?;
-    let b = Runtime::spawn_with(options).await?;
+    let a = Runtime::spawn(options.clone()).await?;
+    let b = Runtime::spawn(options).await?;
 
     let alice = a.identity().create().await?;
     let email = EntryPath::new("contact/email")?;

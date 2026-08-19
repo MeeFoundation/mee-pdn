@@ -42,8 +42,9 @@ const RECONCILE: Duration = Duration::from_millis(500);
 
 /// Spawn a runtime with the tests' short reconcile cadence.
 async fn spawn_runtime() -> Result<Runtime> {
-    Runtime::spawn_with(SpawnOptions {
+    Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
+        ..SpawnOptions::memory()
     })
     .await
 }
