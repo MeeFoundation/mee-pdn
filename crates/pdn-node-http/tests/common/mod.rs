@@ -88,7 +88,7 @@ const READY_POLL: Duration = Duration::from_millis(250);
 /// a second on an idle daemon); the stress pass is where the narrow budget
 /// was measured failing, with the daemon juggling every other test's
 /// containers.
-const RESTART_BUDGET: Duration = Duration::from_secs(60);
+const RESTART_BUDGET: Duration = Duration::from_mins(1);
 
 /// A ceiling on one liveness probe. The budget above is checked between
 /// requests, so without this a probe that connects and then never answers
@@ -131,7 +131,7 @@ const NODE_LOG_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/stand-logs");
 /// How long a wait for convergence may take. Wide enough to cover several of
 /// the runtime's own reconciliation periods, since nothing here shortens that
 /// cadence and a lost dial is retried by the periodic pass.
-pub const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
+pub const CONVERGENCE_BUDGET: Duration = Duration::from_mins(2);
 
 /// How much of a node's log a failing wait carries into its error.
 const LOG_TAIL_BYTES: usize = 4 * 1024;

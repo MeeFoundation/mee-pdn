@@ -2,11 +2,12 @@
 # per person — Alice keeps a laptop for work and another for leisure, which
 # is what makes a device's belonging visible.
 #
-# One network, and HTTP published to the host only — a demo drives the nodes
-# from outside, the way the container suite does, while everything between
-# them runs over the runtimes' own protocols on this network. Ports are bound
-# to loopback: the debug surface is unauthenticated and mints live ceremony
-# secrets, so a wider bind is never the default.
+# One network, and nothing published from this file. A demo driven from the
+# daemon's own host adds ops/compose.ports.yml and reaches the nodes over
+# the published ports; a demo driven from another container on that daemon
+# reaches them on this network instead, which is the only address such a
+# caller has. Between the nodes nothing changes either way: everything runs
+# over the runtimes' own protocols on this network.
 #
 # Each node keeps its state on a named volume of its own, mounted over the
 # image's state directory (the image's PDN_DATA_DIR already points there) —
@@ -29,31 +30,24 @@ x-node: &node
 services:
   alice-phone:
     <<: *node
-    ports: ["127.0.0.1:3011:3011"]
     volumes: ["alice-phone-state:/var/lib/pdn"]
   alice-work-laptop:
     <<: *node
-    ports: ["127.0.0.1:3012:3011"]
     volumes: ["alice-work-laptop-state:/var/lib/pdn"]
   alice-leisure-laptop:
     <<: *node
-    ports: ["127.0.0.1:3013:3011"]
     volumes: ["alice-leisure-laptop-state:/var/lib/pdn"]
   bob-phone:
     <<: *node
-    ports: ["127.0.0.1:3014:3011"]
     volumes: ["bob-phone-state:/var/lib/pdn"]
   bob-laptop:
     <<: *node
-    ports: ["127.0.0.1:3015:3011"]
     volumes: ["bob-laptop-state:/var/lib/pdn"]
   carol-phone:
     <<: *node
-    ports: ["127.0.0.1:3016:3011"]
     volumes: ["carol-phone-state:/var/lib/pdn"]
   carol-laptop:
     <<: *node
-    ports: ["127.0.0.1:3017:3011"]
     volumes: ["carol-laptop-state:/var/lib/pdn"]
 
 networks:

@@ -15,6 +15,12 @@ set -eu
 # `DEMO_COMPOSE=none` and the step is skipped.
 DEMO_COMPOSE=${DEMO_COMPOSE:-docker compose -f ops/compose.yml}
 
+# How a node's base URL is asked for again once its container has restarted,
+# as a command taking the service name. Empty where the URLs outlive the
+# containers behind them: a published port does, a container's own address
+# on the network does not.
+DEMO_RESOLVE=${DEMO_RESOLVE:-}
+
 ALICE_PHONE=${ALICE_PHONE:-http://127.0.0.1:3011}
 ALICE_WORK_LAPTOP=${ALICE_WORK_LAPTOP:-http://127.0.0.1:3012}
 ALICE_LEISURE_LAPTOP=${ALICE_LEISURE_LAPTOP:-http://127.0.0.1:3013}
@@ -49,7 +55,9 @@ shown() { printf '  %s%s%s%s%s\n' "$FACT" "$1" "$OFF$VALUE" "$2" "$OFF"; }
 # mistaken for a broken one later.
 wait_live() {
   for _ in $(seq 1 200); do
-    curl -sf "$1/live" >/dev/null 2>&1 && return 0
+    # A ceiling on one probe, without which an address nothing answers on
+    # holds each attempt open for minutes and the budget above means nothing.
+    curl -sf -m 2 "$1/live" >/dev/null 2>&1 && return 0
     sleep 0.25
   done
   echo "no answer from $1" >&2
@@ -152,6 +160,7 @@ if [ "$DEMO_COMPOSE" != "none" ]; then
   BEFORE=$(node_id "$BOB_LAPTOP")
   $DEMO_COMPOSE stop bob-laptop >/dev/null 2>&1
   $DEMO_COMPOSE start bob-laptop >/dev/null 2>&1
+  [ -z "$DEMO_RESOLVE" ] || BOB_LAPTOP=$($DEMO_RESOLVE bob-laptop)
   wait_live "$BOB_LAPTOP"
   AFTER=$(node_id "$BOB_LAPTOP")
   if [ -z "$BEFORE" ] || [ "$BEFORE" != "$AFTER" ]; then
