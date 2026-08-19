@@ -214,8 +214,8 @@ impl State {
     /// file becomes durable inside `write_record`, while the replicas it
     /// names sit in the store's open write transaction, committed on the
     /// store's own schedule; a process killed between the two comes back
-    /// to a line whose replica does not open, and that start fails rather
-    /// than host less than the record names. Flushing first closes the
+    /// to a line naming a replica its store does not hold, and that
+    /// identity is skipped rather than hosted. Flushing first closes the
     /// window for every path that records hosting, present and future.
     pub(crate) async fn commit_hosting(
         &self,
@@ -465,9 +465,15 @@ type DirectoryChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send +
 /// no peer. Everything else re-derives from the directory once the armers
 /// run: the data namespace from its `data` ticket, the pairs from their
 /// published tickets, the granted namespaces from the counterparty's grant
-/// records. A record line whose directory replica does not open fails the
-/// start: a runtime that silently hosted less than its record names would
-/// look healthy while refusing everything.
+/// records.
+///
+/// The two ways a line can fail to yield a directory are answered
+/// differently. A replica the store does not hold is skipped, loudly: the
+/// identity is not hosted, and the rest of the record — every healthy
+/// identity on this disk — still comes back. A replica the store holds but
+/// cannot open fails the start, because a runtime that silently hosted
+/// less than its record names would look healthy while refusing
+/// everything.
 async fn recover_hosted_identities(
     node: &SyncNode,
     data_dir: Option<&std::path::Path>,
@@ -482,7 +488,7 @@ async fn recover_hosted_identities(
     let mut identities = HashMap::new();
     let mut armers: Vec<(PdnId, DirectoryChanges)> = Vec::new();
     for line in recovered {
-        let directory = PrivateMetadataStore::open(node, line.directory)
+        let opened = PrivateMetadataStore::open(node, line.directory)
             .await
             .with_context(|| {
                 format!(
@@ -490,6 +496,17 @@ async fn recover_hosted_identities(
                     line.identity
                 )
             })?;
+        let Some(directory) = opened else {
+            // The line stays in the record: the skip is then visible on
+            // every start until hosting is ended for the identity, rather
+            // than erased by a start deciding on its own.
+            tracing::warn!(
+                identity = %line.identity,
+                directory = %line.directory,
+                "hosted-identities record names a directory replica this node's store does not hold; the identity is not hosted"
+            );
+            continue;
+        };
         let changes = directory.changes().await?;
         node.host_identity(line.identity, &directory)?;
         identities.insert(line.identity, HostedIdentity { directory });

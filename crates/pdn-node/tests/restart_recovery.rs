@@ -46,6 +46,22 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
     .await
 }
 
+/// The hosted-identities record's file name, as the runtime writes it.
+const RECORD: &str = "hosted-identities.json";
+
+/// The record's lines, left opaque: the scenarios below move a line
+/// between two disks rather than construct one, so what a line says stays
+/// the runtime's business.
+fn record_lines(dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    Ok(serde_json::from_slice(&std::fs::read(dir.join(RECORD))?)?)
+}
+
+/// Replace `dir`'s record with `lines`.
+fn write_record_lines(dir: &std::path::Path, lines: &[serde_json::Value]) -> Result<()> {
+    std::fs::write(dir.join(RECORD), serde_json::to_vec(lines)?)?;
+    Ok(())
+}
+
 /// An identity created before the restart is hosted after it — same node
 /// id, its entry readable with no peer running and no ceremony repeated.
 ///
@@ -92,7 +108,7 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     // Denial (line removed): what the record does not name is not hosted,
     // and reads addressed to it are refused — the recovery above cannot
     // have passed on something other than the record.
-    std::fs::write(dir.path().join("hosted-identities.json"), b"[]")?;
+    std::fs::write(dir.path().join(RECORD), b"[]")?;
     let third = runtime_on(dir.path()).await?;
     assert!(
         third.sync().hosted_identities().await?.is_empty(),
@@ -107,7 +123,7 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
 
     // Denial (record unreadable): the start fails naming the file, rather
     // than coming up healthy with nothing hosted.
-    std::fs::write(dir.path().join("hosted-identities.json"), b"not json")?;
+    std::fs::write(dir.path().join(RECORD), b"not json")?;
     let Err(err) = runtime_on(dir.path()).await else {
         anyhow::bail!("an unreadable record must stop the start");
     };
@@ -174,7 +190,7 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let dir = tempfile::tempdir()?;
-    let record_path = dir.path().join("hosted-identities.json");
+    let record_path = dir.path().join(RECORD);
 
     let runtime = runtime_on(dir.path()).await?;
     let alice = runtime.identity().create().await?;
@@ -382,5 +398,71 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
     probe.shutdown().await?;
     recovered.shutdown().await?;
     issuer_rt.shutdown().await?;
+    Ok(())
+}
+
+/// A record line whose directory replica the store does not hold does not
+/// take the node down with it: the start succeeds, that identity is not
+/// hosted, and every healthy line beside it comes back. Such a line is
+/// what a process killed between the record's rename and the store's
+/// commit used to leave; the commit now precedes the rename, so the state
+/// is arranged the only way left — by carrying a real record line from one
+/// node's disk onto another's, where the named replica has never been.
+///
+/// The denials keep the skip from being a shrug: the skipped identity is
+/// refused, not silently re-created, and the record is left as it was, so
+/// the line is still there to be read by whoever ends the hosting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> Result<()> {
+    let path = EntryPath::new("contact/email")?;
+
+    // The stranger's line: a real record, written by a real create, on a
+    // disk this test then leaves behind.
+    let elsewhere = tempfile::tempdir()?;
+    let stranger_rt = runtime_on(elsewhere.path()).await?;
+    let stranger = stranger_rt.identity().create().await?;
+    stranger_rt.shutdown().await?;
+    drop(stranger_rt);
+    let stranger_line = record_lines(elsewhere.path())?;
+
+    // The disk under test: one healthy identity, and the stranger's line
+    // appended to its record.
+    let dir = tempfile::tempdir()?;
+    let first = runtime_on(dir.path()).await?;
+    let alice = first.identity().create().await?;
+    first.data().write(alice, &path, b"written before").await?;
+    first.shutdown().await?;
+    drop(first);
+    let mut lines = record_lines(dir.path())?;
+    lines.extend(stranger_line);
+    write_record_lines(dir.path(), &lines)?;
+    let record_as_arranged = std::fs::read(dir.path().join(RECORD))?;
+
+    let second = runtime_on(dir.path()).await?;
+    assert_eq!(
+        second.sync().hosted_identities().await?,
+        vec![alice],
+        "the healthy line must come back and the absent one must be skipped"
+    );
+    assert!(
+        eventually(|| async {
+            match second.data().read(alice, &path).await {
+                Ok(payload) => Ok(payload.as_deref() == Some(b"written before".as_slice())),
+                Err(_not_rebound_yet) => Ok(false),
+            }
+        })
+        .await?,
+        "the healthy identity's entry must read back across the skip"
+    );
+    assert!(
+        second.data().read(stranger, &path).await.is_err(),
+        "the skipped identity must be refused, not hosted from a fresh replica"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(RECORD))?,
+        record_as_arranged,
+        "the skip must leave the record as it was"
+    );
+    second.shutdown().await?;
     Ok(())
 }

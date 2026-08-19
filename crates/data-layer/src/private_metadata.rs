@@ -240,17 +240,21 @@ impl PrivateMetadataStore {
     /// Open the private metadata store of a replica this node already holds
     /// — recovery's constructor: no ticket is consumed and nothing is
     /// created, because the replica is already here. A namespace the node's
-    /// store does not hold is an error; `create` and `import` are the
-    /// constructors that bring a replica in.
-    pub async fn open(node: &SyncNode, namespace: NamespaceId) -> Result<Self> {
+    /// store does not hold is `Ok(None)`, so a caller acting on a durable
+    /// record can tell an absent replica from a store that failed to
+    /// answer; `create` and `import` are the constructors that bring a
+    /// replica in.
+    pub async fn open(node: &SyncNode, namespace: NamespaceId) -> Result<Option<Self>> {
         let author = node.default_author().await?;
-        let doc = node.open_doc(namespace).await?;
-        Ok(Self {
+        let Some(doc) = node.open_doc(namespace).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             doc,
             author,
             blobs: node.blobs(),
             pending_mutations: Arc::new(tokio::sync::Mutex::new(())),
-        })
+        }))
     }
 
     /// Share this store as a ticket another device of the identity can

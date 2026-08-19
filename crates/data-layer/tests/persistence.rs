@@ -29,7 +29,10 @@ async fn node_on(dir: &std::path::Path) -> Result<SyncNode> {
 /// The denial beside it: a node spawned on a fresh directory is a
 /// different node holding none of this one's state — without that arm,
 /// the assertions above would pass just as well against a node that
-/// re-created everything from the test's own memory.
+/// re-created everything from the test's own memory. That node also
+/// answers what the reopen of a replica it never held is: absence, not a
+/// failure to open — the distinction a caller acting on a durable record
+/// decides by.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -63,7 +66,9 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         first_id,
         "the node id must come from the stored key"
     );
-    let reopened = PrivateMetadataStore::open(&second, directory_namespace).await?;
+    let reopened = PrivateMetadataStore::open(&second, directory_namespace)
+        .await?
+        .expect("the respawned store must still hold the directory replica");
     assert!(
         reopened.list_devices().await?.contains(&first_id),
         "the directory's device set must survive the respawn"
@@ -90,6 +95,12 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
     assert!(
         fresh.read(ids::ALICE, &path).await.is_err(),
         "a fresh node must refuse the issuer as unknown"
+    );
+    assert!(
+        PrivateMetadataStore::open(&fresh, directory_namespace)
+            .await?
+            .is_none(),
+        "a replica this store never held must be reported absent, not as a failure to open"
     );
     fresh.shutdown().await?;
     second.shutdown().await?;
@@ -121,7 +132,9 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     drop(first);
 
     let second = node_on(dir.path()).await?;
-    let reopened = PrivateMetadataStore::open(&second, directory_namespace).await?;
+    let reopened = PrivateMetadataStore::open(&second, directory_namespace)
+        .await?
+        .expect("the respawned store must still hold the directory replica");
     let stored_ticket = reopened
         .get_ticket("data")
         .await?

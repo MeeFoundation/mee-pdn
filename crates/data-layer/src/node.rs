@@ -943,17 +943,41 @@ impl SyncNode {
     /// and enrol it in the periodic reconcile pass — recovery's
     /// counterpart of [`new_doc`](Self::new_doc) and
     /// [`import_doc`](Self::import_doc): no ticket is consumed and nothing
-    /// is created, so a namespace the store does not hold is an error, not
-    /// a fresh replica.
-    pub(crate) async fn open_doc(&self, namespace: NamespaceId) -> Result<Doc> {
-        let doc = self
+    /// is created, so a namespace the store does not hold is `Ok(None)`,
+    /// not a fresh replica. The absence is separated from a store that
+    /// could not answer, which stays an error: the two are what a caller
+    /// recovering from a durable record has to tell apart, and one of them
+    /// is routine.
+    pub(crate) async fn open_doc(&self, namespace: NamespaceId) -> Result<Option<Doc>> {
+        if !self.holds_namespace(namespace).await? {
+            return Ok(None);
+        }
+        let Some(doc) = self
             .docs
             .open(namespace)
             .await
-            .with_context(|| format!("namespace {namespace} is not in this node's store"))?
-            .ok_or_else(|| anyhow::anyhow!("namespace {namespace} is not in this node's store"))?;
+            .with_context(|| format!("namespace {namespace} did not open"))?
+        else {
+            return Ok(None);
+        };
         self.track(&doc, Vec::new(), SyncStrategy::Swarm)?;
-        Ok(doc)
+        Ok(Some(doc))
+    }
+
+    /// Whether the replica store holds `namespace`, answered from its
+    /// listing. Opening cannot answer it: the fork reports "no such
+    /// namespace" and "the store could not answer" as one error of the
+    /// same shape, so a caller reading them apart would be reading error
+    /// text.
+    async fn holds_namespace(&self, namespace: NamespaceId) -> Result<bool> {
+        let mut listed = self.docs.list().await?;
+        while let Some(entry) = listed.next().await {
+            let (id, _capability) = entry?;
+            if id == namespace {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Import a device-shared store's doc from `ticket`; the doc joins the
