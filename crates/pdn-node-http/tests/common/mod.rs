@@ -110,7 +110,7 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// bound themselves by their own `timeout_secs` (60 seconds at most here),
 /// and a route that legitimately ran longer would need its own budget
 /// rather than this one raised.
-const REQUEST_BUDGET: Duration = Duration::from_secs(120);
+const REQUEST_BUDGET: Duration = Duration::from_mins(2);
 
 /// How many containers one node is worth. A published port that never
 /// answers is an arrangement that failed, not a scenario that did, so the

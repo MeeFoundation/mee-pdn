@@ -255,7 +255,7 @@ const CLEAN_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(8)
 /// A ceiling on the stream that feeds the kill below: ten acknowledged
 /// writes take well under a second on a node that answers, so anything
 /// near this means the stream died and the counter will never move again.
-const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// A kill in the middle of a stream of writes: every write acknowledged
 /// before the stores' settle window reads back after the restart with its
