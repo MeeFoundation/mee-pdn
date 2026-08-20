@@ -390,7 +390,7 @@ impl SyncNode {
             StorageConfig::Memory => Docs::memory(),
             StorageConfig::Directory(directory) => Docs::persistent(directory.join(DOCS_DIR)),
         };
-        let docs = docs_builder
+        let docs = match docs_builder
             .session_access_provider(session_access_provider(
                 Arc::clone(&access),
                 Arc::clone(&registry),
@@ -404,7 +404,18 @@ impl SyncNode {
             }))
             .spawn(endpoint.clone(), blobs_store.clone(), gossip.clone())
             .await
-            .map_err(|err| annotate_store_error(err, &options.storage))?;
+        {
+            Ok(docs) => docs,
+            Err(err) => {
+                // A node that never reaches its caller closes what it
+                // opened: the blob store holds its database open, and the
+                // directory lock releases on drop, so a retry on the same
+                // directory in this process would meet this attempt's own
+                // abandoned store — and wait on it rather than be refused.
+                let _ = blobs_store.shutdown().await;
+                return Err(annotate_store_error(err, &options.storage));
+            }
+        };
         let docs_api = docs.api().clone();
         access.set_blobs(blobs_store.clone());
         let mut router = Router::builder(endpoint)
@@ -503,28 +514,42 @@ impl SyncNode {
         ticket: DocTicket,
     ) -> Result<NamespaceImport> {
         let displaced_tracking = self.guard_data_import(ticket.capability.id())?;
-        let doc = self.import_doc(ticket).await?;
+        // Capability first, sync last, with the binding between them — the
+        // order the grantee import already keeps. A session arriving at a
+        // namespace the book does not know is classified `Full`, so a
+        // replica syncing before its binding is recorded would serve whole
+        // what the binding scopes.
+        let contacts = ticket.nodes.clone();
+        let doc = self.docs.import_namespace(ticket.capability).await?;
         let imported = doc.id();
-        match self
-            .registry
-            .register_data(issuer, doc, ServingPosture::Serve)
-        {
-            Ok(displaced) => Ok(NamespaceImport {
-                issuer,
-                imported,
-                displaced,
-                displaced_tracking,
-            }),
-            Err(err) => {
-                // The one-namespace-one-issuer rejection must not clobber
-                // the rightful issuer's tracking: `import_doc` replaced it
-                // (and joined the swarm) — put it back, membership included.
-                if let Some(previous) = displaced_tracking {
-                    let _ = self.restore_tracking(previous).await;
+        self.track(&doc, contacts.clone(), SyncStrategy::Swarm)?;
+        let displaced =
+            match self
+                .registry
+                .register_data(issuer, doc.clone(), ServingPosture::Serve)
+            {
+                Ok(displaced) => displaced,
+                Err(err) => {
+                    // The one-namespace-one-issuer rejection must not clobber
+                    // the rightful issuer's tracking (the swarm was not joined
+                    // here, so re-inserting the entry is the whole restore).
+                    if let Some(previous) = displaced_tracking {
+                        let _ = self.restore_tracking(previous).await;
+                    }
+                    return Err(err);
                 }
-                Err(err)
-            }
+            };
+        let import = NamespaceImport {
+            issuer,
+            imported,
+            displaced,
+            displaced_tracking,
+        };
+        if let Err(err) = doc.start_sync(contacts).await {
+            let _ = self.undo_import_namespace(import).await;
+            return Err(err);
         }
+        Ok(import)
     }
 
     /// Import a doc shared via `ticket` as a **whole-store grant** of
@@ -949,6 +974,18 @@ impl SyncNode {
     /// recovering from a durable record has to tell apart, and one of them
     /// is routine.
     pub(crate) async fn open_doc(&self, namespace: NamespaceId) -> Result<Option<Doc>> {
+        // The mirror of [`guard_data_import`](Self::guard_data_import),
+        // which refuses a data import onto a device-shared replica: this
+        // one refuses opening a data replica as a device-shared store.
+        // Tracking here is `Swarm`, so without the guard an import that
+        // deliberately stays out of the gossip swarm — every grantee one —
+        // would be pulled into it by a mistaken open.
+        if self.registry.binding_of(namespace)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a data replica on this node; \
+                 it cannot be opened as a device-shared store"
+            ));
+        }
         if !self.holds_namespace(namespace).await? {
             return Ok(None);
         }
@@ -962,6 +999,43 @@ impl SyncNode {
         };
         self.track(&doc, Vec::new(), SyncStrategy::Swarm)?;
         Ok(Some(doc))
+    }
+
+    /// Read the replica store, so a caller can tell a store that still
+    /// answers from one that does not. The store is one database shared by
+    /// every replica this node holds, and a filesystem that filled under
+    /// it leaves it refusing every later operation until it is reopened —
+    /// a state no in-memory bookkeeping reflects, which is why a health
+    /// answer has to come from the store itself.
+    ///
+    /// The read asks one replica for its sync peers, because that reaches
+    /// the store's tables and a store that stopped answering says so
+    /// there. Two cheaper-looking reads do not: the namespace listing and
+    /// an empty entry query both keep answering long after the database
+    /// has refused everything else — the first is served without reaching
+    /// the tables, the second finds nothing pending to commit. A node
+    /// tracking no replica has no replica state to be broken, and the
+    /// listing is then all there is to ask.
+    pub async fn check_replica_store(&self) -> Result<()> {
+        let doc = {
+            let docs = self
+                .tracked_docs
+                .lock()
+                .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+            docs.values().next().map(|tracked| tracked.doc.clone())
+        };
+        match doc {
+            Some(doc) => {
+                let _peers = doc.get_sync_peers().await?;
+            }
+            None => {
+                let mut listed = self.docs.list().await?;
+                if let Some(entry) = listed.next().await {
+                    let _first = entry?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether the replica store holds `namespace`, answered from its
@@ -1395,9 +1469,9 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
 }
 
 /// Generate a fresh key and commit it to `path` — written beside and linked
-/// into place, so no half-written key can exist, and created exclusively,
-/// so two starts racing on one directory cannot mint different keys: the
-/// loser reads the winner's file instead.
+/// into place, so no half-written key can exist, and linked exclusively, so
+/// two starts racing on one directory cannot mint different keys: the loser
+/// reads the winner's file instead.
 #[cfg(unix)]
 fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Result<SecretKey> {
     use std::{
@@ -1406,7 +1480,13 @@ fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Res
     };
     let fresh = SecretKey::generate();
     let encoded = encode_hex(&fresh.to_bytes());
-    let staged = directory.join(format!("{NODE_KEY_FILE}.{}.tmp", std::process::id()));
+    let staged = directory.join(format!("{NODE_KEY_FILE}.tmp"));
+    // One staging name, cleared before use: this runs under the directory's
+    // exclusive lock, so no other node is staging here, and a leftover from
+    // a start interrupted mid-write must not be what stops every later one.
+    // Removed rather than truncated so the mode below is the file's own and
+    // not a leftover's.
+    let _leftover_gone = std::fs::remove_file(&staged);
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -1585,5 +1665,54 @@ fn starts_with_components(path: &EntryPath, prefix: &EntryPath) -> bool {
     match path.as_str().strip_prefix(prefix.as_str()) {
         Some(rest) => rest.is_empty() || rest.starts_with('/'),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reclassification of a held replica store, tested directly
+    /// because no path reaches it: the directory's own advisory lock is
+    /// taken first and refuses the second node before any store opens, so
+    /// this branch is a backstop for a directory whose lock does not hold
+    /// — and a backstop no scenario can reach is exactly the code that
+    /// rots unnoticed when the fork's error shape drifts.
+    ///
+    /// Both halves are asserted together: the held error becomes
+    /// `DirectoryHeld` naming the directory, and an unrelated failure does
+    /// not — a reclassification that fired on everything would name the
+    /// directory just as well while telling the operator the opposite of
+    /// what happened.
+    #[test]
+    fn a_held_database_is_reclassified_and_nothing_else_is() {
+        let directory = std::path::PathBuf::from("/pdn/state");
+        let storage = StorageConfig::Directory(directory.clone());
+
+        // Wrapped in a context layer, the way the fork's own chain
+        // presents it — the classification reads the chain, not the
+        // outermost error.
+        let held = anyhow::Error::new(redb::DatabaseError::DatabaseAlreadyOpen)
+            .context("cannot open the replica store");
+        let annotated = annotate_store_error(held, &storage);
+        let named = annotated
+            .downcast_ref::<DirectoryHeld>()
+            .expect("a database already open must be reclassified as a held directory");
+        assert_eq!(named.directory, directory);
+
+        let unrelated = anyhow::anyhow!("the store's file is corrupt");
+        let annotated = annotate_store_error(unrelated, &storage);
+        assert!(
+            annotated.downcast_ref::<DirectoryHeld>().is_none(),
+            "an unrelated store failure must not read as a held directory"
+        );
+        assert!(
+            format!("{annotated:#}").contains(&directory.display().to_string()),
+            "an unrelated store failure must still name the directory"
+        );
+
+        // A memory node has no directory to name, so nothing is annotated.
+        let on_memory = annotate_store_error(anyhow::anyhow!("boom"), &StorageConfig::Memory);
+        assert_eq!(format!("{on_memory:#}"), "boom");
     }
 }

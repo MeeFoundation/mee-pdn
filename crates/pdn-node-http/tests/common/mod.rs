@@ -22,7 +22,10 @@
 
 use std::{
     future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -93,11 +96,21 @@ const RESTART_BUDGET: Duration = Duration::from_mins(1);
 /// A ceiling on one liveness probe. The budget above is checked between
 /// requests, so without this a probe that connects and then never answers
 /// holds the wait open past any budget. A node that is up answers in
-/// milliseconds; nothing legitimate takes seconds here. A ceremony request
-/// is deliberately left unbounded — a route like `link` may honestly run for
-/// the lifetime its caller asked for; a wait for convergence bounds its own
-/// reads by its own budget instead ([`eventually`], [`poll_read`]).
+/// milliseconds; nothing legitimate takes seconds here — which is why this
+/// is far tighter than [`REQUEST_BUDGET`], the ceiling every other request
+/// carries.
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A ceiling on every other request the stand makes. It exists against the
+/// hang, not against slowness: a container torn down mid-request can leave
+/// the daemon's port-forwarder black-holing the connection, and a request
+/// that never answers and never errors wedges the scenario waiting on it —
+/// a stuck run instead of a red one, holding its slot in the container test
+/// group. Sized above every request this suite makes: the ceremony routes
+/// bound themselves by their own `timeout_secs` (60 seconds at most here),
+/// and a route that legitimately ran longer would need its own budget
+/// rather than this one raised.
+const REQUEST_BUDGET: Duration = Duration::from_secs(120);
 
 /// How many containers one node is worth. A published port that never
 /// answers is an arrangement that failed, not a scenario that did, so the
@@ -207,7 +220,7 @@ impl Stand {
                 .with_env_var("RUST_LOG", "info,pdn_node=debug,data_layer=debug")
                 .with_network(&self.network)
                 .with_log_consumer(stream_to_file(&name))
-                .with_container_name(name);
+                .with_container_name(name.clone());
             if debug {
                 image = image.with_env_var("PDN_DEBUG", "1");
             }
@@ -225,11 +238,12 @@ impl Stand {
                 .start()
                 .await
                 .with_context(|| format!("starting {label}: is {reference} built?"))?;
-            let client = reqwest::Client::new();
+            let client = stand_client()?;
             match wait_live(&container, label, &client, READY_BUDGET).await {
                 Ok(base) => {
                     return Ok(Host {
                         label: label.to_owned(),
+                        name,
                         base: std::sync::Mutex::new(base),
                         client,
                         container,
@@ -299,6 +313,9 @@ impl Answer {
 /// One node of the stand: a container and the client that reaches it.
 pub struct Host {
     label: String,
+    /// The container's name, which is also its log file's — needed after a
+    /// restart, where log capture is re-attached by name.
+    name: String,
     /// Where this node is reached — behind a lock because a restart moves
     /// it: a stopped container's published-port mapping is released, and
     /// the port it comes back on is a different one, re-read from the
@@ -400,6 +417,7 @@ impl Host {
                 .with_context(|| format!("starting {}", self.label))?;
             match wait_live(&self.container, &self.label, &self.client, RESTART_BUDGET).await {
                 Ok(base) => {
+                    follow_logs_into_file(&self.container, &self.name);
                     *self
                         .base
                         .lock()
@@ -423,6 +441,28 @@ impl Host {
             }
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("{} was never started", self.label)))
+    }
+
+    /// This node's exit code, as the daemon recorded it. Read after a stop
+    /// to tell a process that left by its own shutdown path (0) from one
+    /// the daemon killed when the grace ran out (137) — an outcome the
+    /// container's state alone cannot distinguish, since both end with a
+    /// container that is down.
+    pub fn exit_code(&self) -> Result<i64> {
+        let output = std::process::Command::new("docker")
+            .args(["inspect", "-f", "{{.State.ExitCode}}", self.container.id()])
+            .output()
+            .with_context(|| format!("reading the exit code of {}", self.label))?;
+        ensure!(
+            output.status.success(),
+            "reading the exit code of {} failed: {}",
+            self.label,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .with_context(|| format!("the exit code of {} is not a number", self.label))
     }
 
     /// Whether this node's process is still running, as the daemon sees it.
@@ -487,6 +527,55 @@ async fn log_tail(container: &ContainerAsync<GenericImage>, label: &str) -> Stri
     let tail = out.len().saturating_sub(LOG_TAIL_BYTES);
     let text = String::from_utf8_lossy(out.get(tail..).unwrap_or(&out)).into_owned();
     format!("[{label}] last {} bytes of log:\n{text}", text.len())
+}
+
+/// The stand's HTTP client: one per node, with a bounded per-request
+/// timeout. Unbounded is not an option here — the daemon has been observed
+/// leaving the port-forwarder black-holing traffic to a torn-down
+/// container rather than resetting the connection, so a request racing a
+/// container's lifecycle can hang forever, and a scenario waiting on it
+/// wedges instead of failing. The budget is far above any answer the debug
+/// surface takes and far below a run's patience.
+fn stand_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_BUDGET)
+        .build()
+        .context("building the stand's HTTP client")
+}
+
+/// Re-attach log capture to a container that has been started again. The
+/// capture installed at creation follows one run of the process and ends
+/// with it, so without this a restart scenario's file keeps only what the
+/// node printed before its first stop — the half that is not the one under
+/// investigation. The follow starts at the container's first frame and the
+/// file is rewritten whole, so it stays one history in order rather than
+/// two halves interleaved. Best effort throughout: a log that cannot be
+/// written must never decide the outcome of a scenario.
+fn follow_logs_into_file(container: &ContainerAsync<GenericImage>, container_name: &str) {
+    use tokio::io::AsyncReadExt as _;
+
+    let _ = std::fs::create_dir_all(NODE_LOG_DIR);
+    let path = std::path::Path::new(NODE_LOG_DIR).join(format!("{container_name}.log"));
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    let sink = Arc::new(std::sync::Mutex::new(file));
+    for mut stream in [container.stdout(true), container.stderr(true)] {
+        let sink = Arc::clone(&sink);
+        let _detached = tokio::spawn(async move {
+            let mut buffer = [0u8; 8 * 1024];
+            loop {
+                let read = match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                if let Ok(mut file) = sink.lock() {
+                    use std::io::Write as _;
+                    let _ = file.write_all(&buffer[..read]);
+                }
+            }
+        });
+    }
 }
 
 /// A consumer that writes one container's whole log to a file named after

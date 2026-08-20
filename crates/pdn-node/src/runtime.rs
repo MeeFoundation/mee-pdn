@@ -178,6 +178,11 @@ pub(crate) struct State {
     pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
+    /// How long a connection armer waits for its directory to change
+    /// before sweeping anyway. Taken from the spawn's reconcile interval,
+    /// so a runtime configured for a fast test cadence retries as fast as
+    /// it reconciles.
+    pub(crate) sweep_interval: std::time::Duration,
     /// The retraction-event surface: the verdict consumer sends, and
     /// [`Runtime::subscribe_retractions`] hands out receivers.
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
@@ -284,6 +289,9 @@ impl Runtime {
             StorageConfig::Directory(directory) => Some(directory.clone()),
             StorageConfig::Memory => None,
         };
+        // Read before the options move into the node: the armers below
+        // wait on it.
+        let sweep_interval = options.reconcile_interval;
         let pairing = PairingHandler::new();
         let pairing_slot = pairing.slot();
         #[cfg(feature = "test-util")]
@@ -298,20 +306,37 @@ impl Runtime {
             options,
         )
         .await?;
+        let node_id = node.node_id();
+        // Everything between the node and the state, in one fallible step:
+        // whatever fails here, the node is shut down before the error
+        // leaves, because a node that never reaches its caller still holds
+        // the directory's databases open, and a retry on the same
+        // directory in this process would meet them.
+        //
         // The node's one author: the fork's persisted default author, so a
         // directory-configured runtime writes as the author it wrote as
         // before. The provisional-write tracker recognizes this runtime's
         // writes by it, and the runtime's consumer owns the verdict stream.
-        let author = node.default_author().await?;
-        node.track_writer_author(author);
-        let verdicts = node
-            .take_retraction_verdicts()
-            .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
-        let node_id = node.node_id();
-
-        // Recovery: host what the record names, before the state exists —
+        // Recovery hosts what the record names, before the state exists —
         // the armers spawn right after it does.
-        let (identities, armers) = recover_hosted_identities(&node, data_dir.as_deref()).await?;
+        let prepared = async {
+            let author = node.default_author().await?;
+            node.track_writer_author(author);
+            let verdicts = node
+                .take_retraction_verdicts()
+                .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
+            let (identities, armers) =
+                recover_hosted_identities(&node, data_dir.as_deref()).await?;
+            anyhow::Ok((author, verdicts, identities, armers))
+        }
+        .await;
+        let (author, verdicts, identities, armers) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let _ = node.shutdown().await;
+                return Err(err);
+            }
+        };
 
         let (retraction_events, _no_subscribers_yet) =
             tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
@@ -338,6 +363,7 @@ impl Runtime {
             fail_next_pending_device_write: false,
             retraction_events,
             data_dir,
+            sweep_interval,
         }));
         for (identity, changes) in armers {
             crate::connections::spawn_connection_armer(Arc::downgrade(&state), identity, changes);

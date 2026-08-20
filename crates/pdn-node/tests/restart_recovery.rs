@@ -466,3 +466,180 @@ async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> 
     second.shutdown().await?;
     Ok(())
 }
+
+/// A start that fails after the stores are open leaves the directory
+/// reusable: the second attempt in the same process comes up instead of
+/// waiting forever on its predecessor's blob store. The failure is the
+/// unreadable record — the one this change makes reachable on every start
+/// — and it is raised after the node exists, which is what makes the
+/// difference observable at all.
+///
+/// The wait is bounded on purpose: without the shutdown on the failing
+/// path the retry does not fail, it hangs, and an unbounded wait would
+/// turn that regression into a stuck run rather than a red one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
+    const RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+    let dir = tempfile::tempdir()?;
+    let first = runtime_on(dir.path()).await?;
+    let alice = first.identity().create().await?;
+    first.shutdown().await?;
+    drop(first);
+
+    // The failing start: the record cannot be parsed, and the refusal
+    // comes after the node's stores are open.
+    let record = std::fs::read(dir.path().join(RECORD))?;
+    std::fs::write(dir.path().join(RECORD), b"not json")?;
+    assert!(
+        runtime_on(dir.path()).await.is_err(),
+        "an unreadable record must stop the start"
+    );
+
+    // The retry, on the same directory in the same process.
+    std::fs::write(dir.path().join(RECORD), &record)?;
+    let retried = tokio::time::timeout(RETRY_BUDGET, runtime_on(dir.path()))
+        .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!("the retry never returned: the failed start left its stores open")
+        })??;
+    assert_eq!(
+        retried.sync().hosted_identities().await?,
+        vec![alice],
+        "the retry must host what the record names"
+    );
+    retried.shutdown().await?;
+    Ok(())
+}
+
+/// A connection and the grant riding on it come back after a restart, with
+/// the grant untouched throughout: the connection is listed, the grant is
+/// readable from the pair, and the granted namespace's entries read again
+/// once the pair's first sweep has run — from the durable records alone,
+/// with no ceremony repeated and nothing re-granted. An entry the issuer
+/// writes after the restart arrives too, so what came back is a live
+/// replica and not the bytes left on disk.
+///
+/// The denial rides the same scenario, as it must: a bare node holding the
+/// namespace's read ticket and pointed at the restarted runtime by hand —
+/// the access-control negative control — obtains nothing while the granted
+/// audience reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = EntryPath::new("contact/email")?;
+
+    let issuer_rt = memory_rt().await?;
+    let audience_rt = runtime_on(dir.path()).await?;
+    let issuer = issuer_rt.identity().create().await?;
+    let audience = audience_rt.identity().create().await?;
+
+    let invite = issuer_rt.connections().invite(issuer, None).await?;
+    establish_patiently(&audience_rt, audience, &issuer_rt, issuer, invite).await?;
+    issuer_rt.data().write(issuer, &path, b"granted").await?;
+    common::granted_patiently(
+        &issuer_rt,
+        issuer,
+        &audience_rt,
+        audience,
+        issuer,
+        claims_on(issuer, &path, false),
+    )
+    .await?;
+    assert!(
+        eventually(|| async {
+            match audience_rt.data().read(issuer, &path).await {
+                Ok(payload) => Ok(payload.as_deref() == Some(b"granted".as_slice())),
+                Err(_not_bound_yet) => Ok(false),
+            }
+        })
+        .await?,
+        "the audience never read the granted entry before the restart"
+    );
+
+    // The ticket the denial below presents, captured while the grant is
+    // live: a real read ticket, with no grant behind its holder.
+    let leaked_ticket = issuer_rt.data().share(issuer, ShareMode::Read).await?;
+
+    // The outage. Nothing is withdrawn, nothing re-granted: the grant is
+    // live before it and live after it.
+    audience_rt.shutdown().await?;
+    drop(audience_rt);
+    let recovered = runtime_on(dir.path()).await?;
+
+    assert!(
+        recovered
+            .connections()
+            .list(audience)
+            .await?
+            .contains(&issuer),
+        "the connection must be listed again after the restart"
+    );
+    assert!(
+        eventually(|| async {
+            Ok(!recovered
+                .connections()
+                .read_grants(audience, issuer)
+                .await?
+                .is_empty())
+        })
+        .await?,
+        "the grant must be readable from the pair after the restart"
+    );
+    assert!(
+        eventually(|| async {
+            match recovered.data().read(issuer, &path).await {
+                Ok(payload) => Ok(payload.as_deref() == Some(b"granted".as_slice())),
+                Err(_not_rebound_yet) => Ok(false),
+            }
+        })
+        .await?,
+        "the granted namespace must read again after the restart"
+    );
+
+    // The probe: a ticket holder with no grant, dialing the restarted
+    // runtime itself. Its import fires a sync attempt now and every
+    // reconcile interval after; asserted below, after a proven wave.
+    let probe = data_layer::SyncNode::spawn(data_layer::SpawnOptions {
+        reconcile_interval: RECONCILE,
+        ..data_layer::SpawnOptions::memory()
+    })
+    .await?;
+    let mut ticket = leaked_ticket;
+    ticket.nodes = vec![recovered.sync().dial_handle_for_test().await.addr()];
+    probe.import_namespace_scoped(issuer, ticket).await?;
+
+    // What the issuer writes after the restart arrives over the same
+    // binding — a live replica, not the bytes the outage left behind. The
+    // rewrite stays inside the granted claim: what falls outside it is
+    // filtered by subset reconciliation and would never arrive, grant or
+    // no grant.
+    issuer_rt.data().write(issuer, &path, b"after").await?;
+    assert!(
+        eventually(|| async {
+            match recovered.data().read(issuer, &path).await {
+                Ok(payload) => Ok(payload.as_deref() == Some(b"after".as_slice())),
+                Err(_not_rebound_yet) => Ok(false),
+            }
+        })
+        .await?,
+        "a rewrite after the restart must reach the audience over the recovered binding"
+    );
+
+    // The audience's read above is the proven wave; three more of the
+    // probe's own intervals mean "it tried repeatedly and was refused".
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        probe.read(issuer, &path).await?.is_none(),
+        "a ticket holder with no grant must obtain nothing from the restarted node"
+    );
+    assert!(
+        probe.list(issuer, None).await?.is_empty(),
+        "a ticket holder with no grant must not even list the namespace"
+    );
+
+    probe.shutdown().await?;
+    recovered.shutdown().await?;
+    issuer_rt.shutdown().await?;
+    Ok(())
+}

@@ -25,6 +25,9 @@ percent-encoding = "2"
 # backend — the stand speaks plain HTTP to loopback and nothing else.
 reqwest = { version = "0.12", default-features = false }
 testcontainers = "0.26"
+# `io-util` for the stand's log follower, which re-attaches a container's
+# log capture after a restart; the crate's own build needs no reader.
+tokio = { version = "1", features = ["io-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

@@ -109,9 +109,9 @@ run-image:
 # narration is the same either way.
 #
 # The nodes and their volumes are torn down on every exit, the failing one
-# included: a demo that leaves containers — or, now that each node keeps its
-# state on a volume, volumes — behind has the next run meeting the last
-# run's state, which is the one thing a demo must never do.
+# included: each node keeps its state on a volume, so a demo that leaves
+# either behind has the next run meeting the last run's state, which is the
+# one thing a demo must never do.
 [doc("Run the live demo across containers (needs docker)")]
 demo:
   #!/bin/sh

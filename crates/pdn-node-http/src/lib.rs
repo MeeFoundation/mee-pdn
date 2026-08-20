@@ -135,9 +135,15 @@ async fn live(State(_runtime): State<Arc<Runtime>>) -> &'static str {
     "ok"
 }
 
-/// Readiness reports whether the runtime's state answers within its budget.
+/// Readiness reports whether the runtime answers within its budget — its
+/// state and the storage under it. The storage read is the half that can
+/// say no: a full disk leaves the replica store refusing every operation
+/// until the process restarts, and a readiness answer drawn from
+/// in-memory bookkeeping alone would keep reporting a healthy node that
+/// serves nothing.
 async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, HostError> {
     with_runtime_budget(runtime.sync().hosted_identities()).await?;
+    with_runtime_budget(runtime.sync().check_storage()).await?;
     Ok("ok")
 }
 

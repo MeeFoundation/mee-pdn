@@ -330,10 +330,11 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
 }
 
 /// Keep hosted `identity`'s connections bound for session classification:
-/// one sweep now, then one per directory change, each opening every
-/// directory-listed pair not yet cached. Hosting an identity thereby keeps
-/// its pairs registered — on the device that established them and on every
-/// linked device their records replicate to. Without the sweep a linked
+/// one sweep now, then one per directory change and one per sweep
+/// interval, each opening every directory-listed pair not yet cached.
+/// Hosting an identity thereby keeps its pairs registered — on the device
+/// that established them and on every linked device their records
+/// replicate to. Without the sweep a linked
 /// device would silently refuse grants its identity really issued until
 /// its first grant read, and stay invisible to the counterparty
 /// ([`open_pair`] is also what publishes the device record).
@@ -350,19 +351,29 @@ pub(crate) fn spawn_connection_armer(
     let mut changes = changes;
     let _detached = tokio::spawn(async move {
         loop {
-            {
+            let interval = {
                 let Some(strong) = state.upgrade() else {
                     return;
                 };
                 let mut guard = strong.lock().await;
                 arm_connections(&mut guard, identity, &state).await;
-            }
-            match changes.next().await {
-                Some(Ok(())) => {}
-                // A failed subscription or a stream ended by shutdown both
-                // end the armer; the grant surface's on-demand open remains
-                // as the backstop.
-                Some(Err(_)) | None => return,
+                guard.sweep_interval
+            };
+            // Two wake sources, not one. A sweep can fail for a reason the
+            // directory knows nothing about — an import that met a full
+            // disk — and nothing then writes to the directory to ask for
+            // another try, so a change-driven armer alone would leave the
+            // identity unbound until something unrelated happened to write
+            // there. The timer bounds that to one interval.
+            tokio::select! {
+                change = changes.next() => match change {
+                    Some(Ok(())) => {}
+                    // A failed subscription or a stream ended by shutdown
+                    // both end the armer; the grant surface's on-demand
+                    // open remains as the backstop.
+                    Some(Err(_)) | None => return,
+                },
+                () = tokio::time::sleep(interval) => {}
             }
         }
     });
@@ -809,7 +820,10 @@ async fn bind_data_namespace(state: &mut State, identity: PdnId) {
         return;
     };
     if let Err(err) = state.node.import_namespace(identity, ticket).await {
-        tracing::debug!(%identity, "re-binding the data namespace failed: {err:#}");
+        // Warn, not debug: this is the identity's own data namespace, and
+        // an import that keeps failing leaves it hosted and unreadable
+        // with nothing else to say so. The retry is the next sweep.
+        tracing::warn!(%identity, "re-binding the data namespace failed: {err:#}");
     }
 }
 

@@ -370,6 +370,38 @@ impl PrivateMetadataStore {
         self.cleanup_pending_devices_at(now).await
     }
 
+    /// Write `device`'s record under `author` rather than the node's own —
+    /// the negative control for
+    /// [`live_device_record_count`](Self::live_device_record_count): a
+    /// count of one proves nothing unless a second author's record would
+    /// have counted. Behind `test-util` and absent from every product
+    /// build.
+    #[cfg(feature = "test-util")]
+    pub async fn add_device_as_for_test(&self, device: NodeId, author: AuthorId) -> Result<()> {
+        self.doc
+            .set_bytes(author, device_key(&device).into_bytes(), vec![1u8])
+            .await?;
+        Ok(())
+    }
+
+    /// How many live records the directory holds at `device`'s key, across
+    /// authors. Every product read collapses them latest-wins, so a record
+    /// written under a second author is invisible everywhere else and
+    /// shows up only in a count like this — which is what makes the node's
+    /// one author assertable at all. Behind `test-util` and absent from
+    /// every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn live_device_record_count(&self, device: NodeId) -> Result<usize> {
+        let query = Query::all().key_exact(device_key(&device).into_bytes());
+        let mut entries = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut count = 0usize;
+        while let Some(entry) = entries.next().await {
+            let _live = entry?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Promote `device` from pending to confirmed, clearing the pending
     /// record. Written by the newcomer itself: only a device that imported
     /// this directory holds the write ticket that lets it, so the record is

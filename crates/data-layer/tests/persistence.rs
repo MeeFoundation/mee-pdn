@@ -155,13 +155,18 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     Ok(())
 }
 
-/// A device withdrawn after a restart stays withdrawn. Prefix deletion is
-/// scoped to the writing author, so a tombstone written under one author
-/// leaves another author's record live in the replica; the set reads the
-/// device as absent because the latest-per-key collapse sees the tombstone
-/// before empty entries are excluded. This test pins that query behavior:
-/// a read that excluded empties before the collapse would resurrect the
-/// withdrawn device, whatever author wrote the tombstone.
+/// A device withdrawn after a restart stays withdrawn — and the record it
+/// withdraws was written by another node, which is what puts the query's
+/// order under test. Prefix deletion is scoped to the writing author, so
+/// this node's tombstone leaves the other author's record live in the
+/// replica; the set reads the device as absent only because the
+/// latest-per-key collapse sees the tombstone before empty entries are
+/// excluded. A read that excluded empties first would keep the older live
+/// record and resurrect the withdrawn device.
+///
+/// The restart is load-bearing twice over: the tombstone must be written
+/// by the author this node had before it, and the record it buries must
+/// have survived the outage on disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     use std::str::FromStr as _;
@@ -182,10 +187,25 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     let cms = ConnectionMetadataStore::create(&first).await?;
     let own_node = first.node_id();
     cms.ensure_device_published(own_node).await?;
-    cms.ensure_device_published(withdrawn).await?;
     let ticket = cms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
+
+    // The withdrawn device's record comes from another node, so it stands
+    // under another author than the tombstone below.
+    let other = test_utils::memory_node().await?;
+    let other_cms = ConnectionMetadataStore::import(&other, ticket.clone()).await?;
+    other_cms.ensure_device_published(withdrawn).await?;
+    assert!(
+        test_utils::eventually(|| async {
+            Ok(cms.published_devices().await?.contains(&withdrawn))
+        })
+        .await?,
+        "the other node's record never reached this replica"
+    );
+    other.shutdown().await?;
+    drop(other_cms);
+    drop(other);
     first.shutdown().await?;
     drop(cms);
     drop(first);
@@ -266,5 +286,101 @@ async fn a_malformed_key_file_stops_the_start_and_is_not_replaced() -> Result<()
         b"not a key",
         "the malformed key must not be replaced with a fresh one"
     );
+    Ok(())
+}
+
+/// A staging file left by a start that died while minting the key does not
+/// block the next one: the key is minted, the node comes up, and the
+/// leftover is gone. The staged name is fixed rather than derived from the
+/// process id, so on a container — where the node is always pid 1 — a
+/// leftover would otherwise reproduce byte for byte and stop every later
+/// start until a person deleted it from the volume.
+///
+/// The denial beside it: a leftover that is the *committed* key is a
+/// different thing entirely and stays untouched — the start reads it, and
+/// the node keeps the id that file names, rather than minting over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let staged = dir.path().join("node.key.tmp");
+    std::fs::create_dir_all(dir.path())?;
+    std::fs::write(&staged, b"half a key from a start that died")?;
+
+    let node = node_on(dir.path()).await?;
+    let id = node.node_id();
+    assert!(
+        dir.path().join("node.key").exists(),
+        "the interrupted start's leftover must not stop the key from being minted"
+    );
+    assert!(
+        !staged.exists(),
+        "the staging file must not survive the start that used it"
+    );
+    node.shutdown().await?;
+    drop(node);
+
+    // Denial: the committed key is not a leftover — a restart reads it.
+    let again = node_on(dir.path()).await?;
+    assert_eq!(
+        again.node_id(),
+        id,
+        "the committed key must be read back, not minted again"
+    );
+    again.shutdown().await?;
+    Ok(())
+}
+
+/// One author per node, and the stores use it: a device record rewritten
+/// after a restart replaces its predecessor instead of accreting beside it
+/// under a second author. The sibling scenario above asserts the fork
+/// hands back a stable default author; this one asserts the directory
+/// writes with it, which is the half a store that minted its own author
+/// again would break — invisibly, since every product read is latest-wins
+/// and would keep returning the newest record either way.
+///
+/// The denial beside it: a record written under a deliberately separate
+/// author does accrete, so the count is a real instrument and not a
+/// constant.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let device = first.node_id();
+    let directory = PrivateMetadataStore::create(&first).await?;
+    let namespace = directory.namespace();
+    directory.add_device(device).await?;
+    assert_eq!(
+        directory.live_device_record_count(device).await?,
+        1,
+        "the first write must leave one record"
+    );
+    first.shutdown().await?;
+    drop(directory);
+    drop(first);
+
+    let second = node_on(dir.path()).await?;
+    let reopened = PrivateMetadataStore::open(&second, namespace)
+        .await?
+        .expect("the respawned store must still hold the directory replica");
+    reopened.add_device(device).await?;
+    assert_eq!(
+        reopened.live_device_record_count(device).await?,
+        1,
+        "the rewrite after the restart must replace the record, not accrete beside it"
+    );
+
+    // Denial: a record written under another author accretes — the count
+    // above is not one by construction.
+    let other_author = second.create_author().await?;
+    reopened
+        .add_device_as_for_test(device, other_author)
+        .await?;
+    assert_eq!(
+        reopened.live_device_record_count(device).await?,
+        2,
+        "a second author's record must be countable, or the assertion above proves nothing"
+    );
+    second.shutdown().await?;
     Ok(())
 }

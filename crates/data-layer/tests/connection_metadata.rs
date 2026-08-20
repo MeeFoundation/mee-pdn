@@ -383,6 +383,43 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     Ok(())
 }
 
+/// The mirror denial: a data replica refuses to be opened as a
+/// device-shared store. `PrivateMetadataStore::open` is recovery's
+/// constructor and enrols what it opens in the gossip swarm, so an open
+/// aimed at a data namespace would widen the data path of a replica whose
+/// import deliberately stays out of that swarm — and would do it silently,
+/// since the store does hold the namespace.
+///
+/// Beside it, the allowed case: the directory this node created opens, and
+/// reads back what it holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
+    let alice = memory_node().await?;
+    let directory = PrivateMetadataStore::create(&alice).await?;
+    directory.add_device(alice.node_id()).await?;
+    alice.create_namespace(ids::ALICE).await?;
+    let data = alice
+        .share_ticket(ids::ALICE, ShareMode::Read, AddrInfoOptions::Addresses)
+        .await?;
+
+    assert!(
+        PrivateMetadataStore::open(&alice, data.capability.id())
+            .await
+            .is_err(),
+        "a data replica must not open as a device-shared store"
+    );
+    let reopened = PrivateMetadataStore::open(&alice, directory.namespace())
+        .await?
+        .expect("the node holds its own directory replica");
+    assert!(
+        reopened.list_devices().await?.contains(&alice.node_id()),
+        "the directory itself must still open and read back"
+    );
+
+    alice.shutdown().await?;
+    Ok(())
+}
+
 /// A device-shared replica refuses a data import: a connection metadata
 /// store — like a directory — is tracked but not data-bound, and a ticket
 /// naming its namespace must not repurpose it as a data namespace. Honoring
