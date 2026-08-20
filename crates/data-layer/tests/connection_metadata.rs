@@ -16,7 +16,7 @@ use data_layer::{
     PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NodeId, NonEmpty, PdnId};
-use test_utils::{eventually, ids, wait_entry_is};
+use test_utils::{eventually, ids, memory_node, wait_entry_is};
 
 /// The reconcile cadence the sibling-serving scenario runs at. A grantee
 /// replica has no gossip path, so every denial is "the reader retried over
@@ -27,8 +27,9 @@ const RECONCILE: Duration = Duration::from_millis(500);
 
 /// Spawn a node with the sibling-serving scenario's short reconcile cadence.
 async fn spawn_node() -> Result<SyncNode> {
-    SyncNode::spawn_with_options(SpawnOptions {
+    SyncNode::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
+        ..SpawnOptions::memory()
     })
     .await
 }
@@ -85,9 +86,9 @@ async fn wait_grant_is(
 /// absent, and converges without any re-import.
 #[tokio::test(flavor = "multi_thread")]
 async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
-    let mut alice = SyncNode::spawn().await?;
-    let bob = SyncNode::spawn().await?;
-    let carol = SyncNode::spawn().await?;
+    let mut alice = memory_node().await?;
+    let bob = memory_node().await?;
+    let carol = memory_node().await?;
 
     // Alice issues one store per counterparty; Bob issues one toward Alice.
     let a_own_b = ConnectionMetadataStore::create(&alice).await?;
@@ -198,10 +199,10 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the pair's whole lifetime in one place
 async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
-    let mut a_phone = SyncNode::spawn().await?;
-    let mut a_laptop = SyncNode::spawn().await?;
-    let b_phone = SyncNode::spawn().await?;
-    let b_laptop = SyncNode::spawn().await?;
+    let mut a_phone = memory_node().await?;
+    let mut a_laptop = memory_node().await?;
+    let b_phone = memory_node().await?;
+    let b_laptop = memory_node().await?;
 
     // Alice's phone issues the store toward Bob. Her laptop opens it from
     // the write ticket (the directory's own-kind path); Bob's devices open
@@ -316,8 +317,8 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
 /// is only ever one entry to replace or delete.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
-    let mut alice = SyncNode::spawn().await?;
-    let bob = SyncNode::spawn().await?;
+    let mut alice = memory_node().await?;
+    let bob = memory_node().await?;
 
     // Alice's own store toward Bob; Bob imports the read ticket.
     let own = ConnectionMetadataStore::create(&alice).await?;
@@ -382,6 +383,43 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     Ok(())
 }
 
+/// The mirror denial: a data replica refuses to be opened as a
+/// device-shared store. `PrivateMetadataStore::open` is recovery's
+/// constructor and enrols what it opens in the gossip swarm, so an open
+/// aimed at a data namespace would widen the data path of a replica whose
+/// import deliberately stays out of that swarm — and would do it silently,
+/// since the store does hold the namespace.
+///
+/// Beside it, the allowed case: the directory this node created opens, and
+/// reads back what it holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
+    let alice = memory_node().await?;
+    let directory = PrivateMetadataStore::create(&alice).await?;
+    directory.add_device(alice.node_id()).await?;
+    alice.create_namespace(ids::ALICE).await?;
+    let data = alice
+        .share_ticket(ids::ALICE, ShareMode::Read, AddrInfoOptions::Addresses)
+        .await?;
+
+    assert!(
+        PrivateMetadataStore::open(&alice, data.capability.id())
+            .await
+            .is_err(),
+        "a data replica must not open as a device-shared store"
+    );
+    let reopened = PrivateMetadataStore::open(&alice, directory.namespace())
+        .await?
+        .expect("the node holds its own directory replica");
+    assert!(
+        reopened.list_devices().await?.contains(&alice.node_id()),
+        "the directory itself must still open and read back"
+    );
+
+    alice.shutdown().await?;
+    Ok(())
+}
+
 /// A device-shared replica refuses a data import: a connection metadata
 /// store — like a directory — is tracked but not data-bound, and a ticket
 /// naming its namespace must not repurpose it as a data namespace. Honoring
@@ -390,7 +428,7 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
 /// the store's live path by leaving the gossip swarm.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
-    let alice = SyncNode::spawn().await?;
+    let alice = memory_node().await?;
     let own = ConnectionMetadataStore::create(&alice).await?;
     let ticket = own
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
@@ -424,7 +462,7 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
 /// default.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Result<()> {
-    let alice = SyncNode::spawn().await?;
+    let alice = memory_node().await?;
     let own = ConnectionMetadataStore::create(&alice).await?;
     let device = alice.node_id();
 
@@ -459,7 +497,7 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
 /// opaque id — so the denial is the boundary's, not the writer's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
-    let alice = SyncNode::spawn().await?;
+    let alice = memory_node().await?;
     let own = ConnectionMetadataStore::create(&alice).await?;
 
     let device = alice.node_id();
@@ -492,10 +530,10 @@ async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() -> Result<()> {
-    let mut a_phone = SyncNode::spawn().await?;
-    let mut a_laptop = SyncNode::spawn().await?;
-    let mut bob = SyncNode::spawn().await?;
-    let carol = SyncNode::spawn().await?;
+    let mut a_phone = memory_node().await?;
+    let mut a_laptop = memory_node().await?;
+    let mut bob = memory_node().await?;
+    let carol = memory_node().await?;
 
     // The A→B pair: laptop on the write ticket, Bob on the read ticket.
     let own_b_phone = ConnectionMetadataStore::create(&a_phone).await?;

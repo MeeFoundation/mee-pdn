@@ -23,11 +23,17 @@ iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
 pdn-store = { workspace = true }
 pdn-types = { path = "../pdn-types" }
+# The same major the fork's replica store uses, for one downcast: telling
+# "the directory is held by another running node" apart from corruption
+# when a spawn's store open fails (`DirectoryHeld`).
+redb = "4.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Scenario tests of directory-configured nodes get a directory each.
+tempfile = "3"
 test-utils = { path = "../test-utils" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 

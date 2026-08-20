@@ -1,14 +1,16 @@
 //! Entry point: serve one embedded runtime over HTTP.
 //!
-//! Environment: `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default
-//! `3011`), and `PDN_DEBUG=1` to mount the scaffolding `/debug/` routes
-//! (absent otherwise). The binary is glue only — assembly and authorization
+//! Environment: `PDN_DATA_DIR` (required — the runtime's storage directory;
+//! the host offers no in-memory mode, and unset stops the start),
+//! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`), and
+//! `PDN_DEBUG=1` to mount the scaffolding `/debug/` routes (absent
+//! otherwise). The binary is glue only — assembly and authorization
 //! posture live in `pdn-node` (see the library crate docs).
 
 use std::{sync::Arc, time::Duration};
 
-use pdn_node::Runtime;
-use pdn_node_http::{bind_addr_from_env, debug_enabled_from_env, router};
+use pdn_node::{Runtime, SpawnOptions};
+use pdn_node_http::{bind_addr_from_env, data_dir_from_env, debug_enabled_from_env, router};
 
 /// How long `main` waits for axum's graceful drain — in-flight requests,
 /// e.g. a long-running `/debug/link` — before giving up on them and moving
@@ -27,14 +29,28 @@ const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let runtime = Arc::new(Runtime::spawn().await?);
+    // Configuration is parsed whole before anything is created: a typo in
+    // any of the variables answers at once, with no directory made, no key
+    // minted, no lock taken and no recovery run for a process that was
+    // never going to serve. It also keeps the markers below meaning what
+    // they say — a failure between them is a failure of the spawn, not of
+    // a value that was readable all along.
+    let data_dir = data_dir_from_env()?;
+    let bind_addr = bind_addr_from_env()?;
+    let debug_enabled = debug_enabled_from_env()?;
+
+    // The runtime is spawned before the listener binds: an unusable
+    // directory — held by another node, unwritable — exits here, serving
+    // neither liveness nor the debug surface, and never falls back to
+    // memory.
+    let runtime = Arc::new(Runtime::spawn(SpawnOptions::on_directory(data_dir)).await?);
     // The two startup markers below bracket the only silent stretch of a
     // node's life. Without them a node stuck in `Runtime::spawn` and one
     // serving happily but unreachable leave byte-identical logs, and the
     // difference between them is the difference between a defect here and a
     // defect in whatever publishes the port.
     tracing::info!("runtime spawned");
-    let result = run(&runtime).await;
+    let result = run(&runtime, bind_addr, debug_enabled).await;
     // Always runs, on every outcome of `run` above, `?`-early-returns
     // included: skipping it leaves the endpoint and every task a hosted
     // identity spawned running while the process tries to exit, which holds
@@ -51,15 +67,19 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The fallible part of serving: read configuration, bind, and serve until
-/// a stop signal arrives, then drain for at most [`GRACEFUL_DRAIN_BUDGET`].
+/// The fallible part of serving: bind the parsed address and serve until a
+/// stop signal arrives, then drain for at most [`GRACEFUL_DRAIN_BUDGET`].
 /// Split out of `main` so that every exit from here — the stop signal
-/// followed by the drain budget, or any `?` on a configuration/bind
-/// failure — still reaches `runtime.shutdown()` in `main`, unconditionally
-/// and exactly once.
-async fn run(runtime: &Arc<Runtime>) -> anyhow::Result<()> {
-    let app = router(Arc::clone(runtime), debug_enabled_from_env()?);
-    let listener = tokio::net::TcpListener::bind(bind_addr_from_env()?).await?;
+/// followed by the drain budget, or any `?` on a bind failure — still
+/// reaches `runtime.shutdown()` in `main`, unconditionally and exactly
+/// once.
+async fn run(
+    runtime: &Arc<Runtime>,
+    bind_addr: std::net::SocketAddr,
+    debug_enabled: bool,
+) -> anyhow::Result<()> {
+    let app = router(Arc::clone(runtime), debug_enabled);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = ?listener.local_addr()?, "HTTP listening");
 
     // The drain budget starts counting only once a stop signal actually

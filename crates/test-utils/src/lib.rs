@@ -12,8 +12,16 @@ use std::{
 };
 
 use anyhow::Result;
-use data_layer::{PrivateMetadataStore, SyncNode};
+use data_layer::{PrivateMetadataStore, SpawnOptions, SyncNode};
 use pdn_types::{EntryPath, NodeId, PdnId};
+
+/// A node on memory storage, no extra protocols — what the workspace's
+/// in-process suites run on. Storage is a required choice of every spawn,
+/// and this helper is where the suites name it, so none of them gains a
+/// temporary directory or filesystem I/O.
+pub async fn memory_node() -> Result<SyncNode> {
+    SyncNode::spawn(SpawnOptions::memory()).await
+}
 
 /// The cast: bare [`PdnId`] values, one byte pattern each. No node runs for
 /// any of them unless a test spawns one — the peers (Bob, Carol, Dave) exist

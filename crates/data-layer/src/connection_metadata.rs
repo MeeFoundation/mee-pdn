@@ -180,12 +180,14 @@ impl ConnectionMetadataStore {
     /// Create a fresh metadata store on `node` — this side's `own` replica
     /// toward one counterparty.
     pub async fn create(node: &SyncNode) -> Result<Self> {
-        // The author is minted first, and the doc — tracked by `new_doc`
+        // The author is resolved first, and the doc — tracked by `new_doc`
         // the moment it exists — last: nothing awaits between the tracking
         // and the handle reaching the caller, so a future dropped in here
         // cannot leave a tracked replica no handle refers to. The author is
-        // a standalone keypair, so the order costs nothing.
-        let author = node.create_author().await?;
+        // the node's one author ([`SyncNode::default_author`]): per-store
+        // authors would leave a record written before a restart standing
+        // beside its replacement written after one.
+        let author = node.default_author().await?;
         let doc = node.new_doc().await?;
         Ok(Self {
             doc,
@@ -200,7 +202,7 @@ impl ConnectionMetadataStore {
     /// at once; content converges asynchronously.
     pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see [`create`](Self::create).
-        let author = node.create_author().await?;
+        let author = node.default_author().await?;
         let doc = node.import_doc(ticket).await?;
         Ok(Self {
             doc,

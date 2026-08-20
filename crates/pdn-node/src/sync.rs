@@ -16,6 +16,13 @@ pub trait SyncService {
     /// The identities this runtime hosts: exactly those created or linked
     /// on it, in no particular order.
     async fn hosted_identities(&self) -> Result<Vec<PdnId>>;
+
+    /// Read the runtime's storage, so a caller asking whether this node is
+    /// fit to serve gets an answer the storage itself gave. Every other
+    /// report here is in-memory bookkeeping, which a broken store leaves
+    /// untouched: the identities stay listed, and every operation on them
+    /// fails.
+    async fn check_storage(&self) -> Result<()>;
 }
 
 /// The production [`SyncService`], backed by the runtime's `data-layer`
@@ -39,6 +46,14 @@ impl SyncService for RuntimeSyncService<'_> {
     async fn hosted_identities(&self) -> Result<Vec<PdnId>> {
         let state = self.runtime.state.lock().await;
         Ok(state.identities.keys().copied().collect())
+    }
+
+    async fn check_storage(&self) -> Result<()> {
+        let node = {
+            let state = self.runtime.state.lock().await;
+            std::sync::Arc::clone(&state.node)
+        };
+        node.check_replica_store().await
     }
 }
 

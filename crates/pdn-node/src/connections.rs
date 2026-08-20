@@ -330,10 +330,11 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
 }
 
 /// Keep hosted `identity`'s connections bound for session classification:
-/// one sweep now, then one per directory change, each opening every
-/// directory-listed pair not yet cached. Hosting an identity thereby keeps
-/// its pairs registered — on the device that established them and on every
-/// linked device their records replicate to. Without the sweep a linked
+/// one sweep now, then one per directory change and one per sweep
+/// interval, each opening every directory-listed pair not yet cached.
+/// Hosting an identity thereby keeps its pairs registered — on the device
+/// that established them and on every linked device their records
+/// replicate to. Without the sweep a linked
 /// device would silently refuse grants its identity really issued until
 /// its first grant read, and stay invisible to the counterparty
 /// ([`open_pair`] is also what publishes the device record).
@@ -350,19 +351,29 @@ pub(crate) fn spawn_connection_armer(
     let mut changes = changes;
     let _detached = tokio::spawn(async move {
         loop {
-            {
+            let interval = {
                 let Some(strong) = state.upgrade() else {
                     return;
                 };
                 let mut guard = strong.lock().await;
                 arm_connections(&mut guard, identity, &state).await;
-            }
-            match changes.next().await {
-                Some(Ok(())) => {}
-                // A failed subscription or a stream ended by shutdown both
-                // end the armer; the grant surface's on-demand open remains
-                // as the backstop.
-                Some(Err(_)) | None => return,
+                guard.sweep_interval
+            };
+            // Two wake sources, not one. A sweep can fail for a reason the
+            // directory knows nothing about — an import that met a full
+            // disk — and nothing then writes to the directory to ask for
+            // another try, so a change-driven armer alone would leave the
+            // identity unbound until something unrelated happened to write
+            // there. The timer bounds that to one interval.
+            tokio::select! {
+                change = changes.next() => match change {
+                    Some(Ok(())) => {}
+                    // A failed subscription or a stream ended by shutdown
+                    // both end the armer; the grant surface's on-demand
+                    // open remains as the backstop.
+                    Some(Err(_)) | None => return,
+                },
+                () = tokio::time::sleep(interval) => {}
             }
         }
     });
@@ -673,11 +684,12 @@ async fn held_by_another_pair(state: &State, unbinding: (PdnId, PdnId), issuer: 
         if (*audience, *peer) == unbinding {
             continue;
         }
-        match open.peer.read_grant(issuer, *audience).await {
-            Ok(data_layer::GrantRead::Granted(..)) => return true,
-            // Unreadable or unreachable is no evidence of holding either
-            // way; a grant that turns out live re-imports on its own sweep.
-            Ok(_) | Err(_) => {}
+        // Unreadable or unreachable is no evidence of holding either way;
+        // a grant that turns out live re-imports on its own sweep.
+        if let Ok(data_layer::GrantRead::Granted(..)) =
+            open.peer.read_grant(issuer, *audience).await
+        {
+            return true;
         }
     }
     false
@@ -751,6 +763,20 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
     // Every directory change re-applies the retraction markers: a marker
     // replicated from a sibling acts here, and re-application is idempotent.
     apply_retractions(state, identity).await;
+    // The identity's data namespace follows the directory's `data` ticket:
+    // bound already on the device that created or linked the identity, and
+    // re-bound here when the node holds the directory alone — a restart. A
+    // ticket whose payload has not landed yet leaves the issuer unbound
+    // until a later sweep; a read meanwhile refuses as unknown, fail-closed.
+    bind_data_namespace(state, identity).await;
+    // The identity's own device record, written whenever the directory
+    // lacks it: a device writes it after its hosting is durable, never
+    // before, so a start that finds itself hosted and unnamed writes it
+    // here — and so does a link whose confirmation did not go through.
+    // Until it lands, the identity's other devices refuse this one.
+    if let Err(err) = ensure_own_device_confirmed(state, identity).await {
+        tracing::warn!(%identity, "confirming this device in the directory failed: {err:#}");
+    }
     let peers = {
         let Ok(hosted) = state.hosted(identity) else {
             return;
@@ -771,6 +797,62 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
         if state.grant_binders.insert((identity, peer)) {
             spawn_grant_binder(runtime.clone(), identity, peer, peer_store);
         }
+    }
+}
+
+/// Write this node's device record into hosted `identity`'s directory when
+/// the confirmed set does not name it. Idempotent by construction — the
+/// read decides — and the repair for both windows that leave a hosted
+/// device unnamed: a link whose confirmation failed after its hosting was
+/// recorded, and a process killed between the two.
+///
+/// Removal of a device cannot be expressed as the absence of this record,
+/// precisely because of this write: an absence would be undone at the next
+/// sweep, with nothing left to say a removal ever happened. Nothing here
+/// reads a revocation record because the runtime has none; what keeps this
+/// safe is that removal, when it exists, is a record of its own that this
+/// write consults ([device-linking](../../../mia-docs/openspec/specs/components/pdn-node/device-linking.md)).
+pub(crate) async fn ensure_own_device_confirmed(state: &mut State, identity: PdnId) -> Result<()> {
+    let own_device = state.node.node_id();
+    let hosted = state.hosted(identity)?;
+    if hosted.directory.list_devices().await?.contains(&own_device) {
+        return Ok(());
+    }
+    hosted.directory.confirm_device(own_device).await
+}
+
+/// Bind hosted `identity`'s data namespace from its directory's `data`
+/// ticket when nothing is bound for it — the recovery half of the binding:
+/// creation and linking bind it themselves, and a restarted node holds the
+/// replica and the ticket while its in-memory registry starts empty. The
+/// import is idempotent against a replica the store already holds (the
+/// capability merges), so re-running it on every sweep converges. Nothing
+/// here dials by itself; the import's sync attempts ride the ordinary
+/// reconcile machinery.
+async fn bind_data_namespace(state: &mut State, identity: PdnId) {
+    match state.node.data_namespace_of(identity) {
+        Ok(None) => {}
+        // Bound already, or a registry failure this sweep cannot judge —
+        // the next sweep retries.
+        Ok(Some(_)) | Err(_) => return,
+    }
+    let Ok(hosted) = state.hosted(identity) else {
+        return;
+    };
+    // Absent, payload-waiting, or unreadable: cold until the payload's
+    // arrival fires the next sweep.
+    let Ok(Some(ticket)) = hosted
+        .directory
+        .get_ticket(crate::identity::DATA_TICKET_KIND)
+        .await
+    else {
+        return;
+    };
+    if let Err(err) = state.node.import_namespace(identity, ticket).await {
+        // Warn, not debug: this is the identity's own data namespace, and
+        // an import that keeps failing leaves it hosted and unreadable
+        // with nothing else to say so. The retry is the next sweep.
+        tracing::warn!(%identity, "re-binding the data namespace failed: {err:#}");
     }
 }
 

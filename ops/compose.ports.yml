@@ -1,0 +1,25 @@
+# The demo's HTTP published to the daemon's host, for a demo driven from
+# that host: `docker compose -f ops/compose.yml -f ops/compose.ports.yml`.
+#
+# Bound to loopback: the debug surface is unauthenticated and mints live
+# ceremony secrets, so a wider bind is never the default. A demo driven from
+# another container on the same daemon leaves this file out — a published
+# port belongs to the daemon's host, and a caller that is not that host
+# cannot reach it, while the port it holds there can collide with whatever
+# else that host is running.
+
+services:
+  alice-phone:
+    ports: ["127.0.0.1:3011:3011"]
+  alice-work-laptop:
+    ports: ["127.0.0.1:3012:3011"]
+  alice-leisure-laptop:
+    ports: ["127.0.0.1:3013:3011"]
+  bob-phone:
+    ports: ["127.0.0.1:3014:3011"]
+  bob-laptop:
+    ports: ["127.0.0.1:3015:3011"]
+  carol-phone:
+    ports: ["127.0.0.1:3016:3011"]
+  carol-laptop:
+    ports: ["127.0.0.1:3017:3011"]

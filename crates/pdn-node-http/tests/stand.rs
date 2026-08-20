@@ -124,12 +124,11 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
             .find(|grant| grant.issuer == alice))
     })
     .await?;
-    let capability = match capability {
-        Some(capability) => capability,
-        None => anyhow::bail!(
+    let Some(capability) = capability else {
+        anyhow::bail!(
             "the grant did not reach the grantee over the pair\n{}",
             scanner.diagnostics().await
-        ),
+        )
     };
     let GrantCapability {
         issuer: _,

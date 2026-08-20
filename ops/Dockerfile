@@ -39,10 +39,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p pdn-node-http
 
 FROM debian:bookworm-slim AS runtime
+# The state directory is created for the non-root user the binary runs as,
+# and the image declares no VOLUME over it: an image-declared volume is
+# created anonymously for every container that ever runs, so what is
+# mounted over the directory stays the caller's decision (the demo's
+# compose file mounts a named volume per node; the test stand mounts
+# nothing and the state lives and dies with the container).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 pdn
+    && useradd --create-home --uid 10001 pdn \
+    && mkdir -p /var/lib/pdn \
+    && chown pdn /var/lib/pdn \
+    && chmod 700 /var/lib/pdn
 COPY --from=builder /app/target/release/pdn-node-http /usr/local/bin/pdn-node-http
 USER pdn
 
@@ -51,9 +60,12 @@ USER pdn
 # stays unset on purpose: unset, the endpoint binds every interface and
 # publishes the container's own address, which is the address a peer
 # container dials. Set it and the node publishes an address only itself can
-# reach.
+# reach. The host requires PDN_DATA_DIR — it offers no in-memory mode — so
+# the image points it at the state directory above and a container needs no
+# per-node configuration.
 ENV PDN_HOST=0.0.0.0 \
-    PDN_PORT=3011
+    PDN_PORT=3011 \
+    PDN_DATA_DIR=/var/lib/pdn
 EXPOSE 3011
 
 # The debug subtree stays absent unless the caller asks for it: the stand

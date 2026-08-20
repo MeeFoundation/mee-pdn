@@ -1,10 +1,20 @@
 //! The HTTP host for the demo stand: a thin layer serving one embedded
 //! [`pdn_node::Runtime`] over HTTP.
 //!
-//! One process, one embedded runtime. The host holds no state and
-//! orchestrates nothing: each route delegates to a single service call of
-//! the runtime it embeds. It also authorizes nothing — every refusal is the
-//! runtime's, on the runtime's terms — and it adds no identity of its own.
+//! One process, one embedded runtime. The host holds no state of its own
+//! and orchestrates nothing: each route delegates to a single service call
+//! of the runtime it embeds. It also authorizes nothing — every refusal is
+//! the runtime's, on the runtime's terms — and it adds no identity of its
+//! own.
+//!
+//! The runtime's state lives where `PDN_DATA_DIR` points, and the variable
+//! is required ([`data_dir`]): the host offers no in-memory mode and
+//! carries no path of its own, so an unset variable stops the start with
+//! an error naming it, before anything serves. A directory the runtime
+//! cannot use — unwritable, held by another running node — stops the start
+//! the same way, serving neither liveness nor the debug surface; falling
+//! back to memory is exactly the failure this refuses, a host that
+//! promises persistence while holding everything in RAM.
 //!
 //! `GET /live` is the one always-on route, probed by container harnesses
 //! and the demo stand. Everything under `/debug/` is scaffolding for that
@@ -59,8 +69,8 @@ use pdn_node::{Runtime, SyncService as _};
 
 pub use crate::{
     bind::{
-        bind_addr, bind_addr_from_env, debug_enabled, debug_enabled_from_env, DEFAULT_HOST,
-        DEFAULT_PORT,
+        bind_addr, bind_addr_from_env, data_dir, data_dir_from_env, debug_enabled,
+        debug_enabled_from_env, DEFAULT_HOST, DEFAULT_PORT,
     },
     error::HostError,
 };
@@ -125,9 +135,15 @@ async fn live(State(_runtime): State<Arc<Runtime>>) -> &'static str {
     "ok"
 }
 
-/// Readiness reports whether the runtime's state answers within its budget.
+/// Readiness reports whether the runtime answers within its budget — its
+/// state and the storage under it. The storage read is the half that can
+/// say no: a full disk leaves the replica store refusing every operation
+/// until the process restarts, and a readiness answer drawn from
+/// in-memory bookkeeping alone would keep reporting a healthy node that
+/// serves nothing.
 async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, HostError> {
     with_runtime_budget(runtime.sync().hosted_identities()).await?;
+    with_runtime_budget(runtime.sync().check_storage()).await?;
     Ok("ok")
 }
 

@@ -206,12 +206,14 @@ pub struct PrivateMetadataStore {
 impl PrivateMetadataStore {
     /// Create a fresh private metadata store on `node`.
     pub async fn create(node: &SyncNode) -> Result<Self> {
-        // The author is minted first, and the doc — tracked by `new_doc`
+        // The author is resolved first, and the doc — tracked by `new_doc`
         // the moment it exists — last: nothing awaits between the tracking
         // and the handle reaching the caller, so a future dropped in here
         // cannot leave a tracked replica no handle refers to. The author is
-        // a standalone keypair, so the order costs nothing.
-        let author = node.create_author().await?;
+        // the node's one author ([`SyncNode::default_author`]): per-store
+        // authors would leave a record written before a restart standing
+        // beside its replacement written after one.
+        let author = node.default_author().await?;
         let doc = node.new_doc().await?;
         Ok(Self {
             doc,
@@ -225,7 +227,7 @@ impl PrivateMetadataStore {
     /// ticket handed to a newly linked device over the linking dialogue).
     pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see [`create`](Self::create).
-        let author = node.create_author().await?;
+        let author = node.default_author().await?;
         let doc = node.import_doc(ticket).await?;
         Ok(Self {
             doc,
@@ -233,6 +235,26 @@ impl PrivateMetadataStore {
             blobs: node.blobs(),
             pending_mutations: Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// Open the private metadata store of a replica this node already holds
+    /// — recovery's constructor: no ticket is consumed and nothing is
+    /// created, because the replica is already here. A namespace the node's
+    /// store does not hold is `Ok(None)`, so a caller acting on a durable
+    /// record can tell an absent replica from a store that failed to
+    /// answer; `create` and `import` are the constructors that bring a
+    /// replica in.
+    pub async fn open(node: &SyncNode, namespace: NamespaceId) -> Result<Option<Self>> {
+        let author = node.default_author().await?;
+        let Some(doc) = node.open_doc(namespace).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            doc,
+            author,
+            blobs: node.blobs(),
+            pending_mutations: Arc::new(tokio::sync::Mutex::new(())),
+        }))
     }
 
     /// Share this store as a ticket another device of the identity can
@@ -346,6 +368,38 @@ impl PrivateMetadataStore {
     #[cfg(feature = "test-util")]
     pub async fn cleanup_pending_devices_at_for_test(&self, now: SystemTime) -> Result<()> {
         self.cleanup_pending_devices_at(now).await
+    }
+
+    /// Write `device`'s record under `author` rather than the node's own —
+    /// the negative control for
+    /// [`live_device_record_count`](Self::live_device_record_count): a
+    /// count of one proves nothing unless a second author's record would
+    /// have counted. Behind `test-util` and absent from every product
+    /// build.
+    #[cfg(feature = "test-util")]
+    pub async fn add_device_as_for_test(&self, device: NodeId, author: AuthorId) -> Result<()> {
+        self.doc
+            .set_bytes(author, device_key(&device).into_bytes(), vec![1u8])
+            .await?;
+        Ok(())
+    }
+
+    /// How many live records the directory holds at `device`'s key, across
+    /// authors. Every product read collapses them latest-wins, so a record
+    /// written under a second author is invisible everywhere else and
+    /// shows up only in a count like this — which is what makes the node's
+    /// one author assertable at all. Behind `test-util` and absent from
+    /// every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn live_device_record_count(&self, device: NodeId) -> Result<usize> {
+        let query = Query::all().key_exact(device_key(&device).into_bytes());
+        let mut entries = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut count = 0usize;
+        while let Some(entry) = entries.next().await {
+            let _live = entry?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Promote `device` from pending to confirmed, clearing the pending
