@@ -196,6 +196,7 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
     let alice = runtime.identity().create().await?;
     let record_after_first = std::fs::read(&record_path)?;
     let inode_after_first = std::fs::metadata(&record_path)?.ino();
+    let tracked_after_first = runtime.sync().tracked_doc_count().await?;
 
     // The injected failure: the directory refuses new files, so staging
     // the replacement fails while the stores — files already open, in
@@ -217,6 +218,16 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
         runtime.sync().hosted_identities().await?,
         vec![alice],
         "the failed create must not disturb the hosted set"
+    );
+    // And it leaves nothing behind in the running node either. The
+    // replicas it provisioned before the commit point are gone, rather
+    // than reconciled for the rest of the process's life by a node that
+    // hosts nothing they belong to — which a restart would clear, and a
+    // caller retrying on a full disk never gets.
+    assert_eq!(
+        runtime.sync().tracked_doc_count().await?,
+        tracked_after_first,
+        "the failed create must leave no replica tracked in the running node"
     );
 
     // A later successful change replaces the file whole — a fresh inode,
@@ -641,5 +652,143 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
     probe.shutdown().await?;
     recovered.shutdown().await?;
     issuer_rt.shutdown().await?;
+    Ok(())
+}
+
+/// A link whose record cannot be written leaves nothing anywhere: the link
+/// fails, this device hosts nothing, and the identity's directory never
+/// names it — not at the moment of the failure and not later, because the
+/// confirmation is written after the record and never before it. The
+/// injected failure is the directory made unwritable, the closest
+/// injectable stand-in for a full disk, and the same one the create side
+/// uses.
+///
+/// The retry beside it is what makes the denial a denial: with the
+/// permissions back, the same device links and the directory names it, so
+/// the absence above is the failure's doing rather than a link that could
+/// never have worked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let inviter = memory_rt().await?;
+    let identity = inviter.identity().create().await?;
+    // The store-level view of the identity's directory, held by a device
+    // that linked the same way any device does.
+    let (probe, directory) = common::link_probe(&inviter, identity).await?;
+
+    let dir = tempfile::tempdir()?;
+    let dialer = runtime_on(dir.path()).await?;
+    let newcomer = dialer.node_id();
+
+    // The injected failure: the directory refuses new files, so staging
+    // the record fails while the stores — already open, in writable
+    // subdirectories — carry the whole ceremony as usual.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))?;
+    let payload = inviter.identity().linking_invite(identity, None).await?;
+    let refused = dialer
+        .identity()
+        .link(payload, Duration::from_secs(30))
+        .await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    assert!(
+        refused.is_err(),
+        "a link whose record cannot be written must fail"
+    );
+    assert!(
+        dialer.sync().hosted_identities().await?.is_empty(),
+        "the failed link must leave nothing hosted"
+    );
+
+    // Not now, and not late either: the sweep that repeats a confirmation
+    // only runs for a hosted identity, and this one is not hosted. Three
+    // reconcile intervals are what "it did not arrive afterwards" costs.
+    // The order itself is asserted separately, below.
+    assert!(
+        !directory.list_devices().await?.contains(&newcomer),
+        "the failed link must not name this device in the identity's directory"
+    );
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        !directory.list_devices().await?.contains(&newcomer),
+        "the failed link's device record must not arrive later either"
+    );
+
+    // The retry, on the same directory: the record is written, and the
+    // confirmation follows it.
+    common::link_patiently(&dialer, &inviter, identity).await?;
+    assert_eq!(
+        dialer.sync().hosted_identities().await?,
+        vec![identity],
+        "the retried link must host the identity"
+    );
+    assert!(
+        eventually(|| async { Ok(directory.list_devices().await?.contains(&newcomer)) }).await?,
+        "the retried link must name this device in the identity's directory"
+    );
+
+    dialer.shutdown().await?;
+    probe.shutdown().await?;
+    inviter.shutdown().await?;
+    Ok(())
+}
+
+/// The order the failure above depends on, asserted directly: at the
+/// moment a link is about to commit, it has published nothing into the
+/// identity's directory. Held there by a pause, the scenario reads the
+/// directory from a device that already belongs to the identity, and waits
+/// long enough for a record written earlier to have replicated — the
+/// device set names the inviter's probe and not the dialer. Only after the
+/// commit is released does the dialer appear.
+///
+/// This is what a rollback can and cannot take back: what is local it
+/// undoes, and what has replicated to another device it cannot. Committing
+/// first is what keeps the second category empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
+    let inviter = memory_rt().await?;
+    let identity = inviter.identity().create().await?;
+    let (probe, directory) = common::link_probe(&inviter, identity).await?;
+
+    let dialer = std::sync::Arc::new(memory_rt().await?);
+    let newcomer = dialer.node_id();
+    let pause = dialer.pause_next_link_before_commit().await;
+
+    let payload = inviter.identity().linking_invite(identity, None).await?;
+    let linking = {
+        let dialer = std::sync::Arc::clone(&dialer);
+        tokio::spawn(async move {
+            dialer
+                .identity()
+                .link(payload, Duration::from_secs(30))
+                .await
+        })
+    };
+
+    pause.wait_until_reached().await;
+    // Long enough that a record written before the pause would have
+    // reached this replica: the ceremony's own catch-up ran over the same
+    // path moments ago, and three reconcile intervals follow it.
+    tokio::time::sleep(RECONCILE * 3).await;
+    let published = directory.list_devices().await?;
+    assert!(
+        !published.contains(&newcomer),
+        "a link must publish nothing into the directory before it commits: {published:?}"
+    );
+    assert!(
+        published.contains(&probe.node_id()),
+        "the reading device must be in the set it reads, or the read proves nothing"
+    );
+
+    pause.release();
+    linking.await??;
+    assert!(
+        eventually(|| async { Ok(directory.list_devices().await?.contains(&newcomer)) }).await?,
+        "the committed link must confirm the device afterwards"
+    );
+
+    dialer.shutdown().await?;
+    probe.shutdown().await?;
+    inviter.shutdown().await?;
     Ok(())
 }

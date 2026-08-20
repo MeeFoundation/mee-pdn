@@ -553,9 +553,8 @@ async fn link_via_dialogue_inner(
     // already replicated or arriving later — register here as their records
     // and ticket payloads land, so this device serves and is servable
     // without ever touching the grant surface itself. Taken before the
-    // confirmation below, so that confirmation is the last thing that can
-    // fail: a rollback that ran after it would forget the directory here
-    // while the record it wrote had already replicated to the inviter.
+    // commit point below, so that the commit is the last thing that can
+    // fail.
     let changes = match directory.changes().await {
         Ok(changes) => changes,
         Err(err) => {
@@ -564,24 +563,18 @@ async fn link_via_dialogue_inner(
         }
     };
 
-    // The tickets are in hand and the directory has caught up, so this
-    // device — its id read from the dial's own authenticated identity, the
-    // one the inviter registered as pending — converts that registration
-    // into a confirmed one. Only a holder of the directory's write ticket
-    // can write this record, which is why the newcomer writes it: the
-    // inviter, having sent the reply into a connection that may drop,
-    // cannot establish that it arrived. Until it replicates, the identity's
-    // other devices refuse this one's sessions and re-serve it later.
-    let own_device = NodeId::from_bytes(*dial.id().as_bytes());
-    if let Err(err) = directory.confirm_device(own_device).await {
-        rollback.roll_back().await;
-        return Err(err).context("the linked device could not confirm itself in the directory");
+    #[cfg(feature = "test-util")]
+    if let Some(pause) = state.lock().await.link_before_commit_pause.take() {
+        pause.reached.notify_one();
+        pause.release.notified().await;
     }
 
     // Success: the identity joins the runtime's hosted set. The record
-    // write is the commit point — after the catch-up, before hosting: a
-    // failure rolls the link back whole and the previous record stays
-    // intact, so replicas nothing points at are never hosted.
+    // write is the commit point — after the catch-up, before hosting and
+    // before anything is written into the directory this device now shares
+    // with the identity's others: a failure rolls the link back whole, the
+    // previous record stays intact, and no sibling ever saw this attempt.
+    // Nothing durable outside this device has been touched up to here.
     let mut guard = state.lock().await;
     if let Err(err) = guard
         .commit_hosting(payload.identity, directory.namespace())
@@ -594,6 +587,37 @@ async fn link_via_dialogue_inner(
     guard
         .identities
         .insert(payload.identity, HostedIdentity { directory });
+
+    // The confirmation, after the commit point and never before it: this
+    // device — its id read from the dial's own authenticated identity, the
+    // one the inviter registered as pending — converts that registration
+    // into a confirmed one. Only a holder of the directory's write ticket
+    // can write this record, which is why the newcomer writes it: the
+    // inviter, having sent the reply into a connection that may drop,
+    // cannot establish that it arrived. Until it replicates, the identity's
+    // other devices refuse this one's sessions and re-serve it later.
+    //
+    // A failure here neither fails the link nor rolls it back. The link is
+    // committed, and the sweep writes this record whenever it finds the
+    // directory without it — whereas a confirmation written *before* the
+    // commit would stand on every sibling with no local failure able to
+    // take it back.
+    let own_device = NodeId::from_bytes(*dial.id().as_bytes());
+    debug_assert_eq!(
+        own_device,
+        guard.node.node_id(),
+        "the dial's authenticated id is this node's own"
+    );
+    if let Err(err) =
+        crate::connections::ensure_own_device_confirmed(&mut guard, payload.identity).await
+    {
+        tracing::warn!(
+            identity = %payload.identity,
+            %own_device,
+            "the linked device is not confirmed in the directory yet; the sweep repeats it: {err:#}"
+        );
+    }
+    drop(guard);
     crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
     rollback.disarm();
     Ok(())

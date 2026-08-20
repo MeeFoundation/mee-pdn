@@ -769,6 +769,14 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
     // ticket whose payload has not landed yet leaves the issuer unbound
     // until a later sweep; a read meanwhile refuses as unknown, fail-closed.
     bind_data_namespace(state, identity).await;
+    // The identity's own device record, written whenever the directory
+    // lacks it: a device writes it after its hosting is durable, never
+    // before, so a start that finds itself hosted and unnamed writes it
+    // here — and so does a link whose confirmation did not go through.
+    // Until it lands, the identity's other devices refuse this one.
+    if let Err(err) = ensure_own_device_confirmed(state, identity).await {
+        tracing::warn!(%identity, "confirming this device in the directory failed: {err:#}");
+    }
     let peers = {
         let Ok(hosted) = state.hosted(identity) else {
             return;
@@ -790,6 +798,27 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
             spawn_grant_binder(runtime.clone(), identity, peer, peer_store);
         }
     }
+}
+
+/// Write this node's device record into hosted `identity`'s directory when
+/// the confirmed set does not name it. Idempotent by construction — the
+/// read decides — and the repair for both windows that leave a hosted
+/// device unnamed: a link whose confirmation failed after its hosting was
+/// recorded, and a process killed between the two.
+///
+/// Removal of a device cannot be expressed as the absence of this record,
+/// precisely because of this write: an absence would be undone at the next
+/// sweep, with nothing left to say a removal ever happened. Nothing here
+/// reads a revocation record because the runtime has none; what keeps this
+/// safe is that removal, when it exists, is a record of its own that this
+/// write consults ([device-linking](../../../mia-docs/openspec/specs/components/pdn-node/device-linking.md)).
+pub(crate) async fn ensure_own_device_confirmed(state: &mut State, identity: PdnId) -> Result<()> {
+    let own_device = state.node.node_id();
+    let hosted = state.hosted(identity)?;
+    if hosted.directory.list_devices().await?.contains(&own_device) {
+        return Ok(());
+    }
+    hosted.directory.confirm_device(own_device).await
 }
 
 /// Bind hosted `identity`'s data namespace from its directory's `data`

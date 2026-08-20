@@ -362,9 +362,23 @@ impl SyncNode {
         let (secret_key, directory_lock) = match &options.storage {
             StorageConfig::Memory => (None, None),
             StorageConfig::Directory(directory) => {
-                provision_directory(directory)?;
-                let lock = lock_directory(directory)?;
-                (Some(read_or_generate_node_key(directory)?), Some(lock))
+                // One blocking step, off the worker thread: creating the
+                // directory, taking the lock and minting the key are
+                // `std::fs` calls with two `sync_all`s among them, and on
+                // a virtualized filesystem they cost long enough to stall
+                // whatever else that thread was running. The advisory lock
+                // travels back as an open file, and it is the open file
+                // that holds it, not the thread that opened it.
+                let directory = directory.clone();
+                tokio::task::spawn_blocking(move || {
+                    provision_directory(&directory)?;
+                    let lock = lock_directory(&directory)?;
+                    let key = read_or_generate_node_key(&directory)?;
+                    anyhow::Ok((key, lock))
+                })
+                .await
+                .context("the storage directory could not be provisioned")?
+                .map(|(key, lock)| (Some(key), Some(lock)))?
             }
         };
 

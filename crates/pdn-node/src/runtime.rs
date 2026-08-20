@@ -176,6 +176,11 @@ pub(crate) struct State {
     pub(crate) pairing_in_flight: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "test-util")]
     pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
+    /// A pause taken on the linking path immediately before the commit
+    /// point, where a scenario can observe what a link has published
+    /// before it commits — which is nothing.
+    #[cfg(feature = "test-util")]
+    pub(crate) link_before_commit_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
     /// How long a connection armer waits for its directory to change
@@ -244,7 +249,17 @@ impl State {
             identity,
             directory,
         });
-        hosted::write_record(dir, &lines)
+        // Off the worker thread: the write is a `sync_all` and a rename,
+        // which block the thread rather than the task, and on the volumes
+        // a node actually runs on they cost tens of milliseconds. The
+        // caller's lock is still held across it — the record is built from
+        // the hosted set and must not be built from a set another commit
+        // is changing meanwhile — so what this buys is the runtime's
+        // worker pool, not the lock.
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || hosted::write_record(&dir, &lines))
+            .await
+            .context("the hosted-identities record writer did not run")?
     }
 }
 
@@ -360,6 +375,8 @@ impl Runtime {
             #[cfg(feature = "test-util")]
             link_after_import_pause: None,
             #[cfg(feature = "test-util")]
+            link_before_commit_pause: None,
+            #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
             retraction_events,
             data_dir,
@@ -455,6 +472,18 @@ impl Runtime {
             release: tokio::sync::Notify::new(),
         });
         self.state.lock().await.link_after_import_pause = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// Hold the next link just before its commit point, so a scenario can
+    /// read what the ceremony has published up to there.
+    #[cfg(feature = "test-util")]
+    pub async fn pause_next_link_before_commit(&self) -> Arc<LinkAfterImportPause> {
+        let pause = Arc::new(LinkAfterImportPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        self.state.lock().await.link_before_commit_pause = Some(Arc::clone(&pause));
         pause
     }
 
