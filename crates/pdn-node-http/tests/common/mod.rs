@@ -569,9 +569,12 @@ fn follow_logs_into_file(container: &ContainerAsync<GenericImage>, container_nam
                     Ok(0) | Err(_) => return,
                     Ok(read) => read,
                 };
+                let Some(frame) = buffer.get(..read) else {
+                    return;
+                };
                 if let Ok(mut file) = sink.lock() {
                     use std::io::Write as _;
-                    let _ = file.write_all(&buffer[..read]);
+                    let _ = file.write_all(frame);
                 }
             }
         });

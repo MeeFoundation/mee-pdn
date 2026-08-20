@@ -536,6 +536,7 @@ async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
 /// the access-control negative control — obtains nothing while the granted
 /// audience reads.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one restart, its liveness and its denial in the same place
 async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = EntryPath::new("contact/email")?;

@@ -353,34 +353,7 @@ impl SyncNode {
             }
         }
 
-        // A configured directory is provisioned before anything binds, and
-        // the endpoint's key comes out of it — a node that persists its
-        // stores but not its key would come back under a fresh wire id
-        // while its device records and tickets all name the old one. The
-        // directory lock comes first of all: one running node per
-        // directory, refused by name ([`DirectoryHeld`]).
-        let (secret_key, directory_lock) = match &options.storage {
-            StorageConfig::Memory => (None, None),
-            StorageConfig::Directory(directory) => {
-                // One blocking step, off the worker thread: creating the
-                // directory, taking the lock and minting the key are
-                // `std::fs` calls with two `sync_all`s among them, and on
-                // a virtualized filesystem they cost long enough to stall
-                // whatever else that thread was running. The advisory lock
-                // travels back as an open file, and it is the open file
-                // that holds it, not the thread that opened it.
-                let directory = directory.clone();
-                tokio::task::spawn_blocking(move || {
-                    provision_directory(&directory)?;
-                    let lock = lock_directory(&directory)?;
-                    let key = read_or_generate_node_key(&directory)?;
-                    anyhow::Ok((key, lock))
-                })
-                .await
-                .context("the storage directory could not be provisioned")?
-                .map(|(key, lock)| (Some(key), Some(lock)))?
-            }
-        };
+        let (secret_key, directory_lock) = prepare_storage(&options.storage).await?;
 
         let endpoint = bind_endpoint(secret_key).await?;
         let blobs_store: iroh_blobs::api::Store = match &options.storage {
@@ -1038,15 +1011,12 @@ impl SyncNode {
                 .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
             docs.values().next().map(|tracked| tracked.doc.clone())
         };
-        match doc {
-            Some(doc) => {
-                let _peers = doc.get_sync_peers().await?;
-            }
-            None => {
-                let mut listed = self.docs.list().await?;
-                if let Some(entry) = listed.next().await {
-                    let _first = entry?;
-                }
+        if let Some(doc) = doc {
+            let _peers = doc.get_sync_peers().await?;
+        } else {
+            let mut listed = self.docs.list().await?;
+            if let Some(entry) = listed.next().await {
+                let _first = entry?;
             }
         }
         Ok(())
@@ -1576,6 +1546,39 @@ fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::
             directory.display()
         ))
     }
+}
+
+/// Make a configured directory ready to be a node's, and hand back what
+/// the node takes from it: the endpoint's secret key and the open file
+/// holding the directory's lock. A node that persists its stores but not
+/// its key would come back under a fresh wire id while its device records
+/// and tickets all name the old one, so the key comes out of the directory
+/// before anything binds — and the lock comes first of all: one running
+/// node per directory, refused by name ([`DirectoryHeld`]). A memory node
+/// has neither.
+///
+/// One blocking step, off the worker thread: creating the directory,
+/// taking the lock and minting the key are `std::fs` calls with two
+/// `sync_all`s among them, and on a virtualized filesystem they cost long
+/// enough to stall whatever else that thread was running. The lock travels
+/// back as an open file, and it is the open file that holds it, not the
+/// thread that opened it.
+async fn prepare_storage(
+    storage: &StorageConfig,
+) -> Result<(Option<SecretKey>, Option<std::fs::File>)> {
+    let StorageConfig::Directory(directory) = storage else {
+        return Ok((None, None));
+    };
+    let directory = directory.clone();
+    let (key, lock) = tokio::task::spawn_blocking(move || {
+        provision_directory(&directory)?;
+        let lock = lock_directory(&directory)?;
+        let key = read_or_generate_node_key(&directory)?;
+        anyhow::Ok((key, lock))
+    })
+    .await
+    .context("the storage directory could not be provisioned")??;
+    Ok((Some(key), Some(lock)))
 }
 
 /// Bind the node's endpoint, with `secret_key` when the node's storage
