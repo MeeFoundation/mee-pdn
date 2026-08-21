@@ -250,6 +250,10 @@ stress-docker count="100" *args:
   logs=target/tmp/stand-logs
   replaced_log=target/tmp/stand-replacements.log
   kept="target/tmp/stand-hunt-$(date +%Y%m%d-%H%M%S)"
+  # Cargo makes that directory when it builds the tests, and the first build
+  # here happens inside the image — on a fresh checkout the truncations below
+  # would find nothing to write into.
+  mkdir -p target/tmp
   # Emptied first, so what is counted and kept belongs to this hunt alone —
   # a day of runs leaves a hundred megabytes of logs behind otherwise.
   rm -rf "$logs"
