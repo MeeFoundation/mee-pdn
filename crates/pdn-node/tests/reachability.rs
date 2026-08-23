@@ -283,6 +283,69 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     Ok(())
 }
 
+/// The connection's metadata pair is pointed at every device that holds
+/// it, not only at the devices its tickets name: the identity's own devices
+/// and the peer's, re-derived whenever a sweep looks at the pair. The half
+/// this identity writes is the one that matters — a ticket names the
+/// devices of the side that minted it, so without this derivation a grant
+/// published from a device that is then lost stays on the audience's device
+/// alone, out of reach of the issuer's surviving devices, which then refuse
+/// that audience fail-closed.
+///
+/// The derivation is asserted here rather than the recovery it exists for:
+/// the engine's own recorded peers rescue that recovery often enough that a
+/// scenario passes without the derivation most of the time (about 97 runs
+/// in 100 — `a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audience`
+/// in `restart_recovery.rs` is that scenario).
+///
+/// Denied: a live node that is a device of neither side never enters the
+/// set, so what the derivation adds is the pair's holders rather than
+/// whatever is reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_laptop = spawn_runtime().await?;
+    let rt_bob = spawn_runtime().await?;
+    let rt_stranger = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    link_patiently(&rt_laptop, &rt_phone, alice).await?;
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
+    // A node of its own, connected to nobody — the set must never name it.
+    let stranger = rt_stranger.identity().create().await?;
+    ensure!(stranger != alice, "the stranger must be its own identity");
+
+    let phone_id = rt_phone.node_id();
+    let bob_id = rt_bob.node_id();
+    let stranger_id = rt_stranger.node_id();
+
+    // The laptop opens the pair on its own sweep, the way a device reaches a
+    // connection established elsewhere, and the sweeps that follow take in
+    // the device records as they replicate.
+    assert!(
+        eventually(|| async {
+            let (own, peer) = rt_laptop.connections().pair_contacts(alice, bob).await?;
+            Ok(own.contains(&bob_id) && own.contains(&phone_id) && peer.contains(&bob_id))
+        })
+        .await?,
+        "the pair's halves never named the devices that hold them"
+    );
+
+    let (own, peer) = rt_laptop.connections().pair_contacts(alice, bob).await?;
+    assert!(
+        !own.contains(&stranger_id) && !peer.contains(&stranger_id),
+        "a node that holds neither half must not be a contact of either"
+    );
+
+    rt_phone.shutdown().await?;
+    rt_laptop.shutdown().await?;
+    rt_bob.shutdown().await?;
+    rt_stranger.shutdown().await?;
+    Ok(())
+}
+
 /// A device linked *after* the grant was published and consumed is dialed
 /// too: its record replicates into the pair, the sweep counts it among the
 /// audience replica's contacts — no re-import, no new grant — and the

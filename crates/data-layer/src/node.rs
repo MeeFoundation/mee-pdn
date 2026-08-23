@@ -1318,6 +1318,24 @@ impl SyncNode {
         Ok(entries)
     }
 
+    /// The reconciliation contacts currently tracked for one device-shared
+    /// store's doc — the observation side of
+    /// [`set_doc_contacts`](Self::set_doc_contacts), so a scenario asserts
+    /// what a caller derived instead of sleeping and guessing. Behind the
+    /// `test-util` feature and absent from every product build. Empty when
+    /// the namespace resolves to no tracked doc.
+    #[cfg(feature = "test-util")]
+    pub fn doc_contacts(&self, namespace: NamespaceId) -> Result<Vec<EndpointAddr>> {
+        let docs = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+        Ok(docs
+            .get(&namespace)
+            .map(|tracked| tracked.contacts.clone())
+            .unwrap_or_default())
+    }
+
     /// Shut the node down, closing the endpoint and all protocols. Takes
     /// `&self`: no exclusive ownership is required, and a repeat call is a
     /// no-op (the reconcile-stop send only fires once; the router's own

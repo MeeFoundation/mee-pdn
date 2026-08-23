@@ -46,6 +46,25 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
     .await
 }
 
+/// A node of its own holding `ticket` and nothing else, pointed at
+/// `target`'s address: the bare ticket holder the denials here probe with.
+/// Its import fires a sync attempt now and one every reconcile interval
+/// after, so a probe read is "it tried repeatedly and was refused".
+async fn ticket_holder_dialing(
+    target: &Runtime,
+    issuer: pdn_types::PdnId,
+    mut ticket: data_layer::DocTicket,
+) -> Result<data_layer::SyncNode> {
+    let probe = data_layer::SyncNode::spawn(data_layer::SpawnOptions {
+        reconcile_interval: RECONCILE,
+        ..data_layer::SpawnOptions::memory()
+    })
+    .await?;
+    ticket.nodes = vec![target.sync().dial_handle_for_test().await.addr()];
+    probe.import_namespace_scoped(issuer, ticket).await?;
+    Ok(probe)
+}
+
 /// The hosted-identities record's file name, as the runtime writes it.
 const RECORD: &str = "hosted-identities.json";
 
@@ -350,14 +369,7 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
     // the restarted runtime itself. Its import fires a sync attempt now
     // and every reconcile interval after; the assertion waits below, after
     // a proven wave.
-    let probe = data_layer::SyncNode::spawn(data_layer::SpawnOptions {
-        reconcile_interval: RECONCILE,
-        ..data_layer::SpawnOptions::memory()
-    })
-    .await?;
-    let mut ticket = leaked_ticket;
-    ticket.nodes = vec![recovered.sync().dial_handle_for_test().await.addr()];
-    probe.import_namespace_scoped(issuer, ticket).await?;
+    let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
 
     // The re-grant over the same claim: imported again with no ceremony —
     // no invite minted, no establishment run since the restart.
@@ -653,6 +665,117 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
     probe.shutdown().await?;
     recovered.shutdown().await?;
     issuer_rt.shutdown().await?;
+    Ok(())
+}
+
+/// A grant published from a device that is then lost still reaches the
+/// issuer's other device — from the audience's, which is the only live
+/// holder of the record. The sibling is down while the grant is published,
+/// so what it lacks when it comes back is that record alone, and the
+/// publishing device never returns, so nothing of the issuer's own can hand
+/// it over. Without the record the sibling would refuse the audience
+/// fail-closed while the issuer believes the grant published.
+///
+/// Denied, per `code-practices/access-control-tests.md`: a holder of the
+/// issuer's read ticket with no grant behind it obtains nothing from the
+/// recovered device, probed after the audience's own convergence has proven
+/// a wave went out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audience() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = EntryPath::new("contact/email")?;
+
+    let publisher_rt = memory_rt().await?;
+    let sibling_rt = runtime_on(dir.path()).await?;
+    let audience_rt = memory_rt().await?;
+
+    let issuer = publisher_rt.identity().create().await?;
+    common::link_patiently(&sibling_rt, &publisher_rt, issuer).await?;
+    let audience = audience_rt.identity().create().await?;
+    let invite = publisher_rt.connections().invite(issuer, None).await?;
+    establish_patiently(&audience_rt, audience, &publisher_rt, issuer, invite).await?;
+    publisher_rt.data().write(issuer, &path, b"before").await?;
+
+    // The ticket the denial below presents, minted while the publisher is
+    // up: a real read ticket, with no grant behind its holder.
+    let leaked_ticket = publisher_rt.data().share(issuer, ShareMode::Read).await?;
+
+    // The pair is open on the sibling before it goes down, so the grant
+    // record is the one thing it misses while away. The connection record
+    // alone would not do: it leaves the pair's tickets payload-waiting, and
+    // the only device holding those payloads is the publisher this scenario
+    // then takes away for good.
+    assert!(
+        eventually(|| async {
+            let (own, _peer) = sibling_rt
+                .connections()
+                .pair_contacts(issuer, audience)
+                .await?;
+            Ok(!own.is_empty())
+        })
+        .await?,
+        "the pair never opened on the sibling"
+    );
+    sibling_rt.shutdown().await?;
+    drop(sibling_rt);
+
+    // Published while the sibling is away and read by the audience: the
+    // record is on the audience's device, and on the publisher's until it
+    // goes for good.
+    common::granted_patiently(
+        &publisher_rt,
+        issuer,
+        &audience_rt,
+        audience,
+        issuer,
+        claims_on(issuer, &path, false),
+    )
+    .await?;
+    publisher_rt.shutdown().await?;
+
+    let recovered = runtime_on(dir.path()).await?;
+    assert!(
+        eventually(|| async {
+            recovered
+                .connections()
+                .grant_visible(issuer, audience, issuer)
+                .await
+        })
+        .await?,
+        "the grant record never reached the device that has to serve by it"
+    );
+
+    // And the record is not merely present: the recovered device serves by
+    // it, so the audience converges on a write only that device made.
+    recovered.data().write(issuer, &path, b"after").await?;
+    assert!(
+        eventually(|| async {
+            match audience_rt.data().read(issuer, &path).await {
+                Ok(payload) => Ok(payload.as_deref() == Some(b"after".as_slice())),
+                Err(_not_bound_yet) => Ok(false),
+            }
+        })
+        .await?,
+        "the audience never converged on the recovered device's write"
+    );
+
+    // The probe: a ticket holder with no grant, dialing the recovered device
+    // itself, read after the convergence above has proven a wave went out
+    // and after three of the probe's own reconcile intervals.
+    let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        probe.read(issuer, &path).await?.is_none(),
+        "a ticket holder with no grant must obtain nothing from the recovered device"
+    );
+    assert!(
+        probe.list(issuer, None).await?.is_empty(),
+        "a ticket holder with no grant must not even list the namespace"
+    );
+
+    probe.shutdown().await?;
+    recovered.shutdown().await?;
+    audience_rt.shutdown().await?;
     Ok(())
 }
 
