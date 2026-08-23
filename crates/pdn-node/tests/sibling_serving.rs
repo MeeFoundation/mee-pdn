@@ -3,8 +3,9 @@
 //! connection and the scoped grant arrive by establishment and the pair,
 //! and after the issuer goes offline the linked device still catches up —
 //! the grant record over the device-replicated pair, the claim itself from
-//! its sibling device, served per the locally replicated grant. No import
-//! act appears in either scenario: the grant binder is what turns a grant
+//! its sibling device, served per the locally replicated grant — and so
+//! does a device that joins only after the issuer is already gone. No
+//! import act appears in any of them: the grant binder is what turns a grant
 //! that replicated in into an imported namespace, and a withdrawal back
 //! into a forgotten one. Paired denial per
 //! `code-practices/access-control-tests.md`: an outsider holding a
@@ -157,6 +158,75 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     // reachable, sibling-addressed — but resolves in no audience
     // directory. After the laptop's proven convergence and several of her
     // own reconcile intervals, she holds nothing.
+    let leaked = rt_phone.data().share(bob, ShareMode::Read).await?;
+    rt_carol.data().import_scoped(bob, leaked).await?;
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert!(
+        rt_carol.data().list(bob, None).await?.is_empty(),
+        "a sibling-minted ticket without audience membership must deliver nothing"
+    );
+    assert!(rt_carol.data().read(bob, &email).await?.is_none());
+
+    rt_phone.shutdown().await?;
+    rt_laptop.shutdown().await?;
+    rt_carol.shutdown().await?;
+    Ok(())
+}
+
+/// Allowed: a device that joins the identity only after the issuer has gone
+/// offline still catches up. Nothing of this connection was ever on the
+/// laptop while Bob was reachable, so every record crosses from the sibling:
+/// the connection, the pair's two halves, the grant inside the half Bob
+/// wrote, and the claim behind it. The pair's halves are pointed at the
+/// identity's own devices for exactly this — a ticket names the devices of
+/// the side that minted it, and Bob's names only Bob's.
+///
+/// Denied, outsider with a sibling ticket: Carol holds a ticket the phone
+/// minted, resolves in no audience directory, and obtains nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_laptop = spawn_runtime().await?;
+    let rt_bob = spawn_runtime().await?;
+    let rt_carol = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_bob.connections().invite(bob, None).await?;
+    establish_patiently(&rt_phone, alice, &rt_bob, bob, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    rt_bob.data().write(bob, &email, b"bob@example.org").await?;
+    rt_bob
+        .connections()
+        .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
+        .await?;
+    assert!(
+        claim_arrives(&rt_phone, bob, &email, b"bob@example.org").await?,
+        "the granted claim did not reach the phone while Bob was online"
+    );
+
+    // Bob leaves, and only then does the laptop join the identity.
+    rt_bob.shutdown().await?;
+    let link_invite = rt_phone.identity().linking_invite(alice, None).await?;
+    rt_laptop.identity().link(link_invite, TIMEOUT).await?;
+
+    assert!(
+        eventually(|| async { Ok(rt_laptop.connections().list(alice).await?.contains(&bob)) })
+            .await?,
+        "the connection record did not reach the laptop from its sibling"
+    );
+    assert!(
+        grant_arrives(&rt_laptop, alice, bob, bob).await?,
+        "the grant record did not reach the laptop from its sibling"
+    );
+    assert!(
+        claim_arrives(&rt_laptop, bob, &email, b"bob@example.org").await?,
+        "the granted claim did not catch up from the sibling with the issuer offline"
+    );
+
+    // Denied, outsider: a ticket the phone itself minted resolves in no
+    // audience directory, probed after several of Carol's own reconcile
+    // intervals.
     let leaked = rt_phone.data().share(bob, ShareMode::Read).await?;
     rt_carol.data().import_scoped(bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;

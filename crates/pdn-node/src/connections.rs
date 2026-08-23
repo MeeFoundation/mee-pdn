@@ -892,6 +892,9 @@ async fn open_pair(
     // doc and an author).
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
+    let own_nodes = own_ticket.nodes.clone();
+    let peer_nodes = peer_ticket.nodes.clone();
+    let devices = state.hosted(identity)?.directory.list_devices().await?;
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
     let own = match &cached {
         Some(pair) if pair.own.namespace() == own_namespace => pair.own.clone(),
@@ -917,6 +920,50 @@ async fn open_pair(
     state
         .node
         .host_connection(identity, peer, &pair.own, &pair.peer)?;
+    point_pair_at_siblings(state, &pair, &own_nodes, &peer_nodes, &devices);
     state.metadata_pairs.insert((identity, peer), pair.clone());
     Ok(Some(pair))
+}
+
+/// Point both halves of a connection's metadata pair at the identity's
+/// other devices, beside the addressing each ticket carries. A ticket names
+/// the devices of the side that minted it alone, so the counterparty's half
+/// — imported from the counterparty's ticket — has nowhere to reconcile
+/// with while that side is offline, and a grant a sibling already holds
+/// never crosses. Derived from the directory's device records whenever the
+/// pair is opened, never stored: the records are the durable truth and they
+/// replicate.
+///
+/// A half whose doc is not tracked keeps whatever contacts it has: the pair
+/// is open and usable, and the next sweep to open it derives the set again.
+fn point_pair_at_siblings(
+    state: &State,
+    pair: &ConnectionMetadata,
+    own_nodes: &[EndpointAddr],
+    peer_nodes: &[EndpointAddr],
+    devices: &[NodeId],
+) {
+    let own_device = state.node.node_id();
+    let mut siblings = Vec::new();
+    for device in devices.iter().filter(|device| **device != own_device) {
+        match EndpointId::from_bytes(device.as_bytes()) {
+            Ok(id) => siblings.push(EndpointAddr::new(id)),
+            Err(err) => tracing::warn!(%device, "undialable device record: {err:#}"),
+        }
+    }
+    for (namespace, nodes) in [
+        (pair.own.namespace(), own_nodes),
+        (pair.peer.namespace(), peer_nodes),
+    ] {
+        let mut seen: HashSet<[u8; 32]> = nodes.iter().map(|node| *node.id.as_bytes()).collect();
+        let mut contacts = nodes.to_vec();
+        for sibling in &siblings {
+            if seen.insert(*sibling.id.as_bytes()) {
+                contacts.push(sibling.clone());
+            }
+        }
+        if let Err(err) = state.node.set_doc_contacts(namespace, contacts) {
+            tracing::warn!(%namespace, "the metadata pair kept its import-time contacts: {err:#}");
+        }
+    }
 }
