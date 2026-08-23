@@ -166,6 +166,35 @@ impl<'rt> RuntimeConnectionsService<'rt> {
         Ok(pair.own.read_grant(issuer, peer).await?.granted().is_some())
     }
 
+    /// The devices among the reconciliation contacts of the pair's two
+    /// halves — own first, peer second — as the pair's open derived them.
+    /// Observation only, for scenarios that assert the derivation itself:
+    /// what it exists for is a record that reaches a device no ticket names,
+    /// and the engine's own recorded peers rescue that often enough to hide
+    /// the derivation behind luck. Behind the `test-util` feature and absent
+    /// from every product build. Empty lists when no pair is open.
+    #[cfg(feature = "test-util")]
+    pub async fn pair_contacts(
+        &self,
+        identity: PdnId,
+        peer: PdnId,
+    ) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
+        let state = self.runtime.state.lock().await;
+        let Some(pair) = state.metadata_pairs.get(&(identity, peer)) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let devices = |contacts: Vec<EndpointAddr>| {
+            contacts
+                .iter()
+                .map(|contact| NodeId::from_bytes(*contact.id.as_bytes()))
+                .collect::<Vec<_>>()
+        };
+        Ok((
+            devices(state.node.doc_contacts(pair.own.namespace())?),
+            devices(state.node.doc_contacts(pair.peer.namespace())?),
+        ))
+    }
+
     /// Whether the grant binder of `(identity, peer)` holds an imported
     /// binding for `issuer` — the sweep's own record of what it brought in.
     /// Observation only, for scenarios that must order an assertion after
@@ -789,6 +818,13 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
     for peer in peers {
         if !state.metadata_pairs.contains_key(&(identity, peer)) {
             let _cold_until_next_sweep = open_pair(state, identity, peer).await;
+        } else if let Some(pair) = state.metadata_pairs.get(&(identity, peer)).cloned() {
+            // Device records replicate, so a device that joined either side
+            // after this pair was opened enters the set here rather than at
+            // the next restart.
+            if let Err(err) = point_pair_at_its_devices(state, identity, peer, &pair).await {
+                tracing::warn!(%identity, %peer, "the pair kept the contacts it had: {err:#}");
+            }
         }
         let Some(pair) = state.metadata_pairs.get(&(identity, peer)) else {
             continue;
@@ -892,9 +928,6 @@ async fn open_pair(
     // doc and an author).
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
-    let own_nodes = own_ticket.nodes.clone();
-    let peer_nodes = peer_ticket.nodes.clone();
-    let devices = state.hosted(identity)?.directory.list_devices().await?;
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
     let own = match &cached {
         Some(pair) if pair.own.namespace() == own_namespace => pair.own.clone(),
@@ -920,34 +953,56 @@ async fn open_pair(
     state
         .node
         .host_connection(identity, peer, &pair.own, &pair.peer)?;
-    point_pair_at_siblings(state, &pair, &own_nodes, &peer_nodes, &devices);
+    if let Err(err) = point_pair_at_its_devices(state, identity, peer, &pair).await {
+        tracing::warn!(%identity, %peer, "the pair kept its import-time contacts: {err:#}");
+    }
     state.metadata_pairs.insert((identity, peer), pair.clone());
     Ok(Some(pair))
 }
 
-/// Point both halves of a connection's metadata pair at the identity's
-/// other devices, beside the addressing each ticket carries. A ticket names
-/// the devices of the side that minted it alone, so the counterparty's half
-/// — imported from the counterparty's ticket — has nowhere to reconcile
-/// with while that side is offline, and a grant a sibling already holds
-/// never crosses. Derived from the directory's device records whenever the
-/// pair is opened, never stored: the records are the durable truth and they
-/// replicate.
+/// Point both halves of a connection's metadata pair at every device that
+/// holds them — the identity's own and the peer's — beside the addressing
+/// each ticket carries. A ticket names the devices of the side that minted
+/// it alone, so a half whose minting side is offline has nowhere to
+/// reconcile with: a grant one of this identity's other devices already
+/// holds never crosses, and a grant published from a device that is now
+/// gone stays on the audience's device alone, where the issuer's surviving
+/// devices cannot reach it and refuse the audience fail-closed.
 ///
+/// Both sides read each half whole (Invariant 3), so a device of either can
+/// serve it and neither gains anything by it: every entry is signed by its
+/// author and its payload addressed by its hash, so a counterparty can
+/// withhold a record but never forge one.
+///
+/// Derived from the durable device records whenever the pair is opened,
+/// never stored: the records are the durable truth and they replicate.
 /// A half whose doc is not tracked keeps whatever contacts it has: the pair
 /// is open and usable, and the next sweep to open it derives the set again.
-fn point_pair_at_siblings(
+async fn point_pair_at_its_devices(
     state: &State,
+    identity: PdnId,
+    peer: PdnId,
     pair: &ConnectionMetadata,
-    own_nodes: &[EndpointAddr],
-    peer_nodes: &[EndpointAddr],
-    devices: &[NodeId],
-) {
+) -> Result<()> {
+    let directory = &state.hosted(identity)?.directory;
+    let own_nodes = directory
+        .get_ticket(&data_layer::own_ticket_kind(&peer))
+        .await?
+        .map(|ticket| ticket.nodes)
+        .unwrap_or_default();
+    let peer_nodes = directory
+        .get_ticket(&data_layer::peer_ticket_kind(&peer))
+        .await?
+        .map(|ticket| ticket.nodes)
+        .unwrap_or_default();
+    let mut devices = directory.list_devices().await?;
+    devices.extend(pair.peer.published_devices().await?);
+
     let own_device = state.node.node_id();
-    let mut siblings = Vec::new();
+    let mut holders = Vec::new();
     for device in devices.iter().filter(|device| **device != own_device) {
         match EndpointId::from_bytes(device.as_bytes()) {
-            Ok(id) => siblings.push(EndpointAddr::new(id)),
+            Ok(id) => holders.push(EndpointAddr::new(id)),
             Err(err) => tracing::warn!(%device, "undialable device record: {err:#}"),
         }
     }
@@ -956,14 +1011,13 @@ fn point_pair_at_siblings(
         (pair.peer.namespace(), peer_nodes),
     ] {
         let mut seen: HashSet<[u8; 32]> = nodes.iter().map(|node| *node.id.as_bytes()).collect();
-        let mut contacts = nodes.to_vec();
-        for sibling in &siblings {
-            if seen.insert(*sibling.id.as_bytes()) {
-                contacts.push(sibling.clone());
+        let mut contacts = nodes;
+        for holder in &holders {
+            if seen.insert(*holder.id.as_bytes()) {
+                contacts.push(holder.clone());
             }
         }
-        if let Err(err) = state.node.set_doc_contacts(namespace, contacts) {
-            tracing::warn!(%namespace, "the metadata pair kept its import-time contacts: {err:#}");
-        }
+        state.node.set_doc_contacts(namespace, contacts)?;
     }
+    Ok(())
 }

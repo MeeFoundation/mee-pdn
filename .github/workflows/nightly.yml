@@ -1,11 +1,12 @@
-# The container flaky hunt, run without anyone deciding to look.
+# The flaky hunt, run without anyone deciding to look: one job per suite —
+# the container stand's, and the in-process scenarios'.
 #
-# The stand's scenarios cost seconds each and pass on any given run; the
-# failures worth finding here show up once in tens or hundreds of them, which
-# no pull request can afford and no person remembers to do. So the suite is
-# repeated nightly, and a night that catches something keeps the nodes' logs
-# as an artifact — the assertion says a value never arrived, and only those
-# logs say what the node was doing instead.
+# Both cost seconds per test and pass on any given run; the failures worth
+# finding here show up once in tens or hundreds of them, which no pull
+# request can afford and no person remembers to do. So each suite is repeated
+# nightly, and a night that catches something in the stand keeps the nodes'
+# logs as an artifact — the assertion says a value never arrived, and only
+# those logs say what the node was doing instead.
 name: nightly
 
 on:
@@ -23,7 +24,9 @@ on:
         default: "15"
 
 jobs:
-  hunt:
+  # The container suite: every test of the HTTP surface is a container test,
+  # so this job needs the daemon and builds the stand's image itself.
+  container-stand:
     runs-on: ubuntu-latest
     # A hundred iterations of a suite whose own wall clock is seconds, plus
     # one image build from cold. Past this the job is stuck rather than slow.
@@ -48,7 +51,7 @@ jobs:
       # The recipe builds the image itself, without the pull request job's
       # layer cache: a nightly can afford the cold build, and paying it here
       # keeps one command doing the same thing locally and in the pipeline.
-      - name: Hunt
+      - name: Hunt the container stand
         run: just stress-docker "${{ github.event.inputs.iterations || '100' }}"
 
       - name: Keep what the failure needs
@@ -60,9 +63,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # The in-process scenarios, hunted the same way and in parallel with the
-  # stand's — they share nothing, and a public repository's runners are free.
-  scenarios:
+  # The in-process scenarios — no container, no daemon, no image. Hunted the
+  # same way and in parallel with the stand's: they share nothing, and a
+  # public repository's runners are free.
+  in-process-scenarios:
     runs-on: ubuntu-latest
     # One pass of the scenario tests is about two minutes on a development
     # machine and slower on a runner's four cores. The repeat count is the
@@ -91,5 +95,5 @@ jobs:
       # how often it happens and whether anything else fails too. The
       # selection is the recipe's own default — the scenario tests, with the
       # stand's container binaries skipped as they are everywhere else.
-      - name: Hunt
+      - name: Hunt the in-process scenarios
         run: just stress --stress-count "${{ github.event.inputs.scenario_iterations || '15' }}" --no-fail-fast
