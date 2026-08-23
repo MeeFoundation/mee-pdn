@@ -55,6 +55,16 @@ pub struct UnknownIssuer {
     pub issuer: PdnId,
 }
 
+/// An operation addressed a namespace this node does not track: it was
+/// forgotten, or never imported here. Downcast from the `anyhow::Error` of
+/// [`SyncNode::set_doc_contacts`].
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("namespace not tracked on this node: {namespace}")]
+pub struct UntrackedNamespace {
+    /// The namespace the operation addressed.
+    pub namespace: NamespaceId,
+}
+
 /// A protocol supplied to [`SyncNode::spawn_with`]: the ALPN it
 /// answers under, and the handler dispatched for connections arriving on it.
 pub type ExtraProtocol = (Vec<u8>, Box<dyn DynProtocolHandler>);
@@ -666,11 +676,43 @@ impl SyncNode {
             .registry
             .data_doc(issuer)?
             .ok_or(UnknownIssuer { issuer })?;
+        // The issuer is what this caller named, so an untracked namespace
+        // is reported as the issuer resolving nowhere; a tracking map that
+        // cannot answer at all is a different failure and stays itself.
+        self.set_doc_contacts(doc.id(), contacts).map_err(|err| {
+            match err.downcast_ref::<UntrackedNamespace>() {
+                Some(_untracked) => UnknownIssuer { issuer }.into(),
+                None => err,
+            }
+        })
+    }
+
+    /// Set the reconciliation contacts of one device-shared store's doc —
+    /// a directory or a connection metadata store — replacing the previous
+    /// set. The import point knows only the ticket's own nodes, and a
+    /// ticket names the devices of the side that minted it: the
+    /// counterparty's, for the half of a pair received at establishment.
+    /// A caller that also knows which of its own devices hold the replica
+    /// records them here, so the doc catches up from a sibling while the
+    /// minting side is offline. Derived by the caller from the durable
+    /// device records, never accumulated: replacement is what lets a
+    /// withdrawn device stop being dialed.
+    ///
+    /// A namespace this node does not track takes no contacts and refuses
+    /// with [`UntrackedNamespace`] — silently dropping the set would starve
+    /// the replica with nothing to attribute it to.
+    pub fn set_doc_contacts(
+        &self,
+        namespace: NamespaceId,
+        contacts: Vec<EndpointAddr>,
+    ) -> Result<()> {
         let mut docs = self
             .tracked_docs
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
-        let entry = docs.get_mut(&doc.id()).ok_or(UnknownIssuer { issuer })?;
+        let entry = docs
+            .get_mut(&namespace)
+            .ok_or(UntrackedNamespace { namespace })?;
         entry.contacts = contacts;
         Ok(())
     }
