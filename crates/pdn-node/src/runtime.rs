@@ -183,6 +183,16 @@ pub(crate) struct State {
     pub(crate) link_before_commit_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
+    /// Fail every arming of a freshly opened metadata pair, and count the
+    /// failures. Sticky rather than one-shot: the connection armer retries
+    /// every sweep, and what a scenario asserts here is that repeated
+    /// attempts leave nothing open — one attempt cannot show that. The
+    /// count is the positive control: without it an assertion that nothing
+    /// accumulates is satisfied by a device that never attempted.
+    #[cfg(feature = "test-util")]
+    pub(crate) fail_pair_arm: bool,
+    #[cfg(feature = "test-util")]
+    pub(crate) pair_arm_failures: usize,
     /// How long a connection armer waits for its directory to change
     /// before sweeping anyway. Taken from the spawn's reconcile interval,
     /// so a runtime configured for a fast test cadence retries as fast as
@@ -378,6 +388,10 @@ impl Runtime {
             link_before_commit_pause: None,
             #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
+            #[cfg(feature = "test-util")]
+            fail_pair_arm: false,
+            #[cfg(feature = "test-util")]
+            pair_arm_failures: 0,
             retraction_events,
             data_dir,
             sweep_interval,
@@ -442,6 +456,23 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn fail_next_pending_device_write_for_test(&self) {
         self.state.lock().await.fail_next_pending_device_write = true;
+    }
+
+    /// Make every arming of a freshly opened metadata pair fail from now
+    /// on, so a scenario can watch what a failed open leaves behind. Behind
+    /// the `test-util` feature and absent from every product build.
+    #[cfg(feature = "test-util")]
+    pub async fn fail_pair_arm_for_test(&self) {
+        self.state.lock().await.fail_pair_arm = true;
+    }
+
+    /// How many pair arms have failed under
+    /// [`fail_pair_arm_for_test`](Self::fail_pair_arm_for_test) — the
+    /// evidence that attempts happened, without which "nothing
+    /// accumulated" says nothing.
+    #[cfg(feature = "test-util")]
+    pub async fn pair_arm_failures_for_test(&self) -> usize {
+        self.state.lock().await.pair_arm_failures
     }
 
     #[cfg(feature = "test-util")]

@@ -15,7 +15,7 @@ use data_layer::{
 use pdn_node::{
     ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentInProgress,
     EstablishmentRefused, EstablishmentTimeout, IdentityService as _, InvitePayload,
-    InviterUnreachable, SpawnOptions, UnknownIdentity, UnsupportedInviteVersion,
+    InviterUnreachable, Runtime, SpawnOptions, UnknownIdentity, UnsupportedInviteVersion,
     INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
@@ -935,5 +935,58 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     probe_node.shutdown().await?;
     rt_a.shutdown().await?;
     rt_b.shutdown().await?;
+    Ok(())
+}
+
+/// A pair open that fails part-way leaves no replica open. The armer
+/// retries every sweep, and each attempt imports both halves before it
+/// arms, so a failure that returned without forgetting them would grow the
+/// node's open replicas by two per sweep — on a device that is doing
+/// nothing but catching up.
+///
+/// The sibling is where a fresh import happens without arranging one: the
+/// laptop links, its directory replicates, and its armer opens a pair it
+/// never had. Arming is failed from before the link, so no sweep succeeds
+/// and every sweep imports again. `tracked_doc_count` is the anchor here
+/// for the reason the cancelled-establish scenario above gives; the failure
+/// count beside it is the positive control, without which "nothing
+/// accumulated" is satisfied by a device that never attempted.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_pair_open_leaves_no_replica_behind() -> Result<()> {
+    let phone = memory_runtime().await?;
+    let peer = memory_runtime().await?;
+    let alice = phone.identity().create().await?;
+    let bob = peer.identity().create().await?;
+    let invite = phone.connections().invite(alice, None).await?;
+    establish_patiently(&peer, bob, &phone, alice, invite).await?;
+
+    // A sweep cadence the scenario can wait on: the armer retries at the
+    // reconcile interval, and the default one would make several attempts
+    // outlast the poll budget.
+    let laptop = Runtime::spawn(SpawnOptions {
+        storage: data_layer::StorageConfig::Memory,
+        reconcile_interval: Duration::from_millis(200),
+    })
+    .await?;
+    // Armed before the laptop knows of any connection, so no sweep of its
+    // armer can slip past and cache the pair.
+    laptop.fail_pair_arm_for_test().await;
+    link_patiently(&laptop, &phone, alice).await?;
+
+    let settled = laptop.sync().tracked_doc_count().await?;
+    assert!(
+        eventually(|| async { Ok(laptop.pair_arm_failures_for_test().await >= 4) }).await?,
+        "the linked device never attempted to open the pair, so nothing here is a denial"
+    );
+    assert!(
+        eventually(|| async { Ok(laptop.sync().tracked_doc_count().await? <= settled) }).await?,
+        "repeated failed pair opens left replicas open: {} tracked against {settled} before them",
+        laptop.sync().tracked_doc_count().await?
+    );
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
+    peer.shutdown().await?;
     Ok(())
 }

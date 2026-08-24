@@ -1018,6 +1018,11 @@ async fn arm_open_pair(
     peer: PdnId,
     pair: &ConnectionMetadata,
 ) -> Result<()> {
+    #[cfg(feature = "test-util")]
+    if state.fail_pair_arm {
+        state.pair_arm_failures += 1;
+        anyhow::bail!("arming the pair failed for test");
+    }
     pair.own
         .ensure_device_published(state.node.node_id())
         .await?;
