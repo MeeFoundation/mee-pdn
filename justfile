@@ -381,8 +381,11 @@ check:
   set -eux
   cargo fmt --all -- --check
   # Both configurations: the product build first — a break there is invisible
-  # to a run that only ever enables the dev feature.
-  cargo clippy --workspace --all-targets
+  # to a run that only ever enables the dev feature. Product targets only:
+  # `--all-targets` builds the dev targets, and a dev-dependency on
+  # `pdn-node/test-util` unifies the feature back in, which would make this
+  # line a copy of the next one.
+  cargo clippy --workspace --lib --bins
   cargo clippy --workspace --all-targets {{ test_features }}
   cargo check --workspace --all-targets {{ test_features }}
 
@@ -393,8 +396,11 @@ check-fix:
   cargo fmt --all
   cargo clippy --workspace --all-targets {{ test_features }} --fix --allow-dirty --allow-staged
   # Both configurations: the product build first — a break there is invisible
-  # to a run that only ever enables the dev feature.
-  cargo clippy --workspace --all-targets
+  # to a run that only ever enables the dev feature. Product targets only:
+  # `--all-targets` builds the dev targets, and a dev-dependency on
+  # `pdn-node/test-util` unifies the feature back in, which would make this
+  # line a copy of the next one.
+  cargo clippy --workspace --lib --bins
   cargo clippy --workspace --all-targets {{ test_features }}
   cargo check --workspace --all-targets {{ test_features }}
 
