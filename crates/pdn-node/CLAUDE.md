@@ -2,7 +2,7 @@
 
 The embeddable runtime core: identity / connections / data / sync services as thin glue over `data-layer`, plus the runtime's two ceremonies.
 
-Pairing (ADR-0011): connections are produced by establishment — `invite` mints a bearer-free payload carrying a one-time secret (no ticket, no identity proof — nothing grants durable access; the secret burns on first use), `establish` dials the pairing ALPN and runs the verify-and-burn dialogue, and the grant surface publishes/reads whole-store tickets over the connection's metadata pair (no manual recording).
+Pairing (ADR-0011): connections are produced by establishment — `invite` mints a bearer-free payload carrying a one-time secret (no ticket, no identity proof — nothing grants durable access; the secret burns on first use), `establish` dials the pairing ALPN and runs the verify-and-burn dialogue, and the grant surface publishes, withdraws and reads grants over the connection's metadata pair — the peer's half for what the peer granted, capability and ticket together, the identity's own half for what it granted itself, capability alone (no manual recording).
 
 Device linking (ADR-0012, the `linking` module next to `pairing`): `linking_invite` mints the same kind of bearer-free payload (one-time secret inside, nothing durable), `link` dials the linking ALPN — the inviter verifies-and-burns, registers the newcomer's device record itself (from the connection's authenticated peer id), and replies with fresh directory and data-namespace write tickets; `link` imports both and returns caught up, rolling both back on failure.
 

@@ -77,13 +77,20 @@ pub struct PeerGrant {
 /// recording is offered.
 ///
 /// Grants ride the connection's metadata pair: publishing writes into the
-/// identity's own store toward the peer, reading opens the counterpart's
-/// store — from the directory's tickets on demand, so linked devices reach
-/// pairs established elsewhere. Reading hands back the ticket a grant
-/// carries; acting on it is the grant binder's job, not the caller's. One
-/// grant record exists per granted issuer — every grant is scoped by an
-/// exact claim set — so a republication replaces the previous record and a
-/// withdrawal is one act.
+/// identity's own store toward the peer, and both halves are readable —
+/// the counterpart's for what the peer granted, the identity's own for
+/// what it granted itself. Either read opens the pair from the directory's
+/// tickets on demand, so linked devices reach pairs established elsewhere.
+/// Reading a peer's grant hands back the ticket it carries; acting on it
+/// is the grant binder's job, not the caller's. Reading the identity's own
+/// hands back the capability alone. One grant record exists per granted
+/// issuer — every grant is scoped by an exact claim set — so a
+/// republication replaces the previous record and a withdrawal is one act.
+///
+/// Neither read is free of writes: opening a pair publishes this device's
+/// record into it and registers the connection for session classification,
+/// the same acts the connection armer performs on its sweep. "Reports what
+/// is readable now" means the call does not wait and changes no grant.
 #[allow(async_fn_in_trait)]
 pub trait ConnectionsService {
     /// Mint an invite for hosted `identity`: a one-time secret pending on
@@ -131,10 +138,25 @@ pub trait ConnectionsService {
     ) -> Result<()>;
 
     /// Read the grants `peer` has published toward hosted `identity` —
-    /// capability and ticket together, with the same
-    /// payload-waiting and poll-friendly contract as
-    /// [`read_grants`](Self::read_grants).
+    /// capability and ticket together, with the same payload-waiting and
+    /// poll-friendly contract as
+    /// [`read_own_grants`](Self::read_own_grants).
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>>;
+
+    /// Read the grants hosted `identity` has published toward `peer`, over
+    /// the pair's own half — the capability alone: the caller issues the
+    /// namespace the record addresses, so a ticket to it answers nothing.
+    /// Same observation contract as [`read_grants`](Self::read_grants):
+    /// what is readable now, never a wait, and a record whose payload has
+    /// not arrived reads as no grant.
+    ///
+    /// The answer is this device's. On the device that published a grant it
+    /// says the record is here, never that it reached a sibling or the
+    /// peer; on any device it says nothing about what the peer received.
+    /// An empty answer covers three states — no connection toward `peer`,
+    /// a pair whose tickets have not replicated here yet, and nothing
+    /// granted — so it is never evidence that nothing is shared.
+    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<ReadGrant>>;
 }
 
 /// The production [`ConnectionsService`], backed by the runtime's
@@ -147,23 +169,6 @@ pub struct RuntimeConnectionsService<'rt> {
 impl<'rt> RuntimeConnectionsService<'rt> {
     pub(crate) fn new(runtime: &'rt Runtime) -> Self {
         Self { runtime }
-    }
-
-    /// Whether this runtime's own metadata store toward `peer` holds a
-    /// live, readable grant of `issuer`'s data — the record the serving
-    /// classifier reads. Observation only, for scenarios that shut the
-    /// publishing device down and must first know the record reached the
-    /// device that will serve: the record rides best-effort replication,
-    /// so killing the publisher races it. Behind the `test-util` feature
-    /// and absent from every product build.
-    #[cfg(feature = "test-util")]
-    pub async fn grant_visible(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<bool> {
-        let mut state = self.runtime.state.lock().await;
-        state.hosted(identity)?;
-        let Some(pair) = open_pair(&mut state, identity, peer).await? else {
-            return Ok(false);
-        };
-        Ok(pair.own.read_grant(issuer, peer).await?.granted().is_some())
     }
 
     /// The devices among the reconciliation contacts of the pair's two
@@ -352,6 +357,29 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         for issuer in pair.peer.list_grants().await? {
             if let Some((grant, ticket)) = pair.peer.read_grant(issuer, identity).await?.granted() {
                 grants.push(PeerGrant { grant, ticket });
+            }
+        }
+        Ok(grants)
+    }
+
+    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<ReadGrant>> {
+        let pair = {
+            let mut state = self.runtime.state.lock().await;
+            state.hosted(identity)?;
+            open_pair(&mut state, identity, peer).await?
+        };
+        // No pair here: no connection toward `peer`, or its tickets have not
+        // replicated to this device yet. Both answer as the peer-side read
+        // does, and neither says anything is ungranted.
+        let Some(pair) = pair else {
+            return Ok(Vec::new());
+        };
+        let mut grants = Vec::new();
+        for issuer in pair.own.list_grants().await? {
+            // The ticket is the one minted for `peer` over this identity's
+            // own namespace: nothing the issuer does not already hold.
+            if let Some((grant, _ticket)) = pair.own.read_grant(issuer, peer).await?.granted() {
+                grants.push(grant);
             }
         }
         Ok(grants)

@@ -107,12 +107,24 @@ async fn withdraw_device_toward(
 }
 
 /// Poll until the grant record of `issuer`'s data toward `peer` is live
-/// and readable on `rt` — the record its classifier serves by. The
-/// scenarios wait on this before shutting the publishing device down: the
-/// record rides best-effort replication, and a publisher killed before it
-/// crossed leaves the surviving device refusing the audience fail-closed.
+/// and readable on `rt` — the record its classifier serves by, read the
+/// way a product reads it. The scenarios wait on this before shutting the
+/// publishing device down: the record rides best-effort replication, and a
+/// publisher killed before it crossed leaves the surviving device refusing
+/// the audience fail-closed. Nothing is readable before the pair opens, so
+/// this waits for the open pair as well — the connection record alone
+/// leaves the pair's tickets payload-waiting on a device that never opened
+/// it.
 async fn serving_ready(rt: &Runtime, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<bool> {
-    eventually(|| async { rt.connections().grant_visible(identity, peer, issuer).await }).await
+    eventually(|| async {
+        Ok(rt
+            .connections()
+            .read_own_grants(identity, peer)
+            .await?
+            .iter()
+            .any(|grant| grant.issuer == issuer))
+    })
+    .await
 }
 
 /// The core reachability property: the grant is published from the phone,

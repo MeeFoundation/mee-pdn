@@ -1093,6 +1093,7 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 /// feature.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario: the open pair, the record, the service, the denial
 async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() -> Result<()> {
     let rt_phone = memory_runtime().await?;
     let rt_laptop = memory_runtime().await?;
@@ -1144,14 +1145,30 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         .await?,
         "the granted claim never reached Bob while the phone was up"
     );
-    // The record the laptop will serve by has reached it — the grant rides
-    // best-effort replication, and killing the publisher races it.
+    // The armer opened the pair from the replicated directory, observed
+    // before anything on the grant surface is called here — the read below
+    // opens a pair that is not open yet, which would arrange what this
+    // scenario claims of the laptop. `pair_contacts` is the admitted
+    // instrument: an open pair has no product answer, and this one reads
+    // the cache without opening anything.
     assert!(
         eventually(|| async {
-            rt_laptop
+            let (own, _peer) = rt_laptop.connections().pair_contacts(alice, bob).await?;
+            Ok(!own.is_empty())
+        })
+        .await?,
+        "the pair never opened on the linked device"
+    );
+    // And the record the laptop will serve by has reached it — the grant
+    // rides best-effort replication, and killing the publisher races it.
+    assert!(
+        eventually(|| async {
+            Ok(rt_laptop
                 .connections()
-                .grant_visible(alice, bob, alice)
-                .await
+                .read_own_grants(alice, bob)
+                .await?
+                .iter()
+                .any(|grant| grant.issuer == alice))
         })
         .await?,
         "the grant record never reached the device that must serve by it"
@@ -1171,8 +1188,9 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     rt_carol.data().import(alice, carol_ticket).await?;
 
     // The laptop serves Bob under the grant published on the phone — no
-    // grant-surface call ever ran on the laptop; its armer opened the pair
-    // from the replicated directory, and Bob's route to it is the
+    // grant was published or withdrawn here, and the pair was open before
+    // this device's own grants were read, so what serves is the armer's
+    // work on the replicated directory. Bob's route to it is the
     // published device set. Carol's poll rides along inside the same wait,
     // so her sync attempts against the same target accumulate exactly
     // while Bob's do.
