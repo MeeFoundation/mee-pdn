@@ -87,6 +87,16 @@ pub struct PeerGrant {
 /// issuer — every grant is scoped by an exact claim set — so a
 /// republication replaces the previous record and a withdrawal is one act.
 ///
+/// Both reads report what is readable at the moment of the call and never
+/// wait: a record whose payload has not arrived reads as no grant. Both
+/// answer for the device they run on — on the device that published a
+/// grant the answer says the record is here, never that it reached a
+/// sibling or the peer, and neither says what the peer received. An empty
+/// answer covers four states: no connection toward that peer, a pair whose
+/// tickets have not replicated here yet, a record here whose payload
+/// cannot be read yet, and nothing granted. It is never evidence that
+/// nothing is shared.
+///
 /// Neither read is free of writes: opening a pair publishes this device's
 /// record into it and registers the connection for session classification,
 /// the same acts the connection armer performs on its sweep. "Reports what
@@ -137,25 +147,13 @@ pub trait ConnectionsService {
         claims: NonEmpty<GrantedClaim>,
     ) -> Result<()>;
 
-    /// Read the grants `peer` has published toward hosted `identity` —
-    /// capability and ticket together, with the same payload-waiting and
-    /// poll-friendly contract as
-    /// [`read_own_grants`](Self::read_own_grants).
+    /// Read the grants `peer` has published toward hosted `identity`, over
+    /// the pair's counterpart half — capability and ticket together.
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>>;
 
     /// Read the grants hosted `identity` has published toward `peer`, over
     /// the pair's own half — the capability alone: the caller issues the
     /// namespace the record addresses, so a ticket to it answers nothing.
-    /// Same observation contract as [`read_grants`](Self::read_grants):
-    /// what is readable now, never a wait, and a record whose payload has
-    /// not arrived reads as no grant.
-    ///
-    /// The answer is this device's. On the device that published a grant it
-    /// says the record is here, never that it reached a sibling or the
-    /// peer; on any device it says nothing about what the peer received.
-    /// An empty answer covers three states — no connection toward `peer`,
-    /// a pair whose tickets have not replicated here yet, and nothing
-    /// granted — so it is never evidence that nothing is shared.
     async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<ReadGrant>>;
 }
 
@@ -343,8 +341,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
     }
 
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>> {
-        // Assembly under the lock, polling outside it, exactly as
-        // `read_grants`.
+        // The pair is resolved under the lock, the grant reads run outside it.
         let pair = {
             let mut state = self.runtime.state.lock().await;
             state.hosted(identity)?;
