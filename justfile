@@ -38,6 +38,11 @@ setup-tooling:
 openspec-skills:
   @python3 -I scripts/openspec-skills.py
 
+# Build the mobile facade for one target — what `pdn-sdk` packages (see scripts/build-mobile.sh)
+[doc("Build the mobile facade for one target (positional; TARGET_API picks the NDK wrapper)")]
+build-mobile target="aarch64-linux-android":
+  @sh scripts/build-mobile.sh {{ target }}
+
 # Run workspace tests via nextest — extra args forwarded; a run with no selection ends with the workspace doctests, a `-p` or `-E` selection skips them
 test *args: _need-nextest
   @sh scripts/test.sh "$@"
