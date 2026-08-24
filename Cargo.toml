@@ -6,6 +6,7 @@ members = [
   "crates/pdn-layer",     # platform surface: domain model + PdnOp AST + uwill tokens
   "crates/pdn-node",      # embeddable node runtime: service glue over data-layer
   "crates/pdn-node-http", # thin HTTP host embedding one runtime
+  "crates/pdn-mobile",    # uniffi facade: the host a phone embeds
   "crates/test-utils",    # shared scenario-test plumbing (dev-dependency only)
 ]
 exclude = [

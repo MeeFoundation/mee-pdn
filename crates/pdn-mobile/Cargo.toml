@@ -1,0 +1,52 @@
+[package]
+name = "pdn-mobile"
+version = "0.1.0"
+edition = "2021"
+description = "uniffi facade over the pdn-node runtime: the host an iOS or Android application embeds"
+
+[lib]
+# `cdylib` is what an Android application loads and what the binding
+# generator reads its metadata out of, `lib` what this crate's own tests
+# drive. The static library an iOS application links is asked for by the
+# build recipe (`cargo rustc --crate-type staticlib`) rather than listed
+# here: it archives the whole graph, so a debug build of the workspace
+# would materialise gigabytes nothing on a development machine links.
+crate-type = ["lib", "cdylib"]
+name = "pdn_mobile"
+
+[features]
+# The binding generator, needed by `pdn-sdk`'s packaging recipes and by
+# nothing a device installs. Behind a feature so the product build carries
+# neither the generator nor its argument parser.
+cli = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[dependencies]
+anyhow = "1"
+# The textual form of a ceremony payload: the runtime type's own serde bytes
+# in an alphabet a code renders and a scan recovers.
+base64 = "0.22"
+pdn-node = { path = "../pdn-node" }
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+# The facade owns the asynchronous runtime the operations need; a foreign
+# caller brings none.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tracing = { workspace = true }
+uniffi = { version = "0.32", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+# The surface tests assert a payload minted here parses as the encoding the
+# other host over the same runtime takes, which is the runtime type's own.
+serde_json = "1"
+test-utils = { path = "../test-utils" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

@@ -1,4 +1,6 @@
 /mia-docs/
+/pdn-sdk/
+/pdn-app/
 /.code-review/
 local-data
 .env

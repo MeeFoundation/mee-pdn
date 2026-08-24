@@ -12,6 +12,14 @@
       "name": "mia-docs",
       "path": "mia-docs",
     },
+    {
+      "name": "pdn-sdk",
+      "path": "pdn-sdk",
+    },
+    {
+      "name": "pdn-app",
+      "path": "pdn-app",
+    },
   ],
   "settings": {
     "files.exclude": {

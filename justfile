@@ -37,13 +37,47 @@ build-watch:
   set -eux
   cargo watch -x 'build --workspace'
 
-# Install local developer tooling (cargo-watch, cargo-nextest, wasm targets)
+# Install local developer tooling (cargo-watch, cargo-nextest, wasm and mobile targets)
 setup-tooling:
   #!/bin/sh
   set -eux
   cargo install cargo-watch
   cargo install cargo-nextest --locked
   rustup target add wasm32-wasip1 wasm32-unknown-unknown
+  rustup target add aarch64-apple-ios aarch64-linux-android
+
+# The facade for one mobile target — what `pdn-sdk` packages, built here
+# because the crate lives here. The default target is the Android one,
+# the only of the two a machine that is not a Mac can produce.
+#
+# Both halves need a target C compiler for `ring`'s build script: on Apple
+# platforms `xcrun` finds it, on Android `cc-rs` looks for a bare
+# `aarch64-linux-android-clang` and the NDK ships only API-level-suffixed
+# wrappers, so the caller names one. TARGET_API selects it.
+[doc("Build the mobile facade for one target (positional; TARGET_API picks the NDK wrapper)")]
+build-mobile target="aarch64-linux-android":
+  #!/bin/sh
+  set -eux
+  case "{{ target }}" in
+    *android*)
+      : "${ANDROID_NDK_HOME:?set it to the NDK the build compiles ring with}"
+      api="${TARGET_API:-24}"
+      host="$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64"
+      bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host/bin"
+      CC_aarch64_linux_android="$bin/aarch64-linux-android$api-clang"
+      AR_aarch64_linux_android="$bin/llvm-ar"
+      export CC_aarch64_linux_android AR_aarch64_linux_android
+      # The shared library an application loads.
+      kind=cdylib
+      ;;
+    # An iOS application links the static library. What it also needs is
+    # `-framework Network -framework SystemConfiguration`, which Xcode does
+    # not add for a framework referenced only from an opaque archive — a
+    # link setting of the application's, not of this build.
+    *apple*) kind=staticlib ;;
+    *) echo "not a mobile target: {{ target }}"; exit 1 ;;
+  esac
+  cargo rustc -p pdn-mobile --release --target {{ target }} --crate-type "$kind"
 
 # Run workspace tests via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs). Nextest runs no doctests and the store's README is one, so a run with no selection ends with the workspace doctests; a `-p` or `-E` selection is nextest's alone and skips them.
 test *args:

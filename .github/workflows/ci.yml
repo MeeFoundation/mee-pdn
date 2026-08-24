@@ -81,6 +81,66 @@ jobs:
       - name: Test the store's other feature sets and doctests
         run: just test-store
 
+  # The facade for the 2 targets a device runs. Nothing below it had ever
+  # been compiled for either before the portability spike, so a break here
+  # is a break of the whole mobile host — and it is invisible to
+  # `lint-test-wasm`, which builds for this runner's own target.
+  mobile-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # `ring`'s build script needs a target C compiler, and the NDK ships
+      # only API-level-suffixed wrappers; the recipe names one. The runner
+      # image exports both variables, so the fallback is read in the shell —
+      # the `env` context holds what a workflow sets, not what the image
+      # exports, and naming it there would blank the variable instead.
+      - name: Build the facade for Android
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          [ -d "$ANDROID_NDK_HOME" ] || { echo "no NDK on this runner"; exit 1; }
+          just build-mobile aarch64-linux-android
+
+  mobile-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Build the facade for iOS
+        run: just build-mobile aarch64-apple-ios
+
   stand:
     runs-on: ubuntu-latest
     # A release image build plus the container suite. Past this the job is
