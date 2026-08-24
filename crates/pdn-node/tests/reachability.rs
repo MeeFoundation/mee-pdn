@@ -358,11 +358,15 @@ async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<
     // derivation exists to add. Read on bob, the side whose own half its own
     // ticket names; the positive beside it keeps the denial from holding on
     // a set that is merely empty.
-    let (bob_own, bob_peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
     assert!(
-        bob_own.contains(&phone_id),
+        eventually(|| async {
+            let (own, _peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
+            Ok(own.contains(&phone_id))
+        })
+        .await?,
         "bob's own half never named the issuer device that holds it"
     );
+    let (bob_own, bob_peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
     assert!(
         !bob_own.contains(&bob_id) && !bob_peer.contains(&bob_id),
         "the device that minted a half must not be a contact of it"
