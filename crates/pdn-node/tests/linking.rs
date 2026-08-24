@@ -1073,24 +1073,28 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 /// Hosting an identity arms its connections by replication, not by
 /// grant-surface use. The connection and the grant are both made on the
 /// phone *after* the laptop linked, so everything the laptop knows of them
-/// arrived through the directory; the laptop never touches the grant
-/// surface, yet serves the granted counterparty. Bob is arranged through
-/// his recorded grant alone — the binder imports it — and the serving
-/// device is isolated the way `sibling_serving` isolates its own: the
-/// phone goes offline and the probed update exists on the laptop alone.
-/// Paired, per `code-practices/access-control-tests.md`, with the
-/// tightest unauthorized party: a holder of the replica's ticket with no
-/// grant gets nothing from the same device — Carol's laptop-minted ticket
-/// is the admitted instrument there, since the control needs addressing
-/// to the serving device and no grant exists toward her to carry it.
+/// arrived through the directory; the laptop publishes and withdraws
+/// nothing, yet serves the granted counterparty. That subject rests on the
+/// order of the two waits below, not on the absence of a grant-surface
+/// call: `read_own_grants` opens a pair itself, so the `pair_contacts` wait
+/// ahead of it — which opens nothing — is what proves the armer got there
+/// first. Bob is arranged through his recorded grant alone — the binder
+/// imports it — and the serving device is isolated the way `sibling_serving`
+/// isolates its own: the phone goes offline and the probed update exists on
+/// the laptop alone. Paired, per `code-practices/access-control-tests.md`,
+/// with the tightest unauthorized party: a holder of the replica's ticket
+/// with no grant gets nothing from the same device — Carol's laptop-minted
+/// ticket is the admitted instrument there, since the control needs
+/// addressing to the serving device and no grant exists toward her to carry
+/// it.
 ///
-/// The scenario requires `test-util` as a whole, not only for the wait
-/// below. Its premise — the surviving device holds the grant record it
-/// will serve by — is closed by that wait alone, and the phone is shut
-/// down either way; without the feature the arrangement is the one the
-/// stress pass measured at about 2% flaky, so the scenario runs where its
-/// premise can be pinned and nowhere else. The `just` recipes enable the
-/// feature.
+/// The scenario requires `test-util` as a whole, not only for the
+/// `pair_contacts` wait below. Its premise — the surviving device holds the
+/// grant record it will serve by — is closed by the two waits together, and
+/// the phone is shut down either way; without the feature the arrangement
+/// is the one the stress pass measured at about 2% flaky, so the scenario
+/// runs where its premise can be pinned and nowhere else. The `just`
+/// recipes enable the feature.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario: the open pair, the record, the service, the denial

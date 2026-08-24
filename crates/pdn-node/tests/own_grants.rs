@@ -7,12 +7,17 @@
 //! (`code-practices/access-control-tests.md`), and for this operation the
 //! tightest party is a second identity hosted on the same runtime: it has
 //! a directory of its own, and the read resolves the pair through the
-//! acting identity's directory. The denial is probed in two degrees — a
-//! co-hosted identity with no pair toward that peer, and the tighter one,
-//! a co-hosted identity holding its own pair toward the same peer, which a
-//! lookup keyed on the peer instead of the directory would answer with
-//! another identity's record. A party on another node is no control at
-//! all: nothing lets it address the pair, so no call can be made.
+//! acting identity's directory. The denial is probed in two degrees. A
+//! co-hosted identity with no pair toward that peer catches a lookup keyed
+//! on the peer instead of the directory: publishing opens and caches the
+//! pair, so such a lookup hands that identity the other's record. A
+//! co-hosted identity holding its own pair toward the same peer catches
+//! the narrower slip the first cannot — a lookup keyed on the peer among
+//! the identities that do hold one. Beside both stands the positive read,
+//! without which a denial whose expected answer is nothing is satisfied by
+//! an implementation that answers nothing to everyone. A party on another
+//! node is no control at all: nothing lets it address the pair, so no call
+//! can be made.
 //!
 //! The read hands back the capability alone. No assertion here says the
 //! ticket is absent, because the read's type carries none — an absence has
