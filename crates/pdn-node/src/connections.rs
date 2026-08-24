@@ -954,35 +954,80 @@ async fn open_pair(
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
+    let reuses_own = matches!(&cached, Some(pair) if pair.own.namespace() == own_namespace);
+    let reuses_peer = matches!(&cached, Some(pair) if pair.peer.namespace() == peer_namespace);
     let own = match &cached {
-        Some(pair) if pair.own.namespace() == own_namespace => pair.own.clone(),
+        Some(pair) if reuses_own => pair.own.clone(),
         _ => data_layer::ConnectionMetadataStore::import(&state.node, own_ticket).await?,
     };
     let peer_store = match &cached {
-        Some(pair) if pair.peer.namespace() == peer_namespace => pair.peer.clone(),
-        _ => data_layer::ConnectionMetadataStore::import(&state.node, peer_ticket).await?,
+        Some(pair) if reuses_peer => pair.peer.clone(),
+        _ => match data_layer::ConnectionMetadataStore::import(&state.node, peer_ticket).await {
+            Ok(store) => store,
+            Err(err) => {
+                forget_imported(state, (!reuses_own).then_some(own_namespace), None).await;
+                return Err(err);
+            }
+        },
     };
     let pair = ConnectionMetadata {
         own,
         peer: peer_store,
     };
-    // A device that opens the pair asserts itself into `own` once and
-    // registers the pair for session classification, so linked devices are
-    // resolvable by the counterparty and judge callers themselves.
-    // Assert-once, tombstones respected: opening is not a (re-)publication
-    // act — a live record is left untouched, and a withdrawn record is
-    // never resurrected as a side effect.
+    if let Err(err) = arm_open_pair(state, identity, peer, &pair).await {
+        forget_imported(
+            state,
+            (!reuses_own).then_some(own_namespace),
+            (!reuses_peer).then_some(peer_namespace),
+        )
+        .await;
+        return Err(err);
+    }
+    state.metadata_pairs.insert((identity, peer), pair.clone());
+    Ok(Some(pair))
+}
+
+/// Forget the halves this attempt imported. A failure part-way through
+/// opening leaves the pair uncached, so nothing holds a replica this
+/// attempt opened and the next attempt imports it again — without this the
+/// open handle and its `start_sync` accumulate per attempt. A half taken
+/// from the cache is left alone: the open pair is still its holder.
+async fn forget_imported(
+    state: &State,
+    own: Option<data_layer::NamespaceId>,
+    peer: Option<data_layer::NamespaceId>,
+) {
+    for namespace in [own, peer].into_iter().flatten() {
+        if let Err(err) = state.node.forget_doc(namespace).await {
+            tracing::warn!(%namespace, "a metadata half stayed open after a failed pair open: {err:#}");
+        }
+    }
+}
+
+/// The acts a device performs on the pair it has just opened: it asserts
+/// itself into `own` once and registers the pair for session
+/// classification, so linked devices are resolvable by the counterparty and
+/// judge callers themselves. Assert-once, tombstones respected: opening is
+/// not a (re-)publication act — a live record is left untouched, and a
+/// withdrawn record is never resurrected as a side effect. Pointing the
+/// halves at their devices is not part of the contract: its failure leaves
+/// the import-time contacts and is logged, never raised.
+async fn arm_open_pair(
+    state: &mut State,
+    identity: PdnId,
+    peer: PdnId,
+    pair: &ConnectionMetadata,
+) -> Result<()> {
     pair.own
         .ensure_device_published(state.node.node_id())
         .await?;
     state
         .node
         .host_connection(identity, peer, &pair.own, &pair.peer)?;
-    if let Err(err) = point_pair_at_its_devices(state, identity, peer, &pair).await {
+    if let Err(err) = point_pair_at_its_devices(state, identity, peer, pair).await {
         tracing::warn!(%identity, %peer, "the pair kept its import-time contacts: {err:#}");
     }
-    state.metadata_pairs.insert((identity, peer), pair.clone());
-    Ok(Some(pair))
+    Ok(())
 }
 
 /// Point both halves of a connection's metadata pair at every device that
