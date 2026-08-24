@@ -351,6 +351,23 @@ async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<
         "a node that holds neither half must not be a contact of either"
     );
 
+    // Denied, tighter than the stranger: the device that minted a half is
+    // not a contact of it either. The ticket it minted names itself, and a
+    // set that kept that entry has the node dialing itself once per
+    // reconcile — refused by the endpoint, and never the contact the
+    // derivation exists to add. Read on bob, the side whose own half its own
+    // ticket names; the positive beside it keeps the denial from holding on
+    // a set that is merely empty.
+    let (bob_own, bob_peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
+    assert!(
+        bob_own.contains(&phone_id),
+        "bob's own half never named the issuer device that holds it"
+    );
+    assert!(
+        !bob_own.contains(&bob_id) && !bob_peer.contains(&bob_id),
+        "the device that minted a half must not be a contact of it"
+    );
+
     rt_phone.shutdown().await?;
     rt_laptop.shutdown().await?;
     rt_bob.shutdown().await?;

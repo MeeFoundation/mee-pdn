@@ -32,6 +32,7 @@ const DEBUG_ROUTES: &[(Method, &str)] = &[
     (Method::Get, "/debug/identities/aa/connections"),
     (Method::Post, "/debug/identities/aa/grants/bb"),
     (Method::Get, "/debug/identities/aa/grants/bb"),
+    (Method::Get, "/debug/identities/aa/own-grants/bb"),
     (Method::Delete, "/debug/identities/aa/grants/bb/cc"),
     (Method::Get, "/debug/data/aa"),
     (Method::Put, "/debug/data/aa/contact/email"),

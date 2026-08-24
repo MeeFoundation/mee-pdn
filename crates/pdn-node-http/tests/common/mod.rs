@@ -32,7 +32,7 @@ use std::{
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath};
+use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath, OwnGrants};
 use serde::de::DeserializeOwned;
 use testcontainers::{
     core::{logs::LogFrame, ContainerPort, ExecCommand, Mount, WaitFor},
@@ -851,6 +851,38 @@ pub async fn entry_answers(
     poll_read(host, issuer, path, |answer| answer.status == status)
         .await
         .with_context(|| format!("reading {path} under {issuer} never answered {status}"))
+}
+
+/// Poll until this host reads back a grant of `issuer`'s data that
+/// `identity` published toward `peer` — the record a device serves the
+/// audience by. Nothing is readable there before the pair opens, so the
+/// wait covers the open pair too: a device holding the connection record
+/// alone, its tickets still payload-waiting, reads no grant.
+pub async fn own_grant_reads(
+    host: &Host,
+    identity: PdnId,
+    peer: PdnId,
+    issuer: PdnId,
+) -> Result<()> {
+    let route = format!("/debug/identities/{identity}/own-grants/{peer}");
+    let found = eventually(CONVERGENCE_BUDGET, || async {
+        let grants: OwnGrants = host.get(&route).await?.json()?;
+        Ok(grants
+            .grants
+            .iter()
+            .any(|grant| grant.issuer == issuer)
+            .then_some(()))
+    })
+    .await?;
+    if found.is_none() {
+        // What this device was doing instead of holding the record, for the
+        // reason [`poll_read`] gives.
+        let diagnostics = host.diagnostics().await;
+        anyhow::bail!(
+            "{identity} never read back its grant of {issuer}'s data toward {peer}\n{diagnostics}"
+        );
+    }
+    Ok(())
 }
 
 /// Repeat the read until `holds`, carrying the last answer into the error.

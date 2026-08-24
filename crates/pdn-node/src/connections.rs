@@ -1038,8 +1038,17 @@ async fn point_pair_at_its_devices(
         (pair.own.namespace(), own_nodes),
         (pair.peer.namespace(), peer_nodes),
     ] {
-        let mut seen: HashSet<[u8; 32]> = nodes.iter().map(|node| *node.id.as_bytes()).collect();
-        let mut contacts = nodes;
+        // This device is covered before anything is taken in, so a ticket
+        // that names the side that minted it — this one, for the half it
+        // minted — leaves no contact pointing here: the endpoint refuses a
+        // path to itself, and the dial is spent once per reconcile.
+        let mut seen: HashSet<[u8; 32]> = HashSet::from([*own_device.as_bytes()]);
+        let mut contacts = Vec::new();
+        for node in nodes {
+            if seen.insert(*node.id.as_bytes()) {
+                contacts.push(node);
+            }
+        }
         for holder in &holders {
             if seen.insert(*holder.id.as_bytes()) {
                 contacts.push(holder.clone());

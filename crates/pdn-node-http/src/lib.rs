@@ -204,6 +204,10 @@ fn debug_routes() -> Router<Arc<Runtime>> {
             post(connections::publish_grant).get(connections::read_grants),
         )
         .route(
+            "/debug/identities/{identity}/own-grants/{peer}",
+            get(connections::read_own_grants),
+        )
+        .route(
             "/debug/identities/{identity}/grants/{peer}/{issuer}",
             delete(connections::withdraw_grant),
         )
