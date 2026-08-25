@@ -82,7 +82,7 @@ There is sometimes only one way to fix something — then there is one option, b
 
 - **The review is written in the language resolved from the request**, English by default, the whole file including headings. Never translated, whatever the language: capability, connection metadata store / CMS, private metadata store / PMS, claim, lock, race, identity, audience, connection, binder, session, snapshot, ingress, egress. Identifiers, paths, and type names in backticks, exactly as in the code. A mechanism is called by the word the code gives it — `reclaim` for `reclaim_abandoned_sessions` — never by a metaphor coined for the finding; an operation the code does not name is described in plain words rather than given a new one.
 - **A paragraph is one physical line** — the documentation rule from [CLAUDE.md](../../../../CLAUDE.md). Lists and headings take one line per item.
-- **Links are clickable and relative to `.code-review/`**: `[fs.rs:827](../pdn-store/src/store/fs.rs#L827)`, `[core.md](../mia-docs/openspec/specs/components/pdn-node/core.md)`.
+- **Links are clickable and relative to `.code-review/`**: `[fs.rs:827](../crates/pdn-store/src/store/fs.rs#L827)`, `[core.md](../mia-docs/openspec/specs/components/pdn-node/core.md)`.
 - **Numbers are digits with thousands separators** (`10,000,000 records`).
 - **No invented abbreviations or notation.** Invariants and ADRs by number; `Dn` only when it is said whose decisions those are.
 - **"Checked" means executed.** What was read with eyes is called read.

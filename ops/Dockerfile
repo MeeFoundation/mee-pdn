@@ -16,21 +16,7 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# A workspace may resolve the store fork from the checkout beside it, through
-# a cargo configuration file kept out of version control. Neither is present
-# in a clean checkout, and a `COPY` of a path that is not there fails the
-# build, so this stage turns "may be present" into "is present, possibly
-# empty" — and the dependency stage below then resolves exactly what the
-# final build does, rather than reaching for a checkout it was never given.
-FROM busybox AS local-inputs
-COPY . /ctx
-RUN mkdir -p /out/.cargo /out/pdn-store; \
-    cp -a /ctx/.cargo/. /out/.cargo/ 2>/dev/null || true; \
-    cp -a /ctx/pdn-store/. /out/pdn-store/ 2>/dev/null || true
-
 FROM chef AS builder
-COPY --from=local-inputs /out/.cargo ./.cargo
-COPY --from=local-inputs /out/pdn-store ./pdn-store
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo chef cook --release -p pdn-node-http --recipe-path recipe.json

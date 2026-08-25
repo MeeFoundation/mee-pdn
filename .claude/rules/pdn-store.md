@@ -1,9 +1,9 @@
 ---
-description: Pre-push checklist required after any modification of the nested pdn-store checkout
+description: Pre-push checklist required after any modification of the store crate
 paths:
-  - "pdn-store/**"
+  - "crates/pdn-store/**"
 ---
 
 # pdn-store checks
 
-Any modification of `./pdn-store` ends with running its pre-push checklist (`./pdn-store/CLAUDE.md`, section "Pre-push checklist") before committing: fmt, clippy for all three feature sets, `cargo +nightly docs-rs`, `cargo deny`, tests plus doctests, and the wasm build — all with warnings treated as errors, exactly as that repo's CI runs them.
+Any modification of `crates/pdn-store` ends with the checks the pipeline's `store` job runs, all from the workspace root: `just check`, `just check-store` (clippy on the other two feature sets and rustdoc, warnings denied, then the wasm32 build), `just test`, and `just test-store` (the other two feature sets, then doctests). The crate's `CLAUDE.md`, section "Pre-push checklist", says what each covers.

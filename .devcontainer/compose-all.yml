@@ -27,7 +27,6 @@ services:
       # trees). The container builds into its own volume here.
       - /workspaces/mee-pdn/target
       - /workspaces/mee-pdn/mee-v3-single-device/target
-      - /workspaces/mee-pdn/pdn-store/target
       # Read-only devcontainer directory
       - ../.devcontainer:/workspaces/mee-pdn/.devcontainer:ro
       # Read-only settings directory

@@ -1,0 +1,1193 @@
+#![allow(missing_docs)]
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use anyhow::{Context, Result};
+use iroh::{address_lookup::memory::MemoryLookup, Endpoint, EndpointAddr, EndpointId, PublicKey};
+use iroh_blobs::{
+    api::{
+        blobs::BlobStatus,
+        downloader::{ContentDiscovery, DownloadRequest, Downloader, SplitStrategy},
+        Store,
+    },
+    Hash, HashAndFormat,
+};
+use iroh_gossip::net::Gossip;
+use n0_future::{task::JoinSet, time::SystemTime, FutureExt};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{self, mpsc, oneshot};
+use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+
+// use super::gossip::{GossipActor, ToGossipActor};
+use super::state::{NamespaceStates, Origin, SyncReason};
+use crate::{
+    actor::{OpenOpts, SyncHandle},
+    engine::gossip::GossipState,
+    metrics::Metrics,
+    net::{
+        connect_and_sync, handle_connection, AbortReason, AcceptError, AcceptOutcome, ConnectError,
+        SyncFinished,
+    },
+    AuthorHeads, ContentStatus, NamespaceId, SignedEntry,
+};
+
+/// An iroh-docs operation
+///
+/// This is the message that is broadcast over iroh-gossip.
+#[derive(Debug, Clone, Serialize, Deserialize, strum::Display)]
+pub enum Op {
+    /// A new entry was inserted into the document.
+    Put(SignedEntry),
+    /// A peer now has content available for a hash.
+    ContentReady(Hash),
+    /// We synced with another peer, here's the news.
+    SyncReport(SyncReport),
+}
+
+/// Report of a successful sync with the new heads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReport {
+    namespace: NamespaceId,
+    /// Encoded [`AuthorHeads`]
+    heads: Vec<u8>,
+}
+
+/// Messages to the sync actor
+#[derive(derive_more::Debug, strum::Display)]
+pub enum ToLiveActor {
+    StartSync {
+        namespace: NamespaceId,
+        peers: Vec<EndpointAddr>,
+        /// Whether to join the replica's gossip swarm. Scoped access syncs
+        /// without ever joining the swarm.
+        join_gossip: bool,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    Leave {
+        namespace: NamespaceId,
+        kill_subscribers: bool,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    LeaveGossip {
+        namespace: NamespaceId,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    Shutdown {
+        reply: sync::oneshot::Sender<()>,
+    },
+    Subscribe {
+        namespace: NamespaceId,
+        #[debug("sender")]
+        sender: async_channel::Sender<Event>,
+        #[debug("oneshot::Sender")]
+        reply: sync::oneshot::Sender<Result<()>>,
+    },
+    HandleConnection {
+        conn: iroh::endpoint::Connection,
+    },
+    AcceptSyncRequest {
+        namespace: NamespaceId,
+        peer: PublicKey,
+        #[debug("oneshot::Sender")]
+        reply: sync::oneshot::Sender<AcceptOutcome>,
+    },
+
+    IncomingSyncReport {
+        from: PublicKey,
+        report: SyncReport,
+    },
+    NeighborContentReady {
+        namespace: NamespaceId,
+        node: PublicKey,
+        hash: Hash,
+    },
+    NeighborUp {
+        namespace: NamespaceId,
+        peer: PublicKey,
+    },
+    NeighborDown {
+        namespace: NamespaceId,
+        peer: PublicKey,
+    },
+}
+
+/// Events informing about actions of the live sync progress.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, strum::Display)]
+pub enum Event {
+    /// The content of an entry was downloaded and is now available at the local node
+    ContentReady {
+        /// The content hash of the newly available entry content
+        hash: Hash,
+    },
+    /// We have a new neighbor in the swarm.
+    NeighborUp(PublicKey),
+    /// We lost a neighbor in the swarm.
+    NeighborDown(PublicKey),
+    /// A set-reconciliation sync finished.
+    SyncFinished(SyncEvent),
+    /// All pending content is now ready.
+    ///
+    /// This event is only emitted after a sync completed and `Self::SyncFinished` was emitted at
+    /// least once. It signals that all currently pending downloads have been completed.
+    ///
+    /// Receiving this event does not guarantee that all content in the document is available. If
+    /// blobs failed to download, this event will still be emitted after all operations completed.
+    PendingContentReady,
+}
+
+type SyncConnectRes = (
+    NamespaceId,
+    PublicKey,
+    SyncReason,
+    Result<SyncFinished, ConnectError>,
+);
+type SyncAcceptRes = Result<SyncFinished, AcceptError>;
+type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
+
+// Currently peers might double-sync in both directions.
+pub struct LiveActor {
+    /// Receiver for actor messages.
+    inbox: mpsc::Receiver<ToLiveActor>,
+    sync: SyncHandle,
+    endpoint: Endpoint,
+    bao_store: Store,
+    downloader: Downloader,
+    memory_lookup: MemoryLookup,
+    replica_events_tx: async_channel::Sender<crate::Event>,
+    replica_events_rx: async_channel::Receiver<crate::Event>,
+
+    /// Send messages to self.
+    /// Note: Must not be used in methods called from `Self::run` directly to prevent deadlocks.
+    /// Only clone into newly spawned tasks.
+    sync_actor_tx: mpsc::Sender<ToLiveActor>,
+    gossip: GossipState,
+
+    /// Running sync futures (from connect).
+    running_sync_connect: JoinSet<SyncConnectRes>,
+    /// Running sync futures (from accept).
+    running_sync_accept: JoinSet<SyncAcceptRes>,
+    /// Running download futures.
+    download_tasks: JoinSet<DownloadRes>,
+    /// Content hashes which are wanted but not yet queued because no provider was found,
+    /// keyed by the namespace whose entry wants them (the namespace drives retries on
+    /// sync-finished and keeps `PendingContentReady` attribution correct).
+    missing_hashes: HashSet<(NamespaceId, Hash)>,
+    /// Queued content whose running download should be retried once if it fails: a fresh
+    /// provider was registered (through a finished sync) after the running download had
+    /// already snapshotted its provider set, so the provider is only reachable by a new
+    /// download attempt.
+    retry_after_failure: HashSet<(NamespaceId, Hash)>,
+    /// Content hashes queued in downloader.
+    queued_hashes: QueuedHashes,
+    /// Nodes known to have a hash
+    hash_providers: ProviderNodes,
+
+    /// Subscribers to actor events
+    subscribers: SubscribersMap,
+
+    /// Sync state per replica and peer
+    state: NamespaceStates,
+    /// The embedder's per-session access provider: consulted on both
+    /// session roles — accept and dial — to decide what a peer may see of
+    /// a namespace. `None` keeps every session full (vanilla).
+    session_access: Option<crate::filter::SessionAccessProvider>,
+    metrics: Arc<Metrics>,
+}
+impl LiveActor {
+    /// Create the live actor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        sync: SyncHandle,
+        endpoint: Endpoint,
+        gossip: Gossip,
+        bao_store: Store,
+        downloader: Downloader,
+        inbox: mpsc::Receiver<ToLiveActor>,
+        sync_actor_tx: mpsc::Sender<ToLiveActor>,
+        session_access: Option<crate::filter::SessionAccessProvider>,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self> {
+        let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
+        let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup()?.add(memory_lookup.clone());
+        Ok(Self {
+            inbox,
+            sync,
+            replica_events_rx,
+            replica_events_tx,
+            endpoint,
+            memory_lookup,
+            gossip: gossip_state,
+            bao_store,
+            downloader,
+            sync_actor_tx,
+            running_sync_connect: Default::default(),
+            running_sync_accept: Default::default(),
+            subscribers: Default::default(),
+            download_tasks: Default::default(),
+            state: Default::default(),
+            missing_hashes: Default::default(),
+            retry_after_failure: Default::default(),
+            queued_hashes: Default::default(),
+            hash_providers: Default::default(),
+            session_access,
+            metrics,
+        })
+    }
+
+    /// Run the actor loop.
+    pub async fn run(mut self) -> Result<()> {
+        let shutdown_reply = self.run_inner().await;
+        if let Err(err) = self.shutdown().await {
+            error!(?err, "Error during shutdown");
+        }
+        drop(self);
+        match shutdown_reply {
+            Ok(reply) => {
+                reply.send(()).ok();
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn run_inner(&mut self) -> Result<oneshot::Sender<()>> {
+        let mut i = 0;
+        loop {
+            i += 1;
+            trace!(?i, "tick wait");
+            self.metrics.doc_live_tick_main.inc();
+            tokio::select! {
+                biased;
+                msg = self.inbox.recv() => {
+                    let msg = msg.context("to_actor closed")?;
+                    trace!(?i, %msg, "tick: to_actor");
+                    self.metrics.doc_live_tick_actor.inc();
+                    match msg {
+                        ToLiveActor::Shutdown { reply } => {
+                            break Ok(reply);
+                        }
+                        msg => {
+                            self.on_actor_message(msg).await.context("on_actor_message")?;
+                        }
+                    }
+                }
+                event = self.replica_events_rx.recv() => {
+                    trace!(?i, "tick: replica_event");
+                    self.metrics.doc_live_tick_replica_event.inc();
+                    let event = event.context("replica_events closed")?;
+                    if let Err(err) = self.on_replica_event(event).await {
+                        error!(?err, "Failed to process replica event");
+                    }
+                }
+                Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
+                    trace!(?i, "tick: running_sync_connect");
+                    self.metrics.doc_live_tick_running_sync_connect.inc();
+                    let (namespace, peer, reason, res) = res.context("running_sync_connect closed")?;
+                    self.on_sync_via_connect_finished(namespace, peer, reason, res).await;
+
+                }
+                Some(res) = self.running_sync_accept.join_next(), if !self.running_sync_accept.is_empty() => {
+                    trace!(?i, "tick: running_sync_accept");
+                    self.metrics.doc_live_tick_running_sync_accept.inc();
+                    let res = res.context("running_sync_accept closed")?;
+                    self.on_sync_via_accept_finished(res).await;
+                }
+                Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
+                    trace!(?i, "tick: pending_downloads");
+                    self.metrics.doc_live_tick_pending_downloads.inc();
+                    let (namespace, hash, res) = res.context("pending_downloads closed")?;
+                    self.on_download_ready(namespace, hash, res).await;
+                }
+                res = self.gossip.progress(), if !self.gossip.is_empty() => {
+                    if let Err(error) = res {
+                        warn!(?error, "gossip state failed");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn on_actor_message(&mut self, msg: ToLiveActor) -> anyhow::Result<bool> {
+        match msg {
+            ToLiveActor::Shutdown { .. } => {
+                unreachable!("handled in run");
+            }
+            ToLiveActor::IncomingSyncReport { from, report } => {
+                self.on_sync_report(from, report).await
+            }
+            ToLiveActor::NeighborUp { namespace, peer } => {
+                debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor up");
+                self.sync_with_peer(namespace, peer, SyncReason::NewNeighbor);
+                self.subscribers
+                    .send(&namespace, Event::NeighborUp(peer))
+                    .await;
+            }
+            ToLiveActor::NeighborDown { namespace, peer } => {
+                debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor down");
+                self.subscribers
+                    .send(&namespace, Event::NeighborDown(peer))
+                    .await;
+            }
+            ToLiveActor::StartSync {
+                namespace,
+                peers,
+                join_gossip,
+                reply,
+            } => {
+                let res = self.start_sync(namespace, peers, join_gossip).await;
+                reply.send(res).ok();
+            }
+            ToLiveActor::Leave {
+                namespace,
+                kill_subscribers,
+                reply,
+            } => {
+                let res = self.leave(namespace, kill_subscribers).await;
+                reply.send(res).ok();
+            }
+            ToLiveActor::LeaveGossip { namespace, reply } => {
+                self.leave_gossip(namespace);
+                reply.send(Ok(())).ok();
+            }
+            ToLiveActor::Subscribe {
+                namespace,
+                sender,
+                reply,
+            } => {
+                self.subscribers.subscribe(namespace, sender);
+                reply.send(Ok(())).ok();
+            }
+            ToLiveActor::HandleConnection { conn } => {
+                self.handle_connection(conn).await;
+            }
+            ToLiveActor::AcceptSyncRequest {
+                namespace,
+                peer,
+                reply,
+            } => {
+                let outcome = self.accept_sync_request(namespace, peer);
+                reply.send(outcome).ok();
+            }
+            ToLiveActor::NeighborContentReady {
+                namespace,
+                node,
+                hash,
+            } => {
+                self.on_neighbor_content_ready(namespace, node, hash).await;
+            }
+        };
+        Ok(true)
+    }
+
+    #[instrument("connect", skip_all, fields(peer = %peer.fmt_short(), namespace = %namespace.fmt_short()))]
+    fn sync_with_peer(&mut self, namespace: NamespaceId, peer: PublicKey, reason: SyncReason) {
+        if !self.state.start_connect(&namespace, peer, reason) {
+            return;
+        }
+        let endpoint = self.endpoint.clone();
+        let sync = self.sync.clone();
+        let metrics = self.metrics.clone();
+        let session_access = self.session_access.clone();
+        let fut = async move {
+            // The dialing side serves entries too (reconciliation is
+            // bidirectional), so the embedder's access provider gates this
+            // role exactly like the accept role.
+            let access = match &session_access {
+                None => crate::filter::SessionAccess::Full,
+                Some(provider) => provider(namespace, peer, crate::filter::SessionRole::Dial).await,
+            };
+            let res = match access {
+                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
+                    "session denied by the local access provider"
+                ))),
+                crate::filter::SessionAccess::Full => {
+                    connect_and_sync(
+                        &endpoint,
+                        &sync,
+                        namespace,
+                        EndpointAddr::new(peer),
+                        Some(&metrics),
+                        None,
+                    )
+                    .await
+                }
+                crate::filter::SessionAccess::Filtered(filter) => {
+                    connect_and_sync(
+                        &endpoint,
+                        &sync,
+                        namespace,
+                        EndpointAddr::new(peer),
+                        Some(&metrics),
+                        Some(filter),
+                    )
+                    .await
+                }
+            };
+            (namespace, peer, reason, res)
+        }
+        .instrument(Span::current());
+        self.running_sync_connect.spawn(fut);
+    }
+
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        // cancel all subscriptions
+        self.subscribers.clear();
+        let (gossip_shutdown_res, _store) = tokio::join!(
+            // quit the gossip topics and task loops.
+            self.gossip.shutdown(),
+            // shutdown sync thread
+            self.sync.shutdown()
+        );
+        gossip_shutdown_res?;
+        // TODO: abort_all and join_next all JoinSets to catch panics
+        // (they are aborted on drop, but that swallows panics)
+        Ok(())
+    }
+
+    async fn start_sync(
+        &mut self,
+        namespace: NamespaceId,
+        mut peers: Vec<EndpointAddr>,
+        join_gossip: bool,
+    ) -> Result<()> {
+        debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
+        // update state to allow sync
+        if !self.state.is_syncing(&namespace) {
+            let opts = OpenOpts::default()
+                .sync()
+                .subscribe(self.replica_events_tx.clone());
+            self.sync.open(namespace, opts).await?;
+            self.state.insert(namespace);
+        }
+        // add the peers stored for this document
+        match self.sync.get_sync_peers(namespace).await {
+            Ok(None) => {
+                // no peers for this document
+            }
+            Ok(Some(known_useful_peers)) => {
+                let as_node_addr = known_useful_peers.into_iter().filter_map(|peer_id_bytes| {
+                    // peers are stored as bytes, don't fail the operation if they can't be
+                    // decoded: simply ignore the peer
+                    match PublicKey::from_bytes(&peer_id_bytes) {
+                        Ok(public_key) => Some(EndpointAddr::new(public_key)),
+                        Err(_signing_error) => {
+                            warn!("potential db corruption: peers per doc can't be decoded");
+                            None
+                        }
+                    }
+                });
+                peers.extend(as_node_addr);
+            }
+            Err(e) => {
+                // try to continue if peers per doc can't be read since they are not vital for sync
+                warn!(%e, "db error reading peers per document")
+            }
+        }
+        self.join_peers(namespace, peers, join_gossip).await?;
+        Ok(())
+    }
+
+    async fn leave(
+        &mut self,
+        namespace: NamespaceId,
+        kill_subscribers: bool,
+    ) -> anyhow::Result<()> {
+        // self.subscribers.remove(&namespace);
+        if self.state.remove(&namespace) {
+            self.sync.set_sync(namespace, false).await?;
+            self.sync
+                .unsubscribe(namespace, self.replica_events_tx.clone())
+                .await?;
+            self.sync.close(namespace).await?;
+            self.gossip.quit(&namespace);
+        }
+        if kill_subscribers {
+            self.subscribers.remove(&namespace);
+        }
+        Ok(())
+    }
+
+    /// Leave the replica's gossip swarm and touch nothing else — the
+    /// narrow inverse of the join `start_sync` performs.
+    ///
+    /// The replica stays open and in the sync set — reconciliation keeps
+    /// accepting and dialing — and event subscribers stay live. Quitting
+    /// drops both halves of the topic subscription (the receive loop is
+    /// aborted, the sender goes with its state), so gossip stops in both
+    /// directions: nothing more is ingested from the topic, and
+    /// broadcasting to it becomes a no-op. A later gossip-joining
+    /// `start_sync` re-subscribes. Idempotent: quitting a topic that was
+    /// never joined does nothing.
+    fn leave_gossip(&mut self, namespace: NamespaceId) {
+        self.gossip.quit(&namespace);
+    }
+
+    async fn join_peers(
+        &mut self,
+        namespace: NamespaceId,
+        peers: Vec<EndpointAddr>,
+        join_gossip: bool,
+    ) -> Result<()> {
+        let mut peer_ids = Vec::new();
+
+        // add addresses of peers to our endpoint address book
+        for peer in peers.into_iter() {
+            let peer_id = peer.id;
+            // adding a node address without any addressing info fails with an error,
+            // but we still want to include those peers because endpoint address lookup might find addresses for them
+            if !peer.is_empty() {
+                self.memory_lookup.add_endpoint_info(peer);
+            }
+            peer_ids.push(peer_id);
+        }
+
+        // tell gossip to join — unless this is scoped access, which stays
+        // outside the replica's swarm: reconciliation is its only data
+        // path, and the direct syncs below still run.
+        if join_gossip {
+            self.gossip.join(namespace, peer_ids.clone()).await?;
+        }
+
+        if !peer_ids.is_empty() {
+            // trigger initial sync with initial peers
+            for peer in peer_ids {
+                self.sync_with_peer(namespace, peer, SyncReason::DirectJoin);
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument("connect", skip_all, fields(peer = %peer.fmt_short(), namespace = %namespace.fmt_short()))]
+    async fn on_sync_via_connect_finished(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        reason: SyncReason,
+        result: Result<SyncFinished, ConnectError>,
+    ) {
+        match result {
+            Err(ConnectError::RemoteAbort(AbortReason::AlreadySyncing)) => {
+                debug!(?reason, "remote abort, already syncing");
+                // The remote refused our dial because it sees an exchange with us already
+                // running. Nothing else will finish the dial recorded in our state, so clear
+                // it — otherwise this (namespace, peer) pair stays `Running` forever and every
+                // later sync trigger for it is silently dropped.
+                self.state.abort_connect(&namespace, peer, reason);
+            }
+            res => {
+                self.on_sync_finished(
+                    namespace,
+                    peer,
+                    Origin::Connect(reason),
+                    res.map_err(Into::into),
+                )
+                .await
+            }
+        }
+    }
+
+    #[instrument("accept", skip_all, fields(peer = %fmt_accept_peer(&res), namespace = %fmt_accept_namespace(&res)))]
+    async fn on_sync_via_accept_finished(&mut self, res: Result<SyncFinished, AcceptError>) {
+        match res {
+            Ok(state) => {
+                self.on_sync_finished(state.namespace, state.peer, Origin::Accept, Ok(state))
+                    .await
+            }
+            Err(AcceptError::Abort { reason, .. }) if reason == AbortReason::AlreadySyncing => {
+                // In case we aborted the sync: do nothing (our outgoing sync is in progress)
+                debug!(?reason, "aborted by us");
+            }
+            Err(err) => {
+                if let (Some(peer), Some(namespace)) = (err.peer(), err.namespace()) {
+                    self.on_sync_finished(
+                        namespace,
+                        peer,
+                        Origin::Accept,
+                        Err(anyhow::Error::from(err)),
+                    )
+                    .await;
+                } else {
+                    debug!(?err, "failed before reading the first message");
+                }
+            }
+        }
+    }
+
+    async fn on_sync_finished(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        origin: Origin,
+        result: Result<SyncFinished>,
+    ) {
+        match &result {
+            Err(ref err) => {
+                warn!(?origin, ?err, "sync failed");
+            }
+            Ok(ref details) => {
+                info!(
+                    sent = %details.outcome.num_sent,
+                    recv = %details.outcome.num_recv,
+                    t_connect = ?details.timings.connect,
+                    t_process = ?details.timings.process,
+                    "sync finished",
+                );
+
+                // register the peer as useful for the document
+                if let Err(e) = self
+                    .sync
+                    .register_useful_peer(namespace, *peer.as_bytes())
+                    .await
+                {
+                    debug!(%e, "failed to register peer for document")
+                }
+
+                // Retry content that is still missing for this namespace: the peer we
+                // just synced with is a fresh provider candidate. Entries whose records
+                // arrive ahead of their content are parked in `missing_hashes` and are
+                // otherwise unparked only by a best-effort gossip `ContentReady`
+                // broadcast — if that one message is lost, the content would starve
+                // until an unrelated insert. `start_download` skips content that
+                // arrived in the meantime and dedupes in-flight downloads. Content
+                // already being downloaded gets the peer registered as a provider,
+                // and the download is retried once if it fails: the running attempt
+                // snapshotted its provider set before this peer joined it.
+                let queued: Vec<Hash> = self
+                    .queued_hashes
+                    .by_namespace
+                    .get(&namespace)
+                    .map(|hashes| hashes.iter().copied().collect())
+                    .unwrap_or_default();
+                let parked: Vec<Hash> = self
+                    .missing_hashes
+                    .iter()
+                    .filter(|(ns, _)| *ns == namespace)
+                    .map(|(_, hash)| *hash)
+                    .collect();
+                for hash in parked {
+                    debug!(peer=%peer.fmt_short(), %hash, "retrying parked content");
+                    self.start_download(namespace, hash, peer, true).await;
+                }
+                for hash in queued {
+                    debug!(peer=%peer.fmt_short(), %hash, "registering sync peer for queued content");
+                    self.retry_after_failure.insert((namespace, hash));
+                    self.start_download(namespace, hash, peer, true).await;
+                }
+
+                // broadcast a sync report to our neighbors, but only if we received new entries.
+                if details.outcome.num_recv > 0 {
+                    info!("broadcast sync report to neighbors");
+                    match details
+                        .outcome
+                        .heads_received
+                        .encode(Some(self.gossip.max_message_size()))
+                    {
+                        Err(err) => warn!(?err, "Failed to encode author heads for sync report"),
+                        Ok(heads) => {
+                            let report = SyncReport { namespace, heads };
+                            self.broadcast_neighbors(namespace, &Op::SyncReport(report))
+                                .await;
+                        }
+                    }
+                }
+            }
+        };
+
+        let result_for_event = match &result {
+            Ok(details) => Ok(details.into()),
+            Err(err) => Err(err.to_string()),
+        };
+
+        let Some((started, resync)) = self.state.finish(&namespace, peer, &origin, result) else {
+            return;
+        };
+
+        let ev = SyncEvent {
+            peer,
+            origin,
+            result: result_for_event,
+            finished: SystemTime::now(),
+            started,
+        };
+        self.subscribers
+            .send(&namespace, Event::SyncFinished(ev))
+            .await;
+
+        // Check if there are queued pending content hashes for this namespace.
+        // If hashes are pending, mark this namespace to be eglible for a PendingContentReady event once all
+        // pending hashes have completed downloading.
+        // If no hashes are pending, emit the PendingContentReady event right away. The next
+        // PendingContentReady event may then only be emitted after the next sync completes.
+        if self.queued_hashes.contains_namespace(&namespace) {
+            self.state.set_may_emit_ready(&namespace, true);
+        } else {
+            self.subscribers
+                .send(&namespace, Event::PendingContentReady)
+                .await;
+            self.state.set_may_emit_ready(&namespace, false);
+        }
+
+        if resync {
+            self.sync_with_peer(namespace, peer, SyncReason::Resync);
+        }
+    }
+
+    async fn broadcast_neighbors(&mut self, namespace: NamespaceId, op: &Op) {
+        if !self.state.is_syncing(&namespace) {
+            return;
+        }
+
+        let msg = match postcard::to_stdvec(op) {
+            Ok(msg) => msg,
+            Err(err) => {
+                error!(?err, ?op, "Failed to serialize message:");
+                return;
+            }
+        };
+        // TODO: We should debounce and merge these neighbor announcements likely.
+        self.gossip
+            .broadcast_neighbors(&namespace, msg.into())
+            .await;
+    }
+
+    /// Announce a locally inserted entry to neighbors as a content-free
+    /// [`SyncReport`] — its author head only, never the entry.
+    ///
+    /// The head is exactly the delta a neighbor needs to see it has news
+    /// ([`AuthorHeads::has_news_for`]) and pull the entry over a classified
+    /// reconciliation; the topic therefore carries digests, not keys, hashes,
+    /// or values. Mirrors the post-sync report path: one hop, cascaded by
+    /// each puller re-announcing to its own neighbors.
+    async fn broadcast_local_head(&mut self, namespace: NamespaceId, entry: &SignedEntry) {
+        let mut author_heads = AuthorHeads::default();
+        author_heads.insert(entry.author_bytes(), entry.timestamp());
+        let heads = match author_heads.encode(Some(self.gossip.max_message_size())) {
+            Ok(heads) => heads,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "Failed to encode author head for local-insert announce"
+                );
+                return;
+            }
+        };
+        let report = SyncReport { namespace, heads };
+        self.broadcast_neighbors(namespace, &Op::SyncReport(report))
+            .await;
+    }
+
+    async fn on_download_ready(
+        &mut self,
+        namespace: NamespaceId,
+        hash: Hash,
+        res: Result<(), anyhow::Error>,
+    ) {
+        let completed_namespaces = self.queued_hashes.remove_hash(&hash);
+        debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
+        if res.is_ok() {
+            self.retry_after_failure.retain(|(_, h)| *h != hash);
+            self.subscribers
+                .send(&namespace, Event::ContentReady { hash })
+                .await;
+            // Inform our neighbors that we have new content ready.
+            self.broadcast_neighbors(namespace, &Op::ContentReady(hash))
+                .await;
+        } else {
+            self.missing_hashes.insert((namespace, hash));
+            if self.retry_after_failure.remove(&(namespace, hash)) {
+                // A provider was registered while the failed download was already
+                // running with an older provider snapshot: retry once with the
+                // enriched set.
+                debug!(%hash, "retrying failed download with providers registered meanwhile");
+                self.queue_download(namespace, hash, true).await;
+            }
+        }
+        for namespace in completed_namespaces.iter() {
+            if let Some(true) = self.state.may_emit_ready(namespace) {
+                self.subscribers
+                    .send(namespace, Event::PendingContentReady)
+                    .await;
+            }
+        }
+    }
+
+    async fn on_neighbor_content_ready(
+        &mut self,
+        namespace: NamespaceId,
+        node: EndpointId,
+        hash: Hash,
+    ) {
+        self.start_download(namespace, hash, node, true).await;
+    }
+
+    #[instrument("on_sync_report", skip_all, fields(peer = %from.fmt_short(), namespace = %report.namespace.fmt_short()))]
+    async fn on_sync_report(&mut self, from: PublicKey, report: SyncReport) {
+        let namespace = report.namespace;
+        if !self.state.is_syncing(&namespace) {
+            return;
+        }
+        let heads = match AuthorHeads::decode(&report.heads) {
+            Ok(heads) => heads,
+            Err(err) => {
+                warn!(?err, "failed to decode AuthorHeads");
+                return;
+            }
+        };
+        match self.sync.has_news_for_us(report.namespace, heads).await {
+            Ok(Some(updated_authors)) => {
+                info!(%updated_authors, "news reported: sync now");
+                self.sync_with_peer(report.namespace, from, SyncReason::SyncReport);
+            }
+            Ok(None) => {
+                debug!("no news reported: nothing to do");
+            }
+            Err(err) => {
+                warn!("sync actor error: {err:?}");
+            }
+        }
+    }
+
+    async fn on_replica_event(&mut self, event: crate::Event) -> Result<()> {
+        match event {
+            crate::Event::LocalInsert { namespace, entry } => {
+                debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
+                // A new entry was inserted locally. Announce the new author
+                // head to neighbors — the entry itself never rides the topic
+                // (content-free swarm): a broadcast is relayed by every
+                // member and cannot be filtered per recipient, so gossip
+                // carries only "I have news" and the content flows over the
+                // reconciliation the announce triggers. The announce is one
+                // hop and cascades exactly like the post-sync report below:
+                // a neighbor that pulls the entry re-announces to its own
+                // neighbors, so a whole-topic broadcast (whose relays would
+                // forward the head without holding the content the pull
+                // then asks them for) is deliberately not used.
+                if self.state.is_syncing(&namespace) {
+                    self.broadcast_local_head(namespace, &entry).await;
+                }
+            }
+            crate::Event::RemoteInsert {
+                namespace,
+                entry,
+                from,
+                should_download,
+                remote_content_status,
+            } => {
+                debug!(namespace=%namespace.fmt_short(), "replica event: RemoteInsert");
+                // A new entry was inserted from initial sync or gossip. Queue downloading the
+                // content.
+                if should_download {
+                    let hash = entry.content_hash();
+                    if matches!(remote_content_status, ContentStatus::Complete) {
+                        let node_id = PublicKey::from_bytes(&from)?;
+                        self.start_download(namespace, hash, node_id, false).await;
+                    } else {
+                        self.missing_hashes.insert((namespace, hash));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn start_download(
+        &mut self,
+        namespace: NamespaceId,
+        hash: Hash,
+        node: PublicKey,
+        only_if_missing: bool,
+    ) {
+        self.hash_providers
+            .0
+            .lock()
+            .expect("poisoned")
+            .entry(hash)
+            .or_default()
+            .insert(node);
+        self.queue_download(namespace, hash, only_if_missing).await;
+    }
+
+    /// Queue a download for `hash` from the providers registered so far, unless the
+    /// content is already complete or a download is already running.
+    async fn queue_download(&mut self, namespace: NamespaceId, hash: Hash, only_if_missing: bool) {
+        let entry_status = self.bao_store.blobs().status(hash).await;
+        if matches!(entry_status, Ok(BlobStatus::Complete { .. })) {
+            self.missing_hashes.remove(&(namespace, hash));
+            return;
+        }
+        if self.queued_hashes.contains_hash(&hash) {
+            self.queued_hashes.insert(hash, namespace);
+        } else if !only_if_missing || self.missing_hashes.contains(&(namespace, hash)) {
+            let req = DownloadRequest::new(
+                HashAndFormat::raw(hash),
+                self.hash_providers.clone(),
+                SplitStrategy::None,
+            );
+            let handle = self.downloader.download_with_opts(req);
+
+            self.queued_hashes.insert(hash, namespace);
+            self.missing_hashes.remove(&(namespace, hash));
+            self.download_tasks.spawn(async move {
+                (
+                    namespace,
+                    hash,
+                    handle.await.map_err(|e| anyhow::anyhow!(e)),
+                )
+            });
+        }
+    }
+
+    #[instrument("accept", skip_all)]
+    pub async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) {
+        let to_actor_tx = self.sync_actor_tx.clone();
+        let session_access = self.session_access.clone();
+        let accept_request_cb = move |namespace, peer| {
+            let to_actor_tx = to_actor_tx.clone();
+            let session_access = session_access.clone();
+            async move {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                to_actor_tx
+                    .send(ToLiveActor::AcceptSyncRequest {
+                        namespace,
+                        peer,
+                        reply: reply_tx,
+                    })
+                    .await
+                    .ok();
+                let outcome = match reply_rx.await {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        warn!(
+                            "accept request callback failed to retrieve reply from actor: {err:?}"
+                        );
+                        AcceptOutcome::Reject(AbortReason::InternalServerError)
+                    }
+                };
+                // Consult the embedder's access provider only after the
+                // engine's own session state allowed the request; a denial
+                // is indistinguishable from the namespace not being hosted.
+                match (outcome, session_access) {
+                    (AcceptOutcome::Allow { .. }, Some(provider)) => {
+                        match provider(namespace, peer, crate::filter::SessionRole::Accept).await {
+                            crate::filter::SessionAccess::Full => {
+                                AcceptOutcome::Allow { filter: None }
+                            }
+                            crate::filter::SessionAccess::Filtered(filter) => {
+                                AcceptOutcome::Allow {
+                                    filter: Some(filter),
+                                }
+                            }
+                            crate::filter::SessionAccess::Deny => {
+                                AcceptOutcome::Reject(AbortReason::NotFound)
+                            }
+                        }
+                    }
+                    (outcome, _) => outcome,
+                }
+            }
+            .boxed()
+        };
+        debug!("incoming connection");
+        let sync = self.sync.clone();
+        let metrics = self.metrics.clone();
+        self.running_sync_accept.spawn(
+            async move { handle_connection(sync, conn, accept_request_cb, Some(&metrics)).await }
+                .instrument(Span::current()),
+        );
+    }
+
+    pub fn accept_sync_request(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+    ) -> AcceptOutcome {
+        self.state
+            .accept_request(&self.endpoint.id(), &namespace, peer)
+    }
+}
+
+/// Event emitted when a sync operation completes
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SyncEvent {
+    /// Peer we synced with
+    pub peer: PublicKey,
+    /// Origin of the sync exchange
+    pub origin: Origin,
+    /// Timestamp when the sync started
+    pub finished: SystemTime,
+    /// Timestamp when the sync finished
+    pub started: SystemTime,
+    /// Result of the sync operation
+    pub result: std::result::Result<SyncDetails, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SyncDetails {
+    /// Number of entries received
+    pub entries_received: usize,
+    /// Number of entries sent
+    pub entries_sent: usize,
+}
+
+impl From<&SyncFinished> for SyncDetails {
+    fn from(value: &SyncFinished) -> Self {
+        Self {
+            entries_received: value.outcome.num_recv,
+            entries_sent: value.outcome.num_sent,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SubscribersMap(HashMap<NamespaceId, Subscribers>);
+
+impl SubscribersMap {
+    fn subscribe(&mut self, namespace: NamespaceId, sender: async_channel::Sender<Event>) {
+        self.0.entry(namespace).or_default().subscribe(sender);
+    }
+
+    async fn send(&mut self, namespace: &NamespaceId, event: Event) -> bool {
+        debug!(namespace=%namespace.fmt_short(), %event, "emit event");
+        let Some(subscribers) = self.0.get_mut(namespace) else {
+            return false;
+        };
+
+        if !subscribers.send(event).await {
+            self.0.remove(namespace);
+        }
+        true
+    }
+
+    fn remove(&mut self, namespace: &NamespaceId) {
+        self.0.remove(namespace);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueuedHashes {
+    by_hash: HashMap<Hash, HashSet<NamespaceId>>,
+    by_namespace: HashMap<NamespaceId, HashSet<Hash>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderNodes(Arc<std::sync::Mutex<HashMap<Hash, HashSet<EndpointId>>>>);
+
+impl ContentDiscovery for ProviderNodes {
+    fn find_providers(&self, hash: HashAndFormat) -> n0_future::stream::Boxed<EndpointId> {
+        let nodes = self
+            .0
+            .lock()
+            .expect("poisoned")
+            .get(&hash.hash)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        Box::pin(n0_future::stream::iter(nodes))
+    }
+}
+
+impl QueuedHashes {
+    fn insert(&mut self, hash: Hash, namespace: NamespaceId) {
+        self.by_hash.entry(hash).or_default().insert(namespace);
+        self.by_namespace.entry(namespace).or_default().insert(hash);
+    }
+
+    /// Remove a hash from the set of queued hashes.
+    ///
+    /// Returns a list of namespaces that are now complete (have no queued hashes anymore).
+    fn remove_hash(&mut self, hash: &Hash) -> Vec<NamespaceId> {
+        let namespaces = self.by_hash.remove(hash).unwrap_or_default();
+        let mut removed_namespaces = vec![];
+        for namespace in namespaces {
+            if let Some(hashes) = self.by_namespace.get_mut(&namespace) {
+                hashes.remove(hash);
+                if hashes.is_empty() {
+                    self.by_namespace.remove(&namespace);
+                    removed_namespaces.push(namespace);
+                }
+            }
+        }
+        removed_namespaces
+    }
+
+    fn contains_hash(&self, hash: &Hash) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+
+    fn contains_namespace(&self, namespace: &NamespaceId) -> bool {
+        self.by_namespace.contains_key(namespace)
+    }
+}
+
+#[derive(Debug, Default)]
+struct Subscribers(Vec<async_channel::Sender<Event>>);
+
+impl Subscribers {
+    fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
+        self.0.push(sender)
+    }
+
+    async fn send(&mut self, event: Event) -> bool {
+        let futs = self.0.iter().map(|sender| sender.send(event.clone()));
+        let res = futures_buffered::join_all(futs).await;
+        // reverse the order so removing does not shift remaining indices
+        for (i, res) in res.into_iter().enumerate().rev() {
+            if res.is_err() {
+                self.0.remove(i);
+            }
+        }
+        !self.0.is_empty()
+    }
+}
+
+fn fmt_accept_peer(res: &Result<SyncFinished, AcceptError>) -> String {
+    match res {
+        Ok(res) => res.peer.fmt_short().to_string(),
+        Err(err) => err
+            .peer()
+            .map(|x| x.fmt_short().to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+fn fmt_accept_namespace(res: &Result<SyncFinished, AcceptError>) -> String {
+    match res {
+        Ok(res) => res.namespace.fmt_short(),
+        Err(err) => err
+            .namespace()
+            .map(|x| x.fmt_short())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_sync_remove() {
+        let pk = PublicKey::from_bytes(&[1; 32]).unwrap();
+        let (a_tx, a_rx) = async_channel::unbounded();
+        let (b_tx, b_rx) = async_channel::unbounded();
+        let mut subscribers = Subscribers::default();
+        subscribers.subscribe(a_tx);
+        subscribers.subscribe(b_tx);
+        drop(a_rx);
+        drop(b_rx);
+        subscribers.send(Event::NeighborUp(pk)).await;
+    }
+}

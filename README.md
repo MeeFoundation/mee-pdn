@@ -28,31 +28,13 @@ Clone it into the repository root — specs and code practices are referenced as
 git clone git@github.com:MeeFoundation/mia-docs.git
 ```
 
-### `pdn-store` setup
-
-`pdn-store` is our iroh-docs fork, pulled as a git dependency. Substantive changes almost always end up touching it, so you need the local checkout to patch the workspace against. Clone it into the repository root — `.gitignore` keeps it out of this repository, and the patch resolves it as `./pdn-store`:
-
-```sh
-# From the repository root
-git clone git@github.com:MeeFoundation/pdn-store.git
-```
-
-Builds work as-is; enable the `[patch]` block next to the `pdn-store` dependency in the workspace [`Cargo.toml`](Cargo.toml) only when you are changing `pdn-store` and debugging it alongside `pdn-node`.
-
-#### `upstream` remote (optional)
-
-Needed only to pull a new `iroh-docs` release into the fork — the repository the fork is taken from is not wired up by the clone above:
-
-```sh
-git -C pdn-store remote add upstream git@github.com:n0-computer/iroh-docs.git
-```
-
 ## Development
 
 - `just`: full list of recipes
 - `just build`: build all workspace crates
 - `just test`: run tests for all workspace crates
 - `just check`: format & lint check
+- `just check-store` / `just test-store`: the store's other feature sets, its docs, the wasm32 build, doctests
 - `just fix`: format & lint check + autofix, tests
 
 ## Crates
@@ -60,7 +42,8 @@ git -C pdn-store remote add upstream git@github.com:n0-computer/iroh-docs.git
 Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the wire). Both layers see only `pdn-types`; `pdn-node` is the embeddable runtime built over them.
 
 - `crates/pdn-types`: platform primitives (`PdnId`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, …) plus the data vocabulary (`NamespaceId`, `EntryPath`, `EntryInfo`, `NamespaceRole`)
-- `crates/data-layer`: the data layer over the forked iroh-docs (`pdn-store`) — the entries-only `DataLayer` trait, node/stack assembly, and the metadata stores
+- `crates/pdn-store`: our iroh-docs variant — the document sync engine, diverged from upstream where PDN's access model needs it; the package keeps the upstream name `iroh-docs`
+- `crates/data-layer`: the data layer over `pdn-store` — the entries-only `DataLayer` trait, node/stack assembly, and the metadata stores
 - `crates/pdn-layer`: the platform surface products consume — domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` capability-token module
 - `crates/pdn-node`: the embeddable runtime core — identity / connections / data / sync services, plus the pairing and device-linking ceremonies
 - `crates/pdn-node-http`: thin HTTP host for the demo stand — an axum binary embedding one runtime

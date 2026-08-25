@@ -6,7 +6,7 @@ argument-hint: "[language] [what to look at / intent of the change]"
 
 # Working-tree review
 
-Multi-agent review of everything uncommitted — staged, unstaged, and untracked — across the three repositories in the tree: the workspace root, the nested `pdn-store` checkout (our iroh-docs variant), and `mia-docs` (specs, ADRs, change artifacts). All three are separate git repositories and the last two are gitignored by the root one, so nothing but this command's own sweep brings their changes into view. The result is one file in `.code-review/`, arranged so findings can be fixed one at a time, top down.
+Multi-agent review of everything uncommitted — staged, unstaged, and untracked — across the two repositories in the tree: the workspace root (`crates/pdn-store`, our iroh-docs variant, included) and `mia-docs` (specs, ADRs, change artifacts). The two are separate git repositories and the second is gitignored by the first, so nothing but this command's own sweep brings its changes into view. The result is one file in `.code-review/`, arranged so findings can be fixed one at a time, top down.
 
 **Arguments to this command:** `$ARGUMENTS`
 
@@ -28,7 +28,7 @@ With no arguments: review everything uncommitted, in English, at the scale below
 
 Run everything from the repository root. No absolute paths — the command works in any checkout.
 
-1. `git status --short`, `git -C pdn-store status --short`, `git -C mia-docs status --short` — all three unless the arguments narrowed the scope. A clean repository is named as clean under "Not covered": "nothing changed there" and "nobody looked" must stay distinguishable.
+1. `git status --short`, `git -C mia-docs status --short` — both unless the arguments narrowed the scope. A clean repository is named as clean under "Not covered": "nothing changed there" and "nobody looked" must stay distinguishable.
 2. Per repository with changes: `git diff HEAD` (staged + unstaged). Untracked files never appear in a diff — read them in full and append them to the dump.
 3. Write the dumps to the scratchpad (`<scratchpad>/wip-diff-<repo>.patch`, untracked content beside). Agents read them from disk — a large diff passed through prompts eats the context before the work starts.
 4. Note the size (files, `+N/-M`) to size the fan-out by. It does not go into the final file.
@@ -330,7 +330,7 @@ The working tree is never touched. The order: `git -C <repo> diff HEAD > <scratc
 - **The review is written in the language resolved in §0**, English by default. Never translated, whatever the language: capability, connection metadata store / CMS, private metadata store / PMS, claim, lock, race, identity, audience, connection, binder, session, snapshot, ingress, egress. Identifiers, paths, and type names in backticks, exactly as in the code. A mechanism is called by the word the code gives it — `reclaim` for `reclaim_abandoned_sessions` — never by a metaphor coined for the finding; an operation the code does not name is described in plain words rather than given a new one.
 
 - **A paragraph is one physical line** — the documentation rule from [CLAUDE.md](../../../CLAUDE.md). Lists and headings take one line per item.
-- **Links are clickable and relative to `.code-review/`**: `[fs.rs:827](../pdn-store/src/store/fs.rs#L827)`, `[core.md](../mia-docs/openspec/specs/components/pdn-node/core.md)`.
+- **Links are clickable and relative to `.code-review/`**: `[fs.rs:827](../crates/pdn-store/src/store/fs.rs#L827)`, `[core.md](../mia-docs/openspec/specs/components/pdn-node/core.md)`.
 - **Numbers are digits with thousands separators** (`10,000,000 records`).
 - **No invented abbreviations or notation.** Invariants and ADRs by number; `Dn` only when it is said whose decisions those are.
 - **"Checked" means executed.** What was read with eyes is called read.

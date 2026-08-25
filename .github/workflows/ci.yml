@@ -49,6 +49,38 @@ jobs:
       - name: Run tests
         run: just test
 
+  # The store under its other feature sets and on the wasm32 target — the
+  # configurations the workspace build never compiles, so a break in them is
+  # invisible to the job above. Its own job, so its two extra builds of the
+  # iroh stack run beside the workspace's rather than after it.
+  store:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Install just + nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Lint the store's other feature sets, docs, and wasm build
+        run: just check-store
+
+      - name: Test the store's other feature sets and doctests
+        run: just test-store
+
   stand:
     runs-on: ubuntu-latest
     # A release image build plus the container suite. Past this the job is
