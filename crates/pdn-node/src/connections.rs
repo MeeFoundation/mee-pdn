@@ -960,6 +960,10 @@ async fn open_pair(
     // doc and an author).
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
+    // The addressing each ticket carries, kept before the tickets move into
+    // the imports: arming points the halves at it, and reading the two
+    // tickets again there would ask the directory for what this call holds.
+    let ticket_addressing = (own_ticket.nodes.clone(), peer_ticket.nodes.clone());
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
     let reuses_own = matches!(&cached, Some(pair) if pair.own.namespace() == own_namespace);
     let reuses_peer = matches!(&cached, Some(pair) if pair.peer.namespace() == peer_namespace);
@@ -981,7 +985,7 @@ async fn open_pair(
         own,
         peer: peer_store,
     };
-    if let Err(err) = arm_open_pair(state, identity, peer, &pair).await {
+    if let Err(err) = arm_open_pair(state, identity, peer, &pair, ticket_addressing).await {
         forget_imported(
             state,
             (!reuses_own).then_some(own_namespace),
@@ -1024,6 +1028,7 @@ async fn arm_open_pair(
     identity: PdnId,
     peer: PdnId,
     pair: &ConnectionMetadata,
+    ticket_addressing: (Vec<EndpointAddr>, Vec<EndpointAddr>),
 ) -> Result<()> {
     #[cfg(feature = "test-util")]
     if let Some(failures) = state.pair_arm_failures.as_mut() {
@@ -1036,7 +1041,7 @@ async fn arm_open_pair(
     state
         .node
         .host_connection(identity, peer, &pair.own, &pair.peer)?;
-    if let Err(err) = point_pair_at_its_devices(state, identity, peer, pair).await {
+    if let Err(err) = point_pair_at(state, identity, pair, ticket_addressing).await {
         tracing::warn!(%identity, %peer, "the pair kept its import-time contacts: {err:#}");
     }
     Ok(())
@@ -1077,6 +1082,20 @@ async fn point_pair_at_its_devices(
         .await?
         .map(|ticket| ticket.nodes)
         .unwrap_or_default();
+    point_pair_at(state, identity, pair, (own_nodes, peer_nodes)).await
+}
+
+/// [`point_pair_at_its_devices`] for a caller that already holds what the
+/// pair's two tickets address — the open that just read them. A ticket
+/// absent from the directory addresses nobody, which is the empty set this
+/// takes rather than an error.
+async fn point_pair_at(
+    state: &State,
+    identity: PdnId,
+    pair: &ConnectionMetadata,
+    (own_nodes, peer_nodes): (Vec<EndpointAddr>, Vec<EndpointAddr>),
+) -> Result<()> {
+    let directory = &state.hosted(identity)?.directory;
     let mut devices = directory.list_devices().await?;
     devices.extend(pair.peer.published_devices().await?);
 
