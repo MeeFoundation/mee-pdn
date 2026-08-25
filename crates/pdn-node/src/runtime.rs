@@ -183,16 +183,15 @@ pub(crate) struct State {
     pub(crate) link_before_commit_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
-    /// Fail every arming of a freshly opened metadata pair, and count the
-    /// failures. Sticky rather than one-shot: the connection armer retries
-    /// every sweep, and what a scenario asserts here is that repeated
-    /// attempts leave nothing open — one attempt cannot show that. The
-    /// count is the positive control: without it an assertion that nothing
-    /// accumulates is satisfied by a device that never attempted.
+    /// `Some(n)` fails every arming of a freshly opened metadata pair and
+    /// counts the failures; `None` leaves arming alone. Sticky rather than
+    /// one-shot: the connection armer retries every sweep, and what a
+    /// scenario asserts here is that repeated attempts leave nothing open —
+    /// one attempt cannot show that. The count is the positive control:
+    /// without it an assertion that nothing accumulates is satisfied by a
+    /// device that never attempted.
     #[cfg(feature = "test-util")]
-    pub(crate) fail_pair_arm: bool,
-    #[cfg(feature = "test-util")]
-    pub(crate) pair_arm_failures: usize,
+    pub(crate) pair_arm_failures: Option<usize>,
     /// How long a connection armer waits for its directory to change
     /// before sweeping anyway. Taken from the spawn's reconcile interval,
     /// so a runtime configured for a fast test cadence retries as fast as
@@ -310,10 +309,7 @@ impl Runtime {
     /// unreadable record stops the spawn with an error naming it, and an
     /// absent record is a first start.
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
-        let data_dir = match &options.storage {
-            StorageConfig::Directory(directory) => Some(directory.clone()),
-            StorageConfig::Memory => None,
-        };
+        let data_dir = data_dir_of(&options.storage);
         // Read before the options move into the node: the armers below
         // wait on it.
         let sweep_interval = options.reconcile_interval;
@@ -389,9 +385,7 @@ impl Runtime {
             #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
-            fail_pair_arm: false,
-            #[cfg(feature = "test-util")]
-            pair_arm_failures: 0,
+            pair_arm_failures: None,
             retraction_events,
             data_dir,
             sweep_interval,
@@ -463,7 +457,7 @@ impl Runtime {
     /// the `test-util` feature and absent from every product build.
     #[cfg(feature = "test-util")]
     pub async fn fail_pair_arm_for_test(&self) {
-        self.state.lock().await.fail_pair_arm = true;
+        self.state.lock().await.pair_arm_failures = Some(0);
     }
 
     /// How many pair arms have failed under
@@ -472,7 +466,7 @@ impl Runtime {
     /// accumulated" says nothing.
     #[cfg(feature = "test-util")]
     pub async fn pair_arm_failures_for_test(&self) -> usize {
-        self.state.lock().await.pair_arm_failures
+        self.state.lock().await.pair_arm_failures.unwrap_or(0)
     }
 
     #[cfg(feature = "test-util")]
@@ -599,4 +593,14 @@ async fn recover_hosted_identities(
         armers.push((line.identity, Box::new(changes)));
     }
     Ok((identities, armers))
+}
+
+/// Where a spawn keeps its durable state, or `None` on a memory node whose
+/// hosting ends with the process — the one thing the hosted-identities
+/// record needs and the only part of the storage choice that outlives it.
+fn data_dir_of(storage: &StorageConfig) -> Option<PathBuf> {
+    match storage {
+        StorageConfig::Directory(directory) => Some(directory.clone()),
+        StorageConfig::Memory => None,
+    }
 }

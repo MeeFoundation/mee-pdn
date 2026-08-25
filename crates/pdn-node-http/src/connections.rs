@@ -20,7 +20,7 @@ use crate::{
     error::HostError,
     parse,
     shapes::{
-        Connections, GrantCapability, GrantPublication, Lifetime, NoQuery, OwnGrants, PeerGrants,
+        Connections, GrantCapability, GrantPublication, Lifetime, NoQuery, OwnGrant, PeerGrants,
     },
 };
 
@@ -117,24 +117,22 @@ pub(crate) async fn read_grants(
     Ok(Json(PeerGrants { grants }))
 }
 
-/// `GET /debug/identities/{identity}/own-grants/{peer}` — the capabilities
+/// `GET /debug/identities/{identity}/own-grants/{peer}` — the capability
 /// this identity published toward that peer, as the answering device holds
-/// them, without their tickets.
+/// it, without its ticket.
 pub(crate) async fn read_own_grants(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
-) -> Result<Json<OwnGrants>, HostError> {
+) -> Result<Json<OwnGrant>, HostError> {
     let identity = parse::id(&identity, "identity")?;
     let peer = parse::id(&peer, "peer")?;
-    let grants = runtime
+    let grant = runtime
         .connections()
         .read_own_grants(identity, peer)
         .await?
-        .into_iter()
-        .map(GrantCapability::from)
-        .collect();
-    Ok(Json(OwnGrants { grants }))
+        .map(GrantCapability::from);
+    Ok(Json(OwnGrant { grant }))
 }
 
 /// `DELETE /debug/identities/{identity}/grants/{peer}/{issuer}` — withdraw

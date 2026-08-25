@@ -1171,8 +1171,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
                 .connections()
                 .read_own_grants(alice, bob)
                 .await?
-                .iter()
-                .any(|grant| grant.issuer == alice))
+                .is_some_and(|grant| grant.issuer == alice))
         })
         .await?,
         "the grant record never reached the device that must serve by it"

@@ -17,7 +17,7 @@
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, OwnGrants};
+use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, OwnGrant};
 
 mod common;
 use common::{body, claims_on, entry_reads, grant_on, own_grant_reads, Stand};
@@ -125,17 +125,17 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // record to become readable comes first, and only then does the
     // assertion say that no record names Bob as issuer.
     own_grant_reads(&inviter, alice, bob, alice).await?;
-    let after_foreign: OwnGrants = inviter
+    let after_foreign: OwnGrant = inviter
         .get(&format!("/debug/identities/{alice}/own-grants/{bob}"))
         .await?
         .json()?;
     assert!(
         after_foreign
-            .grants
-            .iter()
-            .all(|grant| grant.issuer == alice),
-        "the refused foreign-issuer grant left a record behind: {:?}",
-        after_foreign.grants
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.issuer == alice),
+        "the refused foreign-issuer grant displaced Alice's own: {:?}",
+        after_foreign.grant
     );
 
     // Denied (a grant naming no claim): every grant is claim-scoped, so an

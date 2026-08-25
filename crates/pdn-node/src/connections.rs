@@ -151,10 +151,14 @@ pub trait ConnectionsService {
     /// the pair's counterpart half — capability and ticket together.
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>>;
 
-    /// Read the grants hosted `identity` has published toward `peer`, over
+    /// Read the grant hosted `identity` has published toward `peer`, over
     /// the pair's own half — the capability alone: the caller issues the
     /// namespace the record addresses, so a ticket to it answers nothing.
-    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<ReadGrant>>;
+    /// One grant at most, and it is addressed rather than searched for:
+    /// this half is written by `identity`'s own devices, publishing refuses
+    /// every issuer but `identity` itself, and a claim set travels inside
+    /// one capability rather than as a record apiece.
+    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Option<ReadGrant>>;
 }
 
 /// The production [`ConnectionsService`], backed by the runtime's
@@ -359,7 +363,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         Ok(grants)
     }
 
-    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<ReadGrant>> {
+    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Option<ReadGrant>> {
         let pair = {
             let mut state = self.runtime.state.lock().await;
             state.hosted(identity)?;
@@ -369,17 +373,20 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         // replicated to this device yet. Both answer as the peer-side read
         // does, and neither says anything is ungranted.
         let Some(pair) = pair else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        let mut grants = Vec::new();
-        for issuer in pair.own.list_grants().await? {
-            // The ticket is the one minted for `peer` over this identity's
-            // own namespace: nothing the issuer does not already hold.
-            if let Some((grant, _ticket)) = pair.own.read_grant(issuer, peer).await?.granted() {
-                grants.push(grant);
-            }
-        }
-        Ok(grants)
+        // The one key this identity can have written, addressed the way the
+        // classifier addresses it — `grant_key(&issuer)` read exactly —
+        // rather than found by scanning the prefix and trusting a record's
+        // position for its issuer. The ticket is the one minted for `peer`
+        // over this identity's own namespace: nothing the issuer does not
+        // already hold.
+        Ok(pair
+            .own
+            .read_grant(identity, peer)
+            .await?
+            .granted()
+            .map(|(grant, _ticket)| grant))
     }
 }
 
@@ -1019,8 +1026,8 @@ async fn arm_open_pair(
     pair: &ConnectionMetadata,
 ) -> Result<()> {
     #[cfg(feature = "test-util")]
-    if state.fail_pair_arm {
-        state.pair_arm_failures += 1;
+    if let Some(failures) = state.pair_arm_failures.as_mut() {
+        *failures += 1;
         anyhow::bail!("arming the pair failed for test");
     }
     pair.own

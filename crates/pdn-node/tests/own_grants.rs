@@ -7,17 +7,25 @@
 //! (`code-practices/access-control-tests.md`), and for this operation the
 //! tightest party is a second identity hosted on the same runtime: it has
 //! a directory of its own, and the read resolves the pair through the
-//! acting identity's directory. The denial is probed in two degrees. A
-//! co-hosted identity with no pair toward that peer catches a lookup keyed
-//! on the peer instead of the directory: publishing opens and caches the
-//! pair, so such a lookup hands that identity the other's record. A
-//! co-hosted identity holding its own pair toward the same peer catches
-//! the narrower slip the first cannot — a lookup keyed on the peer among
-//! the identities that do hold one. Beside both stands the positive read,
-//! without which a denial whose expected answer is nothing is satisfied by
-//! an implementation that answers nothing to everyone. A party on another
-//! node is no control at all: nothing lets it address the pair, so no call
-//! can be made.
+//! acting identity's directory, then reads the one key that directory's
+//! owner can have written.
+//!
+//! Which assertion catches a pair resolved by the peer alone — the slip
+//! this arrangement exists for — is the second degree's *positive* read,
+//! not either denial, and the second read of the capability is why: handed
+//! another identity's pair, the read asks it for a grant of its own issuer
+//! and finds a capability naming someone else, which is a decided absence.
+//! So the wrong pair yields nothing rather than another identity's record,
+//! both denials stay satisfied, and what fails is X or Y no longer reading
+//! back what it published. That is the shape
+//! `access-control-tests.md` names: a denial whose expected answer is
+//! nothing is satisfied by an implementation that answers nothing to
+//! everyone, and the positive beside it is what discriminates.
+//!
+//! The denials keep their own subject: an identity with no pair toward that
+//! peer reads nothing, and two identities that both hold one never cross.
+//! A party on another node is no control at all: nothing lets it address
+//! the pair, so no call can be made.
 //!
 //! The read hands back the capability alone. No assertion here says the
 //! ticket is absent, because the read's type carries none — an absence has
@@ -58,19 +66,21 @@ async fn an_issuer_reads_what_it_published_and_a_co_hosted_identity_reads_none_o
         .publish_grant(x, p, x, claims.clone())
         .await?;
 
-    let own = a.connections().read_own_grants(x, p).await?;
-    assert_eq!(own.len(), 1, "one record per granted issuer: {own:?}");
-    let grant = own.first().expect("one grant");
+    let grant = a
+        .connections()
+        .read_own_grants(x, p)
+        .await?
+        .expect("the issuer reads back what it published");
     assert_eq!(grant.issuer, x);
     assert_eq!(grant.audience, p);
-    assert_eq!(grant.claims, claims);
+    assert_eq!(grant.claims, claims, "the whole set travels in one grant");
 
     // Denied, first degree: Y is hosted beside X and holds no pair toward
     // P, so its own directory answers nothing — while X's record, read on
     // the same runtime a line above, is what makes the emptiness a denial
     // rather than an operation that answers nothing to everyone.
     assert!(
-        a.connections().read_own_grants(y, p).await?.is_empty(),
+        a.connections().read_own_grants(y, p).await?.is_none(),
         "an identity with no connection to the peer must read no grant of another identity's"
     );
 
@@ -85,15 +95,21 @@ async fn an_issuer_reads_what_it_published_and_a_co_hosted_identity_reads_none_o
         .publish_grant(y, p, y, y_claims.clone())
         .await?;
 
-    let y_own = a.connections().read_own_grants(y, p).await?;
-    assert_eq!(y_own.len(), 1, "one record per granted issuer: {y_own:?}");
-    let y_grant = y_own.first().expect("one grant");
+    let y_grant = a
+        .connections()
+        .read_own_grants(y, p)
+        .await?
+        .expect("Y reads back what it published");
     assert_eq!(y_grant.issuer, y, "Y must read its own grant, never X's");
     assert_eq!(y_grant.claims, y_claims);
 
-    let x_own = a.connections().read_own_grants(x, p).await?;
-    assert_eq!(x_own.len(), 1, "one record per granted issuer: {x_own:?}");
-    assert_eq!(x_own.first().expect("one grant").claims, claims);
+    let x_grant = a
+        .connections()
+        .read_own_grants(x, p)
+        .await?
+        .expect("X still reads back what it published");
+    assert_eq!(x_grant.issuer, x, "X must read its own grant, never Y's");
+    assert_eq!(x_grant.claims, claims);
 
     // An identity this runtime neither created nor linked is refused, as
     // every other connections operation refuses it.
@@ -136,20 +152,26 @@ async fn a_republication_and_a_withdrawal_are_visible_to_the_issuer() -> Result<
         .publish_grant(x, p, x, republished.clone())
         .await?;
 
-    let own = a.connections().read_own_grants(x, p).await?;
-    assert_eq!(own.len(), 1, "a republication replaces, never accretes");
-    assert_eq!(own.first().expect("one grant").claims, republished);
+    let grant = a
+        .connections()
+        .read_own_grants(x, p)
+        .await?
+        .expect("the republished grant is readable to its issuer");
+    assert_eq!(
+        grant.claims, republished,
+        "a republication replaces the claim set, never adds to it"
+    );
 
     // Denied in the same place: the co-hosted identity reads nothing of
     // this while the republished set is readable to its issuer.
     assert!(
-        a.connections().read_own_grants(y, p).await?.is_empty(),
+        a.connections().read_own_grants(y, p).await?.is_none(),
         "an identity beside the issuer must read no grant of the issuer's"
     );
 
     a.connections().withdraw_grant(x, p, x).await?;
     assert!(
-        a.connections().read_own_grants(x, p).await?.is_empty(),
+        a.connections().read_own_grants(x, p).await?.is_none(),
         "a withdrawn grant must not be readable to the issuer that withdrew it"
     );
 
@@ -198,8 +220,7 @@ async fn a_sibling_device_reads_a_grant_it_did_not_publish() -> Result<()> {
                 .connections()
                 .read_own_grants(alice, bob)
                 .await?
-                .iter()
-                .any(|grant| {
+                .is_some_and(|grant| {
                     grant.issuer == alice && grant.audience == bob && grant.claims == claims
                 }))
         })
@@ -221,7 +242,7 @@ async fn a_sibling_device_reads_a_grant_it_did_not_publish() -> Result<()> {
                 .connections()
                 .read_own_grants(alice, bob)
                 .await?
-                .is_empty())
+                .is_none())
         })
         .await?,
         "the withdrawal made on the phone never emptied the sibling's read"
@@ -235,7 +256,7 @@ async fn a_sibling_device_reads_a_grant_it_did_not_publish() -> Result<()> {
             .connections()
             .read_own_grants(other, bob)
             .await?
-            .is_empty(),
+            .is_none(),
         "an identity beside the sibling's must read no grant of Alice's"
     );
 

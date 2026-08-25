@@ -32,7 +32,7 @@ use std::{
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath, OwnGrants};
+use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath, OwnGrant};
 use serde::de::DeserializeOwned;
 use testcontainers::{
     core::{logs::LogFrame, ContainerPort, ExecCommand, Mount, WaitFor},
@@ -866,11 +866,10 @@ pub async fn own_grant_reads(
 ) -> Result<()> {
     let route = format!("/debug/identities/{identity}/own-grants/{peer}");
     let found = eventually(CONVERGENCE_BUDGET, || async {
-        let grants: OwnGrants = host.get(&route).await?.json()?;
-        Ok(grants
-            .grants
-            .iter()
-            .any(|grant| grant.issuer == issuer)
+        let own: OwnGrant = host.get(&route).await?.json()?;
+        Ok(own
+            .grant
+            .is_some_and(|grant| grant.issuer == issuer)
             .then_some(()))
     })
     .await?;

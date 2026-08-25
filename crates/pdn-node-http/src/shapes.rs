@@ -167,17 +167,19 @@ pub struct PeerGrants {
     pub grants: Vec<GrantCapability>,
 }
 
-/// The grants a hosted identity published toward a peer, read on the device
+/// The grant a hosted identity published toward a peer, read on the device
 /// that answers — the capability alone, its ticket left behind for the
-/// reason [`PeerGrants`] states.
+/// reason [`PeerGrants`] states. One at most: the identity's own half of
+/// the pair holds one record, its whole claim set inside the capability.
 ///
 /// The answer is this device's. It says the record is readable here, never
-/// that it reached a sibling or the peer, and an empty answer covers a
-/// device with no connection toward the peer, a pair whose tickets have not
-/// replicated here, and nothing granted alike.
+/// that it reached a sibling or the peer, and an absent one covers a device
+/// with no connection toward the peer, a pair whose tickets have not
+/// replicated here, a record here whose payload cannot be read yet, and
+/// nothing granted alike.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OwnGrants {
-    pub grants: Vec<GrantCapability>,
+pub struct OwnGrant {
+    pub grant: Option<GrantCapability>,
 }
 
 /// Entry metadata under one issuer — no payload bytes.

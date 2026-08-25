@@ -121,8 +121,7 @@ async fn serving_ready(rt: &Runtime, identity: PdnId, peer: PdnId, issuer: PdnId
             .connections()
             .read_own_grants(identity, peer)
             .await?
-            .iter()
-            .any(|grant| grant.issuer == issuer))
+            .is_some_and(|grant| grant.issuer == issuer))
     })
     .await
 }

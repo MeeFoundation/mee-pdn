@@ -740,8 +740,7 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
                 .connections()
                 .read_own_grants(issuer, audience)
                 .await?
-                .iter()
-                .any(|grant| grant.issuer == issuer))
+                .is_some_and(|grant| grant.issuer == issuer))
         })
         .await?,
         "the grant record never reached the device that has to serve by it"
