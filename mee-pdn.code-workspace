@@ -12,10 +12,6 @@
       "name": "mia-docs",
       "path": "mia-docs",
     },
-    {
-      "name": "pdn-store",
-      "path": "pdn-store",
-    },
   ],
   "settings": {
     "files.exclude": {

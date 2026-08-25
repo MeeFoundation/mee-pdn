@@ -1,5 +1,6 @@
 # The flaky hunt, run without anyone deciding to look: one job per suite —
-# the container stand's, and the in-process scenarios'.
+# the container stand's, the in-process scenarios', and the store's tests
+# marked flaky.
 #
 # Both cost seconds per test and pass on any given run; the failures worth
 # finding here show up once in tens or hundreds of them, which no pull
@@ -22,6 +23,9 @@ on:
       scenario_iterations:
         description: "How many times to repeat the in-process scenarios"
         default: "15"
+      store_iterations:
+        description: "How many times to repeat the store's tests marked flaky"
+        default: "10"
 
 jobs:
   # The container suite: every test of the HTTP surface is a container test,
@@ -97,3 +101,31 @@ jobs:
       # stand's container binaries skipped as they are everywhere else.
       - name: Hunt the in-process scenarios
         run: just stress --stress-count "${{ github.event.inputs.scenario_iterations || '15' }}" --no-fail-fast
+
+  # The store's tests marked `#[ignore = "flaky"]`: skipped by every ordinary
+  # run for the reason the attribute gives, and run here, where a failure is
+  # what is being looked for rather than a red pull request. `-p` names the
+  # package by its own name, `iroh-docs`, and narrows the recipe's selection
+  # to it; `ignored-only` then keeps just the marked tests.
+  store-flaky:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just + nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,nextest
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Hunt the store's tests marked flaky
+        run: just stress -p iroh-docs --run-ignored ignored-only --stress-count "${{ github.event.inputs.store_iterations || '10' }}" --no-fail-fast

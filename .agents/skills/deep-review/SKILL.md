@@ -1,11 +1,11 @@
 ---
 name: deep-review
-description: Run a rigorous multi-agent review of staged, unstaged, and untracked changes across the root repository, `pdn-store`, and `mia-docs`, then write one prioritized report under `.code-review/`. Use when the user asks for a deep review, independent review angles, adversarial verification, or a comprehensive working-tree assessment.
+description: Run a rigorous multi-agent review of staged, unstaged, and untracked changes across the root repository and `mia-docs`, then write one prioritized report under `.code-review/`. Use when the user asks for a deep review, independent review angles, adversarial verification, or a comprehensive working-tree assessment.
 ---
 
 # Deep working-tree review
 
-Multi-agent review of everything uncommitted — staged, unstaged, and untracked — across the three repositories in the tree: the workspace root, the nested `pdn-store` checkout (our iroh-docs variant), and `mia-docs` (specs, ADRs, change artifacts). All three are separate git repositories and the last two are gitignored by the root one, so nothing but this skill's own sweep brings their changes into view. The result is one file in `.code-review/`, arranged so findings can be fixed one at a time, top down.
+Multi-agent review of everything uncommitted — staged, unstaged, and untracked — across the two repositories in the tree: the workspace root (`crates/pdn-store`, our iroh-docs variant, included) and `mia-docs` (specs, ADRs, change artifacts). The two are separate git repositories and the second is gitignored by the first, so nothing but this skill's own sweep brings its changes into view. The result is one file in `.code-review/`, arranged so findings can be fixed one at a time, top down.
 
 This skill requires and authorizes subagents: `spawn_agent` for every search angle and every verification vote, `wait_agent` for the mailbox, `list_agents` for the live set, `interrupt_agent` to stop the fan-out at the deadline. The scale is the point — what the agent count buys is depth of findings.
 
@@ -26,7 +26,7 @@ With no request text: review everything uncommitted, in English, at the scale be
 
 Run everything from the repository root. No absolute paths — the skill works in any checkout.
 
-1. `git status --short`, `git -C pdn-store status --short`, `git -C mia-docs status --short` — all three unless the request narrowed the scope. **A clean repository is named as clean under "Not covered"**: "nothing changed there" and "nobody looked" must stay distinguishable.
+1. `git status --short`, `git -C mia-docs status --short` — both unless the request narrowed the scope. **A clean repository is named as clean under "Not covered"**: "nothing changed there" and "nobody looked" must stay distinguishable.
 2. Per repository with changes: `git diff HEAD` (staged and unstaged together). Untracked files never appear in a diff — read them in full and append them to the dump. Exclude orchestration artifacts rather than treating them as product changes: `.claude/worktrees/`, the current scratch directory, and mutation worktrees created by §5. If another generated directory appears, exclude it only when repository rules identify it as generated; record the exclusion under "Not covered".
 3. Write the dumps to a scratch directory outside the tracked sources (`<scratch>/wip-diff-<repo>.patch`, untracked content beside), and create `<scratch>/verdicts/`. Agents read the dumps from disk — a large diff passed through prompts eats their context before the work starts.
 4. Note the size (files, `+N/-M`) to size the fan-out by. It does not go into the final file.

@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/pdn-types",     # platform primitives + the data vocabulary
+  "crates/pdn-store",     # our iroh-docs variant: document sync with capability-gated ingest
   "crates/data-layer",    # document sync over our iroh-docs variant
   "crates/pdn-layer",     # platform surface: domain model + PdnOp AST + uwill tokens
   "crates/pdn-node",      # embeddable node runtime: service glue over data-layer
@@ -10,7 +11,6 @@ members = [
 exclude = [
   # Nested checkouts carrying their own manifests — without this, cargo run from
   # inside them walks up, finds this workspace, and refuses to build.
-  "pdn-store",
   "mee-v1",
   "mee-v3-single-device",
 ]
@@ -22,13 +22,10 @@ iroh = "1.0.2"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 tracing = "0.1"
-# `pdn-store` is our iroh-docs variant (capability-gated ingest); the
-# package inside the repo keeps the upstream name `iroh-docs` (cheap
-# rebases), we alias it via `package`. To develop against a local
-# checkout, patch it in temporarily (patches address the real package name):
-#   [patch."https://github.com/MeeFoundation/pdn-store.git"]
-#   iroh-docs = { path = "./pdn-store" }
-pdn-store = { git = "https://github.com/MeeFoundation/pdn-store.git", package = "iroh-docs" }
+# `pdn-store` is our iroh-docs variant (capability-gated ingest). The package
+# keeps the upstream name `iroh-docs`, so a patch taken from upstream applies
+# without renaming; consumers name it `pdn-store` through this alias.
+pdn-store = { path = "crates/pdn-store", package = "iroh-docs" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

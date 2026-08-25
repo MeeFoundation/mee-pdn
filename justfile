@@ -45,13 +45,33 @@ setup-tooling:
   cargo install cargo-nextest --locked
   rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
-# Run workspace tests via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs). This workspace has no doctests, so nextest covers everything.
+# Run workspace tests via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs). Nextest runs no doctests and the store's README is one, so a run with no selection ends with the workspace doctests; a `-p` or `-E` selection is nextest's alone and skips them.
 test *args:
   #!/bin/sh
   set -eu
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
   export PDN_BIND_ADDR=127.0.0.1
   cargo nextest run $(just _features "$@") "$@"
+  # Doctests are outside nextest's reach, and a selection cannot name them.
+  case " $* " in
+    *" -E "*|*" --filter-expr "*|*" -p "*|*" --package "*|*" --package="*) ;;
+    *) cargo test --workspace --doc {{ test_features }} ;;
+  esac
+
+# The store's other feature sets, beyond the default one the workspace
+# builds: `--all-features` and `--no-default-features` compile different
+# code — `fs-store` gates the file-backed store, `rpc` the network API — and
+# the wasm build in `check-store` is the one consumer of the featureless one.
+# `-p` names the package by its own name, `iroh-docs`: cargo selects packages
+# before any workspace alias applies. Extra args are forwarded to nextest.
+[doc("Test the store under its other feature sets, doctests included")]
+test-store *args:
+  #!/bin/sh
+  set -eu
+  command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
+  cargo nextest run -p iroh-docs --all-features "$@"
+  cargo nextest run -p iroh-docs --no-default-features "$@"
+  cargo test -p iroh-docs --all-features --doc
 
 # Test in release mode via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs)
 test-release *args:
@@ -64,8 +84,7 @@ test-release *args:
 # The image the stand runs. The scenarios look for exactly this tag.
 image := "pdn-node-http:dev"
 
-# Build the stand's image from the workspace as it resolves — a store fork
-# pointed at the checkout beside it included.
+# Build the stand's image from the workspace.
 [doc("Build the stand's node image")]
 build-image:
   #!/bin/sh
@@ -404,25 +423,45 @@ check-fix:
   cargo clippy --workspace --all-targets {{ test_features }}
   cargo check --workspace --all-targets {{ test_features }}
 
+# The store's other feature sets, its docs, and its wasm build, which
+# `check` never compiles: clippy with warnings denied on `--all-features`
+# and `--no-default-features`, rustdoc with warnings denied (an intra-doc
+# link to a private item is one), and the featureless build for
+# `wasm32-unknown-unknown`, where `getrandom` needs its backend named.
+[doc("Lint the store under its other feature sets, its docs, and the wasm32 build")]
+check-store:
+  #!/bin/sh
+  set -eu
+  cargo clippy -p iroh-docs --all-features --all-targets -- -Dwarnings
+  cargo clippy -p iroh-docs --no-default-features --lib --bins --tests -- -Dwarnings
+  RUSTDOCFLAGS=-Dwarnings cargo doc -p iroh-docs --all-features --no-deps
+  RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build -p iroh-docs --target wasm32-unknown-unknown --no-default-features
+
 # Includes the container suite, as `fix` does: every test of the HTTP surface
-# is one. Needs a container daemon, and builds the image.
-[doc("Lint, build, test, container suite (needs docker)")]
+# is one. Needs a container daemon, and builds the image. The store's other
+# feature sets and its wasm build run here as the pipeline runs them.
+[doc("Lint, build, test, store matrix, container suite (needs docker)")]
 precommit-check:
   #!/bin/sh
   set -eux
   just check
+  just check-store
   just test
+  just test-store
   just test-docker
 
 # Includes the container suite: every test of the HTTP surface is one, so a
 # pass without it says nothing about that crate. Needs a container daemon,
-# and builds the image.
-[doc("Lint, build, test, container suite, attempt fixes (needs docker)")]
+# and builds the image. The store's other feature sets and its wasm build
+# run here as the pipeline runs them.
+[doc("Lint, build, test, store matrix, container suite, attempt fixes (needs docker)")]
 fix:
   #!/bin/sh
   set -eux
   just check-fix
+  just check-store
   just test
+  just test-store
   just test-docker
 
 pr-review branch:
