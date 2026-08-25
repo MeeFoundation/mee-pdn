@@ -24,7 +24,8 @@ use pdn_node_http::shapes::{
 
 mod common;
 use common::{
-    body, claims_on, entry_answers, entry_reads, eventually, grant_on, Stand, CONVERGENCE_BUDGET,
+    body, claims_on, entry_answers, entry_reads, eventually, grant_on, own_grant_reads, Stand,
+    CONVERGENCE_BUDGET,
 };
 
 /// The whole stand scenario with its paired denials: two identities meet,
@@ -339,12 +340,14 @@ async fn a_device_joins_across_containers() -> Result<()> {
 /// which is a change of its own. Three: the sibling holds no grant record
 /// when the publisher stops, so it refuses the audience fail-closed.
 ///
-/// The waits before the stop cover what this surface can see: the audience
-/// reads the entry, and so does the sibling, which says replication between
-/// the issuer's two devices has run. The audience's contact set and the
-/// sibling's grant record are not visible from here; `pdn-node`'s
-/// `reachability.rs` waits on both, where a scenario reaches every runtime
-/// it arranged.
+/// The waits before the stop rule the third out and leave the other two:
+/// the audience reads the entry, the sibling reads it too — replication
+/// between the issuer's two devices has run — and the sibling reads back
+/// the grant record it serves by, which it cannot do before it opens the
+/// connection's metadata pair and publishes its own device record there.
+/// The audience's contact set stays invisible from here; `pdn-node`'s
+/// `reachability.rs` waits on that as well, where a scenario reaches every
+/// runtime it arranged.
 ///
 /// The denial beside it: the failover must not widen access. A node that
 /// never connected to the issuer is still refused afterwards, so "the peer
@@ -423,6 +426,15 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     )
     .await
     .context("the sibling never caught up on the granted claim before the stop")?;
+
+    // And it holds the grant record itself — the second precondition, and
+    // the one the claim above does not imply: the claim rides the identity's
+    // data namespace, the record rides the connection's metadata pair, and a
+    // device that never opened that pair reads the claim while refusing the
+    // audience fail-closed.
+    own_grant_reads(&sibling, alice, bob, alice)
+        .await
+        .context("the sibling never held the grant record before the stop")?;
 
     // The device that published the grant goes away — and is gone: a device
     // still running would leave the convergence below provable by the very

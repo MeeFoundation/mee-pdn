@@ -19,7 +19,9 @@ use pdn_node::{ConnectionsService as _, InvitePayload, NonEmpty, Runtime};
 use crate::{
     error::HostError,
     parse,
-    shapes::{Connections, GrantPublication, Lifetime, NoQuery, PeerGrants},
+    shapes::{
+        Connections, GrantCapability, GrantPublication, Lifetime, NoQuery, OwnGrant, PeerGrants,
+    },
 };
 
 /// `POST /debug/identities/{identity}/invite` — mint the payload a
@@ -113,6 +115,24 @@ pub(crate) async fn read_grants(
         .map(|peer_grant| peer_grant.grant.into())
         .collect();
     Ok(Json(PeerGrants { grants }))
+}
+
+/// `GET /debug/identities/{identity}/own-grants/{peer}` — the capability
+/// this identity published toward that peer, as the answering device holds
+/// it, without its ticket.
+pub(crate) async fn read_own_grants(
+    State(runtime): State<Arc<Runtime>>,
+    Path((identity, peer)): Path<(String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
+) -> Result<Json<OwnGrant>, HostError> {
+    let identity = parse::id(&identity, "identity")?;
+    let peer = parse::id(&peer, "peer")?;
+    let grant = runtime
+        .connections()
+        .read_own_grants(identity, peer)
+        .await?
+        .map(GrantCapability::from);
+    Ok(Json(OwnGrant { grant }))
 }
 
 /// `DELETE /debug/identities/{identity}/grants/{peer}/{issuer}` — withdraw

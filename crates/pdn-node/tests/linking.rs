@@ -1073,26 +1073,31 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 /// Hosting an identity arms its connections by replication, not by
 /// grant-surface use. The connection and the grant are both made on the
 /// phone *after* the laptop linked, so everything the laptop knows of them
-/// arrived through the directory; the laptop never touches the grant
-/// surface, yet serves the granted counterparty. Bob is arranged through
-/// his recorded grant alone — the binder imports it — and the serving
-/// device is isolated the way `sibling_serving` isolates its own: the
-/// phone goes offline and the probed update exists on the laptop alone.
-/// Paired, per `code-practices/access-control-tests.md`, with the
-/// tightest unauthorized party: a holder of the replica's ticket with no
-/// grant gets nothing from the same device — Carol's laptop-minted ticket
-/// is the admitted instrument there, since the control needs addressing
-/// to the serving device and no grant exists toward her to carry it.
+/// arrived through the directory; the laptop publishes and withdraws
+/// nothing, yet serves the granted counterparty. That subject rests on the
+/// order of the two waits below, not on the absence of a grant-surface
+/// call: `read_own_grants` opens a pair itself, so the `pair_contacts` wait
+/// ahead of it — which opens nothing — is what proves the armer got there
+/// first. Bob is arranged through his recorded grant alone — the binder
+/// imports it — and the serving device is isolated the way `sibling_serving`
+/// isolates its own: the phone goes offline and the probed update exists on
+/// the laptop alone. Paired, per `code-practices/access-control-tests.md`,
+/// with the tightest unauthorized party: a holder of the replica's ticket
+/// with no grant gets nothing from the same device — Carol's laptop-minted
+/// ticket is the admitted instrument there, since the control needs
+/// addressing to the serving device and no grant exists toward her to carry
+/// it.
 ///
-/// The scenario requires `test-util` as a whole, not only for the wait
-/// below. Its premise — the surviving device holds the grant record it
-/// will serve by — is closed by that wait alone, and the phone is shut
-/// down either way; without the feature the arrangement is the one the
-/// stress pass measured at about 2% flaky, so the scenario runs where its
-/// premise can be pinned and nowhere else. The `just` recipes enable the
-/// feature.
+/// The scenario requires `test-util` as a whole, not only for the
+/// `pair_contacts` wait below. Its premise — the surviving device holds the
+/// grant record it will serve by — is closed by the two waits together, and
+/// the phone is shut down either way; without the feature the arrangement
+/// is the one the stress pass measured at about 2% flaky, so the scenario
+/// runs where its premise can be pinned and nowhere else. The `just`
+/// recipes enable the feature.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario: the open pair, the record, the service, the denial
 async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() -> Result<()> {
     let rt_phone = memory_runtime().await?;
     let rt_laptop = memory_runtime().await?;
@@ -1144,14 +1149,29 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         .await?,
         "the granted claim never reached Bob while the phone was up"
     );
-    // The record the laptop will serve by has reached it — the grant rides
-    // best-effort replication, and killing the publisher races it.
+    // The armer opened the pair from the replicated directory, observed
+    // before anything on the grant surface is called here — the read below
+    // opens a pair that is not open yet, which would arrange what this
+    // scenario claims of the laptop. `pair_contacts` is the admitted
+    // instrument: an open pair has no product answer, and this one reads
+    // the cache without opening anything.
     assert!(
         eventually(|| async {
-            rt_laptop
+            let (own, _peer) = rt_laptop.connections().pair_contacts(alice, bob).await?;
+            Ok(!own.is_empty())
+        })
+        .await?,
+        "the pair never opened on the linked device"
+    );
+    // And the record the laptop will serve by has reached it — the grant
+    // rides best-effort replication, and killing the publisher races it.
+    assert!(
+        eventually(|| async {
+            Ok(rt_laptop
                 .connections()
-                .grant_visible(alice, bob, alice)
-                .await
+                .read_own_grants(alice, bob)
+                .await?
+                .is_some_and(|grant| grant.issuer == alice))
         })
         .await?,
         "the grant record never reached the device that must serve by it"
@@ -1171,8 +1191,9 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     rt_carol.data().import(alice, carol_ticket).await?;
 
     // The laptop serves Bob under the grant published on the phone — no
-    // grant-surface call ever ran on the laptop; its armer opened the pair
-    // from the replicated directory, and Bob's route to it is the
+    // grant was published or withdrawn here, and the pair was open before
+    // this device's own grants were read, so what serves is the armer's
+    // work on the replicated directory. Bob's route to it is the
     // published device set. Carol's poll rides along inside the same wait,
     // so her sync attempts against the same target accumulate exactly
     // while Bob's do.

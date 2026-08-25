@@ -17,10 +17,10 @@
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::PdnId;
-use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, PeerGrants};
+use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, OwnGrant};
 
 mod common;
-use common::{body, claims_on, entry_reads, grant_on, Stand};
+use common::{body, claims_on, entry_reads, grant_on, own_grant_reads, Stand};
 
 /// An identity no runtime in this test creates or links.
 const UNHOSTED: PdnId = PdnId::from_bytes([0x77; 32]);
@@ -104,11 +104,6 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         foreign.status,
         foreign.text()
     );
-    let after_foreign: PeerGrants = inviter
-        .get(&format!("/debug/identities/{alice}/grants/{bob}"))
-        .await?
-        .json()?;
-    assert!(after_foreign.grants.is_empty());
     let mut allowed_claims = claims_on("contact/email", false);
     allowed_claims.extend(claims_on("contact/sentinel", false));
     inviter
@@ -122,6 +117,26 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         )
         .await?
         .ok()?;
+    // What the refusal left behind, read from the half the refused
+    // publication writes — Alice's own. Bob's half answers nothing here
+    // whatever the refusal did, since Bob publishes nothing in this
+    // scenario. The accepted publication above is what makes the absence a
+    // denial: an unopened pair reads empty too, so the wait for Alice's own
+    // record to become readable comes first, and only then does the
+    // assertion say that no record names Bob as issuer.
+    own_grant_reads(&inviter, alice, bob, alice).await?;
+    let after_foreign: OwnGrant = inviter
+        .get(&format!("/debug/identities/{alice}/own-grants/{bob}"))
+        .await?
+        .json()?;
+    assert!(
+        after_foreign
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.issuer == alice),
+        "the refused foreign-issuer grant displaced Alice's own: {:?}",
+        after_foreign.grant
+    );
 
     // Denied (a grant naming no claim): every grant is claim-scoped, so an
     // empty claim set is a malformed request rather than a refusal.

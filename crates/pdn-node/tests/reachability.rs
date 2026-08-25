@@ -107,12 +107,23 @@ async fn withdraw_device_toward(
 }
 
 /// Poll until the grant record of `issuer`'s data toward `peer` is live
-/// and readable on `rt` — the record its classifier serves by. The
-/// scenarios wait on this before shutting the publishing device down: the
-/// record rides best-effort replication, and a publisher killed before it
-/// crossed leaves the surviving device refusing the audience fail-closed.
+/// and readable on `rt` — the record its classifier serves by, read the
+/// way a product reads it. The scenarios wait on this before shutting the
+/// publishing device down: the record rides best-effort replication, and a
+/// publisher killed before it crossed leaves the surviving device refusing
+/// the audience fail-closed. Nothing is readable before the pair opens, so
+/// this waits for the open pair as well — the connection record alone
+/// leaves the pair's tickets payload-waiting on a device that never opened
+/// it.
 async fn serving_ready(rt: &Runtime, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<bool> {
-    eventually(|| async { rt.connections().grant_visible(identity, peer, issuer).await }).await
+    eventually(|| async {
+        Ok(rt
+            .connections()
+            .read_own_grants(identity, peer)
+            .await?
+            .is_some_and(|grant| grant.issuer == issuer))
+    })
+    .await
 }
 
 /// The core reachability property: the grant is published from the phone,
@@ -337,6 +348,27 @@ async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<
     assert!(
         !own.contains(&stranger_id) && !peer.contains(&stranger_id),
         "a node that holds neither half must not be a contact of either"
+    );
+
+    // Denied, tighter than the stranger: the device that minted a half is
+    // not a contact of it either. The ticket it minted names itself, and a
+    // set that kept that entry has the node dialing itself once per
+    // reconcile — refused by the endpoint, and never the contact the
+    // derivation exists to add. Read on bob, the side whose own half its own
+    // ticket names; the positive beside it keeps the denial from holding on
+    // a set that is merely empty.
+    assert!(
+        eventually(|| async {
+            let (own, _peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
+            Ok(own.contains(&phone_id))
+        })
+        .await?,
+        "bob's own half never named the issuer device that holds it"
+    );
+    let (bob_own, bob_peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
+    assert!(
+        !bob_own.contains(&bob_id) && !bob_peer.contains(&bob_id),
+        "the device that minted a half must not be a contact of it"
     );
 
     rt_phone.shutdown().await?;

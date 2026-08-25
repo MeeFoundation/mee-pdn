@@ -77,13 +77,30 @@ pub struct PeerGrant {
 /// recording is offered.
 ///
 /// Grants ride the connection's metadata pair: publishing writes into the
-/// identity's own store toward the peer, reading opens the counterpart's
-/// store — from the directory's tickets on demand, so linked devices reach
-/// pairs established elsewhere. Reading hands back the ticket a grant
-/// carries; acting on it is the grant binder's job, not the caller's. One
-/// grant record exists per granted issuer — every grant is scoped by an
-/// exact claim set — so a republication replaces the previous record and a
-/// withdrawal is one act.
+/// identity's own store toward the peer, and both halves are readable —
+/// the counterpart's for what the peer granted, the identity's own for
+/// what it granted itself. Either read opens the pair from the directory's
+/// tickets on demand, so linked devices reach pairs established elsewhere.
+/// Reading a peer's grant hands back the ticket it carries; acting on it
+/// is the grant binder's job, not the caller's. Reading the identity's own
+/// hands back the capability alone. One grant record exists per granted
+/// issuer — every grant is scoped by an exact claim set — so a
+/// republication replaces the previous record and a withdrawal is one act.
+///
+/// Both reads report what is readable at the moment of the call and never
+/// wait: a record whose payload has not arrived reads as no grant. Both
+/// answer for the device they run on — on the device that published a
+/// grant the answer says the record is here, never that it reached a
+/// sibling or the peer, and neither says what the peer received. An empty
+/// answer covers four states: no connection toward that peer, a pair whose
+/// tickets have not replicated here yet, a record here whose payload
+/// cannot be read yet, and nothing granted. It is never evidence that
+/// nothing is shared.
+///
+/// Neither read is free of writes: opening a pair publishes this device's
+/// record into it and registers the connection for session classification,
+/// the same acts the connection armer performs on its sweep. "Reports what
+/// is readable now" means the call does not wait and changes no grant.
 #[allow(async_fn_in_trait)]
 pub trait ConnectionsService {
     /// Mint an invite for hosted `identity`: a one-time secret pending on
@@ -130,11 +147,18 @@ pub trait ConnectionsService {
         claims: NonEmpty<GrantedClaim>,
     ) -> Result<()>;
 
-    /// Read the grants `peer` has published toward hosted `identity` —
-    /// capability and ticket together, with the same
-    /// payload-waiting and poll-friendly contract as
-    /// [`read_grants`](Self::read_grants).
+    /// Read the grants `peer` has published toward hosted `identity`, over
+    /// the pair's counterpart half — capability and ticket together.
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>>;
+
+    /// Read the grant hosted `identity` has published toward `peer`, over
+    /// the pair's own half — the capability alone: the caller issues the
+    /// namespace the record addresses, so a ticket to it answers nothing.
+    /// One grant at most, and it is addressed rather than searched for:
+    /// this half is written by `identity`'s own devices, publishing refuses
+    /// every issuer but `identity` itself, and a claim set travels inside
+    /// one capability rather than as a record apiece.
+    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Option<ReadGrant>>;
 }
 
 /// The production [`ConnectionsService`], backed by the runtime's
@@ -147,23 +171,6 @@ pub struct RuntimeConnectionsService<'rt> {
 impl<'rt> RuntimeConnectionsService<'rt> {
     pub(crate) fn new(runtime: &'rt Runtime) -> Self {
         Self { runtime }
-    }
-
-    /// Whether this runtime's own metadata store toward `peer` holds a
-    /// live, readable grant of `issuer`'s data — the record the serving
-    /// classifier reads. Observation only, for scenarios that shut the
-    /// publishing device down and must first know the record reached the
-    /// device that will serve: the record rides best-effort replication,
-    /// so killing the publisher races it. Behind the `test-util` feature
-    /// and absent from every product build.
-    #[cfg(feature = "test-util")]
-    pub async fn grant_visible(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<bool> {
-        let mut state = self.runtime.state.lock().await;
-        state.hosted(identity)?;
-        let Some(pair) = open_pair(&mut state, identity, peer).await? else {
-            return Ok(false);
-        };
-        Ok(pair.own.read_grant(issuer, peer).await?.granted().is_some())
     }
 
     /// The devices among the reconciliation contacts of the pair's two
@@ -338,8 +345,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
     }
 
     async fn read_grants(&self, identity: PdnId, peer: PdnId) -> Result<Vec<PeerGrant>> {
-        // Assembly under the lock, polling outside it, exactly as
-        // `read_grants`.
+        // The pair is resolved under the lock, the grant reads run outside it.
         let pair = {
             let mut state = self.runtime.state.lock().await;
             state.hosted(identity)?;
@@ -355,6 +361,32 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
             }
         }
         Ok(grants)
+    }
+
+    async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Option<ReadGrant>> {
+        let pair = {
+            let mut state = self.runtime.state.lock().await;
+            state.hosted(identity)?;
+            open_pair(&mut state, identity, peer).await?
+        };
+        // No pair here: no connection toward `peer`, or its tickets have not
+        // replicated to this device yet. Both answer as the peer-side read
+        // does, and neither says anything is ungranted.
+        let Some(pair) = pair else {
+            return Ok(None);
+        };
+        // The one key this identity can have written, addressed the way the
+        // classifier addresses it — `grant_key(&issuer)` read exactly —
+        // rather than found by scanning the prefix and trusting a record's
+        // position for its issuer. The ticket is the one minted for `peer`
+        // over this identity's own namespace: nothing the issuer does not
+        // already hold.
+        Ok(pair
+            .own
+            .read_grant(identity, peer)
+            .await?
+            .granted()
+            .map(|(grant, _ticket)| grant))
     }
 }
 
@@ -928,36 +960,91 @@ async fn open_pair(
     // doc and an author).
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
+    // The addressing each ticket carries, kept before the tickets move into
+    // the imports: arming points the halves at it, and reading the two
+    // tickets again there would ask the directory for what this call holds.
+    let ticket_addressing = (own_ticket.nodes.clone(), peer_ticket.nodes.clone());
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
+    let reuses_own = matches!(&cached, Some(pair) if pair.own.namespace() == own_namespace);
+    let reuses_peer = matches!(&cached, Some(pair) if pair.peer.namespace() == peer_namespace);
     let own = match &cached {
-        Some(pair) if pair.own.namespace() == own_namespace => pair.own.clone(),
+        Some(pair) if reuses_own => pair.own.clone(),
         _ => data_layer::ConnectionMetadataStore::import(&state.node, own_ticket).await?,
     };
     let peer_store = match &cached {
-        Some(pair) if pair.peer.namespace() == peer_namespace => pair.peer.clone(),
-        _ => data_layer::ConnectionMetadataStore::import(&state.node, peer_ticket).await?,
+        Some(pair) if reuses_peer => pair.peer.clone(),
+        _ => match data_layer::ConnectionMetadataStore::import(&state.node, peer_ticket).await {
+            Ok(store) => store,
+            Err(err) => {
+                forget_imported(state, (!reuses_own).then_some(own_namespace), None).await;
+                return Err(err);
+            }
+        },
     };
     let pair = ConnectionMetadata {
         own,
         peer: peer_store,
     };
-    // A device that opens the pair asserts itself into `own` once and
-    // registers the pair for session classification, so linked devices are
-    // resolvable by the counterparty and judge callers themselves.
-    // Assert-once, tombstones respected: opening is not a (re-)publication
-    // act — a live record is left untouched, and a withdrawn record is
-    // never resurrected as a side effect.
+    if let Err(err) = arm_open_pair(state, identity, peer, &pair, ticket_addressing).await {
+        forget_imported(
+            state,
+            (!reuses_own).then_some(own_namespace),
+            (!reuses_peer).then_some(peer_namespace),
+        )
+        .await;
+        return Err(err);
+    }
+    state.metadata_pairs.insert((identity, peer), pair.clone());
+    Ok(Some(pair))
+}
+
+/// Forget the halves this attempt imported. A failure part-way through
+/// opening leaves the pair uncached, so nothing holds a replica this
+/// attempt opened and the next attempt imports it again — without this the
+/// open handle and its `start_sync` accumulate per attempt. A half taken
+/// from the cache is left alone: the open pair is still its holder.
+async fn forget_imported(
+    state: &State,
+    own: Option<data_layer::NamespaceId>,
+    peer: Option<data_layer::NamespaceId>,
+) {
+    for namespace in [own, peer].into_iter().flatten() {
+        if let Err(err) = state.node.forget_doc(namespace).await {
+            tracing::warn!(%namespace, "a metadata half stayed open after a failed pair open: {err:#}");
+        }
+    }
+}
+
+/// The acts a device performs on the pair it has just opened: it asserts
+/// itself into `own` once and registers the pair for session
+/// classification, so linked devices are resolvable by the counterparty and
+/// judge callers themselves. Assert-once, tombstones respected: opening is
+/// not a (re-)publication act — a live record is left untouched, and a
+/// withdrawn record is never resurrected as a side effect. Pointing the
+/// halves at their devices is not part of the contract: its failure leaves
+/// the import-time contacts and is logged, never raised.
+async fn arm_open_pair(
+    state: &mut State,
+    identity: PdnId,
+    peer: PdnId,
+    pair: &ConnectionMetadata,
+    ticket_addressing: (Vec<EndpointAddr>, Vec<EndpointAddr>),
+) -> Result<()> {
+    #[cfg(feature = "test-util")]
+    if let Some(failures) = state.pair_arm_failures.as_mut() {
+        *failures += 1;
+        anyhow::bail!("arming the pair failed for test");
+    }
     pair.own
         .ensure_device_published(state.node.node_id())
         .await?;
     state
         .node
         .host_connection(identity, peer, &pair.own, &pair.peer)?;
-    if let Err(err) = point_pair_at_its_devices(state, identity, peer, &pair).await {
+    if let Err(err) = point_pair_at(state, identity, pair, ticket_addressing).await {
         tracing::warn!(%identity, %peer, "the pair kept its import-time contacts: {err:#}");
     }
-    state.metadata_pairs.insert((identity, peer), pair.clone());
-    Ok(Some(pair))
+    Ok(())
 }
 
 /// Point both halves of a connection's metadata pair at every device that
@@ -995,6 +1082,20 @@ async fn point_pair_at_its_devices(
         .await?
         .map(|ticket| ticket.nodes)
         .unwrap_or_default();
+    point_pair_at(state, identity, pair, (own_nodes, peer_nodes)).await
+}
+
+/// [`point_pair_at_its_devices`] for a caller that already holds what the
+/// pair's two tickets address — the open that just read them. A ticket
+/// absent from the directory addresses nobody, which is the empty set this
+/// takes rather than an error.
+async fn point_pair_at(
+    state: &State,
+    identity: PdnId,
+    pair: &ConnectionMetadata,
+    (own_nodes, peer_nodes): (Vec<EndpointAddr>, Vec<EndpointAddr>),
+) -> Result<()> {
+    let directory = &state.hosted(identity)?.directory;
     let mut devices = directory.list_devices().await?;
     devices.extend(pair.peer.published_devices().await?);
 
@@ -1010,8 +1111,17 @@ async fn point_pair_at_its_devices(
         (pair.own.namespace(), own_nodes),
         (pair.peer.namespace(), peer_nodes),
     ] {
-        let mut seen: HashSet<[u8; 32]> = nodes.iter().map(|node| *node.id.as_bytes()).collect();
-        let mut contacts = nodes;
+        // This device is covered before anything is taken in, so a ticket
+        // that names the side that minted it — this one, for the half it
+        // minted — leaves no contact pointing here: the endpoint refuses a
+        // path to itself, and the dial is spent once per reconcile.
+        let mut seen: HashSet<[u8; 32]> = HashSet::from([*own_device.as_bytes()]);
+        let mut contacts = Vec::new();
+        for node in nodes {
+            if seen.insert(*node.id.as_bytes()) {
+                contacts.push(node);
+            }
+        }
         for holder in &holders {
             if seen.insert(*holder.id.as_bytes()) {
                 contacts.push(holder.clone());
