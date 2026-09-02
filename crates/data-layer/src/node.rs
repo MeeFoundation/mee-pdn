@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Context, Result};
 use futures_lite::{FutureExt, StreamExt};
 use iroh::{
-    endpoint::{presets, Connection},
+    endpoint::{default_relay_mode, presets, Connection},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
-    Endpoint, EndpointAddr, EndpointId, SecretKey, Watcher as _,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
     store::{fs::FsStore, mem::MemStore},
@@ -168,24 +168,53 @@ pub struct SpawnOptions {
     /// How often the periodic reconcile pass re-requests a sync for every
     /// doc this node holds open (default [`RECONCILE_INTERVAL`]).
     pub reconcile_interval: Duration,
+    /// Whether the endpoint binds relay servers, so a peer behind a NAT
+    /// stays reachable and a ticket's addressing survives a change of
+    /// network. Off in every constructor here but
+    /// [`SpawnOptions::for_product`]: a relay carries traffic for this
+    /// node through a third party's infrastructure, so the choice belongs
+    /// to the product embedding the runtime, and the suites and the
+    /// container stand meet their peers over a direct path only. Address
+    /// lookup stays off either way ([`bind_endpoint`]).
+    pub use_relays: bool,
 }
 
 impl SpawnOptions {
     /// Options for a node whose state lives in memory and ends with the
-    /// process — what the workspace's in-process suites run on.
+    /// process — what the workspace's in-process suites run on. Relays
+    /// stay off, so the peers of such a node meet over a direct path.
     pub fn memory() -> Self {
         Self {
             storage: StorageConfig::Memory,
             reconcile_interval: RECONCILE_INTERVAL,
+            use_relays: false,
         }
     }
 
     /// Options for a node whose state lives under `directory`
-    /// ([`StorageConfig::Directory`]).
+    /// ([`StorageConfig::Directory`]), relays off — a persistent node the
+    /// caller reaches directly, which is what the container stand runs on.
+    /// A node a product ships is [`SpawnOptions::for_product`] instead.
     pub fn on_directory(directory: impl Into<std::path::PathBuf>) -> Self {
         Self {
             storage: StorageConfig::Directory(directory.into()),
             reconcile_interval: RECONCILE_INTERVAL,
+            use_relays: false,
+        }
+    }
+
+    /// Options for a node a product ships to a device it does not control:
+    /// state under `directory`, and relays bound, so a peer behind a NAT
+    /// is reachable and the addressing a ticket carries outlives the
+    /// network it was minted on. Relays are what separates this from
+    /// [`SpawnOptions::on_directory`], and the separation is deliberate —
+    /// a relay carries this node's traffic through a third party's
+    /// infrastructure, so a suite or a stand that never needs one never
+    /// binds one.
+    pub fn for_product(directory: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            use_relays: true,
+            ..Self::on_directory(directory)
         }
     }
 }
@@ -365,7 +394,7 @@ impl SyncNode {
 
         let (secret_key, directory_lock) = prepare_storage(&options.storage).await?;
 
-        let endpoint = bind_endpoint(secret_key).await?;
+        let endpoint = bind_endpoint(secret_key, options.use_relays).await?;
         let blobs_store: iroh_blobs::api::Store = match &options.storage {
             StorageConfig::Memory => MemStore::default().into(),
             StorageConfig::Directory(directory) => FsStore::load(directory.join(BLOBS_DIR))
@@ -1647,8 +1676,19 @@ async fn prepare_storage(
 /// that address with an ephemeral port; unset, it binds all interfaces.
 /// Scenario tests bind `127.0.0.1` (the just recipes set it) to keep test
 /// traffic on loopback; production spawns leave it unset.
-async fn bind_endpoint(secret_key: Option<SecretKey>) -> Result<Endpoint> {
-    let builder = Endpoint::builder(presets::Minimal);
+///
+/// Relays are bound when `use_relays` says so ([`SpawnOptions::use_relays`]);
+/// address lookup never is. The `N0` preset bundles the two, and its pkarr
+/// publisher would make every node id globally queryable for presence, so
+/// the relay mode is taken on its own: with relays, the relay URL a ticket
+/// carries is what keeps a node dialable across a change of address.
+async fn bind_endpoint(secret_key: Option<SecretKey>, use_relays: bool) -> Result<Endpoint> {
+    let relay_mode = if use_relays {
+        default_relay_mode()
+    } else {
+        RelayMode::Disabled
+    };
+    let builder = Endpoint::builder(presets::Minimal).relay_mode(relay_mode);
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,
