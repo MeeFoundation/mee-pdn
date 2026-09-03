@@ -965,8 +965,8 @@ async fn a_failed_pair_open_leaves_no_replica_behind() -> Result<()> {
     // reconcile interval, and the default one would make several attempts
     // outlast the poll budget.
     let laptop = Runtime::spawn(SpawnOptions {
-        storage: data_layer::StorageConfig::Memory,
         reconcile_interval: Duration::from_millis(200),
+        ..SpawnOptions::memory()
     })
     .await?;
     // Armed before the laptop knows of any connection, so no sweep of its

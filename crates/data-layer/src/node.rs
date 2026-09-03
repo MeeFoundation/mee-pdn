@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Context, Result};
 use futures_lite::{FutureExt, StreamExt};
 use iroh::{
-    endpoint::{presets, Connection},
+    endpoint::{default_relay_mode, presets, Connection},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
-    Endpoint, EndpointAddr, EndpointId, SecretKey, Watcher as _,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
     store::{fs::FsStore, mem::MemStore},
@@ -157,9 +157,40 @@ pub enum StorageConfig {
     Directory(std::path::PathBuf),
 }
 
+/// What a node's endpoint binds to be reachable, widening in one
+/// direction: each variant keeps what the one before it binds and adds to
+/// it. The choice is the embedding product's, since every step past
+/// [`Connectivity::Direct`] routes something through infrastructure the
+/// project does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connectivity {
+    /// Direct paths only. A peer is reached at an address the endpoint
+    /// publishes about itself — from a ticket, a ceremony payload, or a
+    /// session it already held — or not at all. What the suites and the
+    /// container stand run on.
+    Direct,
+    /// Relay servers too, so a peer behind a NAT is reachable and the
+    /// addressing a ticket carries outlives the network it was minted on:
+    /// the relay routes by node id, and the relay URL travels in every
+    /// ticket and ceremony payload the node mints. A relay carries this
+    /// node's traffic — encrypted, and with both ends' node ids visible to
+    /// whoever runs it.
+    Relays,
+    /// Address lookup as well: the node publishes where it is under its
+    /// node id and resolves peers the same way, so a contact known by node
+    /// id alone is dialable — a sibling read out of a device record, or a
+    /// peer whose ticket addresses have gone stale. The published record
+    /// carries relay addresses, not this node's IP addresses, but it makes
+    /// the node id globally resolvable: anyone holding one — a QR's
+    /// scanner, a former counterparty — can ask whether that device is up
+    /// and which relay it is homed on, and no withdrawal takes that back.
+    RelaysAndAddressLookup,
+}
+
 /// Spawn-time configuration of the node stack ([`SyncNode::spawn_with`]):
 /// where the node stores its state — required, no default — plus tuning.
-/// Build with [`SpawnOptions::memory`] or [`SpawnOptions::on_directory`].
+/// Build with [`SpawnOptions::memory`], [`SpawnOptions::on_directory`] or
+/// [`SpawnOptions::for_product`].
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
     /// Where the node keeps its state. Required: a spawn that names
@@ -168,24 +199,52 @@ pub struct SpawnOptions {
     /// How often the periodic reconcile pass re-requests a sync for every
     /// doc this node holds open (default [`RECONCILE_INTERVAL`]).
     pub reconcile_interval: Duration,
+    /// What the endpoint binds to be reachable ([`Connectivity`]).
+    /// [`Connectivity::Direct`] in every constructor here but
+    /// [`SpawnOptions::for_product`], which is the one that ships to a
+    /// device the project does not control.
+    pub connectivity: Connectivity,
 }
 
 impl SpawnOptions {
     /// Options for a node whose state lives in memory and ends with the
-    /// process — what the workspace's in-process suites run on.
+    /// process — what the workspace's in-process suites run on. Reachable
+    /// over direct paths alone.
     pub fn memory() -> Self {
         Self {
             storage: StorageConfig::Memory,
             reconcile_interval: RECONCILE_INTERVAL,
+            connectivity: Connectivity::Direct,
         }
     }
 
     /// Options for a node whose state lives under `directory`
-    /// ([`StorageConfig::Directory`]).
+    /// ([`StorageConfig::Directory`]) and is reachable over direct paths
+    /// alone — a persistent node its peers already have an address for,
+    /// which is what the container stand runs on. A node a product ships
+    /// is [`SpawnOptions::for_product`] instead.
     pub fn on_directory(directory: impl Into<std::path::PathBuf>) -> Self {
         Self {
             storage: StorageConfig::Directory(directory.into()),
             reconcile_interval: RECONCILE_INTERVAL,
+            connectivity: Connectivity::Direct,
+        }
+    }
+
+    /// Options for a node a product ships to a device it does not control:
+    /// state under `directory`, and
+    /// [`Connectivity::RelaysAndAddressLookup`] — the reachability a
+    /// device that moves between networks and restarts needs, and the one
+    /// that makes a contact carrying a node id alone dialable, which is
+    /// what a sibling read out of a device record is. Reachability is all
+    /// that separates this from [`SpawnOptions::on_directory`], and the
+    /// separation is deliberate: a suite or a stand whose peers already
+    /// have an address for each other reaches nobody's infrastructure to
+    /// find one.
+    pub fn for_product(directory: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            connectivity: Connectivity::RelaysAndAddressLookup,
+            ..Self::on_directory(directory)
         }
     }
 }
@@ -365,7 +424,7 @@ impl SyncNode {
 
         let (secret_key, directory_lock) = prepare_storage(&options.storage).await?;
 
-        let endpoint = bind_endpoint(secret_key).await?;
+        let endpoint = bind_endpoint(secret_key, options.connectivity).await?;
         let blobs_store: iroh_blobs::api::Store = match &options.storage {
             StorageConfig::Memory => MemStore::default().into(),
             StorageConfig::Directory(directory) => FsStore::load(directory.join(BLOBS_DIR))
@@ -1647,8 +1706,23 @@ async fn prepare_storage(
 /// that address with an ephemeral port; unset, it binds all interfaces.
 /// Scenario tests bind `127.0.0.1` (the just recipes set it) to keep test
 /// traffic on loopback; production spawns leave it unset.
-async fn bind_endpoint(secret_key: Option<SecretKey>) -> Result<Endpoint> {
-    let builder = Endpoint::builder(presets::Minimal);
+///
+/// What the endpoint binds to be reachable is `connectivity`'s
+/// ([`Connectivity`]). Only its widest variant takes iroh's `N0` preset,
+/// which bundles relays with the address lookup that publishes under this
+/// node's id; the narrower two take the relay mode on its own over
+/// `Minimal`, so no record about this node leaves the device.
+async fn bind_endpoint(
+    secret_key: Option<SecretKey>,
+    connectivity: Connectivity,
+) -> Result<Endpoint> {
+    let builder = match connectivity {
+        Connectivity::Direct => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
+        Connectivity::Relays => {
+            Endpoint::builder(presets::Minimal).relay_mode(default_relay_mode())
+        }
+        Connectivity::RelaysAndAddressLookup => Endpoint::builder(presets::N0),
+    };
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,
