@@ -62,8 +62,8 @@ pub use iroh::{
 };
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
-    AlpnTaken, DialHandle, DirectoryHeld, ExtraProtocol, NamespaceImport, SpawnOptions,
-    StorageConfig, SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
+    AlpnTaken, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol, NamespaceImport,
+    SpawnOptions, StorageConfig, SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
 };
 // Re-exported pdn-store (iroh-docs fork) vocabulary for the common
 // share/import/write flows, so downstream crates don't need a direct
