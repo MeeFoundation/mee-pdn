@@ -337,7 +337,7 @@ The working tree is never touched. The order: `git -C <repo> diff HEAD > <scratc
 - **Line numbers are as they stand in the working tree** at the time of the review, and are not adjusted afterwards.
 - **No votes, no angles, no agents in the file** — §3's strip rule. The verdict word, the refuted section, and "Not covered" are the only traces of the machinery.
 - **None of these rules is written into the file.** They govern how it is produced; the reader is not told how the sausage is made.
-- **Prototypes**: the pre-pivot one is `v3-single-device`, the current rebuild is `v3-multi-device`; never a bare "v3".
+- **Prototypes**: the pre-pivot one is `v3-single-device`, the rebuild after it is `v3-multi-device`, the current generation is `v4-non-keri`; never a bare number.
 
 ## 7. What this command does not do
 

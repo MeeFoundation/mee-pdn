@@ -91,4 +91,4 @@ There is sometimes only one way to fix something — then there is one option, b
 - **A number names exactly one thing.** `F1..Fn` run through every section in final order; a number is never reused, and a closed finding keeps its number.
 - **Anchors are written, never derived from a heading.** Headings get edited — `[DONE <dd-mm>]` on closing, titles sharpened, languages whose headings do not transliterate — and a written `f4` survives all of it.
 - **None of these rules is written into the file.** They govern how it is produced; the reader is not told how the sausage is made.
-- **Prototypes**: the pre-pivot one is `v3-single-device`, the current rebuild is `v3-multi-device`; never a bare "v3".
+- **Prototypes**: the pre-pivot one is `v3-single-device`, the rebuild after it is `v3-multi-device`, the current generation is `v4-non-keri`; never a bare number.
