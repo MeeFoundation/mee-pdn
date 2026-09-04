@@ -5,11 +5,12 @@ Mee PDN is a decentralized, local‑first data platform focused on privacy and u
 > [!WARNING]
 > **Early development.** Privacy and user sovereignty are the point of this project, but the mechanisms meant to enforce them — access control, capability delegation, identity — are still being built, and none of them is hardened or recommended for production use. Formats, interfaces, and stored state change without notice. Please treat this as a research and development codebase: do not put real personal data into it, and do not rely on it to protect anything that matters to you.
 
-This repository is the current rebuild, informally **v3-multi-device**. Previous generations:
+This repository is the current rebuild, **v4-non-keri**. Previous generations:
 
 - [version 1 (mee-core)](https://github.com/MeeFoundation/mee-core)
 - [version 2 (mdn-repos)](https://github.com/MeeFoundation/mdn-repos)
-- [v3-single-device](https://github.com/MeeFoundation/mee-pdn/tree/single-device) — the pre-pivot prototype (iroh-willow stack), on this repository's `single-device` branch
+- [v3-single-device](https://github.com/MeeFoundation/mee-pdn/tree/v3-single-device) — the pre-pivot prototype (iroh-willow stack), frozen on this repository's `v3-single-device` branch
+- [v3-multi-device](https://github.com/MeeFoundation/mee-pdn/tree/v3-multi-device) — the rebuild this generation grew out of, frozen on this repository's `v3-multi-device` branch
 
 ## First-time setup
 
