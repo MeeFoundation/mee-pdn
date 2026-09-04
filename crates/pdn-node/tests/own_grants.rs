@@ -194,7 +194,7 @@ async fn a_republication_and_a_withdrawal_are_visible_to_the_issuer() -> Result<
 /// The emptiness before that is the contract and not an assertion here:
 /// nothing holds replication back, so a scenario that asserted it would be
 /// racing its own subject. The waiting half is what this stages; the other
-/// half is stated in the service's docs and in `pdn-node/core.md`, guarded
+/// half is stated in the service's docs and in `mee-pdn/pdn-node/core.md`, guarded
 /// by this suite's place in the change's stress pass rather than by a pin
 /// this code offers no place for (`code-practices/flaky-tests.md`).
 #[tokio::test(flavor = "multi_thread")]

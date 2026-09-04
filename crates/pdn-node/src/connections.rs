@@ -879,7 +879,7 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
 /// sweep, with nothing left to say a removal ever happened. Nothing here
 /// reads a revocation record because the runtime has none; what keeps this
 /// safe is that removal, when it exists, is a record of its own that this
-/// write consults ([device-linking](../../../mia-docs/openspec/specs/components/pdn-node/device-linking.md)).
+/// write consults ([device-linking](../../../mia-docs/openspec/specs/components/mee-pdn/pdn-node/device-linking.md)).
 pub(crate) async fn ensure_own_device_confirmed(state: &mut State, identity: PdnId) -> Result<()> {
     let own_device = state.node.node_id();
     let hosted = state.hosted(identity)?;
