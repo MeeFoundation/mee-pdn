@@ -9,7 +9,7 @@ This repository is the current rebuild, **v4-non-keri**. Previous generations:
 
 - [version 1 (mee-core)](https://github.com/MeeFoundation/mee-core)
 - [version 2 (mdn-repos)](https://github.com/MeeFoundation/mdn-repos)
-- [v3-single-device](https://github.com/MeeFoundation/mee-pdn/tree/single-device) — the pre-pivot prototype (iroh-willow stack), on this repository's `single-device` branch
+- [v3-single-device](https://github.com/MeeFoundation/mee-pdn/tree/v3-single-device) — the pre-pivot prototype (iroh-willow stack), frozen on this repository's `v3-single-device` branch
 - [v3-multi-device](https://github.com/MeeFoundation/mee-pdn/tree/v3-multi-device) — the rebuild this generation grew out of, frozen on this repository's `v3-multi-device` branch
 
 ## First-time setup
