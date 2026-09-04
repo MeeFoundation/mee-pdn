@@ -11,7 +11,7 @@
 //! checks) belongs here; the node runtime resolves an entry to the
 //! relevant chain and calls into this module for the verdict.
 //!
-//! See `components/pdn-node/uwill.md` for the full specification.
+//! See `components/mee-pdn/pdn-layer/uwill.md` for the full specification.
 
 use pdn_types::{ClaimId, PdnId};
 use serde::{Deserialize, Serialize};
