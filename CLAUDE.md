@@ -47,7 +47,7 @@ Run a single test: `just test -E 'test(<test_name>)'`.
 
 Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/test-util`, the feature the write-retraction scenarios sit behind, and a bare cargo invocation matches zero of them without saying so. The recipes drop the flag when the caller narrows the package selection away from `pdn-node`, because cargo rejects a feature of an unselected package.
 
-`crates/pdn-store` carries feature sets and a wasm target the workspace build never compiles: `just check-store` lints them and `just test-store` tests them, and the pipeline's `store` job runs both. Under `just test` the store's tests run like any crate's, and a run with no selection ends with the workspace doctests — the store's README is one, and nextest runs no doctests. Its three tests marked `#[ignore = "flaky"]` run only in the nightly workflow.
+`crates/pdn-store` carries feature sets and a wasm target the workspace build never compiles: `just check-store` lints them and `just test-store` tests them, and the pipeline's `store` job runs both. Under `just test` the store's tests run like any crate's, and a run with no selection ends with the workspace doctests — the store's README is one, and nextest runs no doctests. Its tests marked `#[ignore = "flaky"]` run only in the nightly workflow.
 
 ## Lint rules
 

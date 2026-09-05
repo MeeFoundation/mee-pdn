@@ -1,4 +1,8 @@
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    future::Future,
+    sync::Arc,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
@@ -244,7 +248,6 @@ async fn sync_gossip_bulk() -> Result<()> {
 /// This tests basic sync and gossip with 3 peers.
 #[tokio::test]
 #[traced_test]
-#[ignore = "flaky"]
 async fn sync_full_basic() -> testresult::TestResult<()> {
     let mut rng = test_rng(b"sync_full_basic");
     let mut nodes = spawn_nodes(2, &mut rng).await?;
@@ -325,18 +328,21 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     )
     .await;
 
-    // peer0: assert events for entry received via gossip
-    info!("peer0: wait for 2 events (gossip'ed entry from peer1)");
-    assert_next(
+    // peer0: assert events for the entry peer1 announced. The topic carries
+    // peer1's author head, never the entry, so the entry arrives over the
+    // reconciliation that announcement triggers — and that sync's own
+    // `SyncFinished` and `PendingContentReady` fall between the two
+    // checkpoints, which is why the surrounding events are ignored here.
+    info!("peer0: wait for the entry announced by peer1");
+    assert_events_matching(
         &mut events0,
         TIMEOUT,
         vec![
-            Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing, .. } if *from == peer1),
-            ),
+            Box::new(move |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == peer1)),
             Box::new(move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == hash1)),
         ],
-    ).await;
+    )
+    .await;
     assert_latest(blobs0, &doc0, key1, value1).await;
 
     // Note: If we could check gossip messages directly here (we can't easily), we would notice
@@ -352,66 +358,58 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     let peer2 = nodes[2].id();
     let mut events2 = doc2.subscribe().await?;
 
-    info!("peer2: wait for 9 events (from sync with peers)");
-    assert_next_unordered_with_optionals(
+    // How many syncs peer2 runs is not fixed: it reconciles on the ticket's
+    // peer, again on each `NeighborUp`, and once more for every author head
+    // announced meanwhile, so the number of `SyncFinished` and
+    // `PendingContentReady` events around the checkpoints varies. The
+    // checkpoints themselves do not — both neighbors, a finished sync with
+    // each, both entries, both contents.
+    //
+    // An entry's `content_status` is not one of them: it is a snapshot of the
+    // local blob store taken as the event is produced, so what it reports and
+    // what the store holds when the test reads the event need not agree.
+    info!("peer2: wait for the events of its sync with both peers");
+    assert_events_matching(
         &mut events2,
         TIMEOUT,
-        // required events
         vec![
-            // 2 NeighborUp events
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer0)),
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer1)),
-            // 2 SyncFinished events
             Box::new(move |e| match_sync_finished(e, peer0)),
             Box::new(move |e| match_sync_finished(e, peer1)),
-            // 2 InsertRemote events
             Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { entry, content_status: ContentStatus::Missing, .. } if entry.content_hash() == hash0),
+                move |e| matches!(e, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == hash0),
             ),
             Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { entry, content_status: ContentStatus::Missing, .. } if entry.content_hash() == hash1),
+                move |e| matches!(e, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == hash1),
             ),
-            // 2 ContentReady events
             Box::new(move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == hash0)),
             Box::new(move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == hash1)),
-            // at least 1 PendingContentReady
             match_event!(LiveEvent::PendingContentReady),
         ],
-        // optional events
-        // it may happen that we run sync two times against our two peers:
-        // if the first sync (as a result of us joining the peer manually through the ticket) completes
-        // before the peer shows up as a neighbor, we run sync again for the NeighborUp event.
-        vec![
-            // 2 SyncFinished events
-            Box::new(move |e| match_sync_finished(e, peer0)),
-            Box::new(move |e| match_sync_finished(e, peer1)),
-            match_event!(LiveEvent::PendingContentReady),
-            match_event!(LiveEvent::PendingContentReady),
-        ]
-    ).await;
+    )
+    .await;
     assert_latest(blobs2, &doc2, b"k1", b"v1").await;
     assert_latest(blobs2, &doc2, b"k2", b"v2").await;
 
-    info!("peer0: wait for 2 events (join & accept sync finished from peer2)");
-    assert_next(
+    info!("peer0: wait for peer2 to join and its sync to finish");
+    assert_events_matching(
         &mut events0,
         TIMEOUT,
         vec![
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer2)),
             Box::new(move |e| match_sync_finished(e, peer2)),
-            match_event!(LiveEvent::PendingContentReady),
         ],
     )
     .await;
 
-    info!("peer1: wait for 2 events (join & accept sync finished from peer2)");
-    assert_next(
+    info!("peer1: wait for peer2 to join and its sync to finish");
+    assert_events_matching(
         &mut events1,
         TIMEOUT,
         vec![
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer2)),
             Box::new(move |e| match_sync_finished(e, peer2)),
-            match_event!(LiveEvent::PendingContentReady),
         ],
     )
     .await;
@@ -584,6 +582,11 @@ async fn test_sync_via_relay() -> Result<()> {
     let blobs2 = node2.blobs();
     let mut events = doc2.subscribe().await?;
 
+    // An `InsertRemote`'s `content_status` is a snapshot of the local blob
+    // store taken as the event is produced, and `ContentReady` reaches this
+    // stream over a channel of its own that carries no order against it — so
+    // the status is not asserted here. `ContentReady` is what proves the
+    // content arrived.
     assert_next_unordered_with_optionals(
         &mut events,
         Duration::from_secs(2),
@@ -591,7 +594,7 @@ async fn test_sync_via_relay() -> Result<()> {
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(n) if *n== node1_id)),
             Box::new(move |e| match_sync_finished(e, node1_id)),
             Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete, .. } if *from == node1_id),
+                move |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == node1_id),
             ),
             Box::new(
                 move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == inserted_hash),
@@ -599,7 +602,8 @@ async fn test_sync_via_relay() -> Result<()> {
             match_event!(LiveEvent::PendingContentReady),
         ],
         vec![Box::new(move |e| match_sync_finished(e, node1_id))],
-    ).await;
+    )
+    .await;
     let actual = blobs2
         .get_bytes(
             doc2.get_exact(author1, b"foo", false)
@@ -619,7 +623,7 @@ async fn test_sync_via_relay() -> Result<()> {
         Duration::from_secs(10),
         vec![
             Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete, .. } if *from == node1_id),
+                move |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == node1_id),
             ),
             Box::new(
                 move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == updated_hash),
@@ -629,7 +633,8 @@ async fn test_sync_via_relay() -> Result<()> {
             Box::new(move |e| match_sync_finished(e, node1_id)),
             Box::new(move |e| matches!(e, LiveEvent::PendingContentReady)),
         ],
-    ).await;
+    )
+    .await;
     let actual = blobs2
         .get_bytes(
             doc2.get_exact(author1, b"foo", false)
@@ -846,24 +851,30 @@ async fn test_download_policies() -> Result<()> {
 
     assert_eq!(key_hashes.len(), star_wars_movies.len() + lotr_movies.len());
 
+    // Every tally is a set. `ContentReady` and `InsertRemote` reach the
+    // subscriber over two channels of their own that carry no order against
+    // each other, and an `InsertRemote` already reporting `Complete` names
+    // content a `ContentReady` names too — so one downloaded entry can be
+    // counted twice. The loop below breaks on equality, and a tally that
+    // overshoots its expected total never lets it break at all.
     let fut = async {
         use LiveEvent::*;
-        let mut downloaded_a: Vec<&'static str> = Vec::new();
-        let mut downloaded_b: Vec<&'static str> = Vec::new();
-        let mut synced_a = 0usize;
-        let mut synced_b = 0usize;
+        let mut downloaded_a: BTreeSet<&'static str> = BTreeSet::new();
+        let mut downloaded_b: BTreeSet<&'static str> = BTreeSet::new();
+        let mut synced_a: BTreeSet<Hash> = BTreeSet::new();
+        let mut synced_b: BTreeSet<Hash> = BTreeSet::new();
         loop {
             tokio::select! {
                 Ok(Some(ev)) = events_a.try_next() => {
                     match ev {
                         InsertRemote { content_status, entry, .. } => {
-                            synced_a += 1;
+                            synced_a.insert(entry.content_hash());
                             if let ContentStatus::Complete = content_status {
-                                downloaded_a.push(key_hashes.get(&entry.content_hash()).unwrap())
+                                downloaded_a.insert(key_hashes.get(&entry.content_hash()).unwrap());
                             }
                         },
                         ContentReady { hash } => {
-                            downloaded_a.push(key_hashes.get(&hash).unwrap());
+                            downloaded_a.insert(key_hashes.get(&hash).unwrap());
                         },
                         _ => {}
                     }
@@ -871,22 +882,22 @@ async fn test_download_policies() -> Result<()> {
                 Ok(Some(ev)) = events_b.try_next() => {
                     match ev {
                         InsertRemote { content_status, entry, .. } => {
-                            synced_b += 1;
+                            synced_b.insert(entry.content_hash());
                             if let ContentStatus::Complete = content_status {
-                                downloaded_b.push(key_hashes.get(&entry.content_hash()).unwrap())
+                                downloaded_b.insert(key_hashes.get(&entry.content_hash()).unwrap());
                             }
                         },
                         ContentReady { hash } => {
-                            downloaded_b.push(key_hashes.get(&hash).unwrap());
+                            downloaded_b.insert(key_hashes.get(&hash).unwrap());
                         },
                         _ => {}
                     }
                 }
             }
 
-            if synced_a == EXPECTED_A_SYNCED
+            if synced_a.len() == EXPECTED_A_SYNCED
                 && downloaded_a.len() == EXPECTED_A_DOWNLOADED
-                && synced_b == EXPECTED_B_SYNCED
+                && synced_b.len() == EXPECTED_B_SYNCED
                 && downloaded_b.len() == EXPECTED_B_DOWNLOADED
             {
                 break;
@@ -895,14 +906,16 @@ async fn test_download_policies() -> Result<()> {
         (downloaded_a, downloaded_b)
     };
 
-    let (downloaded_a, mut downloaded_b) = n0_future::time::timeout(TIMEOUT, fut)
+    let (downloaded_a, downloaded_b) = n0_future::time::timeout(TIMEOUT, fut)
         .await
         .context("timeout elapsed")?;
 
-    downloaded_b.sort();
-    assert_eq!(downloaded_a, vec!["lotr/fellowship_of_the_ring"]);
     assert_eq!(
-        downloaded_b,
+        downloaded_a.into_iter().collect::<Vec<_>>(),
+        vec!["lotr/fellowship_of_the_ring"]
+    );
+    assert_eq!(
+        downloaded_b.into_iter().collect::<Vec<_>>(),
         vec![
             "star_wars/prequel/attack_of_the_clones",
             "star_wars/prequel/revenge_of_the_sith",
@@ -1433,6 +1446,39 @@ fn match_sync_finished(event: &LiveEvent, peer: PublicKey) -> bool {
         return false;
     };
     e.peer == peer && e.result.is_ok()
+}
+
+/// Receive events until every matcher has matched one, discarding events that
+/// match none. Panics when the timeout elapses first.
+///
+/// The set form of [`next_event_matching`], for the same reason: a local
+/// insert announces an author head to the neighbors and every neighbor pulls,
+/// so how many sync and readiness events surround a checkpoint is not fixed.
+#[allow(clippy::type_complexity)]
+async fn assert_events_matching(
+    stream: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin + Send),
+    timeout: Duration,
+    mut matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
+    let events = Arc::new(parking_lot::Mutex::new(vec![]));
+    let fut = async {
+        while !matchers.is_empty() {
+            let event = stream
+                .try_next()
+                .await
+                .expect("event stream errored")
+                .expect("event stream ended");
+            events.lock().push(event.clone());
+            let _ = apply_matchers(&event, &mut matchers);
+        }
+    };
+    let res = n0_future::time::timeout(timeout, fut).await;
+    let events = events.lock().clone();
+    if res.is_err() {
+        println!("Received events: {events:#?}");
+        panic!("Timeout reached ({timeout:?}) with unmatched matchers left");
+    }
+    events
 }
 
 /// Receive events from the stream until one matches, discarding the rest.
