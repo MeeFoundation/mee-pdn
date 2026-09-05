@@ -62,16 +62,15 @@ test *args:
 # builds: `--all-features` and `--no-default-features` compile different
 # code — `fs-store` gates the file-backed store, `rpc` the network API — and
 # the wasm build in `check-store` is the one consumer of the featureless one.
-# `-p` names the package by its own name, `iroh-docs`: cargo selects packages
-# before any workspace alias applies. Extra args are forwarded to nextest.
+# Extra args are forwarded to nextest.
 [doc("Test the store under its other feature sets, doctests included")]
 test-store *args:
   #!/bin/sh
   set -eu
   command -v cargo-nextest >/dev/null 2>&1 || { echo "cargo-nextest not found — run: just setup-tooling"; exit 1; }
-  cargo nextest run -p iroh-docs --all-features "$@"
-  cargo nextest run -p iroh-docs --no-default-features "$@"
-  cargo test -p iroh-docs --all-features --doc
+  cargo nextest run -p pdn-store --all-features "$@"
+  cargo nextest run -p pdn-store --no-default-features "$@"
+  cargo test -p pdn-store --all-features --doc
 
 # Test in release mode via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs)
 test-release *args:
@@ -432,10 +431,10 @@ check-fix:
 check-store:
   #!/bin/sh
   set -eu
-  cargo clippy -p iroh-docs --all-features --all-targets -- -Dwarnings
-  cargo clippy -p iroh-docs --no-default-features --lib --bins --tests -- -Dwarnings
-  RUSTDOCFLAGS=-Dwarnings cargo doc -p iroh-docs --all-features --no-deps
-  RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build -p iroh-docs --target wasm32-unknown-unknown --no-default-features
+  cargo clippy -p pdn-store --all-features --all-targets -- -Dwarnings
+  cargo clippy -p pdn-store --no-default-features --lib --bins --tests -- -Dwarnings
+  RUSTDOCFLAGS=-Dwarnings cargo doc -p pdn-store --all-features --no-deps
+  RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build -p pdn-store --target wasm32-unknown-unknown --no-default-features
 
 # Includes the container suite, as `fix` does: every test of the HTTP surface
 # is one. Needs a container daemon, and builds the image. The store's other

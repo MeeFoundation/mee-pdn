@@ -1,8 +1,8 @@
-//! Metrics for iroh-docs
+//! Metrics for pdn-store
 
 use iroh_metrics::{Counter, Gauge, MetricsGroup};
 
-/// Metrics for iroh-docs
+/// Metrics for pdn-store
 #[derive(Debug, Default, MetricsGroup)]
 pub struct Metrics {
     /// Number of document entries added locally

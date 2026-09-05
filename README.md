@@ -43,7 +43,7 @@ git clone git@github.com:MeeFoundation/mia-docs.git
 Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the wire). Both layers see only `pdn-types`; `pdn-node` is the embeddable runtime built over them.
 
 - `crates/pdn-types`: platform primitives (`PdnId`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, …) plus the data vocabulary (`NamespaceId`, `EntryPath`, `EntryInfo`, `NamespaceRole`)
-- `crates/pdn-store`: our iroh-docs variant — the document sync engine, diverged from upstream where PDN's access model needs it; the package keeps the upstream name `iroh-docs`
+- `crates/pdn-store`: our iroh-docs variant — the document sync engine, diverged from upstream where PDN's access model needs it; it carries upstream's version number and is never published
 - `crates/data-layer`: the data layer over `pdn-store` — the entries-only `DataLayer` trait, node/stack assembly, and the metadata stores
 - `crates/pdn-layer`: the platform surface products consume — domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` capability-token module
 - `crates/pdn-node`: the embeddable runtime core — identity / connections / data / sync services, plus the pairing and device-linking ceremonies

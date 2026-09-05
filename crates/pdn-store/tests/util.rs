@@ -12,9 +12,9 @@ use iroh::{
     Endpoint, EndpointId, RelayMap, RelayMode, SecretKey,
 };
 use iroh_blobs::store::GcConfig;
-use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs};
 use iroh_gossip::net::Gossip;
 use n0_error::Result;
+use pdn_store::{engine::ProtectCallbackHandler, protocol::Docs};
 
 pub async fn empty_endpoint() -> Result<Endpoint, BindError> {
     Endpoint::bind(presets::Minimal).await
@@ -56,11 +56,11 @@ impl Deref for Node {
 #[derive(Debug, Clone)]
 pub struct Client {
     blobs: iroh_blobs::api::Store,
-    docs: iroh_docs::api::DocsApi,
+    docs: pdn_store::api::DocsApi,
 }
 
 impl Client {
-    fn new(blobs: iroh_blobs::api::Store, docs: iroh_docs::api::DocsApi) -> Self {
+    fn new(blobs: iroh_blobs::api::Store, docs: pdn_store::api::DocsApi) -> Self {
         Self { blobs, docs }
     }
 
@@ -68,7 +68,7 @@ impl Client {
         &self.blobs
     }
 
-    pub fn docs(&self) -> &iroh_docs::api::DocsApi {
+    pub fn docs(&self) -> &pdn_store::api::DocsApi {
         &self.docs
     }
 }
@@ -114,7 +114,7 @@ impl Builder {
             iroh_blobs::ALPN,
             iroh_blobs::BlobsProtocol::new(&blobs, None),
         );
-        router = router.accept(iroh_docs::ALPN, docs.clone());
+        router = router.accept(pdn_store::ALPN, docs.clone());
         router = router.accept(iroh_gossip::ALPN, gossip.clone());
 
         // Build the router

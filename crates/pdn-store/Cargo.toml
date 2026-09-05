@@ -1,14 +1,14 @@
 [package]
-name = "iroh-docs"
+name = "pdn-store"
 version = "0.101.0"
 edition = "2021"
 readme = "README.md"
 description = "PDN's iroh-docs variant: document sync with capability-gated ingest"
 license = "MIT/Apache-2.0"
 authors = ["n0 team"]
-repository = "https://github.com/n0-computer/iroh-docs"
+repository = "https://github.com/MeeFoundation/mee-pdn"
 rust-version = "1.91"
-# Diverged from the upstream crate of the same name: never on crates.io.
+# Diverged from n0's `iroh-docs` and carries its version number: never on crates.io.
 publish = false
 
 [dependencies]

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use iroh_blobs::api::blobs::{ExportMode, ImportMode};
-use iroh_docs::store::Query;
 use n0_future::StreamExt;
+use pdn_store::store::Query;
 use rand::Rng;
 use testresult::TestResult;
 use tokio::io::AsyncWriteExt;
@@ -214,7 +214,7 @@ async fn test_default_author_persist() -> TestResult<()> {
 
     // check that the node fails to start if the default author is missing from the docs store.
     {
-        let mut docs_store = iroh_docs::store::fs::Store::persistent(iroh_root.join("docs.redb"))?;
+        let mut docs_store = pdn_store::store::fs::Store::persistent(iroh_root.join("docs.redb"))?;
         docs_store.delete_author(default_author)?;
         docs_store.flush()?;
         drop(docs_store);

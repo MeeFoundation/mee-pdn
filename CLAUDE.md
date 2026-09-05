@@ -23,7 +23,7 @@ only `data-layer`; `pdn-layer` joins in a later change).
 Each crate carries its own `CLAUDE.md` with its contracts and what is deliberately absent from it — read that file when working inside the crate.
 
 - [`crates/pdn-types`](crates/pdn-types/) — platform primitives and the data vocabulary. The only crate `pdn-layer` and `data-layer` share.
-- [`crates/pdn-store`](crates/pdn-store/) — our iroh-docs variant, the document sync engine under `data-layer`, diverged from upstream where PDN's access model needs it. The package keeps the upstream name `iroh-docs` (`-p iroh-docs`); consumers alias it `pdn-store`.
+- [`crates/pdn-store`](crates/pdn-store/) — our iroh-docs variant, the document sync engine under `data-layer`, diverged from upstream where PDN's access model needs it. It carries upstream's version number and is never published.
 - [`crates/data-layer`](crates/data-layer/) — the data layer over `crates/pdn-store`: the entries-only `DataLayer` trait, `SyncNode` stack assembly, the metadata stores, the protocol-agnostic ceremony slot.
 - [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model, the `PdnOp` operation AST, the `uwill` module. No iroh dependencies.
 - [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / connections / data / sync services over `data-layer`, plus the pairing (ADR-0011) and linking (ADR-0012) ceremonies. No host or HTTP dependencies.

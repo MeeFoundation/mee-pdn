@@ -1,4 +1,4 @@
-//! Tickets for `iroh-docs` documents.
+//! Tickets for `pdn-store` documents.
 
 use iroh::EndpointAddr;
 use iroh_tickets::{ParseError, Ticket};

@@ -807,7 +807,7 @@ impl SyncHandle {
         self.tx
             .send(action)
             .await
-            .context("sending to iroh_docs actor failed")?;
+            .context("sending to pdn-store actor failed")?;
         Ok(())
     }
     async fn send_replica(&self, namespace: NamespaceId, action: ReplicaAction) -> Result<()> {
