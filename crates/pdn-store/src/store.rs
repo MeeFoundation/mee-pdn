@@ -1,4 +1,4 @@
-//! Storage trait and implementation for iroh-docs documents
+//! Storage trait and implementation for pdn-store documents
 use std::num::NonZeroUsize;
 
 use anyhow::Result;

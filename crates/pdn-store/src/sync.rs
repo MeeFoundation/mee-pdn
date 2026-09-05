@@ -1,4 +1,4 @@
-//! API for iroh-docs replicas
+//! API for pdn-store replicas
 
 // Names and concepts are roughly based on Willows design at the moment:
 //

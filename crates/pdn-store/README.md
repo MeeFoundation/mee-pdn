@@ -1,6 +1,6 @@
-# iroh-docs (PDN variant)
+# pdn-store
 
-n0's `iroh-docs`, carried in this workspace as `crates/pdn-store` and diverged from upstream where PDN's access model needs it. Consumers name the crate `pdn-store`; the package keeps the upstream name.
+n0's `iroh-docs`, carried in this workspace as `crates/pdn-store` and diverged from upstream where PDN's access model needs it. The crate carries upstream's version number and is never published.
 
 Multi-dimensional key-value documents with an efficient synchronization protocol.
 
@@ -41,13 +41,13 @@ Iroh provides a [`Router`](https://docs.rs/iroh/latest/iroh/protocol/struct.Rout
 
 `Docs` is a "meta protocol" that relies on the [`iroh-blobs`](https://docs.rs/iroh-blobs) and [`iroh-gossip`](https://docs.rs/iroh-gossip) protocols. Setting up `Docs` will require setting up `Blobs` and `Gossip` as well.
 
-Here is a basic example of how to set up `iroh-docs` with `iroh`:
+Here is a basic example of how to set up `pdn-store` with `iroh`:
 
 ```rust
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use iroh_blobs::{BlobsProtocol, store::mem::MemStore, ALPN as BLOBS_ALPN};
-use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
+use pdn_store::{protocol::Docs, ALPN as DOCS_ALPN};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

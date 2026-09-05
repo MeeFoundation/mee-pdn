@@ -104,9 +104,9 @@ jobs:
 
   # The store's tests marked `#[ignore = "flaky"]`: skipped by every ordinary
   # run for the reason the attribute gives, and run here, where a failure is
-  # what is being looked for rather than a red pull request. `-p` names the
-  # package by its own name, `iroh-docs`, and narrows the recipe's selection
-  # to it; `ignored-only` then keeps just the marked tests.
+  # what is being looked for rather than a red pull request. `-p` narrows the
+  # recipe's selection to the store; `ignored-only` then keeps just the marked
+  # tests.
   store-flaky:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -128,4 +128,4 @@ jobs:
           workspaces: . -> target
 
       - name: Hunt the store's tests marked flaky
-        run: just stress -p iroh-docs --run-ignored ignored-only --stress-count "${{ github.event.inputs.store_iterations || '10' }}" --no-fail-fast
+        run: just stress -p pdn-store --run-ignored ignored-only --stress-count "${{ github.event.inputs.store_iterations || '10' }}" --no-fail-fast

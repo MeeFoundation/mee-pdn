@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-`iroh-docs` implements multi-dimensional key-value *documents* (called **Replicas**) that synchronize between peers using **range-based set reconciliation** (Aljoscha Meyer's algorithm, [paper](https://arxiv.org/abs/2212.13567)).
+`pdn-store` implements multi-dimensional key-value *documents* (called **Replicas**) that synchronize between peers using **range-based set reconciliation** (Aljoscha Meyer's algorithm, [paper](https://arxiv.org/abs/2212.13567)).
+
+It is n0's `iroh-docs`, diverged where PDN's access model needs it, carrying upstream's version number and never published. "Upstream" below means that crate; the wire protocol and its ALPN keep the upstream name.
 
 Two non-obvious facts shape the whole design:
 
@@ -15,10 +17,10 @@ Entries are signed by two keypairs: a **Namespace** key (write capability; its p
 
 ## Common commands
 
-One crate of the `mee-pdn` workspace, at `crates/pdn-store`; every command runs from the workspace root through `just`. Cargo knows the package by its own name, `iroh-docs` — `-p iroh-docs` — while `pdn-store` is the workspace alias consumers write in their manifests.
+One crate of the `mee-pdn` workspace, at `crates/pdn-store`; every command runs from the workspace root through `just`. The package and the directory both read `pdn-store`, with no workspace alias between them — `-p pdn-store` selects it, and code names the crate `pdn_store`.
 
 - **Format**: `cargo fmt --all` under the workspace `rustfmt.toml`; `just check` verifies it. Imports stay grouped std / external / crate with one `use` per crate, as upstream keeps them — stable rustfmt preserves that grouping rather than imposing it, so a new import is placed in its group by hand.
-- **Test** (nextest): `just test -p iroh-docs` runs the default feature set; `-E 'test(test_name)'` selects one test. `just test-store` adds `--all-features`, `--no-default-features`, and the doctests — nextest runs none, and the README example is one. Three tests carry `#[ignore = "flaky"]` and run only in the nightly workflow; `just stress -p iroh-docs --run-ignored ignored-only` runs them by hand.
+- **Test** (nextest): `just test -p pdn-store` runs the default feature set; `-E 'test(test_name)'` selects one test. `just test-store` adds `--all-features`, `--no-default-features`, and the doctests — nextest runs none, and the README example is one. Three tests carry `#[ignore = "flaky"]` and run only in the nightly workflow; `just stress -p pdn-store --run-ignored ignored-only` runs them by hand.
 - **Lint**: `just check` lints the workspace under default features; `just check-store` adds clippy on the other two feature sets and rustdoc, each with warnings denied.
 - **wasm**: `just check-store` builds `wasm32-unknown-unknown` with `--no-default-features`, `getrandom_backend="wasm_js"` named through `RUSTFLAGS`.
 

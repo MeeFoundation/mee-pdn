@@ -22,10 +22,8 @@ iroh = "1.0.2"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 tracing = "0.1"
-# `pdn-store` is our iroh-docs variant (capability-gated ingest). The package
-# keeps the upstream name `iroh-docs`, so a patch taken from upstream applies
-# without renaming; consumers name it `pdn-store` through this alias.
-pdn-store = { path = "crates/pdn-store", package = "iroh-docs" }
+# `pdn-store` is our iroh-docs variant (capability-gated ingest).
+pdn-store = { path = "crates/pdn-store" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

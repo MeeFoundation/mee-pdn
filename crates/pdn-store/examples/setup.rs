@@ -1,7 +1,7 @@
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
-use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
+use pdn_store::{protocol::Docs, ALPN as DOCS_ALPN};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

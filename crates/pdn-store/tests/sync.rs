@@ -4,7 +4,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use iroh::{endpoint::presets, Endpoint, PublicKey, SecretKey};
 use iroh_blobs::Hash;
-use iroh_docs::{
+use n0_future::{
+    time::{Duration, Instant},
+    Stream, TryStreamExt,
+};
+use pdn_store::{
     api::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
@@ -12,10 +16,6 @@ use iroh_docs::{
     engine::LiveEvent,
     store::{DownloadPolicy, FilterKind, Query},
     AuthorId, ContentStatus, Entry,
-};
-use n0_future::{
-    time::{Duration, Instant},
-    Stream, TryStreamExt,
 };
 use rand::{CryptoRng, RngExt, SeedableRng};
 #[cfg(feature = "fs-store")]

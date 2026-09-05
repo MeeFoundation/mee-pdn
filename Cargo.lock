@@ -1065,8 +1065,8 @@ dependencies = [
  "futures-lite",
  "iroh",
  "iroh-blobs",
- "iroh-docs",
  "iroh-gossip",
+ "pdn-store",
  "pdn-types",
  "redb 4.1.0",
  "serde",
@@ -2396,53 +2396,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh-docs"
-version = "0.101.0"
-dependencies = [
- "anyhow",
- "async-channel",
- "blake3",
- "bytes",
- "cfg_aliases",
- "data-encoding",
- "derive_more",
- "futures-buffered",
- "hex",
- "iroh",
- "iroh-blobs",
- "iroh-gossip",
- "iroh-metrics",
- "iroh-tickets",
- "irpc",
- "n0-error",
- "n0-future",
- "nested_enum_utils",
- "noq",
- "num_enum",
- "parking_lot",
- "postcard",
- "proptest",
- "rand 0.10.2",
- "redb 3.1.3",
- "redb 4.1.0",
- "self_cell",
- "serde",
- "serde-error",
- "strum",
- "tempfile",
- "test-strategy",
- "testdir",
- "testresult",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "tracing-test",
-]
-
-[[package]]
 name = "iroh-gossip"
 version = "0.101.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3601,6 +3554,53 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pdn-store"
+version = "0.101.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "blake3",
+ "bytes",
+ "cfg_aliases",
+ "data-encoding",
+ "derive_more",
+ "futures-buffered",
+ "hex",
+ "iroh",
+ "iroh-blobs",
+ "iroh-gossip",
+ "iroh-metrics",
+ "iroh-tickets",
+ "irpc",
+ "n0-error",
+ "n0-future",
+ "nested_enum_utils",
+ "noq",
+ "num_enum",
+ "parking_lot",
+ "postcard",
+ "proptest",
+ "rand 0.10.2",
+ "redb 3.1.3",
+ "redb 4.1.0",
+ "self_cell",
+ "serde",
+ "serde-error",
+ "strum",
+ "tempfile",
+ "test-strategy",
+ "testdir",
+ "testresult",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
 ]
 
 [[package]]
