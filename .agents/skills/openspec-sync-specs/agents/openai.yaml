@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenSpec Sync Specs"
+  short_description: "Merge a change's delta specs into the main specs"
+  default_prompt: "Use $openspec-sync-specs to merge a change's delta specs into the main spec tree."
