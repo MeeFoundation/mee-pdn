@@ -18,21 +18,12 @@ async fn node_on(dir: &std::path::Path) -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions::on_directory(dir)).await
 }
 
-/// The round trip: entries written into a directory replica and a data
-/// namespace come back on a node spawned on the same directory, payloads
-/// included, with no peer running — and the node comes back as the same
-/// node, its id read from the stored key. The re-import of the data
-/// namespace from the directory's own `data` ticket is the product path a
-/// restarted runtime walks, and it lands on a replica the store already
-/// holds, which is what makes the import's idempotence load-bearing.
-///
-/// The denial beside it: a node spawned on a fresh directory is a
-/// different node holding none of this one's state — without that arm,
-/// the assertions above would pass just as well against a node that
-/// re-created everything from the test's own memory. That node also
-/// answers what the reopen of a replica it never held is: absence, not a
-/// failure to open — the distinction a caller acting on a durable record
-/// decides by.
+/// The round trip with no peer running: same node id, both stores readable,
+/// the data namespace re-imported from the directory's own `data` ticket
+/// onto a replica the store already holds (the product path a restarted
+/// runtime walks). The denial beside it: a fresh directory is a different
+/// node holding none of it, and its reopen of a replica it never held
+/// answers absence, not a failure to open.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -43,8 +34,6 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
     let first_id = first.node_id();
     let author = first.default_author().await?;
 
-    // The directory replica, holding this device and the data ticket — the
-    // durable record recovery reads everything else from.
     let directory = PrivateMetadataStore::create(&first).await?;
     directory.add_device(first.node_id()).await?;
     let directory_namespace = directory.namespace();
@@ -58,8 +47,6 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
     drop(directory);
     drop(first);
 
-    // The same directory again: same node id, and both stores readable
-    // without any peer.
     let second = node_on(dir.path()).await?;
     assert_eq!(
         second.node_id(),
@@ -155,18 +142,13 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     Ok(())
 }
 
-/// A device withdrawn after a restart stays withdrawn — and the record it
-/// withdraws was written by another node, which is what puts the query's
-/// order under test. Prefix deletion is scoped to the writing author, so
-/// this node's tombstone leaves the other author's record live in the
-/// replica; the set reads the device as absent only because the
-/// latest-per-key collapse sees the tombstone before empty entries are
-/// excluded. A read that excluded empties first would keep the older live
-/// record and resurrect the withdrawn device.
-///
-/// The restart is load-bearing twice over: the tombstone must be written
-/// by the author this node had before it, and the record it buries must
-/// have survived the outage on disk.
+/// A device withdrawn after a restart stays absent, although the record it
+/// withdraws was written by another author: this node's tombstone leaves
+/// that record live in the replica, and the set reads the device as absent
+/// only because the latest-per-key collapse sees the tombstone before empty
+/// entries are excluded. The restart is load-bearing twice: the tombstone
+/// must be written by the author this node had before it, and the buried
+/// record must have survived on disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     use std::str::FromStr as _;
@@ -290,15 +272,11 @@ async fn a_malformed_key_file_stops_the_start_and_is_not_replaced() -> Result<()
 }
 
 /// A staging file left by a start that died while minting the key does not
-/// block the next one: the key is minted, the node comes up, and the
-/// leftover is gone. The staged name is fixed rather than derived from the
-/// process id, so on a container — where the node is always pid 1 — a
-/// leftover would otherwise reproduce byte for byte and stop every later
-/// start until a person deleted it from the volume.
-///
-/// The denial beside it: a leftover that is the *committed* key is a
-/// different thing entirely and stays untouched — the start reads it, and
-/// the node keeps the id that file names, rather than minting over it.
+/// block the next one, and is gone afterwards. The staged name is fixed
+/// rather than derived from the process id, so on a container — always
+/// pid 1 — a leftover would otherwise stop every later start. The denial
+/// beside it: the committed key is not a leftover and is read back, not
+/// minted over.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -330,17 +308,12 @@ async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
     Ok(())
 }
 
-/// One author per node, and the stores use it: a device record rewritten
-/// after a restart replaces its predecessor instead of accreting beside it
-/// under a second author. The sibling scenario above asserts the fork
-/// hands back a stable default author; this one asserts the directory
-/// writes with it, which is the half a store that minted its own author
-/// again would break — invisibly, since every product read is latest-wins
-/// and would keep returning the newest record either way.
-///
-/// The denial beside it: a record written under a deliberately separate
-/// author does accrete, so the count is a real instrument and not a
-/// constant.
+/// A device record rewritten after a restart replaces its predecessor
+/// instead of accreting beside it under a second author: the directory
+/// writes with the node's one author — the half a store that minted its
+/// own author would break invisibly, since every product read is
+/// latest-wins. The denial beside it: a record under a separate author does
+/// accrete, so the count is an instrument and not a constant.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result<()> {

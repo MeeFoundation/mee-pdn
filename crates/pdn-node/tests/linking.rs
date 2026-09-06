@@ -44,9 +44,7 @@ async fn wait_devices_exactly(
     .await
 }
 
-/// Wait until the probe's directory lists every id in `devices` as pending
-/// — registered by an inviter, conferring nothing until the device itself
-/// confirms.
+/// Wait until the probe's directory lists every id in `devices` as pending.
 async fn wait_pending_devices(
     directory: &PrivateMetadataStore,
     devices: &[NodeId],
@@ -70,9 +68,8 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
     .await
 }
 
-/// Assert the probe's directory holds exactly `devices` and `kinds` — the
-/// inviter-side state a refusal must leave untouched, checked as one act
-/// because a refusal that wrote either would break the same requirement.
+/// The inviter-side state a refusal must leave untouched, checked as one
+/// act.
 async fn assert_directory_is(
     directory: &PrivateMetadataStore,
     devices: &[NodeId],
@@ -89,13 +86,11 @@ async fn assert_directory_is(
     Ok(())
 }
 
-/// The positive ceremony: create on A, invite on A, link on B. The payload
-/// is bearer-free with a distinct secret per invite; link's return means
-/// the directory is caught up (a connection recorded before the invite
-/// lists immediately, with no poll); the newcomer is a device of the
-/// identity by the time link returns; and it comes up with the full store
-/// set — an entry written under the identity on either runtime becomes
-/// readable on the other.
+/// The positive ceremony: create on A, invite on A, link on B. Link's
+/// return means the directory is caught up (a connection recorded before
+/// the invite lists with no poll), the newcomer is a confirmed device, and
+/// the full store set is up — an entry written on either runtime reads on
+/// the other.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -104,17 +99,15 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     let x = rt_a.identity().create().await?;
     let p = rt_peer.identity().create().await?;
 
-    // Fixtures that predate the linking: a connection of X and one data
-    // entry, both authored on A.
+    // Fixtures that predate the linking, authored on A.
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_peer, p, &rt_a, x, invite).await?;
     let founder_path = EntryPath::new("contact/name")?;
     rt_a.data().write(x, &founder_path, b"from-founder").await?;
 
-    // The payload is self-contained and bearer-free: exactly the format
-    // version, the inviting device's address, the one-time secret, and the
-    // identity — no ticket and no identity proof (there are no such fields
-    // to carry one in). Every invite's secret is distinct.
+    // Bearer-free: format version, the inviting device's address, the
+    // one-time secret, the identity — no fields for a ticket or an identity
+    // proof. Every secret is distinct.
     let first = rt_a.identity().linking_invite(x, None).await?;
     let second = rt_a.identity().linking_invite(x, None).await?;
     assert_eq!(first.version, LINKING_FORMAT_VERSION);
@@ -126,11 +119,10 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     );
     assert_ne!(first.secret, second.secret);
 
-    // Link B (patiently — cold transport retries with fresh invites).
+    // Patiently: cold transport retries with fresh invites.
     link_patiently(&rt_b, &rt_a, x).await?;
 
-    // B hosts the identity, and success implies the directory is caught
-    // up: the pre-linking connection lists immediately, no poll.
+    // Success implies the directory is caught up: no poll.
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![x]);
     assert_eq!(
         rt_b.connections().list(x).await?,
@@ -138,19 +130,15 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
         "a caught-up directory must already hold the pre-linking connection record"
     );
 
-    // A completed link leaves the newcomer a confirmed device: A registered
-    // it as pending, B's own confirmation made it one, and both writes have
-    // reached a third replica. Probed from a raw linked node (which
-    // confirms itself the same way).
+    // A registered it as pending, B's own confirmation made it a device;
+    // probed from a raw linked node.
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     assert!(
         wait_devices(&probe_dir, &[rt_a.node_id(), rt_b.node_id()]).await?,
         "the linked device did not appear in the device set"
     );
 
-    // The full store set: B hosts the data namespace from the reply — the
-    // founder's entry becomes readable on B, and an entry written on B
-    // becomes readable on A.
+    // The full store set.
     assert!(
         eventually(|| async {
             Ok(rt_b.data().read(x, &founder_path).await?.as_deref() == Some(&b"from-founder"[..]))
@@ -180,11 +168,10 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     Ok(())
 }
 
-/// The non-founder chain: device 3 links from an invite minted on device 2,
-/// which was itself linked — the induction the reply's ticket minting rests
-/// on: device 2 can mint a write ticket for the data namespace only because
-/// its own linking reply imported one. Device sets converge to three and
-/// data catches up transitively.
+/// Device 3 links from an invite minted on device 2, itself linked: device
+/// sets converge to three and data catches up transitively. Device 2 can
+/// mint a write ticket for the data namespace only because its own linking
+/// reply imported one.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_through_a_non_founder_device() -> Result<()> {
     let rt_1 = memory_runtime().await?;
@@ -198,8 +185,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
     link_patiently(&rt_2, &rt_1, x).await?;
     link_patiently(&rt_3, &rt_2, x).await?;
 
-    // Transitive data catch-up: the founder's entry reaches device 3
-    // through the namespace ticket device 2 minted.
+    // Transitive catch-up through the ticket device 2 minted.
     assert!(
         eventually(|| async {
             Ok(rt_3.data().read(x, &path).await?.as_deref() == Some(&b"Acme Engineering"[..]))
@@ -208,8 +194,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
         "data did not reach the third device through the non-founder chain"
     );
 
-    // All three device sets converge to three — probed store-level from a
-    // raw linked node (registered as a fourth device by its own probe act).
+    // Probed from a raw linked node, itself a fourth device.
     let (probe_node, probe_dir) = link_probe(&rt_3, x).await?;
     assert!(
         wait_devices(
@@ -227,13 +212,11 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
     Ok(())
 }
 
-/// The refusal pairs of the verify-and-burn requirement, each next to its
-/// allowed counterpart and each probed for no observable state on either
-/// side: an expired secret; a linking invite for an unhosted identity; a
-/// wrong secret (which burns nothing — the real one still links); an
-/// unknown payload version (refused before dialing, typed); and a replayed
-/// secret after a completed link. The already-hosted refusal has its own
-/// test below.
+/// The refusal pairs of the verify-and-burn requirement, each probed for no
+/// observable state on either side: expired; an invite for an unhosted
+/// identity; wrong (burns nothing); unknown payload version (refused before
+/// dialing, typed); a replay after a completed link. Already-hosted has its
+/// own test below.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -242,9 +225,8 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     let x = rt_a.identity().create().await?;
     let path = EntryPath::new("contact/name")?;
 
-    // The no-state probe: X's directory watched from a raw linked node.
-    // Baseline: the founder and the probe in the device set (the probe's
-    // own linking registered it), and exactly the data kind from creation.
+    // The no-state probe: X's directory from a raw linked node; baseline is
+    // the founder, the probe, and the data kind.
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     let baseline_kinds = vec!["data".to_owned()];
     assert!(
@@ -258,8 +240,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "directory probe did not sync the baseline device set"
     );
 
-    // An expired secret is refused: B hosts nothing, the identity stays
-    // unknown to it, and the inviter's directory is unchanged.
+    // Expired: B hosts nothing, the inviter's directory is unchanged.
     let tiny = Some(Duration::from_millis(1));
     let expired = rt_a.identity().linking_invite(x, tiny).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -272,8 +253,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
     assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
 
-    // A linking invite for an unhosted identity is refused with the typed
-    // error and mints nothing pending.
+    // An invite for an unhosted identity mints nothing pending.
     let err = rt_a
         .identity()
         .linking_invite(ids::DAVE, None)
@@ -294,8 +274,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
     assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
 
-    // ...and an unknown payload version refuses before dialing, with the
-    // typed error only the pre-dial check produces.
+    // ...and an unknown payload version refuses before dialing, typed.
     let unversioned = LinkingPayload {
         version: 99,
         ..live.clone()
@@ -310,10 +289,8 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         .expect("the version refusal is typed and precedes the dial");
     assert_eq!(version_err.version, 99);
 
-    // The allowed counterpart: the live secret — having survived the wrong
-    // guess and the version probe — still links. Direct (not patient): this
-    // must burn *this* secret so the replay below is refused; the path is
-    // warm from the probe and the expired-secret dial above.
+    // The live secret still links. Direct, not patient: this must burn
+    // *this* secret so the replay below is refused.
     rt_b.identity().link(live.clone(), TIMEOUT).await?;
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![x]);
     let after_link = [rt_a.node_id(), probe_id, rt_b.node_id()];
@@ -323,8 +300,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     );
     assert!(wait_kinds_exactly(&probe_dir, &baseline_kinds).await?);
 
-    // A second presentation of the burned secret is refused, and both
-    // sides are exactly as the first linking left them.
+    // A replay is refused and both sides are as the first linking left them.
     assert!(
         rt_c.identity().link(live, TIMEOUT).await.is_err(),
         "a replayed secret must be refused"
@@ -339,15 +315,10 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     Ok(())
 }
 
-/// The dialer-side legibility of a linking refusal — the caller's half of
-/// the uniform-refusal requirement: a dialogue that reached the inviting
-/// device and got no answer downcasts to the reasonless [`LinkingRefused`],
-/// for an expired secret, a wrong one, and a replayed one alike (one unit
-/// value, nothing separating the three), while a dial that reaches no
-/// inviting device does not. Each refusal leaves no residue: the identity
-/// stays unhosted and its operations refuse as unknown. The catch-up
-/// timeout's distinctness has its own probe in the rollback test, which
-/// owns that harness.
+/// A refusal that reached the inviting device downcasts to the reasonless
+/// [`LinkingRefused`] — expired, wrong, replayed alike — while a dial that
+/// reaches no inviting device does not. Each refusal leaves no residue. The
+/// catch-up timeout's distinctness is probed in the rollback test.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -393,12 +364,9 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
     let read_err = rt_c.data().read(x, &path).await.unwrap_err();
     assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
 
-    // A dial that reaches no inviting device: the failure precedes the
-    // dialogue, so it is not the refusal. The address is a live bare node,
-    // which accepts no linking ALPN — the handshake is rejected at once,
-    // where the address of a node that is gone would cost the transport's
-    // whole connect timeout and leave the probe asserting nothing within any
-    // shorter bound.
+    // A dial that reaches no inviting device: a live bare node accepting no
+    // linking ALPN, rejected at once — a gone node would cost the
+    // transport's whole connect timeout.
     let bystander = memory_node().await?;
     let unreachable = LinkingPayload {
         version: LINKING_FORMAT_VERSION,
@@ -411,9 +379,8 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
         .link(unreachable, TIMEOUT)
         .await
         .unwrap_err();
-    // The positive half of the same distinction: the unreachable dial is
-    // recognized as its own typed outcome — without it, the negation above
-    // would hold even with no marker attached anywhere.
+    // The positive half: the unreachable dial is its own typed outcome,
+    // without which the negation above holds with no marker anywhere.
     assert!(
         err.downcast_ref::<InviterUnreachable>().is_some(),
         "an unreachable inviter must be recognized as its own outcome, got: {err:#}"
@@ -430,10 +397,9 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
     Ok(())
 }
 
-/// Linking into an already-hosted identity is refused before dialing —
-/// proven by the secret surviving the refusal: the payload the hosting
-/// runtime refused still links a third runtime, which could not succeed
-/// had the refusal dialed and burned it.
+/// Linking into an already-hosted identity is refused before dialing,
+/// proven by the secret surviving: the refused payload still links a third
+/// runtime.
 #[tokio::test(flavor = "multi_thread")]
 async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -463,20 +429,17 @@ async fn linking_into_a_hosted_identity_refuses_before_dialing() -> Result<()> {
     Ok(())
 }
 
-/// Lost-reply convergence, and what a lost reply does not confer: a raw
-/// dialer presents a live secret and never reads the reply. The inviter
-/// holds the registration — it precedes the reply — but as pending, so a
-/// device that cannot prove the tickets reached it is in no device set and
-/// admitted nowhere. A fresh invite then links the same device cleanly,
-/// with its node id in the device set exactly once and nothing left
-/// pending.
+/// Lost-reply convergence: a raw dialer presents a live secret and never
+/// reads the reply. The inviter's registration precedes the reply but is
+/// pending, so the dialer is in no device set. A fresh invite then links
+/// the same device cleanly, its node id in the set exactly once and nothing
+/// left pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()> {
     let rt_a = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
 
-    // The probe first: it watches the device set and warms the path for
-    // the raw dialer below.
+    // The probe watches the device set and warms the path.
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     assert!(
         wait_devices(&probe_dir, &[rt_a.node_id()]).await?,
@@ -490,29 +453,25 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     let dial = vanisher.sync().dial_handle_for_test().await;
     let connection = dial_linking_without_reading_from(&dial, &payload).await?;
 
-    // The registration precedes the reply: it appears while the reply sits
-    // unread on the wire — as pending.
+    // The registration precedes the reply, as pending.
     assert!(
         wait_pending_devices(&probe_dir, &[vanisher_id]).await?,
         "the registration must exist on the inviter although the reply was never read"
     );
-    // And pending is all it is: the device set — the one thing the access
-    // book probes — still holds the founder and the probe alone, so a
-    // dialer that never read its tickets is served nothing.
+    // Pending is all it is: the device set holds the founder and the probe
+    // alone.
     assert!(
         wait_devices_exactly(&probe_dir, &[rt_a.node_id(), probe_node.node_id()]).await?,
         "a device that never read its tickets must not be in the device set"
     );
     connection.close(0u32.into(), b"");
 
-    // A fresh invite links the same device cleanly — confirming itself, as
-    // any linking device does, once the tickets are in hand...
+    // A fresh invite links the same device cleanly...
     let retry = rt_a.identity().linking_invite(x, None).await?;
     vanisher.identity().link(retry, TIMEOUT).await?;
     assert_eq!(vanisher.sync().hosted_identities().await?, vec![x]);
 
-    // ...and the device set holds its node id once, with the pending
-    // registration cleared by the confirmation that superseded it.
+    // ...its node id once, the pending registration cleared.
     assert!(
         eventually(|| async {
             let occurrences = probe_dir
@@ -534,11 +493,9 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     Ok(())
 }
 
-/// A linking "inviter" that accepts the dialogue, reads the request, and
-/// never answers — holding the connection open until the dialer goes away.
-/// The harness behind the dialogue-timeout scenario: without a budget over
-/// the dialogue, a dialer against this handler waits for the transport's
-/// idle timeout.
+/// A linking inviter that reads the request and never answers; without a
+/// budget over the dialogue a dialer waits for the transport's idle
+/// timeout.
 #[derive(Debug)]
 struct HungInviter;
 
@@ -553,13 +510,9 @@ impl ProtocolHandler for HungInviter {
     }
 }
 
-/// A hung inviter costs the caller its budget and nothing more: `link`
-/// against an inviter that reads the request and never answers fails with
-/// the typed dialogue timeout, within the named budget rather than the
-/// transport's idle timeout. The positive marker is asserted beside the
-/// two it must not read as — the refusal (the dialogue never ended) and
-/// the catch-up timeout (nothing was imported) — and the dialing runtime
-/// keeps no residue.
+/// A hung inviter costs the caller its budget and nothing more: the typed
+/// dialogue timeout, asserted beside the two it must not read as — the
+/// refusal and the catch-up timeout — with no residue.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_inviter_costs_the_caller_its_budget_and_nothing_more() -> Result<()> {
     let hung = SyncNode::spawn_with(
@@ -607,10 +560,9 @@ async fn a_hung_inviter_costs_the_caller_its_budget_and_nothing_more() -> Result
     Ok(())
 }
 
-/// A linking "inviter" that speaks the dialogue but answers every request
-/// with fixed tickets to replicas whose only host is already gone, so the
-/// dialing runtime's catch-up can never complete — the harness that forces
-/// `link` down its rollback path.
+/// A linking inviter answering every request with tickets to replicas whose
+/// only host is gone, so catch-up can never complete — forces `link` down
+/// its rollback path.
 #[derive(Debug)]
 struct DeadTicketInviter {
     directory: DocTicket,
@@ -637,15 +589,12 @@ impl ProtocolHandler for DeadTicketInviter {
     }
 }
 
-/// Rollback: a link whose directory cannot catch up within the timeout
-/// fails with the typed catch-up timeout, and the dialing runtime
-/// afterwards hosts neither the directory nor the data namespace — the
-/// identity's operations refuse as specifically unknown, not as storage
+/// Rollback: a link whose catch-up times out fails typed, and afterwards
+/// the identity's operations refuse as specifically unknown, not as storage
 /// errors against a dropped replica.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<()> {
-    // Mint real tickets from a scratch node, then take it away: the
-    // namespaces they address end up hosted nowhere.
+    // Real tickets from a scratch node then taken away.
     let scratch = memory_node().await?;
     let dead_directory = PrivateMetadataStore::create(&scratch).await?;
     let directory_ticket = dead_directory
@@ -680,9 +629,8 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
         identity: ids::DAVE,
     };
 
-    // The exchange completes, the imports land, the catch-up cannot: the
-    // wait's typed timeout surfaces (retried in case the first dial fails
-    // before anything is imported, which rolls back nothing).
+    // The exchange completes, the imports land, the catch-up cannot
+    // (retried in case the first dial fails before anything is imported).
     let rt_b = memory_runtime().await?;
     let deadline = std::time::Instant::now() + TIMEOUT;
     let err = loop {
@@ -700,16 +648,14 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
         err.downcast_ref::<CatchUpTimeout>().is_some(),
         "the failure must be the catch-up timeout, got: {err:#}"
     );
-    // The timeout is not the refusal: the dialogue completed and the wait
-    // ran out, and a caller tells the two apart without reading text.
+    // The timeout is not the refusal.
     assert!(
         err.downcast_ref::<LinkingRefused>().is_none(),
         "a catch-up timeout must not read as a refusal"
     );
 
-    // No residue: the identity is not hosted, and its operations refuse as
-    // unknown — the assertion the unregister half of the rollback exists to
-    // make true (a merely dropped replica would fail as a storage error).
+    // No residue: not hosted, refuses as unknown — the unregister half of
+    // the rollback.
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
     let read_err = rt_b
         .data()
@@ -732,18 +678,9 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     Ok(())
 }
 
-/// Cancelling `link` — dropping its future outright, at any point from the
-/// dial through the local commit — must leave no residue: neither a
-/// registered-but-abandoned directory or data namespace, nor a
-/// half-committed hosted identity. `LinkRollbackGuard`'s `Drop` (and, for
-/// the data import, `SelfCleaningImport`'s own) are the only things that
-/// catch this; the rollback test above only exercises a *completed*
-/// catch-up failure, never a genuine future-drop. The sweep of delays
-/// covers the window from before the dial through well after a real link
-/// against a live counterpart normally completes, without needing to land
-/// on one exact instruction.
-// `tracked_doc_count` gates this the same way as the pairing-side
-// cancellation test — see the doc comment above.
+/// A dropped `link` future leaves no residue — only `LinkRollbackGuard`'s
+/// and `SelfCleaningImport`'s `Drop` catch this; the rollback test above
+/// exercises a completed failure, never a future-drop.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_link_leaves_no_residue() -> Result<()> {
@@ -775,6 +712,9 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
     Ok(())
 }
 
+/// A link cancelled after its import and retried on a fresh invite stays
+/// hosted: the cancelled attempt's cleanup does not undo what the retry
+/// did.
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()> {
     let inviter = memory_runtime().await?;
@@ -816,6 +756,10 @@ async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()
     Ok(())
 }
 
+/// An inviter whose pending-device write fails after the secret is burnt
+/// refuses the dialer, reports the failure locally as
+/// `LinkingLocalFailure::PendingDeviceWrite`, refuses the replay too, and
+/// leaves the newcomer neither pending nor a device.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothing() -> Result<()> {
     let inviter = memory_runtime().await?;
@@ -850,22 +794,18 @@ async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothi
     Ok(())
 }
 
-/// The rollback undoes what the link did, and nothing that predates it: a
-/// failed link into an identity whose namespace this runtime already reached
-/// through a peer's grant leaves that grant working.
-///
-/// The two bindings live in different maps — the pre-dial guard reads the
-/// hosted set, `import_namespace` writes the node's issuer registry — so the
-/// guard cannot see a granted issuer and the link proceeds. What keeps the
-/// grant is that the rollback restores the binding it displaced instead of
-/// forgetting the issuer outright; forgetting is permanent (`drop_doc` takes
-/// the entries with it), and a rollback that destroys state it never created
-/// is worse than no rollback at all.
+/// The rollback undoes what the link did and nothing that predates it: a
+/// failed link into an identity whose namespace this runtime already
+/// reached through a grant leaves the grant working. The pre-dial guard
+/// reads the hosted set and `import_namespace` writes the issuer registry,
+/// so the guard lets the link proceed; the rollback restores the binding it
+/// displaced instead of forgetting the issuer, since forgetting is
+/// permanent (`drop_doc` takes the entries with it).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the grant and the failed link in one place
 async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() -> Result<()> {
-    // Two personas of one person, as `multi_identity` models them: X on the
-    // phone, Y on the laptop, connected, with X granting Y its namespace.
+    // Two personas of one person: X on the phone, Y on the laptop, X
+    // granting Y.
     let rt_phone = memory_runtime().await?;
     let rt_laptop = memory_runtime().await?;
     let x = rt_phone.identity().create().await?;
@@ -886,10 +826,8 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     )
     .await?;
 
-    // The grant binder imports what the grant names — X binds in the
-    // node's issuer registry, nowhere near the hosted set the link's guard
-    // consults — so what the rollback below must not destroy is exactly
-    // what the product created.
+    // The binder binds X in the issuer registry, nowhere near the hosted set
+    // the link's guard consults.
     assert!(
         eventually(|| async {
             Ok(rt_laptop.data().read(x, &path).await?.as_deref() == Some(&b"from-x"[..]))
@@ -898,8 +836,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
         "the granted namespace never synced — the premise of this test, not its subject"
     );
 
-    // The person now adds X to the laptop too. The link fails: its tickets
-    // address replicas hosted nowhere, so the catch-up cannot complete.
+    // The link fails: its tickets address replicas hosted nowhere.
     let scratch = memory_node().await?;
     let dead_directory = PrivateMetadataStore::create(&scratch).await?;
     let directory_ticket = dead_directory
@@ -956,8 +893,8 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
         Some(&b"from-x"[..]),
         "the rollback destroyed a granted namespace the link never imported"
     );
-    // And the link left nothing of its own: X is not hosted, so the identity's
-    // own operations still refuse — the grant binding is not a hosted identity.
+    // And the link left nothing of its own: a grant binding is not a hosted
+    // identity.
     assert_eq!(rt_laptop.sync().hosted_identities().await?, vec![y]);
     let err = rt_laptop.connections().list(x).await.unwrap_err();
     assert!(
@@ -971,17 +908,16 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     Ok(())
 }
 
-/// Linking is per identity and isolated: one runtime links into two
-/// identities by two invites, and nothing of one is visible under the
-/// other — including on a runtime that hosts both sources side by side.
+/// Linking is per identity: one runtime links into two identities by two
+/// invites, and nothing of one is visible under the other.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_identity_requires_its_own_linking() -> Result<()> {
     let rt_a = memory_runtime().await?;
     let rt_b = memory_runtime().await?;
     let rt_peers = memory_runtime().await?;
 
-    // A hosts two identities; each establishes its own connection before
-    // any linking, so what B receives is attributable.
+    // Each establishes its own connection before any linking, so what B
+    // receives is attributable.
     let x = rt_a.identity().create().await?;
     let y = rt_a.identity().create().await?;
     let pb = rt_peers.identity().create().await?;
@@ -1000,10 +936,8 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
         "X's pre-linking connection must be readable the moment link returns"
     );
 
-    // Paired deny: nothing of Y arrived through that act. Y is unknown to
-    // B's identity-addressed services — listing, linking invites, both
-    // grant operations — and to its data namespaces; specifically unknown,
-    // not a generic failure.
+    // Paired deny: Y is specifically unknown to every identity-addressed
+    // service on B.
     let err = rt_b.connections().list(y).await.unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
     let err = rt_b.identity().linking_invite(y, None).await.unwrap_err();
@@ -1023,8 +957,7 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
         .unwrap_err();
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
 
-    // Y's stores appear on B only after a separate linking act with a
-    // linking invite for Y — and the two identities stay disjoint.
+    // Y arrives only by its own linking act, and the two stay disjoint.
     link_patiently(&rt_b, &rt_a, y).await?;
     let mut hosted = rt_b.sync().hosted_identities().await?;
     hosted.sort_by_key(|identity| *identity.as_bytes());
@@ -1071,30 +1004,15 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
 }
 
 /// Hosting an identity arms its connections by replication, not by
-/// grant-surface use. The connection and the grant are both made on the
-/// phone *after* the laptop linked, so everything the laptop knows of them
-/// arrived through the directory; the laptop publishes and withdraws
-/// nothing, yet serves the granted counterparty. That subject rests on the
-/// order of the two waits below, not on the absence of a grant-surface
-/// call: `read_own_grants` opens a pair itself, so the `pair_contacts` wait
-/// ahead of it — which opens nothing — is what proves the armer got there
-/// first. Bob is arranged through his recorded grant alone — the binder
-/// imports it — and the serving device is isolated the way `sibling_serving`
-/// isolates its own: the phone goes offline and the probed update exists on
-/// the laptop alone. Paired, per `code-practices/access-control-tests.md`,
-/// with the tightest unauthorized party: a holder of the replica's ticket
-/// with no grant gets nothing from the same device — Carol's laptop-minted
-/// ticket is the admitted instrument there, since the control needs
-/// addressing to the serving device and no grant exists toward her to carry
-/// it.
-///
-/// The scenario requires `test-util` as a whole, not only for the
-/// `pair_contacts` wait below. Its premise — the surviving device holds the
-/// grant record it will serve by — is closed by the two waits together, and
-/// the phone is shut down either way; without the feature the arrangement
-/// is the one the stress pass measured at about 2% flaky, so the scenario
-/// runs where its premise can be pinned and nowhere else. The `just`
-/// recipes enable the feature.
+/// grant-surface use: the connection and the grant are made on the phone
+/// after the laptop linked, and the laptop serves the counterparty having
+/// published nothing. The `pair_contacts` wait ahead of `read_own_grants`
+/// (which opens a pair itself) is what proves the armer got there first.
+/// Paired denial: Carol's laptop-minted ticket is the admitted instrument
+/// (`code-practices/product-path-arrangement.md`) — the control needs
+/// addressing to the serving device and no grant exists toward her. Under
+/// `test-util` as a whole: without the two waits the arrangement measured
+/// about 2% flaky.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario: the open pair, the record, the service, the denial
@@ -1104,10 +1022,8 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     let rt_bob = memory_runtime().await?;
     let rt_carol = memory_runtime().await?;
 
-    // The laptop links first: everything about the connection below
-    // reaches it only by replication — the case where, without arming by
-    // replication, a linked device would silently refuse grants its
-    // identity really issued.
+    // The laptop links first, so everything about the connection reaches it
+    // by replication alone.
     let alice = rt_phone.identity().create().await?;
     link_patiently(&rt_laptop, &rt_phone, alice).await?;
 
@@ -1130,9 +1046,8 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     )
     .await?;
 
-    // Positive control on the laptop's replica: device replication has
-    // delivered the entry it is about to serve. Bob's binder has imported
-    // what the grant names by now too — no import act anywhere.
+    // Positive control: device replication delivered the entry the laptop is
+    // about to serve, and Bob's binder imported what the grant names.
     assert!(
         eventually(|| async {
             Ok(rt_laptop.data().read(alice, &email).await?.as_deref()
@@ -1149,12 +1064,8 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         .await?,
         "the granted claim never reached Bob while the phone was up"
     );
-    // The armer opened the pair from the replicated directory, observed
-    // before anything on the grant surface is called here — the read below
-    // opens a pair that is not open yet, which would arrange what this
-    // scenario claims of the laptop. `pair_contacts` is the admitted
-    // instrument: an open pair has no product answer, and this one reads
-    // the cache without opening anything.
+    // The armer opened the pair, observed before anything on the grant
+    // surface is called: `pair_contacts` reads the cache without opening.
     assert!(
         eventually(|| async {
             let (own, _peer) = rt_laptop.connections().pair_contacts(alice, bob).await?;
@@ -1177,11 +1088,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         "the grant record never reached the device that must serve by it"
     );
 
-    // The serving device is isolated: the phone goes offline, and the
-    // probed update is written on the laptop alone. Carol holds only a
-    // ticket the laptop itself minted (read mode — addressing, not
-    // authority): the admitted instrument of the outsider control, which
-    // needs addressing to the serving device and has no grant to carry it.
+    // The phone goes offline; the probed update exists on the laptop alone.
     rt_phone.shutdown().await?;
     rt_laptop
         .data()
@@ -1190,13 +1097,8 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     let carol_ticket = rt_laptop.data().share(alice, ShareMode::Read).await?;
     rt_carol.data().import(alice, carol_ticket).await?;
 
-    // The laptop serves Bob under the grant published on the phone — no
-    // grant was published or withdrawn here, and the pair was open before
-    // this device's own grants were read, so what serves is the armer's
-    // work on the replicated directory. Bob's route to it is the
-    // published device set. Carol's poll rides along inside the same wait,
-    // so her sync attempts against the same target accumulate exactly
-    // while Bob's do.
+    // Carol's poll rides inside the same wait, so her sync attempts against
+    // the same target accumulate exactly while Bob's do.
     assert!(
         eventually(|| async {
             let _nudge = rt_carol.data().list(alice, None).await?;
@@ -1207,10 +1109,9 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
         "the linked device never served the granted counterparty"
     );
 
-    // Paired deny, the tightest unauthorized party: the ticket holder with
-    // no grant. Bob's convergence just above is the positive control that
-    // this very device is up and serving this very replica, so Carol's
-    // emptiness measures classification, not liveness.
+    // Paired deny: Bob's convergence just above proves this device serves
+    // this replica, so Carol's emptiness measures classification, not
+    // liveness.
     assert!(
         rt_carol.data().list(alice, None).await?.is_empty(),
         "a bare ticket holder must get nothing from a linked device"
@@ -1225,11 +1126,9 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
 
 /// An issuer linked onto the same node as its own grant's audience keeps its
 /// own access: the write is not judged by the grant it made, and withdrawing
-/// that grant narrows the audience's access without forgetting the issuer's
-/// own namespace — even though this node's grant-binder memo carries a
-/// record keyed by that same issuer once the sweep runs. Forces the sweep
-/// deterministically via `sweep_pair_now`/`grant_bound`, so this test compiles
-/// only under the `test-util` feature — the `just` recipes turn it on.
+/// that grant does not forget the issuer's own namespace — although the
+/// grant-binder memo carries a record keyed by that issuer. Forces the
+/// sweep via `sweep_pair_now`/`grant_bound` (`test-util`).
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario: link, own access, withdrawal, negative control
@@ -1237,10 +1136,8 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
     let rt_x_device = memory_runtime().await?;
     let rt_shared = memory_runtime().await?;
 
-    // X and Y connect and X grants Y read-only access to one path while each
-    // still lives on its own node — linking two identities directly onto one
-    // node is not reachable; the only path in is a connection made while
-    // apart, followed by a link that brings one of them over.
+    // Connected while apart, then one of them linked over — the only path
+    // to two connected identities on one node.
     let x = rt_x_device.identity().create().await?;
     let y = rt_shared.identity().create().await?;
     let invite = rt_x_device.connections().invite(x, None).await?;
@@ -1277,19 +1174,17 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
         "the shared node must host both X and Y after the link: {hosted:?}"
     );
 
-    // Force the memo adoption the grant binder would otherwise do on its own
-    // schedule, so the assertions below exercise the exact record shape the
-    // bug reproduced on — a `(y, x, x)` binding, keyed by X as issuer, that
-    // now sits beside X's own hosted namespace.
+    // Force the memo adoption so the assertions exercise the exact record
+    // shape: a `(y, x, x)` binding keyed by X as issuer beside X's own
+    // hosted namespace.
     rt_shared.connections().sweep_pair_now(y, x).await?;
     assert!(
         rt_shared.connections().grant_bound(y, x, x).await,
         "the sweep must have adopted the memo entry keyed by X as issuer — the premise of this test"
     );
 
-    // X writes and reads its own data on the node it now shares with Y: the
-    // write is not refused by the grant courtesy check, even though that
-    // check's own key space now contains an entry naming X as issuer.
+    // X's write is not refused by the grant courtesy check, whose key space
+    // now contains an entry naming X as issuer.
     let own_path = EntryPath::new("notes/diary")?;
     rt_shared.data().write(x, &own_path, b"dear diary").await?;
     assert_eq!(
@@ -1298,10 +1193,9 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
         "X's own write on the shared node must not be refused by its own grant to Y"
     );
 
-    // Withdraw the grant on the shared node itself — X is hosted there too
-    // — and force the revoke sweep. Withdrawing on `rt_x_device` instead
-    // would race the same replication the setup above already waited out.
-    // It must narrow Y's access without forgetting X's own namespace.
+    // Withdrawn on the shared node itself — withdrawing on `rt_x_device`
+    // would race the replication already waited out — and the revoke sweep
+    // forced.
     rt_shared.connections().withdraw_grant(x, y, x).await?;
     rt_shared.connections().sweep_pair_now(y, x).await?;
     assert!(
@@ -1328,8 +1222,7 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
         "X must still be able to write its own data after the grant to Y is withdrawn"
     );
 
-    // Paired deny, the tightest unauthorized party: a node with no
-    // connection to X at all is refused as unknown, not served an absence.
+    // Paired deny: a node with no connection to X is refused as unknown.
     let rt_outsider = memory_runtime().await?;
     let err = rt_outsider.data().read(x, &own_path).await.unwrap_err();
     assert!(

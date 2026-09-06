@@ -27,10 +27,9 @@ use common::{
     PAIRING_ALPN,
 };
 
-/// A pairing "inviter" that accepts the dialogue, reads the request, and
-/// never answers — holding the connection open until the dialer goes away.
-/// The harness behind the dialogue-ceiling scenario: without the ceiling, a
-/// dialer against this handler waits for the transport's idle timeout.
+/// A pairing inviter that reads the request and never answers; without the
+/// dialogue ceiling a dialer against it waits for the transport's idle
+/// timeout.
 #[derive(Debug)]
 struct HungInviter;
 
@@ -45,12 +44,9 @@ impl ProtocolHandler for HungInviter {
     }
 }
 
-/// A hung pairing inviter costs the caller the dialogue ceiling and
-/// nothing more: `establish` against an inviter that reads the request and
-/// never answers fails with the typed establishment timeout — not the
-/// refusal, whose dialogue *ended* — and within the ceiling rather than
-/// the transport's idle timeout. `establish` names no budget, so the
-/// ceiling is the module constant the marker documents.
+/// A hung inviter costs the caller the dialogue ceiling and nothing more:
+/// the typed establishment timeout — not the refusal, whose dialogue ended
+/// — within the ceiling rather than the transport's idle timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<()> {
     let hung = SyncNode::spawn_with(
@@ -90,15 +86,11 @@ async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<(
     Ok(())
 }
 
-/// Shutdown waits for an accept in flight instead of cutting it off, and
-/// stops waiting once that accept returns. A raw dialer opens the pairing
-/// ALPN and leaves the inviter's `accept` parked mid-request, so the
-/// handler holds its permit; `shutdown` started against that is still
-/// running a second later, and returns promptly once the dialer goes away
-/// — well inside the handler's own budget, so what ended the wait is the
-/// accept finishing, not the budget running out. Without the permit the
-/// first assertion fails: shutdown would return with the accept still in
-/// flight, which is the abort this bounded wait exists to replace.
+/// Shutdown waits for an accept in flight and stops waiting once it
+/// returns: a raw dialer leaves the inviter's `accept` parked mid-request,
+/// shutdown is still running against that, and returns once the dialer goes
+/// away — well inside the handler's budget, so the accept finishing is what
+/// ended the wait.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
     let rt = memory_runtime().await?;
@@ -152,15 +144,11 @@ async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
     Ok(())
 }
 
-/// Denied (a second establishment toward the same peer while one is in
-/// flight): the reservation is keyed by the pair, so a second `establish`
-/// from the same identity toward the same inviter refuses as a conflict
-/// rather than racing the first to assemble the same connection twice. The
-/// hung inviter is what makes the overlap the subject rather than a race:
-/// the first attempt is parked in the dialogue for its whole ceiling, so
-/// the second meets the reservation with certainty, and the two secrets
-/// differ — what refuses the second is the pair already in flight, not a
-/// burnt secret.
+/// Denied: a second `establish` from the same identity toward the same
+/// inviter while one is in flight refuses as a conflict. The hung inviter
+/// parks the first attempt for its whole ceiling, so the second meets the
+/// reservation with certainty, and the two secrets differ — what refuses
+/// it is the pair in flight, not a burnt secret.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_establishment_toward_the_same_peer_is_refused_while_one_is_in_flight(
 ) -> Result<()> {
@@ -207,9 +195,7 @@ async fn a_second_establishment_toward_the_same_peer_is_refused_while_one_is_in_
          {errors:#?}"
     );
 
-    // The reservation is released on both outcomes: a later attempt toward
-    // the same peer reaches the dialogue again rather than meeting a
-    // reservation nobody holds.
+    // The reservation is released on both outcomes.
     let after = rt
         .connections()
         .establish(y, toward_dave([0x77; 32]))
@@ -225,11 +211,8 @@ async fn a_second_establishment_toward_the_same_peer_is_refused_while_one_is_in_
     Ok(())
 }
 
-/// A pairing "inviter" that reads the request and then blocks forever,
-/// never accepting a release — the harness for cancelling the scanner's
-/// `establish` future itself (a genuine future-drop) rather than letting the
-/// dialogue run to a completed failure the way [`HungInviter`]'s timeout
-/// does.
+/// A pairing inviter that reads the request and blocks forever, never
+/// accepting a release — for cancelling the `establish` future itself.
 #[cfg(feature = "test-util")]
 #[derive(Debug)]
 struct NeverAnsweringInviter;
@@ -245,14 +228,9 @@ impl ProtocolHandler for NeverAnsweringInviter {
     }
 }
 
-/// Cancelling `establish` — dropping its future outright, before the
-/// dialogue can ever complete — must leave no replica behind, at any point
-/// in its lifetime from the dial through the round trip. `EstablishGuard`'s
-/// `Drop` is the only thing that can catch this; a completed-failure test
-/// like the hung-inviter timeout above never exercises it, since `disarm`
-/// already ran by the time such a test's `.await` returns.
-// `tracked_doc_count` is the pairing side's only observable anchor for
-// this assertion — see the doc comment above.
+/// A dropped `establish` future, anywhere from the dial through the round
+/// trip, leaves no replica behind — only `EstablishGuard`'s `Drop` can
+/// catch this; a completed-failure test never exercises it.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
@@ -265,9 +243,8 @@ async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
     let y = rt.identity().create().await?;
     let before = rt.sync().tracked_doc_count().await?;
 
-    // The inviter never answers, so every one of these delays cancels the
-    // future somewhere between the dial and the round trip's reply —
-    // sweeping the window without needing to land on one exact instruction.
+    // Every delay cancels the future somewhere between the dial and the
+    // reply.
     for delay in [
         Duration::from_millis(0),
         Duration::from_millis(5),
@@ -309,13 +286,11 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
     .await
 }
 
-/// The full flow: an invite minted on one runtime establishes from another,
-/// both sides list each other, and a grant published afterwards crosses the
-/// metadata pair with no new pairing — the carried ticket imports through
-/// the data service and the entries sync. The invite payload is bearer-free
-/// and every invite's secret is distinct and independently pending; the
-/// receiving identity's directory gains exactly the pair's kinds and no
-/// ticket to the peer's data namespace.
+/// The full flow: invite on one runtime, establish from another, both sides
+/// list each other, and a grant published afterwards crosses the pair with
+/// no new pairing. The payload is bearer-free with every secret distinct;
+/// the receiving directory gains the pair's kinds and no ticket to the
+/// peer's data namespace.
 #[tokio::test(flavor = "multi_thread")]
 async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -325,10 +300,9 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     let y = rt_b.identity().create().await?;
     let z = rt_c.identity().create().await?;
 
-    // The payload is self-contained and bearer-free: exactly the format
-    // version, the inviter device's address, the one-time secret, and the
-    // inviting identity — no ticket and no identity proof (there are no
-    // such fields to carry one in).
+    // Bearer-free: format version, the inviter device's address, the
+    // one-time secret, the inviting identity — no fields for a ticket or an
+    // identity proof.
     let first = rt_a.connections().invite(x, None).await?;
     assert_eq!(first.version, INVITE_FORMAT_VERSION);
     assert_eq!(first.inviter, x);
@@ -338,9 +312,8 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "the payload must carry the inviting runtime's address"
     );
 
-    // Every invite carries a distinct secret, each pending independently:
-    // the one minted second establishes first, and the first is still live
-    // afterwards.
+    // Every secret pends independently: the second minted establishes
+    // first, the first is still live.
     let second = rt_a.connections().invite(x, None).await?;
     assert_ne!(first.secret, second.secret);
     establish_patiently(&rt_b, y, &rt_a, x, second).await?;
@@ -352,10 +325,8 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     assert_eq!(rt_b.connections().list(y).await?, vec![x]);
     assert_eq!(rt_c.connections().list(z).await?, vec![x]);
 
-    // The grant flow: X writes data, grants its namespace toward Y after
-    // establishment — no new pairing — and Y's binder imports what the
-    // grant names, unprompted: no import act anywhere, so the read below
-    // is a test of the grant path itself.
+    // The grant flow, no new pairing and no import act: Y's binder imports
+    // what the grant names.
     let path = EntryPath::new("contact/name")?;
     rt_a.data().write(x, &path, b"X").await?;
     granted_patiently(&rt_a, x, &rt_b, y, x, common::claims_on(x, &path, true)).await?;
@@ -367,10 +338,8 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "granted entries did not sync to the peer"
     );
 
-    // The grant carries write on the claim, and the round trip proves it
-    // rather than asserting it: Y overwrites the granted claim under its
-    // own author, and the entry reaches X — the issuer — through ordinary
-    // sync, admitted by the ingest gate per the recorded grant (ADR-0008).
+    // The grant carries write, proven by the round trip: Y's overwrite
+    // reaches X through the ingest gate (ADR-0008).
     rt_b.data().write(x, &path, b"Y was here").await?;
     assert!(
         eventually(|| async {
@@ -380,12 +349,9 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "the grantee's write did not reach the issuer — the grant's ticket is not a write ticket"
     );
 
-    // Paired denial, in the same place: Z is connected to X too, but on its
-    // own separate pair X↔Z. The grant X published toward Y lives only in the
-    // X→Y metadata store, to which Z holds no ticket — so Z reads none of it
-    // (probed after Y demonstrably has it, so a leak would already have
-    // surfaced), and Z never imported X's namespace, so the bytes never reach
-    // it either.
+    // Paired denial: Z, on its own pair with X, holds no ticket to the X→Y
+    // store and never imported X's namespace — probed after Y demonstrably
+    // has the grant.
     assert!(
         rt_c.connections().read_grants(z, x).await?.is_empty(),
         "the grant X published toward Y must not be visible to Z, a separate connection of X"
@@ -395,10 +361,8 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "Z must not reach X's granted data — it never received the grant to import"
     );
 
-    // The routing/grants boundary, probed at the store level: Y's directory
-    // carries the metadata-pair kinds for X — and nothing else; the ticket
-    // to X's data namespace lives only in the metadata store it was read
-    // from.
+    // Y's directory carries the pair's kinds for X and nothing else; the
+    // data-namespace ticket lives only in the metadata store.
     let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
     assert!(
         wait_kinds_exactly(
@@ -420,10 +384,9 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     Ok(())
 }
 
-/// Establishment performed on the phones is visible from the laptops: the
-/// directories' connections records replicate, and each laptop opens the
-/// counterpart's metadata store from its directory's tickets — grants
-/// published on either phone are read on the other identity's laptop.
+/// Establishment on the phones is visible from the laptops: the connections
+/// records replicate, and each laptop opens the counterpart's store from
+/// its directory's tickets.
 #[tokio::test(flavor = "multi_thread")]
 async fn connection_is_visible_from_linked_devices() -> Result<()> {
     let a_phone = memory_runtime().await?;
@@ -452,8 +415,7 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
     );
 
     // ...and read the counterpart's metadata store from the pair their
-    // directories carry: a grant published on either phone reaches the
-    // other identity's laptop.
+    // directories carry.
     a_phone
         .connections()
         .publish_grant(x, y, x, common::nominal_claims(x))
@@ -494,11 +456,9 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
     Ok(())
 }
 
-/// Re-establishment converges, whichever side invites: a second
-/// establishment from a fresh invite — and a third with the direction
-/// swapped — leaves one connections entry per side, reuses each side's own
-/// metadata replica (the directory yields the same namespace across
-/// attempts), and keeps the already-published grants readable.
+/// Re-establishment converges, whichever side invites: one connections
+/// entry per side, the same own replica across attempts, earlier grants
+/// still readable.
 #[tokio::test(flavor = "multi_thread")]
 async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -518,8 +478,7 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
         "the pre-retry grant did not reach the peer"
     );
 
-    // The directory is the identity's durable view of the pair: the own
-    // store's namespace after each attempt must be the same replica.
+    // The own store's namespace must be the same replica after each attempt.
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     let own_kind = format!("connection-metadata/{y}/own");
     assert!(
@@ -545,8 +504,7 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     assert_eq!(rt_a.connections().list(x).await?, vec![y]);
     assert_eq!(rt_b.connections().list(y).await?, vec![x]);
 
-    // The own store is the same replica every time: the directory still
-    // yields the first namespace...
+    // The same replica every time...
     assert!(
         eventually(|| async {
             Ok(probe_dir
@@ -579,15 +537,11 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     Ok(())
 }
 
-/// Granting another identity's data is refused loudly as unsupported
-/// delegation. The classifier scans the connections of the *data issuer's*
-/// identity, so a grant recorded under a different granting identity could
-/// never be honored — an accepted publish would replicate, the recipient
-/// would read a live grant, and enforcement would deny everything: a
-/// silent no-op on both sides. The sharpest form is exercised here: the
-/// foreign issuer is *hosted on the same runtime*. Paired with the allowed
-/// side: the identity's own grant, published after the refusals, crosses —
-/// and nothing of the refused grant ever appears beside it.
+/// Granting another identity's data is refused as unsupported delegation:
+/// the classifier scans the data issuer's connections, so an accepted
+/// publish would be a silent no-op on both sides. The sharpest form: the
+/// foreign issuer hosted on the same runtime. Paired: the identity's own
+/// grant, published after the refusals, crosses alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -599,8 +553,8 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_b, y, &rt_a, x, invite).await?;
 
-    // Denied: the whole-store surface refuses a foreign issuer — even one
-    // hosted right here — before anything is minted or written.
+    // Denied: a foreign issuer, even one hosted right here, refuses before
+    // anything is minted or written.
     let err = rt_a
         .connections()
         .publish_grant(x, y, b, common::nominal_claims(b))
@@ -611,7 +565,7 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
         "a foreign-issuer grant must refuse as unsupported delegation, got: {err:?}"
     );
 
-    // Denied: the scoped surface refuses the same way.
+    // Denied: the same with a one-claim set.
     let email = EntryPath::new("contact/email")?;
     let err = rt_a
         .connections()
@@ -623,9 +577,8 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
         "a foreign-issuer scoped grant must refuse as unsupported delegation, got: {err:?}"
     );
 
-    // Allowed, and the proof nothing was recorded: the identity's own
-    // grant — published after the refusals — is the only one the peer ever
-    // reads over this pair.
+    // Allowed, and the proof nothing was recorded: the identity's own grant
+    // is the only one the peer reads.
     rt_a.connections()
         .publish_grant(x, y, x, common::nominal_claims(x))
         .await?;
@@ -645,12 +598,10 @@ async fn granting_a_foreign_issuers_data_is_refused_as_unsupported_delegation() 
     Ok(())
 }
 
-/// The refusal pairs of the verify-and-burn requirement, each next to its
-/// allowed counterpart and each probed for no observable state on the
-/// inviter: an expired secret, a wrong secret (which burns nothing — the
-/// real one still establishes), an unknown payload version (refused before
-/// dialing), unknown-identity refusals for invite and establish, and a
-/// replayed secret after a completed establishment.
+/// The refusal pairs of the verify-and-burn requirement, each probed for no
+/// observable state on the inviter: expired, wrong (burns nothing), unknown
+/// payload version (refused before dialing), unknown identity for invite
+/// and establish, and a replay after a completed establishment.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -660,9 +611,8 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     let y = rt_b.identity().create().await?;
     let z = rt_c.identity().create().await?;
 
-    // The no-state probe: X's directory, watched from a linked-device view.
-    // Baseline before any establishment: exactly the data kind from
-    // creation.
+    // The no-state probe: X's directory from a linked-device view; baseline
+    // is the data kind from creation.
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     let baseline = vec!["data".to_owned()];
     assert!(
@@ -670,8 +620,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         "directory probe did not sync its baseline"
     );
 
-    // An expired secret is refused: no connections entry, no directory
-    // kind, nothing listed on either side.
+    // Expired: no state on either side.
     let tiny = Some(Duration::from_millis(1));
     let expired = rt_a.connections().invite(x, tiny).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -683,9 +632,8 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     assert!(rt_b.connections().list(y).await?.is_empty());
     assert!(wait_kinds_exactly(&probe_dir, &baseline).await?);
 
-    // Unknown-identity refusals, before anything runs: an invite for an
-    // identity the runtime does not host mints nothing, and establishing on
-    // behalf of one refuses before dialing.
+    // Unknown identity: an invite mints nothing, an establish refuses before
+    // dialing.
     let err = rt_a
         .connections()
         .invite(ids::DAVE, None)
@@ -700,8 +648,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         .unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
 
-    // A wrong secret is refused and burns nothing: the guess fails with no
-    // state anywhere...
+    // A wrong secret burns nothing...
     let forged = InvitePayload {
         secret: [0x5a; 32],
         ..live.clone()
@@ -713,8 +660,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     assert!(rt_a.connections().list(x).await?.is_empty());
     assert!(wait_kinds_exactly(&probe_dir, &baseline).await?);
 
-    // ...and an unknown payload version refuses before dialing, with the
-    // typed error only the pre-dial check produces.
+    // ...and an unknown payload version refuses before dialing, typed.
     let unversioned = InvitePayload {
         version: 99,
         ..live.clone()
@@ -729,11 +675,8 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         .expect("the version refusal is typed and precedes the dial");
     assert_eq!(version_err.version, 99);
 
-    // The allowed counterpart: the live secret — having survived the
-    // unhosted attempt, the wrong guess, and the version probe — still
-    // establishes. Direct (not patient): this must burn *this* secret so the
-    // replay below is refused; the path is already warm from the probe
-    // import and the expired-secret dial above.
+    // The live secret still establishes. Direct, not patient: this must
+    // burn *this* secret so the replay below is refused.
     rt_b.connections().establish(y, live.clone()).await?;
     assert_eq!(rt_a.connections().list(x).await?, vec![y]);
     let established = vec![
@@ -743,9 +686,8 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     ];
     assert!(wait_kinds_exactly(&probe_dir, &established).await?);
 
-    // A second presentation of the burned secret is refused, and the
-    // inviter's stores are exactly as the establishment left them: the one
-    // connection, the same directory kinds, nothing toward the replayer.
+    // A replay is refused and the inviter's stores are as the establishment
+    // left them.
     assert!(
         rt_c.connections().establish(z, live).await.is_err(),
         "a replayed secret must be refused"
@@ -761,13 +703,10 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     Ok(())
 }
 
-/// The dialer-side legibility of a refusal — the caller's half of the
-/// uniform-refusal requirement: a dialogue that reached the inviter and
-/// got no answer downcasts to the reasonless [`EstablishmentRefused`], for
-/// an expired secret, a wrong one, and a replayed one alike (one unit
-/// value, nothing separating the three), while a dial that reaches no
-/// inviter does not — so a host tells refusal from unreachable without
-/// matching error text.
+/// A refusal that reached the inviter downcasts to the reasonless
+/// [`EstablishmentRefused`] — expired, wrong, replayed alike — while a dial
+/// that reaches no inviter does not, so a host tells refusal from
+/// unreachable without matching text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -805,11 +744,9 @@ async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<(
         "a replayed-secret refusal must downcast to the marker, got: {err:#}"
     );
 
-    // A dial that reaches no inviter: the failure precedes the dialogue, so
-    // it is not the refusal. The address is a live bare node, which accepts
-    // no pairing ALPN — the handshake is rejected at once, where the address
-    // of a node that is gone would cost the transport's whole connect
-    // timeout and leave the probe asserting nothing within any shorter bound.
+    // A dial that reaches no inviter: a live bare node accepting no pairing
+    // ALPN, rejected at once — a gone node would cost the transport's whole
+    // connect timeout.
     let bystander = memory_node().await?;
     let unreachable = InvitePayload {
         version: INVITE_FORMAT_VERSION,
@@ -822,9 +759,8 @@ async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<(
         .establish(y, unreachable)
         .await
         .unwrap_err();
-    // The positive half of the same distinction: the unreachable dial is
-    // recognized as its own typed outcome — without it, the negation above
-    // would hold even with no marker attached anywhere.
+    // The positive half: the unreachable dial is its own typed outcome,
+    // without which the negation above holds with no marker anywhere.
     assert!(
         err.downcast_ref::<InviterUnreachable>().is_some(),
         "an unreachable inviter must be recognized as its own outcome, got: {err:#}"
@@ -840,16 +776,10 @@ async fn a_refusal_downcasts_where_an_unreachable_inviter_does_not() -> Result<(
     Ok(())
 }
 
-/// Two runtimes invite each other and both `establish` toward the other at
-/// the same time. The dialogue must not hold the runtime lock across the
-/// network round-trip, or the two establishments deadlock — each holding
-/// its own lock while the peer's accept side blocks on that same lock. A
-/// regression would hang, so the bounded wait is the assertion.
-///
-/// The path is exercised once first (a normal establishment, patiently) so the
-/// concurrent probe below — which calls `establish` directly, no retry, to
-/// exercise the exact timing — reuses the already-cached replicas rather than
-/// paying first-use setup.
+/// Both runtimes `establish` toward each other at once. The dialogue must
+/// not hold the runtime lock across the round-trip, or the two deadlock;
+/// the bounded wait is the assertion. The path is warmed first so the
+/// direct, no-retry probe pays no first-use setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -857,8 +787,7 @@ async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
 
-    // Warm the path between the endpoints and establish the pair once, so
-    // the reciprocal attempts below reuse the cached replicas.
+    // Warm the path and establish once.
     let warm = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_b, y, &rt_a, x, warm).await?;
 
@@ -884,13 +813,10 @@ async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
     Ok(())
 }
 
-/// The pair follows the directory, not a stale cache. The directory is the
-/// durable truth for which replicas a connection addresses; the runtime's
-/// pair map is only a handle cache. Rewriting the directory's peer-kind onto
-/// a different replica — what another device of the identity publishes once
-/// the counterparty re-establishes onto a fresh one — must move the grant
-/// reads there. Without re-validating the cache the pair would keep reading
-/// the superseded replica and silently miss every later grant.
+/// The pair follows the directory, not the pair-map cache: a peer-kind
+/// rewritten onto a fresh replica — what another device publishes once the
+/// counterparty re-establishes — moves grant reads there. Without
+/// re-validating the cache the pair would silently miss every later grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     let rt_a = memory_runtime().await?;
@@ -913,9 +839,8 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
         "the grant did not reach Y"
     );
 
-    // Stand in for another device of Y republishing the pair onto a fresh
-    // replica: the linking reply carries a write ticket to Y's directory,
-    // so a raw linked node does exactly what Y's own devices do.
+    // Stand in for another device of Y: the linking reply carries a write
+    // ticket to Y's directory.
     let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
     let replacement = ConnectionMetadataStore::create(&probe_node).await?;
     let replacement_ticket = replacement
@@ -925,8 +850,7 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
         .put_ticket(&data_layer::peer_ticket_kind(&x), &replacement_ticket)
         .await?;
 
-    // Once the rewrite syncs to B, its reads move to the (empty) replacement
-    // replica rather than staying on the superseded cached one.
+    // Reads move to the (empty) replacement replica.
     assert!(
         eventually(|| async { Ok(rt_b.connections().read_grants(y, x).await?.is_empty()) }).await?,
         "read_grants kept reading the superseded replica from cache instead of the one the directory names"
@@ -938,19 +862,10 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     Ok(())
 }
 
-/// A pair open that fails part-way leaves no replica open. The armer
+/// A pair open that fails part-way leaves no replica open: the armer
 /// retries every sweep, and each attempt imports both halves before it
-/// arms, so a failure that returned without forgetting them would grow the
-/// node's open replicas by two per sweep — on a device that is doing
-/// nothing but catching up.
-///
-/// The sibling is where a fresh import happens without arranging one: the
-/// laptop links, its directory replicates, and its armer opens a pair it
-/// never had. Arming is failed from before the link, so no sweep succeeds
-/// and every sweep imports again. `tracked_doc_count` is the anchor here
-/// for the reason the cancelled-establish scenario above gives; the failure
-/// count beside it is the positive control, without which "nothing
-/// accumulated" is satisfied by a device that never attempted.
+/// arms. Arming is failed from before the link, so every sweep imports
+/// again; the failure count is the positive control.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_pair_open_leaves_no_replica_behind() -> Result<()> {
@@ -961,9 +876,7 @@ async fn a_failed_pair_open_leaves_no_replica_behind() -> Result<()> {
     let invite = phone.connections().invite(alice, None).await?;
     establish_patiently(&peer, bob, &phone, alice, invite).await?;
 
-    // A sweep cadence the scenario can wait on: the armer retries at the
-    // reconcile interval, and the default one would make several attempts
-    // outlast the poll budget.
+    // A sweep cadence the poll budget can wait on.
     let laptop = Runtime::spawn(SpawnOptions {
         reconcile_interval: Duration::from_millis(200),
         ..SpawnOptions::memory()

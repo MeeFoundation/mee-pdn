@@ -1,9 +1,4 @@
-//! Identity handlers: create an identity, list the hosted ones, and the
-//! device-linking ceremony's two halves.
-//!
-//! `link` runs a network dialogue and then waits for catch-up, so the
-//! handler awaits it and answers when it is done — a stand whose callers are
-//! a test and a shell script is happy to wait, and a job id would be host
+//! Identity handlers. `link` is awaited to its end: a job id would be host
 //! state the runtime does not have.
 
 use std::sync::Arc;
@@ -22,7 +17,7 @@ use crate::{
     shapes::{CreatedIdentity, HostedIdentities, Lifetime, LinkBudget, NoQuery},
 };
 
-/// `POST /debug/identities` — an identity on its first device.
+/// `POST /debug/identities`.
 pub(crate) async fn create(
     State(runtime): State<Arc<Runtime>>,
     Query(NoQuery {}): Query<NoQuery>,
@@ -31,7 +26,7 @@ pub(crate) async fn create(
     Ok(Json(CreatedIdentity { identity }))
 }
 
-/// `GET /debug/identities` — the identities this runtime hosts.
+/// `GET /debug/identities`.
 pub(crate) async fn hosted(
     State(runtime): State<Arc<Runtime>>,
     Query(NoQuery {}): Query<NoQuery>,
@@ -40,9 +35,8 @@ pub(crate) async fn hosted(
     Ok(Json(HostedIdentities { identities }))
 }
 
-/// `POST /debug/identities/{identity}/linking-invite` — mint the payload a
-/// new device consumes. It carries a live one-time secret: whoever captures
-/// it can link in the intended device's place until it is burnt or expires.
+/// `POST /debug/identities/{identity}/linking-invite` — the payload carries
+/// a live one-time secret.
 pub(crate) async fn linking_invite(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
@@ -57,9 +51,8 @@ pub(crate) async fn linking_invite(
     Ok(Json(payload))
 }
 
-/// `POST /debug/link` — consume a linking payload: dial, verify, import,
-/// and return caught up. Addressed to no hosted identity, because the
-/// payload names the one being joined.
+/// `POST /debug/link` — addressed to no hosted identity, since the payload
+/// names the one being joined.
 pub(crate) async fn link(
     State(runtime): State<Arc<Runtime>>,
     Query(budget): Query<LinkBudget>,

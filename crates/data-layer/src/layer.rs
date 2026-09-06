@@ -1,5 +1,6 @@
-//! The [`DataLayer`] trait: the entries-only contract the node runtime
-//! drives to read and write replicated entries.
+//! The [`DataLayer`] trait: an entries-only contract over the data layer.
+//! Declared only — nothing implements it; the runtime drives
+//! [`SyncNode`](crate::SyncNode) directly.
 
 use futures_core::Stream;
 use pdn_types::{EntryInfo, EntryPath, PdnId};
@@ -7,7 +8,7 @@ use pdn_types::{EntryInfo, EntryPath, PdnId};
 /// Error returned by [`DataLayer`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DataLayerError {
-    /// The local node does not control a device key resolvable to `issued_by`.
+    /// The local node holds no authority to write as `issued_by`.
     #[error("local node is not authorized to write as {issued_by}")]
     NotAuthorizedToWrite { issued_by: PdnId },
 
@@ -23,15 +24,8 @@ pub enum DataLayerError {
 /// Entries-only interface of the data layer.
 ///
 /// Data is keyed by its `issuer` (a [`PdnId`]): all of an issuer's entries
-/// live in that issuer's single replica. Writing does NOT require any
-/// subject's consent — only local authority over `issuer` is checked; the
-/// subject (`about`) lives inside the entry payload, not in the address.
-///
-/// Capability semantics (issuing, revocation, chain validation) live above
-/// this trait, in the PDN layer: tokens travel as ordinary entries.
-///
-/// This authorization model requires pdn-store, our fork; plain
-/// namespace-key authorization cannot express PdnId-based write authority.
+/// live in that issuer's single replica. The subject (`about`) lives inside
+/// the entry payload, not in the address.
 #[allow(async_fn_in_trait)]
 pub trait DataLayer: Send + Sync {
     /// Insert `payload` at `path` into the data namespace of `issuer`.
@@ -55,10 +49,7 @@ pub trait DataLayer: Send + Sync {
 
     /// Enumerate metadata for entries in the data namespace of `issuer`,
     /// optionally filtered to those whose `path` starts with `path_prefix`.
-    ///
-    /// Yields metadata only (no payload bytes); use
-    /// [`get_entry`](Self::get_entry) to fetch payloads for entries of
-    /// interest.
+    /// No payload bytes; [`get_entry`](Self::get_entry) fetches them.
     async fn list_entries(
         &self,
         issuer: PdnId,

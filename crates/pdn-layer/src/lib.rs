@@ -2,8 +2,8 @@
 //!
 //! Pure domain — no transport, no storage backend. The domain model
 //! (claims, connections, delegation), the operation AST ([`PdnOp`]), and
-//! the [`uwill`] capability-token module live here; executing operations
-//! over a data layer is the node runtime's job.
+//! the [`uwill`] capability-token module live here. A draft: nothing in the
+//! workspace consumes it, and nothing executes a [`PdnOp`].
 
 use std::collections::BTreeMap;
 

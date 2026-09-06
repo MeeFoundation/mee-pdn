@@ -1,20 +1,9 @@
-//! The host's error mapping: one closed table from a runtime error to a
-//! status, and the response it becomes.
-//!
-//! The table is what the container stand's deny tests rest on. A refused
-//! operation must never read as success, and it must be distinguishable
-//! both from a route the host does not serve and from a host that does not
-//! understand what happened — a surface that answers alike for "the
-//! runtime refused you" and "you asked wrong" makes every paired denial
-//! vacuous. An unmapped error is therefore 500, the pessimistic reading:
-//! reporting it as a clean refusal would launder a host bug into a verdict.
-//!
-//! One request-shape limit sits outside this table by construction: the
-//! router's request-body ceiling (64 MB — comfortably above a realistic
-//! demo entry, far short of `pdn-store`'s own 1 GB wire ceiling) answers
-//! axum's own 413 before a handler, and so before `HostError`, ever runs —
-//! the same footing as the two statuses this type decides on its own
-//! (`bad_request`, `not_found`).
+//! One closed table from a runtime error to a status — what the stand's
+//! deny tests rest on: a refusal must be distinguishable from an absent
+//! route and from a host that does not understand what happened. An
+//! unmapped error is 500, the pessimistic reading: a clean refusal would
+//! launder a host bug into a verdict. The router's body ceiling answers
+//! axum's own 413 before any handler runs, outside this table.
 
 use axum::{
     http::StatusCode,
@@ -26,8 +15,6 @@ use pdn_node::{
     UnsupportedInviteVersion, UnsupportedLinkingVersion, WriteNotGranted,
 };
 
-/// A failed operation on its way back to the caller: the status the table
-/// assigned it, and the text of whatever produced it.
 #[derive(Debug)]
 pub struct HostError {
     status: StatusCode,
@@ -35,8 +22,7 @@ pub struct HostError {
 }
 
 impl HostError {
-    /// The request itself is wrong — an unparseable identifier, an
-    /// undecodable body, a claim set with nothing in it.
+    /// The request itself is wrong.
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -44,11 +30,9 @@ impl HostError {
         }
     }
 
-    /// Nothing is there. The host's own 404s are for an absent entry alone;
-    /// the router answers the same for a route it does not serve. An
-    /// identity or issuer the runtime does not know is a refusal (409),
-    /// never this — route names are unpinned, so a deny test asserting 404
-    /// would keep passing after a rename.
+    /// An absent entry alone. An identity or issuer the runtime does not
+    /// know is 409, never this: route names are unpinned, so a deny test
+    /// asserting 404 would keep passing after a rename.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -56,7 +40,6 @@ impl HostError {
         }
     }
 
-    /// The status this error answers with.
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -84,8 +67,7 @@ impl IntoResponse for HostError {
     }
 }
 
-/// The closed table. Downcasting reaches through `anyhow`'s context layers,
-/// so a service error wrapped on its way out still maps.
+/// Downcasting reaches through `anyhow`'s context layers.
 fn status_of(err: &anyhow::Error) -> StatusCode {
     if err.downcast_ref::<EstablishmentRefused>().is_some()
         || err.downcast_ref::<LinkingRefused>().is_some()
@@ -110,8 +92,7 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
     {
         StatusCode::BAD_REQUEST
     } else {
-        // Including an unreachable peer, which needs no type of its own:
-        // 500 against 403 is already the distinction a deny test rests on.
+        // An unreachable peer included: 500 against 403 is the distinction.
         StatusCode::INTERNAL_SERVER_ERROR
     }
 }
@@ -126,7 +107,6 @@ mod tests {
     const ISSUER: PdnId = PdnId::from_bytes([0x11; 32]);
     const PEER: PdnId = PdnId::from_bytes([0x22; 32]);
 
-    /// The status the table gives one error value.
     fn status(err: impl Into<anyhow::Error>) -> StatusCode {
         HostError::from(err.into()).status()
     }
@@ -197,8 +177,6 @@ mod tests {
         );
     }
 
-    /// The pessimistic default: what the host cannot name it does not
-    /// launder into a refusal.
     #[test]
     fn an_unmapped_error_is_500() {
         let err = HostError::from(anyhow!("the inviter was never reached"));
@@ -206,8 +184,6 @@ mod tests {
         assert_eq!(err.message, "internal server error");
     }
 
-    /// Service errors arrive wrapped in context; the table still reads
-    /// through it.
     #[test]
     fn a_wrapped_refusal_keeps_its_status() {
         let wrapped = Err::<(), _>(anyhow::Error::new(LinkingRefused))
@@ -216,8 +192,6 @@ mod tests {
         assert_eq!(HostError::from(wrapped).status(), StatusCode::FORBIDDEN);
     }
 
-    /// The error's own text travels with it, so a deny test can name what
-    /// refused.
     #[test]
     fn the_response_carries_the_errors_text() {
         let err = HostError::from(anyhow::Error::new(UnknownIdentity { identity: PEER }));
@@ -237,7 +211,6 @@ mod tests {
         assert!(!host.message.contains("/secret/node.db"));
     }
 
-    /// The two statuses the host decides on its own, not by downcast.
     #[test]
     fn the_hosts_own_statuses() {
         assert_eq!(

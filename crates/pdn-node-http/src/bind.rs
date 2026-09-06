@@ -1,25 +1,17 @@
-//! Where the host listens.
-//!
-//! Loopback unless a wider bind is configured, so exposing the debug
-//! surface beyond the local host is a deliberate act. The surface carries
-//! live ceremony secrets and authenticates nobody: reaching it is reaching
-//! the node.
+//! The host's configuration from the environment. Every value that is
+//! present and unparseable fails rather than falling back: a mistyped bind
+//! would come up on loopback and look like an unreachable peer, a mistyped
+//! flag would look like a renamed route.
 
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context as _, Result};
 
-/// The bind host when `PDN_HOST` is unset.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 
-/// The bind port when `PDN_PORT` is unset.
 pub const DEFAULT_PORT: u16 = 3011;
 
-/// Resolve the bind address from the two configured values, `None` being
-/// what an unset variable reads as. A value that is present and
-/// unparseable fails rather than falling back: a container that meant to
-/// bind wider and mistyped it would otherwise come up on loopback and look
-/// like an unreachable peer.
+/// `None` is what an unset variable reads as.
 pub fn bind_addr(host: Option<&str>, port: Option<&str>) -> Result<SocketAddr> {
     let host = host.unwrap_or(DEFAULT_HOST);
     let port: u16 = match port {
@@ -44,20 +36,14 @@ fn env(name: &str) -> Result<Option<String>> {
     }
 }
 
-/// [`bind_addr`] over this process's own environment: `PDN_HOST` and
-/// `PDN_PORT`.
+/// `PDN_HOST` and `PDN_PORT`.
 pub fn bind_addr_from_env() -> Result<SocketAddr> {
     let host = env("PDN_HOST")?;
     let port = env("PDN_PORT")?;
     bind_addr(host.as_deref(), port.as_deref())
 }
 
-/// Resolve the debug-surface flag from `PDN_DEBUG`, `None` being unset —
-/// the surface stays off. A closed set of values means on (`"1"`, `"true"`)
-/// or off (`"0"`, `"false"`); anything else fails rather than falling back,
-/// for the same reason [`bind_addr`] does: a typo that silently read as
-/// "off" would turn the whole `/debug/` subtree into what looks like a
-/// renamed route, not an unset flag.
+/// `PDN_DEBUG`: a closed set of values, unset meaning off.
 pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
     match raw {
         Some("1" | "true") => Ok(true),
@@ -68,17 +54,12 @@ pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
     }
 }
 
-/// [`debug_enabled`] over this process's own environment: `PDN_DEBUG`.
 pub fn debug_enabled_from_env() -> Result<bool> {
     debug_enabled(env("PDN_DEBUG")?.as_deref())
 }
 
-/// Resolve the runtime's storage directory from `PDN_DATA_DIR`, `None`
-/// being unset. Required: the host exists for the container stand, offers
-/// no in-memory mode and carries no path of its own — a host that started
-/// without a directory would promise persistence while holding everything
-/// in RAM, which from outside looks like a working node until its state is
-/// gone.
+/// `PDN_DATA_DIR`, required: a host started without a directory would
+/// promise persistence while holding everything in RAM.
 pub fn data_dir(raw: Option<&str>) -> Result<std::path::PathBuf> {
     match raw {
         Some(dir) if !dir.is_empty() => Ok(std::path::PathBuf::from(dir)),
@@ -89,7 +70,6 @@ pub fn data_dir(raw: Option<&str>) -> Result<std::path::PathBuf> {
     }
 }
 
-/// [`data_dir`] over this process's own environment: `PDN_DATA_DIR`.
 pub fn data_dir_from_env() -> Result<std::path::PathBuf> {
     data_dir(env("PDN_DATA_DIR")?.as_deref())
 }
@@ -105,7 +85,6 @@ mod tests {
         assert!(addr.ip().is_loopback(), "the default must not be reachable");
     }
 
-    /// A wider bind is exactly what was asked for, and nothing else.
     #[test]
     fn a_configured_bind_is_taken_as_given() {
         let addr = bind_addr(Some("0.0.0.0"), Some("8080")).unwrap();
@@ -155,8 +134,6 @@ mod tests {
         assert!(debug_enabled(Some(" 1")).is_err());
     }
 
-    /// The host has no in-memory mode and no path of its own: unset — or
-    /// set to nothing — stops the start, naming the variable.
     #[test]
     fn an_unset_data_dir_fails_naming_the_variable() {
         for raw in [None, Some("")] {

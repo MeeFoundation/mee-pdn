@@ -1,14 +1,7 @@
-//! The refusal and containment edges of externally supplied protocols on
-//! the node assembly: a dial under an ALPN the node did not register fails
-//! without running any handler, an ALPN collision (built-in or duplicate)
-//! is refused at spawn, and a panicking handler is contained without
-//! taking the node down. The happy path — a supplied protocol answering on
-//! its ALPN next to a still-syncing built-in stack, dialed through the
-//! dial handle — is exercised end to end by its real consumer, the pairing
-//! protocol (pdn-node's establishment tests); these edges are what the
-//! real consumer never triggers. The types come from `data-layer`'s
-//! re-exported extension surface, the same way the pairing handler
-//! consumes it.
+//! The refusal and containment edges of externally supplied protocols: an
+//! unregistered ALPN, an ALPN collision at spawn, a panicking handler. The
+//! happy path is exercised by the real consumer, pdn-node's pairing
+//! protocol; these edges are what it never triggers.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -63,18 +56,14 @@ impl ProtocolHandler for EchoHandler {
     }
 }
 
-/// Test-only handler that panics (out-of-bounds index) after reading the
-/// dialer's bytes, recording that it ran. Stands in for a buggy extra
-/// protocol whose panic must be contained rather than taking the node down.
+/// Panics (out-of-bounds index) after reading the dialer's bytes.
 #[derive(Debug, Clone, Default)]
 struct PanickingHandler {
     ran: Arc<AtomicUsize>,
 }
 
 impl ProtocolHandler for PanickingHandler {
-    // Panics the way a real handler bug would — an out-of-bounds index rather
-    // than an explicit panic!() the lints deny. The index is allowed here
-    // because the panic is the point; the guard must catch it all the same.
+    // An out-of-bounds index rather than the `panic!()` the lints deny.
     #[allow(clippy::indexing_slicing)]
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.ran.fetch_add(1, Ordering::SeqCst);
@@ -85,9 +74,8 @@ impl ProtocolHandler for PanickingHandler {
     }
 }
 
-/// A panic in an extra handler is contained: the panic is caught, that one
-/// connection fails, and the node's built-in stack keeps syncing — the panic
-/// does not tear the whole node down through iroh's accept loop.
+/// A panic in an extra handler is contained: that one connection fails and
+/// the node's built-in stack keeps syncing.
 #[tokio::test(flavor = "multi_thread")]
 async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     let panicker = PanickingHandler::default();
@@ -98,11 +86,8 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     .await?;
     let node_b = memory_node().await?;
 
-    // Dial the panicking protocol and drive a stream so its handler runs.
-    // The handler panics after reading, so our side must see an error rather
-    // than a clean response. The dial is patient: a process's first
-    // accepted-ALPN handshake can stall on this machine (see
-    // `test_utils::TIMEOUT`), and this test's dial is the binary's first.
+    // Patient: a process's first accepted-ALPN handshake can stall on this
+    // machine, and this dial is the binary's first.
     let deadline = std::time::Instant::now() + test_utils::TIMEOUT;
     let conn = loop {
         match node_b
@@ -118,13 +103,9 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(b"trigger").await?;
     send.finish()?;
-    // The handler panicked before writing anything, so the dialer must come
-    // away with no payload. Whether it learns that as a stream error or as a
-    // clean empty end-of-stream is a teardown race, not the containment
-    // property: the panic unwinds the handler's own future first, dropping
-    // its `SendStream` before the connection (drop implicitly finishes the
-    // stream), so a FIN is queued before the connection's close and
-    // whichever reaches the dialer first decides what this read returns.
+    // Stream error or clean empty end-of-stream is a teardown race (the
+    // unwind drops the handler's `SendStream` before the connection), not
+    // the containment property.
     let response = recv.read_to_end(ECHO_LIMIT).await;
     let payload = response.as_deref().unwrap_or_default();
     assert!(
@@ -136,8 +117,7 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
         "the handler should have run and panicked"
     );
 
-    // The node survived: its built-in stack still converges a replica over
-    // the ordinary ticket flow.
+    // The node survived.
     let author = node_a.create_author().await?;
     node_a.create_namespace(ids::ALICE).await?;
     let name = EntryPath::new("contact/name")?;
@@ -160,8 +140,8 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     Ok(())
 }
 
-/// Paired refusal: a dial under an ALPN the node did not register fails —
-/// no connection is established and the registered handler never runs.
+/// A dial under an ALPN the node did not register fails, and the registered
+/// handler never runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn unregistered_alpn_is_refused() -> Result<()> {
     let echo = EchoHandler::default();
@@ -191,10 +171,8 @@ async fn unregistered_alpn_is_refused() -> Result<()> {
     Ok(())
 }
 
-/// Paired refusal at spawn: an extra protocol claiming a built-in ALPN —
-/// any of blob transfer, gossip, document sync — or the same ALPN as
-/// another extra fails the spawn with the typed collision error; no node
-/// starts.
+/// An extra protocol claiming a built-in ALPN, or the same ALPN as another
+/// extra, fails the spawn with the typed collision error; no node starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn alpn_collisions_are_refused_at_spawn() -> Result<()> {
     for reserved in BUILT_IN_ALPNS {

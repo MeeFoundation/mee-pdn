@@ -1,10 +1,6 @@
-//! Shared plumbing for the workspace's scenario tests: the
-//! poll-until-deadline helper, the replication timeout, and the cast of test
-//! identities.
-//!
-//! A dev-dependency of the crates whose integration tests use it (cargo
-//! permits the cycle: this crate depends on `data-layer`, whose tests
-//! dev-depend on this crate); never published.
+//! Shared plumbing for the workspace's scenario tests. A dev-dependency of
+//! the crates whose integration tests use it (cargo permits the cycle with
+//! `data-layer`); never published.
 
 use std::{
     future::Future,
@@ -15,17 +11,12 @@ use anyhow::Result;
 use data_layer::{PrivateMetadataStore, SpawnOptions, SyncNode};
 use pdn_types::{EntryPath, NodeId, PdnId};
 
-/// A node on memory storage, no extra protocols — what the workspace's
-/// in-process suites run on. Storage is a required choice of every spawn,
-/// and this helper is where the suites name it, so none of them gains a
-/// temporary directory or filesystem I/O.
+/// A node on memory storage — what the in-process suites run on.
 pub async fn memory_node() -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions::memory()).await
 }
 
-/// The cast: bare [`PdnId`] values, one byte pattern each. No node runs for
-/// any of them unless a test spawns one — the peers (Bob, Carol, Dave) exist
-/// only as connections records in directories.
+/// The cast: bare [`PdnId`] values, one byte pattern each.
 pub mod ids {
     use pdn_types::PdnId;
 
@@ -37,20 +28,13 @@ pub mod ids {
     pub const DAVE: PdnId = PdnId::from_bytes([0xd0; 32]);
 }
 
-/// Bounded liveness budget for scenario waits: how long a poll ([`eventually`])
-/// or a catch-up waits for a *remote* convergence before failing. Sized to what
-/// the product is expected to deliver by — a few of the node's periodic
-/// reconcile passes (data-layer's `SpawnOptions::reconcile_interval`, default
-/// 10s; suites probing refusals inject a sub-second cadence instead), so a
-/// convergence rescued by a reconcile pass still fits. Generosity is free —
-/// polls return the moment their condition holds, so a green run (tens of
-/// milliseconds on loopback) never approaches this — but the ceiling is tight
-/// enough that a real non-convergence fails in tens of seconds, with a named
-/// assertion, rather than hanging.
+/// The liveness budget of a scenario wait: a few of the node's periodic
+/// reconcile passes (default 10s), so a convergence rescued by one still
+/// fits, and tight enough that a real non-convergence fails in tens of
+/// seconds rather than hanging.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Poll `check` every 100ms until it returns `true` or [`TIMEOUT`] elapses;
-/// the return says whether the condition was observed in time.
+/// Poll `check` every 100ms until it returns `true` or [`TIMEOUT`] elapses.
 pub async fn eventually<F, Fut>(mut check: F) -> Result<bool>
 where
     F: FnMut() -> Fut,

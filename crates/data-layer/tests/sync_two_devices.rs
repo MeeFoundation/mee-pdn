@@ -1,12 +1,9 @@
 //! Two devices of one identity (Alice) replicate her stores: the directory
-//! (with its connections records) and the data namespace she issues.
-//!
-//! Access is bounded by ticket possession alone — the laptop holds the
-//! tickets, so it replicates everything; no ingest filter runs. All writes
-//! happen on phone; the laptop sees them replicate through plain pdn-store
-//! sync — both as catch-up (writes that precede the import) and live (writes
-//! after the swarm is joined). Tickets are handed over directly by the test;
-//! several identities on one node is the `multi_identity` test.
+//! and the data namespace she issues. No identity is registered on either
+//! node, so access is bounded by ticket possession alone and every entry
+//! replicates — as catch-up (writes that precede the import) and live
+//! (writes after the swarm is joined). Tickets are handed over directly by
+//! the test.
 
 use std::time::{Duration, SystemTime};
 
@@ -15,6 +12,9 @@ use data_layer::{AddrInfoOptions, CatchUpTimeout, PrivateMetadataStore, ShareMod
 use pdn_types::EntryPath;
 use test_utils::{eventually, ids, memory_node, wait_connected, wait_entry_is, TIMEOUT};
 
+/// Both stores replicate to the laptop: the connection and the data entry
+/// written before the import arrive as catch-up, a disconnect and a data
+/// write made after the swarm is joined arrive live.
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_two_devices() -> Result<()> {
     // Two devices of Alice

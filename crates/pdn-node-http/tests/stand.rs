@@ -1,20 +1,9 @@
-//! The stand's scenarios: identities meet, grant, replicate and withdraw
-//! across containers, a device joins an identity, and a device goes away.
-//!
-//! Every node is its own process in its own container, reached only over its
-//! published HTTP port. No step reaches into a runtime, and no namespace
-//! ticket appears anywhere: a grantee reads because the runtime binds what
-//! the grant names, which is the property the stand exists to demonstrate.
-//! Waiting for convergence is repeating the read — the only means the
-//! surface offers.
-//!
-//! What travels between the nodes is iroh, not HTTP: each request acts on
-//! the runtime of the node serving it, and a ceremony payload moves between
-//! them through the test — the caller — as a code moves between two screens
-//! through a person.
-//!
-//! Ignored by default: the suite needs a container daemon and a built image,
-//! and `just test-docker` builds the image and runs it.
+//! The stand's scenarios across containers, reached only over the
+//! published HTTP port: no step reaches into a runtime, no namespace ticket
+//! appears, and waiting for convergence is repeating the read. A ceremony
+//! payload moves between nodes through the test, as a code moves between
+//! two screens through a person. Ignored by default: `just test-docker`
+//! builds the image and runs the suite.
 
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
@@ -44,10 +33,8 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
     let alice = inviter.create_identity().await?;
     let bob = scanner.create_identity().await?;
 
-    // Establishment. The payload crosses as an opaque token: the bytes one
-    // node answered with, handed to the other unread, so this test never
-    // comes to depend on which fields a payload has. The lifetime is named
-    // explicitly; omitting it leaves the runtime's own short default.
+    // The payload crosses as an opaque token, so this test never depends on
+    // its fields. The lifetime is named explicitly.
     let payload = inviter
         .post(
             &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
@@ -100,17 +87,13 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         .await?
         .ok()?;
 
-    // The capability comes out of the poll, not out of a read that follows
-    // it: a record whose ticket payload is still arriving reads as no grant
-    // at all — the transient this wait exists for — so a later read is a
-    // second observation rather than the same one.
-    //
-    // Three guards keep a namespace ticket off this surface, and each closes
-    // a different door. A field added to `GrantCapability` stops the
-    // conversion from `ReadGrant` compiling; a field added and filled stops
-    // the destructuring below compiling; and `deny_unknown_fields` refuses a
-    // response some other producer built, which is the only one of the three
-    // that can fail at run time — here, with the message this decode carries.
+    // The capability comes out of the poll, since a later read is a second
+    // observation. Three guards keep a namespace ticket off this surface: a
+    // field added to `GrantCapability` stops the conversion compiling, one
+    // added and filled stops the destructuring below compiling, and
+    // `deny_unknown_fields` refuses a response some other producer built —
+    // the one that can fail at run time, with the message this decode
+    // carries.
     let capability = eventually(CONVERGENCE_BUDGET, || async {
         let raw = scanner
             .get(&format!("/debug/identities/{bob}/grants/{alice}"))
@@ -148,9 +131,8 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         .await
         .context("the granted entry did not reach the grantee")?;
 
-    // Denied (outsider): a node that never connected to Alice and holds no grant
-    // is refused as unknown — a refusal, not an absence, so the assertion
-    // cannot pass by way of a renamed route.
+    // Denied (outsider): refused as unknown — a refusal, not an absence, so
+    // a renamed route cannot pass.
     let refused = outsider
         .get(&format!("/debug/data/{alice}/contact/email"))
         .await?;
@@ -162,8 +144,7 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         refused.text()
     );
 
-    // Sentinel: an update to the granted claim proves a second replication
-    // wave end to end, which is what orders the absence assertion below.
+    // Sentinel: a proven second wave orders the absence assertion below.
     inviter
         .put(
             &format!("/debug/data/{alice}/contact/email"),
@@ -175,8 +156,7 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         .await
         .context("the sentinel update did not reach the grantee")?;
 
-    // Denied (existence hidden): after that wave, the grantee's view of
-    // Alice's namespace carries exactly the granted claim.
+    // Denied (existence hidden).
     let listed: Entries = scanner.get(&format!("/debug/data/{alice}")).await?.json()?;
     let paths: Vec<String> = listed
         .entries
@@ -199,11 +179,9 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         withheld.text()
     );
 
-    // Withdrawal, the counterpart of the grant above: the grantee's binder
-    // forgets what the grant brought in, so the issuer resolves to nothing
-    // there again — a refusal, not an empty answer. The issuer keeps its own
-    // data throughout, which is what says withdrawal narrowed access and did
-    // not delete anything.
+    // Withdrawal: the binder forgets what the grant brought in, so the
+    // issuer resolves to nothing there — a refusal, not an empty answer —
+    // while the issuer keeps its own data.
     inviter
         .delete(&format!("/debug/identities/{alice}/grants/{bob}/{alice}"))
         .await?
@@ -231,18 +209,12 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
     Ok(())
 }
 
-/// A device joins an identity: the linking payload is minted on the node of
-/// the identity's first device and consumed on a second, which then reports
-/// the identity among the ones it hosts and reads what was written before it
-/// joined.
-///
-/// The paired denials sit beside the successful link: the same payload
-/// presented a second time is refused — its secret is burnt — and the node
-/// that presented it hosts nothing afterwards, and a node that never linked
-/// is refused as unknown when it addresses the identity's namespace. The
-/// stranger is a node of its own rather than the bystander, whose refused
-/// attempt could leave a residue that passes the last check for the wrong
-/// reason.
+/// A device joins an identity: the linking payload minted on the first
+/// device is consumed on a second, which then hosts the identity and reads
+/// what was written before it joined. Denied: the same payload presented
+/// again is refused (its secret is burnt) and the presenter hosts nothing;
+/// a node that never linked is refused as unknown — a node of its own,
+/// since the bystander's refused attempt could leave a residue.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn a_device_joins_across_containers() -> Result<()> {
@@ -268,8 +240,7 @@ async fn a_device_joins_across_containers() -> Result<()> {
         )
         .await?
         .ok()?;
-    // The budget of the whole act — dialogue plus catch-up — named
-    // explicitly; omitting it leaves the surface's own default.
+    // The budget of the whole act, named explicitly.
     second
         .post("/debug/link?timeout_secs=60", payload.clone())
         .await?
@@ -287,9 +258,8 @@ async fn a_device_joins_across_containers() -> Result<()> {
         .await
         .context("the linked device did not catch up on the entry written before the link")?;
 
-    // Denied (a replayed payload): the secret was burnt by the link above,
-    // so a second presentation is refused — and the refusal is a refusal,
-    // distinguishable from a node that never reached the inviter.
+    // Denied (a replayed payload): a refusal, distinguishable from a node
+    // that never reached the inviter.
     let refused = bystander.post("/debug/link", payload).await?;
     assert_eq!(
         refused.status,
@@ -304,8 +274,7 @@ async fn a_device_joins_across_containers() -> Result<()> {
         "a refused link must leave nothing behind: {nothing:?}"
     );
 
-    // Denied (a node that never linked): addressing the identity's namespace
-    // is refused as unknown, not answered as absent.
+    // Denied (a node that never linked).
     let outsider = stranger
         .get(&format!("/debug/data/{alice}/contact/email"))
         .await?;
@@ -319,39 +288,14 @@ async fn a_device_joins_across_containers() -> Result<()> {
     Ok(())
 }
 
-/// A granted peer keeps converging after the device that published the grant
-/// is stopped: a sibling device of the same identity serves the namespace.
-///
-/// The property is that the issuer's whole device set is reachable, not only
-/// the publishing one, and this is the only place it is proven across
-/// processes: a contact derived from a device record carries an endpoint id
-/// alone, and whether that resolves is a question about a real network.
-///
-/// A failure to converge after the stop is not answered by a longer budget,
-/// and three causes produce it — told apart before any of them is acted on,
-/// from the log this harness streams per node. Which peers the audience
-/// dialled is what separates them, and the counts come out of its log:
-/// `grep -o "peer=[0-9a-f]*" <log> | sort | uniq -c`.
-///
-/// One: the audience holds no contact for the sibling at all, so the
-/// stopped device stays the only address it ever tries. Two: it holds one
-/// that leads nowhere — a device record carries an endpoint id alone, and
-/// this stand has neither relay nor discovery to turn one into a path,
-/// which is a change of its own. Three: the sibling holds no grant record
-/// when the publisher stops, so it refuses the audience fail-closed.
-///
-/// The waits before the stop rule the third out and leave the other two:
-/// the audience reads the entry, the sibling reads it too — replication
-/// between the issuer's two devices has run — and the sibling reads back
-/// the grant record it serves by, which it cannot do before it opens the
-/// connection's metadata pair and publishes its own device record there.
-/// The audience's contact set stays invisible from here; `pdn-node`'s
-/// `reachability.rs` waits on that as well, where a scenario reaches every
-/// runtime it arranged.
-///
-/// The denial beside it: the failover must not widen access. A node that
-/// never connected to the issuer is still refused afterwards, so "the peer
-/// reads" cannot be satisfied by a node that serves whoever asks.
+/// A granted peer keeps converging after the publishing device is stopped:
+/// the only place the issuer's whole device set is proven reachable across
+/// processes, since a contact derived from a device record carries an
+/// endpoint id alone. A failure to converge is not answered by a longer
+/// budget: the waits before the stop rule out a sibling without the grant
+/// record, and which peers the audience dialled comes out of its streamed
+/// log (`grep -o "peer=[0-9a-f]*" <log> | sort | uniq -c`). The denial
+/// beside it: the failover must not widen access.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // one failover, with its denial in the same place
@@ -362,8 +306,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     let audience = stand.spawn("audience").await?;
     let outsider = stand.spawn("outsider").await?;
 
-    // The issuer on two devices: the second joins through the linking
-    // ceremony, the way a device joins.
+    // The second device joins by linking.
     let alice = publisher.create_identity().await?;
     let payload = publisher
         .post(
@@ -391,8 +334,8 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
         .await?
         .ok()?;
 
-    // The grant, published from that same device and read by the audience,
-    // so the failover starts from a connection that demonstrably works.
+    // Read by the audience, so the failover starts from a connection that
+    // demonstrably works.
     publisher
         .put(
             &format!("/debug/data/{alice}/contact/email"),
@@ -413,11 +356,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     .await
     .context("the audience never read the granted entry before the stop")?;
 
-    // And the sibling holds the same claim: the one precondition of the
-    // failover this surface can observe, read the way any caller reads. It
-    // says replication between the issuer's devices has run — not that the
-    // sibling can serve, which needs its grant record and is not visible
-    // here.
+    // Replication between the issuer's devices has run.
     entry_reads(
         &sibling,
         alice,
@@ -427,29 +366,22 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     .await
     .context("the sibling never caught up on the granted claim before the stop")?;
 
-    // And it holds the grant record itself — the second precondition, and
-    // the one the claim above does not imply: the claim rides the identity's
-    // data namespace, the record rides the connection's metadata pair, and a
-    // device that never opened that pair reads the claim while refusing the
-    // audience fail-closed.
+    // And the sibling holds the grant record it serves by, which the claim
+    // above does not imply: a device that never opened the pair reads the
+    // claim while refusing the audience fail-closed.
     own_grant_reads(&sibling, alice, bob, alice)
         .await
         .context("the sibling never held the grant record before the stop")?;
 
-    // The device that published the grant goes away — and is gone: a device
-    // still running would leave the convergence below provable by the very
-    // one this scenario removes, which is the whole assertion. The daemon is
-    // asked, not the network: the stopped container's published port is
-    // released, and a probe to the address it used can be answered by a live
-    // node that was given the same port afterwards.
+    // Asked of the daemon, not the network: the released port can be
+    // answered by a live node given the same port afterwards.
     publisher.stop().await?;
     assert!(
         !publisher.is_running().await?,
         "the device this scenario stops is still running"
     );
 
-    // The sibling writes, and the audience converges on it — reaching a
-    // device of the issuer whose address it was never given.
+    // The audience converges on a device whose address it was never given.
     sibling
         .put(
             &format!("/debug/data/{alice}/contact/email"),
@@ -467,8 +399,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
         return Err(err.context(logs));
     }
 
-    // Denied: the failover widened nothing. A node with no connection and no
-    // grant is still refused as unknown, not answered as absent.
+    // Denied: the failover widened nothing.
     let refused = outsider
         .get(&format!("/debug/data/{alice}/contact/email"))
         .await?;
@@ -482,26 +413,12 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     Ok(())
 }
 
-/// A grant that names a claim writable lets the grantee write there, and the
-/// write reaches the issuer: the granted peer is a writer of that claim, not
-/// only a reader of it.
-///
-/// The write set is per claim, which is what the paired denial holds the
-/// grant to. The same publication names a second path read-only, and the
-/// grantee's write there is refused — the tightest unauthorized party for a
-/// write is not an outsider but this very peer, one claim over. The refusal
-/// is ordered against a later replication wave, so "the issuer never saw it"
-/// says the write was rejected rather than that it had not arrived yet.
-///
-/// What that refusal proves is the courtesy check on the grantee's own side
-/// (`write_refusal`, the sole caller of `covers_write`): the write never
-/// leaves. The issuer's gate — `admit_ingest`, which derives its write set
-/// independently — is the enforcement, and no test here reaches it: the
-/// courtesy always answers first, and the only way past it is a runtime
-/// feature this surface does not expose and should not. The gate is proven
-/// where that bypass lives, in `pdn-node`'s `scoped_writes.rs`, which forces
-/// a write outside the write set and asserts it never reaches the issuer and
-/// that the provisional entry is retracted.
+/// A write grant lets the grantee write the claim it names, and the write
+/// reaches the issuer. The tightest unauthorized party is this very peer,
+/// one claim over: its write at the read-only claim of the same
+/// publication is refused. That refusal proves the grantee-side courtesy
+/// check only; the issuer's gate is proven in `pdn-node`'s
+/// `scoped_writes.rs`, where the bypass lives.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // one write grant, with its denial in the same place
@@ -557,15 +474,13 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
         .await?
         .ok()?;
 
-    // The grantee holding the value is the precondition of writing over it:
-    // it says the grant arrived and the namespace is bound here.
+    // The precondition of writing over it: the namespace is bound here.
     entry_reads(&grantee, alice, "contact/phone", b"+1-555-0100")
         .await
         .context("the granted entry did not reach the grantee")?;
 
-    // Allowed: the grantee writes the claim the grant made writable, and the
-    // value reads back on both sides — on the issuer's, which is what says
-    // the write crossed rather than stopping in the grantee's own replica.
+    // Allowed: the value reads back on the issuer's side, so the write
+    // crossed.
     grantee
         .put(
             &format!("/debug/data/{alice}/contact/phone"),
@@ -596,10 +511,8 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
         refused.text()
     );
 
-    // Sentinel: a write on the granted claim, observed arriving, proves a
-    // completed session ran after the refusal — without it the issuer-side
-    // read below would pass whether or not the refused write was ever going
-    // to arrive.
+    // Sentinel: a completed session after the refusal, without which the
+    // issuer-side read below would pass either way.
     issuer
         .put(
             &format!("/debug/data/{alice}/contact/phone"),
@@ -632,34 +545,14 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
     Ok(())
 }
 
-/// Two personas of one person on one node, each with an audience of its own:
-/// Alice at work is known to Bob, Alice at leisure to Carol, and both
-/// connections carry data.
-///
-/// The node hosts both identities, which is the one arrangement the rest of
-/// this suite never builds — every other test puts one identity on one
-/// container. What it holds is that sharing a process is not sharing an
-/// audience: connections and grants are keyed by the hosting identity, so
-/// Bob is a peer of the work persona and a stranger to the leisure one.
-///
-/// The paired denials are read from the peers' side on purpose. There each
-/// node hosts a single identity, so "Bob asks for the leisure namespace" is
-/// an unambiguous question; asked on Alice's own node it would not be, since
-/// the read names the namespace and never the reader. Both denials are
-/// ordered after both positive reads, so an absence cannot pass for a value
-/// that has not replicated yet.
-///
-/// What no test here asserts is the other half of co-location: that one
-/// persona cannot read the other's data on the node they share. The
-/// principal every enforcement point names is the device — a serving node
-/// resolves a caller's rights from its transport-authenticated node id
-/// through the published device sets, the ingest gate keys write admission
-/// by namespace and node id, and a namespace secret is a bearer ticket
-/// scoped to neither persona. A device publishing one node id in two device
-/// sets therefore resolves to both, and its rights are the union by design.
-/// An assertion here would name a boundary that no layer draws, and the
-/// surface it would be written against — a read that names the namespace and
-/// never the reader — is the shape of that same fact, not its cause.
+/// Two personas of one person on one node, each with an audience of its
+/// own: sharing a process is not sharing an audience. The denials are read
+/// from the peers' side, where each node hosts one identity and the
+/// question is unambiguous — a read on Alice's node names the namespace and
+/// never the reader. Not asserted: that one persona cannot read the other's
+/// data on the node they share. Every enforcement point names the device,
+/// so a device in two device sets resolves to both by design; no layer
+/// draws that boundary.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // two personas and two audiences, kept in one place
@@ -698,9 +591,8 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
             .ok()?;
     }
 
-    // The same path under each persona, holding different data — so a read
-    // that reached the wrong namespace would answer the wrong bytes rather
-    // than nothing.
+    // Different data under the same path, so a read that reached the wrong
+    // namespace answers the wrong bytes rather than nothing.
     alice_node
         .put(
             &format!("/debug/data/{at_work}/contact/email"),
@@ -742,8 +634,7 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
     .await
     .context("Carol did not read the leisure persona's entry")?;
 
-    // Each persona's connections carry its own peer and not the other's —
-    // read on Alice's node, where the route names which persona is asked.
+    // Read on Alice's node, where the route names which persona is asked.
     let work_side: Connections = alice_node
         .get(&format!("/debug/identities/{at_work}/connections"))
         .await?
@@ -761,8 +652,7 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
         "the leisure persona knows Carol and not Bob: {leisure_side:?}"
     );
 
-    // Denied, both ways: a peer of one persona is a stranger to the other,
-    // and is refused as unknown rather than answered as absent.
+    // Denied, both ways: refused as unknown rather than answered as absent.
     for (peer_node, other_persona, who) in [
         (&bob_node, at_leisure, "Bob"),
         (&carol_node, at_work, "Carol"),

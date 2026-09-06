@@ -1,15 +1,9 @@
-//! Helpers shared by this crate's scenario tests.
-//!
-//! Runtime-level test support lives here rather than in `test-utils`: that
-//! crate serves the layer below (`data-layer`'s own tests depend on it), so a
-//! helper needing `Runtime` would force it to depend on `pdn-node` and make
-//! the lower layer's tests compile the runtime above them.
-//!
-//! The linking helpers drive the dialogue raw — its ALPN, framing, and
-//! message shapes mirrored here on purpose: they are the wire contract of
-//! ADR-0012, and a silent drift in the protocol must break these tests.
-// Each test binary includes this module and uses its own subset of the
-// helpers; what one binary leaves unused is not dead code of the crate.
+//! Helpers shared by this crate's scenario tests (runtime-level, so not in
+//! `test-utils`, which `data-layer`'s tests depend on). The linking helpers
+//! drive the dialogue raw — ALPN, framing, and message shapes mirrored on
+//! purpose: they are the wire contract of ADR-0012, and a silent drift must
+//! break these tests.
+// Each test binary uses its own subset of the helpers.
 #![allow(dead_code)]
 
 use anyhow::{ensure, Context, Result};
@@ -23,10 +17,7 @@ use pdn_node::{
 use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, memory_node, TIMEOUT};
 
-/// A runtime on memory storage — what this crate's in-process scenarios run
-/// on. Storage is a required choice of every spawn, and this helper is
-/// where the suite names it, so no scenario gains a temporary directory or
-/// filesystem I/O.
+/// A runtime on memory storage.
 pub async fn memory_runtime() -> Result<Runtime> {
     Runtime::spawn(SpawnOptions::memory()).await
 }
@@ -60,12 +51,9 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Run the linking dialogue raw from a bare node: dial the payload's
-/// address on the linking ALPN, present the secret, and return the reply's
-/// directory and data write tickets — what `link` does, without a runtime
-/// around it. The request mirrors the protocol's `{version, secret}`
-/// message (postcard encodes the struct exactly as this tuple), the reply
-/// its `{directory, data}`.
+/// Run the linking dialogue raw from a bare node. The request mirrors the
+/// protocol's `{version, secret}` message (postcard encodes the struct
+/// exactly as this tuple), the reply its `{directory, data}`.
 pub async fn dial_linking(
     node: &SyncNode,
     payload: &LinkingPayload,
@@ -89,10 +77,8 @@ pub async fn dial_linking(
     Ok((directory, data))
 }
 
-/// Present `payload`'s secret and never read the reply — the lost-response
-/// dialer of the linking convergence scenario. The connection is handed
-/// back still open (its receive half already dropped), so the caller
-/// decides when to drop it; the inviter's reply is lost either way.
+/// Present `payload`'s secret and never read the reply. The connection is
+/// handed back still open, its receive half already dropped.
 pub async fn dial_linking_without_reading(
     node: &SyncNode,
     payload: &LinkingPayload,
@@ -117,15 +103,10 @@ pub async fn dial_linking_without_reading_from(
     Ok(connection)
 }
 
-/// A store-level probe of `identity`'s directory on `runtime`: a bare node
-/// that links raw — the same act a linking device performs — and imports
-/// the directory from the reply, so everything it reads afterwards is what
-/// any device of the identity reads. Confirming itself is part of that act:
-/// the inviter registers a newcomer as pending, and only the newcomer's own
-/// write — which its write ticket is what permits — makes it a device.
-/// One attempt — a single dial succeeds reliably in the loopback test
-/// setup. Note the probe ends up in the device set, so device-set
-/// assertions use contains/exact-with-probe, never counts that forget it.
+/// A store-level probe of `identity`'s directory: a bare node that links
+/// raw and confirms itself, so everything it reads is what any device of
+/// the identity reads. The probe ends up in the device set, so device-set
+/// assertions never use counts that forget it.
 pub async fn link_probe(
     runtime: &Runtime,
     identity: PdnId,
@@ -138,21 +119,15 @@ pub async fn link_probe(
     Ok((node, directory))
 }
 
-/// Link `linker` into `identity`: mint a fresh invite on `inviter` and link
-/// once. One attempt — a single link succeeds reliably in the loopback test
-/// setup. Assertions about one specific invite — that *this* secret is refused,
-/// or must be the one burned — call `link` directly instead.
+/// Mint a fresh invite on `inviter` and link once. Assertions about one
+/// specific invite call `link` directly instead.
 pub async fn link_patiently(linker: &Runtime, inviter: &Runtime, identity: PdnId) -> Result<()> {
     let payload = inviter.identity().linking_invite(identity, None).await?;
     linker.identity().link(payload, TIMEOUT).await
 }
 
-/// Establish `scanner`'s side by presenting `invite`, once. A single
-/// establish succeeds reliably in the loopback test setup.
 /// `_inviter`/`_inviter_id` are unused, kept for call-site symmetry with
-/// the linking helper. Assertions about one specific invite — that *this*
-/// secret is refused, or must be the one burned — call `establish`
-/// directly instead.
+/// the linking helper.
 pub async fn establish_patiently(
     scanner: &Runtime,
     scanner_id: PdnId,
@@ -163,10 +138,9 @@ pub async fn establish_patiently(
     scanner.connections().establish(scanner_id, invite).await
 }
 
-/// The nominal claim these scenarios grant on: every grant is
-/// capability-scoped, so a publish needs a claim set even where the
-/// scenario is about the record crossing rather than about what it covers.
-// Test-only helper: clippy.toml's expect relaxation reaches `#[test]` bodies only.
+/// A claim set for a scenario about the record crossing rather than about
+/// what it covers.
+// clippy.toml's expect relaxation reaches `#[test]` bodies only.
 #[allow(clippy::expect_used)]
 pub fn nominal_claims(issuer: PdnId) -> NonEmpty<GrantedClaim> {
     claims_on(
@@ -176,9 +150,7 @@ pub fn nominal_claims(issuer: PdnId) -> NonEmpty<GrantedClaim> {
     )
 }
 
-/// The claim set covering exactly `path` of `issuer`'s namespace — read
-/// always, write when `write` — for a scenario whose subject is the data
-/// behind the grant rather than the record crossing.
+/// The claim set covering exactly `path` — read always, write when `write`.
 pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<GrantedClaim> {
     NonEmpty::new(GrantedClaim {
         claim: pdn_node::claim_id_of(&issuer, path),
@@ -186,15 +158,10 @@ pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<Grant
     })
 }
 
-/// Publish a grant of `issuer`'s namespace on `claims` from the giving
-/// side's hosted identity toward the receiving side's, and return once the
-/// receiver reads it whole over the connection's metadata pair. The
-/// crossing is a poll, not a wait: a grant's ticket payload is a blob and
-/// lags the record that names it, so `read_grants` omits it until it
-/// lands. Delivery alone is returned; a caller that needs the grant's
-/// value reads it inside its own poll (see `scoped_grant_patiently` in the
-/// scoped-grants scenarios) — a second read after this poll is not the
-/// same read.
+/// Publish a grant and return once the receiver reads it whole over the
+/// pair. Delivery alone: a caller that needs the grant's value reads it
+/// inside its own poll, since a second read after this one is not the same
+/// read.
 pub async fn granted_patiently(
     gives: &Runtime,
     gives_id: PdnId,

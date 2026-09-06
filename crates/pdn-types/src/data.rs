@@ -129,12 +129,8 @@ impl AsRef<str> for EntryPath {
 
 /// Metadata for a single data-layer entry, without the payload bytes.
 ///
-/// Returned by enumeration methods so callers can decide which entries'
-/// payloads to actually load.
-///
-/// The author dimension is omitted: in our model it is fixed to the
-/// issuer (so claims resolve across the issuer's devices via the data
-/// layer's newer-wins overwrite semantics) and would be redundant here.
+/// No author field: every read collapses the records at a key to the
+/// latest across authors, so the author carries no meaning to a consumer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
     pub issuer: PdnId,

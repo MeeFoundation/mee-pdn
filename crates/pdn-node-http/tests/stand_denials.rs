@@ -1,18 +1,7 @@
 //! The surface's refusals, each next to the authorized act it is the
-//! tightest denial of ([access-control-tests]).
-//!
-//! Every one arrives as a client error with a status of its own, so a
-//! container-level assertion can tell "the runtime refused you" from "you
-//! asked wrong" and from "this host is broken". A surface that answered
-//! alike for those would make each pairing below vacuous.
-//!
-//! An unhosted identity is 409 rather than the more natural 404 on purpose:
-//! route names here are unpinned, so a test asserting absence would keep
-//! passing after a route was renamed out from under it, and 404 stays
-//! reserved for a route the host does not serve and for an entry that is
-//! not there.
-//!
-//! [access-control-tests]: ../../../mia-docs/openspec/specs/code-practices/access-control-tests.md
+//! tightest denial of (`code-practices/access-control-tests.md`). An
+//! unhosted identity is 409 rather than 404 on purpose: route names are
+//! unpinned, so a test asserting absence would keep passing after a rename.
 
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
@@ -25,6 +14,11 @@ use common::{body, claims_on, entry_reads, grant_on, own_grant_reads, Stand};
 /// An identity no runtime in this test creates or links.
 const UNHOSTED: PdnId = PdnId::from_bytes([0x77; 32]);
 
+/// Each refusal of the surface arrives with a status of its own, beside the
+/// accepted act it denies: an unhosted identity (409), a grant naming a
+/// foreign issuer or no claim, a replayed invite payload, a read-only
+/// grantee's write, an absent entry (404), a malformed identifier, an empty
+/// payload, and a mistyped query parameter (400).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // the denials of one surface, kept beside their positives
@@ -46,10 +40,8 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         .await?
         .ok()?;
 
-    // Denied (an unhosted identity): the runtime does not host what the
-    // request addressed. Beside it, the same route on a hosted identity
-    // answers — without which "not the value I expected" would be all this
-    // assertion says.
+    // Denied (an unhosted identity). Beside it, the same route on a hosted
+    // identity answers.
     let unhosted = inviter
         .get(&format!("/debug/identities/{UNHOSTED}/connections"))
         .await?;
@@ -84,9 +76,9 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         .await?
         .ok()?;
 
-    // Denied (a grant naming a foreign issuer): granting another identity's
-    // data is delegation, which is not expressible. Beside it, the same
-    // publication naming its own issuer is accepted.
+    // Denied (a grant naming a foreign issuer): delegation is not
+    // expressible. Beside it, the same publication naming its own issuer is
+    // accepted.
     let foreign = inviter
         .publish_grant(
             alice,
@@ -117,13 +109,9 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         )
         .await?
         .ok()?;
-    // What the refusal left behind, read from the half the refused
-    // publication writes — Alice's own. Bob's half answers nothing here
-    // whatever the refusal did, since Bob publishes nothing in this
-    // scenario. The accepted publication above is what makes the absence a
-    // denial: an unopened pair reads empty too, so the wait for Alice's own
-    // record to become readable comes first, and only then does the
-    // assertion say that no record names Bob as issuer.
+    // Read from the half the refused publication writes — Alice's own. An
+    // unopened pair reads empty too, so the wait for the accepted record
+    // comes first.
     own_grant_reads(&inviter, alice, bob, alice).await?;
     let after_foreign: OwnGrant = inviter
         .get(&format!("/debug/identities/{alice}/own-grants/{bob}"))
@@ -158,9 +146,8 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         claimless.text()
     );
 
-    // Denied (a replayed invite payload): the establishment above burnt the
-    // secret, so presenting it again is refused — and the inviter records no
-    // second connection, which is what says the refusal left no state.
+    // Denied (a replayed invite payload): the secret is burnt, and the
+    // inviter records no second connection.
     let refused_replay = replayer
         .post(&format!("/debug/identities/{carol}/establish"), payload)
         .await?;
@@ -186,10 +173,8 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         .json()?;
     assert!(replayer_recorded.connections.is_empty());
 
-    // Allowed, then denied on the same claim: the grantee reads the granted
-    // entry, and its write into the same claim is refused because the grant
-    // covers it read-only — with the value that was there before still what
-    // reads back on both sides.
+    // Allowed, then denied on the same claim: the grant covers it read-only,
+    // and the prior value still reads back on both sides.
     entry_reads(&scanner, alice, "contact/email", b"alice@example.org")
         .await
         .context("the granted entry did not reach the grantee")?;
@@ -215,11 +200,9 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         Bytes::from_static(b"alice@example.org"),
         "the refused write must not touch the grantee's own replica"
     );
-    // Sentinel: a control write to another path proves a completed
-    // two-way session ran after the refusal, before the issuer-side read
-    // below is trusted to say anything about delivery rather than about
-    // timing — an unpolled read right after the refusal could pass whether
-    // or not the bad write was ever going to arrive.
+    // Sentinel: a completed two-way session after the refusal, before the
+    // issuer-side read is trusted to say anything about delivery rather
+    // than timing.
     inviter
         .put(
             &format!("/debug/data/{alice}/contact/sentinel"),

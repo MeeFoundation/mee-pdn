@@ -1,16 +1,9 @@
-//! Sibling serving through the runtime services, ceremonies included: an
-//! identity is created on one runtime and linked onto a second, the
-//! connection and the scoped grant arrive by establishment and the pair,
-//! and after the issuer goes offline the linked device still catches up —
-//! the grant record over the device-replicated pair, the claim itself from
-//! its sibling device, served per the locally replicated grant — and so
-//! does a device that joins only after the issuer is already gone. No
-//! import act appears in any of them: the grant binder is what turns a grant
-//! that replicated in into an imported namespace, and a withdrawal back
-//! into a forgotten one. Paired denial per
-//! `code-practices/access-control-tests.md`: an outsider holding a
-//! sibling-minted ticket — the same serving device demonstrably answers the
-//! sibling — obtains nothing.
+//! Sibling serving through the runtime services, ceremonies included: after
+//! the issuer goes offline, a linked device — and one that joins only
+//! afterwards — still catches up on the grant record over the pair and on
+//! the claim from its sibling, with no import act anywhere: the grant
+//! binder imports and forgets. Paired denial: an outsider holding a
+//! sibling-minted ticket obtains nothing from the same serving device.
 
 use std::time::Duration;
 
@@ -25,12 +18,8 @@ use test_utils::{eventually, TIMEOUT};
 mod common;
 use common::establish_patiently;
 
-/// The reconcile cadence of these scenarios — the outsider denial below is
-/// "it retried over several intervals and was refused", made cheap by
-/// injecting a sub-second interval.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-/// Spawn a runtime with the tests' short reconcile cadence.
 async fn spawn_runtime() -> Result<Runtime> {
     Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -58,10 +47,8 @@ async fn grant_arrives(
     .await
 }
 
-/// Poll until `reads` sees `expected` at `path` in `issuer`'s namespace.
-/// An unbound issuer counts as "not yet", not as a failure: nothing imports
-/// the namespace up front any more, so until the binder acts on the grant
-/// the issuer resolves to nothing at all.
+/// An unbound issuer counts as "not yet": until the binder acts on the
+/// grant the issuer resolves to nothing at all.
 async fn claim_arrives(
     reads: &Runtime,
     issuer: PdnId,
@@ -77,20 +64,12 @@ async fn claim_arrives(
     .await
 }
 
-/// Allowed: Alice's laptop — linked after the fact, never introduced to
-/// Bob's runtime directly — catches up on the pair, the grant, and the
-/// granted claim while Bob is offline, with no import act anywhere: the
-/// records cross the device-replicated stores, the binder imports what the
-/// grant names, and the claim is served by the phone per the replicated
-/// grant.
-///
-/// Denied, existence hidden: Bob's withheld claim never reaches the
-/// laptop — the phone serves the claim set, not its holdings.
-///
-/// Denied, outsider with a sibling ticket: a runtime holding a ticket the
-/// phone itself minted resolves in no audience directory and obtains
-/// nothing, probed after the laptop's proven convergence plus several of
-/// its own reconcile intervals.
+/// Allowed: the laptop, linked after the fact and never introduced to Bob's
+/// runtime, catches up on the pair, the grant, and the claim while Bob is
+/// offline. Denied: Bob's withheld claim never reaches it — the phone
+/// serves the claim set, not its holdings; Carol, holding a ticket the
+/// phone itself minted, resolves in no audience directory and obtains
+/// nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -117,8 +96,7 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
         .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
         .await?;
 
-    // The phone converges on the granted claim while Bob is online — the
-    // binder imports what the grant names, unprompted.
+    // The binder imports what the grant names, unprompted.
     assert!(
         claim_arrives(&rt_phone, bob, &email, b"bob@example.org").await?,
         "the granted claim did not reach the phone while Bob was online"
@@ -127,8 +105,7 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     // Bob goes offline before the laptop ever touches his grant.
     rt_bob.shutdown().await?;
 
-    // The grant record crossed device-to-device, and the claim behind it
-    // followed — from the sibling, with the issuer away and no import act.
+    // Both crossed from the sibling, with the issuer away.
     assert!(
         grant_arrives(&rt_laptop, alice, bob, bob).await?,
         "the grant record did not reach the laptop from its sibling"
@@ -154,10 +131,8 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
         "the laptop's view must contain exactly the granted subset"
     );
 
-    // Denied, outsider: Carol holds a ticket the phone itself minted —
-    // reachable, sibling-addressed — but resolves in no audience
-    // directory. After the laptop's proven convergence and several of her
-    // own reconcile intervals, she holds nothing.
+    // Denied, outsider: Carol's ticket is sibling-addressed and reachable,
+    // and she resolves in no audience directory.
     let leaked = rt_phone.data().share(bob, ShareMode::Read).await?;
     rt_carol.data().import_scoped(bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
@@ -173,16 +148,11 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     Ok(())
 }
 
-/// Allowed: a device that joins the identity only after the issuer has gone
-/// offline still catches up. Nothing of this connection was ever on the
-/// laptop while Bob was reachable, so every record crosses from the sibling:
-/// the connection, the pair's two halves, the grant inside the half Bob
-/// wrote, and the claim behind it. The pair's halves are pointed at the
-/// identity's own devices for exactly this — a ticket names the devices of
-/// the side that minted it, and Bob's names only Bob's.
-///
-/// Denied, outsider with a sibling ticket: Carol holds a ticket the phone
-/// minted, resolves in no audience directory, and obtains nothing.
+/// A device that joins only after the issuer has gone offline still catches
+/// up: every record crosses from the sibling, which is what the pair's
+/// halves being pointed at the identity's own devices exists for — a
+/// ticket names the devices of the side that minted it. Denied: Carol, as
+/// above.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -224,9 +194,7 @@ async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()>
         "the granted claim did not catch up from the sibling with the issuer offline"
     );
 
-    // Denied, outsider: a ticket the phone itself minted resolves in no
-    // audience directory, probed after several of Carol's own reconcile
-    // intervals.
+    // Denied, outsider.
     let leaked = rt_phone.data().share(bob, ShareMode::Read).await?;
     rt_carol.data().import_scoped(bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
@@ -243,9 +211,8 @@ async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()>
 }
 
 /// The binder's other direction: a withdrawn grant takes the namespace back
-/// out. What the binder imported it also forgets once the record it stood on
-/// is gone, so the grantee stops holding bytes no grant justifies — and the
-/// issuer becomes unknown again rather than resolving to a stale replica.
+/// out, and the issuer becomes unknown again rather than resolving to a
+/// stale replica.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_grant_takes_the_namespace_back_out() -> Result<()> {
     let rt_alice = spawn_runtime().await?;

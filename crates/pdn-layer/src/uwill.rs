@@ -1,17 +1,7 @@
-//! `UWill` capability tokens.
-//!
-//! The delegation token format shared by every part of the platform that
-//! issues, transports, stores, or validates capabilities. The module is
-//! transport-independent: it knows nothing about iroh or the data-layer
-//! backend, and its types must not leak below the PDN layer — the data
-//! layer sees tokens only as opaque payloads plus an injected ingest
-//! policy.
-//!
-//! Pure chain validation (proof-chain verification, expiry, revocation
-//! checks) belongs here; the node runtime resolves an entry to the
-//! relevant chain and calls into this module for the verdict.
-//!
-//! See `components/mee-pdn/pdn-layer/uwill.md` for the full specification.
+//! `UWill` capability tokens: the format alone. Nothing here validates,
+//! issues, or revokes a token, and these types must not leak below the PDN
+//! layer — the data layer enforces access on its own grant vocabulary.
+//! Spec: `components/mee-pdn/pdn-layer/uwill.md`.
 
 use pdn_types::{ClaimId, PdnId};
 use serde::{Deserialize, Serialize};

@@ -1,19 +1,9 @@
-//! Mixed per-claim rights end to end through the runtime services — the
-//! shape this change exists for: over one connection Bob grants Alice
-//! `contact/email` read-only and `contact/phone` read-write.
-//!
-//! Allowed: Alice reads both claims, and her overwrite of the read-write
-//! claim reaches Bob. Denied at the surface: her write at the read-only
-//! claim is refused at the call site ([`WriteNotGranted`]), before the
-//! replica is touched. Denied at the gate, with recovery: a forced write
-//! outside the write set — the courtesy bypassed — never reaches Bob, and
-//! Alice's provisional entry is retracted back to Bob's value, surfaced as
-//! an event. The read denials stay with `scoped_grants.rs`; this file is
-//! the write side, paired per `code-practices/access-control-tests.md`.
-//!
-//! The forced write goes through `RuntimeDataService::write_unguarded`, so
-//! this file compiles only under the `test-util` feature — the `just` dev
-//! recipes enable it; a bare `cargo build`/`check` omits the file.
+//! The write side of mixed per-claim rights (the read denials are in
+//! `scoped_grants.rs`): Bob grants Alice `contact/email` read-only and
+//! `contact/phone` read-write. Denied at the surface: a write at the
+//! read-only claim is refused at the call site. Denied at the gate: a
+//! forced write past the courtesy (`write_unguarded`, hence `test-util`
+//! only) never reaches Bob and is retracted, surfaced as an event.
 #![cfg(feature = "test-util")]
 
 use std::time::Duration;
@@ -29,9 +19,8 @@ use test_utils::{eventually, TIMEOUT};
 mod common;
 use common::establish_patiently;
 
-/// A brisk reconcile cadence, so the forced write draws its in-band rejection
-/// — and its retraction — in a sub-second session rather than the production
-/// reconcile interval.
+/// The forced write draws its rejection and retraction in a sub-second
+/// session.
 const RECONCILE: Duration = Duration::from_millis(300);
 
 async fn spawn_runtime() -> Result<Runtime> {
@@ -58,6 +47,12 @@ async fn reads_value(
     .await
 }
 
+/// Allowed: Alice reads both claims and her overwrite of the read-write
+/// claim reaches Bob. Denied at the surface: her write at the read-only
+/// claim is refused at the call site, before the replica is touched. Denied
+/// at the gate: a forced write past the courtesy never reaches Bob, and
+/// Alice's provisional entry is retracted back to Bob's value, surfaced as
+/// an event.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and both denied sides in one place
 async fn mixed_grant_email_read_only_phone_read_write() -> Result<()> {
@@ -124,12 +119,9 @@ async fn mixed_grant_email_read_only_phone_read_write() -> Result<()> {
         "the refused write must not touch the local replica"
     );
 
-    // Denied at the gate, with recovery: a client that bypasses the
-    // courtesy writes the read-only claim anyway — the secret rode the
-    // write ticket, so the entry is signed and reconciles, but Bob's gate
-    // refuses it every session, and says so in band. Alice's node retracts
-    // it on the first rejection and emits the event; her view returns to
-    // Bob's value.
+    // Denied at the gate, with recovery: the secret rode the write ticket, so
+    // the forced entry is signed and reconciles; Bob's gate refuses it in
+    // band, and Alice's node retracts on the first rejection.
     rt_alice
         .data()
         .write_unguarded(bob, &email, b"forced-by-alice")
@@ -141,9 +133,8 @@ async fn mixed_grant_email_read_only_phone_read_write() -> Result<()> {
         "the forced write must be stored locally before the verdict"
     );
 
-    // The retraction event names the forced entry — including the provenance
-    // the host is meant to recover from: the address of the lost payload in
-    // the blob store, and the device that decided.
+    // The event carries the provenance a host recovers from: the lost
+    // payload's address in the blob store, and the device that decided.
     let event = tokio::time::timeout(test_utils::TIMEOUT, retractions.recv())
         .await
         .map_err(|_elapsed| anyhow::anyhow!("no retraction event within the timeout"))??;
@@ -177,15 +168,12 @@ async fn mixed_grant_email_read_only_phone_read_write() -> Result<()> {
     Ok(())
 }
 
-/// The narrowing half of the gate: a claim leaving the grant does not destroy
-/// what the issuer accepted under it while it was there. Bob grants Alice
-/// write on `contact/email`, keeps her entry, then republishes the grant on
-/// `contact/phone` alone — the grant narrows, it is not withdrawn.
-///
-/// Alice goes on offering the entry every session, because Bob's narrowed
-/// egress no longer serves it back and the two sets read as divergent. Bob's
-/// gate refuses it, and refuses it *silently*: he holds that entry, and a
-/// rejection is what makes Alice destroy her copy of it.
+/// A claim leaving the grant does not destroy what the issuer accepted
+/// under it: Bob narrows Alice's grant from email and phone to phone alone,
+/// and his copy of her email entry stays. Alice goes on offering the entry
+/// every session, since Bob's narrowed egress no longer serves it back; his
+/// gate refuses it silently, because a rejection is what makes Alice
+/// destroy her copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn narrowing_a_grant_keeps_what_the_issuer_already_accepted() -> Result<()> {
     let rt_bob = spawn_runtime().await?;
@@ -225,9 +213,8 @@ async fn narrowing_a_grant_keeps_what_the_issuer_already_accepted() -> Result<()
         "the granted write did not reach the issuer"
     );
 
-    // Bob narrows the grant to phone alone. Nothing is withdrawn, so the
-    // namespace stays bound at Alice — but email leaves her read slice, so
-    // Bob stops serving that entry back and the two sets read as divergent.
+    // Narrowed to phone alone: nothing is withdrawn, but email leaves
+    // Alice's read slice.
     rt_bob
         .connections()
         .publish_grant(bob, alice, bob, common::claims_on(bob, &phone, true))
@@ -277,12 +264,9 @@ async fn narrowing_a_grant_keeps_what_the_issuer_already_accepted() -> Result<()
     Ok(())
 }
 
-/// The sibling half of retraction: a retracted provisional write does not
-/// flap back from a sibling device that replicated it. Alice hosts two
-/// devices; her phone forces a write Bob refuses, the laptop replicates
-/// that provisional entry from its sibling, and once the phone retracts,
-/// the marker crosses to the laptop and the laptop drops it too — so a
-/// reader on the laptop returns to Bob's value rather than the forged one.
+/// A retracted provisional write does not flap back from a sibling device
+/// that replicated it: the marker crosses to the laptop and it drops the
+/// entry too.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // two devices, allowed and the flap denial in one place
 async fn a_retraction_does_not_flap_back_from_a_sibling() -> Result<()> {
@@ -295,9 +279,8 @@ async fn a_retraction_does_not_flap_back_from_a_sibling() -> Result<()> {
     let link_invite = rt_phone.identity().linking_invite(alice, None).await?;
     rt_laptop.identity().link(link_invite, TIMEOUT).await?;
 
-    // The grant is mixed — email read-only, phone read-write — so it ships
-    // a write ticket (the secret) while email stays outside the write set.
-    // The phone can thus produce an email entry the gate refuses.
+    // Mixed, so the grant ships a write ticket while email stays outside the
+    // write set.
     let bob = rt_bob.identity().create().await?;
     let invite = rt_bob.connections().invite(bob, None).await?;
     establish_patiently(&rt_phone, alice, &rt_bob, bob, invite).await?;
@@ -324,14 +307,9 @@ async fn a_retraction_does_not_flap_back_from_a_sibling() -> Result<()> {
         "the laptop did not converge on the granted claim"
     );
 
-    // The phone forces the read-only claim under its own author. It stores
-    // locally and, as a sibling, may replicate the provisional entry to the
-    // laptop before Bob's gate refuses it. Bob nacks the phone in-band, so the
-    // phone retracts deterministically and records the marker; the marker
-    // replicates to the laptop, which drops the forged entry too (and the
-    // laptop, reaching Bob's gate itself, would be refused there as well).
-    // Whichever path runs, the forged value survives on neither device — it
-    // does not flap back from the sibling.
+    // The phone forces the read-only claim and may replicate it to the laptop
+    // before Bob's gate refuses it. Whichever path runs, the forged value
+    // survives on neither device.
     rt_phone
         .data()
         .write_unguarded(bob, &email, b"forced-by-phone")

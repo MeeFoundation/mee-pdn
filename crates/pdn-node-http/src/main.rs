@@ -12,50 +12,32 @@ use std::{sync::Arc, time::Duration};
 use pdn_node::{Runtime, SpawnOptions};
 use pdn_node_http::{bind_addr_from_env, data_dir_from_env, debug_enabled_from_env, router};
 
-/// How long `main` waits for axum's graceful drain — in-flight requests,
-/// e.g. a long-running `/debug/link` — before giving up on them and moving
-/// on to `runtime.shutdown()` regardless. Independent of any ceremony's own
-/// budget (which can run up to a day). Runtime shutdown has its own bounds.
-///
-/// This budget and that shutdown together have to fit inside the grace the
-/// stopper allows, or the process is killed part-way and the drain promised
-/// here is the first thing lost: a container runtime sends SIGTERM and
-/// follows it with SIGKILL about 10 seconds later unless it is told
-/// otherwise. Sized against that default, rather than against a wider grace
-/// every deployment would have to remember to configure.
+/// How long `main` waits for axum's graceful drain before moving on to
+/// `runtime.shutdown()`. This budget and that shutdown together have to fit
+/// inside a container runtime's default grace — SIGTERM, then SIGKILL about
+/// 10 seconds later — or the drain is the first thing lost.
 const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // Configuration is parsed whole before anything is created: a typo in
-    // any of the variables answers at once, with no directory made, no key
-    // minted, no lock taken and no recovery run for a process that was
-    // never going to serve. It also keeps the markers below meaning what
-    // they say — a failure between them is a failure of the spawn, not of
-    // a value that was readable all along.
+    // Parsed whole before anything is created, so a typo answers at once
+    // with no directory made, no key minted, no lock taken.
     let data_dir = data_dir_from_env()?;
     let bind_addr = bind_addr_from_env()?;
     let debug_enabled = debug_enabled_from_env()?;
 
-    // The runtime is spawned before the listener binds: an unusable
-    // directory — held by another node, unwritable — exits here, serving
-    // neither liveness nor the debug surface, and never falls back to
-    // memory.
+    // Spawned before the listener binds: an unusable directory exits here,
+    // serving nothing and never falling back to memory.
     let runtime = Arc::new(Runtime::spawn(SpawnOptions::on_directory(data_dir)).await?);
-    // The two startup markers below bracket the only silent stretch of a
-    // node's life. Without them a node stuck in `Runtime::spawn` and one
-    // serving happily but unreachable leave byte-identical logs, and the
-    // difference between them is the difference between a defect here and a
-    // defect in whatever publishes the port.
+    // The two startup markers bracket the only silent stretch of a node's
+    // life: without them a node stuck in `spawn` and one serving but
+    // unreachable leave byte-identical logs.
     tracing::info!("runtime spawned");
     let result = run(&runtime, bind_addr, debug_enabled).await;
-    // Always runs, on every outcome of `run` above, `?`-early-returns
-    // included: skipping it leaves the endpoint and every task a hosted
-    // identity spawned running while the process tries to exit, which holds
-    // the exit for minutes. `Runtime::shutdown` takes `&self` and is
-    // idempotent, so nothing here needs `runtime` back afterward.
+    // On every outcome of `run`: skipping it leaves the endpoint and every
+    // hosted identity's tasks running while the process tries to exit.
     let shutdown = runtime.shutdown().await;
     match (result, shutdown) {
         (Err(primary), Err(shutdown)) => Err(anyhow::anyhow!(
@@ -67,12 +49,8 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The fallible part of serving: bind the parsed address and serve until a
-/// stop signal arrives, then drain for at most [`GRACEFUL_DRAIN_BUDGET`].
-/// Split out of `main` so that every exit from here — the stop signal
-/// followed by the drain budget, or any `?` on a bind failure — still
-/// reaches `runtime.shutdown()` in `main`, unconditionally and exactly
-/// once.
+/// Split out of `main` so every exit — the drained stop, or a `?` on a
+/// bind failure — reaches `runtime.shutdown()` exactly once.
 async fn run(
     runtime: &Arc<Runtime>,
     bind_addr: std::net::SocketAddr,
@@ -82,9 +60,7 @@ async fn run(
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = ?listener.local_addr()?, "HTTP listening");
 
-    // The drain budget starts counting only once a stop signal actually
-    // arrives — `stopped` stays pending, and `serve` runs unbounded, for as
-    // long as no signal has come in.
+    // The drain budget starts counting only once a stop signal arrives.
     let stopped = Arc::new(tokio::sync::Notify::new());
     let signalled = Arc::clone(&stopped);
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -92,8 +68,6 @@ async fn run(
         signalled.notify_one();
     });
 
-    // Past this budget, whatever of the drain remains is dropped along with
-    // the listener, and `main` moves on to `runtime.shutdown()` regardless.
     let drain_budget_spent = async {
         stopped.notified().await;
         tokio::time::sleep(GRACEFUL_DRAIN_BUDGET).await;
@@ -108,9 +82,8 @@ async fn run(
     }
 }
 
-/// Whichever of Ctrl-C and SIGTERM arrives first. A container stop sends
-/// SIGTERM, so on Ctrl-C alone the graceful path would never run in the one
-/// deployment that has it.
+/// Ctrl-C or SIGTERM: a container stop sends the latter, so on Ctrl-C alone
+/// the graceful path would never run in the one deployment that has it.
 async fn stop_signal() {
     let interrupt = async {
         match tokio::signal::ctrl_c().await {

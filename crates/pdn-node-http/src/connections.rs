@@ -1,10 +1,6 @@
-//! Connection handlers: the pairing ceremony's two halves, the connection
-//! list, and the grant surface over a connection's metadata pair.
-//!
-//! Reads report what the runtime reports right now. A grant record whose
-//! ticket payload is still arriving reads as no grant yet, and the caller
-//! polls — the host inventing a wait would hide the difference between slow
-//! and never, exactly where a harness needs to see it.
+//! Connection handlers. Reads report what the runtime reports right now:
+//! a host inventing a wait would hide the difference between slow and
+//! never, exactly where a harness needs to see it.
 
 use std::sync::Arc;
 
@@ -24,10 +20,8 @@ use crate::{
     },
 };
 
-/// `POST /debug/identities/{identity}/invite` — mint the payload a
-/// counterparty consumes. Like a linking payload it carries a live one-time
-/// secret, and a captured one can be consumed in the intended
-/// counterparty's place.
+/// `POST /debug/identities/{identity}/invite` — the payload carries a live
+/// one-time secret.
 pub(crate) async fn invite(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
@@ -42,8 +36,7 @@ pub(crate) async fn invite(
     Ok(Json(payload))
 }
 
-/// `POST /debug/identities/{identity}/establish` — consume an invite
-/// payload and run the establishment dialogue to its end.
+/// `POST /debug/identities/{identity}/establish`.
 pub(crate) async fn establish(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
@@ -67,8 +60,7 @@ pub(crate) async fn list(
     Ok(Json(Connections { connections }))
 }
 
-/// `POST /debug/identities/{identity}/grants/{peer}` — publish a grant of
-/// the granting identity's own data on exactly the claims named.
+/// `POST /debug/identities/{identity}/grants/{peer}`.
 pub(crate) async fn publish_grant(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer)): Path<(String, String)>,
@@ -98,8 +90,8 @@ pub(crate) async fn publish_grant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /debug/identities/{identity}/grants/{peer}` — the capabilities the
-/// peer published toward this identity, without their tickets.
+/// `GET /debug/identities/{identity}/grants/{peer}` — capabilities without
+/// their tickets.
 pub(crate) async fn read_grants(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer)): Path<(String, String)>,
@@ -117,9 +109,8 @@ pub(crate) async fn read_grants(
     Ok(Json(PeerGrants { grants }))
 }
 
-/// `GET /debug/identities/{identity}/own-grants/{peer}` — the capability
-/// this identity published toward that peer, as the answering device holds
-/// it, without its ticket.
+/// `GET /debug/identities/{identity}/own-grants/{peer}` — as the answering
+/// device holds it, without its ticket.
 pub(crate) async fn read_own_grants(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer)): Path<(String, String)>,
@@ -135,8 +126,7 @@ pub(crate) async fn read_own_grants(
     Ok(Json(OwnGrant { grant }))
 }
 
-/// `DELETE /debug/identities/{identity}/grants/{peer}/{issuer}` — withdraw
-/// the grant of that issuer's data toward that peer.
+/// `DELETE /debug/identities/{identity}/grants/{peer}/{issuer}`.
 pub(crate) async fn withdraw_grant(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, peer, issuer)): Path<(String, String, String)>,
