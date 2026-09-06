@@ -37,13 +37,19 @@ build-watch:
   set -eux
   cargo watch -x 'build --workspace'
 
-# Install local developer tooling (cargo-watch, cargo-nextest, wasm targets)
+# Install local developer tooling: the pinned toolchain (rust-toolchain.toml), cargo-watch, cargo-nextest, cargo-deny
 setup-tooling:
   #!/bin/sh
-  set -eux
-  cargo install cargo-watch
-  cargo install cargo-nextest --locked
-  rustup target add wasm32-wasip1 wasm32-unknown-unknown
+  set -eu
+  # Channel, components and targets from rust-toolchain.toml.
+  (set -x; rustup toolchain install)
+  # Only what PATH lacks: `cargo install` refuses a binary it did not put
+  # there (a pre-built nextest, a Homebrew cargo-deny), and a rebuild of a
+  # tool already present buys nothing.
+  for tool in cargo-watch cargo-nextest cargo-deny; do
+    if command -v "$tool" >/dev/null 2>&1; then echo "$tool: present ($(command -v "$tool"))"; continue; fi
+    (set -x; cargo install "$tool" --locked)
+  done
 
 # The workspace root is not an openspec root — the specs live in the sibling
 # repo `mia-docs/` — so the skills here are the ones `openspec update` writes
@@ -436,6 +442,10 @@ hammer binary count="100":
   echo "hammer: $fails failures over {{ count }} iterations"
   [ "$fails" -eq 0 ]
 
+# Check the dependency tree against deny.toml (advisories, licenses, sources)
+audit:
+  cargo deny check
+
 # Lint and type-check without modifying files
 check:
   #!/bin/sh
@@ -482,10 +492,11 @@ check-store:
 # Includes the container suite, as `fix` does: every test of the HTTP surface
 # is one. Needs a container daemon, and builds the image. The store's other
 # feature sets and its wasm build run here as the pipeline runs them.
-[doc("Lint, build, test, store matrix, container suite (needs docker)")]
+[doc("Audit, lint, build, test, store matrix, container suite (needs docker)")]
 precommit-check:
   #!/bin/sh
   set -eux
+  just audit
   just check
   just check-store
   just test
@@ -496,10 +507,11 @@ precommit-check:
 # pass without it says nothing about that crate. Needs a container daemon,
 # and builds the image. The store's other feature sets and its wasm build
 # run here as the pipeline runs them.
-[doc("Lint, build, test, store matrix, container suite, attempt fixes (needs docker)")]
+[doc("Audit, lint, build, test, store matrix, container suite, attempt fixes (needs docker)")]
 fix:
   #!/bin/sh
   set -eux
+  just audit
   just check-fix
   just check-store
   just test

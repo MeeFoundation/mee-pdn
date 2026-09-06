@@ -2,6 +2,7 @@
 name = "pdn-node-http"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Thin HTTP host for the demo stand, embedding one pdn-node runtime"
 
 [dependencies]
@@ -24,7 +25,7 @@ percent-encoding = "2"
 # The stand's transport: a client over a container's published port. No TLS
 # backend — the stand speaks plain HTTP to loopback and nothing else.
 reqwest = { version = "0.12", default-features = false }
-testcontainers = "0.26"
+testcontainers = "0.28"
 # `io-util` for the stand's log follower, which re-attaches a container's
 # log capture after a restart; the crate's own build needs no reader.
 tokio = { version = "1", features = ["io-util"] }
