@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 It is n0's `iroh-docs`, diverged where PDN's access model needs it, carrying upstream's version number and never published. "Upstream" below means that crate; the wire protocol and its ALPN keep the upstream name.
 
+[`UPSTREAM.md`](UPSTREAM.md) tracks every upstream commit since the fork point with a verdict on each — adapted, not applicable, already fixed here, or not yet handled. A commit missing from it is one nobody has looked at.
+
 Two non-obvious facts shape the whole design:
 
 - **Documents store hashes, not content.** Each *Entry* maps a key to the BLAKE3 hash, size, and timestamp of some content — the content bytes themselves are never stored in or transferred through a replica. Actual blob transfer is delegated to `iroh-blobs`.
