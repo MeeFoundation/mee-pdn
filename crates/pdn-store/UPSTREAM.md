@@ -18,7 +18,7 @@ Refresh the list by fetching upstream and reading `git log <bottom hash>..upstre
 
 ## 2026-08-17 · `f8d48e1` · Emil Sayahi · docs: fix `SyncEvent` property comments (#116)
 
-**Not yet handled; applies.** The doc comments on `SyncEvent::finished` and `SyncEvent::started` in `src/engine/live.rs` are still swapped here. A one-line correction to take on the next touch of that file.
+**Adapted** on 2026-09-06. The doc comments on `SyncEvent::finished` and `SyncEvent::started` in `src/engine/live.rs` were swapped; the two lines now sit on the fields they describe, as upstream has them. The values were always assigned correctly — `finished` is taken at event construction, `started` comes from the sync state — so only rustdoc changes.
 
 ## 2026-07-30 · `ad80e69` · Floris Bruynooghe · chore: run scheduled CI jobs earlier (#115)
 
