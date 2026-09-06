@@ -754,6 +754,18 @@ impl<'a> StoreInstance<'a> {
         }
     }
 
+    /// Every namespace's records share one table, so an identifier naming
+    /// another namespace would read — or, in `remove_prefix_filtered`,
+    /// delete — that namespace's rows. Refused, as `get_range` refuses a
+    /// foreign boundary.
+    fn ensure_own_namespace(&self, id: &RecordIdentifier) -> Result<()> {
+        anyhow::ensure!(
+            id.namespace() == self.namespace,
+            "record identifier names another namespace"
+        );
+        Ok(())
+    }
+
     /// The instance a sync session reads through.
     pub(crate) fn with_session_snapshot(
         namespace: NamespaceId,
@@ -969,14 +981,16 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         &mut self,
         id: &RecordIdentifier,
     ) -> Result<Self::ParentIterator<'_>, Self::Error> {
+        self.ensure_own_namespace(id)?;
         let tables = self.store.as_mut().tables()?;
-        ParentIterator::new(tables, id.namespace(), id.author(), id.key().to_vec())
+        ParentIterator::new(tables, self.namespace, id.author(), id.key().to_vec())
     }
 
     #[cfg(test)]
     fn prefixed_by(&mut self, id: &RecordIdentifier) -> Result<Self::RangeIterator<'_>> {
+        self.ensure_own_namespace(id)?;
         let tables = self.store.as_mut().tables()?;
-        let bounds = RecordsBounds::author_prefix(id.namespace(), id.author(), id.key_bytes());
+        let bounds = RecordsBounds::author_prefix(self.namespace, id.author(), id.key_bytes());
         let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
         Ok(chain_none(iter))
     }
@@ -986,7 +1000,8 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         id: &RecordIdentifier,
         predicate: impl Fn(&Record) -> bool,
     ) -> Result<usize> {
-        let bounds = RecordsBounds::author_prefix(id.namespace(), id.author(), id.key_bytes());
+        self.ensure_own_namespace(id)?;
+        let bounds = RecordsBounds::author_prefix(self.namespace, id.author(), id.key_bytes());
         self.store.as_mut().modify(|tables| {
             let cb = |_k: RecordsId, v: RecordsValue| {
                 let (timestamp, _namespace_sig, _author_sig, len, hash) = v;

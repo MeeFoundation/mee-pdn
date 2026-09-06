@@ -6,8 +6,12 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use iroh::{endpoint::presets, Endpoint, PublicKey, SecretKey};
+use iroh::{
+    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
+    SecretKey,
+};
 use iroh_blobs::Hash;
+use iroh_gossip::{api::Event as GossipEvent, net::Gossip, proto::TopicId};
 use n0_future::{
     time::{Duration, Instant},
     Stream, TryStreamExt,
@@ -130,6 +134,115 @@ async fn sync_simple() -> Result<()> {
     )
     .await;
 
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// One undecodable gossip message does not end a namespace's receive loop:
+/// what comes after it is still delivered, and the next write still arrives
+/// live. The sender is a bare gossip peer, not a docs node — the topic id is
+/// the namespace id, which any ticket carries, so this is what a ticket holder
+/// can do with the ticket alone.
+///
+/// Ordering: the sender leaves the topic right after the message, and its
+/// `NeighborDown` at the subscriber travels the same connection behind the
+/// message, so asserting it before the write proves the loop survived the
+/// message rather than never having seen it.
+#[tokio::test]
+#[traced_test]
+async fn sync_continues_after_invalid_gossip_message() -> Result<()> {
+    let mut rng = test_rng(b"sync_continues_after_invalid_gossip_message");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let author0 = clients[0].docs().author_create().await?;
+    let doc0 = clients[0].docs().create().await?;
+    let hash_k1 = doc0
+        .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
+        .await?;
+    let writer_ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    let doc1 = clients[1].docs().import(writer_ticket.clone()).await?;
+    let mut events1 = doc1.subscribe().await?;
+    next_event_matching(
+        &mut events1,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == hash_k1),
+    )
+    .await;
+
+    // The subscriber's own ticket carries its address; the sender bootstraps off both nodes.
+    let subscriber_ticket = doc1
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let namespace = writer_ticket.capability.id();
+    let sender_endpoint = Endpoint::builder(presets::Minimal).bind().await?;
+    let lookup = MemoryLookup::new();
+    sender_endpoint.address_lookup()?.add(lookup.clone());
+    let mut bootstrap = Vec::new();
+    for addr in writer_ticket
+        .nodes
+        .iter()
+        .chain(subscriber_ticket.nodes.iter())
+    {
+        bootstrap.push(addr.id);
+        if !addr.is_empty() {
+            lookup.add_endpoint_info(addr.clone());
+        }
+    }
+    let sender_gossip = Gossip::builder().spawn(sender_endpoint.clone());
+    let sender_router = Router::builder(sender_endpoint.clone())
+        .accept(iroh_gossip::ALPN, sender_gossip.clone())
+        .spawn();
+    let topic = sender_gossip
+        .subscribe(TopicId::from(namespace.to_bytes()), bootstrap)
+        .await?;
+    let (sender, mut sender_events) = topic.split();
+
+    // The subscriber adds the sender to its neighbors before replying, so once the sender sees
+    // the subscriber as a neighbor the link is up on both sides.
+    let subscriber = nodes[1].id();
+    loop {
+        let event = sender_events
+            .try_next()
+            .await?
+            .context("gossip stream ended")?;
+        if matches!(event, GossipEvent::NeighborUp(peer) if peer == subscriber) {
+            break;
+        }
+    }
+    // Neighbors scope, as the engine's own ops: a swarm-scope message is forwarded, and on a
+    // triangle the duplicate prunes the writer–subscriber link, which no neighbors-scope
+    // report crosses again.
+    sender
+        .broadcast_neighbors(Bytes::from_static(b"not a postcard-encoded Op"))
+        .await?;
+    // Both halves gone: the sender quits the topic and sends its neighbors a disconnect.
+    drop((sender, sender_events));
+
+    let sender_id = sender_endpoint.id();
+    next_event_matching(
+        &mut events1,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::NeighborDown(peer) if *peer == sender_id),
+    )
+    .await;
+
+    let hash_k2 = doc0
+        .set_bytes(author0, b"k2".to_vec(), b"v2".to_vec())
+        .await?;
+    next_event_matching(
+        &mut events1,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == hash_k2),
+    )
+    .await;
+
+    sender_router.shutdown().await?;
     for node in nodes {
         node.shutdown().await?;
     }

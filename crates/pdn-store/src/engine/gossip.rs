@@ -139,7 +139,20 @@ async fn receive_loop(
                 continue;
             }
             Event::Received(msg) => {
-                let op: Op = postcard::from_bytes(&msg.content)?;
+                // Skipped, never `?`: an error here ends the loop and the
+                // namespace leaves the active set, so one undecodable message
+                // from any topic member would silence the topic.
+                let op: Op = match postcard::from_bytes(&msg.content) {
+                    Ok(op) => op,
+                    Err(error) => {
+                        debug!(
+                            len = msg.content.len(),
+                            %error,
+                            "received invalid gossip message, ignoring"
+                        );
+                        continue;
+                    }
+                };
                 match op {
                     Op::Put(_entry) => {
                         // Content never rides the topic (content-free
