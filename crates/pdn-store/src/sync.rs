@@ -2412,6 +2412,62 @@ mod tests {
         Ok(())
     }
 
+    /// An identifier naming another namespace is refused by the prefix
+    /// reads and the prefix delete, so `put` on a store instance is safe
+    /// without `validate_entry` in front of it. The neighbour's rows are
+    /// read back at the end: a refusal has to leave them as they were.
+    #[tokio::test]
+    async fn an_identifier_naming_another_namespace_is_refused() -> Result<()> {
+        use crate::{ranger::Store as _, store::fs::StoreInstance};
+
+        let (mut store, mine, neighbour, author) = store_with_two_namespaces().await?;
+        let at =
+            |ns: &NamespaceSecret, key: &[u8]| RecordIdentifier::new(ns.id(), author.id(), key);
+        let rows = |store: &mut Store, ns: &NamespaceSecret| -> Result<Vec<SignedEntry>> {
+            store.get_many(ns.id(), Query::all())?.collect()
+        };
+        let before = rows(&mut store, &neighbour)?;
+        assert_eq!(before.len(), 2);
+
+        let mut inst = StoreInstance::new(mine.id(), &mut store);
+
+        // Allowed: this namespace's identifier reads its own rows.
+        assert_eq!(inst.prefixes_of(&at(&mine, b"mine"))?.count(), 1);
+
+        // Denied: the neighbour's identifier, on every prefix operation.
+        assert!(
+            inst.prefixes_of(&at(&neighbour, b"secret-a")).is_err(),
+            "a foreign identifier read the neighbour's parents"
+        );
+        assert!(
+            inst.prefixed_by(&at(&neighbour, b"secret")).is_err(),
+            "a foreign identifier read the neighbour's prefix"
+        );
+        assert!(
+            inst.remove_prefix_filtered(&at(&neighbour, b"secret"), |_| true)
+                .is_err(),
+            "a foreign identifier deleted under the neighbour's prefix"
+        );
+
+        // Denied: a well-signed neighbour entry through `put` itself.
+        let entry = Entry::new(
+            at(&neighbour, b"secret-a"),
+            Record::current_from_data(b"forged"),
+        );
+        let entry = SignedEntry::from_entry(entry, &neighbour, &author);
+        assert!(inst.put(entry).is_err(), "a foreign entry was taken in");
+
+        // Allowed: this namespace's identifier deletes its own rows, so the
+        // denials above are refusals rather than a delete that does nothing.
+        assert_eq!(
+            inst.remove_prefix_filtered(&at(&mine, b"mine"), |_| true)?,
+            1
+        );
+
+        assert_eq!(rows(&mut store, &neighbour)?, before);
+        Ok(())
+    }
+
     /// The same check on the wire: a peer with a session on one namespace
     /// crafts a range over the neighbour's rows. An empty fingerprint puts
     /// the reply straight into the recursion anchor, which transmits every
