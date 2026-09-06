@@ -1,21 +1,9 @@
-//! The private metadata store: the one device-replicated **directory** of an
-//! identity's own state — its devices, the tickets to its other stores, and
-//! its connections.
-//!
-//! A dedicated pdn-store replica, separate from data namespaces, that all
-//! devices of one identity replicate. It is device-internal by ticket alone
-//! (Invariant 1): its ticket is handed only to the identity's own devices,
-//! over the device-linking dialogue. Four record families live here, under
-//! disjoint prefixes: `devices/` — the device set; `tickets/` — typed
-//! tickets to the identity's other stores and its connections' metadata
-//! pairs; `connections/` — one marker record per connection counterparty;
-//! `retractions/` — write-retraction markers, keyed by granted issuer,
-//! author, and path. One node holds the private metadata stores of any
-//! number of identities.
-//!
-//! Device and connection records are record-level (visible as soon as the
-//! entry syncs — liveness never waits on payload bytes); ticket payloads are
-//! blobs, so `get_ticket` returns `None` until the payload has arrived.
+//! The private metadata store: the one device-replicated directory of an
+//! identity's own state, device-internal by ticket alone (Invariant 1).
+//! Five record families under disjoint prefixes: `devices/`,
+//! `pending-devices/`, `tickets/`, `connections/`, `retractions/`. Device
+//! and connection records are record-level; ticket and marker payloads are
+//! blobs, so their reads wait for content.
 
 use std::{
     collections::HashSet,
@@ -40,48 +28,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::{read_payload, SyncNode};
 
-/// The bounded wait of [`PrivateMetadataStore::wait_caught_up`] elapsed with
-/// no successful sync session of the replica started after the given
-/// instant. Downcast from the `anyhow::Error` of that wait — how a caller
-/// tells "did not catch up in time" apart from this node's own failures.
+/// The wait of [`PrivateMetadataStore::wait_caught_up`] elapsed. Downcast
+/// from its `anyhow::Error` to tell "did not catch up in time" from this
+/// node's own failures.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("no successful sync session of the replica within the wait")]
 pub struct CatchUpTimeout;
 
-/// Key prefix for device records — the one shape shared by the directory's
-/// device set (Invariant 1), the connection metadata store's published
-/// device sets, and the access book's membership probe. One definition on
-/// purpose: this key decides who counts as an identity's own device, so a
-/// drifted copy would be an access-control bug.
-///
-/// A record here is a *confirmed* device: one that holds this directory's
-/// write ticket. Linking registers its newcomer under
-/// [`PENDING_DEVICES_PREFIX`] first, so a dialogue cut off before the
-/// tickets arrive confers nothing.
+/// The one key shape shared by the directory's device set, the connection
+/// metadata store's published device sets, and the access book's probe:
+/// it decides who counts as an identity's own device, so a drifted copy
+/// would be an access-control bug. A record here is a *confirmed* device,
+/// one holding this directory's write ticket.
 pub(crate) const DEVICES_PREFIX: &str = "devices/";
-/// Key prefix for pending device records — a linking that registered its
-/// newcomer but cannot yet know whether the tickets reached it. Deliberately
-/// disjoint from [`DEVICES_PREFIX`]: the access book probes that prefix
-/// alone, so a pending record grants nothing until the newcomer confirms
-/// itself ([`PrivateMetadataStore::confirm_device`]).
+/// Disjoint from [`DEVICES_PREFIX`] on purpose: the access book probes that
+/// prefix alone, so a pending record grants nothing until the newcomer
+/// confirms itself.
 const PENDING_DEVICES_PREFIX: &str = "pending-devices/";
 const PENDING_DEVICE_MARKER_VERSION: u8 = 1;
 pub const PENDING_DEVICE_TTL: Duration = Duration::from_hours(24);
-/// Key prefix for typed tickets.
 const TICKETS_PREFIX: &str = "tickets/";
-/// Key prefix for connection records.
 const CONNECTIONS_PREFIX: &str = "connections/";
-/// Key prefix for write-retraction markers.
 const RETRACTIONS_PREFIX: &str = "retractions/";
 
-/// The entry key of a device record: `devices/<node-id-hex>`
-/// ([`DEVICES_PREFIX`] is the one shared definition).
 pub(crate) fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
 }
 
-/// The entry key of a pending device record:
-/// `pending-devices/<node-id-hex>`.
 fn pending_device_key(device: &NodeId) -> String {
     format!("{PENDING_DEVICES_PREFIX}{device}")
 }
@@ -90,12 +63,10 @@ fn ticket_key(kind: &str) -> String {
     format!("{TICKETS_PREFIX}{kind}")
 }
 
-/// The entry key for a connection to `peer`: `connections/<pdnid-hex>`.
 fn connection_key(peer: &PdnId) -> String {
     format!("{CONNECTIONS_PREFIX}{peer}")
 }
 
-/// Parse a `NodeId` back out of a `devices/<hex>` key, if it matches.
 pub(crate) fn device_of(key: &[u8]) -> Option<NodeId> {
     std::str::from_utf8(key)
         .ok()?
@@ -104,8 +75,6 @@ pub(crate) fn device_of(key: &[u8]) -> Option<NodeId> {
         .ok()
 }
 
-/// Parse a `NodeId` back out of a `pending-devices/<hex>` key, if it
-/// matches.
 fn pending_device_of(key: &[u8]) -> Option<NodeId> {
     std::str::from_utf8(key)
         .ok()?
@@ -139,7 +108,6 @@ fn pending_device_marker(marker: &[u8]) -> PendingMarker {
         .map_or(PendingMarker::Malformed, PendingMarker::Timestamp)
 }
 
-/// Parse a `PdnId` back out of a `connections/<hex>` key, if it matches.
 fn connection_peer_of(key: &[u8]) -> Option<PdnId> {
     std::str::from_utf8(key)
         .ok()?
@@ -148,15 +116,11 @@ fn connection_peer_of(key: &[u8]) -> Option<PdnId> {
         .ok()
 }
 
-/// The entry key of a retraction marker:
-/// `retractions/<issuer-hex>/<author-hex>/<path>` — the granted data
-/// store's issuer, the retracted entry's author, and its path.
+/// `retractions/<issuer-hex>/<author-hex>/<path>`.
 fn retraction_key(issuer: &PdnId, author: &AuthorId, path: &str) -> String {
     format!("{RETRACTIONS_PREFIX}{issuer}/{author}/{path}")
 }
 
-/// Parse `(issuer, author, path)` back out of a
-/// `retractions/<issuer-hex>/<author-hex>/<path>` key, if it matches.
 fn retraction_of(key: &[u8]) -> Option<(PdnId, AuthorId, String)> {
     let rest = std::str::from_utf8(key)
         .ok()?
@@ -169,32 +133,27 @@ fn retraction_of(key: &[u8]) -> Option<(PdnId, AuthorId, String)> {
     Some((issuer.parse().ok()?, author.parse().ok()?, path.to_owned()))
 }
 
-/// One listed retraction marker: the entry it addresses — issuer, author,
-/// path — with the decoded marker.
+/// One listed marker: the addressed entry (issuer, author, path) and the
+/// decoded marker.
 pub type ListedRetraction = (PdnId, AuthorId, String, RetractionMarker);
 
-/// One write-retraction verdict, as the directory records it: the exact
-/// entry it addresses lives in the key (issuer, author, path); the payload
-/// carries the bound and the provenance. Serialized as JSON; a payload this
-/// build cannot decode reads as no marker (fail-closed: nothing gets
-/// removed on its word).
+/// The payload of a retraction marker; the addressed entry lives in the
+/// key. JSON; a payload this build cannot decode reads as no marker
+/// (fail-closed: nothing is removed on its word).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetractionMarker {
     /// Entries of the marker's author and path with a timestamp at or below
-    /// this bound are retracted.
+    /// this are retracted.
     pub bound: u64,
-    /// The device that reached the verdict.
     pub decided_by: NodeId,
-    /// The content hash of the retracted entry — the address of what was
-    /// lost, recoverable from the blob store while the blob lives.
+    /// The address of what was lost, recoverable from the blob store while
+    /// the blob lives.
     pub content_hash: [u8; 32],
-    /// The retracted entry's timestamp.
     pub timestamp: u64,
 }
 
-/// Device-replicated directory of an identity's own state: its devices, the
-/// tickets to its other stores, and its connections. The owning identity is
-/// not kept here — the handle's holder knows which identity it serves.
+/// The owning identity is not kept here — the handle's holder knows which
+/// identity it serves.
 #[derive(Debug)]
 pub struct PrivateMetadataStore {
     doc: Doc,
@@ -204,15 +163,12 @@ pub struct PrivateMetadataStore {
 }
 
 impl PrivateMetadataStore {
-    /// Create a fresh private metadata store on `node`.
     pub async fn create(node: &SyncNode) -> Result<Self> {
-        // The author is resolved first, and the doc — tracked by `new_doc`
-        // the moment it exists — last: nothing awaits between the tracking
-        // and the handle reaching the caller, so a future dropped in here
-        // cannot leave a tracked replica no handle refers to. The author is
-        // the node's one author ([`SyncNode::default_author`]): per-store
-        // authors would leave a record written before a restart standing
-        // beside its replacement written after one.
+        // Author first, tracked doc last: nothing awaits between the
+        // tracking and the handle reaching the caller, so a dropped future
+        // cannot leave a tracked replica no handle refers to. The node's one
+        // author: per-store authors would leave a record written before a
+        // restart standing beside its replacement written after one.
         let author = node.default_author().await?;
         let doc = node.new_doc().await?;
         Ok(Self {
@@ -223,10 +179,9 @@ impl PrivateMetadataStore {
         })
     }
 
-    /// Import an existing private metadata store via `ticket` (the write
-    /// ticket handed to a newly linked device over the linking dialogue).
+    /// Import via the write ticket the linking reply carries.
     pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
-        // Author first, tracked doc last — see [`create`](Self::create).
+        // Author first, tracked doc last — see `create`.
         let author = node.default_author().await?;
         let doc = node.import_doc(ticket).await?;
         Ok(Self {
@@ -237,13 +192,10 @@ impl PrivateMetadataStore {
         })
     }
 
-    /// Open the private metadata store of a replica this node already holds
-    /// — recovery's constructor: no ticket is consumed and nothing is
-    /// created, because the replica is already here. A namespace the node's
-    /// store does not hold is `Ok(None)`, so a caller acting on a durable
-    /// record can tell an absent replica from a store that failed to
-    /// answer; `create` and `import` are the constructors that bring a
-    /// replica in.
+    /// Recovery's constructor: open a replica this node already holds. A
+    /// namespace the store does not hold is `Ok(None)`, so a caller acting on
+    /// a durable record tells an absent replica from a store that failed to
+    /// answer.
     pub async fn open(node: &SyncNode, namespace: NamespaceId) -> Result<Option<Self>> {
         let author = node.default_author().await?;
         let Some(doc) = node.open_doc(namespace).await? else {
@@ -257,8 +209,6 @@ impl PrivateMetadataStore {
         }))
     }
 
-    /// Share this store as a ticket another device of the identity can
-    /// import.
     pub async fn share_ticket(
         &self,
         mode: ShareMode,
@@ -268,17 +218,13 @@ impl PrivateMetadataStore {
         Ok(ticket)
     }
 
-    /// The backing doc handle, for registration with the node's access
-    /// book ([`SyncNode::host_identity`](crate::SyncNode::host_identity)).
+    /// For registration with the node's access book.
     pub(crate) fn doc_handle(&self) -> Doc {
         self.doc.clone()
     }
 
-    /// Record `device` as one of the identity's confirmed devices — one
-    /// that holds this directory's write ticket, and so reads and writes
-    /// the identity's data whole (Invariant 1). A device that has not
-    /// demonstrated that possession is registered with
-    /// [`add_pending_device`](Self::add_pending_device) instead.
+    /// Record `device` as a confirmed device — one holding this directory's
+    /// write ticket.
     pub async fn add_device(&self, device: NodeId) -> Result<()> {
         self.doc
             .set_bytes(self.author, device_key(&device).into_bytes(), vec![1u8])
@@ -286,12 +232,8 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// Record that `device` has begun linking into the identity, without
-    /// conferring anything: the access book probes the confirmed set alone,
-    /// so a dialogue cut off before its reply arrives leaves a device that
-    /// is visible to the identity's other devices and admitted nowhere. The
-    /// newcomer promotes itself with [`confirm_device`](Self::confirm_device)
-    /// once the tickets are in hand.
+    /// Record that `device` has begun linking, conferring nothing; the
+    /// newcomer promotes itself with [`confirm_device`](Self::confirm_device).
     pub async fn add_pending_device(&self, device: NodeId) -> Result<()> {
         let _mutation = self.pending_mutations.lock().await;
         self.write_pending_device_at(device, SystemTime::now())
@@ -372,10 +314,7 @@ impl PrivateMetadataStore {
 
     /// Write `device`'s record under `author` rather than the node's own —
     /// the negative control for
-    /// [`live_device_record_count`](Self::live_device_record_count): a
-    /// count of one proves nothing unless a second author's record would
-    /// have counted. Behind `test-util` and absent from every product
-    /// build.
+    /// [`live_device_record_count`](Self::live_device_record_count).
     #[cfg(feature = "test-util")]
     pub async fn add_device_as_for_test(&self, device: NodeId, author: AuthorId) -> Result<()> {
         self.doc
@@ -384,12 +323,9 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// How many live records the directory holds at `device`'s key, across
-    /// authors. Every product read collapses them latest-wins, so a record
-    /// written under a second author is invisible everywhere else and
-    /// shows up only in a count like this — which is what makes the node's
-    /// one author assertable at all. Behind `test-util` and absent from
-    /// every product build.
+    /// Live records at `device`'s key across authors — what every product
+    /// read collapses latest-wins, so this is the only way to assert the
+    /// node's one author.
     #[cfg(feature = "test-util")]
     pub async fn live_device_record_count(&self, device: NodeId) -> Result<usize> {
         let query = Query::all().key_exact(device_key(&device).into_bytes());
@@ -402,11 +338,10 @@ impl PrivateMetadataStore {
         Ok(count)
     }
 
-    /// Promote `device` from pending to confirmed, clearing the pending
-    /// record. Written by the newcomer itself: only a device that imported
-    /// this directory holds the write ticket that lets it, so the record is
-    /// evidence the linking reply arrived — which the inviter, having sent
-    /// it into a connection that may drop, cannot establish on its own.
+    /// Promote `device` from pending to confirmed. Written by the newcomer
+    /// itself: only a holder of the write ticket can, so the record is
+    /// evidence the linking reply arrived — which the inviter cannot
+    /// establish on its own.
     pub async fn confirm_device(&self, device: NodeId) -> Result<()> {
         let _mutation = self.pending_mutations.lock().await;
         self.doc
@@ -416,10 +351,7 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// List the identity's confirmed devices (record-level — available as
-    /// soon as the records sync). Pending registrations are excluded: they
-    /// are not yet devices anywhere the set is consulted, from the access
-    /// book to the device sets published over a connection.
+    /// The confirmed devices, record-level.
     pub async fn list_devices(&self) -> Result<Vec<NodeId>> {
         let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
@@ -432,8 +364,8 @@ impl PrivateMetadataStore {
         Ok(devices.into_iter().collect())
     }
 
-    /// List the devices that began linking and have not confirmed —
-    /// registrations that confer nothing ([`add_pending_device`](Self::add_pending_device)).
+    /// The devices that began linking and have not confirmed, after a
+    /// cleanup pass.
     pub async fn list_pending_devices(&self) -> Result<Vec<NodeId>> {
         self.cleanup_pending_devices().await?;
         let query = Query::single_latest_per_key().key_prefix(PENDING_DEVICES_PREFIX.as_bytes());
@@ -447,9 +379,7 @@ impl PrivateMetadataStore {
         Ok(devices.into_iter().collect())
     }
 
-    /// Record a live connection to `peer`. The payload is an opaque marker
-    /// (the key carries the identity), replicated to the identity's other
-    /// devices like any directory entry.
+    /// Record a live connection to `peer`; the payload is an opaque marker.
     pub async fn connect(&self, peer: PdnId) -> Result<()> {
         self.doc
             .set_bytes(self.author, connection_key(&peer).into_bytes(), vec![1u8])
@@ -457,8 +387,7 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// Drop the connection to `peer` — writes a tombstone (empty entry) that
-    /// replicates like any other entry.
+    /// Tombstone the connection to `peer`.
     pub async fn disconnect(&self, peer: PdnId) -> Result<()> {
         self.doc
             .del(self.author, connection_key(&peer).into_bytes())
@@ -466,18 +395,14 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// Whether `peer` is currently a live connection.
-    ///
-    /// A record-level check: it returns `true` as soon as the connect entry
-    /// is present, without waiting on the marker blob to download. A
-    /// tombstone (latest entry empty) reads as not connected.
+    /// Record-level: `true` as soon as the connect entry is present; a
+    /// tombstone reads as not connected.
     pub async fn is_connected(&self, peer: PdnId) -> Result<bool> {
         let query = Query::single_latest_per_key().key_exact(connection_key(&peer).as_bytes());
         Ok(self.doc.get_one(query).await?.is_some())
     }
 
-    /// List currently live connections (record-level, like
-    /// [`is_connected`](Self::is_connected)).
+    /// Live connections, record-level.
     pub async fn list_connections(&self) -> Result<Vec<PdnId>> {
         let query = Query::single_latest_per_key().key_prefix(CONNECTIONS_PREFIX.as_bytes());
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
@@ -490,10 +415,9 @@ impl PrivateMetadataStore {
         Ok(peers)
     }
 
-    /// Record a write-retraction verdict: one marker at
-    /// `retractions/<issuer-hex>/<author-hex>/<path>`, replacing any
-    /// previous marker for the same entry address — the widest bound wins
-    /// at the consumer, so a replacement never un-retracts.
+    /// Record a write-retraction verdict, replacing any previous marker for
+    /// the same entry address — the widest bound wins at the consumer, so a
+    /// replacement never un-retracts.
     pub async fn record_retraction(
         &self,
         issuer: PdnId,
@@ -511,11 +435,8 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// The recorded retraction markers, payload-waiting: a marker lists
-    /// only once its payload — the bound lives in it — is readable, and a
-    /// payload this build cannot decode is skipped (fail-closed: nothing is
-    /// removed on its word). Each item is the addressed entry — issuer,
-    /// author, path — with its marker.
+    /// The recorded markers whose payload is readable; an undecodable
+    /// payload is skipped (fail-closed).
     pub async fn list_retractions(&self) -> Result<Vec<ListedRetraction>> {
         let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
         let mut keys = Vec::new();
@@ -541,9 +462,7 @@ impl PrivateMetadataStore {
         Ok(markers)
     }
 
-    /// Drop every retraction marker for `issuer` — the counterpart of
-    /// forgetting the granted namespace: the entries the markers address
-    /// left with the replica.
+    /// Drop every marker for `issuer` — with the granted namespace binding.
     pub async fn prune_retractions(&self, issuer: PdnId) -> Result<()> {
         self.doc
             .del(
@@ -554,20 +473,12 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// The retention-window GC: drop the markers this device recorded whose
-    /// directory entry has aged past `retention` — a coarse proxy for "the
-    /// marked entry can no longer win" (the nack is the backstop, so a marker
-    /// dropped early self-heals). Only markers authored by this device are
-    /// pruned, since deletion is per directory-author; a sibling ages out what
-    /// it recorded. `now` and `retention` are microseconds, matching entry
-    /// timestamps. Deletion is by key prefix, so a marker whose path is a
-    /// prefix of another marker's path drops that one too — harmless: nested
-    /// marker paths are rare, and an over-drop self-heals through the nack.
-    ///
-    /// Returns the addresses dropped — issuer, author, path — so the caller
-    /// can take down the in-memory refusal each one armed: a marker that no
-    /// longer exists must not go on refusing entries, and nothing else in the
-    /// sweep would ever tell.
+    /// Drop the markers this device recorded whose entry aged past
+    /// `retention` (microseconds, like entry timestamps). Only own-author
+    /// markers, since deletion is per directory author. Deletion is by key
+    /// prefix, so a marker whose path prefixes another's drops that one too
+    /// — an over-drop self-heals through the issuer's rejection. Returns the
+    /// dropped addresses so the caller can disarm what each one armed.
     pub async fn prune_aged_retractions(
         &self,
         now: u64,
@@ -595,8 +506,6 @@ impl PrivateMetadataStore {
         Ok(dropped)
     }
 
-    /// Store the `ticket` for store `kind` (e.g. `"data"`), so the
-    /// identity's other devices can discover and import that store.
     pub async fn put_ticket(&self, kind: &str, ticket: &DocTicket) -> Result<()> {
         self.doc
             .set_bytes(
@@ -608,22 +517,16 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// Subscribe to this store's replica events (inserts, sync sessions).
-    /// Crate-private on purpose: the fork's event type stays behind this
-    /// layer; consumers get the two narrow properties stated by
-    /// [`wait_caught_up`](Self::wait_caught_up) and [`changes`](Self::changes).
+    /// Crate-private: the fork's event type stays behind this layer.
     pub(crate) async fn events(
         &self,
     ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
         self.doc.subscribe().await
     }
 
-    /// One item per observed change of this directory: an entry written
-    /// here, an entry arrived by sync, or a payload blob become readable.
-    /// The item carries no detail on purpose — the fork's event vocabulary
-    /// stays behind this layer, and "something changed, look again" is
-    /// exactly what a re-reading consumer needs. An `Err` item reports the
-    /// subscription failing; the stream ends when the node shuts down.
+    /// One detail-free item per observed change — an entry written here,
+    /// arrived by sync, or a payload become readable. An `Err` item is the
+    /// subscription failing; the stream ends with the node.
     pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
         let events = self.events().await?;
         Ok(events.filter_map(|event| match event {
@@ -632,32 +535,19 @@ impl PrivateMetadataStore {
                 | LiveEvent::InsertRemote { .. }
                 | LiveEvent::ContentReady { .. },
             ) => Some(Ok(())),
-            // Sync-session and neighbor bookkeeping is not a change of the
-            // directory's contents.
             Ok(_) => None,
             Err(err) => Some(Err(err)),
         }))
     }
 
-    /// The namespace id of the backing replica — which replica this handle
-    /// addresses. Lets an imported directory be named to
-    /// [`SyncNode::forget_doc`] when the act that imported it fails and must
-    /// leave nothing behind.
     pub fn namespace(&self) -> NamespaceId {
         self.doc.id()
     }
 
-    /// Wait until the first successful sync session of this replica that
-    /// started after `since` has finished, or fail with [`CatchUpTimeout`]
-    /// once `timeout` elapses — never hang.
-    ///
-    /// The property waited on is "this replica has caught up with a peer":
-    /// a completed, successful exchange — not "some content arrived".
-    /// Polling contents cannot state it: a replica that synced and found
-    /// nothing new and one that never synced read the same. Importing a
-    /// replica already starts its first session and enrols it in the
-    /// periodic reconcile pass, so a failed first exchange is re-dialed
-    /// within this wait's own budget.
+    /// Wait for the first successful sync session started after `since`, or
+    /// fail with [`CatchUpTimeout`]. A completed session, not arrived
+    /// content: a replica that synced and found nothing new and one that
+    /// never synced read the same.
     pub async fn wait_caught_up(&self, since: SystemTime, timeout: Duration) -> Result<()> {
         let mut events = self.events().await?;
         let deadline = Instant::now() + timeout;
@@ -679,12 +569,7 @@ impl PrivateMetadataStore {
         }
     }
 
-    /// List the kinds under which tickets are published (record-level; a
-    /// listed kind's ticket may still be payload-waiting in
-    /// [`get_ticket`](Self::get_ticket)). The directory's audit surface:
-    /// what routing the identity's devices can discover here — and what
-    /// must not appear (no tickets to another identity's data stores; those
-    /// live in connection metadata stores).
+    /// The kinds under which tickets are published, record-level.
     pub async fn list_ticket_kinds(&self) -> Result<Vec<String>> {
         let query = Query::single_latest_per_key().key_prefix(TICKETS_PREFIX.as_bytes());
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
@@ -701,14 +586,11 @@ impl PrivateMetadataStore {
         Ok(kinds)
     }
 
-    /// Read the stored ticket for store `kind`, if present and its payload has
-    /// arrived. Returns `Ok(None)` while the payload is still syncing.
-    ///
-    /// A payload that does not decode is an error, not an absence: the only
-    /// writers here are the identity's own devices, so garbage is this
-    /// implementation's own bug. The counterparty-written grants of
-    /// [`ConnectionMetadataStore::read_grant`](crate::ConnectionMetadataStore::read_grant)
-    /// deliberately read the other way.
+    /// `Ok(None)` while the payload is still syncing. A payload that does
+    /// not decode is an error, not an absence: only the identity's own
+    /// devices write here, so garbage is this implementation's own bug —
+    /// unlike the counterparty-written grants of
+    /// [`ConnectionMetadataStore::read_grant`](crate::ConnectionMetadataStore::read_grant).
     pub async fn get_ticket(&self, kind: &str) -> Result<Option<DocTicket>> {
         let Some(bytes) = read_payload(&self.doc, &self.blobs, ticket_key(kind).as_bytes()).await?
         else {

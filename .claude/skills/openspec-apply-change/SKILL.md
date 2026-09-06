@@ -148,6 +148,7 @@ What would you like to do?
 - Pause on errors, blockers, or unclear requirements - don't guess
 - Use contextFiles from CLI output, don't assume specific file names
 - Hold the work to the repo's code practices in `mia-docs/openspec/specs/code-practices/`: `operating-conditions.md` — for the path you are implementing, which of several identities per node, one device or several, a device linking before or during or after, a dropped connection, a full disk, and a capability narrowed or revoked and re-granted actually change the outcome; each one that does needs a scenario and a test, and each one that does not is worth saying so once. `access-control-tests.md` — an authorized-access assertion carries its tightest denial beside it. `flaky-tests.md` — the change ends with a stress pass
+- Comments follow the `## Code comments` rules in `CLAUDE.md`: one to three lines; an invariant, a non-obvious why, or a pointer to the spec, ADR, or proving test — never a restatement of the spec or of the assertion beside it; present tense only. Every test has a doc comment whose first sentence says which case the scenario tests; it carries at most the paired denial and the rationale of any non-obvious arrangement beside that, nothing else
 - A task that adds a scenario is not done until the test would fail with the mechanism removed
 
 **Fluid Workflow Integration**

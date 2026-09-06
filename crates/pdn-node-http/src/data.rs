@@ -1,14 +1,6 @@
-//! Data handlers: entries of an issuer's data namespace, addressed by
-//! issuer and path.
-//!
-//! The payload is the request body on the way in and the response body on
-//! the way out — no base64, no JSON string escaping, so a replication
-//! assertion tests replication and not an encoding both sides had to agree
-//! on.
-//!
-//! Issuers, not hosted identities: a hosted identity's own namespace and a
-//! namespace a grant brought in are both addressed the same way here, and
-//! the second belongs to no hosted identity at all.
+//! Data handlers, addressed by issuer and path. The payload is the raw
+//! request or response body, so a replication assertion tests replication
+//! and not an encoding both sides had to agree on.
 
 use std::sync::Arc;
 
@@ -26,14 +18,9 @@ use crate::{
     shapes::{Entries, ListingPrefix, NoQuery},
 };
 
-/// `PUT /debug/data/{issuer}/{*path}` — the body's bytes become the entry.
-///
-/// Success is local: for a granted namespace the write passes the courtesy
-/// check against the grant record this node has read, and the issuer's
-/// ingest gate decides afterwards — a claim its own record does not cover
-/// is refused there and the provisional entry is retracted here. The
-/// retraction verdict does not cross this surface, so an answer here says
-/// the write was admitted locally, not that the issuer kept it.
+/// `PUT /debug/data/{issuer}/{*path}`. Success is local: the issuer's
+/// ingest gate decides afterwards, and the retraction verdict does not
+/// cross this surface.
 pub(crate) async fn write(
     State(runtime): State<Arc<Runtime>>,
     Path((issuer, path)): Path<(String, String)>,
@@ -42,9 +29,8 @@ pub(crate) async fn write(
 ) -> Result<StatusCode, HostError> {
     let issuer = parse::id(&issuer, "issuer")?;
     let path = parse::entry_path(&path)?;
-    // The engine rejects a zero-length entry, and that rejection is the
-    // request being wrong rather than the host not knowing what happened —
-    // where an unnamed engine error would land.
+    // The engine rejects a zero-length entry: the request being wrong, not
+    // the 500 an unnamed engine error would land on.
     if body.is_empty() {
         return Err(HostError::bad_request(format!(
             "an entry payload is at least one byte: nothing to write at {path} under {issuer}"
@@ -54,11 +40,8 @@ pub(crate) async fn write(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /debug/data/{issuer}/{*path}` — the entry's bytes, or 404.
-///
-/// Absence covers both "no such entry" and "the record is here and its
-/// payload is still arriving": the surface reports the present moment, and
-/// the caller repeating the read is what waiting for convergence is.
+/// `GET /debug/data/{issuer}/{*path}` — 404 covers both "no such entry"
+/// and "payload still arriving"; repeating the read is the wait.
 pub(crate) async fn read(
     State(runtime): State<Arc<Runtime>>,
     Path((issuer, path)): Path<(String, String)>,
@@ -74,8 +57,7 @@ pub(crate) async fn read(
         .ok_or_else(|| HostError::not_found(format!("no entry at {path} under {issuer}")))
 }
 
-/// `GET /debug/data/{issuer}` — entry metadata, optionally narrowed by a
-/// `prefix` query parameter matching whole path components.
+/// `GET /debug/data/{issuer}` — `prefix` matches whole path components.
 pub(crate) async fn list(
     State(runtime): State<Arc<Runtime>>,
     Path(issuer): Path<String>,

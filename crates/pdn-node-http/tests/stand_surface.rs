@@ -1,16 +1,8 @@
-//! The surface's own bounds, asserted against a node of the stand: the debug
-//! gate, the routes it gates, and the body ceiling.
-//!
-//! The gate is asserted route by route, and absent is the whole point: a
-//! route that answered "unauthorized" instead of 404 would be a surface
-//! present in a deployment that must not have one. Asserting it against the
-//! image also asserts the image's own default — a container started without
-//! the flag serves nothing under `/debug/`. The route names themselves stay
-//! unpinned scaffolding: this test moves with them, and nothing outside this
-//! repository may depend on them.
-//!
-//! Ignored by default: the suite needs a container daemon and a built image,
-//! and `just test-docker` builds the image and runs it.
+//! The surface's own bounds against a node of the stand: the debug gate,
+//! the routes it gates, and the body ceiling. Absent is the point of the
+//! gate — a route answering "unauthorized" instead of 404 would be a
+//! surface present in a deployment that must not have one. Ignored by
+//! default: `just test-docker` builds the image and runs the suite.
 
 use anyhow::Result;
 use axum::{body::Bytes, http::StatusCode};
@@ -39,6 +31,8 @@ const DEBUG_ROUTES: &[(Method, &str)] = &[
     (Method::Get, "/debug/data/aa/contact/email"),
 ];
 
+/// Without the flag the node answers liveness and readiness, and every
+/// `/debug/` route is absent (404) — the image's own default.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
@@ -60,13 +54,9 @@ async fn live_is_200_and_debug_is_absent_without_the_flag() -> Result<()> {
     Ok(())
 }
 
-/// The same routes answer something other than 404 with the flag on — so the
-/// list above is a list of real routes, not of typos that would pass the gate
-/// assertion for the wrong reason. Some of them (`/debug/status`, the two on
-/// `/debug/identities`) carry no identifier to malform and legitimately
-/// answer 200 on a fresh runtime; the rest answer a client error. A served
-/// route is neither, so the one property common to all of them — and the one
-/// a typo'd, unregistered route would fail — is simply not being absent.
+/// With the flag on, every route in the list answers something other than
+/// 404 — so the list is a list of real routes, not of typos that would pass
+/// the gate assertion for the wrong reason.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn every_gated_route_exists_with_the_flag() -> Result<()> {

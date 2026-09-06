@@ -1,35 +1,11 @@
 //! What a hosted identity has published toward a peer, read from its own
-//! half of the connection's metadata pair: the capability the issuer reads
-//! back, a republication and a withdrawal seen through it, and a sibling
-//! device reading a grant it did not publish.
-//!
-//! Every positive read here carries its denial in the same place
-//! (`code-practices/access-control-tests.md`), and for this operation the
-//! tightest party is a second identity hosted on the same runtime: it has
-//! a directory of its own, and the read resolves the pair through the
-//! acting identity's directory, then reads the one key that directory's
-//! owner can have written.
-//!
-//! Which assertion catches a pair resolved by the peer alone — the slip
-//! this arrangement exists for — is the second degree's *positive* read,
-//! not either denial, and the second read of the capability is why: handed
-//! another identity's pair, the read asks it for a grant of its own issuer
-//! and finds a capability naming someone else, which is a decided absence.
-//! So the wrong pair yields nothing rather than another identity's record,
-//! both denials stay satisfied, and what fails is X or Y no longer reading
-//! back what it published. That is the shape
-//! `access-control-tests.md` names: a denial whose expected answer is
-//! nothing is satisfied by an implementation that answers nothing to
-//! everyone, and the positive beside it is what discriminates.
-//!
-//! The denials keep their own subject: an identity with no pair toward that
-//! peer reads nothing, and two identities that both hold one never cross.
-//! A party on another node is no control at all: nothing lets it address
-//! the pair, so no call can be made.
-//!
-//! The read hands back the capability alone. No assertion here says the
-//! ticket is absent, because the read's type carries none — an absence has
-//! no test that could fail.
+//! half of the pair. The tightest denial is a second identity hosted on
+//! the same runtime (`code-practices/access-control-tests.md`); what
+//! catches a pair resolved by the peer alone is the second degree's
+//! *positive* read, since handed another identity's pair the read finds a
+//! capability naming someone else — a decided absence that satisfies both
+//! denials. No assertion says the ticket is absent: the read's type
+//! carries none.
 
 use anyhow::Result;
 use pdn_node::{ConnectionsService as _, IdentityService as _, UnknownIdentity};
@@ -49,7 +25,7 @@ async fn an_issuer_reads_what_it_published_and_a_co_hosted_identity_reads_none_o
     let a = memory_runtime().await?;
     let peer = memory_runtime().await?;
 
-    // X and Y are hosted side by side; only X connects to P for now.
+    // X and Y are hosted side by side; only X connects to P.
     let x = a.identity().create().await?;
     let y = a.identity().create().await?;
     let p = peer.identity().create().await?;
@@ -181,22 +157,11 @@ async fn a_republication_and_a_withdrawal_are_visible_to_the_issuer() -> Result<
 }
 
 /// A sibling device reads a grant it did not publish, once the record and
-/// its payload have replicated to it over the pair.
-///
-/// The withdrawal's other direction — made on the publishing device, read
-/// back on the sibling — is not asserted here. A wait on it timed out at
-/// the full budget once on a loaded machine, where convergence normally
-/// takes one to three polls, and about 50 stress iterations across two
-/// platforms failed to reproduce it. Until that is understood, an
-/// assertion nobody can characterise would be the suite's own flake rather
-/// than a guard.
-///
-/// The emptiness before that is the contract and not an assertion here:
-/// nothing holds replication back, so a scenario that asserted it would be
-/// racing its own subject. The waiting half is what this stages; the other
-/// half is stated in the service's docs and in `mee-pdn/pdn-node/core.md`, guarded
-/// by this suite's place in the change's stress pass rather than by a pin
-/// this code offers no place for (`code-practices/flaky-tests.md`).
+/// its payload have replicated. The withdrawal's other direction — made on
+/// the publisher, read on the sibling — is not asserted: one unreproduced
+/// full-budget timeout on a loaded machine, and an assertion nobody can
+/// characterise would be the suite's own flake. The emptiness before
+/// replication is not asserted either: nothing holds replication back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sibling_device_reads_a_grant_it_did_not_publish() -> Result<()> {
     let phone = memory_runtime().await?;

@@ -26,14 +26,11 @@ const GRANTED: &str = "contact/email";
 const WITHHELD_A: &str = "contact/phone";
 const WITHHELD_B: &str = "notes/diary";
 
-/// The reconcile cadence these scenarios run at. Scoped readers have no
-/// gossip path, so every negative assertion is "the reader retried over
-/// several intervals and was refused" — at the production default that is
-/// tens of seconds of pure sleep per assertion; injected here it is
-/// milliseconds, and the assertions wait out the same number of intervals.
+/// Scoped readers have no gossip path, so every negative assertion is "the
+/// reader retried over several intervals and was refused" — milliseconds
+/// at this cadence instead of the production default's tens of seconds.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-/// Spawn a node with the test's short reconcile cadence.
 async fn spawn_node() -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -55,17 +52,12 @@ fn granted(issuer: PdnId, audience: PdnId, path: &EntryPath, write: bool) -> Rea
     }
 }
 
-/// Assemble the serving side: Bob's node hosting his identity — directory
-/// with his device registered, data namespace with three entries — plus a
-/// connection toward `peer` (both directional stores) registered for
-/// caller classification. Returns the connection pair (Bob's `own` toward
-/// the peer, and Bob's copy of `peer`'s reverse store) with the read
-/// ticket of Bob's own store for the counterparty to import.
+/// The serving side: Bob's node hosting his identity, plus a connection
+/// toward `peer` registered for caller classification.
 struct ServingSide {
     own_toward_peer: ConnectionMetadataStore,
     own_read_ticket: data_layer::DocTicket,
-    /// Bob's directory — the device set the access book probes, handed back
-    /// for the scenarios that vary who is in it.
+    /// The device set the access book probes.
     directory: PrivateMetadataStore,
 }
 
@@ -74,15 +66,11 @@ async fn serving_side(
     peer: PdnId,
     peer_own: &ConnectionMetadataStore,
 ) -> Result<ServingSide> {
-    // Bob's directory: his identity's device set, Invariant 1 audience.
     let directory = PrivateMetadataStore::create(bob).await?;
     directory.add_device(bob.node_id()).await?;
     bob.host_identity(ids::BOB, &directory)?;
 
-    // The connection pair as establishment leaves it: Bob's own store
-    // toward the peer — carrying his published device set (publication is
-    // bilateral) — and Bob's imported copy of the peer's reverse store
-    // (where the peer publishes its device set).
+    // The connection pair as establishment leaves it.
     let own_toward_peer = ConnectionMetadataStore::create(bob).await?;
     own_toward_peer.publish_device(bob.node_id()).await?;
     let own_read_ticket = own_toward_peer
@@ -118,23 +106,11 @@ async fn write_bobs_entries(bob: &SyncNode) -> Result<()> {
     Ok(())
 }
 
-/// The read-restriction scenario (Invariant 2), allowed and denied sides
-/// probed in one place.
-///
-/// Allowed: Alice, granted read on exactly `contact/email`, receives that
-/// entry — and keeps receiving its updates.
-///
-/// Denied, existence hidden: the withheld entries never reach Alice — not
-/// after the grant, and not after a proven second replication wave (the
-/// sentinel update) — so her view is indistinguishable from a replica in
-/// which they do not exist.
-///
-/// Denied, ticket without a grant: Carol holds the replica's leaked read
-/// ticket but no grant and no connection with Bob; her node obtains
-/// nothing — no entry, no listing.
-///
-/// Denied, read-only cannot write: Alice's ticket carries no namespace
-/// secret, so her local write into Bob's namespace fails outright.
+/// Invariant 2. Allowed: Alice, granted read on exactly `contact/email`,
+/// receives it and its updates. Denied: the withheld entries never reach
+/// her, not even after a proven second wave (existence hidden); Carol, with
+/// the leaked ticket and no grant, obtains nothing; Alice's read ticket
+/// carries no namespace secret, so her local write fails outright.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()> {
@@ -152,8 +128,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
     bob.create_namespace(ids::BOB).await?;
     write_bobs_entries(&bob).await?;
 
-    // The grant: read on exactly `contact/email`, no write — so the grant
-    // ships a read ticket (no namespace secret).
+    // Read-only, so the grant ships a read ticket.
     let email = EntryPath::new(GRANTED)?;
     let grant = granted(ids::BOB, ids::ALICE, &email, false);
     let data_read_ticket = bob
@@ -168,12 +143,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
         .publish_grant(&grant, &data_read_ticket)
         .await?;
 
-    // Alice consumes the grant as the bootstrap cascade would: reads it
-    // from her copy of Bob's store, registers her side of the connection
-    // for classification (so Bob's devices resolve when they dial her, and
-    // her own dials to them are judged), and imports the namespace scoped
-    // — outside the replica's gossip swarm, reconciliation is her only
-    // data path.
+    // Alice consumes the grant as the grant binder would.
     let alice_peer =
         ConnectionMetadataStore::import(&alice, serving.own_read_ticket.clone()).await?;
     alice.host_connection(ids::ALICE, ids::BOB, &alice_own, &alice_peer)?;
@@ -196,8 +166,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
         "the granted entry did not reach the granted peer"
     );
 
-    // Denied (read-only cannot write): Alice holds no namespace secret, so
-    // a local write into Bob's namespace is refused outright.
+    // Denied (read-only cannot write).
     let alice_author = alice.create_author().await?;
     assert!(
         alice
@@ -207,16 +176,13 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
         "a write through a read-only grant must be refused"
     );
 
-    // Denied (ticket without a grant): Carol imports the leaked read
-    // ticket. Bob's node cannot resolve her to any granted identity, so
-    // her sync requests are refused and nothing ever arrives.
+    // Denied (ticket without a grant): Carol imports the leaked read ticket.
     carol
         .import_namespace_scoped(ids::BOB, data_read_ticket)
         .await?;
 
-    // Sentinel: Bob updates the granted entry. Its arrival at Alice proves
-    // a second replication wave ran end-to-end after the negatives were
-    // set up — so the absence assertions below are ordered, not racy.
+    // Sentinel: a second wave proven end to end orders the absence assertions
+    // below.
     let author = bob.create_author().await?;
     bob.write(ids::BOB, author, &email, b"bob@new.example.org")
         .await?;
@@ -231,9 +197,8 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
         "the sentinel update did not reach the granted peer"
     );
 
-    // Denied (existence hidden): after the proven second wave, Alice's
-    // view still lists exactly the granted entry — the withheld entries
-    // are absent as records, not merely unreadable.
+    // Denied (existence hidden): after the proven second wave, Alice's view
+    // lists exactly the granted entry.
     let listed: Vec<String> = alice
         .list(ids::BOB, None)
         .await?
@@ -255,13 +220,10 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
         );
     }
 
-    // ...and Carol, with the ticket but no grant, has obtained nothing.
-    // Her denial is bounded, not incidental: her import fired a sync
-    // attempt, every one of her reconcile intervals since re-dials Bob's
-    // node (his address rides the leaked ticket), and the reads below
-    // nudge once more — waiting out three more of her intervals after the
-    // proven second wave means "she tried repeatedly and was refused" is
-    // what keeps this green, not a poll that outran her first dial.
+    // ...and Carol, with the ticket but no grant, has obtained nothing:
+    // three more of her intervals after the proven second wave make this
+    // "she tried repeatedly and was refused", not a poll that outran her
+    // first dial.
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         carol.list(ids::BOB, None).await?.is_empty(),
@@ -275,15 +237,10 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
     Ok(())
 }
 
-/// A pending device registration confers nothing; the confirmation is the
-/// whole difference. Linking registers its newcomer before it can know the
-/// reply arrived, so what it writes is pending — and the access book probes
-/// the confirmed set alone. Alice, a scoped grantee of Bob who is also
-/// pending in his directory, receives exactly her granted claim: the
-/// registration adds not one entry to what her grant already allows. The
-/// same node, once Bob's directory carries its confirmation, reads the
-/// replica whole — so the denial above is the record's doing, not a path
-/// that was never live.
+/// A pending device registration confers nothing: Alice, a scoped grantee
+/// of Bob who is also pending in his directory, receives exactly her
+/// granted claim, and reads the replica whole once confirmed — so the
+/// denial is the record's doing, not a path that was never live.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     let bob = spawn_node().await?;
@@ -296,15 +253,13 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     bob.create_namespace(ids::BOB).await?;
     write_bobs_entries(&bob).await?;
 
-    // The registration a linking dialogue leaves on the inviter before —
-    // and, when the reply is lost, instead of — the newcomer's own
-    // confirmation.
+    // The registration a linking dialogue leaves on the inviter.
     serving
         .directory
         .add_pending_device(alice.node_id())
         .await?;
 
-    // Alice's grant on one claim, consumed the way the bootstrap does.
+    // Alice's grant on one claim, consumed as the grant binder would.
     let email = EntryPath::new(GRANTED)?;
     let grant = granted(ids::BOB, ids::ALICE, &email, false);
     let data_read_ticket = bob
@@ -340,10 +295,8 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
         "the granted entry did not reach the granted peer"
     );
 
-    // Denied: pending is not membership. Waited out over three more of
-    // Alice's reconcile intervals after the granted entry proved the path
-    // live, so this is "she reconciled repeatedly and was served nothing
-    // more", not a poll that outran her first session.
+    // Denied: pending is not membership, waited out over three more of
+    // Alice's intervals after the path proved live.
     tokio::time::sleep(RECONCILE * 3).await;
     for withheld in [WITHHELD_A, WITHHELD_B] {
         assert!(
@@ -377,17 +330,10 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     Ok(())
 }
 
-/// The grant's capability names its audience, and the serving side honors
-/// that name — not the mere position of the record. A grant sitting in
-/// Bob's store toward Alice but whose capability names Carol as its
-/// audience serves Alice nothing: the record's place says who wrote it, the
-/// capability says whom it was written for, and only the second authorizes.
-///
-/// This is the one guard between "a device the connection is toward" and "a
-/// device the grant is addressed to". Without the `cap.audience` check the
-/// classifier would extend Alice the claim set on position alone, so a
-/// record misaddressed — by a bug, or by a replica shared into two
-/// connections — would serve the wrong identity's devices.
+/// A grant in Bob's store toward Alice whose capability names Carol serves
+/// Alice nothing: the capability's audience authorizes, not the record's
+/// position — the one guard between "a device the connection is toward" and
+/// "a device the grant is addressed to".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grant_addressed_to_another_identity_serves_nobody() -> Result<()> {
     let bob = spawn_node().await?;
@@ -421,11 +367,9 @@ async fn a_grant_addressed_to_another_identity_serves_nobody() -> Result<()> {
     let alice_peer =
         ConnectionMetadataStore::import(&alice, serving.own_read_ticket.clone()).await?;
     alice.host_connection(ids::ALICE, ids::BOB, &alice_own, &alice_peer)?;
-    // The grant record converges to Alice — proof the two nodes replicate,
-    // so the data denial below is "refused", not "not yet connected". She
-    // reads no grant out of it all the same: the record sits in the store
-    // Bob writes toward her, but only the capability says whom it was
-    // written for, and it names Carol.
+    // The record converges to Alice — proof the nodes replicate, so the
+    // data denial below is "refused", not "not yet connected" — and reads
+    // as a decided absence.
     assert!(
         eventually(|| async {
             Ok(matches!(
@@ -458,21 +402,12 @@ async fn a_grant_addressed_to_another_identity_serves_nobody() -> Result<()> {
     Ok(())
 }
 
-/// The write-grant scenario: a grant carrying write ships a write ticket,
-/// the audience's write on the granted claim reaches the issuer — and the
-/// ingest gate (ADR-0008) bounds the secret to the granted claim — while
-/// the read filter still narrows what flows the other way.
-///
-/// Allowed: Alice, granted read+write on `shared/note`, writes it and Bob
-/// converges on her value.
-///
-/// Denied (the read side is still scoped): Bob's other entries never reach
-/// Alice, proven after her own write demonstrably round-tripped.
-///
-/// Denied (write outside the write set): the ticket's secret lets Alice
-/// produce an entry at a claim that was never granted, and the issuer's
-/// gate refuses it — Bob's own entry survives, proven after a second
-/// granted-claim round-trip ordered the denial.
+/// A grant carrying write ships a write ticket; the ingest gate (ADR-0008)
+/// bounds the secret to the granted claim. Allowed: Alice writes
+/// `shared/note` and Bob converges. Denied: Bob's other entries still never
+/// reach her, and an entry she signs at an ungranted claim is refused by
+/// the gate — Bob's own survives — each ordered by a granted-claim
+/// round-trip.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
@@ -491,9 +426,8 @@ async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
     let bob_author = bob.create_author().await?;
     bob.write(ids::BOB, bob_author, &note, b"from bob").await?;
 
-    // Grant read+write on exactly `shared/note`; the grant ships a WRITE
-    // ticket — the namespace secret is the transport of write authority,
-    // and the ingest gate is what scopes it.
+    // The write ticket carries the namespace secret; the ingest gate is what
+    // scopes it.
     let grant = granted(ids::BOB, ids::ALICE, &note, true);
     let data_write_ticket = bob
         .share_ticket(
@@ -546,8 +480,8 @@ async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
         "the write-granted peer's write did not reach the issuer"
     );
 
-    // Denied: the round-trip above proves bidirectional replication ran,
-    // yet the ungranted entries still never reached Alice.
+    // Denied: bidirectional replication demonstrably ran, yet the ungranted
+    // entries never reached Alice.
     let listed: Vec<String> = alice
         .list(ids::BOB, None)
         .await?
@@ -560,17 +494,14 @@ async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
         "a write grant must not widen the read scope"
     );
 
-    // Denied (write outside the write set): the secret signs an entry at a
-    // path that was never granted (and that the read filter hides from
-    // her). The gate refuses it at every device of the issuer, so Bob's
-    // own entry survives; her replica keeps her value — a provisional
-    // write, whose bounded fate is the retraction discipline's.
+    // Denied (write outside the write set): Bob's own entry survives; Alice's
+    // replica keeps her provisional write.
     let diary = EntryPath::new(WITHHELD_B)?;
     alice
         .write(ids::BOB, alice_author, &diary, b"ungranted overwrite")
         .await?;
-    // Sentinel: a second granted-claim round-trip proves the sessions that
-    // carried — and refused — the ungranted write have run.
+    // Sentinel: the sessions that carried and refused the ungranted write
+    // have run.
     alice
         .write(ids::BOB, alice_author, &note, b"from alice again")
         .await?;
@@ -596,16 +527,8 @@ async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
     Ok(())
 }
 
-/// Withdrawal: rights are frozen per session, so a withdrawn grant refuses
-/// the *next* session — while data already delivered stays readable
-/// (Invariant 2 governs acquisition, not retention).
-///
-/// Allowed (before): Alice converges on the granted entry.
-///
-/// Denied (after): once the issuer withdraws the grant, updates stop
-/// reaching Alice — probed by writing an update, waiting out several of
-/// her reconcile intervals, and asserting her view still carries the
-/// pre-withdrawal value; that value itself is still readable.
+/// A withdrawn grant refuses the next session while what was delivered
+/// stays readable (Invariant 2 governs acquisition, not retention).
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> Result<()> {
     let bob = spawn_node().await?;
@@ -653,9 +576,8 @@ async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> 
         "the granted entry did not reach the granted peer before withdrawal"
     );
 
-    // The issuer withdraws the grant — one tombstone over the one record,
-    // whatever its width; his own book reads it as absent at once, so his
-    // next session classification has nothing to admit.
+    // One tombstone over the one record; the issuer's own book reads it as
+    // absent at once.
     serving.own_toward_peer.withdraw_grant(ids::BOB).await?;
     assert!(serving
         .own_toward_peer
@@ -664,19 +586,11 @@ async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> 
         .granted()
         .is_none());
 
-    // Rights are frozen per session: a session that started just before
-    // the withdrawal still carries the granted claim, and if the update
-    // landed while such a session was mid-exchange it could ride out
-    // legitimately. One interval drains any in-flight pre-withdrawal
-    // session (sessions on loopback finish in milliseconds) before the
-    // update exists at all, so the assertion below probes only sessions
-    // classified after the withdrawal.
+    // Rights are frozen per session: one interval drains any in-flight
+    // pre-withdrawal session before the update exists.
     tokio::time::sleep(RECONCILE).await;
 
-    // Denied: an update written after the withdrawal never arrives. Alice's
-    // reconcile pass retries every interval; waiting out several of her
-    // intervals makes "she tried and was refused" the only way to stay
-    // green — an admitted update would flip the assertion red.
+    // Denied: an update written after the withdrawal never arrives.
     let author = bob.create_author().await?;
     bob.write(ids::BOB, author, &email, b"bob@after-withdrawal")
         .await?;
@@ -694,23 +608,15 @@ async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> 
     Ok(())
 }
 
-/// Swarm membership does not bypass the access book. The fork's swarm is
-/// content-free: entries never ride the gossip topic, they flow only over
-/// the classified reconciliation an announce triggers — so a swarm member
-/// is served exactly what the issuer's book grants it *at each session*,
-/// never a raw broadcast.
-///
-/// Dave joins Bob's data-namespace swarm (a device-style import) and stays a
-/// member throughout. Positive control: while Bob's book carries a
-/// grant for Dave, Dave converges on Bob's write — proving the
-/// mesh is live and the delivery path works. Negative: once Bob withdraws
-/// the grant, a write made afterwards never reaches Dave — although Dave is
-/// still a swarm member.
+/// Swarm membership does not bypass the access book: the swarm is
+/// content-free, so a member is served what the book grants it per session.
+/// Dave joins Bob's swarm with a device-style import and stays a member
+/// throughout. Positive control: while granted, he converges on Bob's
+/// write. Negative: once the grant is withdrawn, a later write never
+/// reaches him.
 #[tokio::test(flavor = "multi_thread")]
 async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
-    /// How long a would-be broadcast gets before "it never came" counts —
-    /// absolute, because gossip latency does not scale with the reconcile
-    /// interval.
+    /// Absolute: gossip latency does not scale with the reconcile interval.
     const SWARM_WINDOW: Duration = Duration::from_secs(15);
 
     let bob = spawn_node().await?;
@@ -733,8 +639,8 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
         )
         .await?;
 
-    // Dave joins Bob's swarm with a device-style import, and stays a member
-    // for the whole test — nothing below removes him from the swarm.
+    // Dave joins Bob's swarm with a device-style import; nothing below removes
+    // him.
     dave.import_namespace(ids::BOB, ticket).await?;
 
     // Bob's book carries a grant for Dave on the granted claim.
@@ -751,10 +657,7 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
         .publish_grant(&grant, &grant_ticket)
         .await?;
 
-    // Positive control: while granted, Dave converges on Bob's write — the
-    // mesh is live and content is delivered (through the classified sync,
-    // not a raw broadcast, but that distinction is invisible here — only
-    // that it arrives). Bob re-writes each poll so a first announce lands.
+    // Bob re-writes each poll so a first announce lands.
     assert!(
         eventually(|| async {
             bob.write(ids::BOB, bob_author, &email, b"bob@example.org")
@@ -767,13 +670,10 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
 
     // Bob withdraws the grant; his own book reads it as absent at once.
     serving.own_toward_peer.withdraw_grant(ids::BOB).await?;
-    // Drain any pre-withdrawal session (rights are frozen per session)
-    // before the probe write exists, so the negative probes only sessions
-    // classified after the withdrawal.
+    // Drain any pre-withdrawal session before the probe write exists.
     tokio::time::sleep(RECONCILE).await;
 
-    // Negative: a write made after the withdrawal never reaches Dave —
-    // although he is still a swarm member.
+    // Negative: a write made after the withdrawal never reaches Dave.
     let after = EntryPath::new(WITHHELD_A)?;
     bob.write(ids::BOB, bob_author, &after, b"post-withdrawal")
         .await?;
@@ -782,8 +682,7 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
         dave.read(ids::BOB, &after).await?.is_none(),
         "a swarm member received a write after its grant was withdrawn — the swarm carried content"
     );
-    // What was delivered while granted is retained (acquisition, not
-    // retention), so the negative above is not a wiped replica.
+    // Retained: the negative above is not a wiped replica.
     assert!(dave.read(ids::BOB, &email).await?.is_some());
 
     bob.shutdown().await?;
@@ -791,12 +690,9 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
     Ok(())
 }
 
-/// One grant, mixed rights: a read-only claim beside a read-write claim
-/// over one connection. Allowed: the write-granted claim round-trips under
-/// the audience's author. Denied: the same holder's write at the read-only
-/// claim — produced with the very secret the write ticket carries — never
-/// reaches the issuer, and the issuer's value survives, ordered by a
-/// sentinel wave on the writable claim.
+/// Mixed rights in one grant. Allowed: the write-granted claim round-trips.
+/// Denied: the same holder's write at the read-only claim, signed with the
+/// very secret the write ticket carries, never reaches the issuer.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn a_mixed_grant_admits_exactly_its_write_claims() -> Result<()> {
@@ -810,8 +706,7 @@ async fn a_mixed_grant_admits_exactly_its_write_claims() -> Result<()> {
     bob.create_namespace(ids::BOB).await?;
     write_bobs_entries(&bob).await?;
 
-    // The mixed grant: `contact/email` read-only, `contact/phone`
-    // read-write — one record, a write ticket (write present).
+    // One record, a write ticket.
     let email = EntryPath::new(GRANTED)?;
     let phone = EntryPath::new(WITHHELD_A)?;
     let mut grant = granted(ids::BOB, ids::ALICE, &email, false);
@@ -872,9 +767,8 @@ async fn a_mixed_grant_admits_exactly_its_write_claims() -> Result<()> {
         "the write-granted claim did not round-trip"
     );
 
-    // Denied: the read-only claim, forced with the ticket's secret. The
-    // sentinel wave on the writable claim proves the sessions that carried
-    // — and refused — the forged entry have run.
+    // Denied: the read-only claim, forced with the ticket's secret; the
+    // sentinel wave orders the assertion.
     alice
         .write(ids::BOB, alice_author, &email, b"forged@alice")
         .await?;
@@ -903,10 +797,8 @@ async fn a_mixed_grant_admits_exactly_its_write_claims() -> Result<()> {
     Ok(())
 }
 
-/// Withdrawal closes the write side from the next session: the same claim
-/// accepts the audience's write before the withdrawal and refuses one made
-/// after — while the value delivered before stays (acquisition, not
-/// retention, both ways).
+/// Withdrawal closes the write side from the next session; the value
+/// accepted before stays.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_write_grant_refuses_the_next_sessions_writes() -> Result<()> {
     let bob = spawn_node().await?;
@@ -969,14 +861,11 @@ async fn a_withdrawn_write_grant_refuses_the_next_sessions_writes() -> Result<()
         "the pre-withdrawal write was not accepted"
     );
 
-    // Withdrawn: rights are frozen per session, so one interval drains any
-    // in-flight pre-withdrawal session before the probe write exists.
+    // One interval drains any in-flight pre-withdrawal session.
     serving.own_toward_peer.withdraw_grant(ids::BOB).await?;
     tokio::time::sleep(RECONCILE).await;
 
-    // A write made after the withdrawal never reaches the issuer — her
-    // node retries every interval and is refused each time — while the
-    // value accepted while granted stays.
+    // A write made after the withdrawal never reaches the issuer.
     alice
         .write(ids::BOB, alice_author, &note, b"post-withdrawal")
         .await?;

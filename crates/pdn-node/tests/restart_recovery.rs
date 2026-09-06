@@ -1,14 +1,9 @@
-//! Restart recovery at the runtime level: a runtime spawned on the
-//! directory of a shut-down one hosts what the hosted-identities record
-//! names, and everything else re-derives from each identity's private
-//! metadata directory — the data namespace from its `data` ticket, the
-//! metadata pairs from their published tickets, the granted namespaces
-//! from the counterparty's grant records.
-//!
-//! An in-process respawn cannot prove anything about a process that exits;
-//! that half lives on the container stand. What it can prove is the
-//! recovery logic itself: the record's commit point, the re-derivation
-//! paths, and what a withdrawal during the outage does.
+//! Restart recovery at the runtime level: a runtime spawned on a shut-down
+//! one's directory hosts what the hosted-identities record names, and
+//! everything else re-derives from each identity's directory. An
+//! in-process respawn proves the recovery logic — the record's commit
+//! point, the re-derivation paths, a withdrawal during the outage — not a
+//! process that exits; that half is the container stand.
 
 use std::time::Duration;
 
@@ -23,12 +18,9 @@ use test_utils::eventually;
 mod common;
 use common::{claims_on, establish_patiently};
 
-/// The suites' short reconcile cadence — the scenarios here wait on sweeps
-/// and reconciliations, and the production 10s default would turn each
-/// wait into pure sleep.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-/// A runtime on memory, at the test cadence — the peers that stay up.
+/// The peers that stay up.
 async fn memory_rt() -> Result<Runtime> {
     Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -37,7 +29,7 @@ async fn memory_rt() -> Result<Runtime> {
     .await
 }
 
-/// A runtime on `dir`, at the test cadence — the node that restarts.
+/// The node that restarts.
 async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
     Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -46,10 +38,9 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
     .await
 }
 
-/// A node of its own holding `ticket` and nothing else, pointed at
-/// `target`'s address: the bare ticket holder the denials here probe with.
-/// Its import fires a sync attempt now and one every reconcile interval
-/// after, so a probe read is "it tried repeatedly and was refused".
+/// A node holding `ticket` and nothing else, pointed at `target`'s address:
+/// the bare ticket holder the denials probe with. Its import fires a sync
+/// attempt now and every interval after.
 async fn ticket_holder_dialing(
     target: &Runtime,
     issuer: pdn_types::PdnId,
@@ -68,9 +59,8 @@ async fn ticket_holder_dialing(
 /// The hosted-identities record's file name, as the runtime writes it.
 const RECORD: &str = "hosted-identities.json";
 
-/// The record's lines, left opaque: the scenarios below move a line
-/// between two disks rather than construct one, so what a line says stays
-/// the runtime's business.
+/// Left opaque: the scenarios move a line between two disks rather than
+/// construct one.
 fn record_lines(dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
     Ok(serde_json::from_slice(&std::fs::read(dir.join(RECORD))?)?)
 }
@@ -81,14 +71,10 @@ fn write_record_lines(dir: &std::path::Path, lines: &[serde_json::Value]) -> Res
     Ok(())
 }
 
-/// An identity created before the restart is hosted after it — same node
-/// id, its entry readable with no peer running and no ceremony repeated.
-///
-/// The paired denials make the recovery the thing under test rather than a
-/// coincidence: with the record's line removed, the same directory hosts
-/// nothing and reads addressed to the identity are refused; with the
-/// record unreadable, the start fails naming the file — never a healthy
-/// start that hosts nothing.
+/// An identity created before the restart is hosted after it, with no peer
+/// and no ceremony repeated. Denied: with the record's line removed, the
+/// same directory hosts nothing; with the record unreadable, the start
+/// fails naming the file.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -108,9 +94,8 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
         vec![alice],
         "the recorded identity must be hosted again"
     );
-    // The data namespace re-binds from the directory's `data` ticket on
-    // the armer's first sweep; the entry and its payload are local, so no
-    // peer is needed.
+    // The data namespace re-binds from the directory's `data` ticket on the
+    // armer's first sweep; the payload is local.
     assert!(
         eventually(|| async {
             match second.data().read(alice, &path).await {
@@ -124,9 +109,7 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     second.shutdown().await?;
     drop(second);
 
-    // Denial (line removed): what the record does not name is not hosted,
-    // and reads addressed to it are refused — the recovery above cannot
-    // have passed on something other than the record.
+    // Denial (line removed).
     std::fs::write(dir.path().join(RECORD), b"[]")?;
     let third = runtime_on(dir.path()).await?;
     assert!(
@@ -140,8 +123,7 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     third.shutdown().await?;
     drop(third);
 
-    // Denial (record unreadable): the start fails naming the file, rather
-    // than coming up healthy with nothing hosted.
+    // Denial (record unreadable): the start fails naming the file.
     std::fs::write(dir.path().join(RECORD), b"not json")?;
     let Err(err) = runtime_on(dir.path()).await else {
         anyhow::bail!("an unreadable record must stop the start");
@@ -153,11 +135,8 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     Ok(())
 }
 
-/// Several identities on one node each come back: two identities with a
-/// connection each, restarted, each hosting its own and listing its own
-/// connections only — which is what makes "each identity comes back with
-/// its own connections" a property rather than a coincidence of testing
-/// one.
+/// Several identities on one node each come back, each listing its own
+/// connections only.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_identities_each_recover_their_own_connections() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -199,11 +178,10 @@ async fn two_identities_each_recover_their_own_connections() -> Result<()> {
 }
 
 /// The record writer at its edges: a create whose record replacement fails
-/// — the directory made unwritable, the closest injectable stand-in for a
-/// full disk — fails whole and keeps the first identity hosted, from a
-/// previous record left intact; the store set it provisioned is hosted by
-/// nobody after a restart. A successful change replaces the file rather
-/// than editing it in place, observed by its inode.
+/// (the directory made unwritable, the closest stand-in for a full disk)
+/// fails whole and keeps the first identity hosted; the store set it
+/// provisioned is hosted by nobody after a restart. A successful change
+/// replaces the file, observed by its inode.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -217,10 +195,9 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
     let inode_after_first = std::fs::metadata(&record_path)?.ino();
     let tracked_after_first = runtime.sync().tracked_doc_count().await?;
 
-    // The injected failure: the directory refuses new files, so staging
-    // the replacement fails while the stores — files already open, in
-    // writable subdirectories — keep working. The create provisions its
-    // store set and dies exactly at the commit point.
+    // The directory refuses new files, so staging the replacement fails
+    // while the stores — already open, in writable subdirectories — keep
+    // working.
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))?;
     let refused = runtime.identity().create().await;
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
@@ -238,19 +215,16 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
         vec![alice],
         "the failed create must not disturb the hosted set"
     );
-    // And it leaves nothing behind in the running node either. The
-    // replicas it provisioned before the commit point are gone, rather
-    // than reconciled for the rest of the process's life by a node that
-    // hosts nothing they belong to — which a restart would clear, and a
-    // caller retrying on a full disk never gets.
+    // And nothing is left in the running node: the replicas provisioned
+    // before the commit point are gone, rather than reconciled for the rest
+    // of the process's life.
     assert_eq!(
         runtime.sync().tracked_doc_count().await?,
         tracked_after_first,
         "the failed create must leave no replica tracked in the running node"
     );
 
-    // A later successful change replaces the file whole — a fresh inode,
-    // never an edit in place.
+    // A fresh inode, never an edit in place.
     let bob = runtime.identity().create().await?;
     assert_ne!(
         std::fs::metadata(&record_path)?.ino(),
@@ -258,10 +232,7 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
         "the record must be replaced by rename, not edited in place"
     );
 
-    // The restart hosts exactly what the record names: the two committed
-    // identities, and nothing from the interrupted provisioning — its
-    // replicas sit in the store with no record pointing at them, never
-    // registered and never served.
+    // The restart hosts exactly what the record names.
     runtime.shutdown().await?;
     drop(runtime);
     let recovered = runtime_on(dir.path()).await?;
@@ -274,17 +245,12 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
     Ok(())
 }
 
-/// A withdrawal that lands during an outage is honoured after the restart:
-/// the granted namespace stops being readable and its issuer resolves to
-/// nothing — the evidence is the counterparty's replica, not the memo the
-/// restart cleared. The re-grant over the same claim imports again with no
-/// ceremony, and a withdrawal after the restart removes exactly the
-/// binding that re-import recorded.
-///
-/// The tightest denial rides the same scenario: a bare node holding the
-/// namespace's read ticket — pointed at the restarted runtime by hand, the
-/// access-control negative control — obtains nothing across every wave the
-/// scenario proves, while the granted audience reads.
+/// A withdrawal during an outage is honoured after the restart — the
+/// evidence is the counterparty's replica, not the memo the restart
+/// cleared. The re-grant imports again with no ceremony, and a withdrawal
+/// after the restart removes exactly that binding. Denied throughout: a
+/// bare holder of the read ticket, pointed at the restarted runtime by
+/// hand, obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one outage, its denial and its re-grant in the same place
 async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
@@ -319,9 +285,7 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
         "the audience never read the granted entry before the stop"
     );
 
-    // The ticket the denial below presents, captured while the grant is
-    // live: a real read ticket to the issuer's namespace, with no grant
-    // behind its holder.
+    // The ticket the denial presents, captured while the grant is live.
     let leaked_ticket = issuer_rt.data().share(issuer, ShareMode::Read).await?;
 
     // The outage, and the withdrawal inside it.
@@ -332,11 +296,9 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
         .withdraw_grant(issuer, audience, issuer)
         .await?;
 
-    // The restart reconnects from durable tickets alone. The local grant
-    // record is stale — still live on this disk — so the refusal is
-    // asserted only once the counterparty's replica has demonstrably
-    // spoken: devices synced, the grant record tombstoned, and a sweep run
-    // against that state.
+    // The local grant record is stale — still live on this disk — so the
+    // refusal is asserted only once the counterparty's replica has
+    // demonstrably spoken and a sweep has run against that state.
     let recovered = runtime_on(dir.path()).await?;
     assert!(
         eventually(|| async {
@@ -365,14 +327,11 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
         "the withdrawal written during the outage must close the replica"
     );
 
-    // Denial: a holder of the namespace's ticket with no grant, dialing
-    // the restarted runtime itself. Its import fires a sync attempt now
-    // and every reconcile interval after; the assertion waits below, after
-    // a proven wave.
+    // Denial: the ticket holder, dialing the restarted runtime itself;
+    // asserted below, after a proven wave.
     let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
 
-    // The re-grant over the same claim: imported again with no ceremony —
-    // no invite minted, no establishment run since the restart.
+    // The re-grant: imported again with no ceremony.
     issuer_rt.data().write(issuer, &path, b"re-granted").await?;
     common::granted_patiently(
         &issuer_rt,
@@ -394,9 +353,7 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
         "the re-granted namespace must import again with no ceremony"
     );
 
-    // The audience's read above is the proven wave; three more of the
-    // probe's own intervals mean "it tried repeatedly and was refused" is
-    // what keeps this green, not a poll that outran its first dial.
+    // Three more of the probe's intervals after the proven wave.
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         probe.read(issuer, &path).await?.is_none(),
@@ -407,8 +364,8 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
         "a ticket holder with no grant must not even list the namespace"
     );
 
-    // The binding the re-import recorded is the one this removes: the
-    // withdrawal with the runtime on, closing the loop after recovery.
+    // The withdrawal with the runtime on removes the binding the re-import
+    // recorded.
     issuer_rt
         .connections()
         .withdraw_grant(issuer, audience, issuer)
@@ -424,23 +381,19 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
     Ok(())
 }
 
-/// A record line whose directory replica the store does not hold does not
-/// take the node down with it: the start succeeds, that identity is not
-/// hosted, and every healthy line beside it comes back. Such a line is
-/// what a process killed between the record's rename and the store's
-/// commit used to leave; the commit now precedes the rename, so the state
-/// is arranged the only way left — by carrying a real record line from one
-/// node's disk onto another's, where the named replica has never been.
-///
-/// The denials keep the skip from being a shrug: the skipped identity is
-/// refused, not silently re-created, and the record is left as it was, so
-/// the line is still there to be read by whoever ends the hosting.
+/// A record line whose directory replica the store does not hold is
+/// skipped: the start succeeds, that identity is not hosted, and every
+/// healthy line beside it comes back. The commit precedes the rename, so
+/// the state is arranged the only way left — a real record line carried
+/// from one node's disk onto another's. The denials keep the skip from
+/// being a shrug: the skipped identity is refused, not re-created, and the
+/// record is left as it was.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> Result<()> {
     let path = EntryPath::new("contact/email")?;
 
-    // The stranger's line: a real record, written by a real create, on a
-    // disk this test then leaves behind.
+    // A real record line, written by a real create on a disk this test
+    // leaves behind.
     let elsewhere = tempfile::tempdir()?;
     let stranger_rt = runtime_on(elsewhere.path()).await?;
     let stranger = stranger_rt.identity().create().await?;
@@ -490,16 +443,10 @@ async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> 
     Ok(())
 }
 
-/// A start that fails after the stores are open leaves the directory
-/// reusable: the second attempt in the same process comes up instead of
-/// waiting forever on its predecessor's blob store. The failure is the
-/// unreadable record — the one this change makes reachable on every start
-/// — and it is raised after the node exists, which is what makes the
-/// difference observable at all.
-///
-/// The wait is bounded on purpose: without the shutdown on the failing
-/// path the retry does not fail, it hangs, and an unbounded wait would
-/// turn that regression into a stuck run rather than a red one.
+/// A start that fails after the stores are open (the unreadable record is
+/// raised after the node exists) leaves the directory reusable in the same
+/// process. The wait is bounded on purpose: without the shutdown on the
+/// failing path the retry hangs rather than fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
     const RETRY_BUDGET: Duration = Duration::from_secs(30);
@@ -510,8 +457,8 @@ async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
     first.shutdown().await?;
     drop(first);
 
-    // The failing start: the record cannot be parsed, and the refusal
-    // comes after the node's stores are open.
+    // The record cannot be parsed, and the refusal comes after the stores
+    // are open.
     let record = std::fs::read(dir.path().join(RECORD))?;
     std::fs::write(dir.path().join(RECORD), b"not json")?;
     assert!(
@@ -535,18 +482,11 @@ async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
     Ok(())
 }
 
-/// A connection and the grant riding on it come back after a restart, with
-/// the grant untouched throughout: the connection is listed, the grant is
-/// readable from the pair, and the granted namespace's entries read again
-/// once the pair's first sweep has run — from the durable records alone,
-/// with no ceremony repeated and nothing re-granted. An entry the issuer
-/// writes after the restart arrives too, so what came back is a live
-/// replica and not the bytes left on disk.
-///
-/// The denial rides the same scenario, as it must: a bare node holding the
-/// namespace's read ticket and pointed at the restarted runtime by hand —
-/// the access-control negative control — obtains nothing while the granted
-/// audience reads.
+/// A connection and its grant come back after a restart from the durable
+/// records alone — listed, readable, the granted entries readable once the
+/// pair's first sweep has run — and an entry the issuer writes afterwards
+/// arrives, so what came back is a live replica. Denied: a bare holder of
+/// the read ticket pointed at the restarted runtime obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one restart, its liveness and its denial in the same place
 async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
@@ -581,12 +521,10 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
         "the audience never read the granted entry before the restart"
     );
 
-    // The ticket the denial below presents, captured while the grant is
-    // live: a real read ticket, with no grant behind its holder.
+    // The ticket the denial presents, captured while the grant is live.
     let leaked_ticket = issuer_rt.data().share(issuer, ShareMode::Read).await?;
 
-    // The outage. Nothing is withdrawn, nothing re-granted: the grant is
-    // live before it and live after it.
+    // The outage; nothing withdrawn, nothing re-granted.
     audience_rt.shutdown().await?;
     drop(audience_rt);
     let recovered = runtime_on(dir.path()).await?;
@@ -621,9 +559,7 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
         "the granted namespace must read again after the restart"
     );
 
-    // The probe: a ticket holder with no grant, dialing the restarted
-    // runtime itself. Its import fires a sync attempt now and every
-    // reconcile interval after; asserted below, after a proven wave.
+    // The probe, asserted below after a proven wave.
     let probe = data_layer::SyncNode::spawn(data_layer::SpawnOptions {
         reconcile_interval: RECONCILE,
         ..data_layer::SpawnOptions::memory()
@@ -633,11 +569,8 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
     ticket.nodes = vec![recovered.sync().dial_handle_for_test().await.addr()];
     probe.import_namespace_scoped(issuer, ticket).await?;
 
-    // What the issuer writes after the restart arrives over the same
-    // binding — a live replica, not the bytes the outage left behind. The
-    // rewrite stays inside the granted claim: what falls outside it is
-    // filtered by subset reconciliation and would never arrive, grant or
-    // no grant.
+    // A live replica, not the bytes the outage left. The rewrite stays
+    // inside the granted claim.
     issuer_rt.data().write(issuer, &path, b"after").await?;
     assert!(
         eventually(|| async {
@@ -650,8 +583,7 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
         "a rewrite after the restart must reach the audience over the recovered binding"
     );
 
-    // The audience's read above is the proven wave; three more of the
-    // probe's own intervals mean "it tried repeatedly and was refused".
+    // Three more of the probe's intervals after the proven wave.
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         probe.read(issuer, &path).await?.is_none(),
@@ -668,18 +600,11 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
     Ok(())
 }
 
-/// A grant published from a device that is then lost still reaches the
-/// issuer's other device — from the audience's, which is the only live
-/// holder of the record. The sibling is down while the grant is published,
-/// so what it lacks when it comes back is that record alone, and the
-/// publishing device never returns, so nothing of the issuer's own can hand
-/// it over. Without the record the sibling would refuse the audience
-/// fail-closed while the issuer believes the grant published.
-///
-/// Denied, per `code-practices/access-control-tests.md`: a holder of the
-/// issuer's read ticket with no grant behind it obtains nothing from the
-/// recovered device, probed after the audience's own convergence has proven
-/// a wave went out.
+/// A grant published from a device that is then lost reaches the issuer's
+/// other device from the audience's, the only live holder of the record;
+/// without it the sibling would refuse the audience fail-closed while the
+/// issuer believes the grant published. Denied: a bare holder of the read
+/// ticket obtains nothing from the recovered device.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audience() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -696,15 +621,13 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
     establish_patiently(&audience_rt, audience, &publisher_rt, issuer, invite).await?;
     publisher_rt.data().write(issuer, &path, b"before").await?;
 
-    // The ticket the denial below presents, minted while the publisher is
-    // up: a real read ticket, with no grant behind its holder.
+    // The ticket the denial presents, minted while the publisher is up.
     let leaked_ticket = publisher_rt.data().share(issuer, ShareMode::Read).await?;
 
-    // The pair is open on the sibling before it goes down, so the grant
-    // record is the one thing it misses while away. The connection record
-    // alone would not do: it leaves the pair's tickets payload-waiting, and
-    // the only device holding those payloads is the publisher this scenario
-    // then takes away for good.
+    // The pair is open on the sibling before it goes down: the connection
+    // record alone leaves the pair's tickets payload-waiting, and the only
+    // device holding those payloads is the publisher this scenario takes
+    // away for good.
     assert!(
         eventually(|| async {
             let (own, _peer) = sibling_rt
@@ -719,9 +642,7 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
     sibling_rt.shutdown().await?;
     drop(sibling_rt);
 
-    // Published while the sibling is away and read by the audience: the
-    // record is on the audience's device, and on the publisher's until it
-    // goes for good.
+    // Published while the sibling is away and read by the audience.
     common::granted_patiently(
         &publisher_rt,
         issuer,
@@ -746,8 +667,7 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
         "the grant record never reached the device that has to serve by it"
     );
 
-    // And the record is not merely present: the recovered device serves by
-    // it, so the audience converges on a write only that device made.
+    // Not merely present: the recovered device serves by it.
     recovered.data().write(issuer, &path, b"after").await?;
     assert!(
         eventually(|| async {
@@ -760,9 +680,7 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
         "the audience never converged on the recovered device's write"
     );
 
-    // The probe: a ticket holder with no grant, dialing the recovered device
-    // itself, read after the convergence above has proven a wave went out
-    // and after three of the probe's own reconcile intervals.
+    // The probe, after the proven wave and three of its own intervals.
     let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
@@ -780,35 +698,26 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
     Ok(())
 }
 
-/// A link whose record cannot be written leaves nothing anywhere: the link
-/// fails, this device hosts nothing, and the identity's directory never
-/// names it — not at the moment of the failure and not later, because the
-/// confirmation is written after the record and never before it. The
-/// injected failure is the directory made unwritable, the closest
-/// injectable stand-in for a full disk, and the same one the create side
-/// uses.
-///
-/// The retry beside it is what makes the denial a denial: with the
-/// permissions back, the same device links and the directory names it, so
-/// the absence above is the failure's doing rather than a link that could
-/// never have worked.
+/// A link whose record cannot be written leaves nothing anywhere: the
+/// identity's directory never names the device, because the confirmation
+/// is written after the record. The injected failure is the directory made
+/// unwritable; the retry with permissions back is what makes the absence
+/// the failure's doing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let inviter = memory_rt().await?;
     let identity = inviter.identity().create().await?;
-    // The store-level view of the identity's directory, held by a device
-    // that linked the same way any device does.
+    // The store-level view of the directory.
     let (probe, directory) = common::link_probe(&inviter, identity).await?;
 
     let dir = tempfile::tempdir()?;
     let dialer = runtime_on(dir.path()).await?;
     let newcomer = dialer.node_id();
 
-    // The injected failure: the directory refuses new files, so staging
-    // the record fails while the stores — already open, in writable
-    // subdirectories — carry the whole ceremony as usual.
+    // The directory refuses new files, so staging the record fails while
+    // the stores carry the ceremony.
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))?;
     let payload = inviter.identity().linking_invite(identity, None).await?;
     let refused = dialer
@@ -825,10 +734,8 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
         "the failed link must leave nothing hosted"
     );
 
-    // Not now, and not late either: the sweep that repeats a confirmation
-    // only runs for a hosted identity, and this one is not hosted. Three
-    // reconcile intervals are what "it did not arrive afterwards" costs.
-    // The order itself is asserted separately, below.
+    // Not late either: the sweep that repeats a confirmation runs only for
+    // a hosted identity. The order itself is asserted below.
     assert!(
         !directory.list_devices().await?.contains(&newcomer),
         "the failed link must not name this device in the identity's directory"
@@ -839,8 +746,7 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
         "the failed link's device record must not arrive later either"
     );
 
-    // The retry, on the same directory: the record is written, and the
-    // confirmation follows it.
+    // The retry: the record is written, the confirmation follows.
     common::link_patiently(&dialer, &inviter, identity).await?;
     assert_eq!(
         dialer.sync().hosted_identities().await?,
@@ -858,17 +764,12 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
     Ok(())
 }
 
-/// The order the failure above depends on, asserted directly: at the
-/// moment a link is about to commit, it has published nothing into the
-/// identity's directory. Held there by a pause, the scenario reads the
-/// directory from a device that already belongs to the identity, and waits
-/// long enough for a record written earlier to have replicated — the
-/// device set names the inviter's probe and not the dialer. Only after the
-/// commit is released does the dialer appear.
-///
-/// This is what a rollback can and cannot take back: what is local it
-/// undoes, and what has replicated to another device it cannot. Committing
-/// first is what keeps the second category empty.
+/// The order the failure above depends on: at the moment a link is about
+/// to commit it has published nothing into the directory. Held there by a
+/// pause, read from a device that already belongs to the identity, waiting
+/// long enough for an earlier record to have replicated. A rollback undoes
+/// what is local and cannot take back what replicated; committing first
+/// keeps the second category empty.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
     let inviter = memory_rt().await?;
@@ -891,9 +792,9 @@ async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
     };
 
     pause.wait_until_reached().await;
-    // Long enough that a record written before the pause would have
-    // reached this replica: the ceremony's own catch-up ran over the same
-    // path moments ago, and three reconcile intervals follow it.
+    // Long enough that a record written before the pause would have reached
+    // this replica: the ceremony's own catch-up ran over the same path, and
+    // three intervals follow.
     tokio::time::sleep(RECONCILE * 3).await;
     let published = directory.list_devices().await?;
     assert!(

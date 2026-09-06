@@ -44,64 +44,48 @@ use crate::{
     retraction::{RetractionTracker, RetractionVerdict},
 };
 
-/// An operation addressed a data namespace this node does not host: `issuer`
-/// has no created or imported namespace here. Downcast from the
-/// `anyhow::Error` of [`SyncNode::read`] / [`SyncNode::write`] /
-/// [`SyncNode::share_ticket`].
+/// `issuer` has no created or imported data namespace here. Downcast from
+/// the `anyhow::Error` of the issuer-addressed operations.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("data namespace not bound on this node: {issuer}")]
 pub struct UnknownIssuer {
-    /// The issuer whose data namespace was addressed.
     pub issuer: PdnId,
 }
 
-/// An operation addressed a namespace this node does not track: it was
-/// forgotten, or never imported here. Downcast from the `anyhow::Error` of
-/// [`SyncNode::set_doc_contacts`].
+/// The namespace was forgotten, or never imported here. Downcast from the
+/// `anyhow::Error` of [`SyncNode::set_doc_contacts`].
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("namespace not tracked on this node: {namespace}")]
 pub struct UntrackedNamespace {
-    /// The namespace the operation addressed.
     pub namespace: NamespaceId,
 }
 
-/// A protocol supplied to [`SyncNode::spawn_with`]: the ALPN it
-/// answers under, and the handler dispatched for connections arriving on it.
+/// A protocol supplied to [`SyncNode::spawn_with`]: its ALPN and handler.
 pub type ExtraProtocol = (Vec<u8>, Box<dyn DynProtocolHandler>);
 
-/// The ALPNs of the built-in protocols — blob transfer, gossip, document
-/// sync. Reserved: an externally supplied protocol claiming one of these is
-/// refused at spawn with [`AlpnTaken`].
+/// Reserved: an extra protocol claiming one of these is refused at spawn.
 pub const BUILT_IN_ALPNS: [&[u8]; 3] = [BLOBS_ALPN, GOSSIP_ALPN, DOCS_ALPN];
 
-/// A spawn was handed an extra protocol whose ALPN is already taken — by a
-/// built-in protocol ([`BUILT_IN_ALPNS`]) or by another extra in the same
-/// call. Downcast from the `anyhow::Error` of [`SyncNode::spawn_with`].
+/// Downcast from the `anyhow::Error` of [`SyncNode::spawn_with`].
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("protocol ALPN already taken: {}", String::from_utf8_lossy(.alpn))]
 pub struct AlpnTaken {
-    /// The colliding ALPN.
     pub alpn: Vec<u8>,
 }
 
-/// A spawn addressed a directory another running node holds: the replica
-/// store inside takes an exclusive lock, and it is taken. The refused start
-/// leaves the running node untouched. Downcast from the `anyhow::Error` of
-/// the spawn entries; the underlying lock error stays in the chain as the
-/// cause.
+/// Another running node holds the directory. Downcast from the
+/// `anyhow::Error` of the spawn entries; the underlying lock error stays in
+/// the chain as the cause.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("storage directory {} is held by another running node", directory.display())]
 pub struct DirectoryHeld {
-    /// The directory both nodes were pointed at.
     pub directory: std::path::PathBuf,
 }
 
-/// Wraps an externally supplied protocol handler so a panic in its `accept`
-/// cannot escape into iroh's router accept loop, where a panicking handler
-/// task is fatal and tears the whole node down. A caught panic drops just
-/// that one connection; the dialer may observe a clean end-of-stream rather
-/// than an error (the unwind drops the handler's `SendStream`, which
-/// finishes it). Does not survive a `panic = "abort"` build.
+/// A panic in an extra handler's `accept` must not reach iroh's router
+/// accept loop, where it is fatal to the whole node. A caught panic drops
+/// that one connection; the dialer may see a clean end-of-stream rather than
+/// an error. Does not survive a `panic = "abort"` build.
 #[derive(Debug)]
 struct PanicGuarded {
     inner: Box<dyn DynProtocolHandler>,
@@ -125,91 +109,63 @@ impl ProtocolHandler for PanicGuarded {
     }
 }
 
-/// How often the periodic reconcile pass re-requests a sync for every doc
-/// this node holds open — the default of
-/// [`SpawnOptions::reconcile_interval`].
-///
-/// Gossip broadcasts are best-effort and the rescue triggers ride that same
-/// gossip; without this pass a late write can starve until some unrelated
-/// contact. Each pass re-dials a doc's import-time contacts plus the peers
-/// the engine has recorded as useful; the import contacts matter because
-/// the engine records a peer only after one *successful* exchange — without
-/// them a replica whose initial exchange died would starve permanently.
+/// Default of [`SpawnOptions::reconcile_interval`]. Gossip is best-effort
+/// and the rescue triggers ride the same gossip, so without this pass a
+/// late write can starve. Each pass re-dials a doc's import-time contacts,
+/// which matter because the engine records a peer only after one successful
+/// exchange — a replica whose initial exchange died would otherwise starve
+/// permanently.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Where a node keeps its state — chosen by name at spawn, with no default:
-/// the runtime's production consumer is a mobile application that embeds it
-/// and passes a directory inside its own sandbox, and the workspace's suites
-/// want memory and say so. Deliberately not read from the process
+/// Chosen by name at spawn, with no default. Not read from the process
 /// environment: several nodes spawn in one process, and a directory belongs
 /// to one node.
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
-    /// Everything in memory; the node's state ends with the process.
     Memory,
-    /// The node's state lives under this directory: `docs/` holds the
-    /// fork's replica store and its persisted author, `blobs/` the payload
-    /// bytes, `node.key` the endpoint's secret key. Created with owner-only
-    /// permissions when absent — the replica store holds namespace secrets
-    /// and the blobs payload bytes in the clear, so the boundary sits on
-    /// the directory. One running node per directory: the replica store's
-    /// exclusive lock refuses a second ([`DirectoryHeld`]).
+    /// `docs/` (replica store and persisted author), `blobs/`, `node.key`,
+    /// `lock`. Created owner-only when absent: the replica store holds
+    /// namespace secrets and the blobs payload bytes in the clear.
     Directory(std::path::PathBuf),
 }
 
-/// What a node's endpoint binds to be reachable, widening in one
-/// direction: each variant keeps what the one before it binds and adds to
-/// it. The choice is the embedding product's, since every step past
-/// [`Connectivity::Direct`] routes something through infrastructure the
-/// project does not run.
+/// What the endpoint binds to be reachable; each variant keeps what the one
+/// before it binds. The choice is the embedding product's, since every step
+/// past [`Connectivity::Direct`] routes through infrastructure the project
+/// does not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Connectivity {
-    /// Direct paths only. A peer is reached at an address the endpoint
-    /// publishes about itself — from a ticket, a ceremony payload, or a
-    /// session it already held — or not at all. What the suites and the
-    /// container stand run on.
+    /// A peer is reached at an address the endpoint publishes about itself
+    /// or not at all. What the suites and the container stand run on.
     Direct,
-    /// Relay servers too, so a peer behind a NAT is reachable and the
-    /// addressing a ticket carries outlives the network it was minted on:
-    /// the relay routes by node id, and the relay URL travels in every
-    /// ticket and ceremony payload the node mints. A relay carries this
-    /// node's traffic — encrypted, and with both ends' node ids visible to
-    /// whoever runs it.
+    /// Relay servers too: the relay routes by node id and its URL travels in
+    /// every ticket and ceremony payload, so a peer behind a NAT is reachable
+    /// and the addressing outlives the network it was minted on. Both ends'
+    /// node ids are visible to whoever runs the relay.
     Relays,
-    /// Address lookup as well: the node publishes where it is under its
-    /// node id and resolves peers the same way, so a contact known by node
-    /// id alone is dialable — a sibling read out of a device record, or a
-    /// peer whose ticket addresses have gone stale. The published record
-    /// carries relay addresses, not this node's IP addresses, but it makes
-    /// the node id globally resolvable: anyone holding one — a QR's
-    /// scanner, a former counterparty — can ask whether that device is up
-    /// and which relay it is homed on, and no withdrawal takes that back.
+    /// Address lookup as well, so a contact known by node id alone — a
+    /// sibling read out of a device record — is dialable. The node id then
+    /// resolves globally: anyone holding one can ask whether the device is
+    /// up and which relay it is homed on, and no withdrawal takes that back.
     RelaysAndAddressLookup,
 }
 
-/// Spawn-time configuration of the node stack ([`SyncNode::spawn_with`]):
-/// where the node stores its state — required, no default — plus tuning.
-/// Build with [`SpawnOptions::memory`], [`SpawnOptions::on_directory`] or
+/// Spawn-time configuration ([`SyncNode::spawn_with`]). Build with
+/// [`SpawnOptions::memory`], [`SpawnOptions::on_directory`], or
 /// [`SpawnOptions::for_product`].
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
-    /// Where the node keeps its state. Required: a spawn that names
-    /// neither memory nor a directory is not expressible.
+    /// Required: a spawn that names neither memory nor a directory is not
+    /// expressible.
     pub storage: StorageConfig,
-    /// How often the periodic reconcile pass re-requests a sync for every
-    /// doc this node holds open (default [`RECONCILE_INTERVAL`]).
     pub reconcile_interval: Duration,
-    /// What the endpoint binds to be reachable ([`Connectivity`]).
-    /// [`Connectivity::Direct`] in every constructor here but
-    /// [`SpawnOptions::for_product`], which is the one that ships to a
-    /// device the project does not control.
+    /// [`Connectivity::Direct`] in every constructor but
+    /// [`SpawnOptions::for_product`].
     pub connectivity: Connectivity,
 }
 
 impl SpawnOptions {
-    /// Options for a node whose state lives in memory and ends with the
-    /// process — what the workspace's in-process suites run on. Reachable
-    /// over direct paths alone.
+    /// In memory, direct paths — what the in-process suites run on.
     pub fn memory() -> Self {
         Self {
             storage: StorageConfig::Memory,
@@ -218,11 +174,7 @@ impl SpawnOptions {
         }
     }
 
-    /// Options for a node whose state lives under `directory`
-    /// ([`StorageConfig::Directory`]) and is reachable over direct paths
-    /// alone — a persistent node its peers already have an address for,
-    /// which is what the container stand runs on. A node a product ships
-    /// is [`SpawnOptions::for_product`] instead.
+    /// Under `directory`, direct paths — what the container stand runs on.
     pub fn on_directory(directory: impl Into<std::path::PathBuf>) -> Self {
         Self {
             storage: StorageConfig::Directory(directory.into()),
@@ -231,16 +183,10 @@ impl SpawnOptions {
         }
     }
 
-    /// Options for a node a product ships to a device it does not control:
-    /// state under `directory`, and
-    /// [`Connectivity::RelaysAndAddressLookup`] — the reachability a
-    /// device that moves between networks and restarts needs, and the one
-    /// that makes a contact carrying a node id alone dialable, which is
-    /// what a sibling read out of a device record is. Reachability is all
-    /// that separates this from [`SpawnOptions::on_directory`], and the
-    /// separation is deliberate: a suite or a stand whose peers already
-    /// have an address for each other reaches nobody's infrastructure to
-    /// find one.
+    /// Under `directory`, with [`Connectivity::RelaysAndAddressLookup`] —
+    /// the reachability a device that moves between networks needs, kept
+    /// out of [`SpawnOptions::on_directory`] so a suite whose peers already
+    /// have an address for each other reaches nobody's infrastructure.
     pub fn for_product(directory: impl Into<std::path::PathBuf>) -> Self {
         Self {
             connectivity: Connectivity::RelaysAndAddressLookup,
@@ -250,87 +196,47 @@ impl SpawnOptions {
 }
 
 /// One running node: iroh endpoint, gossip, blob store, and the docs
-/// engine, with data replicas addressed by their issuer [`PdnId`] and
-/// entries by [`EntryPath`]s. One node hosts the store sets of any number of
-/// identities. Every doc the node opens joins a periodic reconcile pass
-/// ([`SpawnOptions::reconcile_interval`]). Externally supplied protocols
-/// join the same endpoint at spawn ([`SyncNode::spawn_with`]);
-/// their dial sides and the node's own address are reached through
-/// [`SyncNode::dial_handle`].
-///
-/// Both directions of a session are enforced through the node's access
-/// book. Reads: every session is classified — full for a replica identity's
-/// own devices and connection audiences, capability-filtered for granted
-/// counterparties, refused as not-hosted otherwise. Writes: the fork's
-/// ingest hook (ADR-0008) is installed with the book's validator — on a
-/// replica data-bound to a hosted identity, a synced entry is admitted only
-/// from the issuer's own devices or, per claim, per the sender's session
-/// write set; refused entries are dropped before persisting. Enforcement
-/// arms per identity by registration ([`SyncNode::host_identity`] /
-/// [`SyncNode::host_connection`]) and per replica by
-/// [`SyncNode::import_namespace_scoped`]; a node that registers nothing
-/// serves — and admits — any ticket holder the whole replica.
-///
-/// Storage is chosen at spawn ([`SpawnOptions::storage`]), by name: in
-/// memory, ending with the process, or under a directory — the replicas,
-/// the blobs, the node's one author and its endpoint key all live there, so
-/// a node spawned on the same directory comes back as the same node.
+/// engine, with data replicas addressed by issuer [`PdnId`] and entries by
+/// [`EntryPath`]. Every doc the node opens joins the periodic reconcile
+/// pass. A node that registers nothing serves — and admits — any ticket
+/// holder the whole replica.
 #[derive(Debug)]
 pub struct SyncNode {
     router: Router,
     blobs: iroh_blobs::api::Store,
     docs: DocsApi,
     registry: Arc<Registry>,
-    /// Session classification material: hosted identities' directories and
-    /// connection pairs, consulted by the access provider wired into the
-    /// docs engine at spawn.
     access: Arc<AccessBook>,
-    /// Every doc handle this node opened — data namespaces and device-shared
-    /// stores alike — keyed by namespace for the periodic reconcile pass, so
-    /// a re-import replaces its entry rather than accreting a second one.
+    /// Keyed by namespace, so a re-import replaces its entry rather than
+    /// accreting a second one.
     tracked_docs: Arc<Mutex<HashMap<NamespaceId, TrackedDoc>>>,
-    /// Namespaces with a before-access nudge currently in flight
-    /// ([`nudge_scoped`](Self::nudge_scoped)) — at most one spawned attempt
-    /// per namespace at a time, so a tight poll loop cannot pile up
-    /// concurrent attempts against one replica.
+    /// At most one nudge in flight per namespace, so a tight poll loop
+    /// cannot pile up attempts against one replica.
     nudges_in_flight: Arc<Mutex<HashSet<NamespaceId>>>,
-    /// Provisional-write tracking behind the fork's rejection observer; the
-    /// runtime deposits what it takes to judge one (granted namespaces, the
-    /// issuers' devices, own authors) and consumes the verdicts.
     retraction: Arc<RetractionTracker>,
-    /// The verdict stream's receiving half, taken once by the runtime's
-    /// consumer ([`SyncNode::take_retraction_verdicts`]).
+    /// Taken once, by the runtime's consumer.
     retraction_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>>>,
-    /// Ends the periodic reconcile pass when dropped — with the node — or by
-    /// the explicit send in [`SyncNode::shutdown`]. Taken once: a second
-    /// `shutdown` call finds `None` and skips the send, making the method
-    /// idempotent under a shared reference.
+    /// Taken once, so a repeated `shutdown` is a no-op under a shared
+    /// reference.
     reconciler_stop: Mutex<Option<oneshot::Sender<()>>>,
-    /// The node's exclusive hold on its storage directory
-    /// ([`lock_directory`]) — released by [`shutdown`](Self::shutdown),
-    /// with the stores, or when the node is dropped or the process ends.
-    /// `None` on a memory node.
+    /// Released by `shutdown` with the stores, or with the process. `None`
+    /// on a memory node.
     directory_lock: Option<std::fs::File>,
 }
 
-/// How a tracked doc re-syncs — independent of the binding's serving
-/// posture. `Swarm` joins the replica's gossip swarm — the issuer's own
-/// devices and the device-shared stores. `ContactsOnly` re-syncs with the
-/// ticket's contacts alone and never joins the swarm — every grantee
-/// import: gossip broadcasts entries past the
-/// access book, so the swarm of a data namespace is its issuer's device
-/// set.
+/// How a tracked doc re-syncs, independent of the binding's serving
+/// posture. `ContactsOnly` never joins the gossip swarm — every grantee
+/// import: reconciliation is a grantee's only data path, and the swarm of a
+/// data namespace is its issuer's device set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncStrategy {
     Swarm,
     ContactsOnly,
 }
 
-/// One doc under the periodic reconcile pass: the handle, the contacts its
-/// import ticket carried (empty for docs created here), and the sync
-/// strategy. The engine records a peer as useful only after one successful
-/// exchange, so the contacts are the only recovery path for a replica whose
-/// initial exchange died.
+/// One doc under the reconcile pass. The engine records a peer only after
+/// one successful exchange, so the import-time contacts are the only
+/// recovery path for a replica whose initial exchange died.
 #[derive(Debug, Clone)]
 struct TrackedDoc {
     doc: Doc,
@@ -338,83 +244,61 @@ struct TrackedDoc {
     strategy: SyncStrategy,
 }
 
-/// What one [`SyncNode::import_namespace`] did, carried back to the caller so
-/// that [`SyncNode::undo_import_namespace`] can undo exactly that and nothing
-/// more. Opaque on purpose: it holds the fork's replica handle, which stays
-/// behind this layer, and only the node consumes it.
+/// What one [`SyncNode::import_namespace`] did, so that
+/// [`SyncNode::undo_import_namespace`] undoes exactly that. Opaque: it holds
+/// the fork's replica handle.
 #[derive(Debug)]
 pub struct NamespaceImport {
-    /// The issuer whose binding the import wrote.
     issuer: PdnId,
-    /// The namespace the import bound the issuer to.
     imported: NamespaceId,
-    /// The binding the import displaced — `None` if the issuer was free.
+    /// `None` if the issuer was free.
     displaced: Option<crate::registry::DataBinding>,
-    /// The tracking entry the import's `track` replaced — `None` if the
-    /// namespace was untracked. The undo puts the previous entry back and
-    /// re-aligns the swarm membership with it, so a failed import cannot
-    /// leave the replica syncing under the wrong strategy.
+    /// The tracking entry the import replaced; the undo puts it back and
+    /// re-aligns swarm membership with its strategy.
     displaced_tracking: Option<TrackedDoc>,
 }
 
-/// The dial side of a node's protocols, handed out by
-/// [`SyncNode::dial_handle`]. Wraps the node's iroh endpoint but exposes
-/// only what a dial needs — connect out, read the node's own address and
-/// wire id — never the endpoint's lifecycle, which stays the node's own
-/// ([`SyncNode::shutdown`]).
+/// The dial side of a node's protocols: connect out, read the node's own
+/// address and wire id — never the endpoint's lifecycle, which stays the
+/// node's own.
 #[derive(Debug, Clone)]
 pub struct DialHandle {
     endpoint: Endpoint,
 }
 
 impl DialHandle {
-    /// Open a connection to `addr` under `alpn`, as the dial side of an
-    /// extra protocol. The peer must serve `alpn` — a built-in protocol or
-    /// an extra it registered at spawn — or the dial fails.
+    /// The peer must serve `alpn` or the dial fails.
     pub async fn connect(&self, addr: EndpointAddr, alpn: &[u8]) -> Result<Connection> {
         Ok(self.endpoint.connect(addr, alpn).await?)
     }
 
-    /// This node's own address — its wire id plus the paths peers can reach
-    /// it on — to hand to a peer out of band (a pairing QR, say) as the
-    /// dial target for the reverse direction.
+    /// This node's wire id plus the paths peers can reach it on.
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
     }
 
-    /// This node's wire id; [`SyncNode::node_id`] reports the same value as
-    /// a [`NodeId`].
     pub fn id(&self) -> EndpointId {
         self.endpoint.id()
     }
 }
 
 impl SyncNode {
-    /// Spawn the full stack with no externally supplied protocols,
-    /// configured by `options` — where the state lives is a required part
-    /// of it ([`SpawnOptions::storage`]).
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
         Self::spawn_with(Vec::new(), options).await
     }
 
-    /// The full-control spawn: extra protocols plus configuration, served
-    /// on the same endpoint next to the built-in ones (ADR-0011, ADR-0012).
-    /// A connection arriving under a registered extra ALPN is dispatched to
-    /// its handler as a raw bidirectional connection — not a document-sync
-    /// session. ALPNs must be unique across [`BUILT_IN_ALPNS`] and the
-    /// extras; a collision fails the spawn with [`AlpnTaken`] before
-    /// anything binds.
-    ///
-    /// A handler's `accept` should return `Err(AcceptError)` rather than
-    /// panic: a panic is contained per connection, but a `panic = "abort"`
-    /// build still aborts the process.
+    /// Extra protocols are served on the same endpoint next to the built-in
+    /// ones (ADR-0011, ADR-0012), each dispatched as a raw bidirectional
+    /// connection. An ALPN collision fails the spawn with [`AlpnTaken`]
+    /// before anything binds. A handler's `accept` should return
+    /// `Err(AcceptError)` rather than panic: a panic is contained per
+    /// connection, but a `panic = "abort"` build still aborts the process.
     pub async fn spawn_with(
         extra_protocols: Vec<ExtraProtocol>,
         options: SpawnOptions,
     ) -> Result<Self> {
-        // Checked before the endpoint binds: an extra silently replacing a
-        // built-in handler would leave a node that looks alive and never
-        // syncs.
+        // An extra silently replacing a built-in handler would leave a node
+        // that looks alive and never syncs.
         let mut taken: HashSet<&[u8]> = BUILT_IN_ALPNS.into_iter().collect();
         for (alpn, _handler) in &extra_protocols {
             if !taken.insert(alpn.as_slice()) {
@@ -434,9 +318,6 @@ impl SyncNode {
         };
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        // The access book and registry exist before the engine so the
-        // session access provider can close over them; the blob handle is
-        // set right after the spawn, before any session can arrive.
         let registry = Arc::new(Registry::default());
         let access = Arc::new(AccessBook::default());
         let (retraction, retraction_verdicts) = RetractionTracker::new();
@@ -463,11 +344,9 @@ impl SyncNode {
         {
             Ok(docs) => docs,
             Err(err) => {
-                // A node that never reaches its caller closes what it
-                // opened: the blob store holds its database open, and the
-                // directory lock releases on drop, so a retry on the same
-                // directory in this process would meet this attempt's own
-                // abandoned store — and wait on it rather than be refused.
+                // The blob store holds its database open: a retry on the
+                // same directory in this process would wait on it rather
+                // than be refused.
                 let _ = blobs_store.shutdown().await;
                 return Err(annotate_store_error(err, &options.storage));
             }
@@ -478,8 +357,6 @@ impl SyncNode {
             .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs_store, None))
             .accept(GOSSIP_ALPN, gossip)
             .accept(DOCS_ALPN, docs);
-        // Wrapped so a panic in a handler cannot escape into iroh's accept
-        // loop, where it is fatal to the whole node (`PanicGuarded`).
         for (alpn, handler) in extra_protocols {
             router = router.accept(alpn, PanicGuarded { inner: handler });
         }
@@ -507,25 +384,21 @@ impl SyncNode {
     }
 
     /// Register `identity`'s directory for session classification: its
-    /// device records decide which callers are this identity's own devices
-    /// — full view of its replicas — and arm fail-closed serving for its
-    /// data namespace.
+    /// device records decide who is an own device, and its data namespace
+    /// serves fail-closed from here on.
     pub fn host_identity(&self, identity: PdnId, directory: &PrivateMetadataStore) -> Result<()> {
         self.access.host_identity(identity, directory.doc_handle())
     }
 
-    /// Remove `identity`'s directory from session classification — the
-    /// rollback counterpart of [`host_identity`](Self::host_identity), for
-    /// a ceremony that armed the identity and then failed. Registered
-    /// connections are untouched.
+    /// The rollback counterpart of [`host_identity`](Self::host_identity).
+    /// Registered connections are untouched.
     pub fn unhost_identity(&self, identity: PdnId) -> Result<()> {
         self.access.unhost_identity(identity)
     }
 
-    /// Register a connection of `identity` toward `peer` for session
-    /// classification: `own` carries the grants this identity issued (read
-    /// at session setup), `peer_store` the counterparty's published device
-    /// set, which resolves a caller's node id to `peer`.
+    /// Register a connection for session classification: `own` carries the
+    /// grants this identity issued, `peer_store` the counterparty's
+    /// published device set.
     pub fn host_connection(
         &self,
         identity: PdnId,
@@ -540,41 +413,28 @@ impl SyncNode {
     /// Create a fresh doc and register it as the data namespace of `issuer`.
     pub async fn create_namespace(&self, issuer: PdnId) -> Result<()> {
         let doc = self.new_doc().await?;
-        // A registration cannot already exist: `issuer` is minted fresh by
-        // the caller that provisions it, so there is nothing to displace or
-        // restore.
+        // `issuer` is minted fresh by the caller: nothing to displace.
         let _displaced = self
             .registry
             .register_data(issuer, doc, ServingPosture::Serve)?;
         Ok(())
     }
 
-    /// Import a doc shared via `ticket` and register it as the data
-    /// namespace of `issuer` — the device-replication path: the issuer's own
-    /// devices bring the replica up this way, and a device that holds it may
-    /// re-serve it to the next device. A namespace reached through a
-    /// cross-identity **grant** uses
-    /// [`import_namespace_granted`](Self::import_namespace_granted) or
-    /// [`import_namespace_scoped`](Self::import_namespace_scoped) instead.
-    ///
+    /// The device-replication import: the issuer's own devices bring the
+    /// replica up this way, joining its swarm. A namespace reached through a
+    /// grant uses [`import_namespace_scoped`](Self::import_namespace_scoped).
     /// Returns what the import did, undoable through
-    /// [`undo_import_namespace`](Self::undo_import_namespace); a binding the
-    /// import displaced travels in the token, not dropped here.
-    ///
-    /// A ticket naming a replica that is tracked but not data-bound — a
-    /// directory or a connection metadata store — is refused: a data import
-    /// must not hijack a device-shared replica's tracking.
+    /// [`undo_import_namespace`](Self::undo_import_namespace). A ticket
+    /// naming a tracked but not data-bound replica (a directory, a
+    /// connection metadata store) is refused.
     pub async fn import_namespace(
         &self,
         issuer: PdnId,
         ticket: DocTicket,
     ) -> Result<NamespaceImport> {
         let displaced_tracking = self.guard_data_import(ticket.capability.id())?;
-        // Capability first, sync last, with the binding between them — the
-        // order the grantee import already keeps. A session arriving at a
-        // namespace the book does not know is classified `Full`, so a
-        // replica syncing before its binding is recorded would serve whole
-        // what the binding scopes.
+        // Capability, binding, then sync: a session arriving at a namespace
+        // the book does not know is classified `Full`.
         let contacts = ticket.nodes.clone();
         let doc = self.docs.import_namespace(ticket.capability).await?;
         let imported = doc.id();
@@ -587,8 +447,7 @@ impl SyncNode {
                 Ok(displaced) => displaced,
                 Err(err) => {
                     // The one-namespace-one-issuer rejection must not clobber
-                    // the rightful issuer's tracking (the swarm was not joined
-                    // here, so re-inserting the entry is the whole restore).
+                    // the rightful issuer's tracking.
                     if let Some(previous) = displaced_tracking {
                         let _ = self.restore_tracking(previous).await;
                     }
@@ -608,18 +467,9 @@ impl SyncNode {
         Ok(import)
     }
 
-    /// Import a doc shared via `ticket` as a **whole-store grant** of
-    /// `issuer`: access arrives through a grant, not through being a device
-    /// of the issuer, so — unlike
-    /// [`import_namespace`](Self::import_namespace) — this node never joins
-    /// the replica's gossip swarm, and re-serves it only to the devices of
-    /// the grant's audience identity, per the locally replicated grant
-    /// record. Classified reconciliation with the tracked contacts is the
-    /// only data path; what makes this grant whole-store rather than scoped
-    /// lives entirely in the issuer's book, not in the import.
-    ///
-    /// Returns what the import did, undoable through
-    /// [`undo_import_namespace`](Self::undo_import_namespace).
+    /// The same grantee import as
+    /// [`import_namespace_scoped`](Self::import_namespace_scoped); what the
+    /// grant covers lives in the issuer's book, not in the import.
     pub async fn import_namespace_granted(
         &self,
         issuer: PdnId,
@@ -628,15 +478,10 @@ impl SyncNode {
         self.import_grantee_namespace(issuer, ticket).await
     }
 
-    /// Import a doc shared via `ticket` as a **scoped** data namespace of
-    /// `issuer`: access arrives through a grant, not through being a device
-    /// of the issuer. A scoped import never joins the replica's gossip swarm
-    /// — capability-filtered reconciliation with the tracked contacts is its
-    /// only data path — and the slice is re-served only to the devices of
-    /// the grant's audience identity, per the locally replicated grant
-    /// record.
-    ///
-    /// Returns what the import did, undoable through
+    /// The grantee import: never joins the replica's gossip swarm, and
+    /// re-serves it only to the devices of the grant's audience identity per
+    /// the locally replicated grant record. Returns what the import did,
+    /// undoable through
     /// [`undo_import_namespace`](Self::undo_import_namespace).
     pub async fn import_namespace_scoped(
         &self,
@@ -646,18 +491,10 @@ impl SyncNode {
         self.import_grantee_namespace(issuer, ticket).await
     }
 
-    /// The one grantee import behind
-    /// [`import_namespace_granted`](Self::import_namespace_granted) and
-    /// [`import_namespace_scoped`](Self::import_namespace_scoped):
-    /// `AudienceDevices` re-serving, `ContactsOnly` sync. The two public
-    /// names differ only in what the caller was granted — a distinction the
-    /// issuer's book enforces per session.
-    ///
-    /// Like the device-replication import, refuses a ticket naming a
-    /// tracked but not data-bound replica (a directory, a connection
-    /// metadata store): honoring it would downgrade that store's sync
-    /// strategy — leaving the gossip swarm, cutting its live path — on the
-    /// word of whoever minted the ticket.
+    /// Refuses a ticket naming a tracked but not data-bound replica: honoring
+    /// it would downgrade that store's sync strategy — leaving the gossip
+    /// swarm, cutting its live path — on the word of whoever minted the
+    /// ticket.
     async fn import_grantee_namespace(
         &self,
         issuer: PdnId,
@@ -665,10 +502,9 @@ impl SyncNode {
     ) -> Result<NamespaceImport> {
         let contacts = ticket.nodes.clone();
         let displaced_tracking = self.guard_data_import(ticket.capability.id())?;
-        // Import the capability only — no automatic start_sync, which would
-        // join the gossip swarm. The grantee binding registers *before* the
-        // first sync, so even the very first session is judged under the
-        // grantee rules.
+        // The capability only — no `start_sync`, which would join the
+        // swarm. The binding registers before the first sync, so even that
+        // session is judged under the grantee rules.
         let doc = self.docs.import_namespace(ticket.capability).await?;
         let imported = doc.id();
         self.track(&doc, contacts.clone(), SyncStrategy::ContactsOnly)?;
@@ -679,30 +515,20 @@ impl SyncNode {
             {
                 Ok(displaced) => displaced,
                 Err(err) => {
-                    // The one-namespace-one-issuer rejection must not clobber
-                    // the rightful issuer's tracking (the swarm was not joined
-                    // here, so re-inserting the entry is the whole restore).
                     if let Some(previous) = displaced_tracking {
                         let _ = self.restore_tracking(previous).await;
                     }
                     return Err(err);
                 }
             };
-        // The capability, tracking, and binding are in place; the swarm
-        // leave and the first sync remain. If either fails, roll the whole
-        // import back through the same undo the caller would use, rather
-        // than propagate with the binding half-installed and the displaced
-        // one lost.
         let import = NamespaceImport {
             issuer,
             imported,
             displaced,
             displaced_tracking,
         };
-        // Swarm membership follows the recorded strategy: a device-
-        // replicated import downgraded to a grantee binding leaves the
-        // swarm now, so the membership cannot outlive the strategy. A no-op
-        // for a replica that never joined.
+        // A device-replicated import downgraded to a grantee binding leaves
+        // the swarm now, so membership cannot outlive the strategy.
         if let Err(err) = doc.leave_gossip().await {
             let _ = self.undo_import_namespace(import).await;
             return Err(err);
@@ -714,30 +540,16 @@ impl SyncNode {
         Ok(import)
     }
 
-    /// Set the reconciliation contacts for `issuer`'s data namespace,
-    /// replacing the previous set — devices of the grant's audience and of
-    /// the issuer, derived by the caller from the durable device records on
-    /// every sweep. Replacement is what lets a contact leave: a device
-    /// withdrawn from the records is simply absent from the next derived
-    /// set, so it stops being dialed. The periodic reconcile pass and the
-    /// before-access nudge dial exactly this set (the engine unions in
-    /// peers it has recorded as useful), so a granted replica catches up
-    /// from any device in it while the others are offline.
-    ///
-    /// Refuses with [`UnknownIssuer`] when `issuer` resolves to no tracked
-    /// replica — whether it was never bound or is bound-but-untracked (the
-    /// registry and the tracking map are separate: [`forget_doc`] untracks
-    /// without unregistering). Both are the same failure to the caller —
-    /// "nowhere to record these contacts" — so both surface, rather than a
-    /// silent `Ok` that drops them and starves the replica unattributably.
+    /// Replace the reconciliation contacts of `issuer`'s data namespace —
+    /// replacement is what lets a withdrawn device stop being dialed.
+    /// Refuses with [`UnknownIssuer`] whether the issuer was never bound or
+    /// is bound but untracked: silently dropping the set would starve the
+    /// replica unattributably.
     pub fn set_namespace_contacts(&self, issuer: PdnId, contacts: Vec<EndpointAddr>) -> Result<()> {
         let doc = self
             .registry
             .data_doc(issuer)?
             .ok_or(UnknownIssuer { issuer })?;
-        // The issuer is what this caller named, so an untracked namespace
-        // is reported as the issuer resolving nowhere; a tracking map that
-        // cannot answer at all is a different failure and stays itself.
         self.set_doc_contacts(doc.id(), contacts).map_err(|err| {
             match err.downcast_ref::<UntrackedNamespace>() {
                 Some(_untracked) => UnknownIssuer { issuer }.into(),
@@ -746,20 +558,10 @@ impl SyncNode {
         })
     }
 
-    /// Set the reconciliation contacts of one device-shared store's doc —
-    /// a directory or a connection metadata store — replacing the previous
-    /// set. The import point knows only the ticket's own nodes, and a
-    /// ticket names the devices of the side that minted it: the
-    /// counterparty's, for the half of a pair received at establishment.
-    /// A caller that also knows which of its own devices hold the replica
-    /// records them here, so the doc catches up from a sibling while the
-    /// minting side is offline. Derived by the caller from the durable
-    /// device records, never accumulated: replacement is what lets a
-    /// withdrawn device stop being dialed.
-    ///
-    /// A namespace this node does not track takes no contacts and refuses
-    /// with [`UntrackedNamespace`] — silently dropping the set would starve
-    /// the replica with nothing to attribute it to.
+    /// Replace the reconciliation contacts of a device-shared store's doc: a
+    /// ticket names only the devices of the side that minted it, so the
+    /// caller records the devices it knows hold the replica. Refuses with
+    /// [`UntrackedNamespace`] rather than dropping the set silently.
     pub fn set_doc_contacts(
         &self,
         namespace: NamespaceId,
@@ -776,12 +578,9 @@ impl SyncNode {
         Ok(())
     }
 
-    /// The reconciliation contacts currently tracked for `issuer`'s data
-    /// namespace — the observation side of
-    /// [`set_namespace_contacts`](Self::set_namespace_contacts), so a
-    /// scenario asserts what a sweep derived instead of sleeping and
-    /// guessing. Behind the `test-util` feature and absent from every
-    /// product build. Empty when the issuer resolves to no tracked replica.
+    /// The observation side of
+    /// [`set_namespace_contacts`](Self::set_namespace_contacts). Empty when
+    /// the issuer resolves to no tracked replica.
     #[cfg(feature = "test-util")]
     pub fn namespace_contacts(&self, issuer: PdnId) -> Result<Vec<EndpointAddr>> {
         let Some(doc) = self.registry.data_doc(issuer)? else {
@@ -797,12 +596,8 @@ impl SyncNode {
             .unwrap_or_default())
     }
 
-    /// The number of documents currently tracked by the periodic reconcile
-    /// pass — every doc registered by a create/import and not yet
-    /// forgotten. Behind the `test-util` feature and absent from every
-    /// product build: a scenario asserts this count is unchanged after a
-    /// cancelled or failed attempt, the only anchor available when the
-    /// attempt's replica has no other name a scenario can check by.
+    /// The docs under the reconcile pass — the only anchor a scenario has
+    /// for a cancelled attempt whose replica has no other name.
     #[cfg(feature = "test-util")]
     pub fn tracked_doc_count(&self) -> Result<usize> {
         let docs = self
@@ -812,12 +607,8 @@ impl SyncNode {
         Ok(docs.len())
     }
 
-    /// How many live records `issuer`'s replica holds at `path`, across
-    /// all authors — where every ordinary read collapses to the latest one.
-    /// Behind the `test-util` feature and absent from every product build:
-    /// a scenario asserts a rewrite after a restart replaced its
-    /// predecessor rather than accreting beside it under a second author,
-    /// which no latest-wins read can tell apart.
+    /// Live records at `path` across authors — what every latest-wins read
+    /// collapses, so this is the only way to assert one author per node.
     #[cfg(feature = "test-util")]
     pub async fn live_record_count(&self, issuer: PdnId, path: &EntryPath) -> Result<usize> {
         let doc = self.doc(issuer)?;
@@ -831,10 +622,8 @@ impl SyncNode {
         Ok(count)
     }
 
-    /// The shared precondition of both data-namespace imports: hand back
-    /// the tracking entry the import is about to replace, refusing when the
-    /// namespace is tracked but not data-bound — that replica is a
-    /// device-shared store, and a data import must not hijack its tracking.
+    /// The tracking entry a data import is about to replace; refuses when
+    /// the namespace is tracked but not data-bound (a device-shared store).
     fn guard_data_import(&self, namespace: NamespaceId) -> Result<Option<TrackedDoc>> {
         let displaced_tracking = {
             let docs = self
@@ -852,10 +641,9 @@ impl SyncNode {
         Ok(displaced_tracking)
     }
 
-    /// Put back a tracking entry a failed act displaced, and re-align the
-    /// swarm membership with its strategy: a `ContactsOnly` entry leaves
-    /// the swarm now (best-effort — the restore must not fail over it), a
-    /// `Swarm` entry re-joins on the next reconcile pass by itself.
+    /// Put back a displaced tracking entry and re-align swarm membership: a
+    /// `ContactsOnly` entry leaves the swarm now (best-effort), a `Swarm`
+    /// entry re-joins on the next reconcile pass by itself.
     async fn restore_tracking(&self, tracking: TrackedDoc) -> Result<()> {
         self.track(&tracking.doc, tracking.contacts.clone(), tracking.strategy)?;
         if tracking.strategy == SyncStrategy::ContactsOnly {
@@ -864,14 +652,11 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Undo an import: leave exactly the state that preceded it, touching
-    /// nothing the import did not touch. A free issuer is unbound again and
-    /// the imported replica dropped; a replaced binding is put back, and the
-    /// imported replica is dropped **only** when it is a different one —
-    /// with one namespace per issuer (ADR-0009) an import under an
-    /// already-bound issuer resolves to the very replica the binding names,
-    /// and dropping it would destroy the data the restore exists to preserve
-    /// (`drop_doc` is permanent).
+    /// Leave exactly the state that preceded the import. A replaced binding
+    /// is put back, and the imported replica dropped only when it is a
+    /// different one: with one namespace per issuer (ADR-0009) an import
+    /// under a bound issuer resolves to the very replica the binding names,
+    /// and `drop_doc` is permanent.
     pub async fn undo_import_namespace(&self, import: NamespaceImport) -> Result<()> {
         let NamespaceImport {
             issuer,
@@ -887,27 +672,22 @@ impl SyncNode {
         if imported != previous_namespace {
             self.forget_doc(imported).await?;
         } else if let Some(tracking) = displaced_tracking {
-            // Same replica: the import's `track` replaced the previous
-            // entry, and the restored binding must sync under the entry it
-            // was recorded with — `Swarm` re-joins on the next reconcile
-            // pass, `ContactsOnly` leaves the swarm now.
+            // Same replica: the restored binding must sync under the entry
+            // it was recorded with.
             self.restore_tracking(tracking).await?;
         }
         Ok(())
     }
 
-    /// Forget the data namespace of `issuer`: stop reconciling the replica,
-    /// drop it, and remove the issuer's registration, as one act.
-    /// Operations addressed to `issuer` afterwards fail with
-    /// [`UnknownIssuer`]. Dropping the replica without unregistering is
-    /// deliberately not offered: the issuer would keep resolving to a
-    /// dropped replica, and its operations would fail as storage errors
-    /// instead of the distinguishable refusal.
+    /// Stop reconciling `issuer`'s replica, drop it, and unregister the
+    /// issuer, as one act — so operations afterwards fail with
+    /// [`UnknownIssuer`] rather than as storage errors against a dropped
+    /// replica.
     pub async fn forget_namespace(&self, issuer: PdnId) -> Result<()> {
-        // Drop first, unregister second: the reverse order holds a window
-        // in which the replica is alive but unknown to the book. A failed
+        // Drop first: the reverse order opens a window in which the replica
+        // is alive but unknown to the book, and so served whole; a failed
         // drop leaves the registration in place, so a retry still resolves
-        // the issuer instead of erroring on a half-forgotten one.
+        // the issuer.
         let binding = self
             .registry
             .binding(issuer)?
@@ -915,34 +695,26 @@ impl SyncNode {
         let namespace = binding.doc.id();
         self.forget_doc(namespace).await?;
         let _unregistered = self.registry.unregister_data(issuer)?;
-        // Retraction state leaves with the replica: the entries its markers
-        // address are gone, and a rejection naming them judges nothing.
         self.access.disarm_retractions(namespace)?;
         self.retraction.untrack_namespace(namespace);
         Ok(())
     }
 
-    /// The namespace `issuer` currently resolves to here, `None` when it is
-    /// unbound — the registration probe for importers that memoize their own
-    /// imports. A memo entry whose issuer no longer resolves marks an import
-    /// to redo, not one to skip; an issuer already resolving to the very
-    /// namespace at hand marks a registration to adopt, not to re-import —
+    /// The registration probe for importers that memoize their imports:
     /// each import holds one more open handle on the replica, and the drop
     /// at the end of its life must find exactly one.
     pub fn data_namespace_of(&self, issuer: PdnId) -> Result<Option<NamespaceId>> {
         Ok(self.registry.data_doc(issuer)?.map(|doc| doc.id()))
     }
 
-    /// Record `author` as one of this node's own writers, so the
-    /// provisional-write tracker recognizes its entries.
+    /// Record `author` as one of this node's own writers, so the retraction
+    /// tracker recognizes its entries.
     pub fn track_writer_author(&self, author: AuthorId) {
         self.retraction.track_author(author);
     }
 
-    /// Track the granted namespace of `issuer` for provisional-write
-    /// verdicts, with exactly `devices` counting as the issuer's device set
-    /// — replacing any previous set. Refuses with [`UnknownIssuer`] when
-    /// the issuer resolves to no replica here.
+    /// Set exactly `devices` as the issuer's device set for retraction
+    /// verdicts on `issuer`'s granted namespace.
     pub fn track_retraction_peers(&self, issuer: PdnId, devices: Vec<NodeId>) -> Result<()> {
         let doc = self
             .registry
@@ -953,8 +725,7 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Take the provisional-write verdict stream — once: the runtime's
-    /// consumer owns it, and a second take yields `None`.
+    /// Once; a second take yields `None`.
     pub fn take_retraction_verdicts(
         &self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>> {
@@ -964,12 +735,10 @@ impl SyncNode {
             .and_then(|mut slot| slot.take())
     }
 
-    /// Physically remove `author`'s record at `key` in `issuer`'s replica,
-    /// if its timestamp is at or below `bound` — the retraction act. No
-    /// tombstone: the set shrinks, and re-ingest of the removed entry is
-    /// refused only while a matching armed retraction says so
-    /// ([`arm_retraction`](Self::arm_retraction)). Returns whether a record
-    /// was removed.
+    /// Physically remove `author`'s record at `key` if its timestamp is at
+    /// or below `bound` — no tombstone, which the gate would refuse and
+    /// which would shadow the issuer's entries locally. Returns whether a
+    /// record was removed.
     pub async fn retract_entry(
         &self,
         issuer: PdnId,
@@ -981,9 +750,8 @@ impl SyncNode {
         doc.retract(author, key.to_vec(), bound).await
     }
 
-    /// Arm the ingest refusal for `author`'s entries at `key` in `issuer`'s
-    /// replica up to `bound` — the marker's in-memory half, so a retracted
-    /// entry cannot flap back from a sibling that still holds it.
+    /// The marker's in-memory half: refuse re-ingest of `author`'s entries
+    /// at `key` up to `bound`.
     pub fn arm_retraction(
         &self,
         issuer: PdnId,
@@ -998,16 +766,11 @@ impl SyncNode {
         self.access.arm_retraction(doc.id(), author, key, bound)
     }
 
-    /// Whether this node holds exactly the entry `verdict` names in
-    /// `issuer`'s replica: same author, same key, same timestamp, same
-    /// content hash.
-    ///
-    /// A verdict's fields arrive from the peer that refused the write, and
-    /// retraction is destructive, so nothing but the local record makes them
-    /// true. A fabricated timestamp names no record here; neither does one a
-    /// newer own write has already superseded — writing again after a refusal
-    /// is the way back, and it must not be undone by a rejection still in
-    /// flight for the version it replaced.
+    /// Whether this node holds exactly the entry `verdict` names — author,
+    /// key, timestamp, content hash. A verdict's fields are the refusing
+    /// peer's word and retraction is destructive; a version a newer own
+    /// write already superseded must not be undone by a rejection still in
+    /// flight for it.
     pub async fn holds_rejected_entry(
         &self,
         issuer: PdnId,
@@ -1021,12 +784,8 @@ impl SyncNode {
         Ok(entry.timestamp() == verdict.timestamp && entry.content_hash() == verdict.content_hash)
     }
 
-    /// Take down the ingest refusal armed for `author`'s entries at `key` in
-    /// `issuer`'s replica — what a dropped marker leaves behind. Arming is
-    /// in memory and only ever widens ([`arm_retraction`](Self::arm_retraction)),
-    /// so without this an aged-out marker would go on refusing until the
-    /// process restarts. An issuer that resolves to no replica here has
-    /// nothing armed; that is not an error.
+    /// Take down what a dropped marker armed. An issuer resolving to no
+    /// replica has nothing armed; not an error.
     pub fn disarm_retraction(&self, issuer: PdnId, author: AuthorId, key: &[u8]) -> Result<()> {
         let Some(doc) = self.registry.data_doc(issuer)? else {
             return Ok(());
@@ -1034,9 +793,7 @@ impl SyncNode {
         self.access.disarm_retraction(doc.id(), author, key)
     }
 
-    /// Which issuer `namespace` is bound to on this node, if any — the
-    /// reverse resolution a verdict consumer needs (verdicts carry the
-    /// replica's namespace).
+    /// The reverse resolution a verdict consumer needs.
     pub fn issuer_of_namespace(&self, namespace: NamespaceId) -> Result<Option<PdnId>> {
         Ok(self
             .registry
@@ -1044,30 +801,19 @@ impl SyncNode {
             .map(|(issuer, _)| issuer))
     }
 
-    /// Create a fresh doc for a device-shared store; the doc joins the
-    /// periodic reconcile pass.
+    /// A fresh doc for a device-shared store, tracked.
     pub(crate) async fn new_doc(&self) -> Result<Doc> {
         let doc = self.docs.create().await?;
         self.track(&doc, Vec::new(), SyncStrategy::Swarm)?;
         Ok(doc)
     }
 
-    /// Open a device-shared store's doc this node's store already holds,
-    /// and enrol it in the periodic reconcile pass — recovery's
-    /// counterpart of [`new_doc`](Self::new_doc) and
-    /// [`import_doc`](Self::import_doc): no ticket is consumed and nothing
-    /// is created, so a namespace the store does not hold is `Ok(None)`,
-    /// not a fresh replica. The absence is separated from a store that
-    /// could not answer, which stays an error: the two are what a caller
-    /// recovering from a durable record has to tell apart, and one of them
-    /// is routine.
+    /// Recovery's counterpart of `new_doc` / `import_doc`: a namespace the
+    /// store does not hold is `Ok(None)`, kept apart from a store that could
+    /// not answer.
     pub(crate) async fn open_doc(&self, namespace: NamespaceId) -> Result<Option<Doc>> {
-        // The mirror of [`guard_data_import`](Self::guard_data_import),
-        // which refuses a data import onto a device-shared replica: this
-        // one refuses opening a data replica as a device-shared store.
-        // Tracking here is `Swarm`, so without the guard an import that
-        // deliberately stays out of the gossip swarm — every grantee one —
-        // would be pulled into it by a mistaken open.
+        // The mirror of `guard_data_import`: tracking here is `Swarm`, so a
+        // grantee import opened by mistake would be pulled into the swarm.
         if self.registry.binding_of(namespace)?.is_some() {
             return Err(anyhow::anyhow!(
                 "namespace {namespace} is a data replica on this node; \
@@ -1089,21 +835,11 @@ impl SyncNode {
         Ok(Some(doc))
     }
 
-    /// Read the replica store, so a caller can tell a store that still
-    /// answers from one that does not. The store is one database shared by
-    /// every replica this node holds, and a filesystem that filled under
-    /// it leaves it refusing every later operation until it is reopened —
-    /// a state no in-memory bookkeeping reflects, which is why a health
-    /// answer has to come from the store itself.
-    ///
-    /// The read asks one replica for its sync peers, because that reaches
-    /// the store's tables and a store that stopped answering says so
-    /// there. Two cheaper-looking reads do not: the namespace listing and
-    /// an empty entry query both keep answering long after the database
-    /// has refused everything else — the first is served without reaching
-    /// the tables, the second finds nothing pending to commit. A node
-    /// tracking no replica has no replica state to be broken, and the
-    /// listing is then all there is to ask.
+    /// Read the replica store, to tell a store that still answers from one
+    /// a full filesystem left refusing everything. The read asks one
+    /// replica for its sync peers because that reaches the tables; the
+    /// namespace listing and an empty entry query both keep answering long
+    /// after the database has refused everything else.
     pub async fn check_replica_store(&self) -> Result<()> {
         let doc = {
             let docs = self
@@ -1123,11 +859,8 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Whether the replica store holds `namespace`, answered from its
-    /// listing. Opening cannot answer it: the fork reports "no such
-    /// namespace" and "the store could not answer" as one error of the
-    /// same shape, so a caller reading them apart would be reading error
-    /// text.
+    /// Answered from the listing: the fork reports "no such namespace" and
+    /// "the store could not answer" as one error of the same shape.
     async fn holds_namespace(&self, namespace: NamespaceId) -> Result<bool> {
         let mut listed = self.docs.list().await?;
         while let Some(entry) = listed.next().await {
@@ -1139,9 +872,8 @@ impl SyncNode {
         Ok(false)
     }
 
-    /// Import a device-shared store's doc from `ticket`; the doc joins the
-    /// periodic reconcile pass together with the ticket's contacts, so a
-    /// replica whose initial exchange died is re-dialed rather than starved.
+    /// Import a device-shared store's doc, tracked with the ticket's
+    /// contacts.
     pub(crate) async fn import_doc(&self, ticket: DocTicket) -> Result<Doc> {
         let contacts = ticket.nodes.clone();
         let doc = self.docs.import(ticket).await?;
@@ -1149,10 +881,6 @@ impl SyncNode {
         Ok(doc)
     }
 
-    /// Register `doc` with the periodic reconcile pass. Keyed by namespace,
-    /// so a re-import of a replica this node already tracks replaces its
-    /// entry rather than accreting a second one with a contradictory
-    /// strategy.
     fn track(&self, doc: &Doc, contacts: Vec<EndpointAddr>, strategy: SyncStrategy) -> Result<()> {
         let mut docs = self
             .tracked_docs
@@ -1169,12 +897,9 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Forget a doc: stop reconciling it and drop the replica — the
-    /// rollback for a ceremony that must leave nothing behind. Untracks
-    /// before dropping, so the reconcile pass never re-dials a dropped
-    /// replica. (Data namespaces roll back through
-    /// [`forget_namespace`](Self::forget_namespace) instead, which also
-    /// unregisters the issuer.)
+    /// Untrack and drop a device-shared store's doc. Data namespaces go
+    /// through [`forget_namespace`](Self::forget_namespace), which also
+    /// unregisters the issuer.
     pub async fn forget_doc(&self, namespace: NamespaceId) -> Result<()> {
         {
             let mut docs = self
@@ -1187,14 +912,11 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Commit the replica store's open write transaction, so what this node
-    /// wrote through it is on disk before anything durable points at it.
-    /// Writes are batched into one transaction the store commits on its own
-    /// schedule, so a replica created a moment ago is not on disk yet; a
-    /// read takes a snapshot, and taking one commits the batch first.
-    /// Store-wide although it names a namespace: the snapshot covers every
-    /// replica, and the namespace only says which open replica the read
-    /// addresses. The read matches nothing — the commit is the point.
+    /// Commit the store's open write transaction, so what this node wrote
+    /// is on disk before anything durable points at it: a read takes a
+    /// snapshot, and taking one commits the batch first. Store-wide although
+    /// it names a namespace; the read matches nothing — the commit is the
+    /// point.
     pub async fn flush_replicas(&self, namespace: NamespaceId) -> Result<()> {
         let doc = {
             let docs = self
@@ -1211,12 +933,10 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Handle to the node's blob store, for stores that read entry payloads.
     pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
         self.blobs.clone()
     }
 
-    /// Share the data namespace of `issuer` as a ticket other nodes can import.
     pub async fn share_ticket(
         &self,
         issuer: PdnId,
@@ -1227,43 +947,32 @@ impl SyncNode {
         Ok(ticket)
     }
 
-    /// Create a new author keypair on this node — a standalone writer
-    /// identity. The node's own stores do not write with these: they share
-    /// the one author of [`default_author`](Self::default_author).
+    /// A standalone author; the node's own stores write with
+    /// [`default_author`](Self::default_author) instead.
     pub async fn create_author(&self) -> Result<AuthorId> {
         let author = self.docs.author_create().await?;
         Ok(author)
     }
 
-    /// The node's one author — the fork's default author, persisted with
-    /// the replicas on a directory-configured node, so a restarted node
-    /// writes as the author it wrote as before. Every store on the node
-    /// writes with it: an author minted per store would make a rewritten
-    /// key accumulate one live record per author, and leave a device record
-    /// written under one author standing after a withdrawal written under
-    /// another.
+    /// The node's one author, persisted with the replicas. An author minted
+    /// per store or per start would make a rewritten key accumulate one
+    /// live record per author, and leave a device record written under one
+    /// author standing after a withdrawal written under another.
     pub async fn default_author(&self) -> Result<AuthorId> {
         let author = self.docs.author_default().await?;
         Ok(author)
     }
 
-    /// This node's identifier on the wire — its iroh endpoint id (an ed25519
-    /// public key) as a [`NodeId`].
     pub fn node_id(&self) -> NodeId {
         NodeId::from_bytes(*self.router.endpoint().id().as_bytes())
     }
 
-    /// A narrow handle onto the node's iroh endpoint for the dial side of
-    /// extra protocols ([`DialHandle`]). Deliberately not the raw
-    /// [`Endpoint`]: the node stays the sole owner of the endpoint's
-    /// lifecycle.
     pub fn dial_handle(&self) -> DialHandle {
         DialHandle {
             endpoint: self.router.endpoint().clone(),
         }
     }
 
-    /// Write `payload` at `path` in the data namespace of `issuer`.
     pub async fn write(
         &self,
         issuer: PdnId,
@@ -1277,16 +986,9 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Read the latest payload at `path` in the data namespace of `issuer`,
-    /// if present.
-    ///
-    /// Returns `Ok(None)` both when no entry exists and when the entry is
-    /// stored but its payload has not been fetched yet: records and blob
-    /// content arrive independently, so "stored" precedes "readable" — poll
-    /// again for the payload. Reading a grant-imported (`ContactsOnly`)
-    /// namespace nudges its filtered reconciliation first (non-blocking):
-    /// the answer is served from the local replica at once, and the nudge
-    /// pulls fresh entries for the next read.
+    /// `Ok(None)` both when no entry exists and when its payload has not
+    /// been fetched yet — poll again. A grant-imported namespace is nudged
+    /// first (non-blocking): the answer comes from the local replica at once.
     pub async fn read(&self, issuer: PdnId, path: &EntryPath) -> Result<Option<Vec<u8>>> {
         self.nudge_scoped(issuer);
         let doc = self.doc(issuer)?;
@@ -1294,12 +996,8 @@ impl SyncNode {
     }
 
     /// Fire-and-forget a filtered reconciliation of a `ContactsOnly`
-    /// (grant-imported) namespace before serving a read or list. No-op for
-    /// swarm-synced bindings and unknown issuers; failures are the
-    /// reconcile pass's to retry. Debounced to one in-flight attempt per
-    /// namespace — every read and list fires this, and without the latch a
-    /// tight poll loop piles up tasks against one replica; cleared when the
-    /// attempt finishes, success or not.
+    /// namespace; no-op otherwise. Debounced to one attempt in flight per
+    /// namespace, or a tight poll loop piles up tasks against one replica.
     fn nudge_scoped(&self, issuer: PdnId) {
         let Ok(Some(binding)) = self.registry.binding(issuer) else {
             return;
@@ -1334,14 +1032,9 @@ impl SyncNode {
         });
     }
 
-    /// List entry metadata in the data namespace of `issuer` — no payload
-    /// bytes — optionally narrowed to entries whose path starts with
-    /// `path_prefix`, matching whole components (`contacts` matches
-    /// `contacts/a` but not `contactsx/c`).
-    ///
-    /// Record-level: an entry lists once its record is stored, whether or
-    /// not its payload has been fetched yet. Deleted entries (tombstones)
-    /// do not list.
+    /// Entry metadata, record-level, optionally narrowed to `path_prefix`
+    /// matching whole components (`contacts` matches `contacts/a`, not
+    /// `contactsx/c`).
     pub async fn list(
         &self,
         issuer: PdnId,
@@ -1349,8 +1042,7 @@ impl SyncNode {
     ) -> Result<Vec<EntryInfo>> {
         self.nudge_scoped(issuer);
         let doc = self.doc(issuer)?;
-        // Byte-prefix query as the coarse cut (a component prefix is always
-        // a byte prefix); exact component semantics checked per entry below.
+        // Byte prefix as the coarse cut; component semantics per entry below.
         let query = Query::single_latest_per_key();
         let query = match path_prefix {
             Some(prefix) => query.key_prefix(prefix.as_str().as_bytes()),
@@ -1360,8 +1052,6 @@ impl SyncNode {
         let mut entries = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry?;
-            // Keys that don't parse as entry paths are not data-layer
-            // entries; skip them, as the store listings do for foreign keys.
             let Some(path) = path_of(entry.key()) else {
                 continue;
             };
@@ -1377,12 +1067,8 @@ impl SyncNode {
         Ok(entries)
     }
 
-    /// The reconciliation contacts currently tracked for one device-shared
-    /// store's doc — the observation side of
-    /// [`set_doc_contacts`](Self::set_doc_contacts), so a scenario asserts
-    /// what a caller derived instead of sleeping and guessing. Behind the
-    /// `test-util` feature and absent from every product build. Empty when
-    /// the namespace resolves to no tracked doc.
+    /// The observation side of [`set_doc_contacts`](Self::set_doc_contacts).
+    /// Empty when the namespace resolves to no tracked doc.
     #[cfg(feature = "test-util")]
     pub fn doc_contacts(&self, namespace: NamespaceId) -> Result<Vec<EndpointAddr>> {
         let docs = self
@@ -1395,13 +1081,10 @@ impl SyncNode {
             .unwrap_or_default())
     }
 
-    /// Shut the node down, closing the endpoint and all protocols. Takes
-    /// `&self`: no exclusive ownership is required, and a repeat call is a
-    /// no-op (the reconcile-stop send only fires once; the router's own
-    /// shutdown is already idempotent).
+    /// Idempotent under a shared reference.
     pub async fn shutdown(&self) -> Result<()> {
-        // Stop the reconcile pass first so it does not race the docs
-        // engine's shutdown with fresh sync requests.
+        // First, so it does not race the docs engine's shutdown with fresh
+        // sync requests.
         if let Some(stop) = self
             .reconciler_stop
             .lock()
@@ -1411,18 +1094,13 @@ impl SyncNode {
             let _ = stop.send(());
         }
         self.router.shutdown().await?;
-        // The blob store is shut down explicitly rather than left to its
-        // last handle's drop: on a directory-configured node it holds its
-        // database open, and a node respawned on the same directory would
-        // meet its predecessor's lock. Best-effort, keeping the repeat call
-        // a no-op: a store already shut down answers with an error, not
-        // with a hang.
+        // Explicit rather than on the last handle's drop: a node respawned
+        // on the same directory would meet its predecessor's database lock.
+        // Best-effort: a store already shut down answers with an error.
         let _ = self.blobs.shutdown().await;
-        // The directory lock leaves with the stores, not with this value's
-        // drop: a detached task holding the node alive a moment longer —
-        // an armer mid-sweep — must not make a spawn on the same directory
-        // read as a second running node. Best-effort for the same
-        // idempotence reason as above.
+        // With the stores, not with this value's drop: a detached task
+        // holding the node alive a moment longer must not make a spawn on
+        // the same directory read as a second running node.
         if let Some(lock) = &self.directory_lock {
             let _ = lock.unlock();
         }
@@ -1436,36 +1114,24 @@ impl SyncNode {
     }
 }
 
-/// The layout of a configured storage directory
-/// ([`StorageConfig::Directory`]). What a person finds on a volume: `docs/`
-/// — the fork's replica store (`docs.redb`) and its persisted author
-/// (`default-author`); `blobs/` — payload bytes; `node.key` — the
-/// endpoint's secret key, hex-encoded; `lock` — the running node's
-/// exclusive hold on the directory, content-free.
+/// The directory layout: the fork's replica store (`docs.redb`) and its
+/// persisted author (`default-author`).
 const DOCS_DIR: &str = "docs";
-/// See [`DOCS_DIR`].
 const BLOBS_DIR: &str = "blobs";
-/// See [`DOCS_DIR`].
+/// The endpoint's secret key, hex-encoded.
 const NODE_KEY_FILE: &str = "node.key";
-/// See [`DOCS_DIR`].
+/// The running node's exclusive hold, content-free.
 const LOCK_FILE: &str = "lock";
 
-/// Owner-only permissions for the storage directory: the replica store
-/// inside holds namespace secrets and the blob store payload bytes in the
-/// clear, so the boundary sits on the directory rather than on the key file
-/// alone.
+/// The replica store holds namespace secrets and the blob store payload
+/// bytes in the clear, so the boundary sits on the directory.
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
-/// Owner-only permissions for the key file.
 #[cfg(unix)]
 const KEY_MODE: u32 = 0o600;
 
-/// Create the storage directory with owner-only permissions when it is
-/// absent, verifying the permissions of what was created; a directory that
-/// already exists — a mounted volume, a re-open — is taken as the caller
-/// gave it. The `docs/` and `blobs/` subdirectories are created either way:
-/// the stores expect their paths to exist, and the boundary sits on the
-/// directory itself.
+/// Create the directory owner-only when absent; one that exists — a mounted
+/// volume — is taken as the caller gave it.
 fn provision_directory(directory: &std::path::Path) -> Result<()> {
     if !directory.exists() {
         create_owner_only_dir(directory)?;
@@ -1489,9 +1155,7 @@ fn create_owner_only_dir(directory: &std::path::Path) -> Result<()> {
         .mode(DIR_MODE)
         .create(directory)
         .with_context(|| format!("cannot create storage directory {}", directory.display()))?;
-    // Checked, not assumed: the process umask can strip permission bits at
-    // creation, and a directory wider than owner-only exposes namespace
-    // secrets.
+    // Checked, not assumed: the umask can strip bits at creation.
     let mode = std::fs::metadata(directory)?.permissions().mode() & 0o777;
     if mode != DIR_MODE {
         return Err(anyhow::anyhow!(
@@ -1509,14 +1173,10 @@ fn create_owner_only_dir(directory: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Take the node's exclusive hold on the directory: an advisory lock on the
-/// `lock` file, held for the node's lifetime and released with the process.
-/// The stores below take exclusive locks of their own, but this one comes
-/// first, for two reasons: the refusal names the directory and its cause
-/// rather than arriving as a lock error from three layers down that reads
-/// as corruption — and the blob store's open on a database another node
-/// holds waits instead of failing, so a start that reached it would hang
-/// rather than refuse.
+/// An advisory lock on the `lock` file, taken before the stores open their
+/// own: the refusal then names the directory rather than reading as
+/// corruption, and the blob store's open on a database another node holds
+/// waits instead of failing.
 fn lock_directory(directory: &std::path::Path) -> Result<std::fs::File> {
     let path = directory.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
@@ -1536,11 +1196,8 @@ fn lock_directory(directory: &std::path::Path) -> Result<std::fs::File> {
     }
 }
 
-/// Read the endpoint's secret key from `node.key`, or generate and store
-/// one on the first start. A key file that is present but cannot be read or
-/// parsed stops the start with an error naming it — never a regenerated
-/// key: regenerating would silently change the node id, which is the exact
-/// failure the stored key exists to prevent.
+/// A key file present but unreadable stops the start — never a regenerated
+/// key, which would silently change the node id.
 fn read_or_generate_node_key(directory: &std::path::Path) -> Result<SecretKey> {
     let path = directory.join(NODE_KEY_FILE);
     match std::fs::read_to_string(&path) {
@@ -1565,16 +1222,14 @@ fn parse_node_key(text: &str) -> Result<SecretKey> {
 fn encode_hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::with_capacity(64), |mut out, b| {
-        // Writing into a `String` cannot fail.
         let _ = write!(out, "{b:02x}");
         out
     })
 }
 
-/// Generate a fresh key and commit it to `path` — written beside and linked
-/// into place, so no half-written key can exist, and linked exclusively, so
-/// two starts racing on one directory cannot mint different keys: the loser
-/// reads the winner's file instead.
+/// Written beside and linked into place, so no half-written key can exist;
+/// linked exclusively, so two starts racing on one directory cannot mint
+/// different keys — the loser reads the winner's file.
 #[cfg(unix)]
 fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Result<SecretKey> {
     use std::{
@@ -1584,11 +1239,9 @@ fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Res
     let fresh = SecretKey::generate();
     let encoded = encode_hex(&fresh.to_bytes());
     let staged = directory.join(format!("{NODE_KEY_FILE}.tmp"));
-    // One staging name, cleared before use: this runs under the directory's
-    // exclusive lock, so no other node is staging here, and a leftover from
-    // a start interrupted mid-write must not be what stops every later one.
-    // Removed rather than truncated so the mode below is the file's own and
-    // not a leftover's.
+    // A leftover from a start interrupted mid-write must not stop every
+    // later one; removed rather than truncated so the mode below is the
+    // file's own. Safe under the directory's exclusive lock.
     let _leftover_gone = std::fs::remove_file(&staged);
     {
         let mut file = std::fs::OpenOptions::new()
@@ -1614,7 +1267,6 @@ fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Res
         }
     };
     let _staged_gone = std::fs::remove_file(&staged);
-    // Checked, not assumed — the same reason as the directory's own check.
     let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
     if mode != KEY_MODE {
         return Err(anyhow::anyhow!(
@@ -1640,11 +1292,9 @@ fn generate_node_key(_directory: &std::path::Path, path: &std::path::Path) -> Re
     Ok(fresh)
 }
 
-/// Name the directory in a failed store open, and tell the one failure that
-/// is not corruption apart from the rest: a replica store whose exclusive
-/// lock another running node holds surfaces as [`DirectoryHeld`] rather
-/// than as a lock error from three layers down that reads as a corrupt
-/// store. The underlying error stays in the chain either way.
+/// Name the directory in a failed store open, and reclassify a replica
+/// store held by another node as [`DirectoryHeld`] rather than a lock error
+/// that reads as corruption. The underlying error stays in the chain.
 fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::Error {
     let StorageConfig::Directory(directory) = storage else {
         return err;
@@ -1667,21 +1317,11 @@ fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::
     }
 }
 
-/// Make a configured directory ready to be a node's, and hand back what
-/// the node takes from it: the endpoint's secret key and the open file
-/// holding the directory's lock. A node that persists its stores but not
-/// its key would come back under a fresh wire id while its device records
-/// and tickets all name the old one, so the key comes out of the directory
-/// before anything binds — and the lock comes first of all: one running
-/// node per directory, refused by name ([`DirectoryHeld`]). A memory node
-/// has neither.
-///
-/// One blocking step, off the worker thread: creating the directory,
-/// taking the lock and minting the key are `std::fs` calls with two
-/// `sync_all`s among them, and on a virtualized filesystem they cost long
-/// enough to stall whatever else that thread was running. The lock travels
-/// back as an open file, and it is the open file that holds it, not the
-/// thread that opened it.
+/// Provision the directory, take its lock, and read or mint the key —
+/// the lock first, so one running node per directory is refused by name.
+/// One `spawn_blocking` step: the `std::fs` calls and two `sync_all`s stall
+/// a worker thread on a virtualized filesystem. The open file holds the
+/// lock, not the thread that opened it.
 async fn prepare_storage(
     storage: &StorageConfig,
 ) -> Result<(Option<SecretKey>, Option<std::fs::File>)> {
@@ -1700,18 +1340,11 @@ async fn prepare_storage(
     Ok((Some(key), Some(lock)))
 }
 
-/// Bind the node's endpoint, with `secret_key` when the node's storage
-/// holds one — the node id is then the one it had before — and a fresh key
-/// otherwise. If `PDN_BIND_ADDR` holds an IP address the endpoint binds
-/// that address with an ephemeral port; unset, it binds all interfaces.
-/// Scenario tests bind `127.0.0.1` (the just recipes set it) to keep test
-/// traffic on loopback; production spawns leave it unset.
-///
-/// What the endpoint binds to be reachable is `connectivity`'s
-/// ([`Connectivity`]). Only its widest variant takes iroh's `N0` preset,
-/// which bundles relays with the address lookup that publishes under this
-/// node's id; the narrower two take the relay mode on its own over
-/// `Minimal`, so no record about this node leaves the device.
+/// If `PDN_BIND_ADDR` holds an IP address the endpoint binds it with an
+/// ephemeral port (the just recipes set `127.0.0.1` to keep test traffic on
+/// loopback); unset, all interfaces. Only the widest `connectivity` takes
+/// iroh's `N0` preset, which publishes a record under this node's id; the
+/// narrower two take the relay mode alone over `Minimal`.
 async fn bind_endpoint(
     secret_key: Option<SecretKey>,
     connectivity: Connectivity,
@@ -1741,23 +1374,16 @@ async fn bind_endpoint(
     Ok(endpoint)
 }
 
-/// Wait until the freshly bound endpoint reports a dialable address. No
-/// timeout: an endpoint with no address cannot be dialed, and the local
-/// socket's address appears as soon as any transport address is published.
+/// No timeout: the local socket's address appears as soon as any transport
+/// address is published.
 async fn wait_until_dialable(endpoint: &Endpoint) {
     while endpoint.watch_addr().get().is_empty() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-/// Read the latest entry at `key` and its payload, if the record is here and
-/// its blob has arrived.
-///
 /// `Ok(None)` covers both "no such entry" and "record stored, payload not
-/// yet fetched": records and blob content travel independently, so "stored"
-/// precedes "readable" and consumers poll. Every payload-waiting read in
-/// this layer goes through here; what a caller makes of the bytes is the
-/// caller's own.
+/// yet fetched". Every payload-waiting read in this layer goes through here.
 pub(crate) async fn read_payload(
     doc: &Doc,
     blobs: &iroh_blobs::api::Store,
@@ -1774,12 +1400,10 @@ pub(crate) async fn read_payload(
     Ok(Some(blobs.get_bytes(hash).await?.to_vec()))
 }
 
-/// The periodic reconcile pass: every `interval`, re-request a sync for
-/// each tracked doc with its import-time contacts (the engine unions them
-/// with the peers it recorded as useful). A request against a pair whose
-/// sync is running is dropped by the engine's session state; a failed
-/// request is retried by the next pass. Ends when `stop` is sent
-/// ([`SyncNode::shutdown`]) or its sender is dropped with the node.
+/// Every `interval`, re-request a sync for each tracked doc with its
+/// contacts (the engine unions in the peers it recorded). A failed request
+/// is retried by the next pass. Ends when `stop` is sent or its sender is
+/// dropped with the node.
 async fn reconcile_pass(
     interval: Duration,
     docs: Arc<Mutex<HashMap<NamespaceId, TrackedDoc>>>,
@@ -1788,13 +1412,9 @@ async fn reconcile_pass(
     while tokio::time::timeout(interval, &mut stop).await.is_err() {
         let snapshot: Vec<TrackedDoc> = match docs.lock() {
             Ok(guard) => guard.values().cloned().collect(),
-            // A poisoned lock means a tracking write panicked; skip this
-            // pass rather than poison the task — the next tick retries.
             Err(_poisoned) => continue,
         };
         for tracked in snapshot {
-            // Best-effort: a failed re-request is retried by the next tick.
-            // `ContactsOnly` docs re-sync without joining the gossip swarm.
             let _ = match tracked.strategy {
                 SyncStrategy::ContactsOnly => tracked.doc.start_sync_scoped(tracked.contacts).await,
                 SyncStrategy::Swarm => tracked.doc.start_sync(tracked.contacts).await,
@@ -1803,15 +1423,13 @@ async fn reconcile_pass(
     }
 }
 
-/// Parse a stored key back into an [`EntryPath`], if it is one.
 fn path_of(key: &[u8]) -> Option<EntryPath> {
     let s = std::str::from_utf8(key).ok()?;
     EntryPath::new(s).ok()
 }
 
-/// Whether `path`'s leading components equal `prefix`'s components. Both
-/// are validated paths (no empty components, no trailing slash), so a byte
-/// prefix plus a component boundary is exactly component semantics.
+/// Both are validated paths, so a byte prefix plus a component boundary is
+/// exactly component semantics.
 fn starts_with_components(path: &EntryPath, prefix: &EntryPath) -> bool {
     match path.as_str().strip_prefix(prefix.as_str()) {
         Some(rest) => rest.is_empty() || rest.starts_with('/'),
@@ -1823,26 +1441,15 @@ fn starts_with_components(path: &EntryPath, prefix: &EntryPath) -> bool {
 mod tests {
     use super::*;
 
-    /// The reclassification of a held replica store, tested directly
-    /// because no path reaches it: the directory's own advisory lock is
-    /// taken first and refuses the second node before any store opens, so
-    /// this branch is a backstop for a directory whose lock does not hold
-    /// — and a backstop no scenario can reach is exactly the code that
-    /// rots unnoticed when the fork's error shape drifts.
-    ///
-    /// Both halves are asserted together: the held error becomes
-    /// `DirectoryHeld` naming the directory, and an unrelated failure does
-    /// not — a reclassification that fired on everything would name the
-    /// directory just as well while telling the operator the opposite of
-    /// what happened.
+    /// Tested directly: the directory's advisory lock refuses a second node
+    /// before any store opens, so no scenario reaches this backstop, and a
+    /// backstop nobody reaches rots when the fork's error shape drifts.
     #[test]
     fn a_held_database_is_reclassified_and_nothing_else_is() {
         let directory = std::path::PathBuf::from("/pdn/state");
         let storage = StorageConfig::Directory(directory.clone());
 
-        // Wrapped in a context layer, the way the fork's own chain
-        // presents it — the classification reads the chain, not the
-        // outermost error.
+        // Wrapped in a context layer, the way the fork's chain presents it.
         let held = anyhow::Error::new(redb::DatabaseError::DatabaseAlreadyOpen)
             .context("cannot open the replica store");
         let annotated = annotate_store_error(held, &storage);
@@ -1862,7 +1469,6 @@ mod tests {
             "an unrelated store failure must still name the directory"
         );
 
-        // A memory node has no directory to name, so nothing is annotated.
         let on_memory = annotate_store_error(anyhow::anyhow!("boom"), &StorageConfig::Memory);
         assert_eq!(format!("{on_memory:#}"), "boom");
     }

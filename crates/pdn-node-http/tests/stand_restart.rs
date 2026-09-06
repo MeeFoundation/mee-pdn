@@ -137,11 +137,8 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
         .context("the audience never read the granted entry before the stop")?;
     let id_before = node_id(&issuer).await?;
 
-    // Arm one: the clean stop — asserted as clean, not merely as stopped.
-    // The daemon follows its stop signal with a kill once the grace runs
-    // out, and the container is down either way; only the exit code and
-    // the time it took tell the graceful path from the one the daemon cut
-    // short.
+    // Arm one: the clean stop, asserted as clean — only the exit code and
+    // the time it took tell the graceful path from one the daemon cut short.
     let stopping = std::time::Instant::now();
     issuer.stop().await?;
     let stop_took = stopping.elapsed();
@@ -174,14 +171,9 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
     .await
     .context("recovery after the clean stop")?;
 
-    // Arm two: the kill — no grace, no shutdown path — with the same
-    // assertions and no extra ones. The sentinel acknowledged in arm one
-    // is what must have survived, and the kill waits out the stores'
-    // settle window first: both stores acknowledge a write before they
-    // commit it, committing on a timer instead, so a kill inside that
-    // window takes the youngest acknowledged writes with it — the
-    // mid-stream scenario below is where that window itself is the
-    // subject.
+    // Arm two: the kill, with the same assertions. It waits out the settle
+    // window first; the mid-stream scenario below is where that window
+    // itself is the subject.
     tokio::time::sleep(SETTLE_WINDOW).await;
     issuer.kill()?;
     ensure!(
@@ -227,44 +219,28 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
 }
 
 /// How long after its acknowledgement a write is committed for certain:
-/// the stores commit after the acknowledgement, on a timer — the replica
-/// store flushes its open write transaction every 500 milliseconds, and
-/// the blob store's metadata commits when its batch closes — so a kill can
-/// take acknowledged writes younger than this back to the last commit.
-/// The two commit independently, so a kill inside the window can even keep
-/// the entry record while losing its payload; the read then answers
-/// absent, which is what "absent or whole, never torn" allows. Sized to
-/// both timers with room for a loaded machine; tightening it is how this
-/// scenario would catch a store whose commit cadence regressed.
+/// the replica store flushes its write transaction every 500 milliseconds
+/// and the blob store commits when its batch closes, independently — so a
+/// kill inside the window can keep the entry record while losing its
+/// payload, which reads as absent. Tightening it is how this scenario would
+/// catch a store whose commit cadence regressed.
 const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long the replica store may take to notice the filesystem it writes
-/// to is full. The refused write is the blob store's answer; the replica
-/// store commits on a timer, so it meets the same full filesystem a moment
-/// later — this bounds that moment generously, since what is under test is
-/// that readiness follows the store at all, not how fast.
+/// The replica store commits on a timer, so it meets the full filesystem a
+/// moment after the blob store refused the write.
 const FULL_STORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long a clean stop may take. The daemon sends its stop signal and
-/// kills what is still running about ten seconds later, so a graceful exit
-/// has to fit inside that with room to spare — the drain budget and the
-/// runtime's own cleanup budget are both counted in it, and a stop that
-/// spends the whole grace is one signal away from being cut short.
+/// The daemon kills what is still running about ten seconds after its stop
+/// signal; the drain budget and the runtime's cleanup budget both count.
 const CLEAN_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// A ceiling on the stream that feeds the kill below: ten acknowledged
-/// writes take well under a second on a node that answers, so anything
-/// near this means the stream died and the counter will never move again.
+/// Ten acknowledged writes take well under a second on a node that answers.
 const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
 
-/// A kill in the middle of a stream of writes: every write acknowledged
-/// before the stores' settle window reads back after the restart with its
-/// payload, and a write the kill cut inside the window — acknowledged or
-/// not — is absent or whole, never a torn value and never a read error.
-/// Bounded durability and no tearing are what the stores provide — the
-/// commit runs on a timer after the acknowledgement, so durability starts
-/// one window later than the answer does; this scenario asserts exactly
-/// that under fire, and the stress pass hammers it.
+/// A kill mid-stream: every write acknowledged before the settle window
+/// reads back whole, and a write cut inside it is absent or whole, never
+/// torn and never a read error — durability starts one window after the
+/// acknowledgement.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // one kill, the settled and the cut writes in the same place
@@ -438,12 +414,9 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
         "a refused write must not read back as stored"
     );
 
-    // The refusal above is one store's answer about one write. What the
-    // full filesystem does to the node as a whole shows on the next
-    // operation the replica store has to commit — creating an identity
-    // provisions replicas — and that failure is not local to the identity:
-    // the store refuses everything afterwards until it is reopened, which
-    // only a restart does.
+    // What the full filesystem does to the node as a whole shows on the next
+    // operation the replica store has to commit; the store then refuses
+    // everything until a restart reopens it.
     let created = node.post("/debug/identities", body(b"")).await?;
     ensure!(
         !created.status.is_success(),
@@ -451,11 +424,8 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
         created.status
     );
 
-    // And the node comes to say so about itself. No in-memory bookkeeping
-    // reflects a store that stopped answering — the identities stay
-    // listed, the node stays up — so readiness, which reads the store, is
-    // what turns a silent zombie into an outage a platform can restart.
-    // Polled rather than sampled: the store fails on a commit of its own
+    // Readiness reads the store, turning a silent zombie into an outage a
+    // platform can restart. Polled: the store fails on a commit of its own
     // timing, not on the request that filled the disk.
     let unready = eventually(FULL_STORE_BUDGET, || async {
         let answer = node.get("/ready").await?;
@@ -466,9 +436,6 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
         unready.is_some(),
         "a node whose store stopped answering must stop reporting itself ready"
     );
-    // Liveness keeps answering: the process is there, which is all it
-    // claims, and the difference between the two probes is what lets a
-    // platform tell a wedged node from a dead one.
     let live = node.get("/live").await?;
     ensure!(
         live.status.is_success(),

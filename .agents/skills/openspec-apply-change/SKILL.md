@@ -29,6 +29,7 @@ Work from the repository root and use the OpenSpec CLI in `mia-docs`.
    - Follow `CLAUDE.md` and the practices under `mia-docs/openspec/specs/code-practices/`.
    - For an affected path, consider the operating conditions: multiple identities, multiple devices, linking timing, dropped connections, full disks, and capability narrowing, revocation, and re-granting. Add a scenario and a test when a condition changes the outcome.
    - Pair every authorized-access assertion with the tightest unauthorized denial.
+   - Comments follow the `## Code comments` rules in `CLAUDE.md`: one to three lines; an invariant, a non-obvious why, or a pointer to the spec, ADR, or proving test — never a restatement of the spec or of the assertion beside it; present tense only. Every test has a doc comment whose first sentence says which case the scenario tests; it carries at most the paired denial and the rationale of any non-obvious arrangement beside that, nothing else.
    - A scenario task is incomplete until its test would fail when the mechanism is removed.
    - Verify the task with the narrowest relevant check, then change its checkbox from `- [ ]` to `- [x]` immediately.
    - For substantial sync, linking, engine, or dependency changes, finish with the focused stress pass required by `flaky-tests.md`.

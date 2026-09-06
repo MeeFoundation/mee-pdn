@@ -1,27 +1,9 @@
-//! The pairing protocol (ADR-0011): how two identities that share nothing
-//! become connected.
-//!
-//! One raw bidirectional exchange per establishment on the dedicated
-//! pairing ALPN — not a document-sync session. The inviter mints a one-time
-//! secret and a self-contained [`InvitePayload`]; the scanner dials the
-//! payload's address and presents the secret together with its half of the
-//! connection state; the inviter atomically verifies-and-burns the secret
-//! *before any state change* and answers with its own half. Both sides then
-//! assemble the same state, mirrored: a connections record in the
-//! private-metadata directory, the metadata pair
-//! ([`data_layer::ConnectionMetadata`]), and the pair's tickets in the same
-//! directory — which is how the connection reaches the identities' other
-//! devices.
-//!
-//! Refusals are uniform: whatever the reason — unknown secret, expired,
-//! already burned, malformed request, unsupported version — the inviter
-//! closes the connection without a distinguishing answer, and a refused
-//! attempt leaves no observable state. A wrong secret burns nothing: a
-//! guess cannot extinguish a ceremony in progress.
-//!
-//! The dialogue carries no KERI proof of control over a presented `PdnId`
-//! — deferred (ADR-0008): the exchange is bearer-level, secret plus
-//! tickets. Both peers must be online: there are no pending invitations.
+//! The pairing protocol (ADR-0011): one raw exchange on the pairing ALPN.
+//! The inviter verifies-and-burns the secret before any state change and
+//! answers with its half; both sides then assemble the same state,
+//! mirrored. Refusals are uniform — one close, whatever the reason — and a
+//! wrong secret burns nothing. Bearer-level: no KERI proof of the presented
+//! `PdnId` (ADR-0008).
 
 use std::{
     collections::HashMap,
@@ -42,159 +24,106 @@ use tokio::sync::Mutex;
 
 use crate::runtime::State;
 
-/// The dedicated pairing ALPN — the protocol the runtime registers at spawn
-/// next to the built-in stack and the dial side connects under.
 pub(crate) const PAIRING_ALPN: &[u8] = b"/pdn/pairing/0";
 
-/// The invite payload format this runtime speaks. A scanner handed a
-/// payload with any other version refuses it before dialing; the inviter
-/// likewise refuses a request carrying an unknown version (uniformly, like
-/// every other refusal).
+/// Any other version is refused before dialing by the scanner, and
+/// uniformly by the inviter.
 pub const INVITE_FORMAT_VERSION: u8 = 0;
 
-/// How long a pending invite lives unless the invite overrides it.
 pub(crate) const DEFAULT_INVITE_LIFETIME: Duration = Duration::from_mins(2);
 
-/// Ceiling on one length-prefixed wire message, shared by both ceremonies
-/// on this framing (pairing and linking). Their dialogue messages carry
-/// ids, one address, and one or two tickets — far below this; the bound
-/// exists so a malformed length prefix cannot demand an unbounded read.
+/// Ceiling on one length-prefixed wire message of both ceremonies, so a
+/// malformed length prefix cannot demand an unbounded read.
 pub(crate) const MAX_WIRE_MESSAGE_LEN: u32 = 64 * 1024;
 
-/// The self-contained invite payload — what the inviter's device shows and
-/// the scanner's device consumes. In-process it travels as a value; its
-/// string/QR encoding is a host concern.
-///
-/// Deliberately bearer-free: a format version, the inviter device's node
-/// address (the dial target), the one-time secret, and the inviting
-/// identity's `PdnId` — no tickets and no identity proof. The payload is
-/// semi-public (shown on a screen, photographable), so nothing in it may
-/// grant durable access; the secret it carries is one-time and short-lived.
+/// The invite payload: bearer-free on purpose, since it is shown on a
+/// screen and photographable. Its string/QR encoding is a host concern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvitePayload {
-    /// Payload format version ([`INVITE_FORMAT_VERSION`]).
     pub version: u8,
-    /// The inviter device's node address — where the scanner dials.
+    /// Where the scanner dials.
     pub inviter_addr: EndpointAddr,
-    /// The one-time pairing secret, pending on the inviting runtime.
     pub secret: [u8; 32],
-    /// The inviting identity.
     pub inviter: PdnId,
 }
 
-/// `establish` was handed an invite payload whose format version this
-/// runtime does not speak; refused before dialing. Downcast from the
-/// `anyhow::Error` of the connections service's `establish`.
+/// Refused before dialing. Downcast from the `anyhow::Error` of
+/// `establish`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("unsupported invite payload version: {version}")]
 pub struct UnsupportedInviteVersion {
-    /// The version the payload carried.
     pub version: u8,
 }
 
-/// The pairing dialogue reached the inviter and ended without an answer —
-/// a refusal, distinct from never reaching the inviter
-/// ([`InviterUnreachable`], whose failure precedes this point). Deliberately reasonless: which of wrong, expired,
-/// or already burned applied is uniform toward the dialer by design, and a
-/// connection that dies once the request is away — or a handler that fails
-/// internally — surfaces exactly the same way; a death before the request
-/// is away fails the send instead, unmarked. Downcast from the
-/// `anyhow::Error` of the connections service's `establish`.
+/// The dialogue reached the inviter and ended without an answer.
+/// Reasonless by design; a connection that dies once the request is away,
+/// or a handler that fails internally, surfaces the same way. Distinct from
+/// [`InviterUnreachable`], whose failure precedes this point. Downcast from
+/// the `anyhow::Error` of `establish`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("establishment refused by the inviter")]
 pub struct EstablishmentRefused;
 
-/// The establishment dialogue did not complete within its ceiling
-/// ([`ESTABLISHMENT_DIALOGUE_TIMEOUT`]): the inviter was dialed, and the
-/// exchange was still in flight when the ceiling passed — a hung
-/// counterparty, not a refusing one ([`EstablishmentRefused`] requires the
-/// dialogue to have *ended*). The ceiling is a module constant because
-/// `establish` names no budget; without it a hung inviter would hold the
-/// caller for the transport's idle timeout. Downcast from the
-/// `anyhow::Error` of the connections service's `establish`.
+/// The exchange was still in flight when [`ESTABLISHMENT_DIALOGUE_TIMEOUT`]
+/// passed — a hung counterparty, not a refusing one. Downcast from the
+/// `anyhow::Error` of `establish`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("establishment dialogue did not complete in time")]
 pub struct EstablishmentTimeout;
 
-/// The ceiling on the establishment round-trip: generous against any live
-/// exchange over a real network, finite so a hung counterparty cannot hold
-/// the caller beyond it. A constant rather than a parameter — `establish`
-/// names no budget, and the dial that precedes the round-trip stays under
-/// the transport's own connect handling.
+/// A constant because `establish` names no budget; without it a hung
+/// inviter holds the caller for the transport's idle timeout.
 pub const ESTABLISHMENT_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The dial reached no inviting device: the failure precedes the dialogue,
-/// so it is neither a refusal (whose dialogue ended without an answer) nor
-/// a timeout of a dialogue in flight. One type for both ceremonies —
-/// pairing and linking share the dial shape as they share the framing, and
-/// the caller knows which act it attempted. Downcast from the
-/// `anyhow::Error` of the connections service's `establish` and the
-/// identity service's `link`.
+/// The dial reached no inviting device — before any dialogue, so neither a
+/// refusal nor a timeout. One type for both ceremonies. Downcast from the
+/// `anyhow::Error` of `establish` and `link`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("could not reach the inviter")]
 pub struct InviterUnreachable;
 
-/// `establish` was refused before dialing: another `establish` toward the
-/// same `(identity, inviter)` pair is already in flight on this runtime —
-/// the pre-dial guard against two concurrent attempts committing the same
-/// pair twice. Downcast from the `anyhow::Error` of the connections
-/// service's `establish`.
+/// Another `establish` toward the same pair is in flight; refused before
+/// dialing. Downcast from the `anyhow::Error` of `establish`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("an establishment toward {peer} from {identity} is already in flight on this runtime")]
 pub struct EstablishmentInProgress {
-    /// The identity attempting the establishment.
     pub identity: PdnId,
-    /// The inviter it is establishing toward.
     pub peer: PdnId,
 }
 
-/// The scanner's half of the dialogue: the secret, who is scanning, where
-/// to reach it, and the read ticket to the metadata store it issues toward
-/// the inviter.
 #[derive(Debug, Serialize, Deserialize)]
 struct PairingRequest {
     version: u8,
     secret: [u8; 32],
     scanner: PdnId,
     scanner_addr: EndpointAddr,
+    /// The read ticket to the store the scanner issues toward the inviter.
     ticket: DocTicket,
 }
 
-/// The inviter's half, sent only after the verify-and-burn and the state
-/// assembly: the read ticket to the metadata store it issues toward the
-/// scanner.
+/// Sent only after the verify-and-burn and the state assembly.
 #[derive(Debug, Serialize, Deserialize)]
 struct PairingResponse {
     ticket: DocTicket,
 }
 
-/// One pending invite: the identity it invites for and when it expires.
 #[derive(Debug, Clone, Copy)]
 struct PendingInvite {
     identity: PdnId,
     expires_at: Instant,
 }
 
-/// A pending-invite set of one runtime, keyed by secret bytes, each bound
-/// to the identity it invites for. Lives inside the runtime state — one
-/// instance per ceremony that mints one-time secrets (pairing here, device
-/// linking in [`crate::linking`]) — so every operation on it: insertion at
-/// invite, the verify-and-burn at presentation — is a map operation under
-/// the runtime's one coarse lock.
-///
-/// Expiry is lazy: checked at presentation, swept at the next invite — no
-/// background task. Runtime restart drops the set; an invite is a live
-/// ceremony, and a fresh invite is the recovery path for every failure.
+/// One instance per ceremony that mints one-time secrets, inside the
+/// runtime state so every operation is a map operation under the coarse
+/// lock. Expiry is lazy: checked at presentation, swept at the next invite.
 #[derive(Debug, Default)]
 pub(crate) struct PendingInvites {
     map: HashMap<[u8; 32], PendingInvite>,
 }
 
 impl PendingInvites {
-    /// Mint a fresh one-time secret for `identity` with `lifetime`, sweeping
-    /// invites that have already expired. The secret is 32 bytes from the
-    /// operating-system generator.
+    /// 32 bytes from the operating-system generator.
     pub(crate) fn mint(
         &mut self,
         identity: PdnId,
@@ -216,55 +145,40 @@ impl PendingInvites {
         Ok(secret)
     }
 
-    /// The atomic verify-and-burn: present and unexpired — removed, and the
-    /// invited identity returned; expired — removed and refused; unknown —
-    /// refused, burning nothing (a wrong guess cannot extinguish a live
-    /// invite). One map operation, run under the runtime lock *before* any
-    /// state is created or written.
+    /// Present and unexpired — burned and returned; expired — burned and
+    /// refused; unknown — refused, burning nothing.
     pub(crate) fn verify_and_burn(&mut self, secret: &[u8; 32], now: Instant) -> Option<PdnId> {
-        // Peek first: removal must only happen for the presented secret
-        // itself — a miss must not disturb the map.
+        // Peek first: a miss must not disturb the map.
         let live = self.map.get(secret)?.expires_at > now;
         let pending = self.map.remove(secret)?;
         live.then_some(pending.identity)
     }
 }
 
-/// A clonable slot for the runtime state the pairing handler serves: filled
-/// once, right after the node spawns (the handler is built before the node
-/// exists), and held weakly so a runtime kept alive only by this handler's
-/// clone does not itself keep the state alive. A connection arriving before
-/// the slot is filled is refused — unreachable in the honest flow, because
-/// no invite payload exists before spawn returns.
+/// Filled once, right after the node spawns (the handler is built before
+/// the node exists), and held weakly so a handler clone does not keep the
+/// state alive. A connection arriving before the slot is filled is refused.
 pub(crate) type StateSlot = Arc<OnceLock<Weak<Mutex<State>>>>;
 
-/// A generous ceiling on concurrent establishments, never meant to bound
-/// anything in practice — it exists only so `shutdown`'s `acquire_many` has
-/// a fixed permit count to wait for all of.
+/// Never meant to bound anything: exists so `shutdown`'s `acquire_many` has
+/// a fixed permit count to wait for.
 pub(crate) const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1_048_576;
 const MAX_CONCURRENT_ESTABLISHMENTS_U32: u32 = 1_048_576;
 
-/// How long `PairingHandler::shutdown` waits for in-flight `accept` calls
-/// to release their permit before giving up and letting the router close
-/// the endpoint anyway.
+/// How long `shutdown` waits for in-flight `accept` calls before letting
+/// the router close the endpoint anyway.
 pub const SHUTDOWN_ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(10);
 
-/// The accept side of the pairing dialogue, registered at `Runtime::spawn`
-/// through the data-layer assembly slot.
+/// The accept side of the pairing dialogue.
 #[derive(Debug, Clone)]
 pub(crate) struct PairingHandler {
     state: StateSlot,
-    /// One permit held for the duration of each `accept` call; `shutdown`
-    /// waits for every permit to come back, bounding shutdown's wait on an
-    /// in-flight establishment instead of the router aborting it outright.
+    /// One permit per `accept` in flight; `shutdown` waits for every permit
+    /// rather than letting the router abort an establishment outright.
     in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 impl PairingHandler {
-    /// A handler with an unfilled state slot; [`Runtime::spawn`] fills the
-    /// slot right after the node comes up.
-    ///
-    /// [`Runtime::spawn`]: crate::Runtime::spawn
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::default(),
@@ -272,7 +186,6 @@ impl PairingHandler {
         }
     }
 
-    /// The slot to fill with the spawned runtime's state.
     pub(crate) fn slot(&self) -> StateSlot {
         Arc::clone(&self.state)
     }
@@ -282,10 +195,8 @@ impl PairingHandler {
         Arc::clone(&self.in_flight)
     }
 
-    /// Run the inviter's side of one establishment. `None` is a refusal —
-    /// any reason at all — answered by the caller with the one uniform
-    /// close. `Some(())` means the dialogue completed and the response was
-    /// sent.
+    /// `None` is a refusal, any reason at all, answered by the caller with
+    /// the one uniform close.
     async fn serve(&self, connection: &Connection) -> Option<()> {
         let (mut send, mut recv) = connection.accept_bi().await.ok()?;
         let request: PairingRequest = read_message(&mut recv).await.ok()?;
@@ -293,36 +204,23 @@ impl PairingHandler {
             return None;
         }
 
-        // The runtime state is held only for the local verify-and-assemble,
-        // inside this block: both the guard and the strong `Arc` drop at its
-        // end, before the network reply below — so a concurrent operation on
-        // the same coarse lock is never blocked by this accept's wait on the
-        // dialer to close. `shutdown`'s own bound on an in-flight accept
-        // comes from the handler's own semaphore-based wait, not from this
-        // scoping.
+        // The state is held only for the local verify-and-assemble: guard
+        // and strong `Arc` drop before the network reply, so no other lock
+        // holder waits on the dialer.
         let response_ticket = {
-            // The late-bound slot: unfilled (no invite can exist yet) or a
-            // runtime already gone both refuse.
             let state_arc = self.state.get()?.upgrade()?;
             let mut state = state_arc.lock().await;
 
-            // The atomic verify-and-burn, before any state change. Everything
-            // below only runs for a live, unburned secret.
+            // Before any state change.
             let identity = state
                 .pending_invites
                 .verify_and_burn(&request.secret, Instant::now())?;
 
-            // Assembly, mirroring the dial side: create-or-reuse own, import
-            // the scanner's ticket as peer (its node address supplements the
-            // ticket's own first-sync contacts), connections entry, directory
-            // kinds.
             let (own, created_fresh) = own_store_toward(&state, identity, request.scanner)
                 .await
                 .ok()?;
-            // Armed as soon as a fresh replica might exist, symmetric with
-            // the dial side's guard: a cancellation of this `serve` future
-            // from here on (the dialer disconnects, or a bounded shutdown
-            // wait) forgets it, the same as a completed failure below.
+            // Armed as soon as a fresh replica might exist: a cancellation of
+            // this future from here on forgets it.
             let mut rollback = EstablishGuard::new(
                 Arc::clone(&state_arc),
                 own.namespace(),
@@ -333,9 +231,6 @@ impl PairingHandler {
                 .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
                 .await
             else {
-                // Sharing failed before assemble committed: forget a freshly
-                // created own so a failed accept leaves no orphan, the same
-                // rollback the dial side does.
                 if created_fresh {
                     let _ = state.node.forget_doc(own.namespace()).await;
                 }
@@ -364,9 +259,8 @@ impl PairingHandler {
             ticket
         };
 
-        // Commit precedes the reply: if the response is lost, the inviter
-        // keeps its half and a fresh invite converges the rest
-        // (re-establishment).
+        // Commit precedes the reply: a lost response leaves the inviter's
+        // half, and a fresh invite converges the rest.
         write_message(
             &mut send,
             &PairingResponse {
@@ -376,8 +270,7 @@ impl PairingHandler {
         .await
         .ok()?;
         send.finish().ok()?;
-        // Hold the connection until the dialer closes it, so the response
-        // is not cut off by dropping this side first.
+        // Held until the dialer closes, so the response is not cut off.
         connection.closed().await;
         Some(())
     }
@@ -385,29 +278,20 @@ impl PairingHandler {
 
 impl ProtocolHandler for PairingHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // Held for the whole call: `shutdown` waits for this permit to
-        // return before it does, so an establishment in flight when
-        // shutdown starts bounds its wait rather than being aborted
-        // outright. `acquire` only errs once the semaphore is closed, which
-        // this handler never does — the `let else` is exhaustiveness, not a
-        // reachable refusal.
+        // `acquire` only errs once the semaphore is closed, which never
+        // happens: the `let else` is exhaustiveness.
         let Ok(_permit) = self.in_flight.acquire().await else {
             return Ok(());
         };
         if self.serve(&connection).await.is_none() {
-            // The one uniform refusal, whatever the reason: close without a
-            // distinguishing answer, so a prober cannot separate wrong from
-            // expired from already-burned — or any other cause.
+            // The one uniform refusal.
             connection.close(0u32.into(), b"");
         }
         Ok(())
     }
 
-    /// Waits, bounded by [`SHUTDOWN_ESTABLISHMENT_BUDGET`], for every
-    /// in-flight `accept` to finish and release its permit — event-based,
-    /// no polling. `Router::shutdown` (iroh) stops dispatching new `accept`
-    /// calls before awaiting this, so no new acquisition can race the wait
-    /// once it starts: `acquire_many` reaching every permit means every
+    /// `Router::shutdown` stops dispatching new `accept` calls before
+    /// awaiting this, so `acquire_many` reaching every permit means every
     /// `accept` in flight when shutdown began has returned.
     async fn shutdown(&self) {
         let _ = tokio::time::timeout(
@@ -419,25 +303,15 @@ impl ProtocolHandler for PairingHandler {
     }
 }
 
-/// The scanner's side of one establishment: dial the payload's address on
-/// the pairing ALPN, run the exchange, and assemble the same connection
-/// state as the accept side, mirrored.
-///
-/// The runtime lock is taken *per phase* and never held across the network
-/// round-trip — mirroring the accept side, which reads the request before
-/// locking and writes the response after unlocking. Holding it across the
-/// dial and the response wait would deadlock: the accept side (this runtime
-/// included) needs that same lock to answer, so two runtimes establishing
-/// toward each other would each wait on a lock the other holds. Takes the
-/// shared [`Mutex`] rather than a guard so it can lock and unlock around
-/// each phase.
+/// The scanner's side. The runtime lock is taken per phase and never held
+/// across the round-trip: the accept side (this runtime included) needs
+/// the same lock to answer, so two runtimes establishing toward each other
+/// would otherwise deadlock.
 pub(crate) async fn establish_via_dialogue(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
     payload: &InvitePayload,
 ) -> Result<()> {
-    // A brief lock for the hosted check, the in-flight reservation, and the
-    // dial handle (a cheap snapshot); released before any network I/O.
     let (dial, cleanup_tasks) = {
         let mut state_guard = state.lock().await;
         state_guard.hosted(identity)?;
@@ -456,13 +330,9 @@ pub(crate) async fn establish_via_dialogue(
             state_guard.cleanup_tasks.clone(),
         )
     };
-    // Reserved for the whole ceremony from here. Released synchronously
-    // right after `establish_via_dialogue_inner` below settles, on every
-    // one of its outcomes — a caller retrying immediately after a
-    // completed attempt must never race a still-pending detached release.
-    // Only a genuine cancellation of *this* function skips that release,
-    // and `reservation`'s own `Drop` (spawned detached, since `Drop` is
-    // synchronous) is exactly the fallback for that case.
+    // Released synchronously on every outcome, so a caller retrying at once
+    // never races a detached release; the reservation's `Drop` covers a
+    // cancellation of this function alone.
     let reservation = EstablishReservation::new(
         Arc::clone(state),
         identity,
@@ -474,10 +344,8 @@ pub(crate) async fn establish_via_dialogue(
     result
 }
 
-/// The body of [`establish_via_dialogue`] from the dial onward, factored
-/// out so the reservation wrapping it releases synchronously around every
-/// exit — the `?` early returns included — without threading the release
-/// through each one by hand.
+/// Factored out so the reservation releases synchronously around every
+/// exit, `?` early returns included.
 async fn establish_via_dialogue_inner(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
@@ -485,26 +353,19 @@ async fn establish_via_dialogue_inner(
     dial: data_layer::DialHandle,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
 ) -> Result<()> {
-    // Network — no lock held. Dial before minting `own`, so an unreachable
-    // inviter never leaves a replica behind.
+    // Dial before minting `own`, so an unreachable inviter leaves no replica.
     let connection = dial
         .connect(payload.inviter_addr.clone(), PAIRING_ALPN)
         .await
         .context(InviterUnreachable)?;
 
-    // Reachable: this side's half of the pair, created (or reused) under a
-    // brief lock. Its read ticket rides in the request; the lock is released
-    // before the round-trip.
     let (own, created_fresh) = {
         let state = state.lock().await;
         own_store_toward(&state, identity, payload.inviter).await?
     };
-    // A freshly created `own` becomes an orphan replica if this future is
-    // dropped anywhere from here to `assemble_connection`'s commit — the
-    // explicit cleanup below only covers a *completed* round-trip that came
-    // back `Err`; a cancellation skips it the same way it skips every other
-    // early return, so this guard is the only thing that forgets `own` in
-    // that case.
+    // The explicit cleanup below covers only a completed round-trip that
+    // came back `Err`; a cancellation skips it, and this guard is what
+    // forgets a fresh `own` then.
     let mut rollback = EstablishGuard::new(
         Arc::clone(state),
         own.namespace(),
@@ -512,21 +373,12 @@ async fn establish_via_dialogue_inner(
         cleanup_tasks,
     );
 
-    // The round-trip — no lock held, so the accept side can take the lock to
-    // answer (this is what breaks the reciprocal-establishment deadlock). Any
-    // failure here is before assemble commits, so a freshly created `own` is
-    // an orphan — unreferenced by directory or cache — that the reconcile
-    // pass would re-sync for the node's life; forget it instead.
-    // The ticket is minted ahead of the bounded round-trip: a local act
-    // with no dependency on the inviter, kept outside the ceiling so the
-    // ceiling bounds exactly the exchange with the peer; its failure takes
-    // the same cleanup path as any round-trip failure.
+    // The ticket is minted outside the ceiling, so the ceiling bounds
+    // exactly the exchange with the peer.
     let ticket = own
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await;
-    // Bounded by the ceiling: a hung inviter — dialed, but never answering
-    // — surfaces as the typed dialogue timeout on the same cleanup path as
-    // any other round-trip failure.
+    // No lock held across the round-trip.
     let response: Result<PairingResponse> = match ticket {
         Err(err) => Err(err),
         Ok(ticket) => match tokio::time::timeout(ESTABLISHMENT_DIALOGUE_TIMEOUT, async {
@@ -543,9 +395,7 @@ async fn establish_via_dialogue_inner(
             )
             .await?;
             send.finish()?;
-            // Refusals are uniform by design: the connection just closes,
-            // and this read fails without saying why — the typed marker
-            // says only that the inviter was reached and no answer came.
+            // A refusal is just the connection closing.
             read_message(&mut recv).await.context(EstablishmentRefused)
         })
         .await
@@ -567,9 +417,6 @@ async fn establish_via_dialogue_inner(
     };
     connection.close(0u32.into(), b"done");
 
-    // Commit under a brief lock. The inviter's address is a live first-sync
-    // contact for the imported pair, exactly as the scanner's address is on
-    // the accept side.
     let mut state_guard = state.lock().await;
     let own_namespace = own.namespace();
     let result = assemble_connection(
@@ -596,15 +443,10 @@ async fn establish_via_dialogue_inner(
     }
 }
 
-/// Reserves an `(identity, peer)` pair against a concurrent `establish`
-/// while this one is in flight, releasing the reservation on every exit
-/// path of [`establish_via_dialogue`] — success, every explicit failure,
-/// and cancellation alike — the establishment analog of `grant_binders`'
-/// insert-before-spawn/remove-on-exit pattern (`connections.rs`) and of
-/// linking's own `LinkingReservation`. Held for the whole function, unlike
-/// [`EstablishGuard`] below (constructed only once `own` exists): a
-/// cancellation during the dial, before any rollback guard exists, must
-/// still release this one.
+/// Reserves an `(identity, peer)` pair against a concurrent `establish`.
+/// Held for the whole function, unlike [`EstablishGuard`]: a cancellation
+/// during the dial, before any rollback guard exists, must still release
+/// it.
 struct EstablishReservation {
     state: Arc<Mutex<State>>,
     identity: PdnId,
@@ -629,10 +471,7 @@ impl EstablishReservation {
         }
     }
 
-    /// Release the reservation now, synchronously — the normal path for
-    /// every outcome of [`establish_via_dialogue_inner`]. A caller retrying
-    /// immediately after this one returns must see the pair free, not race
-    /// a detached release that has not run yet.
+    /// The normal path: a caller retrying at once must see the pair free.
     async fn release(mut self) {
         self.state
             .lock()
@@ -644,12 +483,9 @@ impl EstablishReservation {
 }
 
 impl Drop for EstablishReservation {
-    /// Only fires on genuine cancellation — the future driving
-    /// [`establish_via_dialogue`] dropped before [`Self::release`] ran.
-    /// `Drop` is synchronous and the removal is not, so this spawns a
-    /// detached task; unlike the normal path, a cancelled attempt leaves no
-    /// caller waiting to retry immediately, so a slight delay here is
-    /// harmless.
+    /// Cancellation only. `Drop` is synchronous and the removal is not, so
+    /// it is spawned detached; a cancelled attempt has no caller waiting to
+    /// retry at once.
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -667,12 +503,9 @@ impl Drop for EstablishReservation {
     }
 }
 
-/// Forgets a freshly created `own` replica if the future driving
-/// [`establish_via_dialogue`] is dropped before it disarms — the orphan case
-/// the comment above `own`'s creation already reasons about for a
-/// *completed* round-trip that came back `Err`, extended here to
-/// cancellation. `Drop` is synchronous and the forget is not, so a
-/// still-armed guard spawns a detached task to run it.
+/// Forgets a freshly created `own` replica if the establishing future is
+/// dropped before it disarms. `Drop` is synchronous and the forget is not,
+/// so it is spawned detached.
 struct EstablishGuard {
     state: Arc<Mutex<State>>,
     own_namespace: data_layer::NamespaceId,
@@ -697,9 +530,6 @@ impl EstablishGuard {
         }
     }
 
-    /// The ceremony reached a normal return — commit or an error branch
-    /// with its own already-`await`ed cleanup — so the drop below must do
-    /// nothing.
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -719,14 +549,11 @@ impl Drop for EstablishGuard {
     }
 }
 
-/// Create-or-reuse this side's own metadata store toward `peer`: the
-/// cached pair first, then the directory's own-kind write ticket — so
+/// The cached pair first, then the directory's own-kind write ticket — so
 /// re-establishment and linked devices converge on one replica — and only
-/// then a fresh replica. The identity must be hosted here.
-///
-/// The bool is `true` only when a fresh replica was created — so the caller
-/// can forget it if establishment then fails before commit, while a reused
-/// or directory-imported replica (which other devices depend on) survives.
+/// then a fresh replica. The bool is `true` only for a fresh replica, the
+/// one a failed establishment may forget; a reused one other devices
+/// depend on.
 async fn own_store_toward(
     state: &State,
     identity: PdnId,
@@ -745,11 +572,8 @@ async fn own_store_toward(
     }
 }
 
-/// The post-dialogue assembly, identical on both sides: import the received
-/// read ticket as `peer` (`peer_addr` supplementing its first-sync
-/// contacts), record the counterparty among the directory's connections
-/// records, publish the pair's tickets in the same directory under the
-/// per-connection kinds, and cache the pair for the grant surface.
+/// The post-dialogue assembly, identical on both sides; `peer_addr`
+/// supplements the imported ticket's first-sync contacts.
 async fn assemble_connection(
     state: &mut State,
     identity: PdnId,
@@ -762,20 +586,13 @@ async fn assemble_connection(
     if let Some(addr) = peer_addr {
         peer_ticket.nodes.push(addr);
     }
-    // Reuse the cached peer store when the ticket still addresses the same
-    // replica: re-establishment carries the counterpart's same namespace, and
-    // a fresh import would leak a tracked doc and an author every attempt
-    // (own is reused the same way in `own_store_toward`). A genuinely new
-    // peer namespace still imports.
+    // A cached peer store is reused while the ticket still addresses its
+    // replica: a fresh import per re-establishment would leak a tracked doc.
     let peer_store = match state.metadata_pairs.get(&(identity, peer)) {
         Some(pair) if pair.peer.namespace() == peer_ticket.capability.id() => pair.peer.clone(),
         _ => ConnectionMetadataStore::import(&state.node, peer_ticket.clone()).await?,
     };
 
-    // The directory carries the pair to the identity's other devices: the
-    // write ticket to `own` (every device of the issuer writes grants), the
-    // received read ticket to `peer`. Only routing lives here — the grants
-    // themselves stay in the metadata stores.
     let own_write_ticket = own
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -788,11 +605,7 @@ async fn assemble_connection(
         .await?;
     directory.connect(peer).await?;
 
-    // This device asserts itself into `own` (the counterparty resolves
-    // callers through these records), and the pair registers for session
-    // classification. Assert-once, like every pair opening: a
-    // re-establishment onto a reused store leaves a live record untouched
-    // and never resurrects a withdrawn one.
+    // Assert-once, like every pair opening.
     own.ensure_device_published(state.node.node_id()).await?;
     state
         .node
@@ -808,7 +621,6 @@ async fn assemble_connection(
     Ok(())
 }
 
-/// Write one length-prefixed postcard message.
 pub(crate) async fn write_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
     let bytes = postcard::to_stdvec(message)?;
     let len = u32::try_from(bytes.len()).context("wire message too large")?;
@@ -820,8 +632,6 @@ pub(crate) async fn write_message<T: Serialize>(send: &mut SendStream, message: 
     Ok(())
 }
 
-/// Read one length-prefixed postcard message, refusing lengths beyond
-/// [`MAX_WIRE_MESSAGE_LEN`].
 pub(crate) async fn read_message<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     recv.read_exact(&mut len_bytes).await?;

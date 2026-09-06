@@ -22,12 +22,8 @@ use test_utils::eventually;
 mod common;
 use common::establish_patiently;
 
-/// The reconcile cadence of this scenario — the ticket-holder denial below
-/// is "it retried over several intervals and was refused", made cheap by
-/// injecting a sub-second interval.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-/// Spawn a runtime with the test's short reconcile cadence.
 async fn spawn_runtime() -> Result<Runtime> {
     Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -37,10 +33,8 @@ async fn spawn_runtime() -> Result<Runtime> {
 }
 
 /// Poll until the peer's scoped grant for `issuer` is readable, handing
-/// back the grant the poll itself observed. A second read after the poll
-/// is not the same read: a record whose payload is momentarily
-/// unfetchable reads as no grant at all — the very transient the poll
-/// exists for — so the value is accumulated inside the poll instead.
+/// back the grant the poll itself observed: a second read is not the same
+/// read.
 async fn scoped_grant_patiently(
     receives: &Runtime,
     receives_id: pdn_types::PdnId,
@@ -66,23 +60,12 @@ async fn scoped_grant_patiently(
         .context("the poll reported the grant and handed back nothing")
 }
 
-/// Allowed: X grants Y read on exactly one claim; Y's runtime receives the
-/// capability and ticket over the pair, imports the namespace scoped, and
-/// converges on exactly that entry — updates included.
-///
-/// Denied, outsider: a runtime with no connection to X and no ticket is
-/// refused as unknown — before it ever holds anything of X's.
-///
-/// Denied, ticket without a grant: a runtime holding the grant's leaked
-/// ticket but no grant of its own imports it and obtains nothing, probed
-/// after the proven second wave plus several of its own reconcile
-/// intervals.
-///
-/// Denied, existence hidden: X's other entries never reach Y, asserted
-/// after a proven second replication wave (the sentinel update).
-///
-/// Denied, read-only cannot write: the grant's ticket carries no namespace
-/// secret, so Y's local write into X's namespace is refused outright.
+/// Allowed: X grants Y read on exactly one claim, and Y converges on
+/// exactly that entry, updates included. Denied: an outsider with no
+/// connection and no ticket is refused as unknown; a holder of the leaked
+/// ticket without a grant obtains nothing; X's other entries never reach Y
+/// (existence hidden); Y's read-only ticket carries no namespace secret, so
+/// its local write is refused.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and every denied side in one place
 async fn scoped_grant_flows_through_the_services() -> Result<()> {
@@ -113,27 +96,23 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         .publish_grant(x, y, x, common::claims_on(x, &email, false))
         .await?;
 
-    // Y reads the grant over the pair — the observation; the binder is
-    // what imports the namespace it names, so no import act follows. The
-    // ticket is kept only to leak it to the third runtime below.
+    // Y reads the grant over the pair; the binder imports what it names. The
+    // ticket is kept only to leak it below.
     let received = scoped_grant_patiently(&rt_b, y, x, x).await?;
     assert!(received.grant.claims.iter().all(|claim| !claim.write));
     let leaked_ticket = received.ticket;
 
-    // Denied (outsider): before holding any ticket, the third runtime is
-    // refused as specifically unknown — X was neither created nor imported
-    // there, and no connection exists.
+    // Denied (outsider): refused as specifically unknown before holding any
+    // ticket.
     let outsider_err = rt_c.data().read(x, &email).await.unwrap_err();
     assert!(
         outsider_err.downcast_ref::<UnknownIssuer>().is_some(),
         "an outsider must be refused as unknown, got: {outsider_err:?}"
     );
 
-    // The ticket holder without a grant: the grant's ticket leaked to the
-    // third runtime, which imports it scoped — a local registration that
-    // starts its classified sync attempts. X's book resolves it to no
-    // device and no grant, so every attempt is refused; the assertions
-    // ride below, after the proven second wave.
+    // The leaked ticket, imported scoped on the third runtime: X's book
+    // resolves it to no device and no grant. Asserted below, after the
+    // proven second wave.
     rt_c.data().import_scoped(x, leaked_ticket).await?;
 
     // Allowed: exactly the granted entry converges.
@@ -145,10 +124,8 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         "the granted entry did not reach the granted peer"
     );
 
-    // Denied (read-only cannot write): the write is refused, and — the part
-    // the refusal alone does not say — nothing is acquired by it. Neither
-    // side's value moves, so the denial holds whether it came from the
-    // courtesy or from the missing namespace secret.
+    // Denied (read-only cannot write): refused, and nothing acquired by it —
+    // neither side's value moves.
     assert!(
         rt_b.data().write(x, &email, b"overwrite").await.is_err(),
         "a write through a read-only scoped grant must be refused"
@@ -164,8 +141,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         "the refused write must never reach the issuer"
     );
 
-    // Sentinel: an update to the granted claim proves a second replication
-    // wave end to end, ordering the absence assertions below.
+    // Sentinel: a proven second wave orders the absence assertions below.
     rt_a.data().write(x, &email, b"x@new.example.org").await?;
     assert!(
         eventually(|| async {
@@ -175,8 +151,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         "the sentinel update did not reach the granted peer"
     );
 
-    // Denied (existence hidden): after the proven second wave, Y's view of
-    // X's namespace lists exactly the granted claim.
+    // Denied (existence hidden).
     let listed: Vec<String> = rt_b
         .data()
         .list(x, None)
@@ -190,11 +165,8 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         "the granted peer's view must contain exactly the granted subset"
     );
 
-    // Denied (ticket without a grant): the holder retried since its import
-    // — the import's own sync attempt, a nudge per read/list, and one
-    // re-dial per reconcile interval; waiting out three more intervals
-    // after the proven second wave makes "it tried and was refused" what
-    // keeps this green.
+    // Denied (ticket without a grant): three more intervals after the proven
+    // second wave make this "tried and refused".
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         rt_c.data().list(x, None).await?.is_empty(),

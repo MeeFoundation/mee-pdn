@@ -9,24 +9,18 @@ use crate::runtime::Runtime;
 /// Reporting the runtime's node id and hosted identities.
 #[allow(async_fn_in_trait)]
 pub trait SyncService {
-    /// This runtime's node id — its endpoint id, stable for the runtime's
-    /// lifetime.
     fn node_id(&self) -> NodeId;
 
-    /// The identities this runtime hosts: exactly those created or linked
-    /// on it, in no particular order.
+    /// Exactly the identities created or linked here, in no particular
+    /// order.
     async fn hosted_identities(&self) -> Result<Vec<PdnId>>;
 
-    /// Read the runtime's storage, so a caller asking whether this node is
-    /// fit to serve gets an answer the storage itself gave. Every other
-    /// report here is in-memory bookkeeping, which a broken store leaves
-    /// untouched: the identities stay listed, and every operation on them
-    /// fails.
+    /// An answer the storage itself gave: every other report here is
+    /// in-memory bookkeeping, which a broken store leaves untouched.
     async fn check_storage(&self) -> Result<()>;
 }
 
-/// The production [`SyncService`], backed by the runtime's `data-layer`
-/// stack.
+/// The production [`SyncService`].
 #[derive(Clone, Copy)]
 pub struct RuntimeSyncService<'rt> {
     runtime: &'rt Runtime,
@@ -63,11 +57,8 @@ impl RuntimeSyncService<'_> {
         self.runtime.state.lock().await.node.dial_handle()
     }
 
-    /// The number of documents the node's reconcile pass currently tracks —
-    /// pairing's own-replica has no hosted-identity-style handle a scenario
-    /// can check by, so a cancelled or failed establishment attempt is
-    /// asserted against this count instead. Behind the `test-util` feature
-    /// and absent from every product build.
+    /// The only anchor for a cancelled establishment: its own-replica has
+    /// no handle a scenario can check by.
     #[cfg(feature = "test-util")]
     pub async fn tracked_doc_count(&self) -> Result<usize> {
         let state = self.runtime.state.lock().await;

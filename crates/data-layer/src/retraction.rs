@@ -1,17 +1,10 @@
-//! Writer-side retraction gate: the trust half of write retraction.
-//! Acceptance of a foreign write is locally unobservable — an accepted and a
-//! refused write leave the writer's replica identical — so the issuer's gate
-//! signals a capability refusal back in-band ([`pdn_store::RejectId`], echoed
-//! on the reconciliation reply). This gate honors a rejection only when it
-//! comes from a device of the issuer (resolved through the pair's published
-//! device set) and names an own author's entry, then emits a verdict at once —
-//! one session, no counting. The verdict is a name, not yet an act: what
-//! makes its fields true is the local record
-//! ([`SyncNode::holds_rejected_entry`](crate::SyncNode::holds_rejected_entry),
-//! consulted before the runtime records anything), so a forged rejection
-//! cannot make a writer discard data it holds legitimately. The runtime
-//! consumes the verdicts: it records the directory marker, and the marker
-//! sweep performs the removal on every device.
+//! Writer-side retraction gate: the trust half of write retraction. An
+//! in-band rejection ([`pdn_store::RejectId`]) becomes a verdict only when
+//! it comes from a device of the issuer and names an own author's entry.
+//! The verdict is a name, not an act: the runtime confirms it against the
+//! local record ([`SyncNode::holds_rejected_entry`](crate::SyncNode::holds_rejected_entry))
+//! before recording a marker, so a forged rejection cannot make a writer
+//! discard data it holds legitimately.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,36 +16,30 @@ use pdn_store::{AuthorId, NamespaceId, PeerIdBytes, RejectId};
 use pdn_types::NodeId;
 use tokio::sync::mpsc;
 
-/// One not-accepted verdict: the exact entry to retract, addressed by the
-/// fields the marker and the event carry.
+/// One not-accepted verdict: the exact entry to retract.
 #[derive(Debug, Clone)]
 pub struct RetractionVerdict {
-    /// The replica the entry sits in.
     pub namespace: NamespaceId,
-    /// The entry's author — a local writer author.
+    /// A local writer author.
     pub author: AuthorId,
-    /// The entry's key (a valid entry path's bytes for entries this node's
-    /// writing surface produced).
+    /// The entry's key — a valid entry path's bytes for entries this node's
+    /// writing surface produced.
     pub key: Vec<u8>,
-    /// The entry's timestamp — the marker's bound.
+    /// The marker's bound.
     pub timestamp: u64,
-    /// The entry's content hash — the address of what is lost.
+    /// The address of what is lost.
     pub content_hash: Hash,
 }
 
-/// The gate behind the fork's rejection observer. The observer half runs on
-/// the fork's sync-actor thread, so recording is synchronous and lock-brief;
-/// the deposits (which namespaces the issuer's devices belong to, which
-/// authors are ours) arrive from the runtime's async side.
+/// The gate behind the fork's rejection observer. The observer runs on the
+/// fork's sync-actor thread, so recording is synchronous and lock-brief.
 #[derive(Debug)]
 pub(crate) struct RetractionTracker {
-    /// Per granted namespace: the peers that count as the issuer's devices —
-    /// the only peers whose rejection is honored. A namespace absent here is
-    /// not tracked.
+    /// Per granted namespace, the peers whose rejection is honored. A
+    /// namespace absent here is not tracked.
     issuer_devices: Mutex<HashMap<NamespaceId, HashSet<NodeId>>>,
-    /// The authors whose entries are this node's own writes.
     local_authors: Mutex<HashSet<AuthorId>>,
-    /// Where verdicts go; the runtime takes the receiving half once.
+    /// The runtime takes the receiving half once.
     verdicts: mpsc::UnboundedSender<RetractionVerdict>,
 }
 
@@ -69,17 +56,15 @@ impl RetractionTracker {
         )
     }
 
-    /// Track `namespace` with exactly `devices` as the issuer's device set —
-    /// replacing any previous set: the published device set moves, and the
-    /// newest sweep's view is the one that counts.
+    /// Track `namespace` with exactly `devices` as the issuer's device set,
+    /// replacing any previous set.
     pub(crate) fn track_namespace(&self, namespace: NamespaceId, devices: HashSet<NodeId>) {
         if let Ok(mut tracked) = self.issuer_devices.lock() {
             tracked.insert(namespace, devices);
         }
     }
 
-    /// Stop honoring rejections for `namespace` — the counterpart of
-    /// forgetting the granted namespace.
+    /// Stop honoring rejections for `namespace`.
     pub(crate) fn untrack_namespace(&self, namespace: NamespaceId) {
         if let Ok(mut tracked) = self.issuer_devices.lock() {
             tracked.remove(&namespace);
@@ -93,11 +78,9 @@ impl RetractionTracker {
         }
     }
 
-    /// The observer entry point: one in-band rejection received from `peer`
-    /// for an entry in `namespace`. Honored — and turned into a verdict at
-    /// once — only when `peer` resolves as a device of the issuer and the
-    /// entry is of an own author; a forged rejection from any other peer, or
-    /// for an entry we did not author, is ignored.
+    /// The observer entry point: one in-band rejection from `peer`, turned
+    /// into a verdict at once when `peer` is a tracked issuer device and the
+    /// entry is of an own author; ignored otherwise.
     pub(crate) fn record_rejection(
         &self,
         namespace: NamespaceId,
@@ -157,8 +140,6 @@ mod tests {
         (namespace, author, issuer_device, [9u8; 32])
     }
 
-    /// A rejection from a device of the issuer, for an own author's entry,
-    /// verdicts at once and carries the entry's id.
     #[test]
     fn a_rejection_from_an_issuer_device_verdicts() {
         let (namespace, author, issuer_device, issuer_peer) = fixtures();
@@ -180,9 +161,6 @@ mod tests {
         assert!(verdicts.try_recv().is_err(), "exactly one verdict");
     }
 
-    /// A rejection from a peer that is not a device of the issuer, for an
-    /// entry we did not author, or in an untracked namespace, is ignored — a
-    /// forged rejection cannot make us discard our own data.
     #[test]
     fn a_forged_or_foreign_rejection_is_ignored() {
         let (namespace, author, issuer_device, issuer_peer) = fixtures();

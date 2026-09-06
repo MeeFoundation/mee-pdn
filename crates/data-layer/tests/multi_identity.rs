@@ -1,13 +1,7 @@
-//! One pair of devices hosts two identities side by side.
-//!
-//! Alice runs two identities from the same devices — Alice-at-work and
-//! Alice-at-leisure — each a `PdnId` of its own with its own store set
-//! (directory, data namespace). The phone brings up both; the laptop joins
-//! each by a separate, explicit import of that identity's directory ticket.
-//! Both identities' stores replicate; they stay isolated (a connection of
-//! one never shows under the other); joining the first identity brings
-//! nothing of the second; and the first identity keeps operating after the
-//! second joins.
+//! One pair of devices hosts two identities side by side — Alice-at-work
+//! and Alice-at-leisure, each a `PdnId` with its own store set. The phone
+//! brings up both; the laptop joins each by a separate import of that
+//! identity's directory ticket.
 
 use anyhow::Result;
 use data_layer::{
@@ -45,6 +39,9 @@ async fn provision_identity_with_data(
     Ok((directory, author, ticket, data_ticket))
 }
 
+/// Both identities' store sets replicate to the laptop, each by its own
+/// import; joining the first brings nothing of the second, the two stay
+/// isolated, and the first keeps operating after the second joins.
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_identity_two_devices() -> Result<()> {
     // The same path in both data namespaces, a different value in each —

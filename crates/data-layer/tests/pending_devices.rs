@@ -4,6 +4,9 @@ use anyhow::Result;
 use data_layer::{AddrInfoOptions, PrivateMetadataStore, ShareMode};
 use test_utils::{eventually, memory_node};
 
+/// Pending registrations older than the expiry are dropped by the cleanup
+/// on a re-imported directory, a recent one is kept, and none of them is a
+/// device.
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_pending_devices_are_reclaimed_after_reimport() -> Result<()> {
     let owner = memory_node().await?;

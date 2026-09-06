@@ -1,15 +1,13 @@
-//! Entry listing: metadata enumeration of a data namespace.
-//!
-//! Single-node scenarios: listing yields exactly the written paths as
-//! metadata, the prefix filter matches whole components, and — the paired
-//! deny — listing an issuer with no data store on this node fails with
-//! `UnknownIssuer`.
+//! Entry listing: metadata enumeration of a data namespace, single node.
 
 use anyhow::Result;
 use data_layer::UnknownIssuer;
 use pdn_types::{EntryInfo, EntryPath};
 use test_utils::{ids, memory_node};
 
+/// Listing yields exactly the written paths as metadata, and the prefix
+/// filter matches whole components. Paired deny: an issuer with no data
+/// store on this node is refused as `UnknownIssuer`.
 #[tokio::test(flavor = "multi_thread")]
 async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> Result<()> {
     let node = memory_node().await?;

@@ -1,13 +1,6 @@
-//! Three devices, two identities, a partial overlap — and no founder.
-//!
-//! Phone brings up Alice-at-work (connected to Bob, one data entry) and
-//! Alice-at-leisure (connected to Carol, one data entry). Laptop imports
-//! both store sets from phone's tickets. Tablet imports the work identity
-//! only — and its tickets come from the **laptop**, not the founder, proving
-//! a device that replicated a store is a full peer: what it holds is
-//! sufficient to bring up the next device. Device sets end up asymmetric
-//! (work: three, leisure: two), live updates cross the three-device swarm,
-//! and the tablet knows nothing of the leisure identity.
+//! Three devices, two identities, a partial overlap: a device that
+//! replicated a store is a full peer, and what it holds is sufficient to
+//! bring up the next device.
 
 use anyhow::Result;
 use data_layer::{
@@ -56,6 +49,11 @@ async fn import_data_from(from: &SyncNode, to: &mut SyncNode, issuer: PdnId) -> 
     Ok(())
 }
 
+/// The tablet joins the work identity from tickets the laptop minted, not
+/// the founder: state authored on the phone reaches it transitively, a
+/// live update crosses the three-device swarm, the device sets end up
+/// asymmetric (work: three, leisure: two), and the tablet knows nothing of
+/// the leisure identity.
 #[tokio::test(flavor = "multi_thread")]
 async fn three_devices_two_identities() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;

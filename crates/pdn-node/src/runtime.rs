@@ -77,165 +77,103 @@ use crate::{
     sync::RuntimeSyncService,
 };
 
-/// How many retraction events the subscription buffers before a slow
-/// subscriber starts losing the oldest — the broadcast channel's capacity.
+/// A slow subscriber past this loses the oldest events.
 const RETRACTION_EVENTS_CAPACITY: usize = 64;
 const LINKING_FAILURES_CAPACITY: usize = 16;
 
-/// An operation addressed an identity this runtime does not host: `identity`
-/// was neither created nor linked here. Downcast from the `anyhow::Error`
-/// of identity-addressed service operations. Data-namespace operations
-/// report the analogous [`data_layer::UnknownIssuer`] instead — namespaces
-/// are registered by creation or import, not by hosting.
+/// `identity` was neither created nor linked here. Downcast from the
+/// `anyhow::Error` of identity-addressed operations; data-namespace
+/// operations report [`data_layer::UnknownIssuer`] instead.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("identity not hosted on this runtime: {identity}")]
 pub struct UnknownIdentity {
-    /// The identity the operation addressed.
     pub identity: PdnId,
 }
 
-/// A hosted identity's store handles — the runtime's own value, keyed by
-/// identity in [`State::identities`]. Data-layer keeps no such list: store
-/// handles stay with the caller, and the runtime is that caller.
+/// A hosted identity's store handles; data-layer keeps no such list.
 #[derive(Debug)]
 pub(crate) struct HostedIdentity {
-    /// The identity's private-metadata directory: devices, tickets, and
-    /// connections records.
     pub(crate) directory: PrivateMetadataStore,
 }
 
-/// Shared runtime state: the node, the hosted identities, and the live
-/// bookkeeping of the runtime's two ceremonies (pairing and linking).
-///
-/// One coarse lock: the hosted-identity map, the pending invites, and the
-/// metadata-pair cache are mutated in place, so all state sits behind a
-/// single async mutex the services (driven concurrently, e.g. from HTTP
-/// handlers) serialize on. `SyncNode`'s own operations take `&self` — its
-/// registry is interior-mutable — so they need no exclusive access. Coarse
-/// on purpose: the state is small in-memory maps, and the writes under the
-/// lock are local — no network wait — so splitting it buys nothing until
-/// contention is measured rather than assumed. Both ceremonies keep that
-/// rule by taking the lock per phase and releasing it across every network
-/// round-trip and wait — otherwise two runtimes running a ceremony toward
-/// each other would deadlock, each holding its own lock while the peer's
-/// accept side blocks on that same lock.
+/// Shared runtime state behind one coarse async mutex: small in-memory
+/// maps, mutated in place under local writes only. Both ceremonies take the
+/// lock per phase and release it across every network round-trip and wait
+/// — otherwise two runtimes running a ceremony toward each other deadlock,
+/// each holding its own lock while the peer's accept side blocks on it.
 pub(crate) struct State {
     pub(crate) node: Arc<SyncNode>,
-    /// The author for this runtime's data-namespace writes. The author
-    /// dimension carries no meaning (see [`pdn_types::EntryInfo`]), so one
-    /// per runtime suffices.
+    /// The node's one persisted author; the retraction tracker recognizes
+    /// this runtime's writes by it.
     pub(crate) author: AuthorId,
-    /// The hosted identities' store handles, keyed by identity: exactly
-    /// those created or linked on this runtime.
+    /// Exactly the identities created or linked here.
     pub(crate) identities: HashMap<PdnId, HostedIdentity>,
-    /// The pairing protocol's pending invites, keyed by secret bytes. In
-    /// runtime memory on purpose: an invite is a live ceremony that does
-    /// not survive a restart, and every operation on the set is a map
-    /// operation under this one lock.
+    /// In memory on purpose: an invite does not survive a restart.
     pub(crate) pending_invites: PendingInvites,
-    /// The linking protocol's pending invites — a second instance of the
-    /// same set, deliberately separate from pairing's: a secret minted for
-    /// one ceremony must never verify in the other.
+    /// Separate from pairing's: a secret minted for one ceremony must never
+    /// verify in the other.
     pub(crate) pending_linking_invites: PendingInvites,
-    /// Connection metadata pairs opened on this runtime, keyed by
-    /// `(hosted identity, counterparty)`: filled by establishment on the
-    /// pairing device, by each hosted identity's connection armer as pair
-    /// records replicate in from its other devices, and on demand from the
-    /// directory's tickets — a cache; the directory is the durable lookup.
+    /// A cache keyed by `(hosted identity, counterparty)`; the directory is
+    /// the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
-    /// Pairs that currently have a grant binder running, keyed by
-    /// `(hosted identity, counterparty)`. One binder per pair: the sweep
-    /// inserts before spawning and the binder removes itself as it exits, so
-    /// a pair whose replica was superseded gets a fresh binder on the next
-    /// sweep rather than two watching different replicas.
+    /// One binder per pair: the sweep inserts before spawning and the
+    /// binder removes itself as it exits.
     pub(crate) grant_binders: HashSet<(PdnId, PdnId)>,
-    /// Data namespaces a grant binder imported, keyed by
-    /// `(hosted identity, counterparty, issuer)` and holding the namespace
-    /// the grant named when it was imported. Two jobs: a grant whose ticket
-    /// still names this namespace is not re-imported every sweep, and a
-    /// grant that disappears is forgotten again — bounded to what an binder
-    /// itself brought in, so a namespace imported any other way is never
-    /// dropped from under its owner.
+    /// What each binder imported, keyed by `(hosted identity, counterparty,
+    /// issuer)`: bounds the unbind to what a binder itself brought in.
     pub(crate) bound_grants: HashMap<(PdnId, PdnId, PdnId), NamespaceId>,
-    /// Identities with a `link` currently in flight on this runtime — the
-    /// linking analog of `grant_binders`: reserved right after the
-    /// already-hosted check, in the same lock scope, so a second concurrent
-    /// `link` toward the same not-yet-hosted identity refuses instead of
-    /// racing the first to commit. Released on every exit path of
-    /// `link_via_dialogue`, success and failure alike.
+    /// Reserved in the same lock scope as the already-hosted check, so a
+    /// concurrent `link` toward the same identity refuses instead of racing
+    /// the first to commit.
     pub(crate) linking_in_flight: HashSet<PdnId>,
-    /// Pairs with an `establish` currently in flight, keyed by `(scanning
-    /// identity, inviter)` — the establishment analog of
-    /// `linking_in_flight`.
+    /// Keyed by `(scanning identity, inviter)`.
     pub(crate) establishing_in_flight: HashSet<(PdnId, PdnId)>,
-    /// Asynchronous rollback work created by cancellation. Shutdown closes
-    /// and joins this tracker before stopping the node underneath it.
+    /// Rollback work created by cancellation; shutdown joins it before
+    /// stopping the node.
     pub(crate) cleanup_tasks: CleanupSupervisor,
     pub(crate) linking_failures: tokio::sync::broadcast::Sender<LinkingLocalFailure>,
     #[cfg(feature = "test-util")]
     pub(crate) pairing_in_flight: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "test-util")]
     pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
-    /// A pause taken on the linking path immediately before the commit
-    /// point, where a scenario can observe what a link has published
-    /// before it commits — which is nothing.
+    /// A pause just before the linking commit point, where a scenario reads
+    /// what a link has published before it commits — nothing.
     #[cfg(feature = "test-util")]
     pub(crate) link_before_commit_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
-    /// `Some(n)` fails every arming of a freshly opened metadata pair and
-    /// counts the failures; `None` leaves arming alone. Sticky rather than
-    /// one-shot: the connection armer retries every sweep, and what a
-    /// scenario asserts here is that repeated attempts leave nothing open —
-    /// one attempt cannot show that. The count is the positive control:
-    /// without it an assertion that nothing accumulates is satisfied by a
-    /// device that never attempted.
+    /// `Some(n)` fails every pair arming and counts the failures. Sticky:
+    /// the armer retries every sweep, and the count is the positive control
+    /// for "repeated attempts leave nothing open".
     #[cfg(feature = "test-util")]
     pub(crate) pair_arm_failures: Option<usize>,
-    /// How long a connection armer waits for its directory to change
-    /// before sweeping anyway. Taken from the spawn's reconcile interval,
-    /// so a runtime configured for a fast test cadence retries as fast as
-    /// it reconciles.
+    /// How long a connection armer waits for a directory change before
+    /// sweeping anyway — the spawn's reconcile interval.
     pub(crate) sweep_interval: std::time::Duration,
-    /// The retraction-event surface: the verdict consumer sends, and
-    /// [`Runtime::subscribe_retractions`] hands out receivers.
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
-    /// Where the hosted-identities record lives — `None` on a memory node,
-    /// whose hosting ends with the process and records nothing.
+    /// `None` on a memory node, which records nothing.
     pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl State {
-    /// The store set of `identity`, or [`UnknownIdentity`].
     pub(crate) fn hosted(&self, identity: PdnId) -> Result<&HostedIdentity, UnknownIdentity> {
         self.identities
             .get(&identity)
             .ok_or(UnknownIdentity { identity })
     }
 
-    /// Whether `identity` is one of this runtime's own hosted identities —
-    /// as opposed to a peer known only through a grant or a connection.
+    /// As opposed to a peer known only through a grant or a connection.
     pub(crate) fn is_hosted(&self, identity: PdnId) -> bool {
         self.identities.contains_key(&identity)
     }
 
-    /// Commit `identity` to the hosted-identities record: the record is
-    /// replaced whole with the currently hosted set plus this identity.
-    /// Called after the identity's store set is provisioned and before it
-    /// is hosted — a process that dies before this leaves replicas nothing
-    /// points at, never registered and never served, and one that dies
-    /// after leaves a fully provisioned identity a restart picks up. A
-    /// failure — a full disk above all — leaves the previous record intact
-    /// and surfaces as the failed create or link, so recording a second
-    /// identity cannot lose the first. A no-op on a memory node.
-    ///
-    /// The record never names a replica the store has not committed. The
-    /// file becomes durable inside `write_record`, while the replicas it
-    /// names sit in the store's open write transaction, committed on the
-    /// store's own schedule; a process killed between the two comes back
-    /// to a line naming a replica its store does not hold, and that
-    /// identity is skipped rather than hosted. Flushing first closes the
-    /// window for every path that records hosting, present and future.
+    /// Replace the hosted-identities record with the hosted set plus
+    /// `identity`. Called after the store set is provisioned and before the
+    /// identity is hosted; a failure leaves the previous record intact. The
+    /// replicas are flushed first: the file becomes durable inside
+    /// `write_record`, while the replicas it names sit in the store's open
+    /// write transaction, and a kill between the two would leave a line
+    /// naming a replica the store does not hold.
     pub(crate) async fn commit_hosting(
         &self,
         identity: PdnId,
@@ -258,13 +196,9 @@ impl State {
             identity,
             directory,
         });
-        // Off the worker thread: the write is a `sync_all` and a rename,
-        // which block the thread rather than the task, and on the volumes
-        // a node actually runs on they cost tens of milliseconds. The
-        // caller's lock is still held across it — the record is built from
-        // the hosted set and must not be built from a set another commit
-        // is changing meanwhile — so what this buys is the runtime's
-        // worker pool, not the lock.
+        // Off the worker thread: a `sync_all` and a rename block the thread.
+        // The caller's lock stays held — the record must not be built from
+        // a set another commit is changing meanwhile.
         let dir = dir.clone();
         tokio::task::spawn_blocking(move || hosted::write_record(&dir, &lines))
             .await
@@ -273,45 +207,24 @@ impl State {
 }
 
 /// The embeddable runtime core: one running node plus the identities it
-/// hosts. Spawn one per process (hosts) or several (in-process tests),
-/// drive it through its services — [`identity`](Self::identity),
-/// [`connections`](Self::connections), [`data`](Self::data),
-/// [`sync`](Self::sync) — and shut it down.
-///
-/// The runtime is the single owner of node assembly: the `SyncNode` is
-/// built at [`spawn`](Self::spawn) and nowhere else, and the runtime's two
-/// protocol handlers — pairing (ADR-0011) and linking (ADR-0012) — thread
-/// through this one place: built before the node, registered at spawn
+/// hosts, driven through its services. The single owner of node assembly:
+/// the two protocol handlers are built before the node, registered at spawn
 /// through the data-layer assembly slot, and handed the shared state right
 /// after.
 pub struct Runtime {
-    /// Cached at spawn; stable for the runtime's lifetime.
     node_id: NodeId,
     pub(crate) state: Arc<Mutex<State>>,
 }
 
 impl Runtime {
-    /// Spawn the node stack, configured by `options` — where the state
-    /// lives is a required part of it ([`SpawnOptions::storage`]). The
-    /// pairing and linking handlers register on the node's endpoint here;
-    /// each handler gets its own state slot, filled immediately after the
-    /// node comes up, so by the time an invite can exist both handlers are
-    /// fully wired.
-    ///
-    /// On a directory-configured runtime, every identity the directory's
-    /// hosted-identities record names is hosted again before the spawn
-    /// returns, through the same tail `create` runs after provisioning:
-    /// the private metadata directory opens from the replica the node
-    /// already holds, arms session classification, and its connection
-    /// armer starts — whose sweeps bring the data namespace, the metadata
-    /// pairs and the granted namespaces back from the directory's own
-    /// records. Recovery performs no ceremony and dials no peer; an
-    /// unreadable record stops the spawn with an error naming it, and an
-    /// absent record is a first start.
+    /// On a directory-configured runtime, every identity the record names
+    /// is hosted again before the spawn returns, through the same tail
+    /// `create` runs: the directory opens from the replica the node holds,
+    /// arms classification, and its connection armer's sweeps bring the
+    /// rest back. No ceremony, no dial; an unreadable record stops the
+    /// spawn, an absent one is a first start.
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
         let data_dir = data_dir_of(&options.storage);
-        // Read before the options move into the node: the armers below
-        // wait on it.
         let sweep_interval = options.reconcile_interval;
         let pairing = PairingHandler::new();
         let pairing_slot = pairing.slot();
@@ -328,18 +241,9 @@ impl Runtime {
         )
         .await?;
         let node_id = node.node_id();
-        // Everything between the node and the state, in one fallible step:
-        // whatever fails here, the node is shut down before the error
-        // leaves, because a node that never reaches its caller still holds
-        // the directory's databases open, and a retry on the same
-        // directory in this process would meet them.
-        //
-        // The node's one author: the fork's persisted default author, so a
-        // directory-configured runtime writes as the author it wrote as
-        // before. The provisional-write tracker recognizes this runtime's
-        // writes by it, and the runtime's consumer owns the verdict stream.
-        // Recovery hosts what the record names, before the state exists —
-        // the armers spawn right after it does.
+        // One fallible step: whatever fails here, the node is shut down
+        // before the error leaves, or a retry on the same directory in this
+        // process would meet its open databases.
         let prepared = async {
             let author = node.default_author().await?;
             node.track_writer_author(author);
@@ -403,40 +307,29 @@ impl Runtime {
         Ok(Self { node_id, state })
     }
 
-    /// This runtime's node id (its endpoint id), stable from spawn to
-    /// shutdown.
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
 
-    /// The identity service: create identities here, mint linking invites
-    /// for hosted ones, link this runtime into existing ones.
     pub fn identity(&self) -> RuntimeIdentityService<'_> {
         RuntimeIdentityService::new(self)
     }
 
-    /// The connections service: establish hosted identities' connections
-    /// (invite / establish), list them, and carry grants over the
-    /// connections' metadata pairs.
     pub fn connections(&self) -> RuntimeConnectionsService<'_> {
         RuntimeConnectionsService::new(self)
     }
 
-    /// The data service: entries by issuer and path, plus the whole-store
-    /// ticket handover.
     pub fn data(&self) -> RuntimeDataService<'_> {
         RuntimeDataService::new(self)
     }
 
-    /// The sync service: node id and hosted identities.
     pub fn sync(&self) -> RuntimeSyncService<'_> {
         RuntimeSyncService::new(self)
     }
 
-    /// Subscribe to write-retraction events of this runtime's hosted
-    /// identities: one event per retracted entry, carrying its full address
-    /// — the host's hook for user-facing surfacing. A subscriber that lags
-    /// past the buffer loses the oldest events, never blocks the runtime.
+    /// One event per retracted entry — the host's hook for user-facing
+    /// surfacing. A lagging subscriber loses the oldest events, never
+    /// blocks the runtime.
     pub async fn subscribe_retractions(&self) -> tokio::sync::broadcast::Receiver<RetractionEvent> {
         self.state.lock().await.retraction_events.subscribe()
     }
@@ -452,18 +345,13 @@ impl Runtime {
         self.state.lock().await.fail_next_pending_device_write = true;
     }
 
-    /// Make every arming of a freshly opened metadata pair fail from now
-    /// on, so a scenario can watch what a failed open leaves behind. Behind
-    /// the `test-util` feature and absent from every product build.
+    /// Fail every pair arming from now on.
     #[cfg(feature = "test-util")]
     pub async fn fail_pair_arm_for_test(&self) {
         self.state.lock().await.pair_arm_failures = Some(0);
     }
 
-    /// How many pair arms have failed under
-    /// [`fail_pair_arm_for_test`](Self::fail_pair_arm_for_test) — the
-    /// evidence that attempts happened, without which "nothing
-    /// accumulated" says nothing.
+    /// The positive control for "nothing accumulated".
     #[cfg(feature = "test-util")]
     pub async fn pair_arm_failures_for_test(&self) -> usize {
         self.state.lock().await.pair_arm_failures.unwrap_or(0)
@@ -500,8 +388,6 @@ impl Runtime {
         pause
     }
 
-    /// Hold the next link just before its commit point, so a scenario can
-    /// read what the ceremony has published up to there.
     #[cfg(feature = "test-util")]
     pub async fn pause_next_link_before_commit(&self) -> Arc<LinkAfterImportPause> {
         let pause = Arc::new(LinkAfterImportPause {
@@ -512,16 +398,9 @@ impl Runtime {
         pause
     }
 
-    /// Shut the node down, closing the endpoint and all protocols. Takes
-    /// `&self`: no exclusive ownership is required — a clone held by a
-    /// router, a handler, or another caller does not block this, and
-    /// `SyncNode::shutdown`'s own idempotence makes a repeat call harmless.
-    /// Clones the node handle and drops the state lock before awaiting the
-    /// shutdown itself: `SyncNode::shutdown` now waits, bounded, for every
-    /// in-flight pairing/linking accept to release its permit, and holding
-    /// the coarse lock across that wait would stall every other operation
-    /// on it — including an accept trying to take the very lock this
-    /// shutdown is waiting on.
+    /// Idempotent. The state lock is dropped before the shutdown is
+    /// awaited: `SyncNode::shutdown` waits for in-flight accepts, and one of
+    /// them may be trying to take that very lock.
     pub async fn shutdown(&self) -> Result<()> {
         const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         let (node, cleanup_tasks) = {
@@ -534,26 +413,13 @@ impl Runtime {
     }
 }
 
-/// A recovered directory's changes stream, boxed so the recovery helper can
-/// return it beside the handle; consumed by that identity's connection
-/// armer once the state exists.
 type DirectoryChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static>;
 
-/// Host every identity the hosted-identities record names: open each
-/// directory from the replica the node already holds and perform the same
-/// registration a newly created identity performs — no ceremony, no dial,
-/// no peer. Everything else re-derives from the directory once the armers
-/// run: the data namespace from its `data` ticket, the pairs from their
-/// published tickets, the granted namespaces from the counterparty's grant
-/// records.
-///
-/// The two ways a line can fail to yield a directory are answered
-/// differently. A replica the store does not hold is skipped, loudly: the
-/// identity is not hosted, and the rest of the record — every healthy
-/// identity on this disk — still comes back. A replica the store holds but
-/// cannot open fails the start, because a runtime that silently hosted
-/// less than its record names would look healthy while refusing
-/// everything.
+/// Host every identity the record names from the replicas the node holds.
+/// A replica the store does not hold is skipped, loudly, and the rest of
+/// the record comes back; one the store holds but cannot open fails the
+/// start, because a runtime hosting less than its record names would look
+/// healthy while refusing everything.
 async fn recover_hosted_identities(
     node: &SyncNode,
     data_dir: Option<&std::path::Path>,
@@ -577,9 +443,8 @@ async fn recover_hosted_identities(
                 )
             })?;
         let Some(directory) = opened else {
-            // The line stays in the record: the skip is then visible on
-            // every start until hosting is ended for the identity, rather
-            // than erased by a start deciding on its own.
+            // The line stays in the record, so the skip is visible on every
+            // start rather than erased by a start deciding on its own.
             tracing::warn!(
                 identity = %line.identity,
                 directory = %line.directory,
@@ -595,9 +460,6 @@ async fn recover_hosted_identities(
     Ok((identities, armers))
 }
 
-/// Where a spawn keeps its durable state, or `None` on a memory node whose
-/// hosting ends with the process — the one thing the hosted-identities
-/// record needs and the only part of the storage choice that outlives it.
 fn data_dir_of(storage: &StorageConfig) -> Option<PathBuf> {
     match storage {
         StorageConfig::Directory(directory) => Some(directory.clone()),

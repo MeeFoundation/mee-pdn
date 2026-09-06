@@ -18,14 +18,11 @@ use data_layer::{
 use pdn_types::{EntryPath, NodeId, NonEmpty, PdnId};
 use test_utils::{eventually, ids, memory_node, wait_entry_is};
 
-/// The reconcile cadence the sibling-serving scenario runs at. A grantee
-/// replica has no gossip path, so every denial is "the reader retried over
-/// several intervals and was refused" — at the production default that is
-/// tens of seconds of pure sleep per assertion; injected here it is
-/// milliseconds, and the assertions wait out the same number of intervals.
+/// A grantee replica has no gossip path, so every denial is "the reader
+/// retried over several intervals and was refused" — milliseconds at this
+/// cadence instead of the production default's tens of seconds.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-/// Spawn a node with the sibling-serving scenario's short reconcile cadence.
 async fn spawn_node() -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -34,18 +31,16 @@ async fn spawn_node() -> Result<SyncNode> {
     .await
 }
 
-/// Create a data namespace for `issuer` on `node` and return its read
-/// ticket — a real whole-store ticket for grants to carry.
+/// A real read ticket for grants to carry.
 async fn data_ticket(node: &mut SyncNode, issuer: PdnId) -> Result<DocTicket> {
     node.create_namespace(issuer).await?;
     node.share_ticket(issuer, ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await
 }
 
-/// The nominal claim these store-level scenarios grant on: the store
-/// carries a capability, it never evaluates one, so one claim is enough to
-/// give every record its shape.
-// Test-only helper: clippy.toml's expect relaxation reaches `#[test]` bodies only.
+/// The store carries a capability and never evaluates one, so one nominal
+/// claim gives every record its shape.
+// clippy.toml's expect relaxation reaches `#[test]` bodies only.
 #[allow(clippy::expect_used)]
 fn nominal_grant(issuer: PdnId, audience: PdnId) -> ReadGrant {
     let path = EntryPath::new("contact/email").expect("a valid path");
@@ -77,13 +72,9 @@ async fn wait_grant_is(
     .await
 }
 
-/// Dedicated replicas: creation yields a fresh replica per direction, the
-/// two directions of one connection are distinct, and one identity's
-/// connections do not share a replica — a grant toward one counterparty is
-/// invisible in the store toward another. The own→peer flip: what the
-/// issuer writes into `own`, the counterparty reads from `peer`. Import
-/// binds before content: the imported handle is usable at once, reads
-/// absent, and converges without any re-import.
+/// One replica per direction, the own→peer flip, and an import that binds
+/// before content: the handle reads absent at once and converges without
+/// re-import.
 #[tokio::test(flavor = "multi_thread")]
 async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     let mut alice = memory_node().await?;
@@ -191,11 +182,10 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
 
 /// Grants over the pair's lifetime, across both identities' devices: a
 /// round-trip, a grant published long after the exchange with no new
-/// tickets handed over, a withdrawal that reads as absent everywhere, and
-/// concurrent updates of one grant key converging to a single entry on
-/// every device. Reads are payload-waiting throughout: a grant lists as
-/// soon as its record syncs and reads absent until its payload arrives —
-/// the polls below ride exactly that contract.
+/// tickets, a withdrawal that reads absent everywhere, and concurrent
+/// updates of one grant key converging to a single entry. A grant lists as
+/// soon as its record syncs and reads absent until its payload arrives; the
+/// polls ride that contract.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the pair's whole lifetime in one place
 async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
@@ -204,9 +194,8 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     let b_phone = memory_node().await?;
     let b_laptop = memory_node().await?;
 
-    // Alice's phone issues the store toward Bob. Her laptop opens it from
-    // the write ticket (the directory's own-kind path); Bob's devices open
-    // it from the read ticket (the establishment / peer-kind path).
+    // The laptop opens from the write ticket, Bob's devices from the read
+    // ticket.
     let own_phone = ConnectionMetadataStore::create(&a_phone).await?;
     let write_ticket = own_phone
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -247,7 +236,7 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     );
 
     // Withdrawal: the tombstone replicates and the grant reads as absent —
-    // and no longer lists — on the counterparty.
+    // and stops listing — on the counterparty.
     own_phone.withdraw_grant(ids::ALICE).await?;
     assert!(
         eventually(|| async {
@@ -310,11 +299,9 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     Ok(())
 }
 
-/// One record per issuer: a republication replaces the previous record in
-/// one write, and a withdrawal removes it in one tombstone. At no point can
-/// either side read a grant other than the last published one — a
-/// half-replaced or half-withdrawn state is unrepresentable, because there
-/// is only ever one entry to replace or delete.
+/// A republication replaces the grant record in one write and a withdrawal
+/// removes it in one tombstone: one record per issuer, so a half-replaced
+/// or half-withdrawn state is unrepresentable.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     let mut alice = memory_node().await?;
@@ -347,9 +334,7 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
         "the grant did not converge to the counterparty"
     );
 
-    // Republished onto a second replica: the one record is replaced
-    // wholesale, so the counterparty comes to read the new ticket and can
-    // never read a mix of the two.
+    // Republished onto a second replica: the one record is replaced wholesale.
     let replacement = data_ticket(&mut alice, ids::ALICE_AT_WORK).await?;
     own.publish_grant(&grant, &replacement).await?;
     assert!(
@@ -383,15 +368,10 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     Ok(())
 }
 
-/// The mirror denial: a data replica refuses to be opened as a
-/// device-shared store. `PrivateMetadataStore::open` is recovery's
-/// constructor and enrols what it opens in the gossip swarm, so an open
-/// aimed at a data namespace would widen the data path of a replica whose
-/// import deliberately stays out of that swarm — and would do it silently,
-/// since the store does hold the namespace.
-///
-/// Beside it, the allowed case: the directory this node created opens, and
-/// reads back what it holds.
+/// A data replica refuses to be opened as a device-shared store; beside it,
+/// the directory this node created opens. `PrivateMetadataStore::open`
+/// enrols what it opens in the gossip swarm, so an open aimed at a data
+/// namespace would silently widen the data path of a grantee import.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
     let alice = memory_node().await?;
@@ -420,12 +400,10 @@ async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
     Ok(())
 }
 
-/// A device-shared replica refuses a data import: a connection metadata
-/// store — like a directory — is tracked but not data-bound, and a ticket
-/// naming its namespace must not repurpose it as a data namespace. Honoring
-/// it would overwrite the store's tracking (strategy and contacts) on the
-/// word of whoever minted the ticket, and the grantee downgrade would cut
-/// the store's live path by leaving the gossip swarm.
+/// A device-shared replica refuses a data import, and stays writable
+/// through its own surface. Honoring the import would overwrite the store's
+/// tracking on the word of whoever minted the ticket, and the grantee
+/// downgrade would cut its live path by leaving the gossip swarm.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     let alice = memory_node().await?;
@@ -453,13 +431,10 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     Ok(())
 }
 
-/// Device records assert once. Opening machinery uses the ensure form: a
-/// first touch publishes, a live record is left untouched, and a
-/// *withdrawn* record is not resurrected — an unconditional publish would
-/// out-bid the tombstone by wall clock on every pair opening. Deliberate
-/// re-assertion stays a distinct act (`publish_device`). The tombstone is
-/// an agreement honest devices keep; this test pins that they keep it by
-/// default.
+/// Opening a pair does not resurrect a withdrawn device record: a first
+/// touch publishes, a tombstone holds, and deliberate re-assertion
+/// (`publish_device`) is a distinct act. The tombstone is an agreement
+/// honest devices keep; this pins that they keep it by default.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Result<()> {
     let alice = memory_node().await?;
@@ -487,14 +462,12 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
     Ok(())
 }
 
-/// A `devices/` key is the counterparty's word, and a `NodeId` carries any
-/// 32 bytes — about half of them decompress into no curve point. Such a
-/// record withholds itself and never the set: consumers convert the
-/// published set into endpoint ids without error handling, and without
-/// this boundary one garbage record would cost every audience of the
-/// replica its whole derived contact set. The garbage record is written
-/// through the product surface itself — `publish_device` accepts the
-/// opaque id — so the denial is the boundary's, not the writer's.
+/// A `devices/` key that decodes into no node id withholds itself and never
+/// the set: consumers convert the set into endpoint ids without error
+/// handling, so one garbage record would otherwise cost every audience its
+/// whole contact set. The record is written through the product surface
+/// itself — `publish_device` accepts the opaque id — so the denial is the
+/// boundary's, not the writer's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
     let alice = memory_node().await?;
@@ -520,13 +493,10 @@ async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
     Ok(())
 }
 
-/// The access pairs of Invariant 3, each allowed path with its tightest
-/// denial. Write: the issuer's second device writes via the directory's
-/// write ticket ⟷ the counterparty, holding only the read ticket, cannot
-/// write and creates no entry. Read: the counterparty reads the whole store
-/// ⟷ a third identity — itself sharing a metadata pair with the issuer —
-/// holds no replica of this pair, no ticket to it, and reads nothing that
-/// reveals its existence.
+/// The access pairs of Invariant 3. Write: the issuer's second device
+/// writes; the counterparty, on the read ticket, cannot and creates no
+/// entry. Read: the counterparty reads the whole store; a third identity
+/// sharing its own pair with the issuer reads nothing that reveals this one.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() -> Result<()> {
@@ -562,9 +532,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     )
     .await?;
 
-    // Allowed: the issuer's second device writes a grant through the write
-    // ticket, and the counterparty reads it — the whole store is its
-    // audience.
+    // Allowed: the issuer's second device writes, the counterparty reads.
     let from_laptop = data_ticket(&mut a_laptop, ids::ALICE_AT_WORK).await?;
     own_b_laptop
         .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &from_laptop)
@@ -607,10 +575,8 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
         .granted()
         .is_none());
 
-    // Denied: Carol — connected to Alice herself — observes nothing of the
-    // A→B store. Her pair is a different replica, she was handed no ticket
-    // to the A→B one, and nothing she can read mentions it: her store
-    // carries exactly what Alice granted her, none of Bob's grants.
+    // Denied: Carol's store carries exactly what Alice granted her, none of
+    // Bob's grants.
     let for_carol = data_ticket(&mut a_phone, ids::ALICE_AT_LEISURE).await?;
     own_toward_carol
         .publish_grant(
@@ -655,19 +621,11 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     Ok(())
 }
 
-/// The sibling path preserves the issuer's scope, honors his withdrawal,
-/// and admits only the audience it is addressed to. A scoped grant serves
-/// a sibling exactly the claim set — withheld entries stay hidden even
-/// though the serving device demonstrably holds them. A device listed only
-/// in a co-located identity's directory — hosted on the same serving node —
-/// is refused, probed after a fresh write demonstrably reaches the audience
-/// (so the refusal is ordered, not a poll that outran the first dial). Once
-/// the withdrawal tombstone reaches the serving device the next sibling
-/// session refuses, and what was delivered while granted is retained.
-///
-/// Nodes run at an injected sub-second reconcile interval: every denial
-/// below waits out several of the refused sibling's own intervals, so it
-/// asserts "retried and refused", not "not yet arrived".
+/// The sibling path preserves the issuer's scope (withheld entries stay
+/// hidden although the serving device holds them), refuses a device listed
+/// only in a co-located identity's directory, and honors the withdrawal
+/// from the next session while retaining what was delivered. Every denial
+/// is ordered after a write that demonstrably reached the audience.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
@@ -707,10 +665,9 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     };
     b_own.publish_grant(&grant, &data_read).await?;
 
-    // The phone opens the pair and imports the namespace. Bob's node is
-    // unarmed — ticket possession serves him whole — so the phone holds
-    // the withheld entry too: the sibling filter below must narrow the
-    // session regardless of what the serving device holds.
+    // Bob's node is unarmed, so the phone holds the withheld entry too: the
+    // sibling filter must narrow the session regardless of what the serving
+    // device holds.
     let phone_peer = ConnectionMetadataStore::import(
         &a_phone,
         b_own
@@ -772,11 +729,8 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     assert!(a_laptop.read(ids::BOB, &withheld).await?.is_none());
 
     // Denied: the intruder resolves only in the co-located identity's
-    // directory — not the audience's. It imports the same sibling ticket the
-    // laptop rode, then Bob writes once more: the update reaches the laptop
-    // (the phone demonstrably serves the audience in this window), so after
-    // several of the intruder's own reconcile intervals its empty view is a
-    // refusal, not a slow first dial.
+    // directory. Bob's next update reaching the laptop orders the refusal
+    // after a window in which the phone demonstrably serves the audience.
     intruder
         .import_namespace_scoped(ids::BOB, phone_ticket)
         .await?;
@@ -790,12 +744,8 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     assert!(intruder.read(ids::BOB, &email).await?.is_none());
     assert!(intruder.list(ids::BOB, None).await?.is_empty());
 
-    // Withdrawal: once the tombstone reaches the serving device, the next
-    // sibling session refuses. Bob then writes again; the phone — granted
-    // directly by the unarmed issuer's ticket — still converges, while the
-    // laptop, after several of its own intervals against the now-refusing
-    // phone, keeps what it was delivered and never advances to the
-    // post-withdrawal value.
+    // Withdrawal: the phone, served whole by the unarmed issuer, still
+    // converges; the laptop keeps what it was delivered and never advances.
     b_own.withdraw_grant(ids::BOB).await?;
     assert!(
         eventually(|| async {

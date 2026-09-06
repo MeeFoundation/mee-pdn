@@ -1,24 +1,10 @@
 //! A granted replica reaches every device of its issuer, not only the one
-//! that published the grant: the grant sweep derives the replica's whole
-//! contact set from the device records on both sides — the issuer's
-//! published devices, the audience identities' siblings — plus the grant
-//! ticket's addressing, re-derived per sweep. The scenarios turn the
-//! publishing device off and require convergence from another; the
-//! contact-set observation rides the `test-util` surface, so entering and
-//! leaving the set is asserted rather than slept on. Paired denial per
-//! `code-practices/access-control-tests.md`: the serving sibling gives a
-//! bare ticket holder nothing, probed right after it demonstrably served
-//! the granted audience.
-//!
-//! The grant sweep's replica lifecycle is asserted on the same surface:
-//! the replica shared by co-hosted audiences (ADR-0009) leaves only with
-//! the last withdrawn grant, the unbind decision counts durable grant
-//! records rather than the binders' bookkeeping, and a replica forgotten
-//! out from under the bookkeeping re-imports on the pair's next sweep.
-//!
-//! The contact observation goes through `RuntimeDataService::contacts_of`,
-//! so this file compiles only under the `test-util` feature — the `just`
-//! dev recipes enable it; a bare `cargo build`/`check` omits the file.
+//! that published the grant; the scenarios turn the publishing device off
+//! and require convergence from another, asserting the contact set through
+//! the `test-util` surface rather than sleeping on it. Paired denial: the
+//! serving sibling gives a bare ticket holder nothing. The grant sweep's
+//! replica lifecycle (ADR-0009: one shared replica, last withdrawal takes
+//! it) is asserted on the same surface. Compiles only under `test-util`.
 #![cfg(feature = "test-util")]
 
 use std::{cell::RefCell, time::Duration};
@@ -35,12 +21,8 @@ use test_utils::eventually;
 mod common;
 use common::{establish_patiently, granted_patiently, link_patiently, link_probe};
 
-/// The reconcile cadence of these scenarios — the denials below are "it
-/// retried over several intervals and was refused", made cheap by
-/// injecting a sub-second interval.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-/// Spawn a runtime with the tests' short reconcile cadence.
 async fn spawn_runtime() -> Result<Runtime> {
     Runtime::spawn(SpawnOptions {
         reconcile_interval: RECONCILE,
@@ -72,9 +54,8 @@ async fn claim_arrives(
 }
 
 /// Tombstone `device`'s published record in the issuer's own store toward
-/// `peer` — the act any device of the issuer performs. The probe links raw
-/// and imports that store from the directory's write ticket, so the write
-/// goes where the product's own withdrawal would go.
+/// `peer`, from a probe that imports the store from the directory's write
+/// ticket — where the product's own withdrawal would go.
 async fn withdraw_device_toward(
     node: &SyncNode,
     directory: &PrivateMetadataStore,
@@ -82,9 +63,8 @@ async fn withdraw_device_toward(
     device: NodeId,
 ) -> Result<()> {
     let own_kind = own_ticket_kind(&peer);
-    // The ticket is accumulated inside the poll: a second read after it is
-    // not the same read — a payload momentarily unfetchable reads as no
-    // ticket at all, the very transient the poll exists for.
+    // Accumulated inside the poll: a second read after it is not the same
+    // read.
     let observed = RefCell::new(None);
     let arrived = eventually(|| async {
         let found = directory.get_ticket(&own_kind).await?;
@@ -106,15 +86,9 @@ async fn withdraw_device_toward(
         .await
 }
 
-/// Poll until the grant record of `issuer`'s data toward `peer` is live
-/// and readable on `rt` — the record its classifier serves by, read the
-/// way a product reads it. The scenarios wait on this before shutting the
-/// publishing device down: the record rides best-effort replication, and a
-/// publisher killed before it crossed leaves the surviving device refusing
-/// the audience fail-closed. Nothing is readable before the pair opens, so
-/// this waits for the open pair as well — the connection record alone
-/// leaves the pair's tickets payload-waiting on a device that never opened
-/// it.
+/// Poll until the grant record is readable on `rt` — waited on before the
+/// publisher is shut down, since a publisher killed before the record
+/// crossed leaves the surviving device refusing the audience fail-closed.
 async fn serving_ready(rt: &Runtime, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<bool> {
     eventually(|| async {
         Ok(rt
@@ -126,17 +100,11 @@ async fn serving_ready(rt: &Runtime, identity: PdnId, peer: PdnId, issuer: PdnId
     .await
 }
 
-/// The core reachability property: the grant is published from the phone,
-/// the laptop holds the granted claim by device replication, the phone
-/// goes offline — and the audience still converges, on an update that
-/// exists on the laptop alone.
-///
-/// Denied, existence hidden: the withheld claim never reaches the
-/// audience; its view lists exactly the granted subset.
-///
-/// Denied, outsider: a runtime holding a ticket the laptop itself minted —
-/// the same device that demonstrably serves the audience — obtains
-/// nothing.
+/// The grant is published from the phone, the laptop holds the claim by
+/// device replication, the phone goes offline, and the audience still
+/// converges on an update that exists on the laptop alone. Denied: the
+/// withheld claim never reaches the audience; Carol, aiming a laptop-minted
+/// ticket at the very device that served Bob, obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -169,9 +137,8 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     )
     .await?;
 
-    // Bob converges while the phone is up; the laptop holds the claim by
-    // device replication; the sweep counts the laptop among Bob's contacts
-    // for the granted replica — the route the rest of the scenario stands on.
+    // The sweep counts the laptop among Bob's contacts — the route the rest
+    // stands on.
     assert!(
         claim_arrives(&rt_bob, alice, &email, b"v1").await?,
         "the granted claim did not reach the audience while the phone was up"
@@ -215,8 +182,7 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
         "the audience's view must contain exactly the granted subset"
     );
 
-    // Denied, outsider: Carol aims a laptop-minted ticket at the very
-    // device that just served Bob, and obtains nothing.
+    // Denied, outsider.
     let leaked = rt_laptop.data().share(alice, ShareMode::Read).await?;
     rt_carol.data().import_scoped(alice, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
@@ -232,11 +198,9 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     Ok(())
 }
 
-/// No device is the founder: the grant is published from the *linked*
-/// device, so the ticket names the laptop — and once the laptop goes
-/// offline, the audience converges from the founder through the published
-/// device set, exactly as it converges from a linked sibling when the
-/// founder published.
+/// No device is the founder: the grant is published from the linked device,
+/// so the ticket names the laptop, and the audience converges from the
+/// founder through the published device set.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -247,8 +211,7 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     link_patiently(&rt_laptop, &rt_phone, alice).await?;
     let bob = rt_bob.identity().create().await?;
 
-    // Establishment and the grant both run on the laptop; the phone never
-    // touches the grant surface.
+    // The phone never touches the grant surface.
     let invite = rt_laptop.connections().invite(alice, None).await?;
     establish_patiently(&rt_bob, bob, &rt_laptop, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
@@ -294,24 +257,14 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     Ok(())
 }
 
-/// The connection's metadata pair is pointed at every device that holds
-/// it, not only at the devices its tickets name: the identity's own devices
-/// and the peer's, re-derived whenever a sweep looks at the pair. The half
-/// this identity writes is the one that matters — a ticket names the
-/// devices of the side that minted it, so without this derivation a grant
-/// published from a device that is then lost stays on the audience's device
-/// alone, out of reach of the issuer's surviving devices, which then refuse
-/// that audience fail-closed.
-///
-/// The derivation is asserted here rather than the recovery it exists for:
-/// the engine's own recorded peers rescue that recovery often enough that a
-/// scenario passes without the derivation most of the time (about 97 runs
-/// in 100 — `a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audience`
-/// in `restart_recovery.rs` is that scenario).
-///
-/// Denied: a live node that is a device of neither side never enters the
-/// set, so what the derivation adds is the pair's holders rather than
-/// whatever is reachable.
+/// The connection's metadata pair is pointed at every device that holds it
+/// — the identity's own devices and the peer's, re-derived per sweep — not
+/// only at the devices its tickets name. The derivation is asserted rather
+/// than the recovery it exists for: the engine's own recorded peers rescue
+/// that recovery about 97 runs in 100
+/// (`a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audience`
+/// in `restart_recovery.rs`). Denied: a node that is a device of neither
+/// side never enters the set.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -332,8 +285,7 @@ async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<
     let bob_id = rt_bob.node_id();
     let stranger_id = rt_stranger.node_id();
 
-    // The laptop opens the pair on its own sweep, the way a device reaches a
-    // connection established elsewhere, and the sweeps that follow take in
+    // The laptop opens the pair on its own sweep, and later sweeps take in
     // the device records as they replicate.
     assert!(
         eventually(|| async {
@@ -351,12 +303,9 @@ async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<
     );
 
     // Denied, tighter than the stranger: the device that minted a half is
-    // not a contact of it either. The ticket it minted names itself, and a
-    // set that kept that entry has the node dialing itself once per
-    // reconcile — refused by the endpoint, and never the contact the
-    // derivation exists to add. Read on bob, the side whose own half its own
-    // ticket names; the positive beside it keeps the denial from holding on
-    // a set that is merely empty.
+    // not a contact of it — a set that kept the ticket's own entry has the
+    // node dialing itself once per reconcile. The positive beside it keeps
+    // the denial from holding on a merely empty set.
     assert!(
         eventually(|| async {
             let (own, _peer) = rt_bob.connections().pair_contacts(bob, alice).await?;
@@ -378,10 +327,8 @@ async fn the_metadata_pair_is_pointed_at_every_device_that_holds_it() -> Result<
     Ok(())
 }
 
-/// A device linked *after* the grant was published and consumed is dialed
-/// too: its record replicates into the pair, the sweep counts it among the
-/// audience replica's contacts — no re-import, no new grant — and the
-/// audience converges from it once the publisher is gone.
+/// A device linked after the grant was consumed is dialed too: no
+/// re-import, no new grant.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -409,9 +356,7 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
         "the granted claim did not reach the audience"
     );
 
-    // Only now does the laptop join the identity. Its device record
-    // replicates into the pair, and the audience's replica comes to count
-    // it among its contacts — without a re-import and without a new grant.
+    // Only now does the laptop join; its record replicates into the pair.
     link_patiently(&rt_laptop, &rt_phone, alice).await?;
     let laptop_id = rt_laptop.node_id();
     assert!(
@@ -427,8 +372,7 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
         "the grant record never reached the device that must serve by it"
     );
 
-    // And it serves: the publisher goes offline, the update exists on the
-    // late-linked device alone, the audience converges.
+    // And it serves.
     rt_phone.shutdown().await?;
     rt_laptop.data().write(alice, &email, b"v2").await?;
     assert!(
@@ -441,11 +385,9 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
     Ok(())
 }
 
-/// A withdrawn device leaves the contact set: the issuer tombstones the
-/// laptop's published record in the pair, and the next sweep's re-derived
-/// set lacks it — while the still-published phone stays. The withdrawal is
-/// written through the pair's own store from a linked probe, the same act
-/// any device of the issuer performs.
+/// A withdrawn device leaves the contact set on the next sweep, while the
+/// still-published phone stays. The withdrawal is written through the
+/// pair's own store from a linked probe.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -469,8 +411,7 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
     )
     .await?;
 
-    // Both issuer devices are contacts of the audience replica first — the
-    // state the withdrawal must undo, not a set that never formed.
+    // Both are contacts first — the state the withdrawal must undo.
     let phone_id = rt_phone.node_id();
     let laptop_id = rt_laptop.node_id();
     assert!(
@@ -482,13 +423,11 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
         "both issuer devices must be contacts before the withdrawal"
     );
 
-    // The withdrawal: an alice device tombstones the laptop's published
-    // record in the pair's own store.
+    // The withdrawal.
     let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
     withdraw_device_toward(&probe_node, &probe_dir, bob, laptop_id).await?;
 
-    // The re-derived set drops the withdrawn device and keeps the
-    // published one.
+    // Dropped from the re-derived set; the published one stays.
     assert!(
         eventually(|| async {
             Ok(!contact_present(&rt_bob, alice, laptop_id).await?
@@ -505,9 +444,8 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
     Ok(())
 }
 
-/// Two counterparties on one audience node: each granted replica keeps its
-/// own contact set — a device the first peer publishes becomes a contact
-/// of that peer's replica only, and never of the second peer's.
+/// Two counterparties on one audience node: a device the first peer
+/// publishes becomes a contact of that peer's replica only.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_granted_replica_keeps_its_own_contact_set() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -556,9 +494,7 @@ async fn each_granted_replica_keeps_its_own_contact_set() -> Result<()> {
         "the new device never entered its own peer's replica contacts"
     );
 
-    // Scoped to the pair the grant came through: after the positive above,
-    // the other peer's replica still knows nothing of it — and neither
-    // replica names the other peer's device.
+    // Scoped to the pair the grant came through.
     assert!(
         !contact_present(&rt_bob, carol, laptop_id).await?,
         "another counterparty's device must not enter this replica's contacts"
@@ -572,16 +508,11 @@ async fn each_granted_replica_keeps_its_own_contact_set() -> Result<()> {
     Ok(())
 }
 
-/// Several identities on one node: two hosted audiences granted by the
-/// same issuer bind one replica, so its contact set is the union of both
-/// audiences' siblings — one binder's sweep must not strip the other
-/// identity's devices from it. The union's boundary is asserted with it: a
-/// third identity hosted on the same node holds no grant of this issuer,
-/// and its device stays out of the set. That is the tightest unauthorized
-/// party for a set keyed by issuer, per
-/// `code-practices/access-control-tests.md` — a co-hosted identity, not an
-/// outsider — and the only thing keeping it out is that the siblings come
-/// from the pairs whose grant binds this issuer.
+/// Two hosted audiences granted by one issuer bind one replica, so its
+/// contact set is the union of both audiences' siblings — one binder's
+/// sweep must not strip the other's devices. The boundary: a third
+/// co-hosted identity holding no grant of this issuer (the tightest
+/// unauthorized party for a set keyed by issuer) stays out.
 #[tokio::test(flavor = "multi_thread")]
 async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
     let rt_x = spawn_runtime().await?;
@@ -591,9 +522,7 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
     let rt_sibling_of_z = spawn_runtime().await?;
     let rt_sibling_of_w = spawn_runtime().await?;
 
-    // One node hosts both audience identities; each has a sibling device;
-    // the issuer has a second device of its own. W is hosted beside them
-    // and is granted nothing — the negative below is about its sibling.
+    // W is hosted beside them and granted nothing.
     let x = rt_x.identity().create().await?;
     let y = rt_shared.identity().create().await?;
     let z = rt_shared.identity().create().await?;
@@ -630,10 +559,8 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
     .await?;
     assert!(claim_arrives(&rt_shared, x, &email, b"v1").await?);
 
-    // The one replica's contact set holds the issuer's devices — the
-    // non-publishing one included — and *both* audiences' siblings at
-    // once, and keeps holding them: with a per-identity set, each binder's
-    // sweep would strip the other identity's sibling.
+    // Both audiences' siblings at once, and kept: a per-identity set would
+    // let each binder's sweep strip the other's.
     let second_of_x = rt_second_of_x.node_id();
     let sibling_of_y = rt_sibling_of_y.node_id();
     let sibling_of_z = rt_sibling_of_z.node_id();
@@ -647,10 +574,7 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
         "the shared replica's contacts must union the issuer's devices and both audiences' siblings"
     );
 
-    // The boundary of that union, probed once the sweeps the positive
-    // waited for have run: W is hosted on the same node and holds no grant
-    // of X, so its sibling is no route to this replica and never enters the
-    // set.
+    // The boundary, probed after the sweeps the positive waited for.
     assert!(
         !contact_present(&rt_shared, x, rt_sibling_of_w.node_id()).await?,
         "a co-hosted identity with no grant of this issuer must not lend its devices to the replica"
@@ -665,17 +589,11 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
     Ok(())
 }
 
-/// The issuer half of the same union: two audiences of one issuer hosted
-/// together share one replica, and its issuer devices are what *every*
-/// bound pair publishes, not what the pair that swept last says alone. The
-/// pairs replicate independently, so one pair's word taken as the whole set
-/// would strip a device the issuer never withdrew.
-///
-/// Asserted where the two readings differ: the record is tombstoned in one
-/// audience's pair only, and the device stays a contact because the other
-/// audience's pair still publishes it. The control against a positive that
-/// merely says "nothing ever leaves" is the second withdrawal — once no
-/// bound pair publishes the device, it goes.
+/// An issuer device leaves the contact set only when no bound pair
+/// publishes it: the replica's issuer devices are what every bound pair
+/// publishes, not what the last-swept pair says alone, since pairs
+/// replicate independently. Asserted where the readings differ: tombstoned
+/// in one pair only, the device stays; withdrawn in both, it goes.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -721,13 +639,9 @@ async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Resul
         "the issuer's other device must be a contact before the withdrawals"
     );
 
-    // Withdrawn in the pair toward Y alone: the pair toward Z still
-    // publishes it, so it stays. Ordered by the two readings whose
-    // divergence is the scenario's subject: first Y's pair demonstrably
-    // stops publishing the device — the tombstone reached this node — then
-    // a sweep of exactly that pair is run against the tombstoned state, and
-    // only then the union is asserted to still carry the device. Without
-    // the forced sweep the assertion would race the event-driven one and
+    // Withdrawn toward Y alone: Y's pair demonstrably stops publishing the
+    // device, a sweep of exactly that pair runs against the tombstoned
+    // state, and only then is the union asserted — otherwise the assertion
     // could read a set derived before the tombstone.
     let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
     withdraw_device_toward(&probe_node, &probe_dir, y, laptop_id).await?;
@@ -763,11 +677,9 @@ async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Resul
     Ok(())
 }
 
-/// Capabilities move: a grant is withdrawn — the binder forgets the
-/// namespace — and granted anew over the same claim; the re-import derives
+/// Withdrawn, then granted anew over the same claim: the re-import derives
 /// a fresh contact set, so the audience converges from the issuer's other
-/// device again once the publisher is gone. The path worth testing is this
-/// second grant, not the first.
+/// device again. The second grant is the path under test.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -792,8 +704,7 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     .await?;
     assert!(claim_arrives(&rt_bob, alice, &email, b"v1").await?);
 
-    // Withdrawal: the binder forgets what it imported — the issuer
-    // resolves to nothing on the audience node again.
+    // Withdrawal: the binder forgets; the issuer resolves to nothing.
     rt_phone
         .connections()
         .withdraw_grant(alice, bob, alice)
@@ -807,8 +718,7 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
         "the withdrawn namespace was still bound on the audience"
     );
 
-    // The re-grant over the same claim: the binder imports afresh and the
-    // sweep re-derives the contacts, the issuer's other device included.
+    // The re-grant: fresh import, contacts re-derived.
     granted_patiently(
         &rt_phone,
         alice,
@@ -832,8 +742,7 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
         "the re-grant record never reached the device that must serve by it"
     );
 
-    // And the rebuilt route serves: publisher off, update on the laptop
-    // alone, the audience converges.
+    // The rebuilt route serves.
     rt_phone.shutdown().await?;
     rt_laptop.data().write(alice, &email, b"v2").await?;
     assert!(
@@ -846,15 +755,11 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     Ok(())
 }
 
-/// One replica, two hosted audiences (ADR-0009): withdrawing the grant
-/// toward one of them must not take the bytes from the other. The read
-/// below is ordered by the binder's own record (`grant_bound`), not by
-/// time — the unbind demonstrably ran before the survival is asserted. The
-/// surviving audience then also receives a fresh write: the replica is not
-/// merely present but still syncing. The denial half, per
-/// `code-practices/access-control-tests.md`, is the second withdrawal: the
-/// node that held two grants and lost both ends where an outsider starts —
-/// the issuer resolves to nothing, no bytes.
+/// One replica, two hosted audiences (ADR-0009): withdrawing toward one
+/// must not take the bytes from the other. Ordered by the binder's own
+/// record (`grant_bound`), not by time, and the survivor also receives a
+/// fresh write. The denial is the second withdrawal: the node ends where an
+/// outsider starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -900,8 +805,7 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
         "both grants must be bound before the withdrawal"
     );
 
-    // Withdrawn toward Y alone, asserted only once Y's binder has
-    // demonstrably unbound.
+    // Asserted only once Y's binder has demonstrably unbound.
     rt_phone
         .connections()
         .withdraw_grant(alice, y, alice)
@@ -946,14 +850,10 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
     Ok(())
 }
 
-/// The unbind decision is grounded in the durable grant records, not in
-/// the binders' in-memory bookkeeping — which is exactly what a device
-/// restart clears and rebuilds sweep by sweep (operating-conditions: the
-/// device restarts). The record of Z's import is dropped by hand, the
-/// restart-shaped arrangement, while Z's grant sits live and readable in
-/// its pair; the withdrawal toward Y must find that grant and spare the
-/// replica. A decision read off the bookkeeping alone counts zero holders
-/// here and destroys it.
+/// The unbind decision is grounded in the durable grant records, not the
+/// binders' bookkeeping, which a restart clears. Z's import record is
+/// dropped by hand while Z's grant sits live in its pair; the withdrawal
+/// toward Y must find it and spare the replica.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawal_counts_grants_not_bookkeeping() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -997,11 +897,9 @@ async fn a_withdrawal_counts_grants_not_bookkeeping() -> Result<()> {
         "both grants must be bound before the arrangement"
     );
 
-    // The in-memory record a restart clears: the replica and Z's durable
-    // grant record both stand, the binder's memo of the import does not.
-    // Z's binder sweeps only on its own pair's changes, and the withdrawal
-    // below lands in Y's pair — nothing rebuilds the memo before the
-    // decision it is cleared for.
+    // The in-memory record a restart clears. Z's binder sweeps only on its
+    // own pair's changes, and the withdrawal lands in Y's pair, so nothing
+    // rebuilds the memo before the decision.
     rt_shared
         .connections()
         .clear_grant_memo(z, alice, alice)
@@ -1026,14 +924,11 @@ async fn a_withdrawal_counts_grants_not_bookkeeping() -> Result<()> {
     Ok(())
 }
 
-/// The binder's memo is an optimization, the registry the arbiter: a
-/// replica forgotten while the memo still names its import re-imports on
-/// the pair's next sweep instead of being skipped forever. The desync is
-/// hand-made (`forget_namespace` under `test-util`) as this test's subject
-/// per `code-practices/product-path-arrangement` — the product paths keep
-/// memo and registry together — and the recovery is asserted through the
-/// product surface: the issuer republishes the grant, the sweep
-/// re-imports, the entries return.
+/// A replica forgotten while the binder's memo still names its import
+/// re-imports on the pair's next sweep: the memo is an optimization, the
+/// registry the arbiter. The desync is hand-made (`forget_namespace`,
+/// `test-util`) as this test's subject; the recovery is asserted through
+/// the product surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -1065,8 +960,8 @@ async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
         "the memo must still name the import for the desync to be the one under test"
     );
 
-    // The pair's next sweep re-imports — caused here by the issuer
-    // republishing the same grant; any change of the pair's replica does.
+    // The next sweep re-imports — caused by the issuer republishing the same
+    // grant.
     granted_patiently(
         &rt_phone,
         alice,
