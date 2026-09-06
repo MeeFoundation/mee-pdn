@@ -26,7 +26,7 @@ Refresh the list by fetching upstream and reading `git log <bottom hash>..upstre
 
 ## 2026-07-15 · `b53c317` · Franz Heinzmann · fix: don't abort receive loop on invalid message (#110)
 
-**Not yet handled; applies.** `receive_loop` in `src/engine/gossip.rs` still decodes a gossip message with `?`, so one undecodable message ends the receive loop for that namespace, which is then logged and dropped from the active set. The swarm here is content-free, so what a peer can silence this way is `ContentReady` and `SyncReport` delivery, not entry flow — entries move over reconciliation. Skipping the message the way upstream does is the fix.
+**Adapted** on 2026-09-06. `receive_loop` in `src/engine/gossip.rs` decoded a gossip message with `?`, so one undecodable message ended the receive loop for that namespace, which was then logged and dropped from the active set; it now skips the message with a debug line, as upstream does. The swarm here is content-free, so what a peer could silence this way was `ContentReady` and `SyncReport` delivery, not entry flow — entries move over reconciliation. The regression test is `sync_continues_after_invalid_gossip_message` in `tests/sync.rs`, with one rearrangement: upstream sleeps 2 seconds so the malformed message lands before the next write, which proves nothing on a slow run; here the sender leaves the topic right after the message, and the subscriber's `NeighborDown` for it — ordered behind the message on the same connection — is asserted before the write.
 
 ## 2026-06-15 · `091e8ca` · dignifiedquire · chore: Release iroh-docs version 0.101.0
 
