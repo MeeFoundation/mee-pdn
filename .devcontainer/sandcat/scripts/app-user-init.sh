@@ -108,8 +108,12 @@ if command -v codex >/dev/null 2>&1 \
     printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null
 fi
 
-# Ensure WASM targets are available (volume mount overwrites Dockerfile results).
-rustup target add wasm32-unknown-unknown wasm32-wasip1 2>/dev/null || true
+# The toolchain the workspace pins (rust-toolchain.toml: channel, components,
+# targets), on every start since the home volume outlives the image. rustup's
+# own binary rather than the mise shim: the shim fixes the toolchain through
+# RUSTUP_TOOLCHAIN, and rustup then reads nothing from the file.
+(cd /workspaces/mee-pdn && "$HOME/.cargo/bin/rustup" toolchain install) \
+    || echo "rust toolchain install failed; in the container run: just setup-tooling"
 
 # Claude Code and Codex are installed at build time (Dockerfile.app).
 # Background update so it doesn't block startup.

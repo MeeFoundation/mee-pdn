@@ -1,0 +1,44 @@
+# The dependency-tree policy behind `cargo deny check`: RustSec advisories,
+# license compatibility with the project's Apache-2.0, crates.io as the only
+# allowed source. Run by the nightly dependency-audit job and `just audit`.
+
+[graph]
+# The whole lock, feature-gated branches included — the store's wasm and
+# migration features sit outside the default workspace build.
+all-features = true
+
+[advisories]
+# A transitive crate going unmaintained is upstream's to replace; a direct
+# dependency going unmaintained is ours to act on.
+unmaintained = "workspace"
+
+[licenses]
+# Permissive-only. A crate offering a copyleft license beside a permissive
+# one passes through the permissive branch; copyleft-only is refused.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+# MPL-2.0 is file-scoped copyleft: obligations attach to edits of the MPL
+# files themselves, not to the project depending on them.
+exceptions = [
+  { crate = "attohttpc", allow = ["MPL-2.0"] },
+]
+# Workspace crates are unpublished and carry no license field.
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

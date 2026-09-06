@@ -1,6 +1,8 @@
 # The flaky hunt, run without anyone deciding to look: one job per suite —
 # the container stand's, the in-process scenarios', and the store's tests
-# marked flaky.
+# marked flaky. Beside the hunt, the dependency audit — deny.toml's policy
+# over the tree, rechecked nightly because the advisory database moves
+# while the repository stands still.
 #
 # Both cost seconds per test and pass on any given run; the failures worth
 # finding here show up once in tens or hundreds of them, which no pull
@@ -28,19 +30,41 @@ on:
         default: "10"
 
 jobs:
+  # deny.toml's policy over the dependency tree: RustSec advisories, license
+  # compatibility, sources. Nightly rather than per pull request: the
+  # advisory database moves on its own, so a new advisory reddens the next
+  # night instead of whichever pull request happens to run first. The hunts
+  # wait on it — a dependency that just received an advisory is not compiled
+  # and run for hours on a runner first.
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check the tree against deny.toml
+        run: cargo deny check
+
   # The container suite: every test of the HTTP surface is a container test,
   # so this job needs the daemon and builds the stand's image itself.
   container-stand:
+    needs: dependency-audit
     runs-on: ubuntu-latest
     # A hundred iterations of a suite whose own wall clock is seconds, plus
     # one image build from cold. Past this the job is stuck rather than slow.
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Install just + nextest
         uses: taiki-e/install-action@v2
@@ -60,7 +84,7 @@ jobs:
 
       - name: Keep what the failure needs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: stand-hunt
           path: target/tmp/stand-hunt-*
@@ -71,6 +95,7 @@ jobs:
   # same way and in parallel with the stand's: they share nothing, and a
   # public repository's runners are free.
   in-process-scenarios:
+    needs: dependency-audit
     runs-on: ubuntu-latest
     # One pass of the scenario tests is about two minutes on a development
     # machine and slower on a runner's four cores. The repeat count is the
@@ -79,10 +104,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Install just + nextest
         uses: taiki-e/install-action@v2
@@ -108,14 +133,15 @@ jobs:
   # recipe's selection to the store; `ignored-only` then keeps just the marked
   # tests.
   store-flaky:
+    needs: dependency-audit
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Install just + nextest
         uses: taiki-e/install-action@v2

@@ -2,6 +2,7 @@
 name = "pdn-node"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Embeddable node runtime: identity, connections, data, and sync services over data-layer"
 
 [features]

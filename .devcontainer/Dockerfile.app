@@ -55,11 +55,23 @@ RUN mise use -g rust@latest
 
 # END STACKS
 
+# The workspace's rust-toolchain.toml selects the toolchain here as it does for
+# rustup elsewhere; without this mise would hold `rust@latest` over it.
+RUN mise settings add idiomatic_version_file_enable_tools rust
+
 # Install cargo-nextest (pre-built, arch-aware) to ~/.local/bin (on PATH).
 # Required by `just test` / `just stress`. Local machines: `just setup-tooling`.
 RUN ARCH="$(uname -m)"; \
     case "$ARCH" in aarch64|arm64) NX=linux-arm ;; *) NX=linux ;; esac; \
     curl -LsSf "https://get.nexte.st/latest/$NX" | tar zxf - -C /home/vscode/.local/bin
+
+# Install cargo-deny (pre-built, arch-aware) to ~/.local/bin: `just audit`,
+# the same deny.toml check the nightly dependency-audit job runs.
+RUN ARCH="$(uname -m)"; \
+    case "$ARCH" in aarch64|arm64) T=aarch64-unknown-linux-musl ;; *) T=x86_64-unknown-linux-musl ;; esac; \
+    TAG="$(curl -fsSL https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"; \
+    curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$TAG/cargo-deny-$TAG-$T.tar.gz" \
+    | tar zxf - --strip-components=1 -C /home/vscode/.local/bin "cargo-deny-$TAG-$T/cargo-deny"
 
 # Node.js + OpenSpec CLI + Codex CLI (used by the repo-scoped agent skills).
 # Kept outside the sandcat-managed stacks block so `sandcat init --stacks` won't overwrite it.

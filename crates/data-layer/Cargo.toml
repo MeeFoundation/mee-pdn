@@ -2,6 +2,7 @@
 name = "data-layer"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Data layer: capability-gated document sync over our iroh-docs variant"
 
 [features]

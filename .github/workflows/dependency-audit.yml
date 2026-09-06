@@ -1,0 +1,42 @@
+# deny.toml's policy over the dependency tree, run when a change touches the
+# tree itself. The nightly dependency-audit job covers the other direction —
+# the advisory database moving while the tree stands still — so a new
+# advisory reddens the night, not an unrelated pull request. Its own
+# workflow rather than a job in ci.yml: a paths filter is a trigger of the
+# whole workflow, not of one job.
+name: dependency-audit
+
+on:
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "deny.toml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "deny.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check the tree against deny.toml
+        run: cargo deny check

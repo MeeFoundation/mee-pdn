@@ -33,6 +33,8 @@ Each crate carries its own `CLAUDE.md` with its contracts and what is deliberate
 
 Task runner is [just](https://github.com/casey/just) — `just --list` prints every recipe with its doc comment.
 
+`rust-toolchain.toml` pins the compiler, its components and the wasm targets for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
+
 Every test of the HTTP surface is a container test. They carry `#[ignore]`, so
 `just test` on a machine without a daemon or an image stays green and reports
 them skipped; `just test-docker` and the pipeline's own job run them with

@@ -8,7 +8,9 @@
 # The recipe tool is pinned to a release, not a range: it decides how the
 # dependency layer is planned, so a range lets one commit build through two
 # different tools and produce two different images.
-FROM rust:1.93-bookworm AS chef
+# rust-toolchain.toml is outside the build context (.dockerignore), so this
+# tag alone picks the image's compiler: keep its minor with the file's.
+FROM rust:1.98-bookworm AS chef
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /app
 
