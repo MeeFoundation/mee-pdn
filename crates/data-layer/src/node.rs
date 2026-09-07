@@ -1659,7 +1659,7 @@ async fn prepare_storage(
 /// Scenario tests bind `127.0.0.1` (the just recipes set it) to keep test
 /// traffic on loopback; production spawns leave it unset.
 async fn bind_endpoint(secret_key: Option<SecretKey>) -> Result<Endpoint> {
-    let builder = Endpoint::builder(presets::Minimal);
+    let builder = Endpoint::builder(presets::N0);
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,
