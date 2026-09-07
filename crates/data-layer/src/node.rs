@@ -1079,6 +1079,20 @@ impl SyncNode {
             .await
     }
 
+    /// Merge the capability `ticket` carries into a namespace this node
+    /// already holds: a grant widened to write names the replica the grantee
+    /// bound under the read grant before it, and without the merge the
+    /// grantee holds a read replica against a record promising a write. A
+    /// capability the store already holds is no change.
+    pub async fn merge_data_capability(&self, identity: PdnId, ticket: &DocTicket) -> Result<()> {
+        let stack = self.require(identity)?;
+        let _doc = stack
+            .api
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        Ok(())
+    }
+
     /// Refuses a ticket naming a tracked but not data-bound replica: honoring
     /// it would downgrade that store's sync strategy — leaving the gossip
     /// swarm, cutting its live path — on the word of whoever minted the
