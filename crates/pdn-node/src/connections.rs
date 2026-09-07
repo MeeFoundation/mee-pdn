@@ -574,6 +574,12 @@ async fn bind_one_grant(
     let memo_current = state.bound_grants.get(&bound) == Some(&namespace);
     let registered = state.node.data_namespace_of(issuer)?;
     if registered == Some(namespace) {
+        // A grant republished onto the replica already bound carries one new
+        // thing, its capability: a claim widened from read to write travels
+        // as the namespace secret inside the ticket. The import below never
+        // runs for it, so the merge happens here — without it the grantee
+        // holds a read replica against a record promising a write.
+        state.node.merge_data_capability(&ticket).await?;
         if !memo_current {
             state.bound_grants.insert(bound, namespace);
         }

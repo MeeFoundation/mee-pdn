@@ -587,6 +587,17 @@ impl SyncNode {
         self.import_grantee_namespace(issuer, ticket).await
     }
 
+    /// Merge the capability `ticket` carries into a namespace this node
+    /// already holds. A grant republished with write names the replica the
+    /// grantee bound under the read grant before it, and the capability is
+    /// then all that is new: without the merge the grantee holds a read
+    /// replica against a record that promises a write. A capability the
+    /// store already holds is no change.
+    pub async fn merge_data_capability(&self, ticket: &DocTicket) -> Result<()> {
+        let _doc = self.docs.import_namespace(ticket.capability.clone()).await?;
+        Ok(())
+    }
+
     /// The one grantee import behind
     /// [`import_namespace_granted`](Self::import_namespace_granted) and
     /// [`import_namespace_scoped`](Self::import_namespace_scoped):

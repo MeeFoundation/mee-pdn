@@ -356,3 +356,87 @@ async fn a_retraction_does_not_flap_back_from_a_sibling() -> Result<()> {
     rt_laptop.shutdown().await?;
     Ok(())
 }
+
+/// The widening half of the gate: a claim republished with write reaches a
+/// grantee that already holds the namespace. Bob grants Alice read on both
+/// claims, then republishes with write on `contact/phone`. The grant names
+/// the replica Alice's binder already bound, so the capability inside the
+/// ticket is the only new thing in it — and the namespace secret is what
+/// lets Alice sign an entry at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn widening_a_grant_to_write_reaches_a_grantee_already_bound() -> Result<()> {
+    let rt_bob = spawn_runtime().await?;
+    let rt_alice = spawn_runtime().await?;
+    let bob = rt_bob.identity().create().await?;
+    let alice = rt_alice.identity().create().await?;
+
+    let invite = rt_bob.connections().invite(bob, None).await?;
+    establish_patiently(&rt_alice, alice, &rt_bob, bob, invite).await?;
+
+    let email = EntryPath::new("contact/email")?;
+    let phone = EntryPath::new("contact/phone")?;
+    rt_bob.data().write(bob, &email, b"bob@example.org").await?;
+    rt_bob.data().write(bob, &phone, b"+1-555-0100").await?;
+
+    let read_only = |write_phone: bool| {
+        let mut claims = common::claims_on(bob, &email, false);
+        claims.push(GrantedClaim {
+            claim: pdn_node::claim_id_of(&bob, &phone),
+            write: write_phone,
+        });
+        claims
+    };
+    rt_bob
+        .connections()
+        .publish_grant(bob, alice, bob, read_only(false))
+        .await?;
+    assert!(
+        reads_value(&rt_alice, bob, &phone, b"+1-555-0100").await?,
+        "the read grant did not reach Alice"
+    );
+
+    // The same grant republished, one claim widened to write.
+    rt_bob
+        .connections()
+        .publish_grant(bob, alice, bob, read_only(true))
+        .await?;
+
+    // Allowed: Alice writes the widened claim once the record and the
+    // capability behind it arrive, and Bob converges on her value.
+    assert!(
+        eventually(|| async {
+            Ok(rt_alice
+                .data()
+                .write(bob, &phone, b"+7-999-0001")
+                .await
+                .is_ok())
+        })
+        .await?,
+        "the widened claim never accepted a write at Alice"
+    );
+    assert!(
+        reads_value(&rt_bob, bob, &phone, b"+7-999-0001").await?,
+        "the widened claim did not round-trip to the issuer"
+    );
+
+    // Denied: the claim left read-only is still refused at the surface, and
+    // Bob's value stands.
+    let refused = rt_alice
+        .data()
+        .write(bob, &email, b"alice-overwrite")
+        .await
+        .expect_err("a write at the claim left read-only must be refused");
+    assert!(
+        refused.downcast_ref::<WriteNotGranted>().is_some(),
+        "the courtesy refusal must be WriteNotGranted, got: {refused:?}"
+    );
+    assert_eq!(
+        rt_bob.data().read(bob, &email).await?.as_deref(),
+        Some(&b"bob@example.org"[..]),
+        "the refused write must never reach the issuer"
+    );
+
+    rt_bob.shutdown().await?;
+    rt_alice.shutdown().await?;
+    Ok(())
+}
