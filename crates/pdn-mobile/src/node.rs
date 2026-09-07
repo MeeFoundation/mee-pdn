@@ -60,11 +60,31 @@ pub struct PdnNode {
     state: Arc<Mutex<State>>,
 }
 
+/// Routes the runtime's diagnostics to the platform's log, once.
+///
+/// What the error table calls an unrecognized failure carries no cause across
+/// the boundary — the cause chain stays in the log — so without this the one
+/// refusal a person cannot act on is also the one nobody can diagnose. An
+/// embedder that installed a subscriber of its own keeps it.
+fn install_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Err(err) = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init()
+        {
+            tracing::debug!("a subscriber is installed already: {err}");
+        }
+    });
+}
+
 #[uniffi::export]
 impl PdnNode {
     /// A handle with no node behind it yet.
     #[uniffi::constructor]
     pub fn new() -> Result<Arc<Self>, PdnError> {
+        install_log();
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

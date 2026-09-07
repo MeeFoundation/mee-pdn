@@ -38,6 +38,10 @@ thiserror = "2"
 # caller brings none.
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing = { workspace = true }
+# The unrecognized failure carries no cause across the binding boundary: the
+# cause chain stays in the log, which is nothing at all on a phone unless
+# something routes it to the platform's own.
+tracing-subscriber = "0.3"
 uniffi = { version = "0.32", default-features = false }
 
 [dev-dependencies]
