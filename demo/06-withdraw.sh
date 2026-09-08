@@ -1,47 +1,30 @@
 #!/bin/bash
-# Act 6. The phone withdrew its grant, then published it again.
-# On the phone: Withdraw this grant first, then Grant read-only again.
-source "$(dirname "$0")/lib.sh"; need_node
-MINE=$(mine); PEER=$(peer)
-path=${1:-name}
+# Act 6. A withdrawal closes what a grant opened, in both directions, and the
+# same claim granted again reopens it.
+# On the phone: What I share with this peer -> Withdraw this grant, then
+# Grant read-only again. Bob's withdrawal below is answered on the phone's
+# screen, which says he no longer shares it rather than showing a fault.
+source "$(dirname "$0")/lib.sh"; need_nodes
+A=$(ident alice); B=$(ident bob)
 
-# Every stage says what was read, in words. A raw body and a status code are
-# evidence, not a conclusion, and on a stage nobody reads JSON out loud.
-read_value() { curl -s -w '|%{http_code}' "$MAC/debug/data/$PEER/$path"; }
+echo "=== withdraw on the phone; Bob stops knowing Alice as an issuer ==="
+pdnwait 'curl -s $BOB/debug/identities/$B/grants/$A | jq -ce "select((.grants|length)==0)"' || exit 1
+curl -s -w ' [HTTP %{http_code}]\n' "$BOB/debug/data/$A/contact/email"
+echo "409 is the namespace unbound: not an empty answer, and not a fault —"
+echo "his node stopped knowing that issuer altogether."
+echo "Alice's own read of the same entry is untouched:"
+curl -s "$ALICE/debug/data/$A/contact/email"; echo
 
-echo "=== before anything: what this node holds ==="
-n=$(curl -s "$MAC/debug/identities/$MINE/grants/$PEER" | jq '.grants|length')
-out=$(read_value); code=${out##*|}; body=${out%|*}
-echo "read: $n grant(s) from the phone, and $path answers HTTP $code"
-[ "$code" = "200" ] && echo "read: the value is \"$body\""
-
-echo
-echo "withdraw the grant on the phone now"
-if pdnwait 'curl -s $MAC/debug/identities/$MINE/grants/$PEER | jq -ce "select((.grants|length)==0)"' >/dev/null; then
-  out=$(read_value); code=${out##*|}
-  echo "read: no grant is published toward this node any more, and $path answers HTTP $code"
-  if [ "$code" = "409" ]; then
-    echo "read: 409 is the namespace unbound — exactly what this node answered before the two ever met"
-  else
-    echo "read: expected 409 (namespace unbound); got $code"
-  fi
-else
-  echo "read: the grant is still here — either it was not withdrawn, or nothing is reaching this node"
-  exit 1
-fi
+echo "=== grant the same claim again on the phone; the access reopens ==="
+pdnwait 'curl -sf $BOB/debug/data/$A/contact/email' && echo "^ read again by Bob"
 
 echo
-echo "now grant it again on the phone"
-if value=$(pdnwait "curl -sf \$MAC/debug/data/\$PEER/$path"); then
-  echo "read: the value is back, \"$value\""
-  echo
-  echo "A withdrawal closes further delivery and does not recall what was already"
-  echo "delivered. Granting again opens the same claim back up."
-else
-  echo "read: nothing came back within 48 seconds."
-  echo "Either the grant was not published again, or the two nodes are not talking."
-  echo "The log tells them apart — a run of these means the transport is down:"
-  grep -c "sync failed" "$NODE_LOG" | sed 's/^/  sync failures so far: /'
-  tail -3 "$NODE_LOG" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-160 | sed 's/^/  /'
-  exit 1
-fi
+echo "=== now the other direction: Bob withdraws his grant to Alice ==="
+curl -s -X DELETE "$BOB/debug/identities/$B/grants/$A/$B" -w 'HTTP %{http_code}\n'
+echo "watch the phone: the claims leave the card with a line saying this peer"
+echo "no longer shares them — plain text, no error banner."
+echo "press enter to give it back"; read -r _
+curl -s -X POST "$BOB/debug/identities/$B/grants/$A" \
+  -H 'content-type: application/json' \
+  -d "{\"issuer\":\"$B\",\"claims\":[{\"path\":\"contact/email\",\"write\":false},{\"path\":\"notes/shared\",\"write\":true}]}" \
+  -w 'HTTP %{http_code}\n'

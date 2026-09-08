@@ -1,295 +1,162 @@
-# Demonstration run-sheet: the commands in order
+# Demonstration run-sheet: the acts in order
 
-Two nodes: the phone with the application, and the laptop's node. The full command reference is `demo-commands.md`; this file is only the sequence performed live.
+The cast is 4 nodes, one of them a phone. **Alice** lives on 2 devices: a node on a laptop, where she creates her identity and writes her first entries, and a phone that joins that same identity through the linking ceremony. **Bob** is a separate node on a laptop with an identity of his own. **Carol** is a fourth node, which holds nothing of Alice's and is here to show it.
 
-The presenter runs the command blocks: they are the other side of the demonstration — the phone shows the interface, the laptop stands in for a second device. Section 0 and the pre-flight are done before the audience arrives; the blocks of acts 1 to 9 are run in front of them, as the story goes.
+The phone is the only screen in the staging. Bob's and Carol's nodes are `pdn-node-http` processes on the presenter's machine, and their terminal output is the counterparty's behaviour, never a stand-in for what a person would see. Every act whose subject is what a person sees happens on the phone, which is why granting is shown in both directions.
 
-All of it is packed into scripts under `demo/` — one per act, `demo/00-start.sh`, `demo/01-nodes.sh` and so on; `demo/README.md` lists them and says what each does (in Russian). Below are the same commands loose, for when something has to be done by hand.
+Every command is a script in `demo/` — one per act, `demo/00-start.sh`, `demo/01-alice.sh` and so on; `demo/README.md` lists them. The waiting is built in: where a value crosses the network the script waits for it rather than showing the audience an empty screen.
 
-Every block is copy-and-paste whole. The waiting is built in: where something travels over the network, the command waits for it rather than showing the audience an empty answer.
-
-The values of the current run are filled in. After restarting the node on a different directory, replace `MINE` with whatever `POST /debug/identities` returns.
-
-## 0. Preamble — once before the start
+## 0. Before the audience
 
 ```sh
 cd ~/vsprojects/mee/mee-pdn
-export PDN=$PWD
-export MAC=http://127.0.0.1:3011
-export MINE=dc9521aa34d45d9c7be6b702e6eb7c52b0afd7b6ce2636901ec64722540a1cff
-export DEV=5A613C8A-3804-5F62-A945-C7D8D934D088
+demo/00-start.sh      # 3 nodes, an identity for each, a second identity for Alice
+demo/preflight.sh     # the tools, the QR path, a relay address on every node
 ```
 
-Three functions for the whole run. The ceremony code the phone reads is not JSON but base64url without padding over it — that is how the `pdn-mobile` facade mints it and how it reads one back — whereas the HTTP debug surface returns and accepts bare JSON. The third function waits for what travels over the network and prints it the moment it arrives.
+A second tab, where the ceremonies and the sync are visible:
 
 ```sh
-# JSON in -> a QR on the screen, in the form the phone expects
-pdnqr()  { base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=' | qrencode -l L -s 6 -o "$1" && open "$1"; }
-# a code taken off the phone's screen -> the JSON /debug accepts
-pdnraw() { python3 -c "import base64,sys;d=sys.stdin.read().strip();sys.stdout.write(base64.urlsafe_b64decode(d+'='*(-len(d)%4)).decode())"; }
-# wait up to 48 seconds for a command to print something
-pdnwait() { for i in $(seq 1 24); do out=$(eval "$1") && [ -n "$out" ] && { echo "$out"; return 0; }; sleep 2; done; echo "nothing arrived within 48 seconds"; return 1; }
+tail -f tmp/pdn-alice.log
 ```
 
-Bring the laptop's node up. The directory `tmp/pdn-mac-node2` survives a restart: the identity and the connections come back the same. For a run from a clean slate, do the "A full reset between runs" section first.
+A third, to show what the phone says. The command launches the application itself and holds its stderr; `devicectl` offers no way to attach to one already running:
 
 ```sh
-# The first block is required: without $PDN and $MAC the next line starts the wrong path
-[ -x "$PDN/target/debug/pdn-node-http" ] || cargo build -p pdn-node-http
-# The previous node has to release the directory lock, and that takes more than a second
-pkill -f 'target/debug/pdn-node-http'
-for i in $(seq 1 15); do pgrep -f 'target/debug/pdn-node-http' >/dev/null || break; sleep 1; done
-PDN_DATA_DIR=$PDN/tmp/pdn-mac-node2 PDN_DEBUG=1 \
-  nohup $PDN/target/debug/pdn-node-http > $PDN/tmp/pdn-mac-node2.log 2>&1 & disown
-for i in $(seq 1 20); do curl -sf $MAC/ready >/dev/null && break; sleep 1; done
-curl -sf $MAC/debug/status || { echo "the node did not come up, here is its log:"; tail -20 $PDN/tmp/pdn-mac-node2.log; }
+demo/phone-log.sh
 ```
 
-If `debug/status` names no identity, the directory is clean and one has to be minted:
-
-```sh
-export MINE=$(curl -s -X POST $MAC/debug/identities | jq -r .identity)
-echo "the laptop's identity: $MINE"
-```
-
-A second tab — the ceremony and the sync are visible there:
-
-```sh
-tail -f $PDN/tmp/pdn-mac-node2.log
-```
-
-A third one, to show what the phone says. The command launches the application itself and holds its stderr; `devicectl` has no way to attach to one already running:
-
-```sh
-xcrun devicectl device process launch --console --device $DEV org.mee.pdn.app
-```
+By this point the phone is a clean install: no node up, no identity. `demo/reset.sh` puts it in that state.
 
 ---
 
-## Act 1. Two independent nodes
+## Act 1. Alice starts on her laptop
 
-**Phone.** Open the application → **Bring the node up** → **Create an identity**. Show the audience the node id on the card.
+**Presenter.** `demo/01-alice.sh` — the node id, Alice's 2 identities, 3 entries under the one her phone will join, and the same path under the other.
 
-**Laptop.** Its own node id and its own identities:
+**Phone.** Nothing. It has joined nothing yet, and that is worth showing: the identity exists before the device, not the other way round.
 
-```sh
-curl -s $MAC/debug/status
-curl -s $MAC/debug/identities | jq
-```
-
-The point to say out loud: there are two nodes, no server between them, and each holds its own keys.
+Said out loud: 2 identities on one node are 2 lives, not 2 accounts. The same path under each holds a different value, and neither knows anything of the other.
 
 ---
 
-## Act 2. Your data stays with you
+## Act 2. Alice joins her phone
 
-**Phone.** **My entries** → path `contact/email`, value `anton@example.com` → **Write**. Then **Read it** under the row.
+**Presenter.** `demo/02-link-phone.sh` — waits for a home relay, mints the linking payload and draws it as a code that lives 180 seconds.
 
-**Laptop.** The same, as its own identity:
+**Phone.** **Bring the node up** → **Read a code** → the act **A device joining an identity** → point it at the laptop's screen.
 
-```sh
-curl -s -X PUT $MAC/debug/data/$MINE/contact/email --data-binary 'laptop@example.com'
-curl -s $MAC/debug/data/$MINE | jq
-```
+**What is visible afterwards.** The phone hosts Alice's identity, and only that one — her other identity does not appear on it. **My entries** already lists `contact/email`, `contact/phone` and `notes/private`, none of which were written on this phone.
 
-The point to say out loud: with no connection between them, neither node knows anything of the other's data — it does not even know that such an issuer exists.
+Said out loud: a device belongs to an identity, not to a person. The catch-up takes the state whole; a failed link rolls back and leaves no half.
 
----
-
-## Act 3. The ceremony
-
-First wait for the laptop's endpoint to settle and take a home relay: for the first seconds after the node comes up a code carries local addresses only, and reachability beyond one network is lost.
-
-```sh
-pdnwait 'curl -s -X POST "$MAC/debug/identities/$MINE/invite?lifetime_secs=10" | jq -re ".inviter_addr.addrs[]|select(.Relay)|.Relay"'
-```
-
-**Mint an invite and show it as a QR:**
-
-```sh
-curl -s -X POST "$MAC/debug/identities/$MINE/invite?lifetime_secs=180" > tmp/invite.json
-jq '.inviter_addr.addrs' tmp/invite.json
-pdnqr tmp/invite.png < tmp/invite.json
-```
-
-**Phone.** **Connections** → **Read a code** → the act **Accepting an invitation to connect** → point it at the laptop's screen. While the ceremony runs the screen says "Running the ceremony. It ends within 30 seconds either way".
-
-**Both sides see each other.** Take the phone's identity into a variable — every act below needs it:
-
-```sh
-export PEER=$(pdnwait 'curl -s $MAC/debug/identities/$MINE/connections | jq -re ".connections[0]"')
-echo "the phone: $PEER"
-```
-
-The point to say out loud: a connection proves that two devices held one secret, and nothing more. Not who the person is, and not that they told the truth.
+The refusal beside it: a code read under the wrong act — as an invitation to connect — is refused by the runtime, and the phone shows the refusal as what it is.
 
 ---
 
-## Act 4. The phone shares with the laptop
+## Act 3. Bob connects to Alice
 
-**Phone.** **Connections** → the laptop's row → the card **Share claims with this peer** → tap a path → **Grant read-only**. The path lights up and appears under "What I share with this peer".
+**Presenter.** `demo/03-connect-bob.sh` — Bob's node mints an invite and draws it as a code.
 
-**The laptop waits for the grant, then reads the value.** About ten seconds pass between the tap on the phone and the value on the laptop: the grant record travels first, and the payload separately after it.
+**Phone.** **Connections** → **Read a code** → the act **Accepting an invitation to connect** → point it at the screen. While the ceremony runs the screen says "Running the ceremony. It ends within 30 seconds either way".
 
-```sh
-pdnwait 'curl -s $MAC/debug/identities/$MINE/grants/$PEER | jq -ce "select(.grants|length>0)"' | jq
-pdnwait 'curl -sf $MAC/debug/data/$PEER/name'
-```
+**The script waits for 2 things.** First the connection appears on Bob's node. Then on Alice's laptop, where nobody performed an act: a connection belongs to an identity, and the identity's other device comes to hold it on its own.
 
-Replace `name` with the path you actually granted from the phone. What arrived under that issuer at all:
+**Burn the code there and then.** Present the same code to the phone a second time: a refusal on the screen, and Bob still lists exactly one connection to Alice.
 
-```sh
-curl -s $MAC/debug/data/$PEER | jq
-```
-
-The point to say out loud: the grant named an issuer and exactly one claim; nothing else under that issuer replicates here at all. It can be shown like this:
-
-```sh
-curl -s -w ' [HTTP %{http_code}]\n' $MAC/debug/data/$PEER/notes/private
-```
-
-Name honestly what that shows, though: the answer is `404 no entry`, not a refusal. Before the grant the answer was a different one — `409 data namespace not bound on this node`, the namespace was not bound at all. With the grant in place the namespace is bound, and an ungranted path is indistinguishable from one that does not exist. The real test of the boundary is a third node that was granted nothing, and it is not shown on a phone.
+Said out loud: a connection proves that 2 devices held one secret, and nothing else. Not who the person is, and not that they told the truth.
 
 ---
 
-## Act 5. The laptop shares with the phone
+## Act 4. Alice grants Bob one claim
 
-```sh
-curl -s -X POST $MAC/debug/identities/$MINE/grants/$PEER \
-  -H 'content-type: application/json' -d '{
-    "issuer": "'$MINE'",
-    "claims": [{"path": "contact/email", "write": false}]
-  }' -w 'HTTP %{http_code}\n'
-curl -s $MAC/debug/identities/$MINE/own-grants/$PEER | jq
-```
+**Phone.** **Connections** → Bob's row → the card **Share claims with this peer** → tap `contact/email` → **Grant read-only**.
 
-`HTTP 204` means the publication was taken. In `own-grants` the claims appear as hashes: a claim's identity is derived one way from the issuer and the path, and the path does not come back out of it.
+**Presenter.** `demo/04-alice-grants.sh` — waits for the grant, reads the value on Bob's node, then asks it for a path Alice did not grant.
 
-**Phone.** On the connection screen the card **What this peer shares with me** fills itself: the path, the read-only mark, and the value `laptop@example.com`.
+Said out loud: a grant names the issuer and exactly the claims listed in it. The rest is not on Bob's node — not hidden, absent: no content, no path, no count. The `404` on the ungranted path means "no such entry", not a refusal; before the grant the answer was `409`, the namespace not bound at all.
 
 ---
 
-## Act 6. Withdraw, then grant again
+## Act 5. Bob grants Alice 2 claims, the second writable
+
+**Presenter.** `demo/05-bob-grants.sh` — Bob writes 2 entries of his own and publishes a grant: `contact/email` read-only, `notes/shared` with the right to write.
+
+**Phone.** The card **What this peer shares with me** fills itself. Under the writable claim there is a **write a new value** field — type and send, and the script prints what landed in Bob's own entry. The read-only claim has no field at all, and a write attempted against it is refused with what was refused named, the previous value still in place.
+
+Said out loud: this is the direction of granting that has a screen on the receiving end. The boundary is visible on a device rather than in an argument: the phone in the hand declines.
+
+---
+
+## Act 6. Withdrawn and granted again, in both directions
 
 **Phone.** "What I share with this peer" → **Withdraw this grant**.
 
-**Laptop.** No grants left, and the namespace is unbound — the same `409` as before the two ever met:
+**Presenter.** `demo/06-withdraw.sh` — waits until the grants are gone and reads the same path on Bob's node: `409`, the namespace unbound. Alice's own read is unaffected.
 
-```sh
-pdnwait 'curl -s $MAC/debug/identities/$MINE/grants/$PEER | jq -ce "select((.grants|length)==0)"'
-curl -s -w ' [HTTP %{http_code}]\n' $MAC/debug/data/$PEER/name
-```
+**Phone.** **Grant read-only** again — the access reopens.
 
-**Phone.** **Grant read-only** again — the access opens back up:
+**Then the script withdraws from Bob's side.** On the phone the claims leave the card with a line saying the peer no longer shares them — plain text, no error banner. Press enter and Bob grants again.
 
-```sh
-pdnwait 'curl -sf $MAC/debug/data/$PEER/name'
-```
-
-The point to say out loud: a withdrawal closes further delivery and does not recall what was already delivered. The promise is careful, and it is honest.
+Said out loud: withdrawal closes further delivery and does not recall what was delivered. The promise is careful and honest. And nothing that remembers a withdrawal blocks what follows it.
 
 ---
 
-## Act 7. The right to write
+## Act 7. The device left, the identity stayed
 
-**The laptop grants the phone two claims, the second one writable:**
+**Phone.** Airplane mode, the application still in view. Not the lock screen: on iOS a lock can end the process, and then something else is being measured.
 
-```sh
-curl -s -X PUT $MAC/debug/data/$MINE/notes/shared --data-binary 'the first line, from the laptop'
-curl -s -X POST $MAC/debug/identities/$MINE/grants/$PEER \
-  -H 'content-type: application/json' -d '{
-    "issuer": "'$MINE'",
-    "claims": [
-      {"path": "contact/email", "write": false},
-      {"path": "notes/shared", "write": true}
-    ]
-  }' -w 'HTTP %{http_code}\n'
-```
+**Presenter.** `demo/07-stand-in.sh` — Alice's laptop writes a new value of the granted claim with the time in the line, and the script waits for Bob to read it.
 
-**Phone.** Under the writable claim a **write a new value** field appears — type something and send it. A read-only claim has no field at all.
+Said out loud: the phone established the connection and the phone published the grant — and availability does not depend on it. The identity's other device carries the value on its own.
 
-**The laptop sees what the phone wrote, in its own data:**
-
-```sh
-pdnwait 'curl -sf $MAC/debug/data/$MINE/notes/shared'
-```
+Then take the phone out of airplane mode: it catches up by itself, with no second bring-up.
 
 ---
 
-## Act 8. The application is put away
+## Act 8. A party holding nothing obtains nothing
 
-**Phone.** Put it away with the home gesture. Do not lock the screen: a lock may end the process, and then something else is being measured.
+**Presenter.** `demo/08-outsider.sh` — Carol reads the very claim Bob reads and gets `409`; she tries to list anything at all of Alice's and gets `409`. Beside it, in the same output, Bob reads the value.
 
-**The laptop writes while the phone is "gone":**
+Said out loud: this is the tightest denial of the claim the whole demonstration is delivered to make. The other acts pair a connected party against what lies outside its own grant; this one pairs a party that holds nothing against everything.
 
-```sh
-curl -s -X PUT $MAC/debug/data/$MINE/contact/email --data-binary 'changed while the phone slept'
-```
-
-**Phone.** Come back to the application. The value arrives on its own, with no second bring-up.
+Why a fourth node rather than a second identity on Bob's: access to a namespace is decided by the issuer and by the node, not by the identity a screen is set to. An outsider hosted on Bob's node would read the granted claim, and the denial would prove nothing.
 
 ---
 
-## Act 9. Everything survives a restart
+## What is not shown — say it out loud
 
-**Phone.** Close the application with a swipe, open it, **Bring the node up**. The node id and the identity are the same, the connection is there, the data is there.
+1. What the screens show lives in this device's storage, which holds the only copy. Deleting the application erases the directory together with the key.
+2. An identity carries no key material: nothing here proves who a peer is.
+3. The reconcile interval is a configured number, not a property of the network.
+4. 2 of the 4 nodes are not phones, and their side of every act is shown in a terminal rather than on a screen.
+5. Withdrawal closes further delivery and does not recall what was already delivered.
 
-**Laptop — the same.** The `pkill` pattern carries a path on purpose: a bare `pdn-node-http` also matches a build's command line and kills the wrong thing.
+And what carries the traffic: the endpoint binds with the N0 preset — addresses are published under the node id to n0's public name servers, and a session that finds no direct path travels through n0's relay. Those servers see a node id, the addresses, and the times and sizes of traffic between 2 node ids. They see no content and hold nothing that names a person.
 
-```sh
-# The first block is required: without $PDN and $MAC the next line starts the wrong path
-[ -x "$PDN/target/debug/pdn-node-http" ] || cargo build -p pdn-node-http
-# The previous node has to release the directory lock, and that takes more than a second
-pkill -f 'target/debug/pdn-node-http'
-for i in $(seq 1 15); do pgrep -f 'target/debug/pdn-node-http' >/dev/null || break; sleep 1; done
-PDN_DATA_DIR=$PDN/tmp/pdn-mac-node2 PDN_DEBUG=1 \
-  nohup $PDN/target/debug/pdn-node-http > $PDN/tmp/pdn-mac-node2.log 2>&1 & disown
-for i in $(seq 1 20); do curl -sf $MAC/ready >/dev/null && break; sleep 1; done
-curl -sf $MAC/debug/status || { echo "the node did not come up, here is its log:"; tail -20 $PDN/tmp/pdn-mac-node2.log; }
-```
-
-The point to say out loud: a node comes back on its directory as itself. Only work in flight does not come back — a minted and unconsumed invite, an interrupted ceremony. The home relay is taken again too, and that costs about ten seconds.
+The conditions this run does not cover, also said out loud: a device that restarts and returns with its state; a disk that fills; a connection that degrades rather than ends; a capability narrowed and widened rather than closed and reopened; a process killed for memory; a withdrawal from a device other than the one that published the grant; a device joining after a connection already exists.
 
 ---
 
 ## When something goes wrong
 
-| What is seen | Why, and what to do |
+| Symptom | Cause and what to do |
 | --- | --- |
-| `REFUSED · MALFORMED-INPUT`, with "refused by this application before the node was called" | Bare JSON went into the QR. The phone expects base64url over it — draw a code only through `pdnqr` |
-| `REFUSED · COUNTERPARTY-UNREACHABLE` | Local Network is off for the application (Settings → PDN), or the invite was minted before the home relay came up. Run the relay `pdnwait` from act 3 |
-| The code on the screen does not read | Raise the scale in `pdnqr` (`-s 8`), kill the reflection, give the phone 20–30 cm |
-| The ceremony hangs and times out | The invite expired: `lifetime_secs` ran out. Mint another |
-| `pdnwait` prints "nothing arrived" | Watch `tail -f $PDN/tmp/pdn-mac-node2.log`: it shows whether a sync is running and with which peer |
-| `FAILED · INTERNAL` on the screen | Relaunch the application through `devicectl … --console` and read its stderr |
-| The code-reading screen is blank | The camera is refused to the application. Settings → PDN → Camera |
+| `REFUSED · MALFORMED-INPUT`, subtitled "refused by this application before the node was called" | Bare JSON went into the QR. The phone expects base64url over it — draw codes only with the scripts, which do it themselves |
+| `REFUSED · COUNTERPARTY-UNREACHABLE` | Local Network is off for the application (Settings → PDN), or the payload was minted before the home relay came up. The scripts wait for the relay; if the wait was long, mint again |
+| The code on the screen will not read | Raise the scale in `pdnqr` (`-s 8`), kill the reflection, give the phone 20–30 cm |
+| The ceremony hangs and times out | The payload expired: `lifetime_secs` ran out. Run the act's script again |
+| A script prints "nothing arrived within 48 seconds" | Watch `tail -f tmp/pdn-alice.log` and `tmp/pdn-bob.log`: they show whether sync is running and with which peer |
+| `FAILED · INTERNAL` on the screen | Restart the application through `demo/phone-log.sh` and watch its stderr |
+| The reading screen is blank | The camera is denied to the application. Settings → PDN → Camera |
+
+No node is restarted once the run has begun. A node comes back on its directory as itself but not on its address: the port is ephemeral, a restarted node is unreachable to every peer it had, and the screens cannot say so.
 
 ## A full reset between runs
 
 ```sh
-pkill -f 'target/debug/pdn-node-http'
-rm -rf $PDN/tmp/pdn-mac-node2 && mkdir -p $PDN/tmp/pdn-mac-node2
-xcrun devicectl device uninstall app --device $DEV org.mee.pdn.app
-APP=$(ls -dt ~/Library/Developer/Xcode/DerivedData/PDN-*/Build/Products/Release-iphoneos/PDN.app | head -1)
-xcrun devicectl device install app --device $DEV "$APP"
+demo/reset.sh   # the 3 directories and the application with its key; it asks first
+demo/00-start.sh
 ```
 
-Deleting the application erases the directory together with the node's key: that is the loss of the only copy, not a cache being cleared. Exactly what a clean run needs, and exactly what must not happen by accident.
-
-## Pre-flight
-
-```sh
-# The tools are here
-which jq qrencode
-
-# The whole QR path: mint, draw, read back
-curl -s -X POST "$MAC/debug/identities/$MINE/invite?lifetime_secs=60" > tmp/probe.json
-pdnqr tmp/probe.png < tmp/probe.json
-diff tmp/probe.json <(swift $PDN/tmp/qrdecode.swift tmp/probe.png 2>/dev/null | pdnraw) \
-  && echo "the QR reads back into the invite it was made from" && rm -f tmp/probe.json tmp/probe.png
-
-# The addresses the node puts into an invite
-curl -s -X POST "$MAC/debug/identities/$MINE/invite" | jq '.inviter_addr.addrs'
-```
-
-What it should come to: a code of about 490 characters, a round-trip with no difference, and four addresses — the relay `euc1-1.relay.n0.iroh.link`, a public address found through the NAT, and two local ones.
+Deleting the application erases the directory together with the node's key: the loss of the only copy, not a cache clear. Exactly what a clean run needs, and exactly what must not happen by accident.
