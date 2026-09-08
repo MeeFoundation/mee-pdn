@@ -30,9 +30,9 @@ pub use pods::{
 };
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use data_layer::{
-    claim_id_of, CatchUpTimeout, DirectoryHeld, DocTicket, GrantedClaim, GranteeCannotShare, OpId,
-    Operation, PodStore, ReadGrant, ShareMode, SpawnOptions, StorageConfig, UnknownEntry,
-    UnknownIssuer, UnknownPod,
+    claim_id_of, CatchUpTimeout, Connectivity, DirectoryHeld, DocTicket, GrantedClaim,
+    GranteeCannotShare, OpId, Operation, PodStore, ReadGrant, ShareMode, SpawnOptions,
+    StorageConfig, UnknownEntry, UnknownIssuer, UnknownPod,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{

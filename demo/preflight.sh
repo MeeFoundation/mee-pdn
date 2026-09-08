@@ -22,6 +22,8 @@ for n in $NODES; do
   addrs=$(curl -s -X POST "$(url_of "$n")/debug/identities/$id/invite" | jq -c '[.inviter_addr.addrs[]|keys[0]]')
   echo "$n publishes: $addrs"
 done
-echo "expect Relay and a few Ip in each. The endpoint binds with iroh's N0"
-echo "preset: addresses are published under the node id to n0's name servers,"
-echo "and a session that finds no direct path is carried by n0's relay."
+echo "expect Relay and a few Ip in each. The nodes are spawned with"
+echo "PDN_CONNECTIVITY=product: addresses are published under the node id to"
+echo "n0's name servers, and a session that finds no direct path is carried"
+echo "by n0's relay. Without it the host binds direct paths and the phone,"
+echo "which is not on this network, is unreachable."

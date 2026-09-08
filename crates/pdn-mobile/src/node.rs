@@ -24,7 +24,7 @@ use std::{
 
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, InvitePayload, LinkingPayload,
-    Runtime, SpawnOptions, StorageConfig, SyncService as _,
+    Runtime, SpawnOptions, SyncService as _,
 };
 
 use crate::{
@@ -127,9 +127,12 @@ impl PdnNode {
         reconcile_interval_secs: u64,
     ) -> Result<(), PdnError> {
         let interval = shapes::duration(reconcile_interval_secs, "reconcile interval")?;
+        // A phone moves between networks, and a peer reached only at an
+        // address published on the last one is not reached at all — which is
+        // what `for_product` names, relays and address lookup included.
         let options = SpawnOptions {
-            storage: StorageConfig::Directory(std::path::PathBuf::from(storage_dir)),
             reconcile_interval: interval,
+            ..SpawnOptions::for_product(storage_dir)
         };
         self.claim_bring_up()?;
         let state = Arc::clone(&self.state);

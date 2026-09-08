@@ -6,6 +6,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context as _, Result};
+use pdn_node::Connectivity;
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 
@@ -56,6 +57,26 @@ pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
 
 pub fn debug_enabled_from_env() -> Result<bool> {
     debug_enabled(env("PDN_DEBUG")?.as_deref())
+}
+
+/// `PDN_CONNECTIVITY`: a closed set of values, unset meaning `direct`.
+/// Every value past `direct` routes through infrastructure this project does
+/// not run, so a host reaches it only when told to — the container stand
+/// binds direct paths and the demonstration stand names `product`, whose
+/// peers are devices that move between networks.
+pub fn connectivity(raw: Option<&str>) -> Result<Connectivity> {
+    match raw {
+        None | Some("direct") => Ok(Connectivity::Direct),
+        Some("relays") => Ok(Connectivity::Relays),
+        Some("product") => Ok(Connectivity::RelaysAndAddressLookup),
+        Some(other) => Err(anyhow::anyhow!(
+            "PDN_CONNECTIVITY must be one of direct, relays, product, or unset — got {other:?}"
+        )),
+    }
+}
+
+pub fn connectivity_from_env() -> Result<Connectivity> {
+    connectivity(env("PDN_CONNECTIVITY")?.as_deref())
 }
 
 /// `PDN_DATA_DIR`, required: a host started without a directory would
@@ -112,6 +133,18 @@ mod tests {
     fn an_unparseable_value_fails_instead_of_defaulting() {
         assert!(bind_addr(None, Some("http")).is_err());
         assert!(bind_addr(Some("not a host"), None).is_err());
+    }
+
+    #[test]
+    fn connectivity_is_direct_unless_named() {
+        assert_eq!(connectivity(None).unwrap(), Connectivity::Direct);
+        assert_eq!(connectivity(Some("direct")).unwrap(), Connectivity::Direct);
+        assert_eq!(connectivity(Some("relays")).unwrap(), Connectivity::Relays);
+        assert_eq!(
+            connectivity(Some("product")).unwrap(),
+            Connectivity::RelaysAndAddressLookup
+        );
+        assert!(connectivity(Some("relay")).is_err());
     }
 
     #[test]

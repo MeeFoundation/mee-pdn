@@ -132,7 +132,7 @@ Why a fourth node rather than a second identity on Bob's: access to a namespace 
 4. 2 of the 4 nodes are not phones, and their side of every act is shown in a terminal rather than on a screen.
 5. Withdrawal closes further delivery and does not recall what was already delivered.
 
-And what carries the traffic: the endpoint binds with the N0 preset — addresses are published under the node id to n0's public name servers, and a session that finds no direct path travels through n0's relay. Those servers see a node id, the addresses, and the times and sizes of traffic between 2 node ids. They see no content and hold nothing that names a person.
+And what carries the traffic: the nodes are spawned with `PDN_CONNECTIVITY=product` — addresses are published under the node id to n0's public name servers, and a session that finds no direct path travels through n0's relay. Those servers see a node id, the addresses, and the times and sizes of traffic between 2 node ids. They see no content and hold nothing that names a person. What they do give away is availability: once published, a node id resolves globally, so anyone holding one can ask whether the device is up and which relay it is homed on, and no withdrawal takes that back. That is the price of reaching a phone that moves between networks, and it is said out loud.
 
 The conditions this run does not cover, also said out loud: a device that restarts and returns with its state; a disk that fills; a connection that degrades rather than ends; a capability narrowed and widened rather than closed and reopened; a process killed for memory; a withdrawal from a device other than the one that published the grant; a device joining after a connection already exists.
 
