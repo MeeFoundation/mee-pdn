@@ -40,4 +40,10 @@ echo "Alice's other identity, which it does not:  $(alice_other)"
 echo "Bob:   $(ident bob)"
 echo "Carol: $(ident carol)"
 echo
+echo "each node in a browser, the same screens the phone runs:"
+for n in $NODES; do
+  echo "  $n: http://localhost:8081/?node=$(url_of "$n")"
+done
+echo "  (start the page once with: cd $PDN/pdn-app && npm run web)"
+echo
 echo "logs: tail -f $PDN/tmp/pdn-alice.log"
