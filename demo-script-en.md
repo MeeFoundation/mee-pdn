@@ -44,9 +44,13 @@ Said out loud: 2 identities on one node are 2 lives, not 2 accounts. The same pa
 
 **Presenter.** `demo/02-link-phone.sh` — waits for a home relay, mints the linking payload and draws it as a code that lives 180 seconds.
 
-**Phone.** **Bring the node up** → **Read a code** → the act **A device joining an identity** → point it at the laptop's screen.
+**Phone.** **Bring the node up**, and nothing else — no identity is created here. Then **Read a code** → the act **A device joining an identity** → point it at the laptop's screen.
+
+The order is the act: the phone holds no identity at all, and the first one it ever holds is not made here but received. An identity created on the phone beforehand is indistinguishable on the screen from one that arrived, and the arrival is the whole point.
 
 **What is visible afterwards.** The phone hosts Alice's identity, and only that one — her other identity does not appear on it. **My entries** already lists `contact/email`, `contact/phone` and `notes/private`, none of which were written on this phone.
+
+**Then, and only then, a second identity of its own.** On the phone: **Create an identity**. It now holds 2 — the one it joined and the one it made — the same path under each holding a different value, and Alice's connections absent from the other's list. That is the 2-lives-on-one-device act, shown where there is a screen.
 
 Said out loud: a device belongs to an identity, not to a person. The catch-up takes the state whole; a failed link rolls back and leaves no half.
 

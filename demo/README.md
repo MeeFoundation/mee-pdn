@@ -11,7 +11,7 @@
 | `00-start.sh` | Поднимает три node'ы, заводит identity каждой и вторую identity Alice | — |
 | `preflight.sh` | Инструмент на месте, QR-путь цел, у каждой node'ы есть relay-адрес | — |
 | `01-alice.sh` | Node id, две identity Alice, три entry и одноимённый путь под второй identity | — (телефон ещё ни к чему не присоединён) |
-| `02-link-phone.sh` | Чеканит linking-payload для identity Alice и рисует его QR'ом | Read a code → A device joining an identity |
+| `02-link-phone.sh` | Чеканит linking-payload для identity Alice и рисует его QR'ом | Bring the node up — и больше ничего; затем Read a code → A device joining an identity |
 | `03-connect-bob.sh` | Bob чеканит invite и рисует его; ждёт connection у Bob'а и его же появления у ноутбука Alice | Read a code → Accepting an invitation to connect |
 | `04-alice-grants.sh` | Ждёт grant Alice, читает значение на node'е Bob'а, показывает негранованный путь | Share claims with this peer → Grant read-only |
 | `05-bob-grants.sh` | Bob выдаёт два claim'а, второй с правом записи; ждёт, что впишет телефон | Карточка What this peer shares with me, поле write a new value |
