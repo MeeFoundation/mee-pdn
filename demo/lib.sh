@@ -32,7 +32,14 @@ log_of()  { echo "$PDN/tmp/pdn-$1.log"; }
 # JSON in -> a QR on the screen, in the form the phone expects: the facade
 # mints and reads a code as base64url without padding over JSON, whereas this
 # surface returns bare JSON.
-pdnqr() { base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=' | qrencode -l L -s 6 -o "$1" && open "$1"; }
+#
+# Each code gets a file of its own: a viewer showing the previous image of
+# the same name hands the phone a payload whose secret is spent or expired,
+# and the refusal that follows names neither.
+pdnqr() {
+  local png="${1%.png}-$(date +%H%M%S).png"
+  base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=' | qrencode -l L -s 6 -o "$png" && open "$png"
+}
 
 # A code taken off the phone's screen -> the JSON /debug accepts.
 pdnraw() { python3 -c "import base64,sys;d=sys.stdin.read().strip();sys.stdout.write(base64.urlsafe_b64decode(d+'='*(-len(d)%4)).decode())"; }
@@ -101,6 +108,7 @@ start_node() {
   local n=$1
   mkdir -p "$(dir_of "$n")"
   PDN_DATA_DIR="$(dir_of "$n")" PDN_PORT="$(port_of "$n")" PDN_DEBUG=1 \
-    PDN_CONNECTIVITY="$CONNECTIVITY" nohup "$NODE_BIN" > "$(log_of "$n")" 2>&1 &
+    PDN_CONNECTIVITY="$CONNECTIVITY" RUST_LOG="${RUST_LOG:-info}" \
+    nohup "$NODE_BIN" > "$(log_of "$n")" 2>&1 &
   disown
 }
