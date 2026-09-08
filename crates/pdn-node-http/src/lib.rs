@@ -22,6 +22,7 @@ use std::{future::Future, sync::Arc};
 
 use axum::{
     extract::{Query, Request, State},
+    http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse as _, Response},
     routing::{delete, get, post, put},
@@ -50,10 +51,12 @@ pub fn router(runtime: Arc<Runtime>, debug: bool) -> Router {
         .route("/live", get(live))
         .route("/ready", get(ready));
     let app = if debug {
-        let debug = debug_routes().layer(middleware::from_fn_with_state(
-            Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
-            admit_request,
-        ));
+        let debug = debug_routes()
+            .layer(middleware::from_fn_with_state(
+                Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+                admit_request,
+            ))
+            .layer(middleware::from_fn(permit_any_origin));
         app.merge(debug)
     } else {
         app
@@ -95,6 +98,31 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, Host
     with_runtime_budget(runtime.sync().hosted_identities()).await?;
     with_runtime_budget(runtime.sync().check_storage()).await?;
     Ok("ok")
+}
+
+/// Cross-origin headers, so a page a browser loaded from somewhere else can
+/// drive this node the way an application drives its own. Scoped to the
+/// debug subtree, which exists only where `PDN_DEBUG` says so, and open to
+/// any origin because a stand that answers on loopback has no origin worth
+/// naming.
+async fn permit_any_origin(request: Request, next: Next) -> Response {
+    let preflight = request.method() == axum::http::Method::OPTIONS;
+    let mut response = if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    headers.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("content-type"),
+    );
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET,POST,PUT,DELETE,OPTIONS"),
+    );
+    response
 }
 
 /// One route to one service call. Deliberately absent, and to stay absent:
@@ -139,6 +167,7 @@ fn debug_routes() -> Router<Arc<Runtime>> {
             "/debug/identities/{identity}/grants/{peer}/{issuer}",
             delete(connections::withdraw_grant),
         )
+        .route("/debug/claim-id/{issuer}/{*path}", get(data::claim_id))
         .route("/debug/data/{issuer}", get(data::list))
         .route(
             "/debug/data/{issuer}/{*path}",
