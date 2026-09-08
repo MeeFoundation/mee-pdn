@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use pdn_node::{DataService as _, Runtime};
+use pdn_node::{claim_id_of, DataService as _, Runtime};
 
 use crate::{
     error::HostError,
@@ -40,6 +40,19 @@ pub(crate) async fn write(
     }
     runtime.data().write(identity, issuer, &path, &body).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /debug/claim-id/{issuer}/{*path}` — the one-way derivation, so a
+/// caller driving this node joins paths it knows against the claims a grant
+/// read reports, as the mobile facade's caller does. Nothing about the node
+/// is read: the derivation is of the issuer and the path alone.
+pub(crate) async fn claim_id(
+    Path((issuer, path)): Path<(String, String)>,
+    Query(NoQuery {}): Query<NoQuery>,
+) -> Result<String, HostError> {
+    let issuer = parse::id(&issuer, "issuer")?;
+    let path = parse::entry_path(&path)?;
+    Ok(claim_id_of(&issuer, &path).to_string())
 }
 
 /// `GET /debug/data/{identity}/{issuer}/{*path}` — 404 covers both "no
