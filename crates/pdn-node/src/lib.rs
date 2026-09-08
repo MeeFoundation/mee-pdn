@@ -22,8 +22,8 @@ pub use connections::{
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use data_layer::{
-    claim_id_of, CatchUpTimeout, DirectoryHeld, DocTicket, GrantedClaim, ReadGrant, ShareMode,
-    SpawnOptions, StorageConfig, UnknownIssuer,
+    claim_id_of, CatchUpTimeout, Connectivity, DirectoryHeld, DocTicket, GrantedClaim, ReadGrant,
+    ShareMode, SpawnOptions, StorageConfig, UnknownIssuer,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{

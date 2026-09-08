@@ -90,10 +90,13 @@ alice_other() {
   echo "$id"
 }
 
+# `PDN_CONNECTIVITY=product` is what makes the phone reachable: the host
+# binds direct paths unless told otherwise, and the phone is rarely on the
+# network this machine is on.
 start_node() {
   local n=$1
   mkdir -p "$(dir_of "$n")"
   PDN_DATA_DIR="$(dir_of "$n")" PDN_PORT="$(port_of "$n")" PDN_DEBUG=1 \
-    nohup "$NODE_BIN" > "$(log_of "$n")" 2>&1 &
+    PDN_CONNECTIVITY=product nohup "$NODE_BIN" > "$(log_of "$n")" 2>&1 &
   disown
 }
