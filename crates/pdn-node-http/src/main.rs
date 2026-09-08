@@ -2,15 +2,18 @@
 //!
 //! Environment: `PDN_DATA_DIR` (required — the runtime's storage directory;
 //! the host offers no in-memory mode, and unset stops the start),
-//! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`), and
-//! `PDN_DEBUG=1` to mount the scaffolding `/debug/` routes (absent
-//! otherwise). The binary is glue only — assembly and authorization
+//! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`),
+//! `PDN_CONNECTIVITY` (`direct` by default, `relays` or `product` for a peer
+//! that is not on this network), and `PDN_DEBUG=1` to mount the scaffolding
+//! `/debug/` routes (absent otherwise). The binary is glue only — assembly and authorization
 //! posture live in `pdn-node` (see the library crate docs).
 
 use std::{sync::Arc, time::Duration};
 
 use pdn_node::{Runtime, SpawnOptions};
-use pdn_node_http::{bind_addr_from_env, data_dir_from_env, debug_enabled_from_env, router};
+use pdn_node_http::{
+    bind_addr_from_env, connectivity_from_env, data_dir_from_env, debug_enabled_from_env, router,
+};
 
 /// How long `main` waits for axum's graceful drain before moving on to
 /// `runtime.shutdown()`. This budget and that shutdown together have to fit
@@ -27,10 +30,17 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = data_dir_from_env()?;
     let bind_addr = bind_addr_from_env()?;
     let debug_enabled = debug_enabled_from_env()?;
+    let connectivity = connectivity_from_env()?;
 
     // Spawned before the listener binds: an unusable directory exits here,
     // serving nothing and never falling back to memory.
-    let runtime = Arc::new(Runtime::spawn(SpawnOptions::on_directory(data_dir)).await?);
+    let runtime = Arc::new(
+        Runtime::spawn(SpawnOptions {
+            connectivity,
+            ..SpawnOptions::on_directory(data_dir)
+        })
+        .await?,
+    );
     // The two startup markers bracket the only silent stretch of a node's
     // life: without them a node stuck in `spawn` and one serving but
     // unreachable leave byte-identical logs.

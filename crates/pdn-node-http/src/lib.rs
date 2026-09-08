@@ -31,8 +31,8 @@ use pdn_node::{Runtime, SyncService as _};
 
 pub use crate::{
     bind::{
-        bind_addr, bind_addr_from_env, data_dir, data_dir_from_env, debug_enabled,
-        debug_enabled_from_env, DEFAULT_HOST, DEFAULT_PORT,
+        bind_addr, bind_addr_from_env, connectivity, connectivity_from_env, data_dir,
+        data_dir_from_env, debug_enabled, debug_enabled_from_env, DEFAULT_HOST, DEFAULT_PORT,
     },
     error::HostError,
 };
