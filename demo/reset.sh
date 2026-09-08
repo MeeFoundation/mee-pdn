@@ -1,16 +1,17 @@
 #!/bin/bash
-# A full reset between runs. Erases the node's directory and the application on
-# the phone together with its key: the loss of the only copy, not a cache clear.
+# A full reset between runs. Erases the three node directories and the
+# application on the phone together with its key: the loss of the only copy,
+# not a cache clear.
 source "$(dirname "$0")/lib.sh"
 
-read -r -p "erase the laptop node and the application on the phone? [y/N] " answer
+read -r -p "erase the three node directories and the application on the phone? [y/N] " answer
 [ "$answer" = "y" ] || { echo "cancelled"; exit 0; }
 
 pkill -f 'target/debug/pdn-node-http'
 for i in $(seq 1 15); do pgrep -f 'target/debug/pdn-node-http' >/dev/null || break; sleep 1; done
-rm -rf "$NODE_DIR" "$PDN/tmp/peer-id" "$PDN/tmp/mac-identity"
-mkdir -p "$NODE_DIR"
-echo "the laptop directory is clean"
+for n in $NODES; do rm -rf "$(dir_of "$n")" "$PDN/tmp/$n-id"; mkdir -p "$(dir_of "$n")"; done
+rm -f "$PDN/tmp/alice-other-id"
+echo "the node directories are clean"
 
 xcrun devicectl device uninstall app --device "$DEV" "$BUNDLE" 2>&1 | tail -1
 APP=$(ls -dt ~/Library/Developer/Xcode/DerivedData/PDN-*/Build/Products/Release-iphoneos/PDN.app 2>/dev/null | head -1)
