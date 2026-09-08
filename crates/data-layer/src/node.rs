@@ -496,8 +496,15 @@ impl SyncNode {
     /// bound under the read grant before it, and without the merge the
     /// grantee holds a read replica against a record promising a write. A
     /// capability the store already holds is no change.
+    /// The import opens the replica, and the handle it takes is closed here:
+    /// one open per import is what the binder's accounting rests on, and the
+    /// unbind a withdrawal performs has to find the last of them.
     pub async fn merge_data_capability(&self, ticket: &DocTicket) -> Result<()> {
-        let _doc = self.docs.import_namespace(ticket.capability.clone()).await?;
+        let doc = self
+            .docs
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        doc.close().await?;
         Ok(())
     }
 
