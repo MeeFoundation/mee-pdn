@@ -29,6 +29,15 @@ Clone it into the repository root — specs and code practices are referenced as
 git clone git@github.com:MeeFoundation/mia-docs.git
 ```
 
+### `mia-ontologies` setup (optional)
+
+The product's data model — cells, graphs, DataBooks — that the cells design works from. Clone it into the repository root beside `mia-docs` when you need it; `.gitignore` keeps the checkout out of this repository:
+
+```sh
+# From the repository root
+git clone git@github.com:MeeFoundation/mia-ontologies.git
+```
+
 ## Development
 
 - `just`: full list of recipes
