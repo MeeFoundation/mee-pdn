@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Directory layout
 
-`mia-docs/` is a sibling repo cloned in-place at the top of the workspace (gitignored) — UWill ADRs, openspec specs.
+`mia-docs/` is a sibling repo cloned in-place at the top of the workspace (gitignored) — UWill ADRs, openspec specs. `mia-ontologies/` is an optional one, cloned the same way.
+
+- **`mia-docs/` is the source of truth** — ADRs, specs, changes and code practices. What it says is what the platform is and is going to be.
+- **`mia-ontologies/` is the product's long-range vision, not a specification.** It is written without regard to this codebase, to its upstream dependencies (iroh and the rest) or to `mia-docs/`. Much of it is untested; some of it is unworkable, some of it wrong, and some of it contradicts the platform or itself — take nothing in it on faith. Read it for what the product may want in some distant future and may yet change its mind about; check every claim against `mia-docs/` and the code, and when the two disagree, `mia-docs/` wins and the disagreement is worth raising.
 
 ## Project
 
