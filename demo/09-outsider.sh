@@ -1,10 +1,11 @@
 #!/bin/bash
-# Act 8. Carol holds no connection to Alice and no grant from her. She obtains
-# nothing — not the granted claim, not another, not the knowledge that any
-# exists — while Bob demonstrably reads the granted claim in the same place.
-# Nothing happens on the phone.
+# Act 9. Carol holds no connection to Alice and no grant from her. Her denial
+# is watched on the browser screen driving her node, not read off this
+# terminal, while Bob demonstrably reads the granted claim on his own screen
+# in the same place. Nothing happens on the phone.
 source "$(dirname "$0")/lib.sh"; need_nodes
 A=$(ident alice); B=$(ident bob); C=$(ident carol)
+pdnbrowser carol
 
 echo "=== Carol's connections ==="
 curl -s "$CAROL/debug/identities/$C/connections" | jq

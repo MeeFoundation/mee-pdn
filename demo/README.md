@@ -1,49 +1,50 @@
-# Скрипты демонстрации
+# Demo scripts
 
-Половина ноутбука, разложенная по шагам. Порядок в именах: запускать слева направо, по одному на акт сценария (`../demo-script.md`).
+Half the laptop, laid out step by step. Order is in the names: run left to right, one per act of the scenario (`../demo-script-en.md`).
 
-Каст — четыре node'ы, из них один телефон. На этой машине живут три процесса `pdn-node-http`: **alice** (3011) — устройство, на котором Alice заводит identity и пишет первые entry; **bob** (3012) — peer, с которым она устанавливает connection; **carol** (3013) — тот, кто не держит ничего Alice'иного и это показывает. Телефон присоединяется к identity Alice церемонией linking'а и остаётся единственным экраном в постановке.
+The cast is four nodes, one of them a phone. Three `pdn-node-http` processes live on this machine: **alice** (3011) — the device where Alice creates her identity and writes her first entries; **bob** (3012) — the peer she establishes a connection with; **carol** (3013) — the one who holds nothing of Alice's, and shows it. The phone joins Alice's identity through the linking ceremony and remains the only physical device in the staging.
 
-Каждой node'ой можно управлять из браузера теми же экранами, что и телефоном: `cd pdn-app && npm run web`, затем `http://localhost:8081/?node=http://127.0.0.1:3011` для Alice, `:3012` для Bob'а, `:3013` для Carol. Под экранами в этом случае не фасад, а debug-поверхность HTTP-хоста, и две вещи отличаются: node подняли там, где запустили процесс, поэтому страница её не поднимает и не останавливает, а отказ приезжает статусом и фразой, из которой вид отказа вычитывается обратно. Адреса печатает `00-start.sh`.
+Every node can be driven from a browser through the same screens as the phone, and the scripts open the right one themselves: `pdnbrowser` (in `lib.sh`) switches the tab to the act's node if it is not already the one showing, and does nothing if it already is — the page's own reads keep it current. All that is needed is `cd pdn-app && npm run web` running once, before the scripts start. Behind the screens in this case is not the facade but the HTTP host's debug surface, and two things differ: the node came up where the process was started, so the page neither brings it up nor stops it, and a refusal arrives as a status and a phrase, from which the kind of refusal is read back out.
 
-Состояние между запусками живёт в файлах, а не в переменных вкладки: identity каждой node'ы в `tmp/<имя>-id`, вторая identity Alice — в `tmp/alice-other-id`. Поэтому шаги можно запускать в любых вкладках и с перерывами.
+State between runs lives in files, not tab variables: each node's identity in `tmp/<name>-id`, Alice's second identity in `tmp/alice-other-id`, the node whose screen is open in the browser in `tmp/browser-node`. So steps can be run from any tab, and with breaks between them.
 
-| Скрипт | Что делает | Что в это время на телефоне |
+| Script | What it does | What happens on the phone meanwhile |
 | --- | --- | --- |
-| `00-start.sh` | Поднимает три node'ы, заводит identity каждой и вторую identity Alice | — |
-| `preflight.sh` | Инструмент на месте, QR-путь цел, у каждой node'ы есть relay-адрес | — |
-| `01-alice.sh` | Node id, две identity Alice, три entry и одноимённый путь под второй identity | — (телефон ещё ни к чему не присоединён) |
-| `02-link-phone.sh` | Чеканит linking-payload для identity Alice и рисует его QR'ом | Bring the node up — и больше ничего; затем Read a code → A device joining an identity |
-| `03-connect-bob.sh` | Bob чеканит invite и рисует его; ждёт connection у Bob'а и его же появления у ноутбука Alice | Read a code → Accepting an invitation to connect |
-| `04-alice-grants.sh` | Ждёт grant Alice, читает значение на node'е Bob'а, показывает негранованный путь | Share claims with this peer → Grant read-only |
-| `05-bob-grants.sh` | Bob выдаёт два claim'а, второй с правом записи; ждёт, что впишет телефон | Карточка What this peer shares with me, поле write a new value |
-| `06-withdraw.sh` | Снятие и повторная выдача в обе стороны | Withdraw this grant, потом Grant read-only снова |
-| `07-stand-in.sh` | Пишет с ноутбука Alice, пока телефон в авиарежиме | Авиарежим, приложение на экране |
-| `08-outsider.sh` | Carol не получает ничего, рядом Bob читает granted claim | — |
-| `phone-log.sh` | Запускает приложение и держит его stderr | Приложение перезапустится |
-| `reset.sh` | Стирает три каталога и переустанавливает приложение | Приложение удаляется вместе с ключом node'ы |
+| `00-start.sh` | Brings up the three nodes, mints each one's identity and Alice's second identity, seeds base entries for Alice (3) and Bob (2) | — |
+| `preflight.sh` | Confirms the tooling is in place, the QR path is intact, and every node has a relay address | — |
+| `01-alice.sh` | Opens the browser on Alice, shows the node id, both identities, and the entries `00-start.sh` seeded | — (the phone has joined nothing yet) |
+| `02-link-phone.sh` | Mints a linking payload for Alice's identity and draws it as a QR | Bring the node up — and nothing else; then Add an identity → Receive one from another device → Joining this device to an identity |
+| `03-connect-bob.sh` | Bob mints an invite and draws it; waits for the connection on Bob's side, switches the browser to Alice, and waits for Bob to appear on her laptop | Connections → Connect to someone → Read a code → Accepting an invitation to connect |
+| `04-alice-grants.sh` | Switches the browser to Bob; waits for Alice's grant, reads the value on his node, shows the ungranted path | Share claims with this peer → Grant read-only |
+| `05-bob-grants.sh` | Bob publishes 2 claims over the seeded entries, the second with the right to write; his granting is watched on his own browser screen; waits for what the phone writes | The card What this peer shares with me, the write a new value field |
+| `06-withdraw.sh` | Withdrawal and re-grant in both directions, Bob's side watched on his own browser screen | Withdraw this grant, then Grant read-only again |
+| `07-grant-follows-identity.sh` | Switches the browser to Alice; her laptop, which took no part in either grant, already reads what Bob shares and picks up a change he makes to it on its own | — |
+| `08-stand-in.sh` | Writes from Alice's laptop while the phone is in airplane mode; the browser on Bob shows the value arriving | Airplane mode, application in view |
+| `09-outsider.sh` | Switches the browser to Carol; she receives nothing, while Bob reads the granted claim on his own screen alongside | — |
+| `phone-log.sh` | Launches the application and holds its stderr | The application restarts |
+| `reset.sh` | Erases the three directories and reinstalls the application | The application is removed along with the node's key |
 
-Связность узлов выбирается переменной `CONNECTIVITY`, по умолчанию `product` — relay'и и address lookup, то есть достижимость телефона из любой сети. Когда интернет раздаёт сам телефон, все четыре узла в одной сети, и `CONNECTIVITY=direct demo/00-start.sh` доводит до каждого peer'а прямым путём, без третьей стороны. Тогда же отпадает и то, что при `product` приходится проговаривать вслух: опубликованный node id отвечает всякому, поднято ли устройство и на каком relay оно живёт.
+Node connectivity is chosen by the `CONNECTIVITY` variable, `product` by default — relays and address lookup, so the phone is reachable from any network. When the phone itself is the one sharing internet, all 4 nodes are on one network, and `CONNECTIVITY=direct demo/00-start.sh` reaches every peer directly, with no third party. That also removes what has to be said aloud under `product`: the published node id answers anyone asking whether the device is up and which relay it lives on.
 
-Места, где скрипт ждёт, и это нормально:
+Places where a script waits, and this is normal:
 
-- `02-link-phone.sh` и `03-connect-bob.sh` до полуминуты ждут home relay. Первые секунды после подъёма node'ы код несёт только локальные адреса, а телефон обычно не в сети ноутбука.
-- `04-alice-grants.sh` ждёт grant и значение около десяти секунд: сначала едет запись grant'а, отдельно после неё — payload.
-- `03-connect-bob.sh` вторым ожиданием ждёт периодического прохода: connection, установленный телефоном, доезжает до ноутбука Alice сам.
+- `02-link-phone.sh` and `03-connect-bob.sh` wait up to half a minute for a home relay. In the first seconds after a node comes up its code carries only local addresses, and the phone is usually not on the laptop's network.
+- `04-alice-grants.sh` waits around ten seconds for the grant and the value: the grant record travels first, and the payload separately after it.
+- `03-connect-bob.sh`'s second wait is for a periodic pass: the connection the phone established reaches Alice's laptop on its own.
 
-`06-withdraw.sh` и `07-stand-in.sh` останавливаются и ждут enter — там, где следующий шаг делает человек на телефоне.
+`06-withdraw.sh` and `08-stand-in.sh` stop and wait for enter — at the point where the next step is a person acting on the phone.
 
-`reset.sh` спрашивает подтверждение: он стирает каталоги трёх node'ов и приложение вместе с ключом, а это потеря единственной копии, а не очистка кэша.
+`reset.sh` asks for confirmation: it erases the three nodes' directories and the application along with its key, which is the loss of the only copy, not a cache clear.
 
-Node'ы во время прогона не перезапускают. Node возвращается на свой каталог собой, но не на свой адрес — порт эфемерный, — и перезапущенная node недостижима для всех, с кем говорила, а экраны об этом сказать не могут: replica держит последнее дошедшее и возраст значения не сообщает.
+Nodes are not restarted mid-run. A node returns to its own directory on its own, but not to its own address — the port is ephemeral — and a restarted node is unreachable to everyone it was talking to, which the screens have no way to say: a replica holds the last value that arrived and does not report the age of a value.
 
-## Профиль подписи живёт семь дней
+## The signing profile lives seven days
 
-Бесплатный provisioning profile действует неделю. Просроченный валит установку сообщением про embedded profile, и читается оно как ошибка настройки подписи, хотя это просто истёкший срок. `reset.sh` проверяет срок до установки и, если он вышел, печатает команду пересборки:
+A free provisioning profile lasts a week. An expired one fails the install with a message about an embedded profile, which reads like a signing-configuration error though it is simply an expired one. `reset.sh` checks the expiry before installing and, if it has passed, prints the rebuild command:
 
 ```sh
 cd pdn-app/ios && xcodebuild -workspace PDN.xcworkspace -scheme PDN \
   -configuration Release -destination 'generic/platform=iOS' -allowProvisioningUpdates build
 ```
 
-`-allowProvisioningUpdates` обновляет профиль сам. Собранное лежит в `~/Library/Developer/Xcode/DerivedData/PDN-*/Build/Products/Release-iphoneos/PDN.app`, и `reset.sh` берёт оттуда самое свежее.
+`-allowProvisioningUpdates` renews the profile on its own. The build lands in `~/Library/Developer/Xcode/DerivedData/PDN-*/Build/Products/Release-iphoneos/PDN.app`, and `reset.sh` takes the newest one from there.
