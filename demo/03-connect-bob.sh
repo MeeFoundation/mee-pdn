@@ -2,7 +2,8 @@
 # Act 3. Bob connects to Alice. His node mints the invite and draws it; the
 # phone reads it. Then the connection turns up on Alice's laptop node, which
 # took no part in the ceremony.
-# On the phone: Connections -> Read a code -> Accepting an invitation to connect.
+# On the phone: Connections -> Connect to someone -> Read a code ->
+# Accepting an invitation to connect.
 source "$(dirname "$0")/lib.sh"; need_nodes
 A=$(ident alice); B=$(ident bob)
 
@@ -13,12 +14,15 @@ curl -s -X POST "$BOB/debug/identities/$B/invite?lifetime_secs=180" > "$PDN/tmp/
 jq '.inviter_addr.addrs' "$PDN/tmp/invite.json"
 pdnqr "$PDN/tmp/invite.png" < "$PDN/tmp/invite.json"
 echo "the code is on the screen and lives 180 seconds — read it with the phone"
+echo "on the phone: Connections -> Connect to someone -> Read a code ->"
+echo "Accepting an invitation to connect -> scan the code above."
 
 echo "=== Bob's side of the connection ==="
 pdnwait 'curl -s $BOB/debug/identities/$B/connections | jq -re ".connections[]|select(.==\"'"$A"'\")"' || exit 1
 echo "Bob lists Alice"
 
 echo "=== Alice's laptop, where nobody performed an act ==="
+pdnbrowser alice
 pdnwait 'curl -s $ALICE/debug/identities/$A/connections | jq -re ".connections[]|select(.==\"'"$B"'\")"' \
   && echo "the connection reached her other device on its own"
 

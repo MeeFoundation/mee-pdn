@@ -8,7 +8,8 @@
 #
 # Variables do not survive a separate run, so whatever the next step needs goes
 # into a file under tmp/: each node's identity in tmp/<name>-id, Alice's second
-# identity in tmp/alice-other-id.
+# identity in tmp/alice-other-id, and which node's screen the browser is
+# showing in tmp/browser-node.
 
 # ${BASH_SOURCE[0]} is empty when this file is sourced from zsh, and the root
 # would then resolve one level up and every read would answer emptiness rather
@@ -58,6 +59,28 @@ pdnwait() {
 
 # Does this node answer?
 node_up() { curl -sf "$(url_of "$1")/ready" >/dev/null; }
+
+# The web build's own dev server, started once with `cd pdn-app && npm run web`.
+WEB_PORT=${WEB_PORT:-8081}
+
+# The page for a node's screens. The node's own URL is a query *value*, not a
+# second address on this line: left raw, its "http://" reads as a link of its
+# own to a terminal or chat client's URL detector, which then opens that inner
+# address instead of this page. jq's @uri percent-encodes it the way
+# URLSearchParams decodes it back.
+browser_url() { echo "http://localhost:$WEB_PORT/?node=$(jq -rn --arg v "$(url_of "$1")" '$v|@uri')"; }
+
+# Opens the browser on a node's screens, or leaves it alone if that node's
+# page is already the one showing: the page repeats its own reads, so only a
+# switch to a different node needs a fresh open.
+pdnbrowser() {
+  local n=$1 state="$PDN/tmp/browser-node" target
+  [ "$(cat "$state" 2>/dev/null)" = "$n" ] && return 0
+  echo "$n" > "$state"
+  target="$(browser_url "$n")"
+  echo "browser: now on $n's screen — $target"
+  open "$target"
+}
 
 # Require every node of the staging: without them the remaining steps mean nothing.
 need_nodes() {

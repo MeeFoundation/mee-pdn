@@ -106,11 +106,19 @@ Said out loud: withdrawal closes further delivery and does not recall what was d
 
 ---
 
-## Act 7. The device left, the identity stayed
+## Act 7. A grant follows the identity, not the device
+
+**Presenter.** `demo/07-grant-follows-identity.sh` — switches the browser to Alice; her laptop, which took no part in accepting either grant, already reads what Bob shares, then Bob changes the value and the laptop picks it up on its own. Nothing happens on the phone.
+
+Said out loud: Bob granted Alice's identity, not her phone. Every device that identity holds reads what was granted to it, the same way every device it holds was reachable once the phone connected in act 3.
+
+---
+
+## Act 8. The device left, the identity stayed
 
 **Phone.** Airplane mode, the application still in view. Not the lock screen: on iOS a lock can end the process, and then something else is being measured.
 
-**Presenter.** `demo/07-stand-in.sh` — Alice's laptop writes a new value of the granted claim with the time in the line, and the script waits for Bob to read it.
+**Presenter.** `demo/08-stand-in.sh` — Alice's laptop writes a new value of the granted claim with the time in the line, and the script waits for Bob to read it.
 
 Said out loud: the phone established the connection and the phone published the grant — and availability does not depend on it. The identity's other device carries the value on its own.
 
@@ -118,9 +126,9 @@ Then take the phone out of airplane mode: it catches up by itself, with no secon
 
 ---
 
-## Act 8. A party holding nothing obtains nothing
+## Act 9. A party holding nothing obtains nothing
 
-**Presenter.** `demo/08-outsider.sh` — Carol reads the very claim Bob reads and gets `409`; she tries to list anything at all of Alice's and gets `409`. Beside it, in the same output, Bob reads the value.
+**Presenter.** `demo/09-outsider.sh` — Carol reads the very claim Bob reads and gets `409`; she tries to list anything at all of Alice's and gets `409`. Beside it, in the same output, Bob reads the value.
 
 Said out loud: this is the tightest denial of the claim the whole demonstration is delivered to make. The other acts pair a connected party against what lies outside its own grant; this one pairs a party that holds nothing against everything.
 

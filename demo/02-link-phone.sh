@@ -4,7 +4,8 @@
 # camera, so the phone is the side that reads.
 # On the phone: Bring the node up and nothing else — no identity is created
 # here. The first identity this phone ever holds is the one that arrives.
-# Then: Read a code -> A device joining an identity.
+# Then: Add an identity -> Receive one from another device -> Joining this
+# device to an identity.
 source "$(dirname "$0")/lib.sh"; need_nodes
 A=$(ident alice)
 
@@ -19,6 +20,9 @@ echo
 echo "on the phone before reading it: Bring the node up, and no more than that."
 echo "An identity created here first is indistinguishable on the screen from"
 echo "the one that arrives, and the arrival is the whole act."
+echo
+echo "then: Add an identity -> Receive one from another device -> Joining this"
+echo "device to an identity -> scan the code above."
 echo
 echo "what to look for on the phone once the ceremony ends:"
 echo "  - it hosts $A, and no other identity of Alice's"

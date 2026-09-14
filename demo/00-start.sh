@@ -30,20 +30,36 @@ for n in $NODES; do
 done
 
 for n in $NODES; do
-  echo "=== $n ($(url_of "$n")) ==="
+  # port, not the full http:// address: that address serves no page at "/",
+  # and a bare http:// label reads as a browser link to click, which this
+  # isn't — it is only a tag for the status dump that follows.
+  echo "=== $n (port $(port_of "$n")) ==="
   curl -s "$(url_of "$n")/debug/status"
 done
 
+A=$(ident alice); OTHER=$(alice_other); B=$(ident bob); ident carol >/dev/null
+
+# Base data, seeded before the audience so acts 1 and 5 only display and grant
+# rather than also typing it live. The phone joins Alice's identity already
+# holding entries — task 5.10's own premise — and act 1 shows that as true.
+curl -s -X PUT "$ALICE/debug/data/$A/contact/email" --data-binary 'alice@example.org' >/dev/null
+curl -s -X PUT "$ALICE/debug/data/$A/contact/phone" --data-binary '+31 6 1234 5678' >/dev/null
+curl -s -X PUT "$ALICE/debug/data/$A/notes/private" --data-binary 'not for anyone' >/dev/null
+curl -s -X PUT "$ALICE/debug/data/$OTHER/contact/email" --data-binary 'alice@work.example' >/dev/null
+curl -s -X PUT "$BOB/debug/data/$B/contact/email" --data-binary 'bob@example.org' >/dev/null
+curl -s -X PUT "$BOB/debug/data/$B/notes/shared" --data-binary 'the first line, written by Bob' >/dev/null
+
 echo
-echo "Alice's identity, the one her phone joins: $(ident alice)"
-echo "Alice's other identity, which it does not:  $(alice_other)"
-echo "Bob:   $(ident bob)"
+echo "Alice's identity, the one her phone joins: $A"
+echo "Alice's other identity, which it does not:  $OTHER"
+echo "Bob:   $B"
 echo "Carol: $(ident carol)"
 echo
-echo "each node in a browser, the same screens the phone runs:"
-for n in $NODES; do
-  echo "  $n: http://localhost:8081/?node=$(url_of "$n")"
-done
-echo "  (start the page once with: cd $PDN/pdn-app && npm run web)"
+echo "each node's screens, the same ones the phone runs — start the page once"
+echo "with: cd $PDN/pdn-app && npm run web, then open whichever node you need:"
+echo "  alice: $(browser_url alice)"
+echo "  bob:   $(browser_url bob)"
+echo "  carol: $(browser_url carol)"
+echo "the acts also switch to the node they need on their own via pdnbrowser."
 echo
 echo "logs: tail -f $PDN/tmp/pdn-alice.log"
