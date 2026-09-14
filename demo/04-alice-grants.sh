@@ -5,7 +5,11 @@
 # tap contact/email -> Grant read-only.
 source "$(dirname "$0")/lib.sh"; need_nodes
 A=$(ident alice); B=$(ident bob)
+pdnbrowser bob
 
+echo "on the phone: Connections -> Bob -> Share claims with this peer ->"
+echo "tap contact/email -> Grant read-only."
+echo
 echo "=== the grant, as Bob's node reads it ==="
 pdnwait 'curl -s $BOB/debug/identities/$B/grants/$A | jq -ce "select(.grants|length>0)"' | jq || exit 1
 

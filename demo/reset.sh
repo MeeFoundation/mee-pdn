@@ -10,7 +10,7 @@ read -r -p "erase the three node directories and the application on the phone? [
 pkill -f 'target/debug/pdn-node-http'
 for i in $(seq 1 15); do pgrep -f 'target/debug/pdn-node-http' >/dev/null || break; sleep 1; done
 for n in $NODES; do rm -rf "$(dir_of "$n")" "$PDN/tmp/$n-id"; mkdir -p "$(dir_of "$n")"; done
-rm -f "$PDN/tmp/alice-other-id"
+rm -f "$PDN/tmp/alice-other-id" "$PDN/tmp/browser-node"
 echo "the node directories are clean"
 
 xcrun devicectl device uninstall app --device "$DEV" "$BUNDLE" 2>&1 | tail -1

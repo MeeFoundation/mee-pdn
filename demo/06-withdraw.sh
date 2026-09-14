@@ -6,7 +6,10 @@
 # screen, which says he no longer shares it rather than showing a fault.
 source "$(dirname "$0")/lib.sh"; need_nodes
 A=$(ident alice); B=$(ident bob)
+pdnbrowser bob
 
+echo "on the phone: Connections -> Bob -> What I share with this peer ->"
+echo "Withdraw this grant."
 echo "=== withdraw on the phone; Bob stops knowing Alice as an issuer ==="
 pdnwait 'curl -s $BOB/debug/identities/$B/grants/$A | jq -ce "select((.grants|length)==0)"' || exit 1
 curl -s -w ' [HTTP %{http_code}]\n' "$BOB/debug/data/$A/contact/email"
@@ -15,6 +18,8 @@ echo "his node stopped knowing that issuer altogether."
 echo "Alice's own read of the same entry is untouched:"
 curl -s "$ALICE/debug/data/$A/contact/email"; echo
 
+echo "on the phone: still on Bob's connection screen, Share claims with this"
+echo "peer -> tap contact/email -> Grant read-only."
 echo "=== grant the same claim again on the phone; the access reopens ==="
 pdnwait 'curl -sf $BOB/debug/data/$A/contact/email' && echo "^ read again by Bob"
 
