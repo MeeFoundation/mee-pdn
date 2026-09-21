@@ -210,6 +210,7 @@ impl LinkingHandler {
                 .node
                 .share_ticket(
                     identity,
+                    identity,
                     ShareMode::Write,
                     AddrInfoOptions::RelayAndAddresses,
                 )
@@ -340,7 +341,15 @@ async fn link_via_dialogue_inner(
         let state_guard = state.lock().await;
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
-        let directory = PrivateMetadataStore::import(&state_guard.node, directory_ticket).await?;
+        // The identity's own half of the node, brought up by this link and
+        // dropped whole if it fails (ADR-0013).
+        state_guard
+            .node
+            .provision_identity(payload.identity)
+            .await?;
+        let directory =
+            PrivateMetadataStore::import(&state_guard.node, payload.identity, directory_ticket)
+                .await?;
         rollback = LinkRollbackGuard::new(
             rollback_state,
             payload.identity,
@@ -359,7 +368,7 @@ async fn link_via_dialogue_inner(
         }
         let data_import = state_guard
             .node
-            .import_namespace(payload.identity, response.data)
+            .import_namespace(payload.identity, payload.identity, response.data)
             .await;
         match data_import {
             Ok(data_import) => rollback.set_data_import(data_import),
@@ -419,9 +428,10 @@ async fn link_via_dialogue_inner(
         rollback.roll_back().await;
         return Err(err).context("the hosted-identities record could not be written");
     }
+    let author = guard.node.default_author(payload.identity)?;
     guard
         .identities
-        .insert(payload.identity, HostedIdentity { directory });
+        .insert(payload.identity, HostedIdentity { directory, author });
 
     // The confirmation, after the commit point and never before it: written
     // before the commit it would stand on every sibling with no local
@@ -677,11 +687,11 @@ async fn run_linking_dialogue(
 }
 
 /// Undo an abandoned link's local effects in reverse order, best-effort.
-/// The data namespace is undone rather than forgotten by issuer: a peer's
-/// granted namespace binds the same issuer without making the identity
-/// hosted, and forgetting it would destroy a replica this link never
-/// imported. Locks `state` only after the import is undone —
-/// [`SelfCleaningImport::undo`] locks it itself.
+/// The link brought up the identity's own half of the node, so dropping
+/// it reaches exactly what the link imported and nothing else: a
+/// namespace of the same issuer held under another identity's grant is in
+/// that identity's stores and is untouched. Locks `state` only after the
+/// import is undone — [`SelfCleaningImport::undo`] locks it itself.
 async fn undo_link(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
@@ -692,8 +702,8 @@ async fn undo_link(
         import.undo().await;
     }
     let state = state.lock().await;
-    let _ = state.node.unhost_identity(identity);
-    let _ = state.node.forget_doc(directory_namespace).await;
+    let _ = state.node.forget_doc(identity, directory_namespace).await;
+    let _ = state.node.unhost_identity(identity).await;
 }
 
 // `tracked_doc_count` is behind `test-util`.
@@ -714,9 +724,11 @@ mod tests {
         let state = Arc::clone(&rt.state);
 
         let scratch = SyncNode::spawn(data_layer::SpawnOptions::memory()).await?;
-        scratch.create_namespace(ids::DAVE).await?;
+        scratch.provision_identity(ids::DAVE).await?;
+        scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
         let ticket = scratch
             .share_ticket(
+                ids::DAVE,
                 ids::DAVE,
                 ShareMode::Write,
                 AddrInfoOptions::RelayAndAddresses,
@@ -725,8 +737,12 @@ mod tests {
 
         let (import, before) = {
             let guard = state.lock().await;
-            let import = guard.node.import_namespace(ids::DAVE, ticket).await?;
-            let before = guard.node.tracked_doc_count()?;
+            guard.node.provision_identity(ids::ALICE).await?;
+            let import = guard
+                .node
+                .import_namespace(ids::ALICE, ids::DAVE, ticket)
+                .await?;
+            let before = guard.node.tracked_doc_count(ids::ALICE)?;
             (import, before)
         };
 
@@ -739,7 +755,7 @@ mod tests {
 
         let settled = test_utils::eventually(|| async {
             let guard = state.lock().await;
-            Ok(guard.node.tracked_doc_count()? < before)
+            Ok(guard.node.tracked_doc_count(ids::ALICE)? < before)
         })
         .await?;
         assert!(

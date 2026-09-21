@@ -203,6 +203,8 @@ enum ReplicaAction {
         session: SyncSessionId,
         #[debug("filter")]
         filter: Option<crate::filter::EntryFilter>,
+        #[debug("ingest")]
+        ingest: Option<crate::filter::SessionIngest>,
         #[debug("reply")]
         reply: oneshot::Sender<Result<(Option<Message<SignedEntry>>, SyncOutcome)>>,
     },
@@ -235,6 +237,10 @@ enum ReplicaAction {
         heads: AuthorHeads,
         #[debug("reply")]
         reply: oneshot::Sender<Result<Option<NonZeroU64>>>,
+    },
+    AuthorHeads {
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<AuthorHeads>>,
     },
     SetDownloadPolicy {
         policy: DownloadPolicy,
@@ -583,6 +589,7 @@ impl SyncHandle {
         rx.await?
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn sync_process_message(
         &self,
         namespace: NamespaceId,
@@ -591,6 +598,7 @@ impl SyncHandle {
         state: SyncOutcome,
         session: SyncSessionId,
         filter: Option<crate::filter::EntryFilter>,
+        ingest: Option<crate::filter::SessionIngest>,
     ) -> Result<(Option<Message<SignedEntry>>, SyncOutcome)> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::SyncProcessMessage {
@@ -600,6 +608,7 @@ impl SyncHandle {
             state,
             session,
             filter,
+            ingest,
         };
         self.send_replica(namespace, action).await?;
         rx.await?
@@ -627,6 +636,16 @@ impl SyncHandle {
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::RegisterUsefulPeer { reply, peer };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
+    /// The latest timestamp per author in `namespace` — the cheap
+    /// "are we in sync?" digest, read here so a caller can compare two
+    /// replicas it holds without opening a session between them.
+    pub async fn author_heads(&self, namespace: NamespaceId) -> Result<AuthorHeads> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::AuthorHeads { reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -1146,12 +1165,13 @@ impl Actor {
                 mut state,
                 session,
                 filter,
+                ingest,
                 reply,
             } => {
                 let res = async {
                     let mut replica = self.session_replica(&namespace, session)?;
                     let res = replica
-                        .sync_process_message(message, from, &mut state, filter)
+                        .sync_process_message(message, from, &mut state, filter, ingest)
                         .await?;
                     Ok((res, state))
                 }
@@ -1219,6 +1239,20 @@ impl Actor {
             }),
             ReplicaAction::HasNewsForUs { heads, reply } => {
                 let res = self.store.has_news_for_us(namespace, &heads);
+                send_reply(reply, res)
+            }
+            ReplicaAction::AuthorHeads { reply } => {
+                let res = self
+                    .store
+                    .get_latest_for_each_author(namespace)
+                    .and_then(|latest| {
+                        let mut heads = AuthorHeads::default();
+                        for entry in latest {
+                            let (author, timestamp, _key) = entry?;
+                            heads.insert(author, timestamp);
+                        }
+                        Ok(heads)
+                    });
                 send_reply(reply, res)
             }
             ReplicaAction::SetDownloadPolicy { policy, reply } => {

@@ -90,10 +90,14 @@ pub struct UnknownIdentity {
     pub identity: PdnId,
 }
 
-/// A hosted identity's store handles; data-layer keeps no such list.
+/// A hosted identity's store handles and the author its writes carry;
+/// data-layer keeps no such list.
 #[derive(Debug)]
 pub(crate) struct HostedIdentity {
     pub(crate) directory: PrivateMetadataStore,
+    /// One author per hosted identity (ADR-0013), persisted with that
+    /// identity's replicas.
+    pub(crate) author: AuthorId,
 }
 
 /// Shared runtime state behind one coarse async mutex: small in-memory
@@ -103,9 +107,6 @@ pub(crate) struct HostedIdentity {
 /// each holding its own lock while the peer's accept side blocks on it.
 pub(crate) struct State {
     pub(crate) node: Arc<SyncNode>,
-    /// The node's one persisted author; the retraction tracker recognizes
-    /// this runtime's writes by it.
-    pub(crate) author: AuthorId,
     /// Exactly the identities created or linked here.
     pub(crate) identities: HashMap<PdnId, HostedIdentity>,
     /// In memory on purpose: an invite does not survive a restart.
@@ -162,11 +163,6 @@ impl State {
             .ok_or(UnknownIdentity { identity })
     }
 
-    /// As opposed to a peer known only through a grant or a connection.
-    pub(crate) fn is_hosted(&self, identity: PdnId) -> bool {
-        self.identities.contains_key(&identity)
-    }
-
     /// Replace the hosted-identities record with the hosted set plus
     /// `identity`. Called after the store set is provisioned and before the
     /// identity is hosted; a failure leaves the previous record intact. The
@@ -182,7 +178,7 @@ impl State {
         let Some(dir) = &self.data_dir else {
             return Ok(());
         };
-        self.node.flush_replicas(directory).await?;
+        self.node.flush_replicas(identity, directory).await?;
         let mut lines: Vec<HostedLine> = self
             .identities
             .iter()
@@ -245,17 +241,15 @@ impl Runtime {
         // before the error leaves, or a retry on the same directory in this
         // process would meet its open databases.
         let prepared = async {
-            let author = node.default_author().await?;
-            node.track_writer_author(author);
             let verdicts = node
                 .take_retraction_verdicts()
                 .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
             let (identities, armers) =
                 recover_hosted_identities(&node, data_dir.as_deref()).await?;
-            anyhow::Ok((author, verdicts, identities, armers))
+            anyhow::Ok((verdicts, identities, armers))
         }
         .await;
-        let (author, verdicts, identities, armers) = match prepared {
+        let (verdicts, identities, armers) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = node.shutdown().await;
@@ -269,7 +263,6 @@ impl Runtime {
             tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
         let state = Arc::new(Mutex::new(State {
             node: Arc::new(node),
-            author,
             identities,
             pending_invites: PendingInvites::default(),
             pending_linking_invites: PendingInvites::default(),
@@ -434,7 +427,10 @@ async fn recover_hosted_identities(
     let mut identities = HashMap::new();
     let mut armers: Vec<(PdnId, DirectoryChanges)> = Vec::new();
     for line in recovered {
-        let opened = PrivateMetadataStore::open(node, line.directory)
+        // The identity's own half of the node comes up first: its store is
+        // where its directory replica lives.
+        node.provision_identity(line.identity).await?;
+        let opened = PrivateMetadataStore::open(node, line.identity, line.directory)
             .await
             .with_context(|| {
                 format!(
@@ -443,6 +439,7 @@ async fn recover_hosted_identities(
                 )
             })?;
         let Some(directory) = opened else {
+            let _ = node.unhost_identity(line.identity).await;
             // The line stays in the record, so the skip is visible on every
             // start rather than erased by a start deciding on its own.
             tracing::warn!(
@@ -453,8 +450,9 @@ async fn recover_hosted_identities(
             continue;
         };
         let changes = directory.changes().await?;
+        let author = node.default_author(line.identity)?;
         node.host_identity(line.identity, &directory)?;
-        identities.insert(line.identity, HostedIdentity { directory });
+        identities.insert(line.identity, HostedIdentity { directory, author });
         armers.push((line.identity, Box::new(changes)));
     }
     Ok((identities, armers))

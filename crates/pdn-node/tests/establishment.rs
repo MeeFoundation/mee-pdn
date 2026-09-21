@@ -15,8 +15,8 @@ use data_layer::{
 use pdn_node::{
     ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentInProgress,
     EstablishmentRefused, EstablishmentTimeout, IdentityService as _, InvitePayload,
-    InviterUnreachable, Runtime, SpawnOptions, UnknownIdentity, UnsupportedInviteVersion,
-    INVITE_FORMAT_VERSION,
+    InviterUnreachable, Runtime, SpawnOptions, UnknownIdentity, UnknownIssuer,
+    UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, memory_node, TIMEOUT};
@@ -241,7 +241,7 @@ async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
     .await?;
     let rt = memory_runtime().await?;
     let y = rt.identity().create().await?;
-    let before = rt.sync().tracked_doc_count().await?;
+    let before = rt.sync().tracked_doc_count(y).await?;
 
     // Every delay cancels the future somewhere between the dial and the
     // reply.
@@ -264,7 +264,7 @@ async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
             () = tokio::time::sleep(delay) => {}
         }
         assert!(
-            eventually(|| async { Ok(rt.sync().tracked_doc_count().await? == before) }).await?,
+            eventually(|| async { Ok(rt.sync().tracked_doc_count(y).await? == before) }).await?,
             "cancelling establish at {delay:?} left a tracked replica behind"
         );
     }
@@ -328,11 +328,11 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     // The grant flow, no new pairing and no import act: Y's binder imports
     // what the grant names.
     let path = EntryPath::new("contact/name")?;
-    rt_a.data().write(x, &path, b"X").await?;
+    rt_a.data().write(x, x, &path, b"X").await?;
     granted_patiently(&rt_a, x, &rt_b, y, x, common::claims_on(x, &path, true)).await?;
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, &path).await?.as_deref() == Some(&b"X"[..]))
+            Ok(rt_b.data().read(y, x, &path).await?.as_deref() == Some(&b"X"[..]))
         })
         .await?,
         "granted entries did not sync to the peer"
@@ -340,10 +340,10 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
 
     // The grant carries write, proven by the round trip: Y's overwrite
     // reaches X through the ingest gate (ADR-0008).
-    rt_b.data().write(x, &path, b"Y was here").await?;
+    rt_b.data().write(y, x, &path, b"Y was here").await?;
     assert!(
         eventually(|| async {
-            Ok(rt_a.data().read(x, &path).await?.as_deref() == Some(&b"Y was here"[..]))
+            Ok(rt_a.data().read(x, x, &path).await?.as_deref() == Some(&b"Y was here"[..]))
         })
         .await?,
         "the grantee's write did not reach the issuer — the grant's ticket is not a write ticket"
@@ -357,7 +357,7 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "the grant X published toward Y must not be visible to Z, a separate connection of X"
     );
     assert!(
-        rt_c.data().read(x, &path).await.is_err(),
+        rt_c.data().read(z, x, &path).await.is_err(),
         "Z must not reach X's granted data — it never received the grant to import"
     );
 
@@ -829,7 +829,7 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
 
     // X grants toward Y and Y reads it: the pair is live, and now cached on B.
     let path = EntryPath::new("contact/name")?;
-    rt_a.data().write(x, &path, b"X").await?;
+    rt_a.data().write(x, x, &path, b"X").await?;
     rt_a.connections()
         .publish_grant(x, y, x, common::nominal_claims(x))
         .await?;
@@ -842,7 +842,7 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     // Stand in for another device of Y: the linking reply carries a write
     // ticket to Y's directory.
     let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
-    let replacement = ConnectionMetadataStore::create(&probe_node).await?;
+    let replacement = ConnectionMetadataStore::create(&probe_node, y).await?;
     let replacement_ticket = replacement
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -887,19 +887,100 @@ async fn a_failed_pair_open_leaves_no_replica_behind() -> Result<()> {
     laptop.fail_pair_arm_for_test().await;
     link_patiently(&laptop, &phone, alice).await?;
 
-    let settled = laptop.sync().tracked_doc_count().await?;
+    let settled = laptop.sync().tracked_doc_count(alice).await?;
     assert!(
         eventually(|| async { Ok(laptop.pair_arm_failures_for_test().await >= 4) }).await?,
         "the linked device never attempted to open the pair, so nothing here is a denial"
     );
     assert!(
-        eventually(|| async { Ok(laptop.sync().tracked_doc_count().await? <= settled) }).await?,
+        eventually(|| async { Ok(laptop.sync().tracked_doc_count(alice).await? <= settled) })
+            .await?,
         "repeated failed pair opens left replicas open: {} tracked against {settled} before them",
-        laptop.sync().tracked_doc_count().await?
+        laptop.sync().tracked_doc_count(alice).await?
     );
 
     phone.shutdown().await?;
     laptop.shutdown().await?;
     peer.shutdown().await?;
+    Ok(())
+}
+
+/// Two identities of one node establish a connection inside the process:
+/// iroh refuses a connection to this node's own endpoint id, so the same
+/// dialogue runs over a pipe (ADR-0013). Both list the connection, and a
+/// grant from one reaches the other with no peer reachable at all.
+///
+/// Denied: the invite's secret is burned by the establishment, so a
+/// replay of it is refused; and a third identity hosted beside them
+/// lists neither of them and reaches nothing of what they published.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_identities_of_one_node_establish_inside_the_process() -> Result<()> {
+    // The grant binder acts on its connection armer's sweep, whose cadence
+    // is the reconcile interval; the default one would make this scenario
+    // wait tens of seconds for an act that takes microseconds.
+    let rt = Runtime::spawn(SpawnOptions {
+        reconcile_interval: Duration::from_millis(500),
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let work = rt.identity().create().await?;
+    let leisure = rt.identity().create().await?;
+    let outsider = rt.identity().create().await?;
+
+    let invite = rt.connections().invite(work, None).await?;
+    rt.connections().establish(leisure, invite.clone()).await?;
+
+    // Both sides assembled the same connection, mirrored.
+    assert_eq!(rt.connections().list(work).await?, vec![leisure]);
+    assert_eq!(rt.connections().list(leisure).await?, vec![work]);
+
+    // A grant crosses the pair and the granted claim follows it, with no
+    // node but this one running.
+    let path = EntryPath::new("contact/email")?;
+    rt.data()
+        .write(work, work, &path, b"alice@work.example")
+        .await?;
+    granted_patiently(
+        &rt,
+        work,
+        &rt,
+        leisure,
+        work,
+        common::claims_on(work, &path, false),
+    )
+    .await?;
+    assert!(
+        eventually(|| async {
+            Ok(rt.data().read(leisure, work, &path).await?.as_deref()
+                == Some(&b"alice@work.example"[..]))
+        })
+        .await?,
+        "the granted claim did not cross between two identities of one node"
+    );
+
+    // Denied: the secret was burned by the establishment above.
+    let replayed = rt.connections().establish(outsider, invite).await;
+    assert!(
+        replayed.is_err(),
+        "a replayed invite must be refused, even from a co-located identity"
+    );
+
+    // Denied: a third identity of this node sees neither the connection
+    // nor what the two published.
+    assert!(
+        rt.connections().list(outsider).await?.is_empty(),
+        "a co-located identity must not list a connection it is not party to"
+    );
+    let unknown = rt
+        .data()
+        .read(outsider, work, &path)
+        .await
+        .expect_err("a co-located identity must not reach an issuer it holds nothing of");
+    assert!(
+        unknown.downcast_ref::<UnknownIssuer>().is_some(),
+        "the refusal did not read as an unknown issuer: {unknown:#}"
+    );
+
+    rt.shutdown().await?;
     Ok(())
 }

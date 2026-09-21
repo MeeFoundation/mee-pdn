@@ -14,7 +14,7 @@ use data_layer::{
     SyncNode, BUILT_IN_ALPNS,
 };
 use pdn_types::{EntryPath, NodeId};
-use test_utils::{ids, memory_node, wait_entry_is};
+use test_utils::{host_identity, ids, join_identity, memory_node, wait_entry_is};
 
 /// The test protocol's ALPN — deliberately not a built-in one.
 const ECHO_ALPN: &[u8] = b"/pdn-test/echo/0";
@@ -117,21 +117,34 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
         "the handler should have run and panicked"
     );
 
-    // The node survived.
-    let author = node_a.create_author().await?;
-    node_a.create_namespace(ids::ALICE).await?;
+    // The node survived: a device of Alice still catches up her data
+    // namespace from it.
+    let directory = host_identity(&node_a, ids::ALICE).await?;
+    let author = node_a.default_author(ids::ALICE)?;
+    node_a.create_namespace(ids::ALICE, ids::ALICE).await?;
     let name = EntryPath::new("contact/name")?;
-    node_a.write(ids::ALICE, author, &name, b"Alice").await?;
+    node_a
+        .write(ids::ALICE, ids::ALICE, author, &name, b"Alice")
+        .await?;
+    let directory_ticket = directory
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let sibling_dir = join_identity(&node_b, ids::ALICE, directory_ticket).await?;
+    directory.add_device(node_b.node_id()).await?;
+    sibling_dir.add_device(node_b.node_id()).await?;
     let ticket = node_a
         .share_ticket(
+            ids::ALICE,
             ids::ALICE,
             ShareMode::Read,
             AddrInfoOptions::RelayAndAddresses,
         )
         .await?;
-    node_b.import_namespace(ids::ALICE, ticket).await?;
+    node_b
+        .import_namespace(ids::ALICE, ids::ALICE, ticket)
+        .await?;
     assert!(
-        wait_entry_is(&node_b, ids::ALICE, &name, b"Alice").await?,
+        wait_entry_is(&node_b, ids::ALICE, ids::ALICE, &name, b"Alice").await?,
         "node stopped syncing after an extra handler panicked"
     );
 

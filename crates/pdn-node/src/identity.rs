@@ -89,18 +89,19 @@ impl Drop for CreateRollback {
     }
 }
 
-/// Best effort: the caller is already receiving an error.
+/// Best effort: the caller is already receiving an error. Dropping the
+/// identity's half of the node takes its replicas with it, so the two
+/// stores this create brought up need no separate undo — they are named
+/// for the case where the identity stays.
 async fn undo_create(
     node: &data_layer::SyncNode,
     identity: PdnId,
     directory_namespace: data_layer::NamespaceId,
-    hosting_armed: bool,
+    _hosting_armed: bool,
 ) {
-    if hosting_armed {
-        let _ = node.unhost_identity(identity);
-    }
-    let _ = node.forget_namespace(identity).await;
-    let _ = node.forget_doc(directory_namespace).await;
+    let _ = node.forget_namespace(identity, identity).await;
+    let _ = node.forget_doc(identity, directory_namespace).await;
+    let _ = node.unhost_identity(identity).await;
 }
 
 /// Creating and linking identities on a runtime.
@@ -150,7 +151,10 @@ impl IdentityService for RuntimeIdentityService<'_> {
             let state = self.runtime.state.lock().await;
             (Arc::clone(&state.node), state.cleanup_tasks.clone())
         };
-        let directory = PrivateMetadataStore::create(&node).await?;
+        // The identity's own half of the node first: its replicas live in
+        // that store and nowhere else (ADR-0013).
+        node.provision_identity(identity).await?;
+        let directory = PrivateMetadataStore::create(&node, identity).await?;
         // Armed as soon as there is a replica to undo.
         let mut rollback = CreateRollback::new(
             Arc::clone(&node),
@@ -163,9 +167,10 @@ impl IdentityService for RuntimeIdentityService<'_> {
             // device holds a ticket to this fresh directory, so nothing
             // written here can reach anyone.
             directory.add_device(node.node_id()).await?;
-            node.create_namespace(identity).await?;
+            node.create_namespace(identity, identity).await?;
             let data_ticket = node
                 .share_ticket(
+                    identity,
                     identity,
                     ShareMode::Write,
                     AddrInfoOptions::RelayAndAddresses,
@@ -196,9 +201,10 @@ impl IdentityService for RuntimeIdentityService<'_> {
             rollback.roll_back().await;
             return Err(err);
         }
+        let author = node.default_author(identity)?;
         state
             .identities
-            .insert(identity, HostedIdentity { directory });
+            .insert(identity, HostedIdentity { directory, author });
         drop(state);
         crate::connections::spawn_connection_armer(
             Arc::downgrade(&self.runtime.state),

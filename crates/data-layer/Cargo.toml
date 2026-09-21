@@ -6,10 +6,12 @@ publish = false
 description = "Data layer: capability-gated document sync over our iroh-docs variant"
 
 [features]
-# Extra observation surface for scenario tests, never the product:
-# `SyncNode::namespace_contacts`, the read side of the tracked contact set,
-# so a scenario can assert what the sweep derived instead of sleeping and
-# guessing. Off in every product build; `pdn-node/test-util` turns it on.
+# Extra observation surface for scenario tests, never the product: the read
+# side of the tracked contact set, the session and pass counters, and the
+# session opened under a named holder, so a scenario can assert what the
+# node derived instead of sleeping and guessing. Off in every product
+# build; `pdn-node/test-util` turns it on, and `just test -p data-layer`
+# names it directly.
 test-util = []
 
 [dependencies]

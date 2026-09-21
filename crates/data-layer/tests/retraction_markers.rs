@@ -8,12 +8,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use data_layer::{
-    AddrInfoOptions, PrivateMetadataStore, RetractionMarker, RetractionVerdict, ShareMode,
-};
+use data_layer::{AddrInfoOptions, RetractionMarker, RetractionVerdict, ShareMode};
 use iroh_blobs::Hash;
 use pdn_types::{EntryPath, NodeId, PdnId};
-use test_utils::{eventually, ids, memory_node};
+use test_utils::{eventually, host_identity, ids, memory_node};
 
 fn marker(bound: u64) -> RetractionMarker {
     RetractionMarker {
@@ -30,8 +28,8 @@ fn marker(bound: u64) -> RetractionMarker {
 #[tokio::test(flavor = "multi_thread")]
 async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
     let node = memory_node().await?;
-    let directory = PrivateMetadataStore::create(&node).await?;
-    let author = node.create_author().await?;
+    let directory = host_identity(&node, ids::ALICE).await?;
+    let author = node.default_author(ids::ALICE)?;
     let other_issuer: PdnId = ids::CAROL;
 
     directory
@@ -94,8 +92,8 @@ async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
     let node = memory_node().await?;
-    let directory = PrivateMetadataStore::create(&node).await?;
-    let author = node.create_author().await?;
+    let directory = host_identity(&node, ids::ALICE).await?;
+    let author = node.default_author(ids::ALICE)?;
 
     directory
         .record_retraction(ids::BOB, author, "contact/email", &marker(10))
@@ -165,14 +163,16 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_verdict_naming_no_local_record_is_not_honored() -> Result<()> {
     let node = memory_node().await?;
-    node.create_namespace(ids::BOB).await?;
-    let author = node.create_author().await?;
-    let stranger = node.create_author().await?;
+    let _directory = host_identity(&node, ids::ALICE).await?;
+    node.create_namespace(ids::ALICE, ids::BOB).await?;
+    let author = node.default_author(ids::ALICE)?;
+    let stranger = node.create_author(ids::ALICE).await?;
     let path = EntryPath::new("contact/email")?;
     let payload = b"alice@example.org";
-    node.write(ids::BOB, author, &path, payload).await?;
+    node.write(ids::ALICE, ids::BOB, author, &path, payload)
+        .await?;
     let namespace = node
-        .share_ticket(ids::BOB, ShareMode::Read, AddrInfoOptions::Id)
+        .share_ticket(ids::ALICE, ids::BOB, ShareMode::Read, AddrInfoOptions::Id)
         .await?
         .capability
         .id();
@@ -181,6 +181,7 @@ async fn a_verdict_naming_no_local_record_is_not_honored() -> Result<()> {
     // one thing it makes up.
     let hash = Hash::new(payload);
     let verdict = |author, key: &str, timestamp| RetractionVerdict {
+        identity: ids::ALICE,
         namespace,
         author,
         key: key.as_bytes().to_vec(),
@@ -207,7 +208,9 @@ async fn a_verdict_naming_no_local_record_is_not_honored() -> Result<()> {
     ];
     for (verdict, what) in forged {
         assert!(
-            !node.holds_rejected_entry(ids::BOB, &verdict).await?,
+            !node
+                .holds_rejected_entry(ids::ALICE, ids::BOB, &verdict)
+                .await?,
             "{what} names no entry this node holds"
         );
     }

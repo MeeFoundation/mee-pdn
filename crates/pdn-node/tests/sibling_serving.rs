@@ -51,13 +51,14 @@ async fn grant_arrives(
 /// grant the issuer resolves to nothing at all.
 async fn claim_arrives(
     reads: &Runtime,
+    acting: PdnId,
     issuer: PdnId,
     path: &EntryPath,
     expected: &[u8],
 ) -> Result<bool> {
     eventually(|| async {
         Ok(matches!(
-            reads.data().read(issuer, path).await,
+            reads.data().read(acting, issuer, path).await,
             Ok(Some(payload)) if payload == expected
         ))
     })
@@ -76,6 +77,7 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     let rt_laptop = spawn_runtime().await?;
     let rt_bob = spawn_runtime().await?;
     let rt_carol = spawn_runtime().await?;
+    let carol = rt_carol.identity().create().await?;
 
     // Alice lives on the phone; the laptop joins by the linking ceremony.
     let alice = rt_phone.identity().create().await?;
@@ -89,8 +91,14 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     establish_patiently(&rt_phone, alice, &rt_bob, bob, invite).await?;
     let email = EntryPath::new("contact/email")?;
     let withheld = EntryPath::new("contact/phone")?;
-    rt_bob.data().write(bob, &email, b"bob@example.org").await?;
-    rt_bob.data().write(bob, &withheld, b"+1-555-0100").await?;
+    rt_bob
+        .data()
+        .write(bob, bob, &email, b"bob@example.org")
+        .await?;
+    rt_bob
+        .data()
+        .write(bob, bob, &withheld, b"+1-555-0100")
+        .await?;
     rt_bob
         .connections()
         .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
@@ -98,7 +106,7 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
 
     // The binder imports what the grant names, unprompted.
     assert!(
-        claim_arrives(&rt_phone, bob, &email, b"bob@example.org").await?,
+        claim_arrives(&rt_phone, alice, bob, &email, b"bob@example.org").await?,
         "the granted claim did not reach the phone while Bob was online"
     );
 
@@ -111,16 +119,20 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
         "the grant record did not reach the laptop from its sibling"
     );
     assert!(
-        claim_arrives(&rt_laptop, bob, &email, b"bob@example.org").await?,
+        claim_arrives(&rt_laptop, alice, bob, &email, b"bob@example.org").await?,
         "the granted claim did not catch up from the sibling with the issuer offline"
     );
 
     // Denied, existence hidden: the withheld claim is absent, and the
     // laptop's view lists exactly the granted subset.
-    assert!(rt_laptop.data().read(bob, &withheld).await?.is_none());
+    assert!(rt_laptop
+        .data()
+        .read(alice, bob, &withheld)
+        .await?
+        .is_none());
     let listed: Vec<String> = rt_laptop
         .data()
-        .list(bob, None)
+        .list(alice, bob, None)
         .await?
         .into_iter()
         .map(|e| e.path.to_string())
@@ -133,14 +145,14 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
 
     // Denied, outsider: Carol's ticket is sibling-addressed and reachable,
     // and she resolves in no audience directory.
-    let leaked = rt_phone.data().share(bob, ShareMode::Read).await?;
-    rt_carol.data().import_scoped(bob, leaked).await?;
+    let leaked = rt_phone.data().share(alice, bob, ShareMode::Read).await?;
+    rt_carol.data().import_scoped(carol, bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
-        rt_carol.data().list(bob, None).await?.is_empty(),
+        rt_carol.data().list(carol, bob, None).await?.is_empty(),
         "a sibling-minted ticket without audience membership must deliver nothing"
     );
-    assert!(rt_carol.data().read(bob, &email).await?.is_none());
+    assert!(rt_carol.data().read(carol, bob, &email).await?.is_none());
 
     rt_phone.shutdown().await?;
     rt_laptop.shutdown().await?;
@@ -159,19 +171,23 @@ async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()>
     let rt_laptop = spawn_runtime().await?;
     let rt_bob = spawn_runtime().await?;
     let rt_carol = spawn_runtime().await?;
+    let carol = rt_carol.identity().create().await?;
 
     let alice = rt_phone.identity().create().await?;
     let bob = rt_bob.identity().create().await?;
     let invite = rt_bob.connections().invite(bob, None).await?;
     establish_patiently(&rt_phone, alice, &rt_bob, bob, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_bob.data().write(bob, &email, b"bob@example.org").await?;
+    rt_bob
+        .data()
+        .write(bob, bob, &email, b"bob@example.org")
+        .await?;
     rt_bob
         .connections()
         .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
         .await?;
     assert!(
-        claim_arrives(&rt_phone, bob, &email, b"bob@example.org").await?,
+        claim_arrives(&rt_phone, alice, bob, &email, b"bob@example.org").await?,
         "the granted claim did not reach the phone while Bob was online"
     );
 
@@ -190,19 +206,19 @@ async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()>
         "the grant record did not reach the laptop from its sibling"
     );
     assert!(
-        claim_arrives(&rt_laptop, bob, &email, b"bob@example.org").await?,
+        claim_arrives(&rt_laptop, alice, bob, &email, b"bob@example.org").await?,
         "the granted claim did not catch up from the sibling with the issuer offline"
     );
 
     // Denied, outsider.
-    let leaked = rt_phone.data().share(bob, ShareMode::Read).await?;
-    rt_carol.data().import_scoped(bob, leaked).await?;
+    let leaked = rt_phone.data().share(alice, bob, ShareMode::Read).await?;
+    rt_carol.data().import_scoped(carol, bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
-        rt_carol.data().list(bob, None).await?.is_empty(),
+        rt_carol.data().list(carol, bob, None).await?.is_empty(),
         "a sibling-minted ticket without audience membership must deliver nothing"
     );
-    assert!(rt_carol.data().read(bob, &email).await?.is_none());
+    assert!(rt_carol.data().read(carol, bob, &email).await?.is_none());
 
     rt_phone.shutdown().await?;
     rt_laptop.shutdown().await?;
@@ -224,13 +240,16 @@ async fn a_withdrawn_grant_takes_the_namespace_back_out() -> Result<()> {
     establish_patiently(&rt_alice, alice, &rt_bob, bob, invite).await?;
 
     let email = EntryPath::new("contact/email")?;
-    rt_bob.data().write(bob, &email, b"bob@example.org").await?;
+    rt_bob
+        .data()
+        .write(bob, bob, &email, b"bob@example.org")
+        .await?;
     rt_bob
         .connections()
         .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
         .await?;
     assert!(
-        claim_arrives(&rt_alice, bob, &email, b"bob@example.org").await?,
+        claim_arrives(&rt_alice, alice, bob, &email, b"bob@example.org").await?,
         "the granted claim did not reach Alice"
     );
 
@@ -238,10 +257,86 @@ async fn a_withdrawn_grant_takes_the_namespace_back_out() -> Result<()> {
     // imported, and the issuer resolves to nothing again.
     rt_bob.connections().withdraw_grant(bob, alice, bob).await?;
     assert!(
-        eventually(|| async { Ok(rt_alice.data().read(bob, &email).await.is_err()) }).await?,
+        eventually(|| async { Ok(rt_alice.data().read(alice, bob, &email).await.is_err()) })
+            .await?,
         "the withdrawn namespace was still bound on Alice"
     );
 
+    rt_alice.shutdown().await?;
+    rt_bob.shutdown().await?;
+    Ok(())
+}
+
+/// A namespace imported out of band stays readable to the identity that
+/// imported it and is re-served to nobody: neither an identity hosted
+/// beside it on the same node nor an outsider, both holding the very
+/// ticket the import used, obtains anything from it (D17).
+///
+/// Denied: both probe over several of their own reconcile intervals,
+/// ordered after the importer's own read proves the entries are here to
+/// be served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_imported_out_of_band_is_re_served_to_nobody() -> Result<()> {
+    let rt_bob = spawn_runtime().await?;
+    let rt_alice = spawn_runtime().await?;
+    let rt_outsider = spawn_runtime().await?;
+    let bob = rt_bob.identity().create().await?;
+    let work = rt_alice.identity().create().await?;
+    let leisure = rt_alice.identity().create().await?;
+    let outsider = rt_outsider.identity().create().await?;
+
+    // Bob grants Alice-at-work one claim, so the ticket the grant carries
+    // is one she may use; the import is the out-of-band act.
+    let email = EntryPath::new("contact/email")?;
+    rt_bob
+        .data()
+        .write(bob, bob, &email, b"bob@example.org")
+        .await?;
+    let invite = rt_bob.connections().invite(bob, None).await?;
+    establish_patiently(&rt_alice, work, &rt_bob, bob, invite).await?;
+    rt_bob
+        .connections()
+        .publish_grant(bob, work, bob, common::claims_on(bob, &email, false))
+        .await?;
+    let ticket = rt_bob.data().share(bob, bob, ShareMode::Read).await?;
+    rt_alice.data().import(work, bob, ticket.clone()).await?;
+
+    // Allowed: the importing identity reads what it obtained.
+    assert!(
+        eventually(|| async {
+            Ok(rt_alice.data().read(work, bob, &email).await?.as_deref()
+                == Some(&b"bob@example.org"[..]))
+        })
+        .await?,
+        "the importing identity must read the namespace it imported"
+    );
+
+    // Denied: a co-located identity and an outsider, both holding that
+    // very ticket, aimed at the importer's own node.
+    let mut aimed = ticket;
+    aimed.nodes = vec![rt_alice.sync().dial_handle_for_test().await.addr()];
+    rt_alice.data().import(leisure, bob, aimed.clone()).await?;
+    rt_outsider.data().import(outsider, bob, aimed).await?;
+    tokio::time::sleep(RECONCILE * 3).await;
+    for (runtime, identity) in [(&rt_alice, leisure), (&rt_outsider, outsider)] {
+        assert!(
+            runtime.data().list(identity, bob, None).await?.is_empty(),
+            "an out-of-band import must be re-served to nobody: {identity} listed entries"
+        );
+        assert!(
+            runtime.data().read(identity, bob, &email).await?.is_none(),
+            "an out-of-band import must be re-served to nobody: {identity} read an entry"
+        );
+    }
+
+    // And the importer still reads it, so the denials above are the
+    // classification's doing and not a replica that went away.
+    assert_eq!(
+        rt_alice.data().read(work, bob, &email).await?.as_deref(),
+        Some(&b"bob@example.org"[..])
+    );
+
+    rt_outsider.shutdown().await?;
     rt_alice.shutdown().await?;
     rt_bob.shutdown().await?;
     Ok(())

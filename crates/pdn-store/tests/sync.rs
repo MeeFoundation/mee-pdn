@@ -308,8 +308,9 @@ async fn sync_gossip_bulk() -> Result<()> {
 
     let now = Instant::now();
     let mut count = 0;
-    doc0.start_sync(vec![]).await?;
-    doc1.start_sync(peers).await?;
+    doc0.start_sync(vec![], util::TEST_HOLDER).await?;
+    doc1.start_sync(util::contacts(peers), util::TEST_HOLDER)
+        .await?;
     while let Ok(event) = events.try_next().await {
         let event = event.unwrap();
         if matches!(event, LiveEvent::InsertRemote { .. }) {
@@ -578,7 +579,7 @@ async fn sync_leave_gossip_keeps_sync_running() -> Result<()> {
     // Leaving the swarm of a doc that never joined one is a no-op.
     doc.leave_gossip().await?;
 
-    doc.start_sync(vec![]).await?;
+    doc.start_sync(vec![], util::TEST_HOLDER).await?;
     let sub = doc.subscribe().await?;
     let status = doc.status().await?;
     assert!(status.sync);
@@ -599,7 +600,7 @@ async fn sync_leave_gossip_keeps_sync_running() -> Result<()> {
     doc.set_bytes(author, b"k".to_vec(), b"v".to_vec()).await?;
 
     // A later gossip-joining start_sync re-subscribes without error.
-    doc.start_sync(vec![]).await?;
+    doc.start_sync(vec![], util::TEST_HOLDER).await?;
     let status = doc.status().await?;
     assert!(status.sync);
 
@@ -622,7 +623,7 @@ async fn sync_subscribe_stop_close() -> Result<()> {
     assert_eq!(status.handles, 1);
     assert!(!status.sync);
 
-    doc.start_sync(vec![]).await?;
+    doc.start_sync(vec![], util::TEST_HOLDER).await?;
     let status = doc.status().await?;
     assert!(status.sync);
     assert_eq!(status.handles, 2);
@@ -849,7 +850,7 @@ async fn sync_restart_node() -> Result<()> {
     assert_latest(blobs1, &doc1, b"n2/a", b"a").await;
 
     // check that initial resync is working
-    doc1.start_sync(vec![]).await?;
+    doc1.start_sync(vec![], util::TEST_HOLDER).await?;
     assert_next_unordered_with_optionals(
         &mut events1,
         Duration::from_secs(10),
@@ -1114,7 +1115,8 @@ async fn sync_big() -> Result<()> {
     // join nodes together
     for (i, doc) in docs.iter().enumerate().skip(1) {
         info!(me = %node_ids[i].fmt_short(), peer = %peer0.id.fmt_short(), "join");
-        doc.start_sync(vec![peer0.clone()]).await?;
+        doc.start_sync(util::contacts([peer0.clone()]), util::TEST_HOLDER)
+            .await?;
     }
 
     // wait for InsertRemote events stuff to happen
@@ -1678,7 +1680,9 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
         .set_download_policy(DownloadPolicy::NothingExcept(vec![]))
         .await?;
     let mut events_relay = doc_relay.subscribe().await?;
-    doc_relay.start_sync(ticket_writer.nodes.clone()).await?;
+    doc_relay
+        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .await?;
     next_event_matching(
         &mut events_relay,
         TIMEOUT,
@@ -1722,8 +1726,10 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
     // before the fix nothing requested the parked content and it never
     // arrived; now the finished sync retries the parked hash against the
     // writer, which has the bytes.
-    doc_writer.start_sync(vec![]).await?;
-    doc_receiver.start_sync(ticket_writer.nodes.clone()).await?;
+    doc_writer.start_sync(vec![], util::TEST_HOLDER).await?;
+    doc_receiver
+        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .await?;
     next_event_matching(&mut events_receiver, TIMEOUT, |e| {
         match_sync_finished(e, writer_id)
     })

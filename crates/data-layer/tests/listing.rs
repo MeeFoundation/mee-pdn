@@ -3,7 +3,7 @@
 use anyhow::Result;
 use data_layer::UnknownIssuer;
 use pdn_types::{EntryInfo, EntryPath};
-use test_utils::{ids, memory_node};
+use test_utils::{host_identity, ids, memory_node};
 
 /// Listing yields exactly the written paths as metadata, and the prefix
 /// filter matches whole components. Paired deny: an issuer with no data
@@ -11,8 +11,9 @@ use test_utils::{ids, memory_node};
 #[tokio::test(flavor = "multi_thread")]
 async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> Result<()> {
     let node = memory_node().await?;
-    let author = node.create_author().await?;
-    node.create_namespace(ids::ALICE).await?;
+    let _directory = host_identity(&node, ids::ALICE).await?;
+    let author = node.default_author(ids::ALICE)?;
+    node.create_namespace(ids::ALICE, ids::ALICE).await?;
 
     // Payload lengths 1..=4, so the metadata is checkable per path.
     let paths = [
@@ -24,6 +25,7 @@ async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> R
     for (i, path) in paths.iter().enumerate() {
         node.write(
             ids::ALICE,
+            ids::ALICE,
             author,
             &EntryPath::new(*path)?,
             &vec![7u8; i + 1],
@@ -33,7 +35,7 @@ async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> R
 
     // Listing yields exactly the written paths, as metadata (no payload
     // bytes to compare — EntryInfo carries none — but lengths line up).
-    let mut listed = node.list(ids::ALICE, None).await?;
+    let mut listed = node.list(ids::ALICE, ids::ALICE, None).await?;
     listed.sort_by(|a, b| a.path.cmp(&b.path));
     let expected = paths
         .iter()
@@ -51,7 +53,7 @@ async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> R
     // The prefix filter matches whole components: `contact` matches
     // `contact/email` and `contact/phone`, not `contacts/emergency`.
     let filtered = node
-        .list(ids::ALICE, Some(&EntryPath::new("contact")?))
+        .list(ids::ALICE, ids::ALICE, Some(&EntryPath::new("contact")?))
         .await?;
     let mut filtered_paths: Vec<&str> = filtered.iter().map(|e| e.path.as_str()).collect();
     filtered_paths.sort_unstable();
@@ -59,7 +61,7 @@ async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> R
 
     // Paired deny: an issuer with no data store on this node is refused as
     // specifically unknown, not a generic failure.
-    let err = node.list(ids::BOB, None).await.unwrap_err();
+    let err = node.list(ids::ALICE, ids::BOB, None).await.unwrap_err();
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
 
     node.shutdown().await?;

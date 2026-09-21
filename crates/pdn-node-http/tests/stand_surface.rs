@@ -26,9 +26,9 @@ const DEBUG_ROUTES: &[(Method, &str)] = &[
     (Method::Get, "/debug/identities/aa/grants/bb"),
     (Method::Get, "/debug/identities/aa/own-grants/bb"),
     (Method::Delete, "/debug/identities/aa/grants/bb/cc"),
-    (Method::Get, "/debug/data/aa"),
-    (Method::Put, "/debug/data/aa/contact/email"),
-    (Method::Get, "/debug/data/aa/contact/email"),
+    (Method::Get, "/debug/data/aa/bb"),
+    (Method::Put, "/debug/data/aa/bb/contact/email"),
+    (Method::Get, "/debug/data/aa/bb/contact/email"),
 ];
 
 /// Without the flag the node answers liveness and readiness, and every
@@ -87,7 +87,7 @@ async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
     let oversized = vec![b'x'; MAX_REQUEST_BODY_BYTES + 1];
     let answer = node
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             Bytes::from(oversized),
         )
         .await?;
@@ -102,7 +102,7 @@ async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
     // And the entry it addressed stays absent: the refusal happened before
     // any handler, not after a partial write.
     let after = node
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
         .await?;
     assert_eq!(after.status, StatusCode::NOT_FOUND);
     Ok(())

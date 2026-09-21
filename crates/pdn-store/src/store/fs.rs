@@ -91,8 +91,8 @@ enum CurrentTransaction {
 }
 
 #[cfg(feature = "fs-store")]
-fn open_database(path: &std::path::Path) -> Result<Database> {
-    match Database::create(path) {
+fn open_database(path: &std::path::Path, cache_bytes: usize) -> Result<Database> {
+    match Database::builder().set_cache_size(cache_bytes).create(path) {
         Ok(db) => Ok(db),
         Err(redb::DatabaseError::UpgradeRequired(v)) => Err(anyhow!(
             "Opening the database failed: Upgrading from redb {v} no longer supported. Use an older redb version first."
@@ -125,10 +125,15 @@ impl Store {
     /// Create or open a store from a `path` to a database file.
     ///
     /// The file will be created if it does not exist, otherwise it will be opened.
+    ///
+    /// `cache_bytes` caps the resident pages this store holds; it does not
+    /// reserve them. The bound cannot be changed on an open store, so a
+    /// consumer that divides one budget among several stores cuts the
+    /// share before opening any of them.
     #[cfg(feature = "fs-store")]
-    pub fn persistent(path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub fn persistent(path: impl AsRef<std::path::Path>, cache_bytes: usize) -> Result<Self> {
         let path = path.as_ref();
-        let db = open_database(path)?;
+        let db = open_database(path, cache_bytes)?;
         match Self::new_impl(db) {
             Ok(store) => Ok(store),
             Err(err) if is_redb_v2_tuple_mismatch(&err) => {
@@ -136,7 +141,7 @@ impl Store {
                 {
                     info!("redb 2.x tuple format detected, running migration");
                     migrate_redb_v2_tuples::run(path)?;
-                    Self::new_impl(open_database(path)?)
+                    Self::new_impl(open_database(path, cache_bytes)?)
                 }
                 #[cfg(not(feature = "redb-v2-migration"))]
                 {
@@ -1152,10 +1157,13 @@ mod tests {
     use super::*;
     use crate::ranger::Store as _;
 
+    /// A cache big enough that nothing in a scenario evicts.
+    const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
     #[tokio::test]
     async fn test_ranges() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let mut store = Store::persistent(dbfile.path())?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
         let author = store.new_author(&mut rand::rng())?;
         let namespace = NamespaceSecret::new(&mut rand::rng());
@@ -1182,7 +1190,7 @@ mod tests {
     #[test]
     fn test_basics() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let mut store = Store::persistent(dbfile.path())?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
         let authors: Vec<_> = store.list_authors()?.collect::<Result<_>>()?;
         assert!(authors.is_empty());
@@ -1279,7 +1287,7 @@ mod tests {
 
         // create a store and add some data
         let expected = {
-            let mut store = Store::persistent(dbfile.path())?;
+            let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
             let author1 = store.new_author(&mut rand::rng())?;
             let author2 = store.new_author(&mut rand::rng())?;
             let mut replica = store.new_replica(namespace.clone())?;
@@ -1306,7 +1314,7 @@ mod tests {
         })?;
 
         // open the copied db file, which will run the migration.
-        let mut store = Store::persistent(dbfile_before_migration.path())?;
+        let mut store = Store::persistent(dbfile_before_migration.path(), TEST_CACHE_BYTES)?;
         let actual = store
             .get_latest_for_each_author(namespace.id())?
             .collect::<Result<Vec<_>>>()?;
@@ -1321,7 +1329,7 @@ mod tests {
         use redb::ReadableTableMetadata;
         let dbfile = tempfile::NamedTempFile::new()?;
 
-        let mut store = Store::persistent(dbfile.path())?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
         // check that the new table is there, even if empty
         {
@@ -1376,7 +1384,7 @@ mod tests {
             );
         }
 
-        let store = Store::persistent(&path)?;
+        let store = Store::persistent(&path, TEST_CACHE_BYTES)?;
         drop(store);
 
         let backup: std::path::PathBuf = {
@@ -1421,7 +1429,7 @@ mod tests {
     fn test_no_migration_on_fresh_store() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let path = dbfile.path().to_path_buf();
-        let store = Store::persistent(&path)?;
+        let store = Store::persistent(&path, TEST_CACHE_BYTES)?;
         drop(store);
 
         let backup: std::path::PathBuf = {
@@ -1435,7 +1443,7 @@ mod tests {
             backup.display()
         );
 
-        let _store = Store::persistent(&path)?;
+        let _store = Store::persistent(&path, TEST_CACHE_BYTES)?;
         assert!(!backup.exists());
         Ok(())
     }

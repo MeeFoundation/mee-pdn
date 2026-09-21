@@ -49,6 +49,7 @@ pub mod store;
 pub mod sync;
 
 mod heads;
+mod holder;
 mod keys;
 mod ranger;
 
@@ -56,8 +57,12 @@ mod ranger;
 pub use net::ALPN;
 
 pub use self::{
-    filter::{EntryFilter, SessionAccess, SessionAccessFuture, SessionAccessProvider, SessionRole},
+    filter::{
+        EntryFilter, SessionAccess, SessionAccessFuture, SessionAccessProvider, SessionIngest,
+        SessionRole,
+    },
     heads::*,
+    holder::{Contact, Holder},
     keys::*,
     ranger::ValidateOutcome,
     sync::*,

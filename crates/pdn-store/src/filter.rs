@@ -14,15 +14,19 @@
 //! crate: an embedder hands in opaque predicates over [`SignedEntry`]
 //! through a [`SessionAccessProvider`], consulted per session on both
 //! session roles — accepting an incoming sync request and dialing out —
-//! because both ends of a reconciliation serve entries.
+//! because both ends of a reconciliation serve entries. The provider sees
+//! the [`Holder`] whose replica the session addresses and the one its
+//! caller acts for, so a node hosting several holders judges each session
+//! by the one named in it.
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use iroh::PublicKey;
 
 use crate::{
+    holder::Holder,
     keys::NamespaceId,
-    ranger::{Fingerprint, Range, RangeEntry, Store},
+    ranger::{Fingerprint, Range, RangeEntry, Store, ValidateOutcome},
     store::PublicKeyStore,
     sync::{RecordIdentifier, SignedEntry},
 };
@@ -31,23 +35,50 @@ use crate::{
 /// view. Must be cheap — it runs on every entry a range scan touches.
 pub type EntryFilter = Arc<dyn Fn(&SignedEntry) -> bool + Send + Sync + 'static>;
 
-/// What one session may see of a replica, decided per (namespace, peer) at
-/// session setup and frozen for the session.
+/// Per-session ingest verdict on an entry the peer offers. Runs on every
+/// entry a session carries, so it must be cheap.
+///
+/// It rides the session the way [`EntryFilter`] does, which is what makes
+/// a write set frozen at setup hold for that session and no longer: a
+/// verdict kept beside the session instead would outlive it and admit,
+/// under a grant already withdrawn, what a later session offers.
+pub type SessionIngest = Arc<dyn Fn(&SignedEntry) -> ValidateOutcome + Send + Sync + 'static>;
+
+/// What one session may see of a replica and what it may put into it,
+/// decided at session setup and frozen for the session.
 #[derive(Clone)]
 pub enum SessionAccess {
-    /// The peer sees the replica whole.
-    Full,
-    /// The peer sees only the entries the filter admits.
-    Filtered(EntryFilter),
+    /// The session proceeds. `egress` narrows what this side reveals —
+    /// `None` reveals the replica whole — and `ingest` judges every entry
+    /// the peer offers; `None` leaves that to the consumer's validator.
+    Allow {
+        /// What this side reveals; `None` reveals the replica whole.
+        egress: Option<EntryFilter>,
+        /// What this side admits; `None` leaves it to the validator.
+        ingest: Option<SessionIngest>,
+    },
     /// No session: reject as if the replica were not hosted here.
     Deny,
+}
+
+impl SessionAccess {
+    /// The whole replica out, and the consumer's validator alone in.
+    pub fn whole() -> Self {
+        Self::Allow {
+            egress: None,
+            ingest: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionAccess::Full => write!(f, "Full"),
-            SessionAccess::Filtered(_) => write!(f, "Filtered(..)"),
+            SessionAccess::Allow { egress, ingest } => f
+                .debug_struct("Allow")
+                .field("egress", &egress.as_ref().map(|_| "filtered"))
+                .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .finish(),
             SessionAccess::Deny => write!(f, "Deny"),
         }
     }
@@ -71,10 +102,28 @@ pub enum SessionRole {
 pub type SessionAccessFuture = Pin<Box<dyn Future<Output = SessionAccess> + Send + 'static>>;
 
 /// Decides, per session, what a peer may see of a namespace. Consulted on
-/// both session roles. `None` (provider unset) keeps every session
-/// [`SessionAccess::Full`] — vanilla iroh-docs behaviour.
-pub type SessionAccessProvider =
-    Arc<dyn Fn(NamespaceId, PublicKey, SessionRole) -> SessionAccessFuture + Send + Sync + 'static>;
+/// both session roles, with the [`Holder`] whose replica the session
+/// addresses and the one its caller acts for beside the peer's node id:
+/// the verdict follows those two alone and is never widened by another
+/// holder the same node id resolves to.
+///
+/// Required of every assembly: without one a consumer would serve
+/// sessions it never judged. [`serve_whole`] is what a suite names when it
+/// wants upstream's unjudged behaviour.
+pub type SessionAccessProvider = Arc<
+    dyn Fn(NamespaceId, Holder, Holder, PublicKey, SessionRole) -> SessionAccessFuture
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// A provider that judges nothing: every session sees the replica whole.
+/// Named rather than defaulted, so an assembly that wants it says so.
+pub fn serve_whole() -> SessionAccessProvider {
+    Arc::new(|_namespace, _holder, _caller, _peer, _role| {
+        Box::pin(std::future::ready(SessionAccess::whole()))
+    })
+}
 
 /// A replica store narrowed to one session's view.
 ///
@@ -255,7 +304,13 @@ mod tests {
 
     #[test]
     fn session_access_debug_is_opaque() {
-        let access = SessionAccess::Filtered(Arc::new(|_| true));
-        assert_eq!(format!("{access:?}"), "Filtered(..)");
+        let access = SessionAccess::Allow {
+            egress: Some(Arc::new(|_| true)),
+            ingest: None,
+        };
+        assert_eq!(
+            format!("{access:?}"),
+            r#"Allow { egress: Some("filtered"), ingest: None }"#
+        );
     }
 }

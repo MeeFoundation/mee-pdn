@@ -58,11 +58,28 @@ impl RuntimeSyncService<'_> {
     }
 
     /// The only anchor for a cancelled establishment: its own-replica has
-    /// no handle a scenario can check by.
+    /// no handle a scenario can check by. Counted for the identity the
+    /// establishment was run as, since every replica sits in one.
     #[cfg(feature = "test-util")]
-    pub async fn tracked_doc_count(&self) -> Result<usize> {
+    pub async fn tracked_doc_count(&self, identity: PdnId) -> Result<usize> {
         let state = self.runtime.state.lock().await;
-        state.node.tracked_doc_count()
+        state.node.tracked_doc_count(identity)
+    }
+
+    /// The issuer and path of every retraction marker in `identity`'s own
+    /// directory — what shows a verdict was recorded there and in no
+    /// co-located identity's.
+    #[cfg(feature = "test-util")]
+    pub async fn retraction_markers(&self, identity: PdnId) -> Result<Vec<(PdnId, String)>> {
+        let state = self.runtime.state.lock().await;
+        Ok(state
+            .hosted(identity)?
+            .directory
+            .list_retractions()
+            .await?
+            .into_iter()
+            .map(|(issuer, _author, path, _marker)| (issuer, path))
+            .collect())
     }
 
     #[cfg(feature = "test-util")]

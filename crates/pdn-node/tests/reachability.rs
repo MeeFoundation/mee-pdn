@@ -10,7 +10,9 @@
 use std::{cell::RefCell, time::Duration};
 
 use anyhow::{ensure, Context, Result};
-use data_layer::{own_ticket_kind, ConnectionMetadataStore, PrivateMetadataStore, SyncNode};
+use data_layer::{
+    own_ticket_kind, peer_ticket_kind, ConnectionMetadataStore, PrivateMetadataStore, SyncNode,
+};
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, Runtime, ShareMode,
     SpawnOptions, UnknownIssuer,
@@ -33,20 +35,30 @@ async fn spawn_runtime() -> Result<Runtime> {
 
 /// Whether `device` is among the tracked contacts of `issuer`'s replica on
 /// `rt` — the observation the sweep's derivation is asserted through.
-async fn contact_present(rt: &Runtime, issuer: PdnId, device: NodeId) -> Result<bool> {
-    Ok(rt.data().contacts_of(issuer).await?.contains(&device))
+async fn contact_present(
+    rt: &Runtime,
+    acting: PdnId,
+    issuer: PdnId,
+    device: NodeId,
+) -> Result<bool> {
+    Ok(rt
+        .data()
+        .contacts_of(acting, issuer)
+        .await?
+        .contains(&device))
 }
 
 /// Poll until `rt` reads `expected` at `path` under `issuer`.
 async fn claim_arrives(
     rt: &Runtime,
+    acting: PdnId,
     issuer: PdnId,
     path: &EntryPath,
     expected: &[u8],
 ) -> Result<bool> {
     eventually(|| async {
         Ok(matches!(
-            rt.data().read(issuer, path).await,
+            rt.data().read(acting, issuer, path).await,
             Ok(Some(payload)) if payload == expected
         ))
     })
@@ -54,36 +66,44 @@ async fn claim_arrives(
 }
 
 /// Tombstone `device`'s published record in the issuer's own store toward
-/// `peer`, from a probe that imports the store from the directory's write
-/// ticket — where the product's own withdrawal would go.
+/// `peer`, from a probe that opens the pair from the directory's tickets —
+/// where the product's own withdrawal would go.
 async fn withdraw_device_toward(
     node: &SyncNode,
+    identity: PdnId,
     directory: &PrivateMetadataStore,
     peer: PdnId,
     device: NodeId,
 ) -> Result<()> {
-    let own_kind = own_ticket_kind(&peer);
-    // Accumulated inside the poll: a second read after it is not the same
-    // read.
+    let own = ticket_patiently(directory, &own_ticket_kind(&peer)).await?;
+    let counterpart = ticket_patiently(directory, &peer_ticket_kind(&peer)).await?;
+    let own_store = ConnectionMetadataStore::import(node, identity, own).await?;
+    let peer_store = ConnectionMetadataStore::import(node, identity, counterpart).await?;
+    // Registered as a device of the identity registers a pair it opens
+    // from its directory: a replica no registration covers is judged by
+    // nothing, so the tombstone would never leave this node (ADR-0013).
+    node.host_connection(identity, peer, &own_store, &peer_store)?;
+    own_store.withdraw_device(device).await
+}
+
+/// Poll `directory` until the ticket of `kind` is readable, handing back
+/// the one the poll observed: a second read after it is not the same read.
+async fn ticket_patiently(
+    directory: &PrivateMetadataStore,
+    kind: &str,
+) -> Result<data_layer::DocTicket> {
     let observed = RefCell::new(None);
     let arrived = eventually(|| async {
-        let found = directory.get_ticket(&own_kind).await?;
+        let found = directory.get_ticket(kind).await?;
         let seen = found.is_some();
         *observed.borrow_mut() = found;
         Ok(seen)
     })
     .await?;
-    ensure!(
-        arrived,
-        "the pair's own-store ticket did not reach the probe's directory"
-    );
-    let own_ticket = observed
+    ensure!(arrived, "the pair's {kind} ticket did not reach the probe");
+    observed
         .into_inner()
-        .context("the poll reported the ticket and handed back nothing")?;
-    ConnectionMetadataStore::import(node, own_ticket)
-        .await?
-        .withdraw_device(device)
-        .await
+        .context("the poll reported the ticket and handed back nothing")
 }
 
 /// Poll until the grant record is readable on `rt` — waited on before the
@@ -111,6 +131,7 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     let rt_laptop = spawn_runtime().await?;
     let rt_bob = spawn_runtime().await?;
     let rt_carol = spawn_runtime().await?;
+    let carol = rt_carol.identity().create().await?;
 
     let alice = rt_phone.identity().create().await?;
     link_patiently(&rt_laptop, &rt_phone, alice).await?;
@@ -122,10 +143,10 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     // first alone, published from the phone.
     let email = EntryPath::new("contact/email")?;
     let withheld = EntryPath::new("contact/phone")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     rt_phone
         .data()
-        .write(alice, &withheld, b"+1-555-0100")
+        .write(alice, alice, &withheld, b"+1-555-0100")
         .await?;
     granted_patiently(
         &rt_phone,
@@ -140,16 +161,16 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     // The sweep counts the laptop among Bob's contacts — the route the rest
     // stands on.
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v1").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?,
         "the granted claim did not reach the audience while the phone was up"
     );
     assert!(
-        claim_arrives(&rt_laptop, alice, &email, b"v1").await?,
+        claim_arrives(&rt_laptop, alice, alice, &email, b"v1").await?,
         "the claim did not replicate to the laptop"
     );
     let laptop_id = rt_laptop.node_id();
     assert!(
-        eventually(|| async { contact_present(&rt_bob, alice, laptop_id).await }).await?,
+        eventually(|| async { contact_present(&rt_bob, bob, alice, laptop_id).await }).await?,
         "the issuer's other device never entered the audience replica's contacts"
     );
     assert!(
@@ -159,19 +180,19 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
 
     // The phone goes offline; the update is written on the laptop alone.
     rt_phone.shutdown().await?;
-    rt_laptop.data().write(alice, &email, b"v2").await?;
+    rt_laptop.data().write(alice, alice, &email, b"v2").await?;
 
     // The audience converges from the device that did not publish the grant.
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v2").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v2").await?,
         "the audience did not converge from the issuer's other device"
     );
 
     // Existence hidden, after proven convergence: exactly the granted subset.
-    assert!(rt_bob.data().read(alice, &withheld).await?.is_none());
+    assert!(rt_bob.data().read(bob, alice, &withheld).await?.is_none());
     let listed: Vec<String> = rt_bob
         .data()
-        .list(alice, None)
+        .list(bob, alice, None)
         .await?
         .into_iter()
         .map(|e| e.path.to_string())
@@ -183,14 +204,17 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     );
 
     // Denied, outsider.
-    let leaked = rt_laptop.data().share(alice, ShareMode::Read).await?;
-    rt_carol.data().import_scoped(alice, leaked).await?;
+    let leaked = rt_laptop
+        .data()
+        .share(alice, alice, ShareMode::Read)
+        .await?;
+    rt_carol.data().import_scoped(carol, alice, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
-        rt_carol.data().list(alice, None).await?.is_empty(),
+        rt_carol.data().list(carol, alice, None).await?.is_empty(),
         "a bare ticket holder must get nothing from the serving sibling"
     );
-    assert!(rt_carol.data().read(alice, &email).await?.is_none());
+    assert!(rt_carol.data().read(carol, alice, &email).await?.is_none());
 
     rt_laptop.shutdown().await?;
     rt_bob.shutdown().await?;
@@ -215,7 +239,7 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     let invite = rt_laptop.connections().invite(alice, None).await?;
     establish_patiently(&rt_bob, bob, &rt_laptop, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_laptop.data().write(alice, &email, b"v1").await?;
+    rt_laptop.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_laptop,
         alice,
@@ -227,16 +251,16 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     .await?;
 
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v1").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?,
         "the granted claim did not reach the audience while the laptop was up"
     );
     assert!(
-        claim_arrives(&rt_phone, alice, &email, b"v1").await?,
+        claim_arrives(&rt_phone, alice, alice, &email, b"v1").await?,
         "the claim did not replicate to the founder"
     );
     let phone_id = rt_phone.node_id();
     assert!(
-        eventually(|| async { contact_present(&rt_bob, alice, phone_id).await }).await?,
+        eventually(|| async { contact_present(&rt_bob, bob, alice, phone_id).await }).await?,
         "the founder never entered the audience replica's contacts"
     );
     assert!(
@@ -246,9 +270,9 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
 
     // The publishing device goes offline; the founder writes the update.
     rt_laptop.shutdown().await?;
-    rt_phone.data().write(alice, &email, b"v2").await?;
+    rt_phone.data().write(alice, alice, &email, b"v2").await?;
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v2").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v2").await?,
         "the audience did not converge from the founder past the publishing laptop"
     );
 
@@ -341,7 +365,7 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
     let invite = rt_phone.connections().invite(alice, None).await?;
     establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -352,7 +376,7 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
     )
     .await?;
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v1").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?,
         "the granted claim did not reach the audience"
     );
 
@@ -360,11 +384,11 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
     link_patiently(&rt_laptop, &rt_phone, alice).await?;
     let laptop_id = rt_laptop.node_id();
     assert!(
-        eventually(|| async { contact_present(&rt_bob, alice, laptop_id).await }).await?,
+        eventually(|| async { contact_present(&rt_bob, bob, alice, laptop_id).await }).await?,
         "the late-linked device never entered the audience replica's contacts"
     );
     assert!(
-        claim_arrives(&rt_laptop, alice, &email, b"v1").await?,
+        claim_arrives(&rt_laptop, alice, alice, &email, b"v1").await?,
         "the claim did not replicate to the late-linked laptop"
     );
     assert!(
@@ -374,9 +398,9 @@ async fn a_device_linked_after_the_import_is_dialed_too() -> Result<()> {
 
     // And it serves.
     rt_phone.shutdown().await?;
-    rt_laptop.data().write(alice, &email, b"v2").await?;
+    rt_laptop.data().write(alice, alice, &email, b"v2").await?;
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v2").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v2").await?,
         "the audience did not converge from the late-linked device"
     );
 
@@ -400,7 +424,7 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
     let invite = rt_phone.connections().invite(alice, None).await?;
     establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -416,8 +440,8 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
     let laptop_id = rt_laptop.node_id();
     assert!(
         eventually(|| async {
-            Ok(contact_present(&rt_bob, alice, phone_id).await?
-                && contact_present(&rt_bob, alice, laptop_id).await?)
+            Ok(contact_present(&rt_bob, bob, alice, phone_id).await?
+                && contact_present(&rt_bob, bob, alice, laptop_id).await?)
         })
         .await?,
         "both issuer devices must be contacts before the withdrawal"
@@ -425,13 +449,13 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
 
     // The withdrawal.
     let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
-    withdraw_device_toward(&probe_node, &probe_dir, bob, laptop_id).await?;
+    withdraw_device_toward(&probe_node, alice, &probe_dir, bob, laptop_id).await?;
 
     // Dropped from the re-derived set; the published one stays.
     assert!(
         eventually(|| async {
-            Ok(!contact_present(&rt_bob, alice, laptop_id).await?
-                && contact_present(&rt_bob, alice, phone_id).await?)
+            Ok(!contact_present(&rt_bob, bob, alice, laptop_id).await?
+                && contact_present(&rt_bob, bob, alice, phone_id).await?)
         })
         .await?,
         "the withdrawn device did not leave the audience replica's contacts"
@@ -463,8 +487,14 @@ async fn each_granted_replica_keeps_its_own_contact_set() -> Result<()> {
     let invite = rt_carol.connections().invite(carol, None).await?;
     establish_patiently(&rt_bob, bob, &rt_carol, carol, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"from-alice").await?;
-    rt_carol.data().write(carol, &email, b"from-carol").await?;
+    rt_phone
+        .data()
+        .write(alice, alice, &email, b"from-alice")
+        .await?;
+    rt_carol
+        .data()
+        .write(carol, carol, &email, b"from-carol")
+        .await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -483,23 +513,23 @@ async fn each_granted_replica_keeps_its_own_contact_set() -> Result<()> {
         common::claims_on(carol, &email, false),
     )
     .await?;
-    assert!(claim_arrives(&rt_bob, alice, &email, b"from-alice").await?);
-    assert!(claim_arrives(&rt_bob, carol, &email, b"from-carol").await?);
+    assert!(claim_arrives(&rt_bob, bob, alice, &email, b"from-alice").await?);
+    assert!(claim_arrives(&rt_bob, bob, carol, &email, b"from-carol").await?);
 
     // Alice publishes a further device.
     link_patiently(&rt_laptop, &rt_phone, alice).await?;
     let laptop_id = rt_laptop.node_id();
     assert!(
-        eventually(|| async { contact_present(&rt_bob, alice, laptop_id).await }).await?,
+        eventually(|| async { contact_present(&rt_bob, bob, alice, laptop_id).await }).await?,
         "the new device never entered its own peer's replica contacts"
     );
 
     // Scoped to the pair the grant came through.
     assert!(
-        !contact_present(&rt_bob, carol, laptop_id).await?,
+        !contact_present(&rt_bob, bob, carol, laptop_id).await?,
         "another counterparty's device must not enter this replica's contacts"
     );
-    assert!(!contact_present(&rt_bob, alice, rt_carol.node_id()).await?);
+    assert!(!contact_present(&rt_bob, bob, alice, rt_carol.node_id()).await?);
 
     rt_phone.shutdown().await?;
     rt_laptop.shutdown().await?;
@@ -508,13 +538,16 @@ async fn each_granted_replica_keeps_its_own_contact_set() -> Result<()> {
     Ok(())
 }
 
-/// Two hosted audiences granted by one issuer bind one replica, so its
-/// contact set is the union of both audiences' siblings — one binder's
-/// sweep must not strip the other's devices. The boundary: a third
-/// co-hosted identity holding no grant of this issuer (the tightest
-/// unauthorized party for a set keyed by issuer) stays out.
+/// Two audiences granted by one issuer and hosted together keep a
+/// replica each, and each replica's contacts are the issuer's devices
+/// and that audience's own siblings — never the other's (ADR-0013).
+///
+/// Denied: neither audience's replica lists the other's sibling, and a
+/// third identity hosted beside them with no grant of this issuer
+/// reaches nothing of it at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
+#[allow(clippy::too_many_lines)] // one scenario, both audiences and both denials in one place
+async fn audiences_hosted_together_keep_separate_replicas() -> Result<()> {
     let rt_x = spawn_runtime().await?;
     let rt_second_of_x = spawn_runtime().await?;
     let rt_shared = spawn_runtime().await?;
@@ -538,7 +571,7 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
     let invite = rt_x.connections().invite(x, None).await?;
     establish_patiently(&rt_shared, z, &rt_x, x, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_x.data().write(x, &email, b"v1").await?;
+    rt_x.data().write(x, x, &email, b"v1").await?;
     granted_patiently(
         &rt_x,
         x,
@@ -557,27 +590,46 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
         common::claims_on(x, &email, false),
     )
     .await?;
-    assert!(claim_arrives(&rt_shared, x, &email, b"v1").await?);
 
-    // Both audiences' siblings at once, and kept: a per-identity set would
-    // let each binder's sweep strip the other's.
+    // Allowed: each audience reads the claim out of a replica of its own.
+    assert!(claim_arrives(&rt_shared, y, x, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_shared, z, x, &email, b"v1").await?);
+
+    // Each replica is dialed toward the issuer's devices and that
+    // audience's own siblings.
     let second_of_x = rt_second_of_x.node_id();
     let sibling_of_y = rt_sibling_of_y.node_id();
     let sibling_of_z = rt_sibling_of_z.node_id();
     assert!(
         eventually(|| async {
-            Ok(contact_present(&rt_shared, x, second_of_x).await?
-                && contact_present(&rt_shared, x, sibling_of_y).await?
-                && contact_present(&rt_shared, x, sibling_of_z).await?)
+            Ok(contact_present(&rt_shared, y, x, second_of_x).await?
+                && contact_present(&rt_shared, y, x, sibling_of_y).await?
+                && contact_present(&rt_shared, z, x, second_of_x).await?
+                && contact_present(&rt_shared, z, x, sibling_of_z).await?)
         })
         .await?,
-        "the shared replica's contacts must union the issuer's devices and both audiences' siblings"
+        "each replica must be dialed toward the issuer's devices and its own audience's siblings"
     );
 
-    // The boundary, probed after the sweeps the positive waited for.
+    // Denied: the co-located audience's siblings, and an identity hosted
+    // beside them holding no grant. Probed after the sweeps the positive
+    // waited for.
     assert!(
-        !contact_present(&rt_shared, x, rt_sibling_of_w.node_id()).await?,
-        "a co-hosted identity with no grant of this issuer must not lend its devices to the replica"
+        !contact_present(&rt_shared, y, x, sibling_of_z).await?,
+        "one audience's replica must not be dialed toward the other audience's sibling"
+    );
+    assert!(
+        !contact_present(&rt_shared, z, x, sibling_of_y).await?,
+        "one audience's replica must not be dialed toward the other audience's sibling"
+    );
+    let unbound = rt_shared
+        .data()
+        .read(w, x, &email)
+        .await
+        .expect_err("an identity with no grant of this issuer must reach nothing of it");
+    assert!(
+        unbound.downcast_ref::<UnknownIssuer>().is_some(),
+        "the refusal did not read as an unknown issuer: {unbound:#}"
     );
 
     rt_x.shutdown().await?;
@@ -589,13 +641,20 @@ async fn audiences_hosted_together_keep_both_sibling_sets() -> Result<()> {
     Ok(())
 }
 
-/// An issuer device leaves the contact set only when no bound pair
-/// publishes it: the replica's issuer devices are what every bound pair
-/// publishes, not what the last-swept pair says alone, since pairs
-/// replicate independently. Asserted where the readings differ: tombstoned
-/// in one pair only, the device stays; withdrawn in both, it goes.
+/// An issuer device leaves the contacts of the replica whose connection
+/// stopped publishing it, and of that one alone: each audience holds its
+/// own replica, dialed from its own connection's published device set
+/// (ADR-0013).
+///
+/// Denied: the device withdrawn in one audience's pair stays a contact of
+/// the co-located audience's replica, whose pair still publishes it. The
+/// withdrawal is asserted only once the audience node's copy of that pair
+/// has demonstrably stopped publishing the device and a sweep has run
+/// against that state — otherwise the assertion could read a set derived
+/// before the tombstone.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Result<()> {
+async fn an_issuer_device_leaves_the_contacts_of_the_pair_that_stopped_publishing_it() -> Result<()>
+{
     let rt_phone = spawn_runtime().await?;
     let rt_laptop = spawn_runtime().await?;
     let rt_shared = spawn_runtime().await?;
@@ -611,7 +670,7 @@ async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Resul
     let invite = rt_phone.connections().invite(alice, None).await?;
     establish_patiently(&rt_shared, z, &rt_phone, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -630,21 +689,24 @@ async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Resul
         common::claims_on(alice, &email, false),
     )
     .await?;
-    assert!(claim_arrives(&rt_shared, alice, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_shared, y, alice, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_shared, z, alice, &email, b"v1").await?);
 
-    // The laptop is a contact first — the state the withdrawals act on.
+    // The laptop is a contact of both replicas first — the state the
+    // withdrawal acts on.
     let laptop_id = rt_laptop.node_id();
     assert!(
-        eventually(|| async { contact_present(&rt_shared, alice, laptop_id).await }).await?,
-        "the issuer's other device must be a contact before the withdrawals"
+        eventually(|| async {
+            Ok(contact_present(&rt_shared, y, alice, laptop_id).await?
+                && contact_present(&rt_shared, z, alice, laptop_id).await?)
+        })
+        .await?,
+        "the issuer's other device must be a contact of both replicas before the withdrawal"
     );
 
-    // Withdrawn toward Y alone: Y's pair demonstrably stops publishing the
-    // device, a sweep of exactly that pair runs against the tombstoned
-    // state, and only then is the union asserted — otherwise the assertion
-    // could read a set derived before the tombstone.
+    // Withdrawn toward Y alone.
     let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
-    withdraw_device_toward(&probe_node, &probe_dir, y, laptop_id).await?;
+    withdraw_device_toward(&probe_node, alice, &probe_dir, y, laptop_id).await?;
     assert!(
         eventually(|| async {
             Ok(!rt_shared
@@ -658,16 +720,18 @@ async fn an_issuer_device_leaves_only_when_no_bound_pair_publishes_it() -> Resul
     );
     rt_shared.connections().sweep_pair_now(y, alice).await?;
     assert!(
-        contact_present(&rt_shared, alice, laptop_id).await?,
-        "a device withdrawn in one audience's pair must stay while another's pair publishes it"
+        eventually(|| async { Ok(!contact_present(&rt_shared, y, alice, laptop_id).await?) })
+            .await?,
+        "the device did not leave the contacts of the replica whose pair stopped publishing it"
     );
 
-    // Withdrawn in the pair toward Z as well: no bound pair publishes it,
-    // and it leaves.
-    withdraw_device_toward(&probe_node, &probe_dir, z, laptop_id).await?;
+    // Denied: the co-located audience's replica keeps it, its own pair
+    // publishing it still. Probed after a sweep of that pair, so the set
+    // read here was derived after the tombstone.
+    rt_shared.connections().sweep_pair_now(z, alice).await?;
     assert!(
-        eventually(|| async { Ok(!contact_present(&rt_shared, alice, laptop_id).await?) }).await?,
-        "the device did not leave once no bound pair published it"
+        contact_present(&rt_shared, z, alice, laptop_id).await?,
+        "a withdrawal in one audience's pair must not strip the co-located audience's replica"
     );
 
     probe_node.shutdown().await?;
@@ -692,7 +756,7 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     let invite = rt_phone.connections().invite(alice, None).await?;
     establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -702,7 +766,7 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
         common::claims_on(alice, &email, false),
     )
     .await?;
-    assert!(claim_arrives(&rt_bob, alice, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?);
 
     // Withdrawal: the binder forgets; the issuer resolves to nothing.
     rt_phone
@@ -711,7 +775,7 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
         .await?;
     assert!(
         eventually(|| async {
-            Ok(matches!(rt_bob.data().read(alice, &email).await,
+            Ok(matches!(rt_bob.data().read(bob, alice, &email).await,
                 Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()))
         })
         .await?,
@@ -729,12 +793,12 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     )
     .await?;
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v1").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?,
         "the re-granted claim did not reach the audience"
     );
     let laptop_id = rt_laptop.node_id();
     assert!(
-        eventually(|| async { contact_present(&rt_bob, alice, laptop_id).await }).await?,
+        eventually(|| async { contact_present(&rt_bob, bob, alice, laptop_id).await }).await?,
         "the re-import did not rebuild the issuer-device contacts"
     );
     assert!(
@@ -744,9 +808,9 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
 
     // The rebuilt route serves.
     rt_phone.shutdown().await?;
-    rt_laptop.data().write(alice, &email, b"v2").await?;
+    rt_laptop.data().write(alice, alice, &email, b"v2").await?;
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v2").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v2").await?,
         "the audience did not converge from the sibling after the re-grant"
     );
 
@@ -755,12 +819,16 @@ async fn a_regrant_after_withdrawal_rebuilds_the_contact_set() -> Result<()> {
     Ok(())
 }
 
-/// One replica, two hosted audiences (ADR-0009): withdrawing toward one
-/// must not take the bytes from the other. Ordered by the binder's own
-/// record (`grant_bound`), not by time, and the survivor also receives a
-/// fresh write. The denial is the second withdrawal: the node ends where an
-/// outsider starts.
+/// Two audiences of one issuer hosted together, each with a replica of
+/// its own: withdrawing toward one leaves the other reading its own and
+/// receiving a fresh write, and the withdrawn identity's issuer resolves
+/// to nothing for it (ADR-0013).
+///
+/// Denied: the withdrawn audience is refused as an unknown issuer while
+/// its co-located sibling still reads — ordered by the binder's own
+/// record (`grant_bound`) rather than by time.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, both audiences through both withdrawals
 async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
     let rt_shared = spawn_runtime().await?;
@@ -774,7 +842,7 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
     let invite = rt_phone.connections().invite(alice, None).await?;
     establish_patiently(&rt_shared, z, &rt_phone, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -793,7 +861,8 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
         common::claims_on(alice, &email, false),
     )
     .await?;
-    assert!(claim_arrives(&rt_shared, alice, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_shared, y, alice, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_shared, z, alice, &email, b"v1").await?);
 
     // Both binders imported — the state the withdrawal acts on.
     assert!(
@@ -815,18 +884,31 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
             .await?,
         "the withdrawal toward Y was never processed"
     );
-    assert_eq!(
-        rt_shared.data().read(alice, &email).await?.as_deref(),
-        Some(b"v1".as_slice()),
-        "the shared replica must survive a withdrawal that leaves another grant standing"
-    );
-    rt_phone.data().write(alice, &email, b"v2").await?;
+
+    // Denied: the issuer resolves to nothing for the withdrawn audience.
     assert!(
-        claim_arrives(&rt_shared, alice, &email, b"v2").await?,
+        eventually(|| async {
+            Ok(matches!(rt_shared.data().read(y, alice, &email).await,
+                Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()))
+        })
+        .await?,
+        "the withdrawn audience must lose the replica it held under the grant"
+    );
+
+    // Allowed: the co-located audience reads its own and keeps
+    // converging.
+    assert_eq!(
+        rt_shared.data().read(z, alice, &email).await?.as_deref(),
+        Some(b"v1".as_slice()),
+        "a withdrawal toward one audience must not touch the co-located one's replica"
+    );
+    rt_phone.data().write(alice, alice, &email, b"v2").await?;
+    assert!(
+        claim_arrives(&rt_shared, z, alice, &email, b"v2").await?,
         "the surviving audience no longer converges"
     );
 
-    // The last grant leaves, and the replica with it.
+    // The last grant leaves, and its replica with it.
     rt_phone
         .connections()
         .withdraw_grant(alice, z, alice)
@@ -838,85 +920,11 @@ async fn a_withdrawal_toward_one_audience_spares_the_cohosted_other() -> Result<
     );
     assert!(
         eventually(|| async {
-            Ok(matches!(rt_shared.data().read(alice, &email).await,
+            Ok(matches!(rt_shared.data().read(z, alice, &email).await,
                 Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()))
         })
         .await?,
-        "the replica must leave with the last withdrawn grant"
-    );
-
-    rt_phone.shutdown().await?;
-    rt_shared.shutdown().await?;
-    Ok(())
-}
-
-/// The unbind decision is grounded in the durable grant records, not the
-/// binders' bookkeeping, which a restart clears. Z's import record is
-/// dropped by hand while Z's grant sits live in its pair; the withdrawal
-/// toward Y must find it and spare the replica.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_withdrawal_counts_grants_not_bookkeeping() -> Result<()> {
-    let rt_phone = spawn_runtime().await?;
-    let rt_shared = spawn_runtime().await?;
-
-    let alice = rt_phone.identity().create().await?;
-    let y = rt_shared.identity().create().await?;
-    let z = rt_shared.identity().create().await?;
-
-    let invite = rt_phone.connections().invite(alice, None).await?;
-    establish_patiently(&rt_shared, y, &rt_phone, alice, invite).await?;
-    let invite = rt_phone.connections().invite(alice, None).await?;
-    establish_patiently(&rt_shared, z, &rt_phone, alice, invite).await?;
-    let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
-    granted_patiently(
-        &rt_phone,
-        alice,
-        &rt_shared,
-        y,
-        alice,
-        common::claims_on(alice, &email, false),
-    )
-    .await?;
-    granted_patiently(
-        &rt_phone,
-        alice,
-        &rt_shared,
-        z,
-        alice,
-        common::claims_on(alice, &email, false),
-    )
-    .await?;
-    assert!(claim_arrives(&rt_shared, alice, &email, b"v1").await?);
-    assert!(
-        eventually(|| async {
-            Ok(rt_shared.connections().grant_bound(y, alice, alice).await
-                && rt_shared.connections().grant_bound(z, alice, alice).await)
-        })
-        .await?,
-        "both grants must be bound before the arrangement"
-    );
-
-    // The in-memory record a restart clears. Z's binder sweeps only on its
-    // own pair's changes, and the withdrawal lands in Y's pair, so nothing
-    // rebuilds the memo before the decision.
-    rt_shared
-        .connections()
-        .clear_grant_memo(z, alice, alice)
-        .await;
-    rt_phone
-        .connections()
-        .withdraw_grant(alice, y, alice)
-        .await?;
-    assert!(
-        eventually(|| async { Ok(!rt_shared.connections().grant_bound(y, alice, alice).await) })
-            .await?,
-        "the withdrawal toward Y was never processed"
-    );
-    assert_eq!(
-        rt_shared.data().read(alice, &email).await?.as_deref(),
-        Some(b"v1".as_slice()),
-        "the unbind decision must find Z's durable grant with the bookkeeping empty"
+        "the replica must leave with the withdrawn grant"
     );
 
     rt_phone.shutdown().await?;
@@ -939,7 +947,7 @@ async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
     let invite = rt_phone.connections().invite(alice, None).await?;
     establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
     let email = EntryPath::new("contact/email")?;
-    rt_phone.data().write(alice, &email, b"v1").await?;
+    rt_phone.data().write(alice, alice, &email, b"v1").await?;
     granted_patiently(
         &rt_phone,
         alice,
@@ -949,11 +957,11 @@ async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
         common::claims_on(alice, &email, false),
     )
     .await?;
-    assert!(claim_arrives(&rt_bob, alice, &email, b"v1").await?);
+    assert!(claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?);
 
     // The desync: replica gone, memo still naming its import.
-    rt_bob.data().forget_namespace(alice).await?;
-    assert!(matches!(rt_bob.data().read(alice, &email).await,
+    rt_bob.data().forget_namespace(bob, alice).await?;
+    assert!(matches!(rt_bob.data().read(bob, alice, &email).await,
         Err(err) if err.downcast_ref::<UnknownIssuer>().is_some()));
     assert!(
         rt_bob.connections().grant_bound(bob, alice, alice).await,
@@ -972,7 +980,7 @@ async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
     )
     .await?;
     assert!(
-        claim_arrives(&rt_bob, alice, &email, b"v1").await?,
+        claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?,
         "the memoized binding must not skip the re-import of a forgotten replica"
     );
 

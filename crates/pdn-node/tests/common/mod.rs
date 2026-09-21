@@ -112,9 +112,14 @@ pub async fn link_probe(
     identity: PdnId,
 ) -> Result<(SyncNode, PrivateMetadataStore)> {
     let node = memory_node().await?;
+    node.provision_identity(identity).await?;
     let payload = runtime.identity().linking_invite(identity, None).await?;
     let (directory_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
-    let directory = PrivateMetadataStore::import(&node, directory_ticket).await?;
+    let directory = PrivateMetadataStore::import(&node, identity, directory_ticket).await?;
+    // Armed as any device of the identity is: an identity's replicas are
+    // judged by its own records, and a probe that armed nothing would
+    // serve and pull nothing (ADR-0013).
+    node.host_identity(identity, &directory)?;
     directory.confirm_device(node.node_id()).await?;
     Ok((node, directory))
 }

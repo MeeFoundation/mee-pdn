@@ -130,16 +130,17 @@ pub struct ConnectionMetadata {
 }
 
 impl ConnectionMetadataStore {
-    /// Create a fresh metadata store on `node` — this side's `own` replica
-    /// toward one counterparty.
-    pub async fn create(node: &SyncNode) -> Result<Self> {
+    /// Create a fresh metadata store held for `identity` — this side's
+    /// `own` replica toward one counterparty.
+    pub async fn create(node: &SyncNode, identity: PdnId) -> Result<Self> {
         // Author first, tracked doc last: nothing awaits between the
         // tracking and the handle reaching the caller, so a dropped future
-        // cannot leave a tracked replica no handle refers to. The node's one
-        // author: per-store authors would leave a record written before a
-        // restart standing beside its replacement written after one.
-        let author = node.default_author().await?;
-        let doc = node.new_doc().await?;
+        // cannot leave a tracked replica no handle refers to. The
+        // identity's one author: per-store authors would leave a record
+        // written before a restart standing beside its replacement written
+        // after one.
+        let author = node.default_author(identity)?;
+        let doc = node.new_doc(identity).await?;
         Ok(Self {
             doc,
             author,
@@ -150,10 +151,10 @@ impl ConnectionMetadataStore {
     /// Import a metadata store via `ticket` — the counterpart's replica from
     /// the read ticket, or this identity's own replica from the write ticket
     /// in the directory. Usable at once; content converges asynchronously.
-    pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
+    pub async fn import(node: &SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see `create`.
-        let author = node.default_author().await?;
-        let doc = node.import_doc(ticket).await?;
+        let author = node.default_author(identity)?;
+        let doc = node.import_doc(identity, ticket).await?;
         Ok(Self {
             doc,
             author,
@@ -354,6 +355,7 @@ mod tests {
         DocTicket::new(
             Capability::Write(NamespaceSecret::from_bytes(&[7u8; 32])),
             vec![EndpointAddr::new(node)],
+            crate::holder_of(pdn_types::PdnId::from_bytes([3u8; 32])),
         )
     }
 

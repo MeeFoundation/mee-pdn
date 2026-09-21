@@ -15,7 +15,6 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::EndpointAddr;
 use iroh_blobs::{
     api::blobs::{AddPathOptions, AddProgressItem, ExportMode, ExportOptions, ExportProgress},
     Hash,
@@ -38,7 +37,8 @@ use crate::{
     actor::OpenState,
     engine::{Engine, LiveEvent},
     store::{DownloadPolicy, Query},
-    Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
+    Author, AuthorId, Capability, CapabilityKind, Contact, DocTicket, Entry, Holder, NamespaceId,
+    PeerIdBytes,
 };
 
 pub(crate) mod actor;
@@ -143,7 +143,8 @@ impl DocsApi {
         Ok(response.author_id)
     }
 
-    /// Sets the node-wide default author.
+    /// Sets the default author of this engine, the one holder its
+    /// replicas are held for.
     ///
     /// If the author does not exist, an error is returned.
     ///
@@ -220,9 +221,10 @@ impl DocsApi {
 
     /// Imports a document from a ticket and joins all peers in the ticket.
     pub async fn import(&self, ticket: DocTicket) -> Result<Doc> {
-        let DocTicket { capability, nodes } = ticket;
-        let doc = self.import_namespace(capability).await?;
-        doc.start_sync(nodes).await?;
+        let contacts = ticket.contacts();
+        let holder = ticket.holder;
+        let doc = self.import_namespace(ticket.capability).await?;
+        doc.start_sync(contacts, holder).await?;
         Ok(doc)
     }
 
@@ -236,11 +238,17 @@ impl DocsApi {
         &self,
         ticket: DocTicket,
     ) -> Result<(Doc, impl Stream<Item = Result<LiveEvent>>)> {
-        let DocTicket { capability, nodes } = ticket;
-        let response = self.inner.rpc(ImportRequest { capability }).await??;
+        let contacts = ticket.contacts();
+        let holder = ticket.holder;
+        let response = self
+            .inner
+            .rpc(ImportRequest {
+                capability: ticket.capability,
+            })
+            .await??;
         let doc = Doc::new(self.inner.clone(), response.doc_id);
         let events = doc.subscribe().await?;
-        doc.start_sync(nodes).await?;
+        doc.start_sync(contacts, holder).await?;
         Ok((doc, events))
     }
 
@@ -462,13 +470,15 @@ impl Doc {
         Ok(response.0)
     }
 
-    /// Starts to sync this document with a list of peers.
-    pub async fn start_sync(&self, peers: Vec<EndpointAddr>) -> Result<()> {
+    /// Starts to sync this document with a list of peers, each paired
+    /// with the holder it is dialed as.
+    pub async fn start_sync(&self, peers: Vec<Contact>, default_holder: Holder) -> Result<()> {
         self.ensure_open()?;
         self.inner
             .rpc(StartSyncRequest {
                 doc_id: self.namespace_id,
                 peers,
+                default_holder,
                 join_gossip: true,
             })
             .await??;
@@ -480,12 +490,17 @@ impl Doc {
     ///
     /// The scoped-access path: reconciliation with the given peers is the
     /// only data path; updates arrive on the next sync, never over gossip.
-    pub async fn start_sync_scoped(&self, peers: Vec<EndpointAddr>) -> Result<()> {
+    pub async fn start_sync_scoped(
+        &self,
+        peers: Vec<Contact>,
+        default_holder: Holder,
+    ) -> Result<()> {
         self.ensure_open()?;
         self.inner
             .rpc(StartSyncRequest {
                 doc_id: self.namespace_id,
                 peers,
+                default_holder,
                 join_gossip: false,
             })
             .await??;

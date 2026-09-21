@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::{
     net::{AbortReason, AcceptOutcome, SyncFinished},
-    NamespaceId,
+    Holder, NamespaceId,
 };
 
 /// Why we started a sync request
@@ -44,14 +44,21 @@ pub enum SyncState {
     },
 }
 
-/// Contains an entry for each active (syncing) namespace, and in there an entry for each node we
-/// synced with.
+/// Contains an entry for each active (syncing) namespace, and in there an entry for each
+/// counterpart we synced with.
 #[derive(Default)]
 pub struct NamespaceStates(BTreeMap<NamespaceId, NamespaceState>);
 
+/// A counterpart is a node id and the holder across the session — the
+/// callee when dialing, the caller when accepting. A node hosting two
+/// identities opens two exchanges of one namespace from one node id, and
+/// they are as separate as two nodes' (ADR-0013): keying by the node id
+/// alone would make each refuse the other as already syncing.
+type Counterpart = (EndpointId, Holder);
+
 #[derive(Default)]
 struct NamespaceState {
-    nodes: BTreeMap<EndpointId, PeerState>,
+    nodes: BTreeMap<Counterpart, PeerState>,
     may_emit_ready: bool,
 }
 
@@ -73,9 +80,10 @@ impl NamespaceStates {
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
+        callee: Holder,
         reason: SyncReason,
     ) -> bool {
-        match self.entry(namespace, node) {
+        match self.entry(namespace, (node, callee)) {
             None => {
                 debug!("abort connect: namespace is not in sync set");
                 false
@@ -95,9 +103,10 @@ impl NamespaceStates {
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
+        callee: Holder,
         reason: SyncReason,
     ) -> bool {
-        match self.entry(namespace, node) {
+        match self.entry(namespace, (node, callee)) {
             None => false,
             Some(state) => state.abort_connect(reason),
         }
@@ -111,8 +120,9 @@ impl NamespaceStates {
         me: &EndpointId,
         namespace: &NamespaceId,
         node: EndpointId,
+        caller: Holder,
     ) -> AcceptOutcome {
-        let Some(state) = self.entry(namespace, node) else {
+        let Some(state) = self.entry(namespace, (node, caller)) else {
             return AcceptOutcome::Reject(AbortReason::NotFound);
         };
         state.accept_request(me, &node)
@@ -129,10 +139,11 @@ impl NamespaceStates {
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
+        counterpart: Holder,
         origin: &Origin,
         result: Result<SyncFinished>,
     ) -> Option<(SystemTime, bool)> {
-        let state = self.entry(namespace, node)?;
+        let state = self.entry(namespace, (node, counterpart))?;
         state.finish(origin, result)
     }
 
@@ -167,13 +178,17 @@ impl NamespaceStates {
         self.0.remove(namespace).is_some()
     }
 
-    /// Get the [`PeerState`] for a namespace and node.
+    /// Get the [`PeerState`] for a namespace and counterpart.
     /// If the namespace is syncing and the node so far unknown, initialize and return a default [`PeerState`].
     /// If the namespace is not syncing return None.
-    fn entry(&mut self, namespace: &NamespaceId, node: EndpointId) -> Option<&mut PeerState> {
+    fn entry(
+        &mut self,
+        namespace: &NamespaceId,
+        counterpart: Counterpart,
+    ) -> Option<&mut PeerState> {
         self.0
             .get_mut(namespace)
-            .map(|n| n.nodes.entry(node).or_default())
+            .map(|n| n.nodes.entry(counterpart).or_default())
     }
 }
 
@@ -249,14 +264,20 @@ impl PeerState {
 
     fn accept_request(&mut self, me: &EndpointId, node: &EndpointId) -> AcceptOutcome {
         let outcome = match &self.state {
-            SyncState::Idle => AcceptOutcome::Allow { filter: None },
+            SyncState::Idle => AcceptOutcome::Allow {
+                filter: None,
+                ingest: None,
+            },
             SyncState::Running { origin, .. } => match origin {
                 Origin::Accept => AcceptOutcome::Reject(AbortReason::AlreadySyncing),
                 // Incoming sync request while we are dialing ourselves.
                 // In this case, compare the binary representations of our and the other node's id
                 // to deterministically decide which of the two concurrent connections will succeed.
                 Origin::Connect(_reason) => match expected_sync_direction(me, node) {
-                    SyncDirection::Accept => AcceptOutcome::Allow { filter: None },
+                    SyncDirection::Accept => AcceptOutcome::Allow {
+                        filter: None,
+                        ingest: None,
+                    },
                     SyncDirection::Connect => AcceptOutcome::Reject(AbortReason::AlreadySyncing),
                 },
             },
@@ -301,6 +322,13 @@ mod tests {
     }
 
     /// Two deterministic endpoint ids, returned as (lower, higher) by key bytes.
+    /// The holder across the session. Both directions of a mutual dial
+    /// name the same one when each node hosts one identity, which is what
+    /// makes the tie-break below meet its own dial.
+    fn counterpart() -> Holder {
+        Holder::from_bytes([7u8; 32])
+    }
+
     fn node_pair() -> (EndpointId, EndpointId) {
         let a = SecretKey::from_bytes(&[1u8; 32]).public();
         let b = SecretKey::from_bytes(&[2u8; 32]).public();
@@ -322,15 +350,15 @@ mod tests {
         let mut states = NamespaceStates::default();
         states.insert(namespace);
 
-        assert!(states.start_connect(&namespace, peer, SyncReason::DirectJoin));
+        assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
         // While the dial is in flight the pair is busy: triggers are dropped.
-        assert!(!states.start_connect(&namespace, peer, SyncReason::NewNeighbor));
+        assert!(!states.start_connect(&namespace, peer, counterpart(), SyncReason::NewNeighbor));
 
         // Remote answered AlreadySyncing: the dial is dead, clear it.
-        assert!(states.abort_connect(&namespace, peer, SyncReason::DirectJoin));
+        assert!(states.abort_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
 
         // The pair accepts sync triggers again.
-        assert!(states.start_connect(&namespace, peer, SyncReason::NewNeighbor));
+        assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::NewNeighbor));
     }
 
     /// An abort whose reason does not match the running dial belongs to an older
@@ -342,14 +370,14 @@ mod tests {
         let mut states = NamespaceStates::default();
         states.insert(namespace);
 
-        assert!(states.start_connect(&namespace, peer, SyncReason::DirectJoin));
-        assert!(states.abort_connect(&namespace, peer, SyncReason::DirectJoin));
-        assert!(states.start_connect(&namespace, peer, SyncReason::NewNeighbor));
+        assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
+        assert!(states.abort_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
+        assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::NewNeighbor));
 
         // Late abort for the first dial: reason mismatch, nothing cleared.
-        assert!(!states.abort_connect(&namespace, peer, SyncReason::DirectJoin));
+        assert!(!states.abort_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
         // The newer dial is still running.
-        assert!(!states.start_connect(&namespace, peer, SyncReason::NewNeighbor));
+        assert!(!states.start_connect(&namespace, peer, counterpart(), SyncReason::NewNeighbor));
     }
 
     /// Mutual dial where the incoming exchange won the tie-break and took the slot
@@ -363,13 +391,13 @@ mod tests {
         let mut states = NamespaceStates::default();
         states.insert(namespace);
 
-        assert!(states.start_connect(&namespace, node, SyncReason::DirectJoin));
-        let outcome = states.accept_request(&me, &namespace, node);
+        assert!(states.start_connect(&namespace, node, counterpart(), SyncReason::DirectJoin));
+        let outcome = states.accept_request(&me, &namespace, node, counterpart());
         assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
         // Our dial comes back rejected; the slot now belongs to the accept exchange.
-        assert!(!states.abort_connect(&namespace, node, SyncReason::DirectJoin));
+        assert!(!states.abort_connect(&namespace, node, counterpart(), SyncReason::DirectJoin));
         // Still busy until the accept exchange finishes.
-        assert!(!states.start_connect(&namespace, node, SyncReason::DirectJoin));
+        assert!(!states.start_connect(&namespace, node, counterpart(), SyncReason::DirectJoin));
     }
 }

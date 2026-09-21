@@ -15,12 +15,15 @@ use anyhow::{Context, Result};
 use data_layer::{
     own_ticket_kind, peer_ticket_kind, AcceptError, AddrInfoOptions, Connection,
     ConnectionMetadata, ConnectionMetadataStore, DocTicket, EndpointAddr, ProtocolHandler,
-    RecvStream, SendStream, ShareMode,
+    ShareMode,
 };
 use pdn_types::PdnId;
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+    sync::Mutex,
+};
 
 use crate::runtime::State;
 
@@ -199,81 +202,99 @@ impl PairingHandler {
     /// the one uniform close.
     async fn serve(&self, connection: &Connection) -> Option<()> {
         let (mut send, mut recv) = connection.accept_bi().await.ok()?;
-        let request: PairingRequest = read_message(&mut recv).await.ok()?;
-        if request.version != INVITE_FORMAT_VERSION {
-            return None;
-        }
-
-        // The state is held only for the local verify-and-assemble: guard
-        // and strong `Arc` drop before the network reply, so no other lock
-        // holder waits on the dialer.
-        let response_ticket = {
-            let state_arc = self.state.get()?.upgrade()?;
-            let mut state = state_arc.lock().await;
-
-            // Before any state change.
-            let identity = state
-                .pending_invites
-                .verify_and_burn(&request.secret, Instant::now())?;
-
-            let (own, created_fresh) = own_store_toward(&state, identity, request.scanner)
-                .await
-                .ok()?;
-            // Armed as soon as a fresh replica might exist: a cancellation of
-            // this future from here on forgets it.
-            let mut rollback = EstablishGuard::new(
-                Arc::clone(&state_arc),
-                own.namespace(),
-                created_fresh,
-                state.cleanup_tasks.clone(),
-            );
-            let Ok(ticket) = own
-                .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-                .await
-            else {
-                if created_fresh {
-                    let _ = state.node.forget_doc(own.namespace()).await;
-                }
-                rollback.disarm();
-                return None;
-            };
-            let own_namespace = own.namespace();
-            let result = assemble_connection(
-                &mut state,
-                identity,
-                request.scanner,
-                own,
-                request.ticket,
-                Some(request.scanner_addr),
-            )
-            .await;
-            if let Ok(()) = result {
-                rollback.disarm();
-            } else {
-                if created_fresh {
-                    let _ = state.node.forget_doc(own_namespace).await;
-                }
-                rollback.disarm();
-                return None;
-            }
-            ticket
-        };
-
-        // Commit precedes the reply: a lost response leaves the inviter's
-        // half, and a fresh invite converges the rest.
-        write_message(
-            &mut send,
-            &PairingResponse {
-                ticket: response_ticket,
-            },
-        )
-        .await
-        .ok()?;
+        let state = self.state.get()?.upgrade()?;
+        serve_pairing(&state, &mut send, &mut recv).await?;
         send.finish().ok()?;
         // Held until the dialer closes, so the response is not cut off.
         connection.closed().await;
         Some(())
     }
+}
+
+/// The inviter's half of the dialogue, over any pair of streams (D8): read
+/// the request, verify and burn the secret before any state change,
+/// assemble this side's half of the connection, and answer with its
+/// ticket. `None` is a refusal, any reason at all; the transport answers
+/// it its own way.
+pub(crate) async fn serve_pairing<R, W>(
+    state_arc: &Arc<Mutex<State>>,
+    send: &mut W,
+    recv: &mut R,
+) -> Option<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let request: PairingRequest = read_message(recv).await.ok()?;
+    if request.version != INVITE_FORMAT_VERSION {
+        return None;
+    }
+
+    // The state is held only for the local verify-and-assemble: the guard
+    // drops before the reply, so no other lock holder waits on the dialer.
+    let response_ticket = {
+        let mut state = state_arc.lock().await;
+
+        // Before any state change.
+        let identity = state
+            .pending_invites
+            .verify_and_burn(&request.secret, Instant::now())?;
+
+        let (own, created_fresh) = own_store_toward(&state, identity, request.scanner)
+            .await
+            .ok()?;
+        // Armed as soon as a fresh replica might exist: a cancellation of
+        // this future from here on forgets it.
+        let mut rollback = EstablishGuard::new(
+            Arc::clone(state_arc),
+            identity,
+            own.namespace(),
+            created_fresh,
+            state.cleanup_tasks.clone(),
+        );
+        let Ok(ticket) = own
+            .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await
+        else {
+            if created_fresh {
+                let _ = state.node.forget_doc(identity, own.namespace()).await;
+            }
+            rollback.disarm();
+            return None;
+        };
+        let own_namespace = own.namespace();
+        let result = assemble_connection(
+            &mut state,
+            identity,
+            request.scanner,
+            own,
+            request.ticket,
+            Some(request.scanner_addr),
+        )
+        .await;
+        if let Ok(()) = result {
+            rollback.disarm();
+        } else {
+            if created_fresh {
+                let _ = state.node.forget_doc(identity, own_namespace).await;
+            }
+            rollback.disarm();
+            return None;
+        }
+        ticket
+    };
+
+    // Commit precedes the reply: a lost response leaves the inviter's
+    // half, and a fresh invite converges the rest.
+    write_message(
+        send,
+        &PairingResponse {
+            ticket: response_ticket,
+        },
+    )
+    .await
+    .ok()?;
+    Some(())
 }
 
 impl ProtocolHandler for PairingHandler {
@@ -344,8 +365,44 @@ pub(crate) async fn establish_via_dialogue(
     result
 }
 
+/// What a pipe between two identities of one node buffers each way: one
+/// framed message at [`MAX_WIRE_MESSAGE_LEN`] plus its length prefix, so
+/// neither half blocks on the other's read.
+#[allow(clippy::as_conversions)] // const context, and a 32-bit length fits every usize we build for
+const PAIRING_PIPE_BYTES: usize = MAX_WIRE_MESSAGE_LEN as usize + 4;
+
+/// The dialogue between two identities of one node, run over a pipe: the
+/// same messages, the same verify-and-burn and the same assembly as
+/// between two nodes, with the serving half taken from this runtime's own
+/// state (D8).
+async fn pair_in_process(
+    state: &Arc<Mutex<State>>,
+    request: &PairingRequest,
+) -> Result<PairingResponse> {
+    let (dialing, serving) = tokio::io::duplex(PAIRING_PIPE_BYTES);
+    let (mut dial_recv, mut dial_send) = tokio::io::split(dialing);
+    let (mut serve_recv, mut serve_send) = tokio::io::split(serving);
+    let served = {
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            serve_pairing(&state, &mut serve_send, &mut serve_recv)
+                .await
+                .is_some()
+        })
+    };
+    write_message(&mut dial_send, request).await?;
+    let response = read_message(&mut dial_recv).await;
+    // The serving half's own outcome decides: a read that failed because
+    // it declined must not read as a broken pipe.
+    match served.await {
+        Ok(true) => response.context(EstablishmentRefused),
+        _ => Err(EstablishmentRefused.into()),
+    }
+}
+
 /// Factored out so the reservation releases synchronously around every
 /// exit, `?` early returns included.
+#[allow(clippy::too_many_lines)] // one dialogue, both transports and the rollback in one place
 async fn establish_via_dialogue_inner(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
@@ -353,11 +410,19 @@ async fn establish_via_dialogue_inner(
     dial: data_layer::DialHandle,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
 ) -> Result<()> {
-    // Dial before minting `own`, so an unreachable inviter leaves no replica.
-    let connection = dial
-        .connect(payload.inviter_addr.clone(), PAIRING_ALPN)
-        .await
-        .context(InviterUnreachable)?;
+    // An invite whose address carries this node's own wire identity is an
+    // invite from a co-located identity: iroh refuses a connection to its
+    // own endpoint id, so the dialogue runs over a pipe (D8). Dial before
+    // minting `own`, so an unreachable inviter leaves no replica.
+    let connection = if payload.inviter_addr.id == dial.id() {
+        None
+    } else {
+        Some(
+            dial.connect(payload.inviter_addr.clone(), PAIRING_ALPN)
+                .await
+                .context(InviterUnreachable)?,
+        )
+    };
 
     let (own, created_fresh) = {
         let state = state.lock().await;
@@ -368,6 +433,7 @@ async fn establish_via_dialogue_inner(
     // forgets a fresh `own` then.
     let mut rollback = EstablishGuard::new(
         Arc::clone(state),
+        identity,
         own.namespace(),
         created_fresh,
         cleanup_tasks,
@@ -381,41 +447,47 @@ async fn establish_via_dialogue_inner(
     // No lock held across the round-trip.
     let response: Result<PairingResponse> = match ticket {
         Err(err) => Err(err),
-        Ok(ticket) => match tokio::time::timeout(ESTABLISHMENT_DIALOGUE_TIMEOUT, async {
-            let (mut send, mut recv) = connection.open_bi().await?;
-            write_message(
-                &mut send,
-                &PairingRequest {
-                    version: INVITE_FORMAT_VERSION,
-                    secret: payload.secret,
-                    scanner: identity,
-                    scanner_addr: dial.addr(),
-                    ticket,
-                },
-            )
-            .await?;
-            send.finish()?;
-            // A refusal is just the connection closing.
-            read_message(&mut recv).await.context(EstablishmentRefused)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_ceiling_passed) => Err(EstablishmentTimeout.into()),
-        },
+        Ok(ticket) => {
+            let request = PairingRequest {
+                version: INVITE_FORMAT_VERSION,
+                secret: payload.secret,
+                scanner: identity,
+                scanner_addr: dial.addr(),
+                ticket,
+            };
+            match tokio::time::timeout(ESTABLISHMENT_DIALOGUE_TIMEOUT, async {
+                match &connection {
+                    Some(connection) => {
+                        let (mut send, mut recv) = connection.open_bi().await?;
+                        write_message(&mut send, &request).await?;
+                        send.finish()?;
+                        // A refusal is just the connection closing.
+                        read_message(&mut recv).await.context(EstablishmentRefused)
+                    }
+                    None => pair_in_process(state, &request).await,
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_ceiling_passed) => Err(EstablishmentTimeout.into()),
+            }
+        }
     };
     let response = match response {
         Ok(response) => response,
         Err(err) => {
             if created_fresh {
                 let state = state.lock().await;
-                let _ = state.node.forget_doc(own.namespace()).await;
+                let _ = state.node.forget_doc(identity, own.namespace()).await;
             }
             rollback.disarm();
             return Err(err);
         }
     };
-    connection.close(0u32.into(), b"done");
+    if let Some(connection) = &connection {
+        connection.close(0u32.into(), b"done");
+    }
 
     let mut state_guard = state.lock().await;
     let own_namespace = own.namespace();
@@ -435,7 +507,7 @@ async fn establish_via_dialogue_inner(
         }
         Err(err) => {
             if created_fresh {
-                let _ = state_guard.node.forget_doc(own_namespace).await;
+                let _ = state_guard.node.forget_doc(identity, own_namespace).await;
             }
             rollback.disarm();
             Err(err)
@@ -508,6 +580,7 @@ impl Drop for EstablishReservation {
 /// so it is spawned detached.
 struct EstablishGuard {
     state: Arc<Mutex<State>>,
+    identity: PdnId,
     own_namespace: data_layer::NamespaceId,
     created_fresh: bool,
     armed: bool,
@@ -517,12 +590,14 @@ struct EstablishGuard {
 impl EstablishGuard {
     fn new(
         state: Arc<Mutex<State>>,
+        identity: PdnId,
         own_namespace: data_layer::NamespaceId,
         created_fresh: bool,
         cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
         Self {
             state,
+            identity,
             own_namespace,
             created_fresh,
             armed: true,
@@ -541,10 +616,11 @@ impl Drop for EstablishGuard {
             return;
         }
         let state = Arc::clone(&self.state);
+        let identity = self.identity;
         let own_namespace = self.own_namespace;
         self.cleanup_tasks.spawn(async move {
             let node = Arc::clone(&state.lock().await.node);
-            let _ = node.forget_doc(own_namespace).await;
+            let _ = node.forget_doc(identity, own_namespace).await;
         });
     }
 }
@@ -565,10 +641,13 @@ async fn own_store_toward(
     let directory = &state.hosted(identity)?.directory;
     match directory.get_ticket(&own_ticket_kind(&peer)).await? {
         Some(write_ticket) => Ok((
-            ConnectionMetadataStore::import(&state.node, write_ticket).await?,
+            ConnectionMetadataStore::import(&state.node, identity, write_ticket).await?,
             false,
         )),
-        None => Ok((ConnectionMetadataStore::create(&state.node).await?, true)),
+        None => Ok((
+            ConnectionMetadataStore::create(&state.node, identity).await?,
+            true,
+        )),
     }
 }
 
@@ -590,7 +669,7 @@ async fn assemble_connection(
     // replica: a fresh import per re-establishment would leak a tracked doc.
     let peer_store = match state.metadata_pairs.get(&(identity, peer)) {
         Some(pair) if pair.peer.namespace() == peer_ticket.capability.id() => pair.peer.clone(),
-        _ => ConnectionMetadataStore::import(&state.node, peer_ticket.clone()).await?,
+        _ => ConnectionMetadataStore::import(&state.node, identity, peer_ticket.clone()).await?,
     };
 
     let own_write_ticket = own
@@ -621,7 +700,12 @@ async fn assemble_connection(
     Ok(())
 }
 
-pub(crate) async fn write_message<T: Serialize>(send: &mut SendStream, message: &T) -> Result<()> {
+/// Generic over its stream, so one implementation serves the network and
+/// the pipe two identities of one node meet over (ADR-0013).
+pub(crate) async fn write_message<W: AsyncWrite + Unpin, T: Serialize>(
+    send: &mut W,
+    message: &T,
+) -> Result<()> {
     let bytes = postcard::to_stdvec(message)?;
     let len = u32::try_from(bytes.len()).context("wire message too large")?;
     if len > MAX_WIRE_MESSAGE_LEN {
@@ -632,7 +716,10 @@ pub(crate) async fn write_message<T: Serialize>(send: &mut SendStream, message: 
     Ok(())
 }
 
-pub(crate) async fn read_message<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+/// Generic over its stream — see [`write_message`].
+pub(crate) async fn read_message<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    recv: &mut R,
+) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     recv.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes);

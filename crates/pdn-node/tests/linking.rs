@@ -17,7 +17,7 @@ use data_layer::{
 use pdn_node::{
     ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
     InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, SpawnOptions,
-    SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion,
+    SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion, WriteNotGranted,
     LINKING_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId, PdnId};
@@ -103,7 +103,9 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_peer, p, &rt_a, x, invite).await?;
     let founder_path = EntryPath::new("contact/name")?;
-    rt_a.data().write(x, &founder_path, b"from-founder").await?;
+    rt_a.data()
+        .write(x, x, &founder_path, b"from-founder")
+        .await?;
 
     // Bearer-free: format version, the inviting device's address, the
     // one-time secret, the identity — no fields for a ticket or an identity
@@ -141,21 +143,20 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     // The full store set.
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, &founder_path).await?.as_deref() == Some(&b"from-founder"[..]))
+            Ok(rt_b.data().read(x, x, &founder_path).await?.as_deref()
+                == Some(&b"from-founder"[..]))
         })
         .await?,
         "the founder's entry did not reach the newcomer's data namespace"
     );
     let newcomer_path = EntryPath::new("contact/email")?;
     rt_b.data()
-        .write(x, &newcomer_path, b"from-newcomer")
+        .write(x, x, &newcomer_path, b"from-newcomer")
         .await?;
     assert!(
         eventually(|| async {
-            Ok(
-                rt_a.data().read(x, &newcomer_path).await?.as_deref()
-                    == Some(&b"from-newcomer"[..]),
-            )
+            Ok(rt_a.data().read(x, x, &newcomer_path).await?.as_deref()
+                == Some(&b"from-newcomer"[..]))
         })
         .await?,
         "the newcomer's entry did not reach the founder"
@@ -179,7 +180,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
     let rt_3 = memory_runtime().await?;
     let x = rt_1.identity().create().await?;
     let path = EntryPath::new("affiliation/group")?;
-    rt_1.data().write(x, &path, b"Acme Engineering").await?;
+    rt_1.data().write(x, x, &path, b"Acme Engineering").await?;
 
     // Device 2 links from the founder; device 3 from device 2.
     link_patiently(&rt_2, &rt_1, x).await?;
@@ -188,7 +189,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
     // Transitive catch-up through the ticket device 2 minted.
     assert!(
         eventually(|| async {
-            Ok(rt_3.data().read(x, &path).await?.as_deref() == Some(&b"Acme Engineering"[..]))
+            Ok(rt_3.data().read(x, x, &path).await?.as_deref() == Some(&b"Acme Engineering"[..]))
         })
         .await?,
         "data did not reach the third device through the non-founder chain"
@@ -249,8 +250,8 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "an expired secret must be refused"
     );
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
-    let err = rt_b.data().read(x, &path).await.unwrap_err();
-    assert!(err.downcast_ref::<UnknownIssuer>().is_some());
+    let err = rt_b.data().read(x, x, &path).await.unwrap_err();
+    assert!(err.downcast_ref::<UnknownIdentity>().is_some());
     assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
 
     // An invite for an unhosted identity mints nothing pending.
@@ -337,8 +338,8 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
         "an expired-secret refusal must downcast to the marker, got: {err:#}"
     );
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
-    let read_err = rt_b.data().read(x, &path).await.unwrap_err();
-    assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
+    let read_err = rt_b.data().read(x, x, &path).await.unwrap_err();
+    assert!(read_err.downcast_ref::<UnknownIdentity>().is_some());
 
     // A wrong secret: the same reasonless value.
     let live = rt_a.identity().linking_invite(x, None).await?;
@@ -361,8 +362,8 @@ async fn a_refused_link_downcasts_where_an_unreachable_inviter_does_not() -> Res
         "a replayed-secret refusal must downcast to the marker, got: {err:#}"
     );
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
-    let read_err = rt_c.data().read(x, &path).await.unwrap_err();
-    assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
+    let read_err = rt_c.data().read(x, x, &path).await.unwrap_err();
+    assert!(read_err.downcast_ref::<UnknownIdentity>().is_some());
 
     // A dial that reaches no inviting device: a live bare node accepting no
     // linking ALPN, rejected at once — a gone node would cost the
@@ -596,13 +597,15 @@ impl ProtocolHandler for DeadTicketInviter {
 async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<()> {
     // Real tickets from a scratch node then taken away.
     let scratch = memory_node().await?;
-    let dead_directory = PrivateMetadataStore::create(&scratch).await?;
+    scratch.provision_identity(ids::DAVE).await?;
+    let dead_directory = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
     let directory_ticket = dead_directory
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    scratch.create_namespace(ids::DAVE).await?;
+    scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
     let data_ticket = scratch
         .share_ticket(
+            ids::DAVE,
             ids::DAVE,
             ShareMode::Write,
             AddrInfoOptions::RelayAndAddresses,
@@ -659,19 +662,24 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
     let read_err = rt_b
         .data()
-        .read(ids::DAVE, &EntryPath::new("contact/name")?)
+        .read(ids::DAVE, ids::DAVE, &EntryPath::new("contact/name")?)
         .await
         .unwrap_err();
     assert!(
-        read_err.downcast_ref::<UnknownIssuer>().is_some(),
+        read_err.downcast_ref::<UnknownIdentity>().is_some(),
         "reads under the rolled-back identity must refuse as unknown, got: {read_err:#}"
     );
     let write_err = rt_b
         .data()
-        .write(ids::DAVE, &EntryPath::new("contact/name")?, b"residue")
+        .write(
+            ids::DAVE,
+            ids::DAVE,
+            &EntryPath::new("contact/name")?,
+            b"residue",
+        )
         .await
         .unwrap_err();
-    assert!(write_err.downcast_ref::<UnknownIssuer>().is_some());
+    assert!(write_err.downcast_ref::<UnknownIdentity>().is_some());
 
     rt_b.shutdown().await?;
     fake_inviter.shutdown().await?;
@@ -700,7 +708,7 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
     assert!(
         eventually(|| async {
             Ok(rt.sync().hosted_identities().await?.is_empty()
-                && rt.sync().tracked_doc_count().await? == 0
+                && rt.sync().tracked_doc_count(x).await? == 0
                 && !rt.sync().linking_in_flight_for_test(x).await)
         })
         .await?,
@@ -795,12 +803,13 @@ async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothi
 }
 
 /// The rollback undoes what the link did and nothing that predates it: a
-/// failed link into an identity whose namespace this runtime already
-/// reached through a grant leaves the grant working. The pre-dial guard
-/// reads the hosted set and `import_namespace` writes the issuer registry,
-/// so the guard lets the link proceed; the rollback restores the binding it
-/// displaced instead of forgetting the issuer, since forgetting is
-/// permanent (`drop_doc` takes the entries with it).
+/// failed link into X leaves Y's grant on X's namespace working, replica
+/// and entries intact. The two never meet — the link brings up stores for
+/// X, and what Y holds under the grant sits in Y's own stores (ADR-0013)
+/// — so the rollback has nothing of Y's to displace or restore.
+///
+/// Denied: the restored grant binding does not make X hosted here, so
+/// every identity-addressed service still refuses X as unknown.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the grant and the failed link in one place
 async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() -> Result<()> {
@@ -815,7 +824,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     establish_patiently(&rt_laptop, y, &rt_phone, x, invite).await?;
 
     let path = EntryPath::new("shared/note")?;
-    rt_phone.data().write(x, &path, b"from-x").await?;
+    rt_phone.data().write(x, x, &path, b"from-x").await?;
     granted_patiently(
         &rt_phone,
         x,
@@ -830,7 +839,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     // the link's guard consults.
     assert!(
         eventually(|| async {
-            Ok(rt_laptop.data().read(x, &path).await?.as_deref() == Some(&b"from-x"[..]))
+            Ok(rt_laptop.data().read(y, x, &path).await?.as_deref() == Some(&b"from-x"[..]))
         })
         .await?,
         "the granted namespace never synced — the premise of this test, not its subject"
@@ -838,13 +847,15 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 
     // The link fails: its tickets address replicas hosted nowhere.
     let scratch = memory_node().await?;
-    let dead_directory = PrivateMetadataStore::create(&scratch).await?;
+    scratch.provision_identity(ids::DAVE).await?;
+    let dead_directory = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
     let directory_ticket = dead_directory
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    scratch.create_namespace(ids::DAVE).await?;
+    scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
     let data_ticket = scratch
         .share_ticket(
+            ids::DAVE,
             ids::DAVE,
             ShareMode::Write,
             AddrInfoOptions::RelayAndAddresses,
@@ -889,7 +900,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
 
     // The grant survives the failed link, entries and all.
     assert_eq!(
-        rt_laptop.data().read(x, &path).await?.as_deref(),
+        rt_laptop.data().read(y, x, &path).await?.as_deref(),
         Some(&b"from-x"[..]),
         "the rollback destroyed a granted namespace the link never imported"
     );
@@ -952,10 +963,10 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
     let err = rt_b
         .data()
-        .read(y, &EntryPath::new("contact/email")?)
+        .read(y, y, &EntryPath::new("contact/email")?)
         .await
         .unwrap_err();
-    assert!(err.downcast_ref::<UnknownIssuer>().is_some());
+    assert!(err.downcast_ref::<UnknownIdentity>().is_some());
 
     // Y arrives only by its own linking act, and the two stay disjoint.
     link_patiently(&rt_b, &rt_a, y).await?;
@@ -1021,6 +1032,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     let rt_laptop = memory_runtime().await?;
     let rt_bob = memory_runtime().await?;
     let rt_carol = memory_runtime().await?;
+    let carol = rt_carol.identity().create().await?;
 
     // The laptop links first, so everything about the connection reaches it
     // by replication alone.
@@ -1034,7 +1046,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     let email = EntryPath::new("contact/email")?;
     rt_phone
         .data()
-        .write(alice, &email, b"alice@example.org")
+        .write(alice, alice, &email, b"alice@example.org")
         .await?;
     granted_patiently(
         &rt_phone,
@@ -1050,7 +1062,11 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     // about to serve, and Bob's binder imported what the grant names.
     assert!(
         eventually(|| async {
-            Ok(rt_laptop.data().read(alice, &email).await?.as_deref()
+            Ok(rt_laptop
+                .data()
+                .read(alice, alice, &email)
+                .await?
+                .as_deref()
                 == Some(&b"alice@example.org"[..]))
         })
         .await?,
@@ -1058,7 +1074,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     );
     assert!(
         eventually(|| async {
-            Ok(rt_bob.data().read(alice, &email).await?.as_deref()
+            Ok(rt_bob.data().read(bob, alice, &email).await?.as_deref()
                 == Some(&b"alice@example.org"[..]))
         })
         .await?,
@@ -1092,17 +1108,20 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     rt_phone.shutdown().await?;
     rt_laptop
         .data()
-        .write(alice, &email, b"alice@moved.example.org")
+        .write(alice, alice, &email, b"alice@moved.example.org")
         .await?;
-    let carol_ticket = rt_laptop.data().share(alice, ShareMode::Read).await?;
-    rt_carol.data().import(alice, carol_ticket).await?;
+    let carol_ticket = rt_laptop
+        .data()
+        .share(alice, alice, ShareMode::Read)
+        .await?;
+    rt_carol.data().import(carol, alice, carol_ticket).await?;
 
     // Carol's poll rides inside the same wait, so her sync attempts against
     // the same target accumulate exactly while Bob's do.
     assert!(
         eventually(|| async {
-            let _nudge = rt_carol.data().list(alice, None).await?;
-            Ok(rt_bob.data().read(alice, &email).await?.as_deref()
+            let _nudge = rt_carol.data().list(carol, alice, None).await?;
+            Ok(rt_bob.data().read(bob, alice, &email).await?.as_deref()
                 == Some(&b"alice@moved.example.org"[..]))
         })
         .await?,
@@ -1113,10 +1132,10 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     // this replica, so Carol's emptiness measures classification, not
     // liveness.
     assert!(
-        rt_carol.data().list(alice, None).await?.is_empty(),
+        rt_carol.data().list(carol, alice, None).await?.is_empty(),
         "a bare ticket holder must get nothing from a linked device"
     );
-    assert!(rt_carol.data().read(alice, &email).await?.is_none());
+    assert!(rt_carol.data().read(carol, alice, &email).await?.is_none());
 
     rt_laptop.shutdown().await?;
     rt_bob.shutdown().await?;
@@ -1146,7 +1165,7 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
     let granted_path = EntryPath::new("contact/email")?;
     rt_x_device
         .data()
-        .write(x, &granted_path, b"x@example.org")
+        .write(x, x, &granted_path, b"x@example.org")
         .await?;
     granted_patiently(
         &rt_x_device,
@@ -1159,7 +1178,7 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
     .await?;
     assert!(
         eventually(|| async {
-            Ok(rt_shared.data().read(x, &granted_path).await?.as_deref()
+            Ok(rt_shared.data().read(y, x, &granted_path).await?.as_deref()
                 == Some(&b"x@example.org"[..]))
         })
         .await?,
@@ -1183,48 +1202,88 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
         "the sweep must have adopted the memo entry keyed by X as issuer — the premise of this test"
     );
 
+    // Denied: Y writing outside the read-only grant is refused at the call
+    // site, as it would be against a remote issuer — the courtesy judges the
+    // pair of identity and issuer, never what else this node hosts.
+    let refused = rt_shared
+        .data()
+        .write(y, x, &granted_path, b"not mine to write")
+        .await
+        .unwrap_err();
+    assert!(
+        refused.downcast_ref::<WriteNotGranted>().is_some(),
+        "a co-located audience's write outside the grant must be refused up front, got: {refused:#}"
+    );
+
     // X's write is not refused by the grant courtesy check, whose key space
     // now contains an entry naming X as issuer.
     let own_path = EntryPath::new("notes/diary")?;
-    rt_shared.data().write(x, &own_path, b"dear diary").await?;
+    rt_shared
+        .data()
+        .write(x, x, &own_path, b"dear diary")
+        .await?;
     assert_eq!(
-        rt_shared.data().read(x, &own_path).await?.as_deref(),
+        rt_shared.data().read(x, x, &own_path).await?.as_deref(),
         Some(&b"dear diary"[..]),
         "X's own write on the shared node must not be refused by its own grant to Y"
     );
 
     // Withdrawn on the shared node itself — withdrawing on `rt_x_device`
-    // would race the replication already waited out — and the revoke sweep
-    // forced.
+    // would race the replication already waited out. The record still has
+    // to cross from X's own store to Y's copy of it, both held here but
+    // in two identities' replicas, so the sweep is forced until it does.
     rt_shared.connections().withdraw_grant(x, y, x).await?;
-    rt_shared.connections().sweep_pair_now(y, x).await?;
     assert!(
-        !rt_shared.connections().grant_bound(y, x, x).await,
+        eventually(|| async {
+            rt_shared.connections().sweep_pair_now(y, x).await?;
+            Ok(!rt_shared.connections().grant_bound(y, x, x).await)
+        })
+        .await?,
         "the withdrawn grant must leave the binder's memo"
     );
     assert_eq!(
-        rt_shared.data().read(x, &own_path).await?.as_deref(),
+        rt_shared.data().read(x, x, &own_path).await?.as_deref(),
         Some(&b"dear diary"[..]),
         "revoking the grant to Y must not forget X's own namespace"
     );
     let after_withdrawal = EntryPath::new("contact/phone")?;
     rt_shared
         .data()
-        .write(x, &after_withdrawal, b"still mine")
+        .write(x, x, &after_withdrawal, b"still mine")
         .await?;
     assert_eq!(
         rt_shared
             .data()
-            .read(x, &after_withdrawal)
+            .read(x, x, &after_withdrawal)
             .await?
             .as_deref(),
         Some(&b"still mine"[..]),
         "X must still be able to write its own data after the grant to Y is withdrawn"
     );
 
+    // The other half of the withdrawal: Y loses the replica it held under
+    // the grant, exactly as an audience on its own device does. Co-location
+    // is not what decides it.
+    assert!(
+        eventually(|| async {
+            Ok(rt_shared
+                .data()
+                .read(y, x, &granted_path)
+                .await
+                .is_err_and(|err| err.downcast_ref::<UnknownIssuer>().is_some()))
+        })
+        .await?,
+        "the withdrawn grant must leave the co-located audience with no replica of X"
+    );
+
     // Paired deny: a node with no connection to X is refused as unknown.
     let rt_outsider = memory_runtime().await?;
-    let err = rt_outsider.data().read(x, &own_path).await.unwrap_err();
+    let outsider = rt_outsider.identity().create().await?;
+    let err = rt_outsider
+        .data()
+        .read(outsider, x, &own_path)
+        .await
+        .unwrap_err();
     assert!(
         err.downcast_ref::<UnknownIssuer>().is_some(),
         "an outsider must be refused as unknown, got: {err:#}"

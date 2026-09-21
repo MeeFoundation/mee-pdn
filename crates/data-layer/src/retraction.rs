@@ -13,12 +13,15 @@ use std::{
 
 use iroh_blobs::Hash;
 use pdn_store::{AuthorId, NamespaceId, PeerIdBytes, RejectId};
-use pdn_types::NodeId;
+use pdn_types::{NodeId, PdnId};
 use tokio::sync::mpsc;
 
 /// One not-accepted verdict: the exact entry to retract.
 #[derive(Debug, Clone)]
 pub struct RetractionVerdict {
+    /// The hosted identity whose replica holds the entry: several
+    /// identities of one node hold one namespace, each in its own replica.
+    pub identity: PdnId,
     pub namespace: NamespaceId,
     /// A local writer author.
     pub author: AuthorId,
@@ -35,10 +38,14 @@ pub struct RetractionVerdict {
 /// fork's sync-actor thread, so recording is synchronous and lock-brief.
 #[derive(Debug)]
 pub(crate) struct RetractionTracker {
-    /// Per granted namespace, the peers whose rejection is honored. A
-    /// namespace absent here is not tracked.
-    issuer_devices: Mutex<HashMap<NamespaceId, HashSet<NodeId>>>,
-    local_authors: Mutex<HashSet<AuthorId>>,
+    /// Per hosted identity and granted namespace, the peers whose
+    /// rejection is honored. A pair absent here is not tracked. Keyed by
+    /// identity because two identities of one node hold one namespace
+    /// under device sets that move apart (ADR-0013).
+    issuer_devices: Mutex<HashMap<(PdnId, NamespaceId), HashSet<NodeId>>>,
+    /// One author per hosted identity, so a rejection naming a co-located
+    /// identity's author is not this identity's to honor.
+    local_authors: Mutex<HashMap<PdnId, AuthorId>>,
     /// The runtime takes the receiving half once.
     verdicts: mpsc::UnboundedSender<RetractionVerdict>,
 }
@@ -56,33 +63,41 @@ impl RetractionTracker {
         )
     }
 
-    /// Track `namespace` with exactly `devices` as the issuer's device set,
-    /// replacing any previous set.
-    pub(crate) fn track_namespace(&self, namespace: NamespaceId, devices: HashSet<NodeId>) {
+    /// Track `namespace` held by `identity` with exactly `devices` as the
+    /// issuer's device set, replacing any previous set.
+    pub(crate) fn track_namespace(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        devices: HashSet<NodeId>,
+    ) {
         if let Ok(mut tracked) = self.issuer_devices.lock() {
-            tracked.insert(namespace, devices);
+            tracked.insert((identity, namespace), devices);
         }
     }
 
-    /// Stop honoring rejections for `namespace`.
-    pub(crate) fn untrack_namespace(&self, namespace: NamespaceId) {
+    /// Stop honoring rejections for `namespace` as held by `identity`. A
+    /// co-located identity's replica of the same namespace keeps its own.
+    pub(crate) fn untrack_namespace(&self, identity: PdnId, namespace: NamespaceId) {
         if let Ok(mut tracked) = self.issuer_devices.lock() {
-            tracked.remove(&namespace);
+            tracked.remove(&(identity, namespace));
         }
     }
 
-    /// Record `author` as one of this node's own writers.
-    pub(crate) fn track_author(&self, author: AuthorId) {
+    /// Record `author` as the writer `identity` writes with.
+    pub(crate) fn track_author(&self, identity: PdnId, author: AuthorId) {
         if let Ok(mut authors) = self.local_authors.lock() {
-            authors.insert(author);
+            authors.insert(identity, author);
         }
     }
 
-    /// The observer entry point: one in-band rejection from `peer`, turned
-    /// into a verdict at once when `peer` is a tracked issuer device and the
-    /// entry is of an own author; ignored otherwise.
+    /// The observer entry point: one in-band rejection from `peer` in
+    /// `identity`'s replica, turned into a verdict at once when `peer` is a
+    /// tracked issuer device of that pair and the entry is of `identity`'s
+    /// own author; ignored otherwise.
     pub(crate) fn record_rejection(
         &self,
+        identity: PdnId,
         namespace: NamespaceId,
         reject: &RejectId,
         peer: &PeerIdBytes,
@@ -92,7 +107,7 @@ impl RetractionTracker {
             let Ok(tracked) = self.issuer_devices.lock() else {
                 return;
             };
-            let Some(devices) = tracked.get(&namespace) else {
+            let Some(devices) = tracked.get(&(identity, namespace)) else {
                 return;
             };
             if !devices.contains(&device) {
@@ -103,12 +118,13 @@ impl RetractionTracker {
             let Ok(authors) = self.local_authors.lock() else {
                 return;
             };
-            if !authors.contains(&reject.author) {
+            if authors.get(&identity) != Some(&reject.author) {
                 return;
             }
         }
         // A closed channel means the runtime consumer is gone — nothing to notify.
         let _consumer_gone = self.verdicts.send(RetractionVerdict {
+            identity,
             namespace,
             author: reject.author,
             key: reject.key.to_vec(),
@@ -133,27 +149,32 @@ mod tests {
         }
     }
 
-    fn fixtures() -> (NamespaceId, AuthorId, NodeId, PeerIdBytes) {
+    fn fixtures() -> (PdnId, NamespaceId, AuthorId, NodeId, PeerIdBytes) {
+        let identity = PdnId::from_bytes([3u8; 32]);
         let namespace = NamespaceSecret::from_bytes(&[7u8; 32]).id();
         let author = Author::from_bytes(&[5u8; 32]).id();
         let issuer_device = NodeId::from_bytes([9u8; 32]);
-        (namespace, author, issuer_device, [9u8; 32])
+        (identity, namespace, author, issuer_device, [9u8; 32])
     }
 
+    /// A rejection from a device of the issuer, naming an entry of the
+    /// identity's own author, becomes a verdict at once.
     #[test]
     fn a_rejection_from_an_issuer_device_verdicts() {
-        let (namespace, author, issuer_device, issuer_peer) = fixtures();
+        let (identity, namespace, author, issuer_device, issuer_peer) = fixtures();
         let (tracker, mut verdicts) = RetractionTracker::new();
-        tracker.track_namespace(namespace, HashSet::from([issuer_device]));
-        tracker.track_author(author);
+        tracker.track_namespace(identity, namespace, HashSet::from([issuer_device]));
+        tracker.track_author(identity, author);
 
         tracker.record_rejection(
+            identity,
             namespace,
             &reject(author, "contact/email", 42),
             &issuer_peer,
         );
 
         let verdict = verdicts.try_recv().expect("a verdict at once");
+        assert_eq!(verdict.identity, identity);
         assert_eq!(verdict.namespace, namespace);
         assert_eq!(verdict.author, author);
         assert_eq!(verdict.key, b"contact/email");
@@ -161,23 +182,81 @@ mod tests {
         assert!(verdicts.try_recv().is_err(), "exactly one verdict");
     }
 
+    /// A rejection from a stranger, over an entry of another author, or in
+    /// a namespace this identity does not track, is ignored.
     #[test]
     fn a_forged_or_foreign_rejection_is_ignored() {
-        let (namespace, author, issuer_device, issuer_peer) = fixtures();
+        let (identity, namespace, author, issuer_device, issuer_peer) = fixtures();
         let other_author = Author::from_bytes(&[6u8; 32]).id();
         let stranger_peer = [1u8; 32];
         let (tracker, mut verdicts) = RetractionTracker::new();
-        tracker.track_namespace(namespace, HashSet::from([issuer_device]));
-        tracker.track_author(author);
+        tracker.track_namespace(identity, namespace, HashSet::from([issuer_device]));
+        tracker.track_author(identity, author);
 
         // A non-issuer peer's rejection is ignored.
-        tracker.record_rejection(namespace, &reject(author, "k", 1), &stranger_peer);
+        tracker.record_rejection(identity, namespace, &reject(author, "k", 1), &stranger_peer);
         // A rejection for an entry we did not author is ignored.
-        tracker.record_rejection(namespace, &reject(other_author, "k", 1), &issuer_peer);
+        tracker.record_rejection(
+            identity,
+            namespace,
+            &reject(other_author, "k", 1),
+            &issuer_peer,
+        );
         // A rejection in an untracked namespace is ignored.
         let untracked = NamespaceSecret::from_bytes(&[8u8; 32]).id();
-        tracker.record_rejection(untracked, &reject(author, "k", 1), &issuer_peer);
+        tracker.record_rejection(identity, untracked, &reject(author, "k", 1), &issuer_peer);
 
         assert!(verdicts.try_recv().is_err(), "no verdict from any of them");
+    }
+
+    /// Two identities of one node hold one namespace: what one of them
+    /// tracks decides nothing for the other, in either direction.
+    ///
+    /// Denied: a rejection in the untracking identity's replica, from the
+    /// same issuer device and naming the tracking identity's author.
+    #[test]
+    fn a_co_located_identity_neither_grants_nor_takes_a_verdict() {
+        let (work, namespace, work_author, issuer_device, issuer_peer) = fixtures();
+        let leisure = PdnId::from_bytes([4u8; 32]);
+        let leisure_author = Author::from_bytes(&[6u8; 32]).id();
+        let (tracker, mut verdicts) = RetractionTracker::new();
+        tracker.track_namespace(work, namespace, HashSet::from([issuer_device]));
+        tracker.track_author(work, work_author);
+        tracker.track_author(leisure, leisure_author);
+
+        // Denied: the pair (leisure, namespace) is untracked, whoever the
+        // rejection names.
+        tracker.record_rejection(
+            leisure,
+            namespace,
+            &reject(leisure_author, "k", 1),
+            &issuer_peer,
+        );
+        tracker.record_rejection(
+            leisure,
+            namespace,
+            &reject(work_author, "k", 1),
+            &issuer_peer,
+        );
+        // Denied: work tracks the pair, but the entry is the neighbour's.
+        tracker.record_rejection(
+            work,
+            namespace,
+            &reject(leisure_author, "k", 1),
+            &issuer_peer,
+        );
+        assert!(
+            verdicts.try_recv().is_err(),
+            "no verdict crosses identities"
+        );
+
+        // Untracking one identity leaves the other's tracking alone.
+        tracker.track_namespace(leisure, namespace, HashSet::from([issuer_device]));
+        tracker.untrack_namespace(leisure, namespace);
+        tracker.record_rejection(work, namespace, &reject(work_author, "k", 2), &issuer_peer);
+        let verdict = verdicts
+            .try_recv()
+            .expect("the tracking identity still verdicts");
+        assert_eq!(verdict.identity, work);
     }
 }

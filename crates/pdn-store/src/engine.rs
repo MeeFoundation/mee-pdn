@@ -5,7 +5,7 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::{Endpoint, PublicKey};
 use iroh_blobs::{
     api::{blobs::BlobStatus, downloader::Downloader, Store},
     store::{ProtectCb, ProtectOutcome},
@@ -23,13 +23,34 @@ pub use self::{
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, ContentStatus,
-    ContentStatusCallback, Entry, NamespaceId, RejectionObserver,
+    actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, Contact,
+    ContentStatus, ContentStatusCallback, Entry, Holder, NamespaceId, RejectionObserver,
 };
 
 mod gossip;
 mod live;
 mod state;
+
+/// Told of every entry this engine writes locally, with the holder of the
+/// replica that wrote it. A node's own gossip broadcast never reaches its
+/// other subscribers, so this is what tells a co-located holder.
+pub type LocalWriteAnnouncer = Arc<dyn Fn(NamespaceId, Holder) + Send + Sync + 'static>;
+
+/// An announcer that tells nobody — what a node hosting one holder states.
+pub fn announce_nobody() -> LocalWriteAnnouncer {
+    Arc::new(|_namespace, _holder| {})
+}
+
+/// Asked to reconcile `namespace` with a holder of this same node, when a
+/// contact's address carries this node's own wire identity. iroh refuses a
+/// connection to its own endpoint, so a dial that resolves here reaches
+/// the callee through the process or not at all (D7).
+pub type InProcessDialer = Arc<dyn Fn(NamespaceId, Holder) + Send + Sync + 'static>;
+
+/// A dialer that reaches nobody — what a node hosting one holder states.
+pub fn dial_nobody() -> InProcessDialer {
+    Arc::new(|_namespace, _holder| {})
+}
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
 const ACTOR_CHANNEL_CAP: usize = 64;
@@ -52,6 +73,11 @@ pub struct Engine {
     #[debug("ContentStatusCallback")]
     content_status_cb: ContentStatusCallback,
     blob_store: iroh_blobs::api::Store,
+    /// The holder every replica of this engine is held for.
+    holder: Holder,
+    /// Sessions opened over the in-process path, so a pass over a quiet
+    /// pair of co-located holders can be shown to open none.
+    in_process_sessions: Arc<std::sync::atomic::AtomicU64>,
     _gc_protect_task: AbortOnDropHandle<()>,
 }
 
@@ -71,7 +97,10 @@ impl Engine {
         protect_cb: Option<ProtectCallbackHandler>,
         capability_validator: Option<CapabilityValidator>,
         rejection_observer: Option<RejectionObserver>,
-        session_access: Option<crate::filter::SessionAccessProvider>,
+        session_access: crate::filter::SessionAccessProvider,
+        holder: Holder,
+        announce_local: LocalWriteAnnouncer,
+        dial_in_process: InProcessDialer,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -123,6 +152,7 @@ impl Engine {
             }
         }));
 
+        let in_process_sessions = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let actor = LiveActor::new(
             sync.clone(),
             endpoint.clone(),
@@ -132,6 +162,10 @@ impl Engine {
             to_live_actor_recv,
             live_actor_tx.clone(),
             session_access,
+            holder,
+            Arc::clone(&in_process_sessions),
+            announce_local,
+            dial_in_process,
             sync.metrics().clone(),
         )?;
         let actor_handle = n0_future::task::spawn(
@@ -161,6 +195,8 @@ impl Engine {
             content_status_cb,
             default_author,
             blob_store: bao_store,
+            holder,
+            in_process_sessions,
             _gc_protect_task: gc_protect_task,
         })
     }
@@ -179,12 +215,18 @@ impl Engine {
     ///
     /// If `peers` is non-empty, it will both do an initial set-reconciliation sync with each peer,
     /// and join an iroh-gossip swarm with these peers to receive and broadcast document updates.
-    pub async fn start_sync(&self, namespace: NamespaceId, peers: Vec<EndpointAddr>) -> Result<()> {
+    pub async fn start_sync(
+        &self,
+        namespace: NamespaceId,
+        peers: Vec<Contact>,
+        default_holder: Holder,
+    ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
+                default_holder,
                 join_gossip: true,
                 reply,
             })
@@ -202,13 +244,15 @@ impl Engine {
     pub async fn start_sync_scoped(
         &self,
         namespace: NamespaceId,
-        peers: Vec<EndpointAddr>,
+        peers: Vec<Contact>,
+        default_holder: Holder,
     ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
+                default_holder,
                 join_gossip: false,
                 reply,
             })
@@ -289,12 +333,74 @@ impl Engine {
         Ok(a.or(b))
     }
 
-    /// Handle an incoming iroh-docs connection.
+    /// Handle an incoming iroh-docs connection, first message included —
+    /// what an engine that is the whole node's docs handler does.
     pub async fn handle_connection(&self, conn: iroh::endpoint::Connection) -> anyhow::Result<()> {
         self.to_live_actor
             .send(ToLiveActor::HandleConnection { conn })
             .await?;
         Ok(())
+    }
+
+    /// The holder every replica of this engine is held for.
+    pub fn holder(&self) -> Holder {
+        self.holder
+    }
+
+    /// Serve a connection dispatched here by the holder its first message
+    /// named. The connection travels with the session it carries: dropping
+    /// it at the dispatcher would cut the streams mid-exchange.
+    pub async fn handle_session(
+        &self,
+        conn: iroh::endpoint::Connection,
+        opening: crate::net::SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
+        self.to_live_actor
+            .send(ToLiveActor::HandleSession { conn, opening })
+            .await?;
+        Ok(())
+    }
+
+    /// Open a session with a holder of this same node, over a pipe: iroh
+    /// refuses a connection to its own endpoint id, so co-located holders
+    /// meet here or not at all. `serve` is the callee's engine.
+    pub async fn sync_in_process(
+        &self,
+        serve: &Engine,
+        namespace: NamespaceId,
+        callee: Holder,
+    ) -> anyhow::Result<()> {
+        let (dialing, serving) = tokio::io::duplex(live::IN_PROCESS_PIPE_BYTES);
+        let (dial_recv, dial_send) = tokio::io::split(dialing);
+        let (serve_recv, serve_send) = tokio::io::split(serving);
+        let peer = self.endpoint.id();
+        // The callee reads the first message itself: the caller already
+        // resolved which engine holds the replica, so nothing dispatches
+        // between the two.
+        let opening = live::read_in_process_opening(serve_send, serve_recv, peer);
+        let (opening, ()) = tokio::join!(opening, async {
+            let _sent = self
+                .to_live_actor
+                .send(ToLiveActor::SyncInProcess {
+                    namespace,
+                    callee,
+                    peer,
+                    send: dial_send,
+                    recv: dial_recv,
+                })
+                .await;
+        });
+        serve
+            .to_live_actor
+            .send(ToLiveActor::AcceptInProcess { opening: opening? })
+            .await?;
+        Ok(())
+    }
+
+    /// Sessions this engine opened over the in-process path.
+    pub fn in_process_sessions(&self) -> u64 {
+        self.in_process_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shutdown the engine.

@@ -13,11 +13,11 @@ use tracing::{debug, trace, Span};
 use crate::{
     actor::SyncHandle,
     net::{AbortReason, AcceptError, AcceptOutcome, ConnectError},
-    NamespaceId, SyncOutcome,
+    Holder, NamespaceId, SyncOutcome,
 };
 
 #[derive(Debug, Default)]
-struct SyncCodec;
+pub(super) struct SyncCodec;
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // This is likely too large, but lets have some restrictions
 
@@ -69,26 +69,41 @@ impl Encoder<Message> for SyncCodec {
 
 /// Sync Protocol
 ///
-/// - Init message: signals which namespace is being synced
+/// - Init message: names the namespace, the holder whose replica is
+///   addressed and the holder the caller acts for
 /// - N Sync messages
 ///
 /// On any error and on success the substream is closed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum Message {
+pub(super) enum Message {
     /// Init message (sent by the dialing peer)
-    Init {
-        /// Namespace to sync
-        namespace: NamespaceId,
-        /// Initial message
-        message: crate::sync::ProtocolMessage,
-    },
+    Init(Init),
     /// Sync messages (sent by both peers)
     Sync(crate::sync::ProtocolMessage),
     /// Abort message (sent by the accepting peer to decline a request)
     Abort { reason: AbortReason },
 }
 
+/// A session's first message. The two holders are what an accepted
+/// connection is dispatched by, so they are read before any replica is
+/// touched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct Init {
+    /// Namespace to sync
+    pub(super) namespace: NamespaceId,
+    /// Whose replica the session addresses.
+    pub(super) holder: Holder,
+    /// Whom the caller acts for.
+    pub(super) caller: Holder,
+    /// Initial message
+    pub(super) message: crate::sync::ProtocolMessage,
+}
+
 /// Runs the initiator side of the sync protocol.
+///
+/// `holder` names whose replica this session addresses on the peer and
+/// `caller` whom this side acts for; the peer dispatches the connection by
+/// the first and judges the session by the second.
 ///
 /// `filter` is this side's egress filter for the session: every value this
 /// side reveals — the initial range boundary and fingerprint included —
@@ -98,13 +113,17 @@ enum Message {
 /// initial message: entries written after this point are not served
 /// within this session (they travel on the next one). The snapshot is
 /// released when this function exits, on every path.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     reader: &mut R,
     handle: &SyncHandle,
     namespace: NamespaceId,
+    holder: Holder,
+    caller: Holder,
     peer: PublicKey,
     filter: Option<crate::filter::EntryFilter>,
+    ingest: Option<crate::filter::SessionIngest>,
 ) -> Result<SyncOutcome, ConnectError> {
     let peer_bytes = *peer.as_bytes();
     let mut reader = FramedRead::new(reader, SyncCodec);
@@ -124,7 +143,12 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .sync_initial_message(namespace, session.id(), filter.clone())
         .await
         .map_err(ConnectError::sync)?;
-    let init_message = Message::Init { namespace, message };
+    let init_message = Message::Init(Init {
+        namespace,
+        holder,
+        caller,
+        message,
+    });
     trace!("send init message");
     writer
         .send(init_message)
@@ -135,7 +159,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     while let Some(msg) = reader.next().await {
         let msg = msg.map_err(ConnectError::sync)?;
         match msg {
-            Message::Init { .. } => {
+            Message::Init(_) => {
                 return Err(ConnectError::sync(anyhow!("unexpected init message")));
             }
             Message::Sync(msg) => {
@@ -149,6 +173,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         current_progress,
                         session.id(),
                         filter.clone(),
+                        ingest.clone(),
                     )
                     .await
                     .map_err(ConnectError::sync)?;
@@ -173,6 +198,95 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(progress)
 }
 
+/// A session read as far as its first message, before any replica is
+/// touched: the point an accepted connection is dispatched from.
+pub struct SessionOpening<R, W> {
+    peer: PublicKey,
+    init: Init,
+    reader: FramedRead<R, SyncCodec>,
+    writer: FramedWrite<W, SyncCodec>,
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> SessionOpening<R, W> {
+    /// Read the session's first message off `reader`.
+    pub(crate) async fn read(writer: W, reader: R, peer: PublicKey) -> Result<Self, AcceptError> {
+        let mut reader = FramedRead::new(reader, SyncCodec);
+        let writer = FramedWrite::new(writer, SyncCodec);
+        let opened = reader.next().await.ok_or_else(|| {
+            AcceptError::sync(peer, None, anyhow!("stream closed before the init message"))
+        })?;
+        match opened.map_err(|e| AcceptError::sync(peer, None, e))? {
+            Message::Init(init) => Ok(Self {
+                peer,
+                init,
+                reader,
+                writer,
+            }),
+            Message::Sync(_) | Message::Abort { .. } => Err(AcceptError::sync(
+                peer,
+                None,
+                anyhow!("unexpected message before init"),
+            )),
+        }
+    }
+
+    /// Decline the session with a terminal frame, the way the rounds
+    /// decline one: closing the stream alone reads to the initiator as an
+    /// exchange that carried nothing.
+    pub(super) async fn refuse(mut self, reason: AbortReason) -> Result<(W, R), AcceptError> {
+        let sent = self.writer.send(Message::Abort { reason }).await;
+        let (writer, reader) = (self.writer.into_inner(), self.reader.into_inner());
+        match sent {
+            Ok(()) => Ok((writer, reader)),
+            Err(err) => Err(AcceptError::sync(self.peer, Some(self.init.namespace), err)),
+        }
+    }
+}
+
+impl<R, W> SessionOpening<R, W> {
+    /// Whose replica this session addresses.
+    pub fn holder(&self) -> Holder {
+        self.init.holder
+    }
+
+    /// Whom the caller acts for.
+    pub fn caller(&self) -> Holder {
+        self.init.caller
+    }
+
+    /// The namespace the caller named.
+    pub fn namespace(&self) -> NamespaceId {
+        self.init.namespace
+    }
+
+    /// The caller's transport-authenticated node id.
+    pub fn peer(&self) -> PublicKey {
+        self.peer
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        PublicKey,
+        Init,
+        FramedRead<R, SyncCodec>,
+        FramedWrite<W, SyncCodec>,
+    ) {
+        (self.peer, self.init, self.reader, self.writer)
+    }
+}
+
+impl<R, W> std::fmt::Debug for SessionOpening<R, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionOpening")
+            .field("peer", &self.peer.fmt_short().to_string())
+            .field("namespace", &self.init.namespace.fmt_short().to_string())
+            .field("holder", &self.init.holder)
+            .field("caller", &self.init.caller)
+            .finish()
+    }
+}
+
 /// Runs the receiver side of the sync protocol.
 #[cfg(test)]
 pub(super) async fn run_bob<R, W, F, Fut>(
@@ -185,11 +299,15 @@ pub(super) async fn run_bob<R, W, F, Fut>(
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    F: Fn(NamespaceId, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
+    let opening = SessionOpening::read(writer, reader, peer).await?;
+    let (peer, init, mut reader, mut writer) = opening.into_parts();
     let mut state = BobState::new(peer);
-    let namespace = state.run(writer, reader, handle, accept_cb).await?;
+    let namespace = state
+        .run(&mut writer, &mut reader, init, handle, accept_cb)
+        .await?;
     Ok((namespace, state.into_outcome()))
 }
 
@@ -209,6 +327,9 @@ pub struct BobState {
     /// This side's egress filter for the session, taken from the accept
     /// decision and frozen for the session.
     filter: Option<crate::filter::EntryFilter>,
+    /// This side's ingest verdict for the session, from the same decision
+    /// and frozen the same way.
+    ingest: Option<crate::filter::SessionIngest>,
     /// The session's egress snapshot, opened once the request is allowed
     /// and released when this state drops — on every session exit path.
     /// A session carries its own namespace, so the exchange rounds key on
@@ -224,6 +345,7 @@ impl BobState {
             namespace: None,
             progress: Default::default(),
             filter: None,
+            ingest: None,
             session: None,
         }
     }
@@ -232,30 +354,26 @@ impl BobState {
         AcceptError::sync(self.peer, self.namespace(), reason.into())
     }
 
-    /// Handle connection and run to end.
+    /// Handle a session whose first message is already read, and run to end.
     ///
     /// An exchange that ends badly says so with a terminal frame: closing
     /// the stream is what a finished one does, and the initiator cannot
     /// tell the two apart from the wire alone.
     pub async fn run<R, W, F, Fut>(
         &mut self,
-        writer: W,
-        reader: R,
+        writer: &mut FramedWrite<W, SyncCodec>,
+        reader: &mut FramedRead<R, SyncCodec>,
+        init: Init,
         sync: SyncHandle,
         accept_cb: F,
     ) -> Result<NamespaceId, AcceptError>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
-        F: Fn(NamespaceId, PublicKey) -> Fut,
+        F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
         Fut: Future<Output = AcceptOutcome>,
     {
-        let mut reader = FramedRead::new(reader, SyncCodec);
-        let mut writer = FramedWrite::new(writer, SyncCodec);
-
-        let res = self
-            .run_rounds(&mut writer, &mut reader, sync, accept_cb)
-            .await;
+        let res = self.run_rounds(writer, reader, init, sync, accept_cb).await;
         if let Err(ref err) = res {
             // Closing the stream is how a finished exchange ends, so an error
             // that only closes it reads to the initiator as an exchange that
@@ -275,97 +393,76 @@ impl BobState {
         res
     }
 
-    /// The exchange itself: init, then rounds until either side is done.
+    /// The exchange itself: the accept decision on the first message, then
+    /// rounds until either side is done.
     async fn run_rounds<R, W, F, Fut>(
         &mut self,
         writer: &mut FramedWrite<W, SyncCodec>,
         reader: &mut FramedRead<R, SyncCodec>,
+        init: Init,
         sync: SyncHandle,
         accept_cb: F,
     ) -> Result<NamespaceId, AcceptError>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
-        F: Fn(NamespaceId, PublicKey) -> Fut,
+        F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
         Fut: Future<Output = AcceptOutcome>,
     {
-        while let Some(msg) = reader.next().await {
-            let msg = msg.map_err(|e| self.fail(e))?;
-            // Copied out, so the arms can take `self` mutably.
-            let running = self.session.as_ref().map(|s| (s.namespace(), s.id()));
-            let next = match (msg, running) {
-                (Message::Init { namespace, message }, None) => {
-                    Span::current()
-                        .record("namespace", tracing::field::display(&namespace.fmt_short()));
-                    trace!("recv init message");
-                    // Named from the peer's Init, before the decision that
-                    // can fail: the caller registers this pair as exchanging
-                    // when it allows the request, so every error from here on
-                    // has to name the namespace or the caller is never told
-                    // the exchange ended and holds the pair until restart.
-                    self.namespace = Some(namespace);
-                    let accept = accept_cb(namespace, self.peer).await;
-                    match accept {
-                        AcceptOutcome::Allow { filter } => {
-                            trace!("allow request");
-                            self.filter = filter;
-                        }
-                        AcceptOutcome::Reject(reason) => {
-                            debug!(?reason, "reject request");
-                            writer
-                                .send(Message::Abort { reason })
-                                .await
-                                .map_err(|e| self.fail(e))?;
-                            return Err(AcceptError::Abort {
-                                namespace,
-                                peer: self.peer,
-                                reason,
-                            });
-                        }
-                    }
-                    // Session setup: freeze the egress snapshot before the
-                    // first message is processed. A rejected request never
-                    // opens one.
-                    let session = sync
-                        .sync_session_start(namespace)
-                        .await
-                        .map_err(|e| self.fail(e))?;
-                    let session_id = session.id();
-                    self.session = Some(session);
-                    let last_progress = self.progress.clone();
-                    sync.sync_process_message(
-                        namespace,
-                        message,
-                        *self.peer.as_bytes(),
-                        last_progress,
-                        session_id,
-                        self.filter.clone(),
-                    )
+        let Init {
+            namespace,
+            holder,
+            caller,
+            message,
+        } = init;
+        Span::current().record("namespace", tracing::field::display(&namespace.fmt_short()));
+        trace!("recv init message");
+        // Named from the peer's Init, before the decision that can fail:
+        // the caller registers this pair as exchanging when it allows the
+        // request, so every error from here on has to name the namespace or
+        // the caller is never told the exchange ended and holds the pair
+        // until restart.
+        self.namespace = Some(namespace);
+        match accept_cb(namespace, holder, caller, self.peer).await {
+            AcceptOutcome::Allow { filter, ingest } => {
+                trace!("allow request");
+                self.filter = filter;
+                self.ingest = ingest;
+            }
+            AcceptOutcome::Reject(reason) => {
+                debug!(?reason, "reject request");
+                writer
+                    .send(Message::Abort { reason })
                     .await
-                }
-                (Message::Sync(msg), Some((namespace, session_id))) => {
-                    trace!("recv process message");
-                    let last_progress = self.progress.clone();
-                    sync.sync_process_message(
-                        namespace,
-                        msg,
-                        *self.peer.as_bytes(),
-                        last_progress,
-                        session_id,
-                        self.filter.clone(),
-                    )
-                    .await
-                }
-                (Message::Init { .. }, Some(_)) => {
-                    return Err(self.fail(anyhow!("double init message")));
-                }
-                (Message::Sync(_), None) => {
-                    return Err(self.fail(anyhow!("unexpected sync message before init")));
-                }
-                (Message::Abort { .. }, _) => {
-                    return Err(self.fail(anyhow!("unexpected sync abort message")));
-                }
-            };
+                    .map_err(|e| self.fail(e))?;
+                return Err(AcceptError::Abort {
+                    namespace,
+                    peer: self.peer,
+                    reason,
+                });
+            }
+        }
+        // Session setup: freeze the egress snapshot before the first
+        // message is processed. A rejected request never opens one.
+        let session = sync
+            .sync_session_start(namespace)
+            .await
+            .map_err(|e| self.fail(e))?;
+        let session_id = session.id();
+        self.session = Some(session);
+        let mut next = sync
+            .sync_process_message(
+                namespace,
+                message,
+                *self.peer.as_bytes(),
+                self.progress.clone(),
+                session_id,
+                self.filter.clone(),
+                self.ingest.clone(),
+            )
+            .await;
+
+        loop {
             let (reply, progress) = next.map_err(|e| self.fail(e))?;
             self.progress = progress;
             match reply {
@@ -377,6 +474,31 @@ impl BobState {
                         .map_err(|e| self.fail(e))?;
                 }
                 None => break,
+            }
+            let Some(msg) = reader.next().await else {
+                break;
+            };
+            match msg.map_err(|e| self.fail(e))? {
+                Message::Sync(msg) => {
+                    trace!("recv process message");
+                    next = sync
+                        .sync_process_message(
+                            namespace,
+                            msg,
+                            *self.peer.as_bytes(),
+                            self.progress.clone(),
+                            session_id,
+                            self.filter.clone(),
+                            self.ingest.clone(),
+                        )
+                        .await;
+                }
+                Message::Init(_) => {
+                    return Err(self.fail(anyhow!("double init message")));
+                }
+                Message::Abort { .. } => {
+                    return Err(self.fail(anyhow!("unexpected sync abort message")));
+                }
             }
         }
 
@@ -406,12 +528,32 @@ mod tests {
     use rand::{CryptoRng, RngExt, SeedableRng};
     use tracing_test::traced_test;
 
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::{
         actor::OpenOpts,
         store::{self, Query, Store},
         AuthorId, NamespaceSecret,
     };
+
+    /// One holder on both sides: these scenarios test the codec, not the
+    /// dispatch the holders exist for.
+    const TEST_HOLDER: Holder = Holder::from_bytes([0u8; 32]);
+    /// A cache big enough that nothing in a scenario evicts.
+    #[cfg(feature = "fs-store")]
+    const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+    /// An empty first message for `namespace`, under the one test holder.
+    /// `super::`: this module shadows the wire `Message` with its own alias.
+    fn init_frame(namespace: NamespaceId) -> super::Message {
+        super::Message::Init(super::Init {
+            namespace,
+            holder: TEST_HOLDER,
+            caller: TEST_HOLDER,
+            message: crate::ranger::Message::from_parts(vec![]),
+        })
+    }
 
     #[tokio::test]
     async fn test_sync_simple() -> Result<()> {
@@ -478,7 +620,10 @@ mod tests {
                 &mut alice_reader,
                 &alice_handle2,
                 namespace_id,
+                TEST_HOLDER,
+                TEST_HOLDER,
                 bob_peer_id,
+                None,
                 None,
             )
             .await
@@ -495,7 +640,12 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_handle2,
-                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+                |_namespace, _holder, _caller, _peer| {
+                    std::future::ready(AcceptOutcome::Allow {
+                        filter: None,
+                        ingest: None,
+                    })
+                },
                 alice_peer_id,
             )
             .await
@@ -542,8 +692,9 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_sync_many_authors_fs() -> Result<()> {
         let tmpdir = tempfile::tempdir()?;
-        let alice_store = store::fs::Store::persistent(tmpdir.path().join("a.db"))?;
-        let bob_store = store::fs::Store::persistent(tmpdir.path().join("b.db"))?;
+        let alice_store =
+            store::fs::Store::persistent(tmpdir.path().join("a.db"), TEST_CACHE_BYTES)?;
+        let bob_store = store::fs::Store::persistent(tmpdir.path().join("b.db"), TEST_CACHE_BYTES)?;
         test_sync_many_authors(alice_store, bob_store).await
     }
 
@@ -698,7 +849,12 @@ mod tests {
             bob_handle,
             bob_node_pubkey,
             namespace,
-            |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+            |_namespace, _holder, _caller, _peer| {
+                std::future::ready(AcceptOutcome::Allow {
+                    filter: None,
+                    ingest: None,
+                })
+            },
         )
         .await?;
         alice?;
@@ -721,7 +877,7 @@ mod tests {
         Result<(NamespaceId, SyncOutcome), AcceptError>,
     )>
     where
-        F: Fn(NamespaceId, PublicKey) -> Fut + Send + 'static,
+        F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut + Send + 'static,
         Fut: Future<Output = AcceptOutcome> + Send,
     {
         alice_handle
@@ -739,7 +895,10 @@ mod tests {
                 &mut alice_reader,
                 &alice_handle,
                 namespace,
+                TEST_HOLDER,
+                TEST_HOLDER,
                 bob_node_pubkey,
+                None,
                 None,
             )
             .await
@@ -773,8 +932,9 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_sync_timestamps_fs() -> Result<()> {
         let tmpdir = tempfile::tempdir()?;
-        let alice_store = store::fs::Store::persistent(tmpdir.path().join("a.db"))?;
-        let bob_store = store::fs::Store::persistent(tmpdir.path().join("b.db"))?;
+        let alice_store =
+            store::fs::Store::persistent(tmpdir.path().join("a.db"), TEST_CACHE_BYTES)?;
+        let bob_store = store::fs::Store::persistent(tmpdir.path().join("b.db"), TEST_CACHE_BYTES)?;
         test_sync_timestamps(alice_store, bob_store).await
     }
 
@@ -855,6 +1015,122 @@ mod tests {
         Ok((handle, namespace.id()))
     }
 
+    /// A session carries both holders to the serving side, over a stream
+    /// pair with no network under it.
+    ///
+    /// Denied: a caller that names a holder the serving side refuses sees
+    /// its request declined and no entry served.
+    #[tokio::test]
+    async fn a_session_names_both_holders_to_the_serving_side() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+        let addressed = Holder::from_bytes([7u8; 32]);
+        let acting = Holder::from_bytes([9u8; 32]);
+
+        let mut alice_store = store::Store::memory();
+        let author = alice_store.new_author(&mut rng)?;
+        let mut replica = alice_store.new_replica(namespace.clone())?;
+        replica
+            .hash_and_insert("greeting", &author, "hello")
+            .await?;
+        alice_store.close_replica(ns);
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+
+        let seen: Arc<Mutex<Vec<(Holder, Holder)>>> = Arc::default();
+        let (alice_io, bob_io) = tokio::io::duplex(1024);
+        let (mut alice_reader, mut alice_writer) = tokio::io::split(alice_io);
+        let (bob_reader, bob_writer) = tokio::io::split(bob_io);
+
+        let alice_run = alice.clone();
+        let dial = tokio::task::spawn(async move {
+            run_alice(
+                &mut alice_writer,
+                &mut alice_reader,
+                &alice_run,
+                ns,
+                addressed,
+                acting,
+                bob_peer,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let observed = Arc::clone(&seen);
+        let serve = async move {
+            let opening = SessionOpening::read(bob_writer, bob_reader, alice_peer).await?;
+            assert_eq!(opening.holder(), addressed, "the addressed holder");
+            assert_eq!(opening.caller(), acting, "the caller's holder");
+            let (peer, init, mut reader, mut writer) = opening.into_parts();
+            let mut state = BobState::new(peer);
+            state
+                .run(
+                    &mut writer,
+                    &mut reader,
+                    init,
+                    bob.clone(),
+                    move |_ns, holder, caller, _peer| {
+                        observed.lock().unwrap().push((holder, caller));
+                        std::future::ready(AcceptOutcome::Allow {
+                            filter: None,
+                            ingest: None,
+                        })
+                    },
+                )
+                .await?;
+            bob.shutdown().await?;
+            anyhow::Ok(state.into_outcome())
+        };
+
+        let (dialed, served) = tokio::join!(dial, serve);
+        dialed??;
+        let served = served?;
+        assert!(served.num_recv > 0, "the entry crossed the pipe");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(addressed, acting)],
+            "the accept decision saw the holders the caller named"
+        );
+
+        alice.shutdown().await?;
+        Ok(())
+    }
+
+    /// A first message missing the caller's holder does not decode, so no
+    /// session can be opened without one.
+    #[test]
+    fn an_init_without_the_caller_does_not_decode() {
+        /// The first message as it would read without the second holder.
+        #[derive(Serialize)]
+        struct InitWithoutCaller {
+            namespace: NamespaceId,
+            holder: Holder,
+            message: crate::sync::ProtocolMessage,
+        }
+        #[derive(Serialize)]
+        enum Truncated {
+            Init(InitWithoutCaller),
+        }
+
+        let namespace = NamespaceSecret::from_bytes(&[3u8; 32]).id();
+        let bytes = postcard::to_stdvec(&Truncated::Init(InitWithoutCaller {
+            namespace,
+            holder: TEST_HOLDER,
+            message: crate::ranger::Message::from_parts(vec![]),
+        }))
+        .expect("serialize");
+
+        postcard::from_bytes::<super::Message>(&bytes)
+            .expect_err("a first message without the caller's holder decoded");
+    }
+
     /// Both sides of a completed sync exchange release their session
     /// snapshots.
     #[tokio::test]
@@ -872,7 +1148,12 @@ mod tests {
             bob_handle.clone(),
             bob_peer_id,
             namespace_id,
-            |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+            |_namespace, _holder, _caller, _peer| {
+                std::future::ready(AcceptOutcome::Allow {
+                    filter: None,
+                    ingest: None,
+                })
+            },
         )
         .await?;
         alice?;
@@ -905,7 +1186,9 @@ mod tests {
             bob_handle.clone(),
             bob_peer_id,
             namespace_id,
-            |_namespace, _peer| std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound)),
+            |_namespace, _holder, _caller, _peer| {
+                std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound))
+            },
         )
         .await?;
         assert!(alice.is_err());
@@ -941,7 +1224,10 @@ mod tests {
                 &mut alice_reader,
                 &alice_handle2,
                 namespace_id,
+                TEST_HOLDER,
+                TEST_HOLDER,
                 bob_peer_id,
+                None,
                 None,
             )
             .await
@@ -1045,22 +1331,30 @@ mod tests {
         // namespace used to be lost.
         handle.open(namespace_id, OpenOpts::default()).await?;
 
-        let allow = |_ns, _peer| std::future::ready(AcceptOutcome::Allow { filter: None });
+        let allow = |_ns, _holder, _caller, _peer| {
+            std::future::ready(AcceptOutcome::Allow {
+                filter: None,
+                ingest: None,
+            })
+        };
 
         let (bob_side, peer_side) = tokio::io::duplex(1024);
-        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_side);
+        let (bob_reader, bob_writer) = tokio::io::split(bob_side);
         let mut peer_writer = FramedWrite::new(peer_side, SyncCodec);
-        peer_writer
-            .send(super::Message::Init {
-                namespace: namespace_id,
-                message: crate::ranger::Message::from_parts(vec![]),
-            })
-            .await?;
+        peer_writer.send(init_frame(namespace_id)).await?;
         drop(peer_writer);
 
-        let mut state = BobState::new(peer_id);
+        let opening = SessionOpening::read(bob_writer, bob_reader, peer_id).await?;
+        let (peer, init, mut bob_reader, mut bob_writer) = opening.into_parts();
+        let mut state = BobState::new(peer);
         let err = state
-            .run(&mut bob_writer, &mut bob_reader, handle.clone(), allow)
+            .run(
+                &mut bob_writer,
+                &mut bob_reader,
+                init,
+                handle.clone(),
+                allow,
+            )
             .await
             .expect_err("a replica open without sync served a session");
         assert_eq!(
@@ -1073,15 +1367,13 @@ mod tests {
         // before it names nothing, so no caller is told to release a pair
         // it never registered.
         let (bob_side, mut peer_side) = tokio::io::duplex(1024);
-        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_side);
+        let (bob_reader, bob_writer) = tokio::io::split(bob_side);
         peer_side
             .write_all(&[0, 0, 0, 4, 0xff, 0xff, 0xff, 0xff])
             .await?;
         drop(peer_side);
 
-        let mut state = BobState::new(peer_id);
-        let err = state
-            .run(&mut bob_writer, &mut bob_reader, handle.clone(), allow)
+        let err = SessionOpening::read(bob_writer, bob_reader, peer_id)
             .await
             .expect_err("a malformed first message was accepted");
         assert_eq!(
@@ -1174,26 +1466,35 @@ mod tests {
         )]);
 
         let (bob_side, peer_side) = tokio::io::duplex(1024);
-        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_side);
+        let (bob_reader, bob_writer) = tokio::io::split(bob_side);
         // Sent up front and the peer end closed, so an unexpectedly served
         // round runs into end-of-stream instead of parking the test.
         let mut peer_writer = FramedWrite::new(peer_side, SyncCodec);
-        // `super::`: this module shadows the wire `Message` with its own alias.
         peer_writer
-            .send(super::Message::Init {
+            .send(super::Message::Init(super::Init {
                 namespace: namespace_id,
+                holder: TEST_HOLDER,
+                caller: TEST_HOLDER,
                 message: refused,
-            })
+            }))
             .await?;
         drop(peer_writer);
 
-        let mut state = BobState::new(peer_id);
+        let opening = SessionOpening::read(bob_writer, bob_reader, peer_id).await?;
+        let (peer, init, mut bob_reader, mut bob_writer) = opening.into_parts();
+        let mut state = BobState::new(peer);
         let res = state
             .run(
                 &mut bob_writer,
                 &mut bob_reader,
+                init,
                 handle.clone(),
-                |_ns, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+                |_ns, _holder, _caller, _peer| {
+                    std::future::ready(AcceptOutcome::Allow {
+                        filter: None,
+                        ingest: None,
+                    })
+                },
             )
             .await;
         let err = res.expect_err("the refused range was served");
@@ -1349,6 +1650,7 @@ mod tests {
                     std::mem::take(&mut bob_state),
                     bob_session.id(),
                     None,
+                    None,
                 )
                 .await?;
             bob_state = next;
@@ -1361,6 +1663,7 @@ mod tests {
                     *bob_peer.as_bytes(),
                     std::mem::take(&mut alice_state),
                     alice_session.id(),
+                    None,
                     None,
                 )
                 .await?;
@@ -1532,7 +1835,10 @@ mod tests {
                 &mut alice_reader,
                 &alice_run,
                 ns,
+                TEST_HOLDER,
+                TEST_HOLDER,
                 bob_peer,
+                None,
                 None,
             )
             .await
@@ -1544,7 +1850,12 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_run,
-                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+                |_namespace, _holder, _caller, _peer| {
+                    std::future::ready(AcceptOutcome::Allow {
+                        filter: None,
+                        ingest: None,
+                    })
+                },
                 alice_peer,
             )
             .await
@@ -1615,27 +1926,42 @@ mod tests {
         }
 
         let (alice_io, bob_io) = tokio::io::duplex(1024);
-        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_io);
-        let mut state = BobState::new(alice_peer);
+        let (bob_reader, bob_writer) = tokio::io::split(bob_io);
         let bob_run = bob.clone();
-        let bob_fut = state.run(
-            &mut bob_writer,
-            &mut bob_reader,
-            bob_run,
-            |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
-        );
+        let (alice_reader, alice_writer) = tokio::io::split(alice_io);
+
+        let mut state = BobState::new(alice_peer);
+        let serve = async {
+            let opening = SessionOpening::read(bob_writer, bob_reader, alice_peer).await?;
+            let (_peer, init, mut reader, mut writer) = opening.into_parts();
+            state
+                .run(
+                    &mut writer,
+                    &mut reader,
+                    init,
+                    bob_run,
+                    |_namespace, _holder, _caller, _peer| {
+                        std::future::ready(AcceptOutcome::Allow {
+                            filter: None,
+                            ingest: None,
+                        })
+                    },
+                )
+                .await
+        };
 
         let drive_alice = async {
-            let (alice_reader, alice_writer) = tokio::io::split(alice_io);
             let mut reader = FramedRead::new(alice_reader, SyncCodec);
             let mut writer = FramedWrite::new(alice_writer, SyncCodec);
             let session = alice.sync_session_start(ns).await?;
             let message = alice.sync_initial_message(ns, session.id(), None).await?;
             writer
-                .send(super::Message::Init {
+                .send(super::Message::Init(super::Init {
                     namespace: ns,
+                    holder: TEST_HOLDER,
+                    caller: TEST_HOLDER,
                     message,
-                })
+                }))
                 .await?;
 
             let reply = reader
@@ -1660,6 +1986,7 @@ mod tests {
                     SyncOutcome::default(),
                     session.id(),
                     None,
+                    None,
                 )
                 .await?;
             let next = next.ok_or_else(|| anyhow!("the exchange ended in one round"))?;
@@ -1667,7 +1994,7 @@ mod tests {
             anyhow::Ok(())
         };
 
-        let (bob_res, alice_res) = tokio::join!(bob_fut, drive_alice);
+        let (bob_res, alice_res) = tokio::join!(serve, drive_alice);
         alice_res?;
         assert!(bob_res.is_err(), "the round was expected to fail");
         let outcome = state.into_outcome();
@@ -1710,10 +2037,12 @@ mod tests {
         let message = alice.sync_initial_message(ns, session.id(), None).await?;
         let mut alice_framed = FramedWrite::new(alice_io, SyncCodec);
         alice_framed
-            .send(super::Message::Init {
+            .send(super::Message::Init(super::Init {
                 namespace: ns,
+                holder: TEST_HOLDER,
+                caller: TEST_HOLDER,
                 message,
-            })
+            }))
             .await?;
 
         // Dropping alice's end inside the decision puts her vanishing
@@ -1722,7 +2051,7 @@ mod tests {
         let alice_end = std::sync::Arc::new(std::sync::Mutex::new(Some(alice_framed)));
         let accept_cb = {
             let alice_end = std::sync::Arc::clone(&alice_end);
-            move |_namespace, _peer| {
+            move |_namespace, _holder, _caller, _peer| {
                 alice_end.lock().unwrap().take();
                 std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound))
             }

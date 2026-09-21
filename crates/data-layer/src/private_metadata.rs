@@ -163,14 +163,15 @@ pub struct PrivateMetadataStore {
 }
 
 impl PrivateMetadataStore {
-    pub async fn create(node: &SyncNode) -> Result<Self> {
+    pub async fn create(node: &SyncNode, identity: PdnId) -> Result<Self> {
         // Author first, tracked doc last: nothing awaits between the
         // tracking and the handle reaching the caller, so a dropped future
-        // cannot leave a tracked replica no handle refers to. The node's one
-        // author: per-store authors would leave a record written before a
-        // restart standing beside its replacement written after one.
-        let author = node.default_author().await?;
-        let doc = node.new_doc().await?;
+        // cannot leave a tracked replica no handle refers to. The
+        // identity's one author: per-store authors would leave a record
+        // written before a restart standing beside its replacement written
+        // after one.
+        let author = node.default_author(identity)?;
+        let doc = node.new_doc(identity).await?;
         Ok(Self {
             doc,
             author,
@@ -180,10 +181,10 @@ impl PrivateMetadataStore {
     }
 
     /// Import via the write ticket the linking reply carries.
-    pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
+    pub async fn import(node: &SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see `create`.
-        let author = node.default_author().await?;
-        let doc = node.import_doc(ticket).await?;
+        let author = node.default_author(identity)?;
+        let doc = node.import_doc(identity, ticket).await?;
         Ok(Self {
             doc,
             author,
@@ -196,9 +197,13 @@ impl PrivateMetadataStore {
     /// namespace the store does not hold is `Ok(None)`, so a caller acting on
     /// a durable record tells an absent replica from a store that failed to
     /// answer.
-    pub async fn open(node: &SyncNode, namespace: NamespaceId) -> Result<Option<Self>> {
-        let author = node.default_author().await?;
-        let Some(doc) = node.open_doc(namespace).await? else {
+    pub async fn open(
+        node: &SyncNode,
+        identity: PdnId,
+        namespace: NamespaceId,
+    ) -> Result<Option<Self>> {
+        let author = node.default_author(identity)?;
+        let Some(doc) = node.open_doc(identity, namespace).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -324,8 +329,8 @@ impl PrivateMetadataStore {
     }
 
     /// Live records at `device`'s key across authors — what every product
-    /// read collapses latest-wins, so this is the only way to assert the
-    /// node's one author.
+    /// read collapses latest-wins, so this is the only way to assert one
+    /// author per hosted identity.
     #[cfg(feature = "test-util")]
     pub async fn live_device_record_count(&self, device: NodeId) -> Result<usize> {
         let query = Query::all().key_exact(device_key(&device).into_bytes());

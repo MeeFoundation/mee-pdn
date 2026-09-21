@@ -41,31 +41,23 @@ pub(crate) struct Registry {
 
 impl Registry {
     /// Register the data namespace of `issuer` as backed by `doc`, handing
-    /// back the binding this replaced (`None` if the issuer was unbound) so
-    /// an undoable caller can put it back.
-    #[must_use = "the displaced registration must be restored or knowingly discarded"]
+    /// back the binding this replaced (`None` if the issuer was unbound).
+    /// A displaced binding is dropped with the replica it names, never put
+    /// back: what an undo restores is what the identity held before, and
+    /// this registry holds one identity's bindings alone (ADR-0013).
+    ///
+    /// One namespace binds one issuer: registering a second issuer onto a
+    /// replica another one is bound to is refused, because the reverse
+    /// lookup ([`binding_of`](Self::binding_of)) would otherwise pick between
+    /// the two arbitrarily and could answer with the wrong serving posture —
+    /// a fail-open branch.
     pub(crate) fn register_data(
         &self,
         issuer: PdnId,
         doc: Doc,
         posture: ServingPosture,
     ) -> Result<Option<DataBinding>> {
-        self.register_binding(issuer, DataBinding { doc, posture })
-    }
-
-    /// Register a binding wholesale — the restore half of an undo.
-    ///
-    /// One namespace binds one issuer: registering a second identity onto a
-    /// replica another one is bound to is refused, because the reverse
-    /// lookup ([`binding_of`](Self::binding_of)) would otherwise pick between
-    /// the two arbitrarily and could answer with the wrong serving posture —
-    /// a fail-open branch.
-    #[must_use = "the displaced registration must be restored or knowingly discarded"]
-    pub(crate) fn register_binding(
-        &self,
-        issuer: PdnId,
-        binding: DataBinding,
-    ) -> Result<Option<DataBinding>> {
+        let binding = DataBinding { doc, posture };
         let mut docs = self
             .data_docs
             .write()
