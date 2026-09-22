@@ -211,7 +211,7 @@ impl PairingHandler {
     }
 }
 
-/// The inviter's half of the dialogue, over any pair of streams (D8): read
+/// The inviter's half of the dialogue, over any pair of streams: read
 /// the request, verify and burn the secret before any state change,
 /// assemble this side's half of the connection, and answer with its
 /// ticket. `None` is a refusal, any reason at all; the transport answers
@@ -374,7 +374,7 @@ const PAIRING_PIPE_BYTES: usize = MAX_WIRE_MESSAGE_LEN as usize + 4;
 /// The dialogue between two identities of one node, run over a pipe: the
 /// same messages, the same verify-and-burn and the same assembly as
 /// between two nodes, with the serving half taken from this runtime's own
-/// state (D8).
+/// state.
 async fn pair_in_process(
     state: &Arc<Mutex<State>>,
     request: &PairingRequest,
@@ -412,7 +412,7 @@ async fn establish_via_dialogue_inner(
 ) -> Result<()> {
     // An invite whose address carries this node's own wire identity is an
     // invite from a co-located identity: iroh refuses a connection to its
-    // own endpoint id, so the dialogue runs over a pipe (D8). Dial before
+    // own endpoint id, so the dialogue runs over a pipe. Dial before
     // minting `own`, so an unreachable inviter leaves no replica.
     let connection = if payload.inviter_addr.id == dial.id() {
         None

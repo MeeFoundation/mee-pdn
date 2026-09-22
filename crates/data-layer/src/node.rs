@@ -242,7 +242,7 @@ pub struct SyncNode {
     /// The half of the node each hosted identity owns.
     identities: Identities,
     /// What one identity's replica store may hold, cut at spawn from the
-    /// node budget and the count the device is provisioned for (D14). The
+    /// node budget and the count the device is provisioned for. The
     /// bound cannot be changed on an open store, so it is fixed here and
     /// every identity's store opens at it.
     cache_share_bytes: usize,
@@ -512,7 +512,7 @@ impl SyncNode {
             }))
             // A node's own gossip broadcast never reaches its other
             // subscribers, so a co-located holder of the namespace is told
-            // here (D9) and reconciles over the in-process path.
+            // here and reconciles over the in-process path.
             .local_write_announcer({
                 let identities = Arc::clone(&identities);
                 Arc::new(move |namespace, writer| {
@@ -520,7 +520,7 @@ impl SyncNode {
                 })
             })
             // A contact naming this node — from a ticket, a device record,
-            // a contact list — reaches its holder inside the process (D7).
+            // a contact list — reaches its holder inside the process.
             .in_process_dialer(Arc::new(move |namespace, callee| {
                 reconcile_with_co_located(
                     &identities,
@@ -1238,7 +1238,7 @@ impl SyncNode {
         Ok(author)
     }
 
-    /// The identity's one author, persisted with its replicas (D10). An
+    /// The identity's one author, persisted with its replicas. An
     /// author minted per store or per start would make a rewritten key
     /// accumulate one live record per author, and leave a device record
     /// written under one author standing after a withdrawal written under
@@ -1446,7 +1446,7 @@ pub struct IdentityNotProvisioned {
     pub identity: PdnId,
 }
 
-/// One subdirectory per hosted identity (D12), named by the identity, each
+/// One subdirectory per hosted identity, named by the identity, each
 /// holding that identity's replica store and author.
 fn identity_directory(directory: &std::path::Path, identity: PdnId) -> std::path::PathBuf {
     directory

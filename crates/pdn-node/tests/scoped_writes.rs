@@ -361,7 +361,7 @@ async fn a_retraction_does_not_flap_back_from_a_sibling() -> Result<()> {
 /// A retraction verdict is recorded in the directory of the identity
 /// whose author it names and in no other: one identity of a node writes
 /// past the grant it holds, and the co-located identity granted the same
-/// claim keeps its directory and its replica as they were (D10).
+/// claim keeps its directory and its replica as they were.
 ///
 /// Denied: the co-located identity's directory gains no marker and its
 /// replica keeps the issuer's value, asserted after the writing

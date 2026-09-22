@@ -1296,7 +1296,7 @@ async fn two_co_located_audiences_of_one_issuer_receive_each_its_own_claim() -> 
 /// A data replica is refused a caller its identity's records entitle to
 /// nothing, the holder of that replica's own read ticket included, while
 /// the identity's directory and its connection metadata store stay bound
-/// to their tickets (D17, Invariants 1 and 3).
+/// to their tickets (Invariants 1 and 3).
 ///
 /// Denied: Carol, connected to Bob and granted no claim, obtains neither
 /// the entries nor their existence over several of her passes although
@@ -1390,7 +1390,7 @@ async fn a_data_replica_no_record_judges_is_refused_its_own_ticket() -> Result<(
 /// identity's records list the caller's node id: Alice's own node, which
 /// her published device set names, is served, and a node that names her
 /// identity without being one of her devices is refused as if the
-/// replica were not hosted (D4).
+/// replica were not hosted.
 ///
 /// Denied: the impersonating node's session is refused and its replica
 /// stays empty over several of its passes, beside the identical session

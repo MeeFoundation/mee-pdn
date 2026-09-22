@@ -505,7 +505,7 @@ impl LiveActor {
         // iroh refuses a connection to this endpoint's own id before it
         // looks at an address, so a contact that names this node — from a
         // ticket, a device record, a contact list — reaches its holder
-        // inside the process or not at all (D7).
+        // inside the process or not at all.
         if peer == self.endpoint.id() {
             (self.dial_in_process)(namespace, callee);
             return;

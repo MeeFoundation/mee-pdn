@@ -210,9 +210,10 @@ impl AccessBook {
     /// The party across the session names one identity; it is admitted
     /// only when the records this identity holds of that one list the
     /// party's node id. Every path this identity cannot resolve ends in
-    /// `refused`: denied when accepting, a closed egress when dialing —
-    /// serve nothing, receive what the callee admits, and admit nothing
-    /// of it.
+    /// `refused`: denied when accepting, a closed egress when dialing.
+    /// What such a dial then admits follows the posture — nothing on a
+    /// replica this identity issues, and on one held under a grant what
+    /// the serving side's egress delivers.
     async fn classify_data(
         &self,
         registry: Arc<Registry>,
@@ -225,8 +226,9 @@ impl AccessBook {
         let peer_key = crate::private_metadata::device_key(&peer);
         let refused = match role {
             // A dial toward a callee this identity cannot resolve keeps a
-            // closed egress: serve nothing, admit nothing, and still pull
-            // whatever the callee's own filter reveals.
+            // closed egress: serve nothing, and pull whatever the callee's
+            // own filter reveals — admitted or dropped by the posture, as
+            // `ingest` decides.
             SessionRole::Dial => SessionAccess::Allow {
                 egress: Some(closed_egress()),
                 ingest: Some(self.ingest(&registry, WriteAdmission::Nothing)),
@@ -445,11 +447,15 @@ impl AccessBook {
         Arc::new(move |entry: &pdn_store::SignedEntry| {
             let id = entry.id();
             let namespace = id.namespace();
-            let Some((issuer, _posture)) = registry.binding_of(namespace).ok().flatten() else {
+            let issuer = match registry.binding_of(namespace) {
                 // Not a data replica: ticket-bounded admission. Markers
                 // are consulted below this exit, so one unreadable map
                 // cannot silence the stores linking and pairing stand on.
-                return ValidateOutcome::Accept;
+                Ok(None) => return ValidateOutcome::Accept,
+                Ok(Some((issuer, _posture))) => issuer,
+                // An unreadable registry judges nobody: taking it for "no
+                // data replica" would admit whatever the session carries.
+                Err(_poisoned) => return ValidateOutcome::Drop,
             };
             if retraction_names(&book, namespace, entry) {
                 return ValidateOutcome::Drop;

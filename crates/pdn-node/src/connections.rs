@@ -429,7 +429,7 @@ async fn bind_grants(
 }
 
 /// Import the namespace behind one live grant, for the identity the grant
-/// addresses (D11, D16). The record is read before the decision: the
+/// addresses. The record is read before the decision: the
 /// ticket inside it says which replica, so a grant republished onto a
 /// fresh store rebinds too.
 async fn bind_one_grant(

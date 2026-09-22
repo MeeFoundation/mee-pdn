@@ -44,7 +44,7 @@ pub fn announce_nobody() -> LocalWriteAnnouncer {
 /// Asked to reconcile `namespace` with a holder of this same node, when a
 /// contact's address carries this node's own wire identity. iroh refuses a
 /// connection to its own endpoint, so a dial that resolves here reaches
-/// the callee through the process or not at all (D7).
+/// the callee through the process or not at all.
 pub type InProcessDialer = Arc<dyn Fn(NamespaceId, Holder) + Send + Sync + 'static>;
 
 /// A dialer that reaches nobody — what a node hosting one holder states.

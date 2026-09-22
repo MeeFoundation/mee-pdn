@@ -188,8 +188,7 @@ async fn two_identities_each_recover_their_own_connections() -> Result<()> {
 /// Two identities of one node, granted a different claim each of one
 /// issuer, come back after a restart reading each its own and neither
 /// the other's: every identity is restored with stores of its own, its
-/// directory opened there and its granted namespace imported there (D1,
-/// D12).
+/// directory opened there and its granted namespace imported there.
 ///
 /// Denied: neither identity reads the claim granted to its co-located
 /// sibling, before the restart or after it.
