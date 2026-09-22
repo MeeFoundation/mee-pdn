@@ -1,9 +1,8 @@
 //! One stack per hosted identity: a replica store of its own under its
-//! own subdirectory, bounded at a cache share cut from the node's budget
-//! at spawn, and a restart that puts both identities back on the
-//! in-process path (ADR-0013).
+//! own subdirectory, bounded at a share of the node's cache budget cut
+//! as that store opens, and a restart that puts both identities back on
+//! the in-process path (ADR-0013).
 
-use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -65,70 +64,106 @@ async fn each_identity_opens_its_replica_store_under_its_own_subdirectory() -> R
     Ok(())
 }
 
-/// The bound every replica store of a node opens at is the node's budget
-/// divided by the identities the device is provisioned for: the whole
-/// budget when neither value is named, the cut share when both are, and
-/// a node holding more identities than it was provisioned for says so.
+/// A replica store opens at the node's budget divided by the identities
+/// the storage directory holds once that store has its own
+/// subdirectory: the whole budget for a device carrying one, half each
+/// once two are on disk, and a store in memory carries no bound at all.
+/// A second identity provisioned while the node runs leaves the first's
+/// bound where it is, so the bounds handed out pass the budget until the
+/// next start cuts them from the whole set.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_cache_share_is_the_budget_cut_by_the_provisioned_count() -> Result<()> {
-    let plain = SyncNode::spawn(SpawnOptions::memory()).await?;
+async fn a_store_opens_at_its_share_of_the_node_budget() -> Result<()> {
+    let memory = SyncNode::spawn(SpawnOptions::memory()).await?;
+    memory.provision_identity(ids::ALICE).await?;
     assert_eq!(
-        plain.replica_cache_share_bytes(),
-        DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
-        "a node that names neither value must give its one identity the whole budget"
+        memory.replica_cache_share_bytes(ids::ALICE)?,
+        None,
+        "a store in memory must carry no cache bound"
     );
+    assert!(
+        !memory.replica_cache_budget_exceeded()?,
+        "stores that carry no bound cannot pass the budget"
+    );
+    memory.shutdown().await?;
+
+    let plain_dir = tempfile::tempdir()?;
+    let plain = SyncNode::spawn(SpawnOptions::on_directory(plain_dir.path())).await?;
     plain.provision_identity(ids::ALICE).await?;
-    assert!(
-        !plain.replica_cache_budget_exceeded()?,
-        "one identity on a node provisioned for one is within the budget"
+    assert_eq!(
+        plain.replica_cache_share_bytes(ids::ALICE)?,
+        Some(DEFAULT_REPLICA_CACHE_BUDGET_BYTES),
+        "a node that names no budget must give its one identity the whole default"
     );
-
-    let budget = 4 * 1024 * 1024;
-    let provisioned = 4;
-    let cut = SyncNode::spawn(SpawnOptions {
-        replica_cache_budget_bytes: budget,
-        provisioned_identities: NonZeroUsize::new(provisioned).expect("four"),
-        ..SpawnOptions::memory()
-    })
-    .await?;
-    assert_eq!(cut.replica_cache_share_bytes(), budget / provisioned);
-
-    // A node that outgrows the count its share was cut from reports it,
-    // and not before.
-    for identity in [ids::ALICE, ids::BOB, ids::CAROL, ids::DAVE] {
-        cut.provision_identity(identity).await?;
-    }
-    assert!(
-        !cut.replica_cache_budget_exceeded()?,
-        "a node holding exactly what it is provisioned for is within the budget"
-    );
-    cut.provision_identity(ids::ALICE_AT_WORK).await?;
-    assert!(
-        cut.replica_cache_budget_exceeded()?,
-        "a node holding more identities than its share was cut for must report it"
-    );
-
     plain.shutdown().await?;
-    cut.shutdown().await?;
-    Ok(())
-}
 
-/// An identity brought up on a running node opens its store at the share
-/// the node cut at spawn, and the identity already hosted keeps running:
-/// its store is not reopened, so the handles held across the act still
-/// read and write.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_identity_created_on_a_running_node_opens_at_the_same_share() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let budget = 8 * 1024 * 1024;
     let node = SyncNode::spawn(SpawnOptions {
         replica_cache_budget_bytes: budget,
-        provisioned_identities: NonZeroUsize::new(2).expect("two"),
         ..SpawnOptions::on_directory(dir.path())
     })
     .await?;
-    let share = node.replica_cache_share_bytes();
-    assert_eq!(share, budget / 2);
+    node.provision_identity(ids::ALICE_AT_WORK).await?;
+    assert_eq!(
+        node.replica_cache_share_bytes(ids::ALICE_AT_WORK)?,
+        Some(budget),
+        "the one identity a directory holds must take the whole budget"
+    );
+    assert!(
+        !node.replica_cache_budget_exceeded()?,
+        "one store at the whole budget is within it"
+    );
+
+    node.provision_identity(ids::ALICE_AT_LEISURE).await?;
+    assert_eq!(
+        node.replica_cache_share_bytes(ids::ALICE_AT_LEISURE)?,
+        Some(budget / 2),
+        "the second identity of a directory must take half the budget"
+    );
+    assert_eq!(
+        node.replica_cache_share_bytes(ids::ALICE_AT_WORK)?,
+        Some(budget),
+        "the bound of an open store cannot change, so the first identity keeps what it opened at"
+    );
+    assert!(
+        node.replica_cache_budget_exceeded()?,
+        "a node grown while it ran must report that the bounds handed out pass its budget"
+    );
+    node.shutdown().await?;
+
+    let again = SyncNode::spawn(SpawnOptions {
+        replica_cache_budget_bytes: budget,
+        ..SpawnOptions::on_directory(dir.path())
+    })
+    .await?;
+    for identity in [ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE] {
+        again.provision_identity(identity).await?;
+        assert_eq!(
+            again.replica_cache_share_bytes(identity)?,
+            Some(budget / 2),
+            "a start must cut every share from the identities the directory holds"
+        );
+    }
+    assert!(
+        !again.replica_cache_budget_exceeded()?,
+        "two stores at half the budget each are within it"
+    );
+    again.shutdown().await?;
+    Ok(())
+}
+
+/// An identity brought up on a running node leaves the identity already
+/// hosted running: its store is not reopened for the newcomer's share,
+/// so the handles held across the act still read and write.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_created_on_a_running_node_leaves_the_open_store_alone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let budget = 8 * 1024 * 1024;
+    let node = SyncNode::spawn(SpawnOptions {
+        replica_cache_budget_bytes: budget,
+        ..SpawnOptions::on_directory(dir.path())
+    })
+    .await?;
 
     let work = host_identity(&node, ids::ALICE_AT_WORK).await?;
     node.create_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
@@ -144,11 +179,12 @@ async fn an_identity_created_on_a_running_node_opens_at_the_same_share() -> Resu
     )
     .await?;
 
+    let share = node.replica_cache_share_bytes(ids::ALICE_AT_WORK)?;
     node.provision_identity(ids::ALICE_AT_LEISURE).await?;
     assert_eq!(
-        node.replica_cache_share_bytes(),
+        node.replica_cache_share_bytes(ids::ALICE_AT_WORK)?,
         share,
-        "an identity created while the node runs must open at the share cut at spawn"
+        "the store open across the act must keep the bound it opened at"
     );
     assert!(
         store_of(dir.path(), ids::ALICE_AT_LEISURE).is_file(),

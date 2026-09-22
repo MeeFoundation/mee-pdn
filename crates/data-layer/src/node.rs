@@ -7,7 +7,6 @@
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    num::NonZeroUsize,
     panic::AssertUnwindSafe,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -167,26 +166,19 @@ pub struct SpawnOptions {
     /// [`Connectivity::Direct`] in every constructor but
     /// [`SpawnOptions::for_product`].
     pub connectivity: Connectivity,
-    /// What this node's replica stores may hold together. Cut into a share
-    /// per hosted identity at spawn, because the bound cannot be changed
-    /// on an open store.
+    /// What this node's replica stores may hold together. Divided among
+    /// the identities the storage directory holds as each store opens,
+    /// so no host states a count; the bound cannot be changed on an open
+    /// store, so a store keeps the share it opened at until the next
+    /// start.
     pub replica_cache_budget_bytes: usize,
-    /// The identities this device is provisioned for. The budget divided
-    /// by this is what one identity's store bounds its cache at; a node
-    /// that comes to hold more says so and stays above the budget until
-    /// the next start.
-    pub provisioned_identities: NonZeroUsize,
 }
 
 /// What a node's replica stores may hold together, unless the host names
 /// another: enough that a device carrying one identity never evicts what
-/// a personal store holds.
+/// a personal store holds. The only memory figure a host states, since
+/// the count it is divided by is read from the storage directory.
 pub const DEFAULT_REPLICA_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
-
-/// The identities a device is provisioned for, unless the host names
-/// another. A host running where memory is scarce states both values once
-/// at its first start.
-pub const DEFAULT_PROVISIONED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1).expect("one");
 
 impl SpawnOptions {
     /// In memory, direct paths — what the in-process suites run on.
@@ -196,7 +188,6 @@ impl SpawnOptions {
             reconcile_interval: RECONCILE_INTERVAL,
             connectivity: Connectivity::Direct,
             replica_cache_budget_bytes: DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
-            provisioned_identities: DEFAULT_PROVISIONED_IDENTITIES,
         }
     }
 
@@ -207,7 +198,6 @@ impl SpawnOptions {
             reconcile_interval: RECONCILE_INTERVAL,
             connectivity: Connectivity::Direct,
             replica_cache_budget_bytes: DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
-            provisioned_identities: DEFAULT_PROVISIONED_IDENTITIES,
         }
     }
 
@@ -220,12 +210,6 @@ impl SpawnOptions {
             connectivity: Connectivity::RelaysAndAddressLookup,
             ..Self::on_directory(directory)
         }
-    }
-
-    /// The budget divided by the count the device is provisioned for —
-    /// what every store this node opens bounds its cache at.
-    pub fn replica_cache_share_bytes(&self) -> usize {
-        self.replica_cache_budget_bytes / self.provisioned_identities.get()
     }
 }
 
@@ -242,15 +226,9 @@ pub struct SyncNode {
     gossip: Gossip,
     /// The half of the node each hosted identity owns.
     identities: Identities,
-    /// What one identity's replica store may hold, cut at spawn from the
-    /// node budget and the count the device is provisioned for. The
-    /// bound cannot be changed on an open store, so it is fixed here and
-    /// every identity's store opens at it.
-    cache_share_bytes: usize,
-    /// The count the share was cut from; a node that comes to hold more
-    /// identities than this reports that its caches may together exceed
-    /// the budget.
-    provisioned_identities: usize,
+    /// What this node's replica stores may hold together; one store's
+    /// share of it is cut as that store opens.
+    cache_budget_bytes: usize,
     /// Sessions [`reconcile_co_located`] has opened, so a scenario can
     /// assert that a pass over a converged pair opens none.
     #[cfg(feature = "test-util")]
@@ -315,6 +293,9 @@ struct HostedStack {
     registry: Arc<Registry>,
     access: Arc<AccessBook>,
     author: AuthorId,
+    /// The bound this identity's replica store opened at, which the node
+    /// tallies against its budget; a store in memory carries none.
+    cache_share_bytes: Option<usize>,
     /// Keyed by namespace, so a re-import replaces its entry rather than
     /// accreting a second one.
     tracked_docs: Mutex<HashMap<NamespaceId, TrackedDoc>>,
@@ -479,8 +460,7 @@ impl SyncNode {
             blobs: blobs_store,
             gossip,
             identities,
-            cache_share_bytes: options.replica_cache_share_bytes(),
-            provisioned_identities: options.provisioned_identities.get(),
+            cache_budget_bytes: options.replica_cache_budget_bytes,
             #[cfg(feature = "test-util")]
             co_located_sessions: Arc::clone(&co_located_sessions),
             storage: options.storage,
@@ -494,8 +474,9 @@ impl SyncNode {
     /// Bring up the half of the node that hosts `identity`: its own docs
     /// engine and replica store, its registry and the book that judges
     /// its sessions (ADR-0013). The store opens under the identity's own
-    /// subdirectory, bounded at the share cut at spawn. Provisioning an
-    /// identity already hosted is a no-op.
+    /// subdirectory, bounded at its share of the node's cache budget, cut
+    /// as the store opens. Provisioning an identity already hosted is a
+    /// no-op.
     pub async fn provision_identity(&self, identity: PdnId) -> Result<()> {
         if self.stack(identity)?.is_some() {
             return Ok(());
@@ -504,7 +485,7 @@ impl SyncNode {
         let access = Arc::new(AccessBook::new(identity));
         access.set_blobs(self.blobs.clone());
         let observer_tracker = Arc::clone(&self.retraction);
-        let builder = self.docs_builder(identity, &access, &registry)?;
+        let (builder, cache_share_bytes) = self.docs_builder(identity, &access, &registry)?;
         let identities = Arc::clone(&self.identities);
         let docs = builder
             .capability_validator(capability_ingest_validator(&access, &registry))
@@ -547,6 +528,7 @@ impl SyncNode {
             registry,
             access,
             author,
+            cache_share_bytes,
             tracked_docs: Mutex::new(HashMap::new()),
             nudges_in_flight: Mutex::new(HashSet::new()),
         });
@@ -555,14 +537,6 @@ impl SyncNode {
             .write()
             .map_err(|_poisoned| anyhow::anyhow!("hosted identities lock poisoned"))?;
         hosted.insert(identity, stack);
-        if hosted.len() > self.provisioned_identities {
-            tracing::warn!(
-                hosted = hosted.len(),
-                provisioned = self.provisioned_identities,
-                "the node holds more identities than its replica store cache share was cut for; \
-                 the caches may together exceed the budget until the next start"
-            );
-        }
         Ok(())
     }
 
@@ -574,41 +548,63 @@ impl SyncNode {
     }
 
     /// The store one hosted identity opens: in memory, or under that
-    /// identity's own subdirectory bounded at the share cut at spawn.
+    /// identity's own subdirectory, bounded at the node's budget divided
+    /// by the identities that directory holds. The bound is returned
+    /// beside the builder, since a store in memory carries none.
     fn docs_builder(
         &self,
         identity: PdnId,
         access: &Arc<AccessBook>,
         registry: &Arc<Registry>,
-    ) -> Result<pdn_store::protocol::Builder> {
+    ) -> Result<(pdn_store::protocol::Builder, Option<usize>)> {
         let holder = crate::access::holder_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
         Ok(match &self.storage {
-            StorageConfig::Memory => Docs::memory(holder, provider),
+            StorageConfig::Memory => (Docs::memory(holder, provider), None),
             StorageConfig::Directory(directory) => {
                 let own = identity_directory(directory, identity);
                 std::fs::create_dir_all(&own).with_context(|| {
                     format!("cannot create the identity directory {}", own.display())
                 })?;
-                Docs::persistent(own, self.cache_share_bytes, holder, provider)
+                // Counted once this identity has its own subdirectory, so
+                // the nth identity of a directory opens at an nth of the
+                // budget and a device carrying one gives it the whole.
+                let held = identity_directories(directory)?.max(1);
+                let share = self.cache_budget_bytes / held;
+                tracing::info!(
+                    identity = %identity,
+                    share_bytes = share,
+                    identities = held,
+                    "the replica store opens at its share of the node's cache budget"
+                );
+                (Docs::persistent(own, share, holder, provider), Some(share))
             }
         })
     }
 
-    /// Whether this node holds more identities than the count its cache
-    /// share was cut from, so their caches may together exceed the budget.
-    pub fn replica_cache_budget_exceeded(&self) -> Result<bool> {
+    /// What the caches of this node's replica stores may together hold:
+    /// the bounds handed out. An identity provisioned while the node runs
+    /// takes a share cut from a smaller set, so the sum passes the budget
+    /// until the next start cuts every share from the whole set.
+    pub fn replica_cache_ceilings_bytes(&self) -> Result<usize> {
         Ok(self
             .identities
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("hosted identities lock poisoned"))?
-            .len()
-            > self.provisioned_identities)
+            .values()
+            .filter_map(|stack| stack.cache_share_bytes)
+            .sum())
     }
 
-    /// What one identity's replica store bounds its cache at.
-    pub fn replica_cache_share_bytes(&self) -> usize {
-        self.cache_share_bytes
+    /// Whether the bounds handed out together pass the node's budget.
+    pub fn replica_cache_budget_exceeded(&self) -> Result<bool> {
+        Ok(self.replica_cache_ceilings_bytes()? > self.cache_budget_bytes)
+    }
+
+    /// The bound `identity`'s replica store opened at; `None` on a node
+    /// storing in memory, where a store carries no bound.
+    pub fn replica_cache_share_bytes(&self, identity: PdnId) -> Result<Option<usize>> {
+        Ok(self.require(identity)?.cache_share_bytes)
     }
 
     /// Arm `identity`'s directory for session classification: its device
@@ -1466,6 +1462,32 @@ impl SyncNode {
 #[error("no stores are provisioned for identity {identity} on this node")]
 pub struct IdentityNotProvisioned {
     pub identity: PdnId,
+}
+
+/// The identities the storage directory holds, one subdirectory each:
+/// what a store's share of the cache budget is cut from, so no host
+/// states a count of its own (ADR-0013).
+fn identity_directories(directory: &std::path::Path) -> Result<usize> {
+    let identities = directory.join(IDENTITIES_DIR);
+    let read = std::fs::read_dir(&identities).with_context(|| {
+        format!(
+            "cannot read the identities directory {}",
+            identities.display()
+        )
+    })?;
+    let mut held = 0usize;
+    for entry in read {
+        let entry = entry.with_context(|| {
+            format!(
+                "cannot read the identities directory {}",
+                identities.display()
+            )
+        })?;
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            held = held.saturating_add(1);
+        }
+    }
+    Ok(held)
 }
 
 /// One subdirectory per hosted identity, named by the identity, each
