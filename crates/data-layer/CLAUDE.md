@@ -6,7 +6,19 @@ Stores: the device-replicated `PrivateMetadataStore` (the one directory of an id
 
 The `DataLayer` trait in `layer.rs` is declared and implemented by nothing; the runtime drives `SyncNode` directly.
 
-Storage is a required choice of every spawn (`SpawnOptions::storage`): memory by name — the workspace's suites, via their spawn helpers — or a directory by name, with no default. A configured directory holds everything a node needs to be itself, laid out as `identities/<identity>/` (one hosted identity's replica store and its persisted author), `blobs/` (payload bytes), `node.key` (the endpoint's secret key, so the node id survives a restart), and `lock` (the running node's exclusive hold — a second node on the directory is refused as `DirectoryHeld`). Each hosted identity's stores write with that identity's one author (`SyncNode::default_author`, persisted with its replicas), and what one identity's replica store may hold is a share of a node budget, cut at spawn from the identities the device is provisioned for; `PrivateMetadataStore::open` reopens a directory replica the node already holds — recovery's constructor, beside `create` and `import` — and answers `Ok(None)` for a namespace the store does not hold, so a caller acting on a durable record tells an absent replica from a store that failed to answer.
+Storage is a required choice of every spawn (`SpawnOptions::storage`): memory by name — the workspace's suites, via their spawn helpers — or a directory by name, with no default. A configured directory holds everything a node needs to be itself:
+
+```
+<directory>/
+  node.key                  the endpoint's secret key: the node id survives a restart
+  lock                      the running node's exclusive hold; a second node on the directory is refused as DirectoryHeld
+  blobs/                    payload bytes, one store for the node
+  identities/<identity>/    one hosted identity's half of the node
+    docs.redb               its replica store
+    default-author          the one author its writes carry
+```
+
+Each hosted identity's stores write with that identity's one author (`SyncNode::default_author`, persisted with its replicas), and what one identity's replica store may hold is a share of a node budget, cut at spawn from the identities the device is provisioned for; `PrivateMetadataStore::open` reopens a directory replica the node already holds — recovery's constructor, beside `create` and `import` — and answers `Ok(None)` for a namespace the store does not hold, so a caller acting on a durable record tells an absent replica from a store that failed to answer.
 
 Reachability is the other spawn-time choice (`SpawnOptions::connectivity`), and the constructor names it rather than the caller assembling it. `Connectivity::Direct` binds nothing beyond the socket — a peer is reached at an address the endpoint publishes about itself or not at all — and it is what `memory` and `on_directory` give the suites and the container stand, whose peers already hold an address for each other. `Connectivity::Relays` adds the relay servers iroh's own `default_relay_mode` names, so a peer behind a NAT is reachable and the relay URL travelling in every ticket and ceremony payload keeps the node dialable after its network changes. `Connectivity::RelaysAndAddressLookup` adds publishing and resolving under the node id, which is what `for_product` gives a node shipped to a device the project does not control: without it a contact carrying a node id alone — a sibling read out of a device record, a peer whose ticket addresses have gone stale — is not dialable at all. The three map onto iroh as `Minimal` with the relay mode set explicitly, twice, and then the `N0` preset whole.
 

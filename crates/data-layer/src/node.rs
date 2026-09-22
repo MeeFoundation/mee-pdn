@@ -127,9 +127,10 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
     Memory,
-    /// `docs/` (replica store and persisted author), `blobs/`, `node.key`,
-    /// `lock`. Created owner-only when absent: the replica store holds
-    /// namespace secrets and the blobs payload bytes in the clear.
+    /// `identities/<identity>/` (replica store and persisted author),
+    /// `blobs/`, `node.key`, `lock`. Created owner-only when absent: the
+    /// replica store holds namespace secrets and the blobs payload bytes in
+    /// the clear.
     Directory(std::path::PathBuf),
 }
 
