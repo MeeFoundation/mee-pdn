@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, EndpointId, GrantedClaim,
-    PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
+    claim_id_of, holder_of, AddrInfoOptions, ConnectionMetadataStore, Contact, DocTicket,
+    EndpointId, GrantedClaim, PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NodeId, NonEmpty, PdnId};
 use test_utils::{eventually, host_identity, ids, memory_node, wait_entry_is};
@@ -492,6 +492,79 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     assert_eq!(own.published_devices().await?, vec![alice.node_id()]);
 
     alice.shutdown().await?;
+    Ok(())
+}
+
+/// A grant record naming a foreign issuer over a namespace the identity
+/// already holds for itself is refused before it changes anything: the
+/// import is rejected and the replica keeps the contacts it was reconciling
+/// by. The registry refuses a second issuer on its own, but only after the
+/// tracking entry — keyed by namespace and overwritten blind — is already
+/// gone, and nothing puts it back.
+///
+/// Denied: both import paths, the grantee one and the device one, each
+/// naming an issuer the namespace is not bound to.
+///
+/// The ticket is minted here rather than carried by a grant record because
+/// a counterparty choosing what the record points at is the subject: the
+/// namespace id of any grant an identity ever published is known to its
+/// audience, and a read capability is that id.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_naming_another_issuer_is_refused_before_it_rewrites_tracking() -> Result<()> {
+    let mut alice = spawn_node().await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let own = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
+
+    // A sibling device of Alice's own, as the product's contacts name one.
+    let sibling_node = spawn_node().await?;
+    let sibling = Contact::new(sibling_node.dial_handle().addr(), holder_of(ids::ALICE));
+    alice.set_namespace_contacts(ids::ALICE, ids::ALICE, vec![sibling.clone()])?;
+
+    // What a counterparty publishes: a ticket on Alice's own namespace,
+    // carrying its own addressing, under a record naming a third issuer.
+    let counterparty = spawn_node().await?;
+    let mut planted = own.clone();
+    planted.nodes = vec![counterparty.dial_handle().addr()];
+
+    for (path, refused) in [
+        (
+            "grantee",
+            alice
+                .import_namespace_scoped(ids::ALICE, ids::CAROL, planted.clone())
+                .await,
+        ),
+        (
+            "device",
+            alice
+                .import_namespace(ids::ALICE, ids::CAROL, planted.clone())
+                .await,
+        ),
+    ] {
+        // Denied (a record naming an issuer the namespace is not bound to).
+        assert!(
+            refused.is_err(),
+            "the {path} import took a namespace bound to another issuer"
+        );
+    }
+
+    assert_eq!(
+        alice.namespace_contacts(ids::ALICE, ids::ALICE)?,
+        vec![sibling],
+        "the refused import rewrote the contacts of the identity's own replica"
+    );
+    assert_eq!(
+        alice.data_namespace_of(ids::ALICE, ids::ALICE)?,
+        Some(own.capability.id()),
+        "the refused import moved the identity's own binding"
+    );
+    assert!(
+        alice.data_namespace_of(ids::ALICE, ids::CAROL)?.is_none(),
+        "the refused import registered the issuer it named"
+    );
+
+    alice.shutdown().await?;
+    sibling_node.shutdown().await?;
+    counterparty.shutdown().await?;
     Ok(())
 }
 

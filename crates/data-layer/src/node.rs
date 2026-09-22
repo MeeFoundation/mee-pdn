@@ -680,7 +680,7 @@ impl SyncNode {
         ticket: DocTicket,
     ) -> Result<NamespaceImport> {
         let stack = self.require(identity)?;
-        Self::guard_data_import(&stack, ticket.capability.id())?;
+        Self::guard_data_import(&stack, issuer, ticket.capability.id())?;
         let contacts = ticket.contacts();
         let doc = stack.api.import_namespace(ticket.capability).await?;
         stack.track(
@@ -742,7 +742,7 @@ impl SyncNode {
     ) -> Result<NamespaceImport> {
         let stack = self.require(identity)?;
         let contacts = ticket.contacts();
-        Self::guard_data_import(&stack, ticket.capability.id())?;
+        Self::guard_data_import(&stack, issuer, ticket.capability.id())?;
         // The capability only — no `start_sync`, which would join the
         // swarm. The binding registers before the first sync, so even that
         // session is judged under the grantee rules.
@@ -964,14 +964,31 @@ impl SyncNode {
         ))
     }
 
-    /// Refuses when the namespace is tracked but not data-bound (a
-    /// device-shared store): honoring the ticket would repurpose it.
-    fn guard_data_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
-        if stack.tracked(namespace)?.is_some() && stack.registry.binding_of(namespace)?.is_none() {
-            return Err(anyhow::anyhow!(
-                "namespace {namespace} is a device-shared replica of this identity; \
-                 a data import must not repurpose it"
-            ));
+    /// Refuses a ticket that would repurpose a namespace this identity
+    /// already holds: a device-shared store taken as a data replica, or a
+    /// replica taken for an issuer other than the one it is bound to.
+    /// Both stand before the import writes anything, because the tracking
+    /// entry is keyed by namespace and overwritten blind, while the
+    /// registry's own refusal of a second issuer comes after that write
+    /// and restores nothing.
+    fn guard_data_import(stack: &HostedStack, issuer: PdnId, namespace: NamespaceId) -> Result<()> {
+        match stack.registry.binding_of(namespace)? {
+            Some((bound, _posture)) => {
+                if bound != issuer {
+                    return Err(anyhow::anyhow!(
+                        "namespace {namespace} is already bound to issuer {bound}; \
+                         one namespace binds one issuer"
+                    ));
+                }
+            }
+            None => {
+                if stack.tracked(namespace)?.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "namespace {namespace} is a device-shared replica of this identity; \
+                         a data import must not repurpose it"
+                    ));
+                }
+            }
         }
         Ok(())
     }

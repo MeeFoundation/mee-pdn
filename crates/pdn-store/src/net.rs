@@ -224,14 +224,16 @@ pub async fn accept_session(
     connection: &iroh::endpoint::Connection,
 ) -> Result<SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>, AcceptError> {
     let peer = connection.remote_id();
-    let (send_stream, recv_stream) = connection
-        .accept_bi()
-        .await
-        .map_err(|e| AcceptError::open(peer, e))?;
-    time::timeout(
-        SYNC_SESSION_TIMEOUT,
-        SessionOpening::read(send_stream, recv_stream, peer),
-    )
+    // The stream the caller never opens is the same silence as the init
+    // message it never sends, so one bound covers both: outside it, a
+    // connection that stays open and quiet holds this task forever.
+    time::timeout(SYNC_SESSION_TIMEOUT, async {
+        let (send_stream, recv_stream) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| AcceptError::open(peer, e))?;
+        SessionOpening::read(send_stream, recv_stream, peer).await
+    })
     .await
     .map_err(|_elapsed| {
         AcceptError::sync(
@@ -253,19 +255,32 @@ pub async fn refuse_session(
 ) -> Result<(), AcceptError> {
     let peer = opening.peer();
     let namespace = Some(opening.namespace());
-    let (mut send_stream, mut recv_stream) = opening.refuse(reason).await?;
-    send_stream
-        .finish()
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    send_stream
-        .stopped()
-        .await
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    recv_stream
-        .read_to_end(0)
-        .await
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    Ok(())
+    // Under the same bound as a served session: the teardown waits for the
+    // caller, and a caller that never closes its half would otherwise hold
+    // this task for as long as it keeps the connection alive.
+    time::timeout(SYNC_SESSION_TIMEOUT, async {
+        let (mut send_stream, mut recv_stream) = opening.refuse(reason).await?;
+        send_stream
+            .finish()
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        send_stream
+            .stopped()
+            .await
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        recv_stream
+            .read_to_end(0)
+            .await
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        Ok(())
+    })
+    .await
+    .map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            namespace,
+            anyhow::anyhow!("refusal not acknowledged within {SYNC_SESSION_TIMEOUT:?}"),
+        )
+    })?
 }
 
 /// Serve a session whose first message is already read, over an accepted
