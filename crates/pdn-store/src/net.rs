@@ -25,9 +25,13 @@ mod codec;
 ///
 /// Nothing below this point carries a timeout of its own, so a peer that
 /// stays connected and stops talking stalls forever. Two things ride on the
-/// bound. The live actor tracks one running exchange per namespace and peer
-/// and refuses to start another while one runs, so a stalled exchange
-/// blocks that pair and drops every later sync trigger silently. And a
+/// bound. The live actor tracks one running exchange per namespace, peer
+/// and holder — a node of two identities is two counterparts at one node
+/// id (ADR-0013) — and refuses to start another while one runs, so a
+/// stalled exchange blocks that counterpart and drops every later sync
+/// trigger for it silently. A counterpart exists only for a caller the
+/// access provider admitted, so what a peer can occupy is bounded by the
+/// holders it is entitled to act as. And a
 /// session holds a store snapshot, whose read transaction holds back
 /// reclamation of every page freed while it lives — of the oldest live one,
 /// so concurrent sessions cost the same window as a single one, and the
