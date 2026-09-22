@@ -947,6 +947,26 @@ impl SyncNode {
             .unwrap_or_default())
     }
 
+    /// Refuses a ticket naming a namespace this identity already holds in
+    /// another role: its data replica, its directory, a store of one of
+    /// its connections. A device-shared store is classified on its ticket
+    /// alone (Invariants 1 and 3), so a namespace that took that role by
+    /// a counterparty's word would be served whole, past the grant that
+    /// bounds it. The mirror of `guard_data_import` and of `open_doc`'s
+    /// guard, on the path a counterparty's ticket takes.
+    fn guard_shared_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
+        let role = if stack.registry.binding_of(namespace)?.is_some() {
+            "a data replica of this identity"
+        } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
+            role
+        } else {
+            return Ok(());
+        };
+        Err(anyhow::anyhow!(
+            "namespace {namespace} is {role}; a device-shared import must not repurpose it"
+        ))
+    }
+
     /// Refuses when the namespace is tracked but not data-bound (a
     /// device-shared store): honoring the ticket would repurpose it.
     fn guard_data_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
@@ -1176,6 +1196,7 @@ impl SyncNode {
     /// ticket's contacts.
     pub(crate) async fn import_doc(&self, identity: PdnId, ticket: DocTicket) -> Result<Doc> {
         let stack = self.require(identity)?;
+        Self::guard_shared_import(&stack, ticket.capability.id())?;
         let contacts = ticket.contacts();
         let minted_by = ticket.holder;
         let doc = stack.api.import(ticket).await?;

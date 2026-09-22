@@ -495,6 +495,80 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     Ok(())
 }
 
+/// A ticket naming a namespace the identity already holds in another role
+/// is refused as a device-shared import, and a namespace it holds in none
+/// is imported as before. A device-shared store is served on its ticket
+/// alone (Invariants 1 and 3), so honoring such a ticket would hand the
+/// replica over entire, past the grant that bounds it.
+///
+/// Denied: three roles in turn — the identity's own data replica, a
+/// replica it holds under a grant, and its directory — each offered the
+/// way a counterparty offers its connection metadata store.
+///
+/// The tickets are minted here rather than handed over by a ceremony
+/// because a counterparty choosing the namespace is the subject: a read
+/// capability is the namespace id, so anyone who learns one can mint the
+/// ticket this test refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_held_in_another_role_refuses_a_device_shared_import() -> Result<()> {
+    let mut alice = spawn_node().await?;
+    let directory = host_identity(&alice, ids::ALICE).await?;
+
+    // The identity's own data replica, and one it holds under a grant.
+    let own_data = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
+    let mut bob = spawn_node().await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let bobs_data = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
+    alice
+        .import_namespace_scoped(ids::ALICE, ids::BOB, bobs_data.clone())
+        .await?;
+
+    let directory_ticket = directory
+        .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
+        .await?;
+
+    let own_data_namespace = own_data.capability.id();
+    for (role, ticket) in [
+        ("its own data replica", own_data),
+        ("a replica held under a grant", bobs_data),
+        ("its directory", directory_ticket),
+    ] {
+        // Denied (a counterparty naming a namespace already in use).
+        assert!(
+            ConnectionMetadataStore::import(&alice, ids::ALICE, ticket)
+                .await
+                .is_err(),
+            "{role} was repurposed as a device-shared store"
+        );
+    }
+
+    // Allowed: a namespace in no other role imports as before, and the
+    // data replica the first denial protected still reads back.
+    let fresh = ConnectionMetadataStore::create(&bob, ids::BOB).await?;
+    let imported = ConnectionMetadataStore::import(
+        &alice,
+        ids::ALICE,
+        fresh
+            .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
+            .await?,
+    )
+    .await?;
+    assert_eq!(
+        imported.namespace(),
+        fresh.namespace(),
+        "a namespace held in no other role must import as the counterparty's store"
+    );
+    assert_eq!(
+        alice.data_namespace_of(ids::ALICE, ids::ALICE)?,
+        Some(own_data_namespace),
+        "the identity's data replica lost its binding to a refused import"
+    );
+
+    alice.shutdown().await?;
+    bob.shutdown().await?;
+    Ok(())
+}
+
 /// Opening a pair does not resurrect a withdrawn device record: a first
 /// touch publishes, a tombstone holds, and deliberate re-assertion
 /// (`publish_device`) is a distinct act. The tombstone is an agreement

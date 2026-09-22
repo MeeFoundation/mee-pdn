@@ -541,6 +541,19 @@ impl AccessBook {
             .clone())
     }
 
+    /// Which ticket-bound role this identity already holds `namespace` in,
+    /// named for the refusal that quotes it. Both roles are classified on
+    /// the ticket alone (Invariants 1 and 3), so a replica that took one
+    /// by mistake is served whole.
+    pub(crate) fn ticket_bound_role(&self, namespace: NamespaceId) -> Result<Option<&'static str>> {
+        if self.directory_is(namespace)? {
+            return Ok(Some("this identity's directory"));
+        }
+        Ok(self
+            .connection_by_namespace(namespace)?
+            .map(|_connection| "a connection metadata store of this identity"))
+    }
+
     fn directory_is(&self, namespace: NamespaceId) -> Result<bool> {
         Ok(self
             .own_directory()?
