@@ -110,12 +110,15 @@ impl std::ops::Deref for Docs {
 }
 
 impl ProtocolHandler for Docs {
+    /// The one-holder half of the dispatch: this engine answers for its own
+    /// holder and refuses every other, which is what a resolver of one
+    /// holder does.
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        self.engine
-            .handle_connection(connection)
+        let opening = accept_session(&connection)
             .await
             .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?;
-        Ok(())
+        let mine = opening.holder() == self.engine.holder();
+        serve_dispatched(connection, opening, mine.then_some(self)).await
     }
 
     async fn shutdown(&self) {
@@ -257,18 +260,31 @@ impl ProtocolHandler for DocsDispatch {
         let opening = accept_session(&connection)
             .await
             .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?;
-        match (self.resolve)(opening.holder()) {
-            Some(docs) => docs
-                .engine
-                .handle_session(connection, opening)
-                .await
-                .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
-            // Byte-identical to the refusal a replica this node does not
-            // hold draws, so naming a holder tells a caller nothing.
-            None => refuse_session(opening, AbortReason::NotFound)
-                .await
-                .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
-        }
-        Ok(())
+        let resolved = (self.resolve)(opening.holder());
+        serve_dispatched(connection, opening, resolved.as_ref()).await
     }
+}
+
+/// Hand a read session to the engine that answers for the holder it names,
+/// or refuse it. The only way a session enters an engine: reading the first
+/// message is the caller's, so nothing hands an engine a raw connection and
+/// no accept path waits on the wire inside the actor loop.
+async fn serve_dispatched(
+    connection: Connection,
+    opening: crate::net::SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    docs: Option<&Docs>,
+) -> Result<(), iroh::protocol::AcceptError> {
+    match docs {
+        Some(docs) => docs
+            .engine
+            .handle_session(connection, opening)
+            .await
+            .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
+        // Byte-identical to the refusal a replica this node does not
+        // hold draws, so naming a holder tells a caller nothing.
+        None => refuse_session(opening, AbortReason::NotFound)
+            .await
+            .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
+    }
+    Ok(())
 }

@@ -31,8 +31,8 @@ use crate::{
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
-        accept_session, connect_and_sync, handle_in_process_session, handle_session, AbortReason,
-        AcceptError, AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
+        connect_and_sync, handle_in_process_session, handle_session, AbortReason, AcceptError,
+        AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
     },
     AuthorHeads, Contact, ContentStatus, Holder, NamespaceId, SignedEntry,
 };
@@ -112,9 +112,6 @@ pub enum ToLiveActor {
         sender: async_channel::Sender<Event>,
         #[debug("oneshot::Sender")]
         reply: sync::oneshot::Sender<Result<()>>,
-    },
-    HandleConnection {
-        conn: iroh::endpoint::Connection,
     },
     /// A session dispatched here by the holder its first message named.
     HandleSession {
@@ -448,9 +445,6 @@ impl LiveActor {
             } => {
                 self.subscribers.subscribe(namespace, sender);
                 reply.send(Ok(())).ok();
-            }
-            ToLiveActor::HandleConnection { conn } => {
-                self.handle_connection(conn).await;
             }
             ToLiveActor::HandleSession { conn, opening } => {
                 self.handle_session(conn, opening).await;
@@ -1233,18 +1227,6 @@ impl LiveActor {
     /// message here, then serve it. A node of several holders dispatches
     /// before this point ([`crate::protocol::Docs`]).
     #[instrument("accept", skip_all)]
-    pub async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) {
-        debug!("incoming connection");
-        let opening = match accept_session(&conn).await {
-            Ok(opening) => opening,
-            Err(err) => {
-                debug!(?err, "no init message");
-                return;
-            }
-        };
-        self.handle_session(conn, opening).await;
-    }
-
     /// Serve a session whose first message named this engine's holder.
     #[instrument("accept", skip_all)]
     pub async fn handle_session(

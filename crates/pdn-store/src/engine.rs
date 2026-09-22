@@ -333,15 +333,6 @@ impl Engine {
         Ok(a.or(b))
     }
 
-    /// Handle an incoming iroh-docs connection, first message included —
-    /// what an engine that is the whole node's docs handler does.
-    pub async fn handle_connection(&self, conn: iroh::endpoint::Connection) -> anyhow::Result<()> {
-        self.to_live_actor
-            .send(ToLiveActor::HandleConnection { conn })
-            .await?;
-        Ok(())
-    }
-
     /// The holder every replica of this engine is held for.
     pub fn holder(&self) -> Holder {
         self.holder
