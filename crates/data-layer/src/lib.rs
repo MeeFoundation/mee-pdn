@@ -39,9 +39,9 @@ pub use iroh::{
 };
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
-    AlpnTaken, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol, IdentityNotProvisioned,
-    NamespaceImport, SpawnOptions, StorageConfig, SyncNode, UnknownIssuer, UntrackedNamespace,
-    BUILT_IN_ALPNS, DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
+    AlpnTaken, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol, GranteeCannotShare,
+    IdentityNotProvisioned, NamespaceImport, SpawnOptions, StorageConfig, SyncNode, UnknownIssuer,
+    UntrackedNamespace, BUILT_IN_ALPNS, DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
 };
 // pdn-store vocabulary of the share/import/write flows, so downstream
 // crates need no direct dependency on the fork.

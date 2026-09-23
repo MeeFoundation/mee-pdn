@@ -940,15 +940,11 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     );
 
     // The laptop's only contact is the phone: the sibling session serves
-    // exactly the claim set.
-    let phone_ticket = a_phone
-        .share_ticket(
-            ids::ALICE,
-            ids::BOB,
-            ShareMode::Read,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
+    // exactly the claim set. Bob's ticket is aimed at the phone by hand,
+    // since a grantee mints none.
+    let mut phone_ticket = data_read.clone();
+    phone_ticket.nodes = vec![a_phone.dial_handle().addr()];
+    phone_ticket.identity = identity_of(ids::ALICE);
     a_laptop
         .import_namespace_scoped(ids::ALICE, ids::BOB, phone_ticket.clone())
         .await?;

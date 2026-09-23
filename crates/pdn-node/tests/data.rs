@@ -1,17 +1,21 @@
 //! The data service end to end: local write/read/list, the unknown-issuer
 //! denies paired with each allowed path, and the out-of-band ticket
 //! handover as a denial — an armed issuer serves fail-closed, so a ticket
-//! alone delivers nothing. The sanctioned channel is the connections grant
-//! surface (`establishment` and `scoped_grants` suites).
+//! alone delivers nothing, and only the issuer mints one. The sanctioned
+//! channel is the connections grant surface (`establishment` and
+//! `scoped_grants` suites).
 
 use std::time::Duration;
 
 use anyhow::Result;
 use pdn_node::{
-    DataService as _, IdentityService as _, Runtime, ShareMode, SpawnOptions, UnknownIdentity,
-    UnknownIssuer,
+    ConnectionsService as _, DataService as _, GranteeCannotShare, IdentityService as _, Runtime,
+    ShareMode, SpawnOptions, UnknownIdentity, UnknownIssuer,
 };
 use pdn_types::EntryPath;
+use test_utils::eventually;
+
+mod common;
 
 /// "Nothing arrived" is probed by waiting out a few of the ticket identity's
 /// reconcile intervals.
@@ -208,5 +212,73 @@ async fn an_import_names_the_identity_it_is_held_for() -> Result<()> {
 
     issuer_rt.shutdown().await?;
     identity_rt.shutdown().await?;
+    Ok(())
+}
+
+/// An identity holding a namespace as a grantee is refused a ticket on it,
+/// whether the namespace came under a grant or was imported out of band.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_held_as_a_grantee_is_not_shared() -> Result<()> {
+    let options = SpawnOptions {
+        reconcile_interval: RECONCILE,
+        ..SpawnOptions::memory()
+    };
+    let issuer_rt = Runtime::spawn(options.clone()).await?;
+    let audience_rt = Runtime::spawn(options).await?;
+    let bob = issuer_rt.identity().create().await?;
+    let alice = audience_rt.identity().create().await?;
+    let carol = audience_rt.identity().create().await?;
+
+    let email = EntryPath::new("contact/email")?;
+    issuer_rt
+        .data()
+        .write(bob, bob, &email, b"bob@example.org")
+        .await?;
+    let invite = issuer_rt.connections().invite(bob, None).await?;
+    common::establish_patiently(&audience_rt, alice, &issuer_rt, bob, invite).await?;
+    issuer_rt
+        .connections()
+        .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
+        .await?;
+    // The binder has imported once the claim reads back.
+    assert!(
+        eventually(|| async {
+            Ok(matches!(
+                audience_rt.data().read(alice, bob, &email).await,
+                Ok(Some(payload)) if payload == b"bob@example.org"
+            ))
+        })
+        .await?,
+        "the granted claim did not reach the audience"
+    );
+
+    // Allowed: the issuer shares the same namespace.
+    let ticket = issuer_rt.data().share(bob, bob, ShareMode::Read).await?;
+
+    // Denied: the replica under the grant.
+    let refused = audience_rt
+        .data()
+        .share(alice, bob, ShareMode::Read)
+        .await
+        .expect_err("a namespace held under a grant must not be shared");
+    assert!(
+        refused.downcast_ref::<GranteeCannotShare>().is_some(),
+        "the refusal did not name the grantee: {refused:#}"
+    );
+
+    // Denied: the replica imported out of band.
+    audience_rt.data().import(carol, bob, ticket).await?;
+    let refused = audience_rt
+        .data()
+        .share(carol, bob, ShareMode::Read)
+        .await
+        .expect_err("a namespace imported out of band must not be shared");
+    assert!(
+        refused.downcast_ref::<GranteeCannotShare>().is_some(),
+        "the refusal did not name the grantee: {refused:#}"
+    );
+
+    issuer_rt.shutdown().await?;
+    audience_rt.shutdown().await?;
     Ok(())
 }

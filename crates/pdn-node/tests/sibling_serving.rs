@@ -3,13 +3,13 @@
 //! afterwards — still catches up on the grant record over the pair and on
 //! the claim from its sibling, with no import act anywhere: the grant
 //! binder imports and forgets. Paired denial: an outsider holding a
-//! sibling-minted ticket obtains nothing from the same serving device.
+//! ticket aimed at the sibling obtains nothing from it.
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pdn_node::{
-    ConnectionsService as _, DataService as _, IdentityService as _, Runtime, ShareMode,
+    ConnectionsService as _, DataService as _, DocTicket, IdentityService as _, Runtime, ShareMode,
     SpawnOptions,
 };
 use pdn_types::{EntryPath, PdnId};
@@ -65,12 +65,29 @@ async fn claim_arrives(
     .await
 }
 
+/// Carol's ticket, made by hand as `product-path-arrangement.md` admits for
+/// a negative control: an audience mints none, and Bob's own names only his
+/// node, offline here. It addresses Alice's replica on the phone.
+async fn aimed_at_phone(rt_phone: &Runtime, alice: PdnId, bob: PdnId) -> Result<DocTicket> {
+    let mut ticket = rt_phone
+        .connections()
+        .read_grants(alice, bob)
+        .await?
+        .into_iter()
+        .find(|g| g.grant.issuer == bob)
+        .context("the phone holds no grant record of Bob's")?
+        .ticket;
+    ticket.nodes = vec![rt_phone.sync().dial_handle_for_test().await.addr()];
+    ticket.identity = data_layer::Identity::from_bytes(*alice.as_bytes());
+    Ok(ticket)
+}
+
 /// Allowed: the laptop, linked after the fact and never introduced to Bob's
 /// runtime, catches up on the pair, the grant, and the claim while Bob is
 /// offline. Denied: Bob's withheld claim never reaches it — the phone
-/// serves the claim set, not its holdings; Carol, holding a ticket the
-/// phone itself minted, resolves in no audience directory and obtains
-/// nothing.
+/// serves the claim set, not its holdings; Carol, holding a ticket aimed at
+/// the phone by hand (`aimed_at_phone`), resolves in no audience directory
+/// and obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -145,12 +162,12 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
 
     // Denied, outsider: Carol's ticket is sibling-addressed and reachable,
     // and she resolves in no audience directory.
-    let leaked = rt_phone.data().share(alice, bob, ShareMode::Read).await?;
+    let leaked = aimed_at_phone(&rt_phone, alice, bob).await?;
     rt_carol.data().import_scoped(carol, bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         rt_carol.data().list(carol, bob, None).await?.is_empty(),
-        "a sibling-minted ticket without audience membership must deliver nothing"
+        "a ticket aimed at the sibling without audience membership must deliver nothing"
     );
     assert!(rt_carol.data().read(carol, bob, &email).await?.is_none());
 
@@ -211,12 +228,12 @@ async fn a_device_linked_after_the_issuer_left_catches_up_anyway() -> Result<()>
     );
 
     // Denied, outsider.
-    let leaked = rt_phone.data().share(alice, bob, ShareMode::Read).await?;
+    let leaked = aimed_at_phone(&rt_phone, alice, bob).await?;
     rt_carol.data().import_scoped(carol, bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         rt_carol.data().list(carol, bob, None).await?.is_empty(),
-        "a sibling-minted ticket without audience membership must deliver nothing"
+        "a ticket aimed at the sibling without audience membership must deliver nothing"
     );
     assert!(rt_carol.data().read(carol, bob, &email).await?.is_none());
 

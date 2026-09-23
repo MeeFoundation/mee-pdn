@@ -54,6 +54,9 @@ pub trait DataService {
         path_prefix: Option<&EntryPath>,
     ) -> Result<Vec<EntryInfo>>;
 
+    /// A ticket on a namespace `identity` issues; one it holds under a grant
+    /// or imported out of band is refused as
+    /// [`GranteeCannotShare`](crate::GranteeCannotShare).
     async fn share(&self, identity: PdnId, issuer: PdnId, mode: ShareMode) -> Result<DocTicket>;
 
     /// Register a ticket obtained out of band under `issuer`, held for

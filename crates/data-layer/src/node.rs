@@ -52,6 +52,19 @@ pub struct UnknownIssuer {
     pub issuer: PdnId,
 }
 
+/// `identity` holds `issuer`'s namespace as a grantee and mints no ticket
+/// on it: the store's share would rejoin the swarm and dial recorded peers
+/// as the identity. Downcast from the `anyhow::Error` of
+/// [`SyncNode::share_ticket`].
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error(
+    "identity {identity} holds the data namespace of {issuer} as a grantee and cannot share it"
+)]
+pub struct GranteeCannotShare {
+    pub identity: PdnId,
+    pub issuer: PdnId,
+}
+
 /// The namespace was forgotten, or never imported here. Downcast from the
 /// `anyhow::Error` of [`SyncNode::set_doc_contacts`].
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -1282,11 +1295,15 @@ impl SyncNode {
         mode: ShareMode,
         addr_options: AddrInfoOptions,
     ) -> Result<DocTicket> {
-        let ticket = self
+        let binding = self
             .require(identity)?
-            .doc(issuer)?
-            .share(mode, addr_options)
-            .await?;
+            .registry
+            .binding(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        if binding.posture == ServingPosture::AudienceDevices {
+            return Err(GranteeCannotShare { identity, issuer }.into());
+        }
+        let ticket = binding.doc.share(mode, addr_options).await?;
         Ok(ticket)
     }
 
