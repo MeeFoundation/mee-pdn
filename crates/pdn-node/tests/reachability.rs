@@ -1124,3 +1124,64 @@ async fn a_grant_waits_while_an_out_of_band_import_holds_its_issuer() -> Result<
     rt_bob.shutdown().await?;
     Ok(())
 }
+
+/// A withdrawal leaves a namespace imported out of band that holds the
+/// issuer by then: the binder forgets only the replica it imported. The
+/// out-of-band ticket names another identity's namespace under the grant's
+/// issuer as this test's subject, so the two differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawal_leaves_an_out_of_band_import_that_holds_the_issuer() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_bob = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_bob,
+        bob,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    assert!(
+        eventually(|| async { Ok(rt_bob.connections().grant_bound(bob, alice, alice).await) })
+            .await?,
+        "the grant was never bound, so the withdrawal would have nothing to unbind"
+    );
+
+    let elsewhere = rt_phone.identity().create().await?;
+    let out_of_band = rt_phone
+        .data()
+        .share(elsewhere, elsewhere, ShareMode::Read)
+        .await?;
+    let imported = out_of_band.capability.id();
+    rt_bob.data().import(bob, alice, out_of_band).await?;
+
+    rt_phone
+        .connections()
+        .withdraw_grant(alice, bob, alice)
+        .await?;
+    assert!(
+        eventually(|| async { Ok(!rt_bob.connections().grant_bound(bob, alice, alice).await) })
+            .await?,
+        "the withdrawal was never processed"
+    );
+
+    assert!(
+        rt_bob.data().holds_replica(bob, imported).await?,
+        "the withdrawal forgot the namespace imported out of band"
+    );
+    assert!(
+        rt_bob.data().read(bob, alice, &email).await.is_ok(),
+        "the issuer no longer resolves after the withdrawal"
+    );
+
+    rt_phone.shutdown().await?;
+    rt_bob.shutdown().await?;
+    Ok(())
+}

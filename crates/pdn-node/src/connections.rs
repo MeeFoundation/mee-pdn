@@ -558,15 +558,15 @@ async fn refresh_replica_contacts(
 }
 
 async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live: &[PdnId]) {
-    let withdrawn: Vec<PdnId> = state
+    let withdrawn: Vec<(PdnId, data_layer::NamespaceId)> = state
         .bound_grants
-        .keys()
-        .filter(|(bound_identity, bound_peer, issuer)| {
+        .iter()
+        .filter(|((bound_identity, bound_peer, issuer), _namespace)| {
             *bound_identity == identity && *bound_peer == peer && !live.contains(issuer)
         })
-        .map(|(_identity, _peer, issuer)| *issuer)
+        .map(|((_identity, _peer, issuer), namespace)| (*issuer, *namespace))
         .collect();
-    for issuer in withdrawn {
+    for (issuer, imported) in withdrawn {
         // Forget first, prune second, and drop the memo only if the forget
         // went through: a failed forget keeps the retry, and markers pruned
         // ahead of it would take away the only thing that could re-arm
@@ -576,7 +576,16 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
         // identity's own namespace is registered under its own id, and
         // only a forget naming it on both sides could take it away.
         if issuer != identity {
-            match state.node.forget_namespace(identity, issuer).await {
+            // Only the replica this binder imported: one another route has
+            // bound to the issuer since is not the grant's to take.
+            let forgotten = match state.node.data_namespace_of(identity, issuer) {
+                Ok(Some(current)) if current == imported => {
+                    state.node.forget_namespace(identity, issuer).await
+                }
+                Ok(_other) => Ok(()),
+                Err(err) => Err(err),
+            };
+            match forgotten {
                 Ok(()) => {}
                 Err(err) if err.downcast_ref::<data_layer::UnknownIssuer>().is_some() => {}
                 Err(err) => {
