@@ -66,7 +66,7 @@ Added once; later imports leave it alone. It is the file's only pointer to which
 Entries go into a `## Замечания <bot> в PR #<n> (GHn)` section at the end of the review file — created if missing, in the file's language, with a one-line preamble stating when the bot ran and which diff it saw. Each entry:
 
 ```markdown
-**GH<n> — [<severity as the bot tagged it>] <one-line essence of the claim> ([<file>](<relative link>), диффовая строка <line>).** <Verdict and the re-verification in two-to-four sentences: what was checked in the current code, what holds, what does not. If it closes through an existing finding: «закрывается через [F<m>](#f<m>)». If it is fixed separately from any F: say what the fix is. If rejected: why, on which plane.>
+**GH<n> — [<severity as the bot tagged it>] <one-line essence of the claim> ([<file>](<relative link>), диффовая строка <line>).** <Verdict and the re-verification in two-to-four sentences: what was checked in the current code, what holds, what does not. If it closes through an existing finding: «закрывается через [F<m>](#f<m>)». If it is fixed separately from any F: say what the fix is. If rejected: why, on which plane — a remark on a path neither a host nor a modified node reaches is one such plane (`code-practices/defect-reachability.md`), stated with its argument.>
 
 ​```
 <The reply to post on the thread, in English, starting with `Fixed. ` or `Rejected. `. Decided to fix but the variant is not chosen yet — `Fixed. [TODO]` and nothing else. The fence is there so the text copies out raw.>

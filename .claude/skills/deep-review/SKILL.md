@@ -83,6 +83,8 @@ Each angle's prompt carries: the dump paths, the file list, the map from the "Ma
 
 **At most 5 findings per angle, each with a mechanism the agent traced through the sources itself and is prepared to defend.** A guess with no line of code behind it is not returned.
 
+**Every finding names its reach, per `code-practices/defect-reachability.md`:** `product` — a host calling the public surface of `pdn-node` triggers it under some operating condition; `network` — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; `internal` — neither. The symptom names the path behind the word. Reach decides whether a fix is obliged, severity how urgent it is, and neither stands in for the other.
+
 **A second bar, on worth rather than evidence: return a finding only if you would advise a human to spend an hour of their working day on it.** In 1,000 changed lines there is always one more true-but-inconsequential thing to say, so the quota is a ceiling, never a target — an angle returning two findings has done its job as well as one returning five. Findings are worked down one at a time by a person reading the code around each; a file of 68 is not five times more useful than a file of 15, it is a week the change does not have. Clears the bar: a wrong answer under some input, data crossing where it must not, unbounded growth, an invariant a future edit will break unknowingly, a test that passes with the mechanism removed. Does not, unless it causes one of those: naming, phrasing, a comment, an import, a shape you would have written differently.
 
 **A claim about what a build, a test run, or a feature lane would produce is either run or marked as reasoning.** "The result is predetermined, so I did not check" already topped one run's findings and was wrong — one `cargo tree` away from being caught. Execute under the rules below, or state in `evidence` that the claim was derived by reading and never run.
@@ -107,6 +109,8 @@ A verifier is asked to **refute** a finding, not confirm it, and leans "refuted"
 **A majority of `REFUTED` kills a finding; a split resolves to `PLAUSIBLE`** — disagreement between careful readers is itself an honest verdict, not something an extra vote is invented to break. The arithmetic stays in the journal; the file gets the word (§3).
 
 **Verification runs in severity order** — critical, then medium, then structural — sorted before the pipeline is built, so the deadline cuts the tail rather than the head.
+
+**Reach is checked, not taken on trust, and an unreachable mechanism is not refuted.** A path no code can take is `REFUTED`; a mechanism that holds but that neither a host nor a modified node reaches is a real defect whose fix is optional, so the verifier returns reach `internal` rather than killing it.
 
 A verifier opens the sources and cites lines. **A verifier that sharpens a finding is doing its job**: where the mechanism holds but the wording overreaches, the correction goes in `corrections` and is applied in §3 — the three best findings of one run were all narrowed this way. Changing files in the working tree is **forbidden**.
 
@@ -211,7 +215,7 @@ The flag is honoured whether the run is still going or was stopped earlier.
 
 1. **Drop the `REFUTED`** into their own section, one line each with the refuting reason. A refuting majority kills; a split is `PLAUSIBLE` and stays.
 2. **Check the merge rather than redo it.** Catch what triage could not see: two groups the verdicts reveal as one mechanism, one group whose verifiers split because it was two. The same file and line with different mechanisms is not a duplicate — true in triage, true here.
-3. **Apply the `corrections`** from the verifiers — the sharpened wording goes into the file.
+3. **Apply the `corrections`** from the verifiers — the sharpened wording goes into the file. A verifier's `reach` is a correction too; where verifiers disagree on it, the reach that obliges a fix stands, and the symptom is rewritten to name that path.
 4. **Strip the machinery from the prose.** Vote counts, angle names and counts, agent counts, phase names — none reaches the file: "найдено четырьмя углами" is how the run convinced itself; the reader is convinced by the mechanism and the lines. Exactly three traces survive, because they change what the reader does: the verdict word (`CONFIRMED` / `PLAUSIBLE` / `NOT VERIFIED` — trust it, weigh it, or verify it first), the refuted section (do not rediscover these), and the coverage holes under "Not covered".
 5. **Number them `F1..Fn`** in final order — most important first, numbering running through every section. A number is never reused: a closed finding keeps its number in the file.
 6. **Sort into levels.** The order of sections is fixed:
@@ -223,6 +227,8 @@ The flag is honoured whether the run is still going or was stopped earlier.
 8. **Assemble a fixing order** — a route, not a copy of the findings list: what comes first, what is fixed in one pass together, which fix opens another finding (as a timeout opens a cancellation window), which fork needs a human decision, and which decision.
 
    **A coupling shapes the route's structure, never only its prose.** Fixes for one sitting share one bullet; a prerequisite stands directly before its dependent — whatever their severities. Severity ranks the findings sections, dependencies rank the route, and the two orderings may disagree; a bullet carrying mixed severities says which, so the ranking stays legible. "Take together with F2" three items away from F2's own bullet has already lost the coupling — the route is worked top-down.
+
+   **A finding of reach `internal` is optional, and its bullet says so** — "optional: unreachable", in the file's language, with the one-line argument. It never stands before a reachable finding on severity alone.
 
    **Bulleted, never numbered** — a number in this file must name exactly one thing, and a numbered route would stand a second, shifting numbering beside the stable `Fn`.
 
@@ -269,9 +275,9 @@ The template below is in English. When the review language is something else, th
 
 <a id="f1"></a>
 ### F1 — <symptom → consequence, in one line>
-**File:** `<path:line>` · **CONFIRMED** <or **PLAUSIBLE**, or **NOT VERIFIED** when the run ended before a single verifier reached it — the word alone, never a vote tally, an angle name, or a count of who found it> · *new in this change* | *pre-existing, but in scope because <reason>*
+**File:** `<path:line>` · **CONFIRMED** <or **PLAUSIBLE**, or **NOT VERIFIED** when the run ended before a single verifier reached it — the word alone, never a vote tally, an angle name, or a count of who found it> · *new in this change* | *pre-existing, but in scope because <reason>* · **Reach:** product path | network | internal
 
-**How it shows up:** <the exact trigger: which input, which state, what the affected party observes. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
+**How it shows up:** <the exact trigger: which input, which state, what the affected party observes, and the path behind the reach — the public `pdn-node` operation and the condition, the input a modified node sends, or why neither reaches it. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
 
 **What causes it:** <the mechanism through the code with line references: what exactly permits this and why the existing checks do not catch it.>
 
