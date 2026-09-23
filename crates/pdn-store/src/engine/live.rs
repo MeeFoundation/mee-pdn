@@ -55,7 +55,24 @@ pub(super) async fn read_in_process_opening(
     recv: InProcessRecv,
     peer: PublicKey,
 ) -> Result<SessionOpening<InProcessRecv, InProcessSend>, AcceptError> {
-    SessionOpening::read(send, recv, peer).await
+    // Bounded like the first message of an accepted connection: the dialing
+    // half is a task of this process, and a task that never writes would
+    // otherwise hold this one for good.
+    n0_future::time::timeout(
+        crate::net::SYNC_SESSION_TIMEOUT,
+        SessionOpening::read(send, recv, peer),
+    )
+    .await
+    .map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            None,
+            anyhow::anyhow!(
+                "no in-process init message within {:?}",
+                crate::net::SYNC_SESSION_TIMEOUT
+            ),
+        )
+    })?
 }
 
 /// An iroh-docs operation
@@ -662,7 +679,10 @@ impl LiveActor {
         mut send: InProcessSend,
         mut recv: InProcessRecv,
     ) {
-        let reason = SyncReason::DirectJoin;
+        // Announced, not a direct join: a write that finds the pair busy is
+        // queued and replayed, or a batch of writes would deliver only the
+        // one that happened to arrive between two sessions.
+        let reason = SyncReason::Announced;
         if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
         }
@@ -953,12 +973,20 @@ impl LiveActor {
                 );
 
                 // register the peer as useful for the document
-                if let Err(e) = self
-                    .sync
-                    .register_useful_peer(namespace, *peer.as_bytes())
-                    .await
-                {
-                    debug!(%e, "failed to register peer for document")
+                //
+                // This node's own id is never one: the table names nodes to
+                // dial, and a dial that resolves here is an in-process one,
+                // which the consumer asks for through its own path. Left in,
+                // it would make every later start of this replica dial this
+                // node again, converged or not.
+                if peer != self.endpoint.id() {
+                    if let Err(e) = self
+                        .sync
+                        .register_useful_peer(namespace, *peer.as_bytes())
+                        .await
+                    {
+                        debug!(%e, "failed to register peer for document")
+                    }
                 }
 
                 // Retry content that is still missing for this namespace: the peer we
@@ -1379,7 +1407,7 @@ impl LiveActor {
         caller: Holder,
     ) -> AcceptOutcome {
         self.state
-            .accept_request(&self.endpoint.id(), &namespace, peer, caller)
+            .accept_request(&self.endpoint.id(), self.holder, &namespace, peer, caller)
     }
 }
 

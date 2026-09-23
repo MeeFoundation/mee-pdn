@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use anyhow::Result;
 use iroh::EndpointId;
@@ -22,6 +22,8 @@ pub enum SyncReason {
     SyncReport,
     /// We received a sync report while a sync was running, so run again afterwars
     Resync,
+    /// A write of this node announced itself to a holder of this same node.
+    Announced,
 }
 
 /// Why we performed a sync exchange
@@ -118,6 +120,7 @@ impl NamespaceStates {
     pub fn accept_request(
         &mut self,
         me: &EndpointId,
+        own_holder: Holder,
         namespace: &NamespaceId,
         node: EndpointId,
         caller: Holder,
@@ -125,7 +128,7 @@ impl NamespaceStates {
         let Some(state) = self.entry(namespace, (node, caller)) else {
             return AcceptOutcome::Reject(AbortReason::NotFound);
         };
-        state.accept_request(me, &node)
+        state.accept_request(me, own_holder, &node, caller)
     }
 
     /// Insert a finished sync operation into the state.
@@ -236,7 +239,11 @@ impl PeerState {
             // never run two syncs at the same time
             SyncState::Running { .. } => {
                 debug!("abort connect: sync already running");
-                if matches!(reason, SyncReason::SyncReport) {
+                // A reason that says "there is news" is queued rather than
+                // dropped: the running exchange serves a view frozen before
+                // that news, so without the replay it travels no earlier
+                // than the next periodic trigger.
+                if matches!(reason, SyncReason::SyncReport | SyncReason::Announced) {
                     debug!("resync queued");
                     self.resync_requested = true;
                 }
@@ -262,7 +269,13 @@ impl PeerState {
         }
     }
 
-    fn accept_request(&mut self, me: &EndpointId, node: &EndpointId) -> AcceptOutcome {
+    fn accept_request(
+        &mut self,
+        me: &EndpointId,
+        own_holder: Holder,
+        node: &EndpointId,
+        caller: Holder,
+    ) -> AcceptOutcome {
         let outcome = match &self.state {
             SyncState::Idle => AcceptOutcome::Allow {
                 filter: None,
@@ -273,13 +286,17 @@ impl PeerState {
                 // Incoming sync request while we are dialing ourselves.
                 // In this case, compare the binary representations of our and the other node's id
                 // to deterministically decide which of the two concurrent connections will succeed.
-                Origin::Connect(_reason) => match expected_sync_direction(me, node) {
-                    SyncDirection::Accept => AcceptOutcome::Allow {
-                        filter: None,
-                        ingest: None,
-                    },
-                    SyncDirection::Connect => AcceptOutcome::Reject(AbortReason::AlreadySyncing),
-                },
+                Origin::Connect(_reason) => {
+                    match expected_sync_direction((me, own_holder), (node, caller)) {
+                        SyncDirection::Accept => AcceptOutcome::Allow {
+                            filter: None,
+                            ingest: None,
+                        },
+                        SyncDirection::Connect => {
+                            AcceptOutcome::Reject(AbortReason::AlreadySyncing)
+                        }
+                    }
+                }
             },
         };
         if let AcceptOutcome::Allow { .. } = outcome {
@@ -303,8 +320,21 @@ enum SyncDirection {
     Connect,
 }
 
-fn expected_sync_direction(self_node_id: &EndpointId, other_node_id: &EndpointId) -> SyncDirection {
-    if self_node_id > other_node_id {
+/// Which of two mutual dials survives, decided the same way on both
+/// sides. Node ids settle it between two nodes; between two holders of one
+/// node they are the same id, and then the holders settle it — without
+/// that, the comparison is a value against itself, both sides read
+/// "connect", and each refuses the other's dial.
+fn expected_sync_direction(
+    here: (&EndpointId, Holder),
+    there: (&EndpointId, Holder),
+) -> SyncDirection {
+    let ((self_node_id, own_holder), (other_node_id, other_holder)) = (here, there);
+    let greater = match self_node_id.cmp(other_node_id) {
+        Ordering::Equal => own_holder > other_holder,
+        order => order == Ordering::Greater,
+    };
+    if greater {
         SyncDirection::Accept
     } else {
         SyncDirection::Connect
@@ -329,6 +359,12 @@ mod tests {
         Holder::from_bytes([7u8; 32])
     }
 
+    /// This engine's own holder. Only the node ids differ in these cases,
+    /// so the holders never reach the tie-break.
+    fn own_holder() -> Holder {
+        Holder::from_bytes([1u8; 32])
+    }
+
     fn node_pair() -> (EndpointId, EndpointId) {
         let a = SecretKey::from_bytes(&[1u8; 32]).public();
         let b = SecretKey::from_bytes(&[2u8; 32]).public();
@@ -337,6 +373,37 @@ mod tests {
         } else {
             (b, a)
         }
+    }
+
+    /// Two holders of one node dialing each other: exactly one of the two
+    /// exchanges survives, as it does between two nodes. The node ids are
+    /// the same value here, so a tie-break that only compared them would
+    /// read "connect" on both sides and each would refuse the other.
+    #[test]
+    fn a_mutual_dial_between_two_holders_of_one_node_leaves_one_exchange() {
+        let namespace = namespace();
+        let (node, _other) = node_pair();
+        let (low, high) = (Holder::from_bytes([1u8; 32]), Holder::from_bytes([2u8; 32]));
+
+        // The engine of the higher holder, dialing the lower and dialed back.
+        let mut higher = NamespaceStates::default();
+        higher.insert(namespace);
+        assert!(higher.start_connect(&namespace, node, low, SyncReason::DirectJoin));
+        let accepted = higher.accept_request(&node, high, &namespace, node, low);
+        assert!(
+            matches!(accepted, AcceptOutcome::Allow { .. }),
+            "the higher holder refused the exchange that should survive"
+        );
+
+        // The engine of the lower holder, in the mirror position.
+        let mut lower = NamespaceStates::default();
+        lower.insert(namespace);
+        assert!(lower.start_connect(&namespace, node, high, SyncReason::DirectJoin));
+        let refused = lower.accept_request(&node, low, &namespace, node, high);
+        assert!(
+            matches!(refused, AcceptOutcome::Reject(AbortReason::AlreadySyncing)),
+            "both sides accepted, so both exchanges ran"
+        );
     }
 
     /// A dial the remote rejected as already-syncing leaves nothing running that could
@@ -392,7 +459,7 @@ mod tests {
         states.insert(namespace);
 
         assert!(states.start_connect(&namespace, node, counterpart(), SyncReason::DirectJoin));
-        let outcome = states.accept_request(&me, &namespace, node, counterpart());
+        let outcome = states.accept_request(&me, own_holder(), &namespace, node, counterpart());
         assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
         // Our dial comes back rejected; the slot now belongs to the accept exchange.

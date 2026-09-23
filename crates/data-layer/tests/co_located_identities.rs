@@ -359,10 +359,21 @@ async fn the_periodic_pass_catches_up_a_co_located_pair_and_leaves_a_quiet_one_a
         "the periodic pass did not catch the co-located pair up"
     );
 
-    // Quiet from here: no write on either side, so a pass that compares
-    // the author heads finds nothing to reconcile. The metric counts the
-    // pass alone — a contact that resolves to this node is dialed every
-    // interval, converged or not, as any peer's would be.
+    // The pass judges the pair by what has moved since it last reconciled
+    // it, so a delivery costs one more pass: the one that observes that
+    // nothing moved after it. Wait for that to settle, then hold the pair
+    // to silence. The metric counts the pass alone — a contact that
+    // resolves to this node is dialed every interval, converged or not, as
+    // any peer's would be.
+    assert!(
+        eventually(|| async {
+            let before = node.co_located_pass_sessions();
+            tokio::time::sleep(RECONCILE * 2).await;
+            Ok(node.co_located_pass_sessions() == before)
+        })
+        .await?,
+        "the pass never stopped reconciling the pair"
+    );
     let before = node.co_located_pass_sessions();
     tokio::time::sleep(RECONCILE * 6).await;
     assert_eq!(
@@ -387,13 +398,10 @@ async fn the_periodic_pass_catches_up_a_co_located_pair_and_leaves_a_quiet_one_a
 /// several passes, which is also what makes its arrival afterwards the
 /// widening's doing.
 ///
-/// The scenario pins the product's behaviour, not the pass's decision: a
-/// replica whose recorded peers name this node is dialed in process on
-/// every interval whatever the pass decides, so with that dial in place
-/// the entry arrives either way and no assertion here separates the two.
-/// The session count is per namespace all the same, because publishing a
-/// grant writes into the pair's connection stores and a total would move
-/// on their reconciliation alone.
+/// The pass's own decision is what the session count pins: it stands still
+/// while nothing moves and moves once the grant does. Counted per
+/// namespace, because publishing a grant writes into the pair's connection
+/// stores and a total would move on their reconciliation alone.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, both grants and both waits in one place
 async fn a_grant_widened_without_a_write_reaches_the_co_located_audience() -> Result<()> {

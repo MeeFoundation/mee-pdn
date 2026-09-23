@@ -299,6 +299,11 @@ struct HostedStack {
     /// At most one nudge in flight per namespace, so a tight poll loop
     /// cannot pile up attempts against one replica.
     nudges_in_flight: Mutex<HashSet<NamespaceId>>,
+    /// Announcements of a local write already on their way to a co-located
+    /// holder. One write that finds the pair busy is queued by the engine
+    /// and replayed, so the rest of a batch buys nothing but a task, a pipe
+    /// and a message through the actor's inbox each.
+    announcements_in_flight: Mutex<HashSet<(NamespaceId, Holder)>>,
 }
 
 impl HostedStack {
@@ -528,6 +533,7 @@ impl SyncNode {
             cache_share_bytes,
             tracked_docs: Mutex::new(HashMap::new()),
             nudges_in_flight: Mutex::new(HashSet::new()),
+            announcements_in_flight: Mutex::new(HashSet::new()),
         });
         let mut hosted = self
             .identities
@@ -1568,13 +1574,25 @@ fn reconcile_with_co_located(
         .collect();
     drop(hosted);
     for target in targets {
+        let holder = target.holder();
+        {
+            let Ok(mut in_flight) = from.announcements_in_flight.lock() else {
+                continue;
+            };
+            if !in_flight.insert((namespace, holder)) {
+                continue;
+            }
+        }
         let from = Arc::clone(&from);
         let _detached = tokio::spawn(async move {
             let _ = from
                 .docs
                 .engine()
-                .sync_in_process(target.docs.engine(), namespace, target.holder())
+                .sync_in_process(target.docs.engine(), namespace, holder)
                 .await;
+            if let Ok(mut in_flight) = from.announcements_in_flight.lock() {
+                in_flight.remove(&(namespace, holder));
+            }
         });
     }
 }
@@ -1964,19 +1982,32 @@ async fn pair_reading(
     namespace: NamespaceId,
 ) -> Option<PairReading> {
     let (first, second) = ordered(source, target);
+    // The grant is read only for a data replica: a device-shared store is
+    // served on its ticket (Invariants 1 and 3), so no grant governs what
+    // flows through it. Reading the connection stores for one of those
+    // would read them for themselves, and their own reconciliation would
+    // then keep invalidating their own memo.
+    let governed = matches!(first.registry.binding_of(namespace), Ok(Some(_)))
+        || matches!(second.registry.binding_of(namespace), Ok(Some(_)));
+    let (source_rights, target_rights) = if governed {
+        (
+            rights_writes(first, second.identity).await,
+            rights_writes(second, first.identity).await,
+        )
+    } else {
+        (0, 0)
+    };
     Some(PairReading {
         source_writes: first.docs.engine().sync.writes(namespace).await.ok()?,
         target_writes: second.docs.engine().sync.writes(namespace).await.ok()?,
-        source_rights: rights_writes(first, second.identity).await,
-        target_rights: rights_writes(second, first.identity).await,
+        source_rights,
+        target_rights,
     })
 }
 
 /// Reconcile each pair of hosted identities holding one namespace, and
 /// leave alone a pair where nothing has moved since they last reconciled —
-/// a pass over a quiet namespace must not accumulate sessions. The reading
-/// is taken again after the session, because that session is itself what
-/// moves the counters.
+/// a pass over a quiet namespace must not accumulate sessions.
 async fn reconcile_co_located(
     stacks: &[Arc<HostedStack>],
     opened: &CoLocatedPassSessions,
@@ -2005,14 +2036,17 @@ async fn reconcile_co_located(
                     .engine()
                     .sync_in_process(target.docs.engine(), namespace, target.holder())
                     .await;
-                // Only a session that went through may quiet the pair: one
-                // that failed leaves the reading as it was, so the next
-                // pass tries again rather than recording a convergence
-                // that did not happen.
+                // The reading taken before the session is what is kept, and
+                // only if the session went through. Reading again after it
+                // would race the ingest — the receiving side applies what
+                // arrived in its own actor, which the dialing half does not
+                // wait for — and a reading taken too early would differ on
+                // the next pass, which would reconcile again, and again.
+                // Kept this way, a session that delivered something costs
+                // one more pass before the pair goes quiet, and a session
+                // that failed leaves the pair as it was.
                 if reconciliation.is_ok() {
-                    if let Some(after) = pair_reading(source, target, namespace).await {
-                        reconciled.insert(pair, after);
-                    }
+                    reconciled.insert(pair, reading);
                 }
             }
         }

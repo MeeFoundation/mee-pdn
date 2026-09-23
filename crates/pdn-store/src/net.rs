@@ -389,8 +389,23 @@ where
 {
     let t_start = Instant::now();
     let peer = opening.peer();
-    let (res, outcome, mut writer, _reader) = run_session(sync, opening, accept_cb, metrics).await;
-    let _shut = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    // The same bound as a session over the wire: a pipe has no peer to go
+    // quiet on it, but the session holds a store snapshot and a
+    // counterpart's slot either way, and nothing below carries a timeout.
+    let session = time::timeout(SYNC_SESSION_TIMEOUT, async {
+        let (res, outcome, mut writer, _reader) =
+            run_session(sync, opening, accept_cb, metrics).await;
+        let _shut = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+        (res, outcome)
+    })
+    .await;
+    let (res, outcome) = session.map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            None,
+            anyhow::anyhow!("in-process exchange timed out after {SYNC_SESSION_TIMEOUT:?}"),
+        )
+    })?;
     let namespace = res?;
     Ok(SyncFinished {
         namespace,
@@ -463,10 +478,19 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let t_start = Instant::now();
-    let res = run_alice(
-        writer, reader, sync, namespace, holder, caller, peer, filter, ingest,
+    // Bounded like the dial it stands in for; see `handle_in_process_session`.
+    let res = time::timeout(
+        SYNC_SESSION_TIMEOUT,
+        run_alice(
+            writer, reader, sync, namespace, holder, caller, peer, filter, ingest,
+        ),
     )
-    .await;
+    .await
+    .map_err(|_elapsed| {
+        ConnectError::sync(anyhow::anyhow!(
+            "in-process exchange timed out after {SYNC_SESSION_TIMEOUT:?}"
+        ))
+    })?;
     let _shut = tokio::io::AsyncWriteExt::shutdown(writer).await;
     if let Some(metrics) = metrics {
         if res.is_ok() {
