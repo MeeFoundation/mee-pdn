@@ -258,8 +258,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
 /// named identity alone (ADR-0013).
 ///
 /// Denied: the withheld entries stay absent through both, ordered after
-/// a granted read that proves the path live, and the confirmation — the
-/// one act that used to widen it — changes nothing.
+/// a granted read that proves the path live.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, pending and confirmed in one place
 async fn a_pending_device_registration_confers_nothing() -> Result<()> {

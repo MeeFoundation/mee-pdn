@@ -181,7 +181,7 @@ async fn mixed_grant_email_read_only_phone_read_write() -> Result<()> {
 /// A claim leaving the grant does not destroy what the issuer accepted
 /// under it: Bob narrows Alice's grant from email and phone to phone alone,
 /// and his copy of her email entry stays. Alice goes on offering the entry
-/// every session, since Bob's narrowed egress no longer serves it back; his
+/// every session, since Bob's narrowed egress does not serve it back; his
 /// gate refuses it silently, because a rejection is what makes Alice
 /// destroy her copy.
 #[tokio::test(flavor = "multi_thread")]
