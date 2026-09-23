@@ -8,10 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
     panic::AssertUnwindSafe,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -232,7 +229,7 @@ pub struct SyncNode {
     /// Sessions [`reconcile_co_located`] has opened, so a scenario can
     /// assert that a pass over a converged pair opens none.
     #[cfg(feature = "test-util")]
-    co_located_sessions: Arc<AtomicU64>,
+    co_located_sessions: CoLocatedPassSessions,
     storage: StorageConfig,
     retraction: Arc<RetractionTracker>,
     /// Taken once, by the runtime's consumer.
@@ -448,7 +445,7 @@ impl SyncNode {
         let router = router.spawn();
 
         let (reconciler_stop, stop) = oneshot::channel();
-        let co_located_sessions = Arc::new(AtomicU64::new(0));
+        let co_located_sessions: CoLocatedPassSessions = Arc::default();
         let _detached = tokio::spawn(reconcile_pass(
             options.reconcile_interval,
             Arc::clone(&identities),
@@ -541,10 +538,26 @@ impl SyncNode {
     }
 
     /// Sessions the periodic pass over the co-located pairs has opened —
-    /// what shows that a pass over a converged pair opens none.
+    /// what shows that a pass over a converged pair opens none. Counted
+    /// per namespace, because a pair holds its data replica and its two
+    /// connection stores alike, and a scenario about one of them cannot be
+    /// read off a total the other two move.
     #[cfg(feature = "test-util")]
     pub fn co_located_pass_sessions(&self) -> u64 {
-        self.co_located_sessions.load(Ordering::Relaxed)
+        self.co_located_sessions
+            .lock()
+            .map(|opened| opened.values().sum())
+            .unwrap_or_default()
+    }
+
+    /// The same count for one namespace alone.
+    #[cfg(feature = "test-util")]
+    pub fn co_located_pass_sessions_of(&self, namespace: NamespaceId) -> u64 {
+        self.co_located_sessions
+            .lock()
+            .ok()
+            .and_then(|opened| opened.get(&namespace).copied())
+            .unwrap_or_default()
     }
 
     /// The store one hosted identity opens: in memory, or under that
@@ -1861,9 +1874,10 @@ pub(crate) async fn read_payload(
 async fn reconcile_pass(
     interval: Duration,
     identities: Identities,
-    co_located_sessions: Arc<AtomicU64>,
+    co_located_sessions: CoLocatedPassSessions,
     mut stop: oneshot::Receiver<()>,
 ) {
+    let mut reconciled: HashMap<(PdnId, PdnId, NamespaceId), PairReading> = HashMap::new();
     while tokio::time::timeout(interval, &mut stop).await.is_err() {
         let stacks: Vec<Arc<HostedStack>> = match identities.read() {
             Ok(guard) => guard.values().cloned().collect(),
@@ -1887,15 +1901,87 @@ async fn reconcile_pass(
                 };
             }
         }
-        reconcile_co_located(&stacks, &co_located_sessions).await;
+        reconcile_co_located(&stacks, &co_located_sessions, &mut reconciled).await;
     }
 }
 
-/// Reconcile each pair of hosted identities holding one namespace whose
-/// replicas differ, and leave a converged pair alone — a pass over a quiet
-/// namespace must not accumulate sessions. The author heads are the cheap
-/// digest the reconciliation itself compares.
-async fn reconcile_co_located(stacks: &[Arc<HostedStack>], opened: &AtomicU64) {
+/// Sessions the pass has opened, per namespace: a pair holds its data
+/// replica and its two connection stores, and each is reconciled on its
+/// own.
+type CoLocatedPassSessions = Arc<Mutex<HashMap<NamespaceId, u64>>>;
+
+/// What a co-located pair looked like when it last reconciled: how many
+/// writes each side's replica had taken, and how many each side's
+/// connection stores had, both sides in the pair's canonical order. A pass
+/// skips the pair only while all four stand still.
+///
+/// Equality of the two replicas is not the question and cannot be: a
+/// replica held under a claim-scoped grant is poorer than the issuer's by
+/// construction, so the two are never equal and no digest of them says
+/// otherwise. What decides whether anything is owed is the grant, and it
+/// lives in the connection stores, where it changes with no write to the
+/// namespace at all.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct PairReading {
+    source_writes: u64,
+    target_writes: u64,
+    source_rights: u64,
+    target_rights: u64,
+}
+
+/// The writes taken by the connection stores this identity holds toward
+/// `peer` — where a grant between the two is written and where it arrives.
+/// `0` when the two are not connected: then no grant binds them.
+async fn rights_writes(stack: &Arc<HostedStack>, peer: PdnId) -> u64 {
+    let Ok(Some((own, peer_doc))) = stack.access.connection_stores(peer) else {
+        return 0;
+    };
+    let sync = &stack.docs.engine().sync;
+    let (Ok(own), Ok(peer_doc)) = (sync.writes(own).await, sync.writes(peer_doc).await) else {
+        return 0;
+    };
+    own.saturating_add(peer_doc)
+}
+
+/// The pair in a fixed order, so the memo reads the same whichever side
+/// the pass happened to walk from: the stacks come from a hash map, and a
+/// key that depended on that order would miss itself on a rehash and
+/// reconcile a quiet pair.
+fn ordered<'a>(
+    source: &'a Arc<HostedStack>,
+    target: &'a Arc<HostedStack>,
+) -> (&'a Arc<HostedStack>, &'a Arc<HostedStack>) {
+    if source.identity <= target.identity {
+        (source, target)
+    } else {
+        (target, source)
+    }
+}
+
+async fn pair_reading(
+    source: &Arc<HostedStack>,
+    target: &Arc<HostedStack>,
+    namespace: NamespaceId,
+) -> Option<PairReading> {
+    let (first, second) = ordered(source, target);
+    Some(PairReading {
+        source_writes: first.docs.engine().sync.writes(namespace).await.ok()?,
+        target_writes: second.docs.engine().sync.writes(namespace).await.ok()?,
+        source_rights: rights_writes(first, second.identity).await,
+        target_rights: rights_writes(second, first.identity).await,
+    })
+}
+
+/// Reconcile each pair of hosted identities holding one namespace, and
+/// leave alone a pair where nothing has moved since they last reconciled —
+/// a pass over a quiet namespace must not accumulate sessions. The reading
+/// is taken again after the session, because that session is itself what
+/// moves the counters.
+async fn reconcile_co_located(
+    stacks: &[Arc<HostedStack>],
+    opened: &CoLocatedPassSessions,
+    reconciled: &mut HashMap<(PdnId, PdnId, NamespaceId), PairReading>,
+) {
     for (index, source) in stacks.iter().enumerate() {
         for target in stacks.iter().skip(index + 1) {
             for tracked in source.tracked_snapshot() {
@@ -1903,24 +1989,39 @@ async fn reconcile_co_located(stacks: &[Arc<HostedStack>], opened: &AtomicU64) {
                 if target.tracked(namespace).ok().flatten().is_none() {
                     continue;
                 }
-                let (Ok(ours), Ok(theirs)) = (
-                    source.docs.engine().sync.author_heads(namespace).await,
-                    target.docs.engine().sync.author_heads(namespace).await,
-                ) else {
+                let (first, second) = ordered(source, target);
+                let pair = (first.identity, second.identity, namespace);
+                let Some(reading) = pair_reading(source, target, namespace).await else {
                     continue;
                 };
-                if ours == theirs {
+                if reconciled.get(&pair) == Some(&reading) {
                     continue;
                 }
-                opened.fetch_add(1, Ordering::Relaxed);
-                let _ = source
+                if let Ok(mut opened) = opened.lock() {
+                    *opened.entry(namespace).or_default() += 1;
+                }
+                let reconciliation = source
                     .docs
                     .engine()
                     .sync_in_process(target.docs.engine(), namespace, target.holder())
                     .await;
+                // Only a session that went through may quiet the pair: one
+                // that failed leaves the reading as it was, so the next
+                // pass tries again rather than recording a convergence
+                // that did not happen.
+                if reconciliation.is_ok() {
+                    if let Some(after) = pair_reading(source, target, namespace).await {
+                        reconciled.insert(pair, after);
+                    }
+                }
             }
         }
     }
+    reconciled.retain(|(source, target, namespace), _reading| {
+        stacks.iter().any(|stack| {
+            stack.identity == *source && matches!(stack.tracked(*namespace), Ok(Some(_)))
+        }) && stacks.iter().any(|stack| stack.identity == *target)
+    });
 }
 
 fn path_of(key: &[u8]) -> Option<EntryPath> {

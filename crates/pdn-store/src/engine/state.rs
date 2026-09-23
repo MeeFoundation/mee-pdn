@@ -304,7 +304,7 @@ enum SyncDirection {
 }
 
 fn expected_sync_direction(self_node_id: &EndpointId, other_node_id: &EndpointId) -> SyncDirection {
-    if self_node_id.as_bytes() > other_node_id.as_bytes() {
+    if self_node_id > other_node_id {
         SyncDirection::Accept
     } else {
         SyncDirection::Connect
@@ -332,7 +332,7 @@ mod tests {
     fn node_pair() -> (EndpointId, EndpointId) {
         let a = SecretKey::from_bytes(&[1u8; 32]).public();
         let b = SecretKey::from_bytes(&[2u8; 32]).public();
-        if a.as_bytes() < b.as_bytes() {
+        if a < b {
             (a, b)
         } else {
             (b, a)

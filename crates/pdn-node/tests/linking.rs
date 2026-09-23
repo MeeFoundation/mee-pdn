@@ -35,10 +35,10 @@ async fn wait_devices_exactly(
     devices: &[NodeId],
 ) -> Result<bool> {
     let mut expected: Vec<NodeId> = devices.to_vec();
-    expected.sort_by_key(|d| *d.as_bytes());
+    expected.sort_unstable();
     eventually(|| async {
         let mut have = directory.list_devices().await?;
-        have.sort_by_key(|d| *d.as_bytes());
+        have.sort_unstable();
         Ok(have == expected)
     })
     .await
@@ -971,9 +971,9 @@ async fn second_identity_requires_its_own_linking() -> Result<()> {
     // Y arrives only by its own linking act, and the two stay disjoint.
     link_patiently(&rt_b, &rt_a, y).await?;
     let mut hosted = rt_b.sync().hosted_identities().await?;
-    hosted.sort_by_key(|identity| *identity.as_bytes());
+    hosted.sort_unstable();
     let mut expected: Vec<PdnId> = vec![x, y];
-    expected.sort_by_key(|identity| *identity.as_bytes());
+    expected.sort_unstable();
     assert_eq!(hosted, expected);
     assert_eq!(rt_b.connections().list(y).await?, vec![pc]);
     assert_eq!(rt_b.connections().list(x).await?, vec![pb]);
@@ -1001,9 +1001,9 @@ async fn hosted_identities_follow_create_and_link() -> Result<()> {
     link_patiently(&rt_b, &rt_a, linked).await?;
 
     let mut hosted = rt_b.sync().hosted_identities().await?;
-    hosted.sort_by_key(|identity| *identity.as_bytes());
+    hosted.sort_unstable();
     let mut expected = vec![created, linked];
-    expected.sort_by_key(|identity| *identity.as_bytes());
+    expected.sort_unstable();
     assert_eq!(hosted, expected);
 
     // The node id never moved.

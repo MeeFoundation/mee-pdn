@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     iter::{Chain, Flatten},
     num::NonZeroU64,
     ops::Bound,
@@ -57,6 +57,13 @@ pub struct Store {
     transaction: CurrentTransaction,
     open_replicas: HashSet<NamespaceId>,
     pubkeys: MemPublicKeyStore,
+    /// How many times each namespace was written, counted where the write
+    /// is applied. A caller comparing two replicas of one namespace asks
+    /// this rather than a digest of their contents: it is the one value
+    /// that moves on every mutation and on nothing else. In memory, so a
+    /// restart resets it to zero and whoever compares treats the first
+    /// look after a start as a change.
+    writes: HashMap<NamespaceId, u64>,
     #[cfg(test)]
     commits: usize,
 }
@@ -169,6 +176,7 @@ impl Store {
             transaction: Default::default(),
             open_replicas: Default::default(),
             pubkeys: Default::default(),
+            writes: Default::default(),
             #[cfg(test)]
             commits: 0,
         })
@@ -470,6 +478,21 @@ impl Store {
             };
             Ok(outcome)
         })
+    }
+
+    /// Count one write of `namespace`. Called where the write is applied,
+    /// so nothing — a subscription, a channel, a healthy actor — stands
+    /// between a mutation and the count of it.
+    pub(crate) fn wrote(&mut self, namespace: NamespaceId) {
+        *self.writes.entry(namespace).or_default() += 1;
+    }
+
+    /// How many writes this replica has taken since the store opened. Two
+    /// replicas of one namespace are told apart by comparing each against
+    /// its own earlier reading, never against the other's: the number
+    /// counts writes, not entries.
+    pub fn writes_of(&self, namespace: NamespaceId) -> u64 {
+        self.writes.get(&namespace).copied().unwrap_or_default()
     }
 
     /// Remove a replica.
@@ -883,6 +906,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     fn entry_put(&mut self, e: SignedEntry) -> Result<()> {
         let id = e.id();
+        self.store.wrote(id.namespace());
         self.store.as_mut().modify(|tables| {
             // insert into record table
             let key = (
@@ -1007,6 +1031,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     ) -> Result<usize> {
         self.ensure_own_namespace(id)?;
         let bounds = RecordsBounds::author_prefix(self.namespace, id.author(), id.key_bytes());
+        self.store.wrote(self.namespace);
         self.store.as_mut().modify(|tables| {
             let cb = |_k: RecordsId, v: RecordsValue| {
                 let (timestamp, _namespace_sig, _author_sig, len, hash) = v;

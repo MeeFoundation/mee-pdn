@@ -521,6 +521,8 @@ async fn refresh_replica_contacts(
         Ok(hosted) => hosted.directory.list_devices().await?,
         Err(_not_hosted) => Vec::new(),
     };
+    // Keyed by bytes because two id types meet here: a contact carries the
+    // endpoint's own id, a device record this crate's `NodeId`.
     let mut covered: HashSet<[u8; 32]> = HashSet::new();
     covered.insert(*own.as_bytes());
     let mut contacts: Vec<Contact> = Vec::new();
@@ -850,6 +852,8 @@ async fn point_pair_at(
     ] {
         // This device is covered first: a ticket it minted names it, and
         // the endpoint refuses a path to itself.
+        // Keyed by bytes, like the sweep's own set: a contact's address
+        // carries the endpoint's id and a device record this crate's.
         let mut seen: HashSet<[u8; 32]> = HashSet::from([*own_device.as_bytes()]);
         let mut contacts = Vec::new();
         for node in nodes {

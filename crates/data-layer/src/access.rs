@@ -582,6 +582,18 @@ impl AccessBook {
             .cloned())
     }
 
+    /// The two metadata replicas of the connection with `peer`, if one is
+    /// hosted: where the grants that bound what flows between these two
+    /// identities are written and where they arrive.
+    pub(crate) fn connection_stores(
+        &self,
+        peer: PdnId,
+    ) -> Result<Option<(NamespaceId, NamespaceId)>> {
+        Ok(self
+            .connection_with_peer(peer)?
+            .map(|connection| (connection.own.id(), connection.peer_doc.id())))
+    }
+
     fn connection_with_peer(&self, peer: PdnId) -> Result<Option<HostedConnection>> {
         Ok(self
             .connections

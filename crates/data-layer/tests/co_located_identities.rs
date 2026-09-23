@@ -375,6 +375,158 @@ async fn the_periodic_pass_catches_up_a_co_located_pair_and_leaves_a_quiet_one_a
     Ok(())
 }
 
+/// A grant widened while nothing is written reaches the co-located
+/// audience: the claim it newly covers arrives although neither replica
+/// changed between the two grants. What decides whether anything is owed
+/// is the grant, and it lives in the connection stores — comparing the two
+/// replicas cannot see it change, and comparing their author heads cannot
+/// even see them differ here, since the audience holds the issuer's latest
+/// entry and lacks only an earlier one.
+///
+/// Denied: before the widening the withheld claim stays absent over
+/// several passes, which is also what makes its arrival afterwards the
+/// widening's doing.
+///
+/// The scenario pins the product's behaviour, not the pass's decision: a
+/// replica whose recorded peers name this node is dialed in process on
+/// every interval whatever the pass decides, so with that dial in place
+/// the entry arrives either way and no assertion here separates the two.
+/// The session count is per namespace all the same, because publishing a
+/// grant writes into the pair's connection stores and a total would move
+/// on their reconciliation alone.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, both grants and both waits in one place
+async fn a_grant_widened_without_a_write_reaches_the_co_located_audience() -> Result<()> {
+    let node = spawn_node().await?;
+    let _work_dir = host_identity(&node, ids::ALICE_AT_WORK).await?;
+    let _leisure_dir = host_identity(&node, ids::ALICE_AT_LEISURE).await?;
+
+    node.create_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
+        .await?;
+    let author = node.default_author(ids::ALICE_AT_WORK)?;
+    let granted_path = EntryPath::new(GRANTED)?;
+    let withheld_path = EntryPath::new(WITHHELD)?;
+
+    // The withheld entry first: the audience ends up holding the issuer's
+    // latest entry and lacking an earlier one, which is the arrangement in
+    // which author heads of the two replicas are equal while their
+    // contents are not.
+    node.write(
+        ids::ALICE_AT_WORK,
+        ids::ALICE_AT_WORK,
+        author,
+        &withheld_path,
+        b"the diary",
+    )
+    .await?;
+    node.write(
+        ids::ALICE_AT_WORK,
+        ids::ALICE_AT_WORK,
+        author,
+        &granted_path,
+        b"alice@work.example",
+    )
+    .await?;
+
+    let pair = connect_co_located(&node, ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE).await?;
+    let ticket = node
+        .share_ticket(
+            ids::ALICE_AT_WORK,
+            ids::ALICE_AT_WORK,
+            ShareMode::Read,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    node.import_namespace_scoped(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, ticket.clone())
+        .await?;
+    node.set_namespace_contacts(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, Vec::new())?;
+
+    let granted_claim = GrantedClaim {
+        claim: claim_id_of(&ids::ALICE_AT_WORK, &granted_path),
+        write: false,
+    };
+    pair.left_own
+        .publish_grant(
+            &ReadGrant {
+                issuer: ids::ALICE_AT_WORK,
+                audience: ids::ALICE_AT_LEISURE,
+                claims: NonEmpty::new(granted_claim),
+            },
+            &ticket,
+        )
+        .await?;
+    assert!(
+        eventually(|| async {
+            Ok(node
+                .read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &granted_path)
+                .await?
+                .as_deref()
+                == Some(b"alice@work.example".as_ref()))
+        })
+        .await?,
+        "the pass did not deliver the granted claim"
+    );
+
+    // Denied, and the sentinel: the withheld claim is absent over several
+    // passes, so its arrival below cannot be the first grant's doing.
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert_eq!(
+        node.read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &withheld_path)
+            .await?,
+        None,
+        "the withheld claim arrived under a grant that does not cover it"
+    );
+
+    // Quiet: nothing is written and no grant moves, so the pass opens
+    // nothing — the reading it remembers is the one it took.
+    let namespace = ticket.capability.id();
+    let quiet = node.co_located_pass_sessions_of(namespace);
+    tokio::time::sleep(RECONCILE * 3).await;
+    assert_eq!(
+        node.co_located_pass_sessions_of(namespace),
+        quiet,
+        "a pass over a pair where nothing moved opened a session"
+    );
+
+    // The widening alone: not one entry is written into the namespace
+    // after it, on either side.
+    pair.left_own
+        .publish_grant(
+            &ReadGrant {
+                issuer: ids::ALICE_AT_WORK,
+                audience: ids::ALICE_AT_LEISURE,
+                claims: {
+                    let mut claims = NonEmpty::new(granted_claim);
+                    claims.push(GrantedClaim {
+                        claim: claim_id_of(&ids::ALICE_AT_WORK, &withheld_path),
+                        write: false,
+                    });
+                    claims
+                },
+            },
+            &ticket,
+        )
+        .await?;
+    assert!(
+        eventually(|| async { Ok(node.co_located_pass_sessions_of(namespace) > quiet) }).await?,
+        "the pass did not notice the grant it judges the pair by"
+    );
+    assert!(
+        eventually(|| async {
+            Ok(node
+                .read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &withheld_path)
+                .await?
+                .as_deref()
+                == Some(b"the diary".as_ref()))
+        })
+        .await?,
+        "the widened grant did not reach the co-located audience"
+    );
+
+    node.shutdown().await?;
+    Ok(())
+}
+
 /// A write reaches a co-located holder of the namespace within one
 /// reconcile interval, which is the announcement's doing: the write is
 /// made right after a pass has demonstrably run, so the next one is a

@@ -238,6 +238,9 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<Option<NonZeroU64>>>,
     },
+    Writes {
+        reply: oneshot::Sender<Result<u64>>,
+    },
     AuthorHeads {
         #[debug("reply")]
         reply: oneshot::Sender<Result<AuthorHeads>>,
@@ -640,9 +643,22 @@ impl SyncHandle {
         rx.await?
     }
 
-    /// The latest timestamp per author in `namespace` — the cheap
-    /// "are we in sync?" digest, read here so a caller can compare two
-    /// replicas it holds without opening a session between them.
+    /// Per author, the timestamp of the entry this replica inserted last —
+    /// the table is overwritten by every insert, so the value moves
+    /// backwards when an older entry arrives. Equality of two replicas'
+    /// heads therefore means neither equal contents nor equal progress; it
+    /// answers "there may be something new", the question reconciliation
+    /// asks, and never "we are in sync".
+    /// How many writes this replica has taken since the store opened —
+    /// what tells a caller that a replica changed without reading it. Its
+    /// own earlier reading is the only thing it compares against.
+    pub async fn writes(&self, namespace: NamespaceId) -> Result<u64> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::Writes { reply };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
     pub async fn author_heads(&self, namespace: NamespaceId) -> Result<AuthorHeads> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::AuthorHeads { reply };
@@ -1240,6 +1256,9 @@ impl Actor {
             ReplicaAction::HasNewsForUs { heads, reply } => {
                 let res = self.store.has_news_for_us(namespace, &heads);
                 send_reply(reply, res)
+            }
+            ReplicaAction::Writes { reply } => {
+                send_reply(reply, Ok(self.store.writes_of(namespace)))
             }
             ReplicaAction::AuthorHeads { reply } => {
                 let res = self
