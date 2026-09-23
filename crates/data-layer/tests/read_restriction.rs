@@ -1175,7 +1175,8 @@ async fn grant_one_claim_to(
 /// from the issuer or over the in-process path from its co-located
 /// sibling, which holds a replica of the same namespace — nor the claim
 /// withheld from both. A second wave on each granted claim proves both
-/// sessions live and orders the absences.
+/// sessions live, and three passes after it order the absences behind the
+/// co-located sessions.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, both audiences and both denials in one place
 async fn two_co_located_audiences_of_one_issuer_receive_each_its_own_claim() -> Result<()> {
@@ -1263,6 +1264,9 @@ async fn two_co_located_audiences_of_one_issuer_receive_each_its_own_claim() -> 
             "the second wave did not cross for {audience}"
         );
     }
+    // The siblings meet on the co-located pass alone, which dials each pair
+    // one way on its own interval: without these the absences can precede it.
+    tokio::time::sleep(RECONCILE * 3).await;
 
     // Denied: the other audience's claim, and the one withheld from both
     // — neither the payload nor the existence.
