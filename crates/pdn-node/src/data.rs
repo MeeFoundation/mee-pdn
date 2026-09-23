@@ -2,6 +2,8 @@
 //! the out-of-band ticket handover.
 
 use anyhow::Result;
+#[cfg(feature = "test-util")]
+use data_layer::NamespaceId;
 use data_layer::{AddrInfoOptions, DocTicket, GrantRead, ShareMode};
 #[cfg(feature = "test-util")]
 use pdn_types::NodeId;
@@ -114,6 +116,13 @@ impl<'rt> RuntimeDataService<'rt> {
             .iter()
             .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
             .collect())
+    }
+
+    /// Whether `identity` still holds `namespace`, stored or reconciled.
+    #[cfg(feature = "test-util")]
+    pub async fn holds_replica(&self, identity: PdnId, namespace: NamespaceId) -> Result<bool> {
+        let state = self.runtime.state.lock().await;
+        state.node.holds_replica(identity, namespace).await
     }
 
     /// Forget `issuer`'s replica out from under the grant binder's memo — a

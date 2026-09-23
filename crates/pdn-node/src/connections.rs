@@ -453,21 +453,24 @@ async fn bind_one_grant(
     // import holds one more handle and the last unbind must find exactly
     // one; an issuer resolving to nothing is re-imported even when the memo
     // matches.
-    let memo_current = state.bound_grants.get(&bound) == Some(&namespace);
+    let memo = state.bound_grants.get(&bound).copied();
     let registered = state.node.data_namespace_of(identity, issuer)?;
     if registered == Some(namespace) {
-        if !memo_current {
+        if memo != Some(namespace) {
             state.bound_grants.insert(bound, namespace);
         }
-    } else if !memo_current || registered.is_none() {
+    } else if registered.is_none() || registered == memo {
+        // A grant moved off the replica this binder imported: the import
+        // forgets that replica.
         let _import = state
             .node
             .import_namespace_scoped(identity, issuer, ticket)
             .await?;
         state.bound_grants.insert(bound, namespace);
     } else {
-        // An import that arrived another way owns the replica; re-importing
-        // would have two owners displace each other sweep by sweep.
+        // An import that arrived another way owns the replica: importing
+        // over it would forget it, and two owners would displace each other
+        // sweep by sweep.
         tracing::debug!(%issuer, "grant defers to a namespace imported another way");
     }
     // Refreshed even when the binding is unchanged: the device set moves

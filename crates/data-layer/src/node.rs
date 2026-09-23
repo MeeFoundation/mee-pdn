@@ -717,7 +717,9 @@ impl SyncNode {
         ticket: DocTicket,
     ) -> Result<NamespaceImport> {
         let stack = self.require(identity)?;
-        Self::guard_data_import(&stack, issuer, ticket.capability.id())?;
+        let namespace = ticket.capability.id();
+        Self::guard_data_import(&stack, issuer, namespace)?;
+        let rebound = Self::rebound_from(&stack, issuer, namespace)?;
         let contacts = ticket.contacts();
         let doc = stack.api.import_namespace(ticket.capability).await?;
         stack.track(
@@ -726,6 +728,9 @@ impl SyncNode {
             SyncStrategy::Swarm,
             crate::access::identity_of(issuer),
         )?;
+        if let Some(previous) = rebound {
+            self.forget_rebound(&stack, identity, previous).await;
+        }
         let _displaced =
             stack
                 .registry
@@ -779,7 +784,9 @@ impl SyncNode {
     ) -> Result<NamespaceImport> {
         let stack = self.require(identity)?;
         let contacts = ticket.contacts();
-        Self::guard_data_import(&stack, issuer, ticket.capability.id())?;
+        let namespace = ticket.capability.id();
+        Self::guard_data_import(&stack, issuer, namespace)?;
+        let rebound = Self::rebound_from(&stack, issuer, namespace)?;
         // The capability only — no `start_sync`, which would join the
         // swarm. The binding registers before the first sync, so even that
         // session is judged under the grantee rules.
@@ -790,6 +797,9 @@ impl SyncNode {
             SyncStrategy::ContactsOnly,
             crate::access::identity_of(issuer),
         )?;
+        if let Some(previous) = rebound {
+            self.forget_rebound(&stack, identity, previous).await;
+        }
         let _displaced =
             stack
                 .registry
@@ -1028,6 +1038,33 @@ impl SyncNode {
             }
         }
         Ok(())
+    }
+
+    /// The replica `issuer` resolves to when an import onto `namespace`
+    /// binds it elsewhere.
+    fn rebound_from(
+        stack: &HostedStack,
+        issuer: PdnId,
+        namespace: NamespaceId,
+    ) -> Result<Option<NamespaceId>> {
+        Ok(stack
+            .registry
+            .data_doc(issuer)?
+            .map(|doc| doc.id())
+            .filter(|bound| *bound != namespace))
+    }
+
+    /// Drop the replica an import rebinds its issuer away from, while that
+    /// binding still stands — the order `forget_namespace` keeps — so an
+    /// issuer keeps one data binding and nothing outlives it. The import
+    /// goes on whatever this answers: a replica that would not drop is
+    /// already off the reconcile pass.
+    async fn forget_rebound(&self, stack: &HostedStack, identity: PdnId, namespace: NamespaceId) {
+        if let Err(err) = self.forget_doc(identity, namespace).await {
+            tracing::warn!(%namespace, "a replica its issuer was rebound away from stayed in the store: {err:#}");
+        }
+        let _disarmed = stack.access.disarm_retractions(namespace);
+        self.retraction.untrack_namespace(identity, namespace);
     }
 
     /// Leave exactly the state that preceded the import.
@@ -1444,6 +1481,16 @@ impl SyncNode {
             .tracked(namespace)?
             .map(|tracked| tracked.contacts)
             .unwrap_or_default())
+    }
+
+    /// Whether `identity` still holds `namespace` in its replica store or
+    /// under the reconcile pass; an identity not hosted holds nothing.
+    #[cfg(feature = "test-util")]
+    pub async fn holds_replica(&self, identity: PdnId, namespace: NamespaceId) -> Result<bool> {
+        let Some(stack) = self.stack(identity)? else {
+            return Ok(false);
+        };
+        Ok(stack.tracked(namespace)?.is_some() || holds_namespace(&stack.api, namespace).await?)
     }
 
     /// The identities this node hosts.

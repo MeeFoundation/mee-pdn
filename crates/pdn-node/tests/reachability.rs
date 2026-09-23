@@ -11,7 +11,8 @@ use std::{cell::RefCell, time::Duration};
 
 use anyhow::{ensure, Context, Result};
 use data_layer::{
-    own_ticket_kind, peer_ticket_kind, ConnectionMetadataStore, PrivateMetadataStore, SyncNode,
+    own_ticket_kind, peer_ticket_kind, ConnectionMetadataStore, PrivateMetadataStore, ReadGrant,
+    SyncNode,
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, Runtime, ShareMode,
@@ -75,15 +76,29 @@ async fn withdraw_device_toward(
     peer: PdnId,
     device: NodeId,
 ) -> Result<()> {
+    own_store_toward(node, identity, directory, peer)
+        .await?
+        .withdraw_device(device)
+        .await
+}
+
+/// The issuer's own store toward `peer`, opened on a probe from the
+/// directory's tickets.
+async fn own_store_toward(
+    node: &SyncNode,
+    identity: PdnId,
+    directory: &PrivateMetadataStore,
+    peer: PdnId,
+) -> Result<ConnectionMetadataStore> {
     let own = ticket_patiently(directory, &own_ticket_kind(&peer)).await?;
     let counterpart = ticket_patiently(directory, &peer_ticket_kind(&peer)).await?;
     let own_store = ConnectionMetadataStore::import(node, identity, own).await?;
     let peer_store = ConnectionMetadataStore::import(node, identity, counterpart).await?;
     // Registered as a device of the identity registers a pair it opens
     // from its directory: a replica no registration covers is judged by
-    // nothing, so the tombstone would never leave this node (ADR-0013).
+    // nothing, so a write would never leave this node (ADR-0013).
     node.host_connection(identity, peer, &own_store, &peer_store)?;
-    own_store.withdraw_device(device).await
+    Ok(own_store)
 }
 
 /// Poll `directory` until the ticket of `kind` is readable, handing back
@@ -982,6 +997,127 @@ async fn a_forgotten_replica_reimports_on_the_next_sweep() -> Result<()> {
     assert!(
         claim_arrives(&rt_bob, bob, alice, &email, b"v1").await?,
         "the memoized binding must not skip the re-import of a forgotten replica"
+    );
+
+    rt_phone.shutdown().await?;
+    rt_bob.shutdown().await?;
+    Ok(())
+}
+
+/// A grant republished onto a fresh store replaces the audience's replica
+/// instead of adding one: after the sweep that rebinds, the replica the
+/// grant left is neither stored nor reconciled. The republication is
+/// written raw from a linked probe as this test's subject: `publish_grant`
+/// names only the issuer's own namespace, so only a modified device of the
+/// issuer moves a grant to another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_republished_onto_a_fresh_store_replaces_the_replica() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_bob = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
+    let email = EntryPath::new("contact/email")?;
+    let claims = common::claims_on(alice, &email, false);
+    granted_patiently(&rt_phone, alice, &rt_bob, bob, alice, claims.clone()).await?;
+    let previous = rt_phone
+        .data()
+        .share(alice, alice, ShareMode::Read)
+        .await?
+        .capability
+        .id();
+    assert!(
+        eventually(|| async { rt_bob.data().holds_replica(bob, previous).await }).await?,
+        "the grant was never imported, so its replica's absence would prove nothing"
+    );
+
+    // Another identity's namespace, so the move displaces nothing of Alice's.
+    let elsewhere = rt_phone.identity().create().await?;
+    let fresh = rt_phone
+        .data()
+        .share(elsewhere, elsewhere, ShareMode::Read)
+        .await?;
+    let moved_to = fresh.capability.id();
+    let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
+    own_store_toward(&probe_node, alice, &probe_dir, bob)
+        .await?
+        .publish_grant(
+            &ReadGrant {
+                issuer: alice,
+                audience: bob,
+                claims,
+            },
+            &fresh,
+        )
+        .await?;
+
+    // The replica the grant moved to orders the absence below: the sweep
+    // that imports it is the one that rebinds.
+    assert!(
+        eventually(|| async { rt_bob.data().holds_replica(bob, moved_to).await }).await?,
+        "the republished grant never rebound the audience"
+    );
+    assert!(
+        !rt_bob.data().holds_replica(bob, previous).await?,
+        "the replica the grant moved away from is still stored or reconciled"
+    );
+
+    probe_node.shutdown().await?;
+    rt_phone.shutdown().await?;
+    rt_bob.shutdown().await?;
+    Ok(())
+}
+
+/// A grant waits while a namespace imported out of band holds its issuer:
+/// the sweep neither imports the granted namespace nor forgets the one
+/// imported. The out-of-band ticket names another identity's namespace
+/// under the grant's issuer as this test's subject, so the two differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_waits_while_an_out_of_band_import_holds_its_issuer() -> Result<()> {
+    let rt_phone = spawn_runtime().await?;
+    let rt_bob = spawn_runtime().await?;
+
+    let alice = rt_phone.identity().create().await?;
+    let bob = rt_bob.identity().create().await?;
+    let invite = rt_phone.connections().invite(alice, None).await?;
+    establish_patiently(&rt_bob, bob, &rt_phone, alice, invite).await?;
+
+    let elsewhere = rt_phone.identity().create().await?;
+    let out_of_band = rt_phone
+        .data()
+        .share(elsewhere, elsewhere, ShareMode::Read)
+        .await?;
+    let imported = out_of_band.capability.id();
+    rt_bob.data().import_scoped(bob, alice, out_of_band).await?;
+
+    let email = EntryPath::new("contact/email")?;
+    granted_patiently(
+        &rt_phone,
+        alice,
+        &rt_bob,
+        bob,
+        alice,
+        common::claims_on(alice, &email, false),
+    )
+    .await?;
+    let granted = rt_phone
+        .data()
+        .share(alice, alice, ShareMode::Read)
+        .await?
+        .capability
+        .id();
+    // A sweep that reads the grant orders the assertions below.
+    rt_bob.connections().sweep_pair_now(bob, alice).await?;
+
+    assert!(
+        rt_bob.data().holds_replica(bob, imported).await?,
+        "the grant's sweep forgot a namespace imported out of band"
+    );
+    assert!(
+        !rt_bob.data().holds_replica(bob, granted).await?,
+        "the grant was imported over a namespace imported out of band"
     );
 
     rt_phone.shutdown().await?;

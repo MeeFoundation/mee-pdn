@@ -5,7 +5,8 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, AuthorId, DocTicket, PrivateMetadataStore, ShareMode, SyncNode, UnknownIssuer,
+    AddrInfoOptions, AuthorId, DocTicket, NamespaceImport, PrivateMetadataStore, ShareMode,
+    SyncNode, UnknownIssuer,
 };
 use pdn_types::{EntryPath, PdnId};
 use test_utils::{
@@ -276,5 +277,63 @@ async fn forgetting_a_namespace_unregisters_its_issuer() -> Result<()> {
 
     phone.shutdown().await?;
     laptop.shutdown().await?;
+    Ok(())
+}
+
+/// The grantee import when `scoped`, the device-replication one otherwise.
+async fn import_under(
+    node: &SyncNode,
+    holder: PdnId,
+    issuer: PdnId,
+    ticket: DocTicket,
+    scoped: bool,
+) -> Result<NamespaceImport> {
+    if scoped {
+        node.import_namespace_scoped(holder, issuer, ticket).await
+    } else {
+        node.import_namespace(holder, issuer, ticket).await
+    }
+}
+
+/// An import that moves an issuer onto another replica forgets the one it
+/// replaced, on the device-replication and the grantee path alike: the
+/// issuer resolves to the new replica, and the old one is neither held nor
+/// reconciled. Both namespaces belong to identities of the same node, so
+/// the registration under test needs no session.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_onto_another_replica_forgets_the_one_it_replaced() -> Result<()> {
+    let node = memory_node().await?;
+    for identity in [ids::ALICE, ids::BOB, ids::CAROL, ids::DAVE] {
+        node.provision_identity(identity).await?;
+    }
+    let mut namespaces = Vec::new();
+    for owner in [ids::CAROL, ids::DAVE] {
+        node.create_namespace(owner, owner).await?;
+        namespaces.push(
+            node.share_ticket(owner, owner, ShareMode::Read, AddrInfoOptions::Addresses)
+                .await?,
+        );
+    }
+    let [first, second] = namespaces.as_slice() else {
+        anyhow::bail!("two namespaces were minted");
+    };
+
+    for (holder, scoped) in [(ids::ALICE, false), (ids::BOB, true)] {
+        let _first = import_under(&node, holder, ids::CAROL, first.clone(), scoped).await?;
+        assert!(node.holds_replica(holder, first.capability.id()).await?);
+        let _second = import_under(&node, holder, ids::CAROL, second.clone(), scoped).await?;
+
+        assert_eq!(
+            node.data_namespace_of(holder, ids::CAROL)?,
+            Some(second.capability.id()),
+            "the issuer must resolve to the replica the import moved it to (scoped: {scoped})"
+        );
+        assert!(
+            !node.holds_replica(holder, first.capability.id()).await?,
+            "the replica the import moved the issuer away from is still held (scoped: {scoped})"
+        );
+    }
+
+    node.shutdown().await?;
     Ok(())
 }
