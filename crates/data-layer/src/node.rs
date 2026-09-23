@@ -363,6 +363,43 @@ impl HostedStack {
         Ok(())
     }
 
+    /// Add `contacts` to a tracked store's, keeping those it has: one naming
+    /// an endpoint and identity already listed is left as it was.
+    fn add_contacts(&self, namespace: NamespaceId, contacts: Vec<Contact>) -> Result<()> {
+        let mut docs = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+        let Some(entry) = docs.get_mut(&namespace) else {
+            return Ok(());
+        };
+        for contact in contacts {
+            let listed = entry.contacts.iter().any(|known| {
+                known.addr.id == contact.addr.id && known.identity == contact.identity
+            });
+            if !listed {
+                entry.contacts.push(contact);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the sync of a device-shared store this identity just armed,
+    /// with its tracked contacts; detached, because arming is synchronous
+    /// and a failed start is retried by the next pass anyway.
+    fn start_armed(&self, namespace: NamespaceId) -> Result<()> {
+        let Some(tracked) = self.tracked(namespace)? else {
+            return Ok(());
+        };
+        let _detached = tokio::spawn(async move {
+            let _ = tracked
+                .doc
+                .start_sync(tracked.contacts, tracked.default_identity)
+                .await;
+        });
+        Ok(())
+    }
+
     fn tracked(&self, namespace: NamespaceId) -> Result<Option<TrackedDoc>> {
         Ok(self
             .tracked_docs
@@ -674,11 +711,12 @@ impl SyncNode {
 
     /// Arm `identity`'s directory for session classification: its device
     /// records decide who is one of its devices, and its data namespaces
-    /// serve fail-closed from here on.
+    /// serve fail-closed from here on. The directory's sync starts here,
+    /// after the arming, so its first session is one the book can judge.
     pub fn host_identity(&self, identity: PdnId, directory: &PrivateMetadataStore) -> Result<()> {
-        self.require(identity)?
-            .access
-            .arm_directory(directory.doc_handle())
+        let stack = self.require(identity)?;
+        stack.access.arm_directory(directory.doc_handle())?;
+        stack.start_armed(directory.namespace())
     }
 
     /// The rollback counterpart of [`host_identity`](Self::host_identity):
@@ -715,11 +753,19 @@ impl SyncNode {
         own: &ConnectionMetadataStore,
         peer_store: &ConnectionMetadataStore,
     ) -> Result<()> {
-        self.require(identity)?.access.host_connection(
-            peer,
-            own.doc_handle(),
-            peer_store.doc_handle(),
-        )
+        let stack = self.require(identity)?;
+        stack
+            .access
+            .host_connection(peer, own.doc_handle(), peer_store.doc_handle())?;
+        // The devices that hold one half hold the other, under the same
+        // identity each: pointed at them too, `own` is dialed from here, so
+        // the side that arms second reaches the first over both halves.
+        if let Some(peer_half) = stack.tracked(peer_store.namespace())? {
+            stack.add_contacts(own.namespace(), peer_half.contacts)?;
+        }
+        // After the arming, as `host_identity` starts the directory's.
+        stack.start_armed(own.namespace())?;
+        stack.start_armed(peer_store.namespace())
     }
 
     /// Create a fresh doc and register it as `issuer`'s data namespace,
@@ -1339,7 +1385,11 @@ impl SyncNode {
         Self::guard_shared_import(&stack, ticket.capability.id())?;
         let contacts = ticket.contacts();
         let minted_by = ticket.identity;
-        let doc = stack.api.import(ticket).await?;
+        // The capability only: a session started before the store is armed
+        // is refused by this identity's own book, and nothing retries it
+        // before the next pass. `host_identity` or `host_connection` starts
+        // the sync once the store is armed.
+        let doc = stack.api.import_namespace(ticket.capability).await?;
         stack.track(&doc, contacts, SyncStrategy::Swarm, minted_by)?;
         Ok(doc)
     }

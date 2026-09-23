@@ -984,3 +984,50 @@ async fn two_identities_of_one_node_establish_inside_the_process() -> Result<()>
     rt.shutdown().await?;
     Ok(())
 }
+
+/// Two identities of one node that establish a connection read each
+/// other's published devices from the first sessions of the stores the
+/// establishment imported, well inside one reconcile interval. They share
+/// no gossip, so the interval is set far past the budget and nothing but
+/// those first sessions can bring the records in time. Ten pairs, because
+/// which side arms first is the scheduler's choice, and a first session
+/// lost to the side that armed first shows only in some of the orders.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_co_located_establishment_reads_the_counterpartys_devices_at_once() -> Result<()> {
+    const INTERVAL: Duration = Duration::from_secs(120);
+    const BUDGET: Duration = Duration::from_secs(10);
+    const PAIRS: usize = 10;
+
+    let rt = Runtime::spawn(SpawnOptions {
+        reconcile_interval: INTERVAL,
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let device = rt.node_id();
+    for _ in 0..PAIRS {
+        let alice = rt.identity().create().await?;
+        let bob = rt.identity().create().await?;
+        let invite = rt.connections().invite(alice, None).await?;
+        rt.connections().establish(bob, invite).await?;
+
+        let deadline = std::time::Instant::now() + BUDGET;
+        for (identity, peer) in [(bob, alice), (alice, bob)] {
+            while !rt
+                .connections()
+                .published_devices_of(identity, peer)
+                .await?
+                .contains(&device)
+            {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "{identity} never read {peer}'s devices before the next reconcile pass"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    rt.shutdown().await?;
+    Ok(())
+}

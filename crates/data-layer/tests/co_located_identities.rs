@@ -698,3 +698,58 @@ async fn a_write_reaches_a_co_located_identity_before_the_next_pass() -> Result<
     node.shutdown().await?;
     Ok(())
 }
+
+/// Both halves of a co-located pair converge from the sessions their
+/// arming starts, whichever side arms first: the side that arms second
+/// dials the first over its own half as well as its peer half. Armed right
+/// then left, the right side's early dial toward the left's own half
+/// meets a left side not yet armed and is refused; the pause lets it land
+/// first. The reconcile interval is set far past the wait, so a pass
+/// cannot bring what those sessions do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_halves_of_a_co_located_pair_converge_whichever_side_arms_first() -> Result<()> {
+    const INTERVAL: Duration = Duration::from_secs(120);
+    const BUDGET: Duration = Duration::from_secs(10);
+
+    let node = SyncNode::spawn(SpawnOptions {
+        reconcile_interval: INTERVAL,
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let (left, right) = (ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE);
+    let _left_dir = host_identity(&node, left).await?;
+    let _right_dir = host_identity(&node, right).await?;
+    let left_own = ConnectionMetadataStore::create(&node, left).await?;
+    let right_own = ConnectionMetadataStore::create(&node, right).await?;
+    left_own.publish_device(node.node_id()).await?;
+    right_own.publish_device(node.node_id()).await?;
+    let left_read = left_own
+        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let right_read = right_own
+        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let right_as_left_sees = ConnectionMetadataStore::import(&node, left, right_read).await?;
+    let left_as_right_sees = ConnectionMetadataStore::import(&node, right, left_read).await?;
+
+    node.host_connection(right, left, &right_own, &left_as_right_sees)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node.host_connection(left, right, &left_own, &right_as_left_sees)?;
+
+    let deadline = std::time::Instant::now() + BUDGET;
+    for (reader, copy) in [
+        ("the right identity", &left_as_right_sees),
+        ("the left identity", &right_as_left_sees),
+    ] {
+        while !copy.published_devices().await?.contains(&node.node_id()) {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "{reader} never read the other side's devices before the next pass"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    node.shutdown().await?;
+    Ok(())
+}
