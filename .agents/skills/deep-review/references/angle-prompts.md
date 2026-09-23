@@ -50,11 +50,11 @@ Your angle is [ANGLE KEY]. [ANGLE PROMPT]
 
 Return at most 5 findings, each with a mechanism you traced through the sources yourself. Do not return a guess with no line of code behind it. Five is a ceiling, not a target: return a finding only if you would advise a human to spend an hour of their working day on it, and return two rather than pad to five. What clears the bar — a wrong answer under some input, data that crosses where it must not, a resource that grows without bound, an invariant a future edit will break unknowingly, a test that would pass with the mechanism removed. What does not, unless it causes one of those — naming, phrasing, a comment, an import, a shape you would have written differently.
 
-For each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. In `evidence`, say what you actually checked it with — reading the code, running a named test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). Then a recommendation: which option and why, or — where the fork needs a human decision — exactly which question is in front of them.
+For each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: `product` — a host calling the public surface of pdn-node triggers it under some operating condition; `network` — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; `internal` — neither; `n/a` — not a defect in behaviour at all: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path behind the word: the public operation and the condition, the input a modified node sends, or why neither reaches it. In `evidence`, say what you actually checked it with — reading the code, running a named test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). Then a recommendation: which option and why, or — where the fork needs a human decision — exactly which question is in front of them.
 
 Write your answer to [SCRATCH]/findings-[ANGLE KEY].json before you return it, as one JSON object, and return the same JSON as your final answer:
 
-{"findings": [{"title": str, "file": str, "line": str, "severity": "critical"|"medium"|"structural"|"cleanup", "origin": "new"|"pre-existing", "symptom": str, "cause": str, "victim": str, "evidence": str, "fixes": [{"name": str, "how": str, "product": str, "architecture": str}], "recommendation": str}]}
+{"findings": [{"title": str, "file": str, "line": str, "severity": "critical"|"medium"|"structural"|"cleanup", "reach": "product"|"network"|"internal"|"n/a", "origin": "new"|"pre-existing", "symptom": str, "cause": str, "victim": str, "evidence": str, "fixes": [{"name": str, "how": str, "product": str, "architecture": str}], "recommendation": str}]}
 
 The file is what survives a run that is cut before you return, so write it first. An angle with nothing to report writes `{"findings": []}` — that is a result, not a failure.
 ```
@@ -93,14 +93,14 @@ Map of the change:
 
 You merge and rank. You do NOT judge: whether a mechanism is real is decided by verification after you, so never drop a candidate for being weak, wrong, or unlikely — only ever as a duplicate of another. A candidate you cannot confidently merge stays on its own. Every index must appear in exactly one group.
 
-For each group return: the member indices, the index of the member whose write-up is the fullest and most accurate (its prose is kept verbatim, so choose it on quality of the mechanism traced), one merged title, and the highest severity among the members.
+For each group return: the member indices, the index of the member whose write-up is the fullest and most accurate (its prose is kept verbatim, so choose it on quality of the mechanism traced), one merged title, the highest severity among the members, and the most obliging reach among them — `network`, then `product`, then `internal`, then `n/a`: a fix one member obliges is obliged for the mechanism.
 
 Candidates:
-[DIGEST: one line per candidate — index, angle, severity, file:line, title, symptom]
+[DIGEST: one line per candidate — index, angle, severity, reach, file:line, title, symptom]
 
 Write your answer to [SCRATCH]/triage.json and return the same JSON:
 
-{"groups": [{"members": [int], "primary": int, "title": str, "severity": "critical"|"medium"|"structural"|"cleanup"}]}
+{"groups": [{"members": [int], "primary": int, "title": str, "severity": "critical"|"medium"|"structural"|"cleanup", "reach": "product"|"network"|"internal"|"n/a"}]}
 ```
 
 ## Verify — one agent per vote
@@ -114,12 +114,13 @@ Title: [TITLE]
 Place: [FILE]:[LINE]
 Symptom: [SYMPTOM]
 Cause: [CAUSE]
+Reach: [REACH]
 
-Open the sources and check the mechanism line by line. Check whether it is already caught by something above or below in the stack, whether the path is reachable at all, and whether a neighbouring edit in the same diff already changed the behaviour. Running one named test is allowed and expected where it decides the verdict; so are read-only build queries. If the finding is real but its wording overreaches or misattributes, return the sharpened wording in `corrections` — narrowing a finding is doing the job, not softening it. This is pass [K].
+Open the sources and check the mechanism line by line. Check whether it is already caught by something above or below in the stack, whether the path can execute at all — a path no code can take is REFUTED — and whether a neighbouring edit in the same diff already changed the behaviour. Then check the reach against mia-docs/openspec/specs/code-practices/defect-reachability.md: whether a host can trigger it through the public surface of pdn-node, or a modified node through what it sends. A mechanism that holds but that neither reaches is not refuted: return `reach` `internal`. A finding that is no defect in behaviour is `n/a`. Return `reach` whenever the claimed one is wrong. Running one named test is allowed and expected where it decides the verdict; so are read-only build queries. If the finding is real but its wording overreaches or misattributes, return the sharpened wording in `corrections` — narrowing a finding is doing the job, not softening it. This is pass [K].
 
 Write your answer to [SCRATCH]/verdicts/[MECHANISM SLUG]-[K].json and return the same JSON. Repeat the Title line into the file exactly as you received it — that is the only thing that ties your verdict back to its finding:
 
-{"title": str, "state": "CONFIRMED"|"PLAUSIBLE"|"REFUTED", "reason": str, "lines": str, "corrections": str}
+{"title": str, "state": "CONFIRMED"|"PLAUSIBLE"|"REFUTED", "reason": str, "lines": str, "corrections": str, "reach": "product"|"network"|"internal"|"n/a"}
 ```
 
 `CONFIRMED` — the mechanism holds end to end. `PLAUSIBLE` — it holds, but the trigger depends on conditions the verifier could not check. `REFUTED` — it does not hold. A verifier changes no file in the working tree.

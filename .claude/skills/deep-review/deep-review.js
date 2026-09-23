@@ -32,7 +32,7 @@ const RANK = { critical: 0, medium: 1, structural: 2, cleanup: 3 }
 const VOTES = { critical: 5, medium: 3, structural: 3, cleanup: 0 }
 // A group's reach is its most obliging member's: a fix one member obliges
 // is obliged for the mechanism.
-const REACH = { network: 0, product: 1, internal: 2 }
+const REACH = { network: 0, product: 1, internal: 2, 'n/a': 3 }
 
 // The nine angles that read the change whole, one agent each.
 const WHOLE = [
@@ -116,7 +116,7 @@ const CLAIM_SCHEMA = {
           file: { type: 'string' },
           line: { type: 'string' },
           severity: { type: 'string', enum: ['critical', 'medium', 'structural', 'cleanup'] },
-          reach: { type: 'string', enum: ['product', 'network', 'internal'] },
+          reach: { type: 'string', enum: ['product', 'network', 'internal', 'n/a'] },
           origin: { type: 'string', enum: ['new', 'pre-existing'] },
           symptom: { type: 'string' },
           cause: { type: 'string' },
@@ -158,7 +158,7 @@ const VERDICT_SCHEMA = {
     reason: { type: 'string' },
     lines: { type: 'string' },
     corrections: { type: 'string' },
-    reach: { type: 'string', enum: ['product', 'network', 'internal'] },
+    reach: { type: 'string', enum: ['product', 'network', 'internal', 'n/a'] },
   },
 }
 
@@ -182,7 +182,7 @@ phase('Search')
 const searched = await parallel(
   LENSES.map((lens) => () =>
     agent(
-      `${BASE}\n\nMap of the change:\n${map}\n\nYour angle is ${lens.key}. ${lens.prompt}\n\nReturn at most 5 findings, each with a mechanism you traced through the sources yourself. Do not return a guess with no line of code behind it. Five is a ceiling, not a target: return a finding only if you would advise a human to spend an hour of their working day on it, and return two rather than pad to five. What clears the bar — a wrong answer under some input, data that crosses where it must not, a resource that grows without bound, an invariant a future edit will break unknowingly, a test that would pass with the mechanism removed. What does not, unless it causes one of those — naming, phrasing, a comment, an import, a shape you would have written differently.\n\nFor each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: product — a host calling the public surface of pdn-node triggers it under some operating condition; network — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; internal — neither. The symptom names the path: the public operation and the condition, the input a modified node sends, or why neither reaches it. In evidence, say what you actually checked it with — reading the code, running a test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). Then a recommendation: which option and why, or — where the fork needs a human decision — exactly which question is in front of them.`,
+      `${BASE}\n\nMap of the change:\n${map}\n\nYour angle is ${lens.key}. ${lens.prompt}\n\nReturn at most 5 findings, each with a mechanism you traced through the sources yourself. Do not return a guess with no line of code behind it. Five is a ceiling, not a target: return a finding only if you would advise a human to spend an hour of their working day on it, and return two rather than pad to five. What clears the bar — a wrong answer under some input, data that crosses where it must not, a resource that grows without bound, an invariant a future edit will break unknowingly, a test that would pass with the mechanism removed. What does not, unless it causes one of those — naming, phrasing, a comment, an import, a shape you would have written differently.\n\nFor each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: product — a host calling the public surface of pdn-node triggers it under some operating condition; network — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; internal — neither; n/a — not a defect in behaviour at all: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path: the public operation and the condition, the input a modified node sends, or why neither reaches it. In evidence, say what you actually checked it with — reading the code, running a test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). Then a recommendation: which option and why, or — where the fork needs a human decision — exactly which question is in front of them.`,
       { label: `search:${lens.key}`, phase: 'Search', schema: CLAIM_SCHEMA, effort: lens.effort },
     ),
   ),
@@ -240,7 +240,7 @@ const results = await pipeline(
     return parallel(
       Array.from({ length: votes }, (_, i) => () =>
         agent(
-          `${BASE}\n\nTry to REFUTE this finding. When in doubt, answer REFUTED.\n\nTitle: ${f.title}\nPlace: ${f.file}:${f.line}\nSymptom: ${f.symptom}\nCause: ${f.cause}\nReach: ${f.reach}\n\nOpen the sources and check the mechanism line by line. Check whether it is already caught by something above or below in the stack, whether the path can execute at all — a path no code can take is REFUTED — and whether a neighbouring edit in the same diff already changed the behaviour. Then check the reach against mia-docs/openspec/specs/code-practices/defect-reachability.md: whether a host can trigger it through the public surface of pdn-node, or a modified node through what it sends. A mechanism that holds but that neither reaches is not refuted: return reach internal. Return reach whenever the claimed one is wrong. Running one named test is allowed and encouraged where it decides the verdict; so are read-only build queries (cargo tree, cargo metadata). If the finding is real but its wording overreaches or misattributes, return the sharpened wording in corrections — narrowing a finding is doing the job, not softening it. Pass ${i + 1}.`,
+          `${BASE}\n\nTry to REFUTE this finding. When in doubt, answer REFUTED.\n\nTitle: ${f.title}\nPlace: ${f.file}:${f.line}\nSymptom: ${f.symptom}\nCause: ${f.cause}\nReach: ${f.reach}\n\nOpen the sources and check the mechanism line by line. Check whether it is already caught by something above or below in the stack, whether the path can execute at all — a path no code can take is REFUTED — and whether a neighbouring edit in the same diff already changed the behaviour. Then check the reach against mia-docs/openspec/specs/code-practices/defect-reachability.md: whether a host can trigger it through the public surface of pdn-node, or a modified node through what it sends. A mechanism that holds but that neither reaches is not refuted: return reach internal. A finding that is no defect in behaviour — a rule violation, a spec promising more than intended code — is reach n/a. Return reach whenever the claimed one is wrong. Running one named test is allowed and encouraged where it decides the verdict; so are read-only build queries (cargo tree, cargo metadata). If the finding is real but its wording overreaches or misattributes, return the sharpened wording in corrections — narrowing a finding is doing the job, not softening it. Pass ${i + 1}.`,
           { label: `verify:${f.file}#${i + 1}`, phase: 'Verify', schema: VERDICT_SCHEMA },
         ),
       ),
