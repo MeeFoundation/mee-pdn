@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Result;
 use data_layer::{
-    holder_of, AddrInfoOptions, ConnectionMetadata, ConnectionMetadataStore, Contact, DocTicket,
+    identity_of, AddrInfoOptions, ConnectionMetadata, ConnectionMetadataStore, Contact, DocTicket,
     EndpointAddr, EndpointId, GrantedClaim, ReadGrant, ShareMode,
 };
 use futures_lite::{Stream, StreamExt};
@@ -534,7 +534,7 @@ async fn refresh_replica_contacts(
             contacts.push(contact.clone());
         }
     }
-    for (device, holder) in issuer_devices
+    for (device, identity) in issuer_devices
         .iter()
         .map(|device| (device, issuer))
         .chain(siblings.iter().map(|device| (device, identity)))
@@ -542,7 +542,7 @@ async fn refresh_replica_contacts(
         if covered.insert(*device.as_bytes()) {
             contacts.push(Contact::new(
                 EndpointAddr::new(EndpointId::from_bytes(device.as_bytes())?),
-                holder_of(holder),
+                identity_of(identity),
             ));
         }
     }
@@ -832,8 +832,8 @@ async fn point_pair_at(
     let own_device = state.node.node_id();
     // A device is dialed as the identity it belongs to: this node's
     // siblings act for `identity`, the counterparty's devices for `peer`.
-    let mut holders = Vec::new();
-    for (device, holder) in siblings
+    let mut identities = Vec::new();
+    for (device, identity) in siblings
         .iter()
         .map(|device| (device, identity))
         .chain(counterparty.iter().map(|device| (device, peer)))
@@ -842,7 +842,7 @@ async fn point_pair_at(
             continue;
         }
         match EndpointId::from_bytes(device.as_bytes()) {
-            Ok(id) => holders.push(Contact::new(EndpointAddr::new(id), holder_of(holder))),
+            Ok(id) => identities.push(Contact::new(EndpointAddr::new(id), identity_of(identity))),
             Err(err) => tracing::warn!(%device, "undialable device record: {err:#}"),
         }
     }
@@ -861,9 +861,9 @@ async fn point_pair_at(
                 contacts.push(node);
             }
         }
-        for holder in &holders {
-            if seen.insert(*holder.addr.id.as_bytes()) {
-                contacts.push(holder.clone());
+        for identity in &identities {
+            if seen.insert(*identity.addr.id.as_bytes()) {
+                contacts.push(identity.clone());
             }
         }
         state.node.set_doc_contacts(identity, namespace, contacts)?;

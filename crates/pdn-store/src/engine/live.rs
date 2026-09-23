@@ -34,7 +34,7 @@ use crate::{
         connect_and_sync, handle_in_process_session, handle_session, AbortReason, AcceptError,
         AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
     },
-    AuthorHeads, Contact, ContentStatus, Holder, NamespaceId, SignedEntry,
+    AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
 };
 
 /// The stream halves an in-process session runs over: a pipe, since iroh
@@ -102,7 +102,7 @@ pub enum ToLiveActor {
     StartSync {
         namespace: NamespaceId,
         peers: Vec<Contact>,
-        default_holder: Holder,
+        default_identity: Identity,
         /// Whether to join the replica's gossip swarm. Scoped access syncs
         /// without ever joining the swarm.
         join_gossip: bool,
@@ -130,13 +130,13 @@ pub enum ToLiveActor {
         #[debug("oneshot::Sender")]
         reply: sync::oneshot::Sender<Result<()>>,
     },
-    /// A session dispatched here by the holder its first message named.
+    /// A session dispatched here by the identity its first message named.
     HandleSession {
         conn: iroh::endpoint::Connection,
         #[debug("SessionOpening")]
         opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     },
-    /// The serving half of a session between two holders of this node.
+    /// The serving half of a session between two identities of this node.
     AcceptInProcess {
         #[debug("SessionOpening")]
         opening: SessionOpening<InProcessRecv, InProcessSend>,
@@ -144,7 +144,7 @@ pub enum ToLiveActor {
     /// The dialing half of the same session.
     SyncInProcess {
         namespace: NamespaceId,
-        callee: Holder,
+        callee: Identity,
         peer: PublicKey,
         #[debug("pipe")]
         send: InProcessSend,
@@ -154,9 +154,9 @@ pub enum ToLiveActor {
     AcceptSyncRequest {
         namespace: NamespaceId,
         peer: PublicKey,
-        /// The holder the caller acts for: two identities of one node are
+        /// The identity the caller acts for: two identities of one node are
         /// two callers at one node id (ADR-0013).
-        caller: Holder,
+        caller: Identity,
         #[debug("oneshot::Sender")]
         reply: sync::oneshot::Sender<AcceptOutcome>,
     },
@@ -204,43 +204,43 @@ pub enum Event {
     PendingContentReady,
 }
 
-/// The holder is the callee the dial addressed: a node of two identities
+/// The identity is the callee the dial addressed: a node of two identities
 /// is two counterparts at one node id (ADR-0013).
 type SyncConnectRes = (
     NamespaceId,
     PublicKey,
-    Holder,
+    Identity,
     SyncReason,
     Result<SyncFinished, ConnectError>,
 );
-/// The namespace and peer the session was opened on, then the holder it
+/// The namespace and peer the session was opened on, then the identity it
 /// named as its caller: the pair is reported even when the exchange fails,
-/// because the holder it put in `peer_holders` is released by it.
+/// because the identity it put in `peer_identities` is released by it.
 type SyncAcceptRes = (
     NamespaceId,
     PublicKey,
-    Holder,
+    Identity,
     Result<SyncFinished, AcceptError>,
 );
 type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
 
-/// The holders one peer of one replica is dialed as. Two sources, held
+/// The identities one peer of one replica is dialed as. Two sources, held
 /// apart because they are trusted and live differently: a contact is the
 /// consumer's own statement and stays, while a session's first message is
 /// the caller's word and stays only as long as that admitted session —
-/// otherwise any reachable peer could name holders until the map exhausts
+/// otherwise any reachable peer could name identities until the map exhausts
 /// memory.
 #[derive(Default, Debug)]
-struct PeerHolders {
-    stated: BTreeSet<Holder>,
-    /// Counted, because two sessions of one holder can run at once.
+struct PeerIdentities {
+    stated: BTreeSet<Identity>,
+    /// Counted, because two sessions of one identity can run at once.
     /// Taken when the access provider admits the session, given back when
     /// it ends, so a refused caller leaves nothing.
-    in_session: BTreeMap<Holder, usize>,
+    in_session: BTreeMap<Identity, usize>,
 }
 
-impl PeerHolders {
-    fn all(&self) -> impl Iterator<Item = Holder> + '_ {
+impl PeerIdentities {
+    fn all(&self) -> impl Iterator<Item = Identity> + '_ {
         self.stated
             .iter()
             .chain(self.in_session.keys())
@@ -253,13 +253,13 @@ impl PeerHolders {
         self.stated.is_empty() && self.in_session.is_empty()
     }
 
-    fn enter(&mut self, holder: Holder) {
-        *self.in_session.entry(holder).or_default() += 1;
+    fn enter(&mut self, identity: Identity) {
+        *self.in_session.entry(identity).or_default() += 1;
     }
 
-    fn leave(&mut self, holder: Holder) {
+    fn leave(&mut self, identity: Identity) {
         if let std::collections::btree_map::Entry::Occupied(mut entry) =
-            self.in_session.entry(holder)
+            self.in_session.entry(identity)
         {
             *entry.get_mut() -= 1;
             if *entry.get() == 0 {
@@ -316,24 +316,24 @@ pub struct LiveActor {
     /// session roles — accept and dial — to decide what a peer may see of
     /// a namespace.
     session_access: crate::filter::SessionAccessProvider,
-    /// The holder every replica of this engine is held for, and the one
+    /// The identity every replica of this engine is held for, and the one
     /// its dials act as.
-    holder: Holder,
-    /// Which holders a peer is dialed as, per replica. One node id hosts
+    identity: Identity,
+    /// Which identities a peer is dialed as, per replica. One node id hosts
     /// several (ADR-0013), so the value is a set: a single slot would let
     /// each of them displace the others and leave all but the last
     /// undialed.
-    peer_holders: HashMap<(NamespaceId, PublicKey), PeerHolders>,
+    peer_identities: HashMap<(NamespaceId, PublicKey), PeerIdentities>,
     /// Whom a peer of a replica is dialed as when nothing named one — the
     /// consumer's statement, since only it knows whose replica this is.
-    default_holders: HashMap<NamespaceId, Holder>,
+    default_identities: HashMap<NamespaceId, Identity>,
     /// In-process sessions opened, so a pass over a quiet pair can be
     /// shown to open none.
     in_process_sessions: Arc<AtomicU64>,
-    /// Told of every local write, with the holder of the replica that
-    /// wrote: what reaches the holders of this same node.
+    /// Told of every local write, with the identity of the replica that
+    /// wrote: what reaches the identities of this same node.
     announce_local: crate::engine::LocalWriteAnnouncer,
-    /// Asked to reconcile with a holder of this same node, for a contact
+    /// Asked to reconcile with a identity of this same node, for a contact
     /// whose address carries this node's own wire identity.
     dial_in_process: crate::engine::InProcessDialer,
     metrics: Arc<Metrics>,
@@ -350,7 +350,7 @@ impl LiveActor {
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         session_access: crate::filter::SessionAccessProvider,
-        holder: Holder,
+        identity: Identity,
         in_process_sessions: Arc<AtomicU64>,
         announce_local: crate::engine::LocalWriteAnnouncer,
         dial_in_process: crate::engine::InProcessDialer,
@@ -381,9 +381,9 @@ impl LiveActor {
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
             session_access,
-            holder,
-            peer_holders: Default::default(),
-            default_holders: Default::default(),
+            identity,
+            peer_identities: Default::default(),
+            default_identities: Default::default(),
             in_process_sessions,
             announce_local,
             dial_in_process,
@@ -447,7 +447,7 @@ impl LiveActor {
                     trace!(?i, "tick: running_sync_accept");
                     self.metrics.doc_live_tick_running_sync_accept.inc();
                     let (namespace, peer, caller, res) = res.context("running_sync_accept closed")?;
-                    self.release_peer_holder(namespace, peer, caller);
+                    self.release_peer_identity(namespace, peer, caller);
                     self.on_sync_via_accept_finished(caller, res).await;
                 }
                 Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
@@ -489,12 +489,12 @@ impl LiveActor {
             ToLiveActor::StartSync {
                 namespace,
                 peers,
-                default_holder,
+                default_identity,
                 join_gossip,
                 reply,
             } => {
                 let res = self
-                    .start_sync(namespace, peers, default_holder, join_gossip)
+                    .start_sync(namespace, peers, default_identity, join_gossip)
                     .await;
                 reply.send(res).ok();
             }
@@ -540,8 +540,8 @@ impl LiveActor {
                 reply,
             } => {
                 // Reaching here means the access provider admitted the
-                // caller, so this is where its holder is learned.
-                self.peer_holders
+                // caller, so this is where its identity is learned.
+                self.peer_identities
                     .entry((namespace, peer))
                     .or_default()
                     .enter(caller);
@@ -559,16 +559,16 @@ impl LiveActor {
         Ok(true)
     }
 
-    /// Which holder `peer` is dialed as for `namespace`: what a contact
+    /// Which identity `peer` is dialed as for `namespace`: what a contact
     /// or a past session named, else the consumer's default for the
-    /// replica, else this engine's own holder — what a sibling device of
-    /// the same holder is.
-    /// Give back the holder a finished session named, and drop the pair
+    /// replica, else this engine's own identity — what a sibling device of
+    /// the same identity is.
+    /// Give back the identity a finished session named, and drop the pair
     /// once nothing names it: a session that was refused leaves no trace,
     /// and one that ran leaves none either.
-    fn release_peer_holder(&mut self, namespace: NamespaceId, peer: PublicKey, caller: Holder) {
+    fn release_peer_identity(&mut self, namespace: NamespaceId, peer: PublicKey, caller: Identity) {
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.peer_holders.entry((namespace, peer))
+            self.peer_identities.entry((namespace, peer))
         {
             entry.get_mut().leave(caller);
             if entry.get().is_empty() {
@@ -577,44 +577,44 @@ impl LiveActor {
         }
     }
 
-    /// Every holder this peer is dialed as for `namespace`: what contacts
+    /// Every identity this peer is dialed as for `namespace`: what contacts
     /// and running sessions named, else the consumer's default for the
-    /// replica, else this engine's own holder — what a sibling device of
-    /// the same holder is.
-    fn holders_of_peer(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Holder> {
-        let learned: Vec<Holder> = self
-            .peer_holders
+    /// replica, else this engine's own identity — what a sibling device of
+    /// the same identity is.
+    fn identities_of_peer(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Identity> {
+        let learned: Vec<Identity> = self
+            .peer_identities
             .get(&(namespace, peer))
-            .map(|holders| holders.all().collect())
+            .map(|identities| identities.all().collect())
             .unwrap_or_default();
         if !learned.is_empty() {
             return learned;
         }
-        match self.default_holders.get(&namespace) {
+        match self.default_identities.get(&namespace) {
             Some(default) => vec![*default],
-            None => vec![self.holder],
+            None => vec![self.identity],
         }
     }
 
-    /// One dial per holder the peer is known as: co-located holders of one
+    /// One dial per identity the peer is known as: co-located identities of one
     /// node id each get their own exchange, since one session addresses one.
     fn sync_with_peer(&mut self, namespace: NamespaceId, peer: PublicKey, reason: SyncReason) {
-        for callee in self.holders_of_peer(namespace, peer) {
-            self.sync_with_holder(namespace, peer, callee, reason);
+        for callee in self.identities_of_peer(namespace, peer) {
+            self.sync_with_identity(namespace, peer, callee, reason);
         }
     }
 
     #[instrument("connect", skip_all, fields(peer = %peer.fmt_short(), namespace = %namespace.fmt_short()))]
-    fn sync_with_holder(
+    fn sync_with_identity(
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
-        callee: Holder,
+        callee: Identity,
         reason: SyncReason,
     ) {
         // iroh refuses a connection to this endpoint's own id before it
         // looks at an address, so a contact that names this node — from a
-        // ticket, a device record, a contact list — reaches its holder
+        // ticket, a device record, a contact list — reaches its identity
         // inside the process or not at all.
         if peer == self.endpoint.id() {
             (self.dial_in_process)(namespace, callee);
@@ -627,12 +627,12 @@ impl LiveActor {
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
-        let caller = self.holder;
+        let caller = self.identity;
         let fut = async move {
             // The dialing side serves entries too (reconciliation is
             // bidirectional), so the embedder's access provider gates this
             // role exactly like the accept role.
-            // The addressed holder first, the acting one second, as on
+            // The addressed identity first, the acting one second, as on
             // the accept path: dialing, the party across the session is
             // the callee.
             let access = session_access(
@@ -668,13 +668,13 @@ impl LiveActor {
         self.running_sync_connect.spawn(fut);
     }
 
-    /// The dialing half of a session between two holders of this node.
+    /// The dialing half of a session between two identities of this node.
     /// The pipe replaces the transport and nothing else: the same codec,
     /// the same session setup, the same access provider call.
     fn sync_in_process(
         &mut self,
         namespace: NamespaceId,
-        callee: Holder,
+        callee: Identity,
         peer: PublicKey,
         mut send: InProcessSend,
         mut recv: InProcessRecv,
@@ -689,10 +689,10 @@ impl LiveActor {
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
-        let caller = self.holder;
+        let caller = self.identity;
         self.in_process_sessions.fetch_add(1, Ordering::Relaxed);
         let fut = async move {
-            // The addressed holder first, the acting one second, as on
+            // The addressed identity first, the acting one second, as on
             // the accept path: dialing, the party across the session is
             // the callee.
             let access = session_access(
@@ -748,13 +748,13 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
-        default_holder: Holder,
+        default_identity: Identity,
         join_gossip: bool,
     ) -> Result<()> {
         // A peer the engine recorded carries a node id and nothing else,
         // so the consumer states whom a peer of this replica is dialed as
         // when neither a contact nor a past session named one.
-        self.default_holders.insert(namespace, default_holder);
+        self.default_identities.insert(namespace, default_identity);
         let mut recorded: Vec<PublicKey> = Vec::new();
         debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
         // update state to allow sync
@@ -772,8 +772,8 @@ impl LiveActor {
             }
             Ok(Some(known_useful_peers)) => {
                 // A peer the engine recorded carries a node id and no
-                // holder, so it is dialed as whatever this replica already
-                // learned for it — never recorded as a holder of its own,
+                // identity, so it is dialed as whatever this replica already
+                // learned for it — never recorded as a identity of its own,
                 // or a guess would stick and outlive what a contact says.
                 recorded.extend(known_useful_peers.into_iter().filter_map(|peer_id_bytes| {
                     // peers are stored as bytes, don't fail the operation if they can't be
@@ -804,8 +804,8 @@ impl LiveActor {
     ) -> anyhow::Result<()> {
         // self.subscribers.remove(&namespace);
         if self.state.remove(&namespace) {
-            self.peer_holders
-                .retain(|(tracked, _peer), _holders| *tracked != namespace);
+            self.peer_identities
+                .retain(|(tracked, _peer), _identities| *tracked != namespace);
             self.sync.set_sync(namespace, false).await?;
             self.sync
                 .unsubscribe(namespace, self.replica_events_tx.clone())
@@ -844,15 +844,15 @@ impl LiveActor {
         let mut peer_ids = Vec::new();
 
         // add addresses of peers to our endpoint address book
-        for Contact { addr, holder } in peers.into_iter() {
+        for Contact { addr, identity } in peers.into_iter() {
             let peer_id = addr.id;
-            // The contact names the holder it is dialed as, so a later
+            // The contact names the identity it is dialed as, so a later
             // dial reaches the same one however it was triggered.
-            self.peer_holders
+            self.peer_identities
                 .entry((namespace, peer_id))
                 .or_default()
                 .stated
-                .insert(holder);
+                .insert(identity);
             // adding a node address without any addressing info fails with an error,
             // but we still want to include those peers because endpoint address lookup might find addresses for them
             if !addr.is_empty() {
@@ -887,7 +887,7 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
-        callee: Holder,
+        callee: Identity,
         reason: SyncReason,
         result: Result<SyncFinished, ConnectError>,
     ) {
@@ -916,7 +916,7 @@ impl LiveActor {
     #[instrument("accept", skip_all, fields(peer = %fmt_accept_peer(&res), namespace = %fmt_accept_namespace(&res)))]
     async fn on_sync_via_accept_finished(
         &mut self,
-        caller: Holder,
+        caller: Identity,
         res: Result<SyncFinished, AcceptError>,
     ) {
         match res {
@@ -955,7 +955,7 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
-        counterpart: Holder,
+        counterpart: Identity,
         origin: Origin,
         result: Result<SyncFinished>,
     ) {
@@ -1216,11 +1216,11 @@ impl LiveActor {
                     self.broadcast_local_head(namespace, &entry).await;
                 }
                 // A node's own gossip broadcast never reaches its other
-                // subscribers, so a holder co-located with this one is told
+                // subscribers, so a identity co-located with this one is told
                 // here or on the periodic pass (ADR-0013). Content-free like
-                // the broadcast: what the co-located holder obtains comes
+                // the broadcast: what the co-located identity obtains comes
                 // through the session its reconcile opens, and its filter.
-                (self.announce_local)(namespace, self.holder);
+                (self.announce_local)(namespace, self.identity);
             }
             crate::Event::RemoteInsert {
                 namespace,
@@ -1299,22 +1299,22 @@ impl LiveActor {
     /// namespace not being hosted.
     fn accept_callback(
         &self,
-    ) -> impl Fn(NamespaceId, Holder, Holder, PublicKey) -> n0_future::future::Boxed<AcceptOutcome>
+    ) -> impl Fn(NamespaceId, Identity, Identity, PublicKey) -> n0_future::future::Boxed<AcceptOutcome>
            + Clone
            + use<> {
         let to_actor_tx = self.sync_actor_tx.clone();
         let session_access = self.session_access.clone();
-        move |namespace, holder, caller, peer| {
+        move |namespace, identity, caller, peer| {
             let to_actor_tx = to_actor_tx.clone();
             let session_access = session_access.clone();
             async move {
-                // Rights before state: the holder and the namespace are the
+                // Rights before state: the identity and the namespace are the
                 // caller's own word, and asking the actor first would let a
                 // caller the provider denies leave a slot of its choosing
                 // behind on every attempt.
                 let admitted = session_access(
                     namespace,
-                    holder,
+                    identity,
                     caller,
                     peer,
                     crate::filter::SessionRole::Accept,
@@ -1356,10 +1356,10 @@ impl LiveActor {
     }
 
     /// An engine that is the whole node's docs handler: read the first
-    /// message here, then serve it. A node of several holders dispatches
+    /// message here, then serve it. A node of several identities dispatches
     /// before this point ([`crate::protocol::Docs`]).
     #[instrument("accept", skip_all)]
-    /// Serve a session whose first message named this engine's holder.
+    /// Serve a session whose first message named this engine's identity.
     #[instrument("accept", skip_all)]
     pub async fn handle_session(
         &mut self,
@@ -1382,7 +1382,7 @@ impl LiveActor {
         );
     }
 
-    /// The serving half of a session between two holders of this node.
+    /// The serving half of a session between two identities of this node.
     #[instrument("accept-in-process", skip_all)]
     fn accept_in_process(&mut self, opening: SessionOpening<InProcessRecv, InProcessSend>) {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
@@ -1404,10 +1404,10 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
-        caller: Holder,
+        caller: Identity,
     ) -> AcceptOutcome {
         self.state
-            .accept_request(&self.endpoint.id(), self.holder, &namespace, peer, caller)
+            .accept_request(&self.endpoint.id(), self.identity, &namespace, peer, caller)
     }
 }
 
@@ -1587,38 +1587,38 @@ mod tests {
         subscribers.send(Event::NeighborUp(pk)).await;
     }
 
-    /// A peer of one replica is dialed as every holder it is known by, and
-    /// a session's holder is known only while that session runs: two
-    /// sessions of one holder both have to end before it is forgotten, and
+    /// A peer of one replica is dialed as every identity it is known by, and
+    /// a session's identity is known only while that session runs: two
+    /// sessions of one identity both have to end before it is forgotten, and
     /// a contact the consumer stated outlives all of them.
     #[test]
-    fn a_session_holder_lives_as_long_as_its_session_and_a_stated_one_outlives_it() {
-        let stated = Holder::from_bytes([1; 32]);
-        let named = Holder::from_bytes([2; 32]);
-        let mut holders = PeerHolders::default();
-        holders.stated.insert(stated);
+    fn a_session_identity_lives_as_long_as_its_session_and_a_stated_one_outlives_it() {
+        let stated = Identity::from_bytes([1; 32]);
+        let named = Identity::from_bytes([2; 32]);
+        let mut identities = PeerIdentities::default();
+        identities.stated.insert(stated);
 
-        holders.enter(named);
-        holders.enter(named);
-        assert_eq!(holders.all().collect::<Vec<_>>(), vec![stated, named]);
+        identities.enter(named);
+        identities.enter(named);
+        assert_eq!(identities.all().collect::<Vec<_>>(), vec![stated, named]);
 
-        // One of the two sessions ends: the holder is still named by the other.
-        holders.leave(named);
-        assert_eq!(holders.all().collect::<Vec<_>>(), vec![stated, named]);
+        // One of the two sessions ends: the identity is still named by the other.
+        identities.leave(named);
+        assert_eq!(identities.all().collect::<Vec<_>>(), vec![stated, named]);
 
-        holders.leave(named);
+        identities.leave(named);
         assert_eq!(
-            holders.all().collect::<Vec<_>>(),
+            identities.all().collect::<Vec<_>>(),
             vec![stated],
-            "the holder outlived the sessions that named it"
+            "the identity outlived the sessions that named it"
         );
         assert!(
-            !holders.is_empty(),
+            !identities.is_empty(),
             "a stated contact was dropped with the sessions"
         );
 
         // A release with nothing to release leaves the stated one alone.
-        holders.leave(named);
-        assert_eq!(holders.all().collect::<Vec<_>>(), vec![stated]);
+        identities.leave(named);
+        assert_eq!(identities.all().collect::<Vec<_>>(), vec![stated]);
     }
 }

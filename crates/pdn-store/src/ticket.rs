@@ -4,7 +4,7 @@ use iroh::EndpointAddr;
 use iroh_tickets::{ParseError, Ticket};
 use serde::{Deserialize, Serialize};
 
-use crate::{Capability, Contact, Holder};
+use crate::{Capability, Contact, Identity};
 
 /// Contains both a key (either secret or public) to a document, and a list of peers to join.
 #[derive(Serialize, Deserialize, Clone, Debug, derive_more::Display)]
@@ -15,8 +15,8 @@ pub struct DocTicket {
     /// A list of nodes to contact.
     pub nodes: Vec<EndpointAddr>,
     /// Whose replica the listed nodes hold: a ticket is minted by one
-    /// holder, so an importer knows which one to name when it dials them.
-    pub holder: Holder,
+    /// identity, so an importer knows which one to name when it dials them.
+    pub identity: Identity,
 }
 
 /// Wire format for [`DocTicket`].
@@ -51,20 +51,20 @@ impl Ticket for DocTicket {
 
 impl DocTicket {
     /// Create a new doc ticket
-    pub fn new(capability: Capability, peers: Vec<EndpointAddr>, holder: Holder) -> Self {
+    pub fn new(capability: Capability, peers: Vec<EndpointAddr>, identity: Identity) -> Self {
         Self {
             capability,
             nodes: peers,
-            holder,
+            identity,
         }
     }
 
-    /// The listed nodes, each paired with the holder that minted the
+    /// The listed nodes, each paired with the identity that minted the
     /// ticket.
     pub fn contacts(&self) -> Vec<Contact> {
         self.nodes
             .iter()
-            .map(|addr| Contact::new(addr.clone(), self.holder))
+            .map(|addr| Contact::new(addr.clone(), self.identity))
             .collect()
     }
 }
@@ -102,7 +102,7 @@ mod tests {
         let ticket = DocTicket {
             capability: Capability::Read(namespace_id),
             nodes: vec![EndpointAddr::new(node_id)],
-            holder: Holder::from_bytes([0xab; 32]),
+            identity: Identity::from_bytes([0xab; 32]),
         };
         let s = ticket.to_string();
         let base32 = data_encoding::BASE32_NOPAD
@@ -120,7 +120,7 @@ mod tests {
             01 # one node
             ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6 # node id, 32 bytes, see above
             00 # no addrs
-            abababababababababababababababababababababababababababababababab # holder, 32 bytes
+            abababababababababababababababababababababababababababababababab # identity, 32 bytes
         ").unwrap();
         assert_eq!(base32, expected);
     }

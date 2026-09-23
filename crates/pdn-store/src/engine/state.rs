@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::{
     net::{AbortReason, AcceptOutcome, SyncFinished},
-    Holder, NamespaceId,
+    Identity, NamespaceId,
 };
 
 /// Why we started a sync request
@@ -22,7 +22,7 @@ pub enum SyncReason {
     SyncReport,
     /// We received a sync report while a sync was running, so run again afterwars
     Resync,
-    /// A write of this node announced itself to a holder of this same node.
+    /// A write of this node announced itself to a identity of this same node.
     Announced,
 }
 
@@ -51,12 +51,12 @@ pub enum SyncState {
 #[derive(Default)]
 pub struct NamespaceStates(BTreeMap<NamespaceId, NamespaceState>);
 
-/// A counterpart is a node id and the holder across the session — the
+/// A counterpart is a node id and the identity across the session — the
 /// callee when dialing, the caller when accepting. A node hosting two
 /// identities opens two exchanges of one namespace from one node id, and
 /// they are as separate as two nodes' (ADR-0013): keying by the node id
 /// alone would make each refuse the other as already syncing.
-type Counterpart = (EndpointId, Holder);
+type Counterpart = (EndpointId, Identity);
 
 #[derive(Default)]
 struct NamespaceState {
@@ -82,7 +82,7 @@ impl NamespaceStates {
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
-        callee: Holder,
+        callee: Identity,
         reason: SyncReason,
     ) -> bool {
         match self.entry(namespace, (node, callee)) {
@@ -105,7 +105,7 @@ impl NamespaceStates {
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
-        callee: Holder,
+        callee: Identity,
         reason: SyncReason,
     ) -> bool {
         match self.entry(namespace, (node, callee)) {
@@ -120,15 +120,15 @@ impl NamespaceStates {
     pub fn accept_request(
         &mut self,
         me: &EndpointId,
-        own_holder: Holder,
+        own_identity: Identity,
         namespace: &NamespaceId,
         node: EndpointId,
-        caller: Holder,
+        caller: Identity,
     ) -> AcceptOutcome {
         let Some(state) = self.entry(namespace, (node, caller)) else {
             return AcceptOutcome::Reject(AbortReason::NotFound);
         };
-        state.accept_request(me, own_holder, &node, caller)
+        state.accept_request(me, own_identity, &node, caller)
     }
 
     /// Insert a finished sync operation into the state.
@@ -142,7 +142,7 @@ impl NamespaceStates {
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
-        counterpart: Holder,
+        counterpart: Identity,
         origin: &Origin,
         result: Result<SyncFinished>,
     ) -> Option<(SystemTime, bool)> {
@@ -272,9 +272,9 @@ impl PeerState {
     fn accept_request(
         &mut self,
         me: &EndpointId,
-        own_holder: Holder,
+        own_identity: Identity,
         node: &EndpointId,
-        caller: Holder,
+        caller: Identity,
     ) -> AcceptOutcome {
         let outcome = match &self.state {
             SyncState::Idle => AcceptOutcome::Allow {
@@ -287,7 +287,7 @@ impl PeerState {
                 // In this case, compare the binary representations of our and the other node's id
                 // to deterministically decide which of the two concurrent connections will succeed.
                 Origin::Connect(_reason) => {
-                    match expected_sync_direction((me, own_holder), (node, caller)) {
+                    match expected_sync_direction((me, own_identity), (node, caller)) {
                         SyncDirection::Accept => AcceptOutcome::Allow {
                             filter: None,
                             ingest: None,
@@ -321,17 +321,17 @@ enum SyncDirection {
 }
 
 /// Which of two mutual dials survives, decided the same way on both
-/// sides. Node ids settle it between two nodes; between two holders of one
-/// node they are the same id, and then the holders settle it — without
+/// sides. Node ids settle it between two nodes; between two identities of one
+/// node they are the same id, and then the identities settle it — without
 /// that, the comparison is a value against itself, both sides read
 /// "connect", and each refuses the other's dial.
 fn expected_sync_direction(
-    here: (&EndpointId, Holder),
-    there: (&EndpointId, Holder),
+    here: (&EndpointId, Identity),
+    there: (&EndpointId, Identity),
 ) -> SyncDirection {
-    let ((self_node_id, own_holder), (other_node_id, other_holder)) = (here, there);
+    let ((self_node_id, own_identity), (other_node_id, other_identity)) = (here, there);
     let greater = match self_node_id.cmp(other_node_id) {
-        Ordering::Equal => own_holder > other_holder,
+        Ordering::Equal => own_identity > other_identity,
         order => order == Ordering::Greater,
     };
     if greater {
@@ -352,17 +352,17 @@ mod tests {
     }
 
     /// Two deterministic endpoint ids, returned as (lower, higher) by key bytes.
-    /// The holder across the session. Both directions of a mutual dial
+    /// The identity across the session. Both directions of a mutual dial
     /// name the same one when each node hosts one identity, which is what
     /// makes the tie-break below meet its own dial.
-    fn counterpart() -> Holder {
-        Holder::from_bytes([7u8; 32])
+    fn counterpart() -> Identity {
+        Identity::from_bytes([7u8; 32])
     }
 
-    /// This engine's own holder. Only the node ids differ in these cases,
-    /// so the holders never reach the tie-break.
-    fn own_holder() -> Holder {
-        Holder::from_bytes([1u8; 32])
+    /// This engine's own identity. Only the node ids differ in these cases,
+    /// so the identities never reach the tie-break.
+    fn own_identity() -> Identity {
+        Identity::from_bytes([1u8; 32])
     }
 
     fn node_pair() -> (EndpointId, EndpointId) {
@@ -375,27 +375,30 @@ mod tests {
         }
     }
 
-    /// Two holders of one node dialing each other: exactly one of the two
+    /// Two identities of one node dialing each other: exactly one of the two
     /// exchanges survives, as it does between two nodes. The node ids are
     /// the same value here, so a tie-break that only compared them would
     /// read "connect" on both sides and each would refuse the other.
     #[test]
-    fn a_mutual_dial_between_two_holders_of_one_node_leaves_one_exchange() {
+    fn a_mutual_dial_between_two_identities_of_one_node_leaves_one_exchange() {
         let namespace = namespace();
         let (node, _other) = node_pair();
-        let (low, high) = (Holder::from_bytes([1u8; 32]), Holder::from_bytes([2u8; 32]));
+        let (low, high) = (
+            Identity::from_bytes([1u8; 32]),
+            Identity::from_bytes([2u8; 32]),
+        );
 
-        // The engine of the higher holder, dialing the lower and dialed back.
+        // The engine of the higher identity, dialing the lower and dialed back.
         let mut higher = NamespaceStates::default();
         higher.insert(namespace);
         assert!(higher.start_connect(&namespace, node, low, SyncReason::DirectJoin));
         let accepted = higher.accept_request(&node, high, &namespace, node, low);
         assert!(
             matches!(accepted, AcceptOutcome::Allow { .. }),
-            "the higher holder refused the exchange that should survive"
+            "the higher identity refused the exchange that should survive"
         );
 
-        // The engine of the lower holder, in the mirror position.
+        // The engine of the lower identity, in the mirror position.
         let mut lower = NamespaceStates::default();
         lower.insert(namespace);
         assert!(lower.start_connect(&namespace, node, high, SyncReason::DirectJoin));
@@ -459,7 +462,7 @@ mod tests {
         states.insert(namespace);
 
         assert!(states.start_connect(&namespace, node, counterpart(), SyncReason::DirectJoin));
-        let outcome = states.accept_request(&me, own_holder(), &namespace, node, counterpart());
+        let outcome = states.accept_request(&me, own_identity(), &namespace, node, counterpart());
         assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
         // Our dial comes back rejected; the slot now belongs to the accept exchange.

@@ -2,7 +2,7 @@
 //! that published the grant; the scenarios turn the publishing device off
 //! and require convergence from another, asserting the contact set through
 //! the `test-util` surface rather than sleeping on it. Paired denial: the
-//! serving sibling gives a bare ticket holder nothing. The grant sweep's
+//! serving sibling gives a bare ticket identity nothing. The grant sweep's
 //! replica lifecycle (ADR-0009: one shared replica, last withdrawal takes
 //! it) is asserted on the same surface. Compiles only under `test-util`.
 #![cfg(feature = "test-util")]
@@ -212,7 +212,7 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         rt_carol.data().list(carol, alice, None).await?.is_empty(),
-        "a bare ticket holder must get nothing from the serving sibling"
+        "a bare ticket identity must get nothing from the serving sibling"
     );
     assert!(rt_carol.data().read(carol, alice, &email).await?.is_none());
 

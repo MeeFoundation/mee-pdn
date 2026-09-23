@@ -24,32 +24,32 @@ pub use self::{
 };
 use crate::{
     actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, Contact,
-    ContentStatus, ContentStatusCallback, Entry, Holder, NamespaceId, RejectionObserver,
+    ContentStatus, ContentStatusCallback, Entry, Identity, NamespaceId, RejectionObserver,
 };
 
 mod gossip;
 mod live;
 mod state;
 
-/// Told of every entry this engine writes locally, with the holder of the
+/// Told of every entry this engine writes locally, with the identity of the
 /// replica that wrote it. A node's own gossip broadcast never reaches its
-/// other subscribers, so this is what tells a co-located holder.
-pub type LocalWriteAnnouncer = Arc<dyn Fn(NamespaceId, Holder) + Send + Sync + 'static>;
+/// other subscribers, so this is what tells a co-located identity.
+pub type LocalWriteAnnouncer = Arc<dyn Fn(NamespaceId, Identity) + Send + Sync + 'static>;
 
-/// An announcer that tells nobody — what a node hosting one holder states.
+/// An announcer that tells nobody — what a node hosting one identity states.
 pub fn announce_nobody() -> LocalWriteAnnouncer {
-    Arc::new(|_namespace, _holder| {})
+    Arc::new(|_namespace, _identity| {})
 }
 
-/// Asked to reconcile `namespace` with a holder of this same node, when a
+/// Asked to reconcile `namespace` with a identity of this same node, when a
 /// contact's address carries this node's own wire identity. iroh refuses a
 /// connection to its own endpoint, so a dial that resolves here reaches
 /// the callee through the process or not at all.
-pub type InProcessDialer = Arc<dyn Fn(NamespaceId, Holder) + Send + Sync + 'static>;
+pub type InProcessDialer = Arc<dyn Fn(NamespaceId, Identity) + Send + Sync + 'static>;
 
-/// A dialer that reaches nobody — what a node hosting one holder states.
+/// A dialer that reaches nobody — what a node hosting one identity states.
 pub fn dial_nobody() -> InProcessDialer {
-    Arc::new(|_namespace, _holder| {})
+    Arc::new(|_namespace, _identity| {})
 }
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
@@ -73,10 +73,10 @@ pub struct Engine {
     #[debug("ContentStatusCallback")]
     content_status_cb: ContentStatusCallback,
     blob_store: iroh_blobs::api::Store,
-    /// The holder every replica of this engine is held for.
-    holder: Holder,
+    /// The identity every replica of this engine is held for.
+    identity: Identity,
     /// Sessions opened over the in-process path, so a pass over a quiet
-    /// pair of co-located holders can be shown to open none.
+    /// pair of co-located identities can be shown to open none.
     in_process_sessions: Arc<std::sync::atomic::AtomicU64>,
     _gc_protect_task: AbortOnDropHandle<()>,
 }
@@ -98,7 +98,7 @@ impl Engine {
         capability_validator: Option<CapabilityValidator>,
         rejection_observer: Option<RejectionObserver>,
         session_access: crate::filter::SessionAccessProvider,
-        holder: Holder,
+        identity: Identity,
         announce_local: LocalWriteAnnouncer,
         dial_in_process: InProcessDialer,
     ) -> anyhow::Result<Self> {
@@ -162,7 +162,7 @@ impl Engine {
             to_live_actor_recv,
             live_actor_tx.clone(),
             session_access,
-            holder,
+            identity,
             Arc::clone(&in_process_sessions),
             announce_local,
             dial_in_process,
@@ -195,7 +195,7 @@ impl Engine {
             content_status_cb,
             default_author,
             blob_store: bao_store,
-            holder,
+            identity,
             in_process_sessions,
             _gc_protect_task: gc_protect_task,
         })
@@ -219,14 +219,14 @@ impl Engine {
         &self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
-        default_holder: Holder,
+        default_identity: Identity,
     ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
-                default_holder,
+                default_identity,
                 join_gossip: true,
                 reply,
             })
@@ -245,14 +245,14 @@ impl Engine {
         &self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
-        default_holder: Holder,
+        default_identity: Identity,
     ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
-                default_holder,
+                default_identity,
                 join_gossip: false,
                 reply,
             })
@@ -333,12 +333,12 @@ impl Engine {
         Ok(a.or(b))
     }
 
-    /// The holder every replica of this engine is held for.
-    pub fn holder(&self) -> Holder {
-        self.holder
+    /// The identity every replica of this engine is held for.
+    pub fn identity(&self) -> Identity {
+        self.identity
     }
 
-    /// Serve a connection dispatched here by the holder its first message
+    /// Serve a connection dispatched here by the identity its first message
     /// named. The connection travels with the session it carries: dropping
     /// it at the dispatcher would cut the streams mid-exchange.
     pub async fn handle_session(
@@ -352,14 +352,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Open a session with a holder of this same node, over a pipe: iroh
-    /// refuses a connection to its own endpoint id, so co-located holders
+    /// Open a session with a identity of this same node, over a pipe: iroh
+    /// refuses a connection to its own endpoint id, so co-located identities
     /// meet here or not at all. `serve` is the callee's engine.
     pub async fn sync_in_process(
         &self,
         serve: &Engine,
         namespace: NamespaceId,
-        callee: Holder,
+        callee: Identity,
     ) -> anyhow::Result<()> {
         let (dialing, serving) = tokio::io::duplex(live::IN_PROCESS_PIPE_BYTES);
         let (dial_recv, dial_send) = tokio::io::split(dialing);

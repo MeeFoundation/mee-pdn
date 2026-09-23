@@ -24,7 +24,7 @@ pub mod private_metadata;
 mod registry;
 mod retraction;
 
-pub use access::holder_of;
+pub use access::identity_of;
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
@@ -47,7 +47,7 @@ pub use node::{
 // crates need no direct dependency on the fork.
 pub use pdn_store::{
     api::protocol::{AddrInfoOptions, ShareMode},
-    AuthorId, Contact, DocTicket, Holder, NamespaceId,
+    AuthorId, Contact, DocTicket, Identity, NamespaceId,
 };
 pub use private_metadata::{CatchUpTimeout, PrivateMetadataStore, RetractionMarker};
 pub use retraction::RetractionVerdict;

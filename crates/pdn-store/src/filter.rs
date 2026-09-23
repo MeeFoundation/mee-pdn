@@ -15,8 +15,8 @@
 //! through a [`SessionAccessProvider`], consulted per session on both
 //! session roles — accepting an incoming sync request and dialing out —
 //! because both ends of a reconciliation serve entries. The provider sees
-//! the [`Holder`] whose replica the session addresses and the one its
-//! caller acts for, so a node hosting several holders judges each session
+//! the [`Identity`] whose replica the session addresses and the one its
+//! caller acts for, so a node hosting several identities judges each session
 //! by the one named in it.
 
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -24,7 +24,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use iroh::PublicKey;
 
 use crate::{
-    holder::Holder,
+    identity::Identity,
     keys::NamespaceId,
     ranger::{Fingerprint, Range, RangeEntry, Store, ValidateOutcome},
     store::PublicKeyStore,
@@ -102,16 +102,16 @@ pub enum SessionRole {
 pub type SessionAccessFuture = Pin<Box<dyn Future<Output = SessionAccess> + Send + 'static>>;
 
 /// Decides, per session, what a peer may see of a namespace. Consulted on
-/// both session roles, with the [`Holder`] whose replica the session
+/// both session roles, with the [`Identity`] whose replica the session
 /// addresses and the one its caller acts for beside the peer's node id:
 /// the verdict follows those two alone and is never widened by another
-/// holder the same node id resolves to.
+/// identity the same node id resolves to.
 ///
 /// Required of every assembly: without one a consumer would serve
 /// sessions it never judged. [`serve_whole`] is what a suite names when it
 /// wants upstream's unjudged behaviour.
 pub type SessionAccessProvider = Arc<
-    dyn Fn(NamespaceId, Holder, Holder, PublicKey, SessionRole) -> SessionAccessFuture
+    dyn Fn(NamespaceId, Identity, Identity, PublicKey, SessionRole) -> SessionAccessFuture
         + Send
         + Sync
         + 'static,
@@ -120,7 +120,7 @@ pub type SessionAccessProvider = Arc<
 /// A provider that judges nothing: every session sees the replica whole.
 /// Named rather than defaulted, so an assembly that wants it says so.
 pub fn serve_whole() -> SessionAccessProvider {
-    Arc::new(|_namespace, _holder, _caller, _peer, _role| {
+    Arc::new(|_namespace, _identity, _caller, _peer, _role| {
         Box::pin(std::future::ready(SessionAccess::whole()))
     })
 }

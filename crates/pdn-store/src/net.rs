@@ -11,7 +11,7 @@ use crate::{
     actor::SyncHandle,
     metrics::Metrics,
     net::codec::{run_alice, BobState},
-    Holder, NamespaceId, SyncOutcome,
+    Identity, NamespaceId, SyncOutcome,
 };
 
 pub use crate::net::codec::SessionOpening;
@@ -26,12 +26,12 @@ mod codec;
 /// Nothing below this point carries a timeout of its own, so a peer that
 /// stays connected and stops talking stalls forever. Two things ride on the
 /// bound. The live actor tracks one running exchange per namespace, peer
-/// and holder — a node of two identities is two counterparts at one node
+/// and identity — a node of two identities is two counterparts at one node
 /// id (ADR-0013) — and refuses to start another while one runs, so a
 /// stalled exchange blocks that counterpart and drops every later sync
 /// trigger for it silently. A counterpart exists only for a caller the
 /// access provider admitted, so what a peer can occupy is bounded by the
-/// holders it is entitled to act as. And a
+/// identities it is entitled to act as. And a
 /// session holds a store snapshot, whose read transaction holds back
 /// reclamation of every page freed while it lives — of the oldest live one,
 /// so concurrent sessions cost the same window as a single one, and the
@@ -72,8 +72,8 @@ pub async fn connect_and_sync(
     endpoint: &Endpoint,
     sync: &SyncHandle,
     namespace: NamespaceId,
-    holder: Holder,
-    caller: Holder,
+    identity: Identity,
+    caller: Identity,
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     filter: Option<crate::filter::EntryFilter>,
@@ -82,7 +82,7 @@ pub async fn connect_and_sync(
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
         connect_and_sync_inner(
-            endpoint, sync, namespace, holder, caller, peer, metrics, filter, ingest,
+            endpoint, sync, namespace, identity, caller, peer, metrics, filter, ingest,
         ),
     )
     .await
@@ -99,8 +99,8 @@ async fn connect_and_sync_inner(
     endpoint: &Endpoint,
     sync: &SyncHandle,
     namespace: NamespaceId,
-    holder: Holder,
-    caller: Holder,
+    identity: Identity,
+    caller: Identity,
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     filter: Option<crate::filter::EntryFilter>,
@@ -125,7 +125,7 @@ async fn connect_and_sync_inner(
         &mut recv_stream,
         sync,
         namespace,
-        holder,
+        identity,
         caller,
         peer_id,
         filter,
@@ -222,7 +222,7 @@ impl std::fmt::Debug for AcceptOutcome {
 }
 
 /// Read an accepted connection's first message, before any replica is
-/// touched, so the session can be dispatched to the engine of the holder
+/// touched, so the session can be dispatched to the engine of the identity
 /// it names (ADR-0013).
 pub async fn accept_session(
     connection: &iroh::endpoint::Connection,
@@ -249,7 +249,7 @@ pub async fn accept_session(
 }
 
 /// Refuse a session read this far, with the reason a caller that named a
-/// holder this node does not host is given. The refusal is the whole
+/// identity this node does not host is given. The refusal is the whole
 /// message, so it is torn down like a served session: without waiting
 /// for the caller, the connection can end before the frame reaches it
 /// and the refusal arrives as a lost connection.
@@ -302,7 +302,7 @@ pub async fn handle_session<F, Fut>(
     metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
-    F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
     let peer = opening.peer();
@@ -329,7 +329,7 @@ async fn handle_session_inner<F, Fut>(
     metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
-    F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
     let t_start = Instant::now();
@@ -384,7 +384,7 @@ pub async fn handle_in_process_session<R, W, F, Fut>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
     let t_start = Instant::now();
@@ -429,7 +429,7 @@ async fn run_session<R, W, F, Fut>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
     let peer = opening.peer();
@@ -464,8 +464,8 @@ where
 pub async fn sync_in_process<R, W>(
     sync: &SyncHandle,
     namespace: NamespaceId,
-    holder: Holder,
-    caller: Holder,
+    identity: Identity,
+    caller: Identity,
     peer: PublicKey,
     writer: &mut W,
     reader: &mut R,
@@ -482,7 +482,7 @@ where
     let res = time::timeout(
         SYNC_SESSION_TIMEOUT,
         run_alice(
-            writer, reader, sync, namespace, holder, caller, peer, filter, ingest,
+            writer, reader, sync, namespace, identity, caller, peer, filter, ingest,
         ),
     )
     .await

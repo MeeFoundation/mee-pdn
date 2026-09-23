@@ -1,7 +1,7 @@
 //! Caller classification for reconciliation sessions, decided from
 //! material one hosted identity already holds — its own directory and its
 //! connection metadata pairs. Nothing is presented over the wire: the
-//! transport-authenticated caller node id, the holders the session names
+//! transport-authenticated caller node id, the identities the session names
 //! and the requested namespace are the only inputs. One book per hosted
 //! identity, so a verdict is never widened by what a co-located identity
 //! holds (ADR-0013).
@@ -14,7 +14,7 @@ use std::{
 use anyhow::Result;
 use iroh_blobs::Hash;
 use pdn_store::{
-    api::Doc, store::Query, AuthorId, EntryFilter, Holder, NamespaceId, SessionAccess,
+    api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, SessionAccess,
     SessionIngest, SessionRole, ValidateOutcome,
 };
 use pdn_types::{ClaimId, NodeId, PdnId};
@@ -27,8 +27,8 @@ use crate::{
 
 /// A hosted identity as the store names it on the wire: the 32 bytes of
 /// its `PdnId`, which the store compares and never interprets.
-pub fn holder_of(identity: PdnId) -> Holder {
-    Holder::from_bytes(*identity.as_bytes())
+pub fn identity_of(identity: PdnId) -> Identity {
+    Identity::from_bytes(*identity.as_bytes())
 }
 
 /// The directional stores of this book's identity toward `peer`: `own`
@@ -154,17 +154,17 @@ impl AccessBook {
     /// Fail-closed everywhere but the two ticket-bound store kinds
     /// (Invariants 1 and 3).
     ///
-    /// `addressed` is the holder whose replica the session names and
-    /// `acting` the holder its caller acts for. Which of the two is the
+    /// `addressed` is the identity whose replica the session names and
+    /// `acting` the identity its caller acts for. Which of the two is the
     /// party across the session follows the role: accepting, it is the
     /// caller; dialing, this node is the caller and the party is the
-    /// holder it addressed.
+    /// identity it addressed.
     pub(crate) async fn classify(
         &self,
         registry: Arc<Registry>,
         namespace: NamespaceId,
-        addressed: Holder,
-        acting: Holder,
+        addressed: Identity,
+        acting: Identity,
         peer: NodeId,
         role: SessionRole,
     ) -> SessionAccess {
@@ -185,7 +185,7 @@ impl AccessBook {
         &self,
         registry: Arc<Registry>,
         namespace: NamespaceId,
-        remote: Holder,
+        remote: Identity,
         peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
@@ -219,7 +219,7 @@ impl AccessBook {
         registry: Arc<Registry>,
         issuer: PdnId,
         posture: ServingPosture,
-        remote: Holder,
+        remote: Identity,
         peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
@@ -253,11 +253,11 @@ impl AccessBook {
         &self,
         registry: &Arc<Registry>,
         issuer: PdnId,
-        remote: Holder,
+        remote: Identity,
         peer_key: &[u8],
         refused: SessionAccess,
     ) -> Result<SessionAccess> {
-        if remote == holder_of(self.identity) {
+        if remote == identity_of(self.identity) {
             if !self.peer_is_own_device(peer_key).await? {
                 return Ok(refused);
             }
@@ -301,12 +301,12 @@ impl AccessBook {
         &self,
         registry: &Arc<Registry>,
         issuer: PdnId,
-        remote: Holder,
+        remote: Identity,
         peer_key: &[u8],
         refused: SessionAccess,
     ) -> Result<SessionAccess> {
         let connection = self.connection_with_peer(issuer)?;
-        if remote == holder_of(issuer) {
+        if remote == identity_of(issuer) {
             let listed = match &connection {
                 Some(connection) => device_listed(&connection.peer_doc, peer_key).await?,
                 None => false,
@@ -319,7 +319,7 @@ impl AccessBook {
                 ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
             });
         }
-        if remote != holder_of(self.identity) || !self.peer_is_own_device(peer_key).await? {
+        if remote != identity_of(self.identity) || !self.peer_is_own_device(peer_key).await? {
             return Ok(refused);
         }
         let Some(connection) = connection else {
@@ -570,15 +570,15 @@ impl AccessBook {
             .cloned())
     }
 
-    /// The connection with the identity a caller named, if the holder names
+    /// The connection with the identity a caller named, if the identity names
     /// one this identity is connected to.
-    fn connection_with(&self, holder: Holder) -> Result<Option<HostedConnection>> {
+    fn connection_with(&self, identity: Identity) -> Result<Option<HostedConnection>> {
         Ok(self
             .connections
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
             .iter()
-            .find(|c| holder_of(c.peer) == holder)
+            .find(|c| identity_of(c.peer) == identity)
             .cloned())
     }
 
@@ -634,7 +634,7 @@ async fn device_listed(doc: &Doc, device_key: &[u8]) -> Result<bool> {
     Ok(doc.get_one(query).await?.is_some())
 }
 
-/// Dial-side stance toward callers a scoped holder cannot resolve: serve
+/// Dial-side stance toward callers a scoped identity cannot resolve: serve
 /// nothing while still pulling its own updates.
 fn closed_egress() -> EntryFilter {
     Arc::new(|_entry: &pdn_store::SignedEntry| false)

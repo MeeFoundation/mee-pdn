@@ -15,7 +15,7 @@ use crate::{
     actor::OpenState,
     engine::LiveEvent,
     store::{DownloadPolicy, Query},
-    Author, AuthorId, Capability, CapabilityKind, Contact, DocTicket, Entry, Holder, NamespaceId,
+    Author, AuthorId, Capability, CapabilityKind, Contact, DocTicket, Entry, Identity, NamespaceId,
     PeerIdBytes, SignedEntry,
 };
 
@@ -192,12 +192,12 @@ pub struct RetractResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StartSyncRequest {
     pub doc_id: NamespaceId,
-    /// Each peer paired with the holder it is dialed as.
+    /// Each peer paired with the identity it is dialed as.
     pub peers: Vec<Contact>,
-    /// The holder a peer of this replica is dialed as when no contact and
+    /// The identity a peer of this replica is dialed as when no contact and
     /// no past session named one — an address book entry the engine
     /// recorded carries a node id and nothing else.
-    pub default_holder: Holder,
+    pub default_identity: Identity,
     /// Whether to join the replica's gossip swarm. Scoped access syncs
     /// without ever joining the swarm.
     #[serde(default = "default_join_gossip")]

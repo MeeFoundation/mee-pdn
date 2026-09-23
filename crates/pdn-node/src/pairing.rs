@@ -231,7 +231,7 @@ where
     }
 
     // The state is held only for the local verify-and-assemble: the guard
-    // drops before the reply, so no other lock holder waits on the dialer.
+    // drops before the reply, so no other lock identity waits on the dialer.
     let response_ticket = {
         let mut state = state_arc.lock().await;
 

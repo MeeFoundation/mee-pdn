@@ -1,8 +1,8 @@
 //! The docs protocol handler dispatches an accepted connection by the
-//! holder its first message names, before any replica is touched, and
-//! hands the streams to that holder's engine. What the session access
-//! provider of that engine is asked carries the holder the caller
-//! addressed and the holder the caller acts for.
+//! identity its first message names, before any replica is touched, and
+//! hands the streams to that identity's engine. What the session access
+//! provider of that engine is asked carries the identity the caller
+//! addressed and the identity the caller acts for.
 
 use std::{
     sync::{Arc, Mutex},
@@ -19,17 +19,17 @@ use pdn_store::{
         Doc, DocsApi,
     },
     net::{connect_and_sync, AbortReason, ConnectError},
-    protocol::{Docs, DocsDispatch, HolderResolver},
+    protocol::{Docs, DocsDispatch, IdentityResolver},
     store::Query,
-    Contact, Holder, NamespaceId, SessionAccess, SessionAccessFuture, SessionAccessProvider,
+    Contact, Identity, NamespaceId, SessionAccess, SessionAccessFuture, SessionAccessProvider,
     SessionRole,
 };
 
-const WORK: Holder = Holder::from_bytes([0xa2; 32]);
-const LEISURE: Holder = Holder::from_bytes([0xa3; 32]);
-const CALLER: Holder = Holder::from_bytes([0xb0; 32]);
-/// A holder no engine of the serving node answers for.
-const UNHOSTED: Holder = Holder::from_bytes([0xc0; 32]);
+const WORK: Identity = Identity::from_bytes([0xa2; 32]);
+const LEISURE: Identity = Identity::from_bytes([0xa3; 32]);
+const CALLER: Identity = Identity::from_bytes([0xb0; 32]);
+/// A identity no engine of the serving node answers for.
+const UNHOSTED: Identity = Identity::from_bytes([0xc0; 32]);
 
 const KEY: &[u8] = b"contact/email";
 const WORK_VALUE: &[u8] = b"alice@work.example";
@@ -39,8 +39,8 @@ const LEISURE_VALUE: &[u8] = b"alice@leisure.example";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Asked {
     namespace: NamespaceId,
-    holder: Holder,
-    caller: Holder,
+    identity: Identity,
+    caller: Identity,
     peer: PublicKey,
     role: SessionRole,
 }
@@ -51,18 +51,19 @@ type Log = Arc<Mutex<Vec<Asked>>>;
 fn recording() -> (SessionAccessProvider, Log) {
     let log: Log = Arc::default();
     let recorded = Arc::clone(&log);
-    let provider: SessionAccessProvider = Arc::new(move |namespace, holder, caller, peer, role| {
-        if let Ok(mut asked) = recorded.lock() {
-            asked.push(Asked {
-                namespace,
-                holder,
-                caller,
-                peer,
-                role,
-            });
-        }
-        Box::pin(std::future::ready(SessionAccess::whole())) as SessionAccessFuture
-    });
+    let provider: SessionAccessProvider =
+        Arc::new(move |namespace, identity, caller, peer, role| {
+            if let Ok(mut asked) = recorded.lock() {
+                asked.push(Asked {
+                    namespace,
+                    identity,
+                    caller,
+                    peer,
+                    role,
+                });
+            }
+            Box::pin(std::future::ready(SessionAccess::whole())) as SessionAccessFuture
+        });
     (provider, log)
 }
 
@@ -107,10 +108,10 @@ async fn serving_node() -> Result<Serving> {
     let leisure = Docs::memory(LEISURE, leisure_provider)
         .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
         .await?;
-    let resolve: HolderResolver = {
+    let resolve: IdentityResolver = {
         let work = work.clone();
         let leisure = leisure.clone();
-        Arc::new(move |holder| match holder {
+        Arc::new(move |identity| match identity {
             h if h == WORK => Some(work.clone()),
             h if h == LEISURE => Some(leisure.clone()),
             _ => None,
@@ -130,7 +131,7 @@ async fn serving_node() -> Result<Serving> {
     })
 }
 
-/// The dialing node: one engine, one holder, its own recording provider.
+/// The dialing node: one engine, one identity, its own recording provider.
 struct Dialing {
     router: Router,
     docs: Docs,
@@ -145,9 +146,9 @@ async fn dialing_node() -> Result<Dialing> {
     let docs = Docs::memory(CALLER, provider)
         .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
         .await?;
-    let resolve: HolderResolver = {
+    let resolve: IdentityResolver = {
         let docs = docs.clone();
-        Arc::new(move |holder| (holder == CALLER).then(|| docs.clone()))
+        Arc::new(move |identity| (identity == CALLER).then(|| docs.clone()))
     };
     let router = Router::builder(endpoint)
         .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
@@ -196,16 +197,16 @@ async fn holds(doc: &Doc, value: &[u8]) -> Result<bool> {
 }
 
 /// A node of two hosted identities is handed a session for each by the
-/// holder its first message names, and each engine's provider is asked
-/// about the holders that session carries — the one addressed and the
+/// identity its first message names, and each engine's provider is asked
+/// about the identities that session carries — the one addressed and the
 /// one the caller acts for.
 ///
-/// Denied: a session naming a holder the node does not host is refused
-/// exactly as one naming a replica the addressed holder does not hold,
+/// Denied: a session naming a identity the node does not host is refused
+/// exactly as one naming a replica the addressed identity does not hold,
 /// and neither engine's provider is asked about it — the connection is
 /// dispatched before any replica is touched.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
+async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
     let serving = serving_node().await?;
     let dialing = dialing_node().await?;
     let serving_addr = serving.router.endpoint().addr();
@@ -219,24 +220,24 @@ async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
     let leisure_namespace = leisure_here.id();
 
     // Allowed: one session per hosted identity, over one endpoint.
-    for (holder, doc, value) in [
+    for (identity, doc, value) in [
         (WORK, &work_here, WORK_VALUE),
         (LEISURE, &leisure_here, LEISURE_VALUE),
     ] {
         // Contacts only: no swarm, so the only session either node can
         // open is the dial this scenario makes.
-        doc.start_sync_scoped(vec![Contact::new(serving_addr.clone(), holder)], holder)
+        doc.start_sync_scoped(vec![Contact::new(serving_addr.clone(), identity)], identity)
             .await?;
         assert!(
             eventually(|| holds(doc, value)).await?,
-            "the session for {holder:?} carried nothing"
+            "the session for {identity:?} carried nothing"
         );
     }
 
     // Each engine was asked about its own session alone, and about the
-    // holders that session named. A pass may retry and the serving side
+    // identities that session named. A pass may retry and the serving side
     // dials back, so the accepted questions are compared as a set.
-    for (log, namespace, holder) in [
+    for (log, namespace, identity) in [
         (&serving.work_log, work_namespace, WORK),
         (&serving.leisure_log, leisure_namespace, LEISURE),
     ] {
@@ -244,23 +245,23 @@ async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
             .into_iter()
             .filter(|asked| asked.role == SessionRole::Accept)
             .collect();
-        distinct.sort_by_key(|asked| (asked.namespace, asked.holder, asked.caller));
+        distinct.sort_by_key(|asked| (asked.namespace, asked.identity, asked.caller));
         distinct.dedup();
         assert_eq!(
             distinct,
             vec![Asked {
                 namespace,
-                holder,
+                identity,
                 caller: CALLER,
                 peer: dialing_id,
                 role: SessionRole::Accept,
             }],
-            "the engine of {holder:?} was not asked about exactly its own session"
+            "the engine of {identity:?} was not asked about exactly its own session"
         );
     }
 
-    // Denied: a holder this node does not host, and a replica the
-    // addressed holder does not hold, refuse the same way.
+    // Denied: a identity this node does not host, and a replica the
+    // addressed identity does not hold, refuse the same way.
     let unhosted = connect_and_sync(
         dialing.router.endpoint(),
         &dialing.docs.engine().sync,
@@ -273,7 +274,7 @@ async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
         None,
     )
     .await
-    .expect_err("a holder the node does not host must be refused");
+    .expect_err("a identity the node does not host must be refused");
     let not_held = connect_and_sync(
         dialing.router.endpoint(),
         &dialing.docs.engine().sync,
@@ -286,7 +287,7 @@ async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
         None,
     )
     .await
-    .expect_err("a replica the addressed holder does not hold must be refused");
+    .expect_err("a replica the addressed identity does not hold must be refused");
     for refusal in [&unhosted, &not_held] {
         assert!(
             matches!(refusal, ConnectError::RemoteAbort(AbortReason::NotFound)),
@@ -294,11 +295,11 @@ async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
         );
     }
 
-    // The unhosted holder never reached an engine: no question names it.
+    // The unhosted identity never reached an engine: no question names it.
     for log in [&serving.work_log, &serving.leisure_log] {
         assert!(
-            asked(log).iter().all(|asked| asked.holder != UNHOSTED),
-            "a holder the node does not host reached an engine"
+            asked(log).iter().all(|asked| asked.identity != UNHOSTED),
+            "a identity the node does not host reached an engine"
         );
     }
 
@@ -307,10 +308,10 @@ async fn a_session_is_dispatched_by_the_holder_it_names() -> Result<()> {
     Ok(())
 }
 
-/// The dialing side's provider is asked about the same pair of holders
-/// under the dial role: the holder it addresses and the one it acts for.
+/// The dialing side's provider is asked about the same pair of identities
+/// under the dial role: the identity it addresses and the one it acts for.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_dialing_side_is_asked_about_the_holder_it_addresses() -> Result<()> {
+async fn the_dialing_side_is_asked_about_the_identity_it_addresses() -> Result<()> {
     let serving = serving_node().await?;
     let dialing = dialing_node().await?;
     let serving_addr = serving.router.endpoint().addr();
@@ -339,12 +340,12 @@ async fn the_dialing_side_is_asked_about_the_holder_it_addresses() -> Result<()>
     };
     assert_eq!(dial.namespace, namespace);
     assert_eq!(
-        dial.holder, WORK,
-        "the dial did not address the contact's holder"
+        dial.identity, WORK,
+        "the dial did not address the contact's identity"
     );
     assert_eq!(
         dial.caller, CALLER,
-        "the dial did not act as this node's holder"
+        "the dial did not act as this node's identity"
     );
 
     serving.router.shutdown().await?;

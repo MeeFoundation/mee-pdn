@@ -49,7 +49,7 @@ pub mod store;
 pub mod sync;
 
 mod heads;
-mod holder;
+mod identity;
 mod keys;
 mod ranger;
 
@@ -62,7 +62,7 @@ pub use self::{
         SessionRole,
     },
     heads::*,
-    holder::{Contact, Holder},
+    identity::{Contact, Identity},
     keys::*,
     ranger::ValidateOutcome,
     sync::*,

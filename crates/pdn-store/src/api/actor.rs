@@ -417,14 +417,14 @@ impl RpcActor {
                 crate::Capability::Write(secret)
             }
         };
-        self.start_sync(doc_id, vec![], self.holder())
+        self.start_sync(doc_id, vec![], self.identity())
             .await
             .map_err(|e| RpcError::new(&*e))?;
 
         Ok(ShareResponse(DocTicket {
             capability,
             nodes: vec![me],
-            holder: self.holder(),
+            identity: self.identity(),
         }))
     }
 
@@ -485,15 +485,15 @@ impl RpcActor {
         let StartSyncRequest {
             doc_id,
             peers,
-            default_holder,
+            default_identity,
             join_gossip,
         } = req;
         if join_gossip {
-            self.start_sync(doc_id, peers, default_holder)
+            self.start_sync(doc_id, peers, default_identity)
                 .await
                 .map_err(|e| RpcError::new(&*e))?;
         } else {
-            self.start_sync_scoped(doc_id, peers, default_holder)
+            self.start_sync_scoped(doc_id, peers, default_identity)
                 .await
                 .map_err(|e| RpcError::new(&*e))?;
         }

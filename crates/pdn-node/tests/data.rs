@@ -13,7 +13,7 @@ use pdn_node::{
 };
 use pdn_types::EntryPath;
 
-/// "Nothing arrived" is probed by waiting out a few of the ticket holder's
+/// "Nothing arrived" is probed by waiting out a few of the ticket identity's
 /// reconcile intervals.
 const RECONCILE: Duration = Duration::from_millis(500);
 
@@ -93,7 +93,7 @@ async fn writes_read_back_list_exactly_and_hand_over_by_ticket() -> Result<()> {
     tokio::time::sleep(SWARM_WINDOW).await;
     assert!(
         b.data().list(bob, alice, None).await?.is_empty(),
-        "a post-import write must not reach a bare-ticket holder over gossip"
+        "a post-import write must not reach a bare-ticket identity over gossip"
     );
     assert!(b.data().read(bob, alice, &after).await?.is_none());
 
@@ -159,9 +159,9 @@ async fn an_operation_acts_for_the_identity_it_names() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_names_the_identity_it_is_held_for() -> Result<()> {
     let issuer_rt = Runtime::spawn(SpawnOptions::memory()).await?;
-    let holder_rt = Runtime::spawn(SpawnOptions::memory()).await?;
+    let identity_rt = Runtime::spawn(SpawnOptions::memory()).await?;
     let issuer = issuer_rt.identity().create().await?;
-    let holder = holder_rt.identity().create().await?;
+    let identity = identity_rt.identity().create().await?;
     let unhosted = issuer_rt.identity().create().await?;
 
     let path = EntryPath::new("contact/email")?;
@@ -175,18 +175,22 @@ async fn an_import_names_the_identity_it_is_held_for() -> Result<()> {
         .await?;
 
     // Allowed: the identity that holds it registers the issuer.
-    holder_rt
+    identity_rt
         .data()
-        .import(holder, issuer, ticket.clone())
+        .import(identity, issuer, ticket.clone())
         .await?;
     assert!(
-        holder_rt.data().list(holder, issuer, None).await.is_ok(),
+        identity_rt
+            .data()
+            .list(identity, issuer, None)
+            .await
+            .is_ok(),
         "the importing identity must resolve the issuer it named"
     );
 
     // Denied: an identity this node does not host, refused at the same
     // call the binder makes.
-    let refused = holder_rt
+    let refused = identity_rt
         .data()
         .import(unhosted, issuer, ticket)
         .await
@@ -195,7 +199,7 @@ async fn an_import_names_the_identity_it_is_held_for() -> Result<()> {
         refused.downcast_ref::<UnknownIdentity>().is_some(),
         "the refusal did not name the unhosted identity: {refused:#}"
     );
-    let unknown = holder_rt
+    let unknown = identity_rt
         .data()
         .list(unhosted, issuer, None)
         .await
@@ -203,6 +207,6 @@ async fn an_import_names_the_identity_it_is_held_for() -> Result<()> {
     assert!(unknown.downcast_ref::<UnknownIdentity>().is_some());
 
     issuer_rt.shutdown().await?;
-    holder_rt.shutdown().await?;
+    identity_rt.shutdown().await?;
     Ok(())
 }

@@ -20,7 +20,7 @@ use test_utils::{eventually, host_identity, ids};
 const GRANTED: &str = "contact/email";
 const WITHHELD: &str = "notes/diary";
 
-/// A scoped holder has no gossip path, so a negative assertion is "the
+/// A scoped identity has no gossip path, so a negative assertion is "the
 /// reader retried over several passes and was refused"; at this cadence
 /// that is milliseconds rather than the production default's tens of
 /// seconds.
@@ -185,7 +185,7 @@ async fn two_identities_of_one_node_converge_what_the_grant_covers() -> Result<(
     );
 
     // Denied (a co-located identity with the ticket and no grant). Several
-    // reconcile passes: a scoped holder has no gossip path, so what it
+    // reconcile passes: a scoped identity has no gossip path, so what it
     // would obtain it obtains on a pass.
     node.import_namespace_scoped(ids::CAROL, ids::ALICE_AT_WORK, ticket)
         .await?;
@@ -535,7 +535,7 @@ async fn a_grant_widened_without_a_write_reaches_the_co_located_audience() -> Re
     Ok(())
 }
 
-/// A write reaches a co-located holder of the namespace within one
+/// A write reaches a co-located identity of the namespace within one
 /// reconcile interval, which is the announcement's doing: the write is
 /// made right after a pass has demonstrably run, so the next one is a
 /// whole interval away and what delivers inside the bound below cannot
@@ -543,10 +543,10 @@ async fn a_grant_widened_without_a_write_reaches_the_co_located_audience() -> Re
 ///
 /// Denied: the claim the grant withholds stays absent although the same
 /// announcement is what opened the session that carried the granted one
-/// — the announcement names a namespace and a holder, never an entry.
+/// — the announcement names a namespace and a identity, never an entry.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the arrangement and both waves in one place
-async fn a_write_reaches_a_co_located_holder_before_the_next_pass() -> Result<()> {
+async fn a_write_reaches_a_co_located_identity_before_the_next_pass() -> Result<()> {
     // Long enough that the bound below sits well inside it, short enough
     // that the arrangement converges over a handful of passes.
     const INTERVAL: Duration = Duration::from_secs(3);
@@ -686,7 +686,7 @@ async fn a_write_reaches_a_co_located_holder_before_the_next_pass() -> Result<()
     }
     assert!(
         announced,
-        "the write did not reach the co-located holder inside the interval"
+        "the write did not reach the co-located identity inside the interval"
     );
     assert_eq!(
         node.read_unnudged(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &withheld_path)

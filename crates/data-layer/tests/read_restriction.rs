@@ -4,8 +4,8 @@
 //! counterparty receives exactly that subset over reconciliation, and the
 //! withheld entries never arrive — content or existence. Per
 //! `code-practices/access-control-tests.md`, every allowed path sits next
-//! to its tightest denial: the outsider, the holder of the replica's
-//! ticket without a grant, and (for writes) the read-only grant holder.
+//! to its tightest denial: the outsider, the identity of the replica's
+//! ticket without a grant, and (for writes) the read-only grant identity.
 //!
 //! Establishment (the pairing dialogue) and device-set publication live in
 //! pdn-node; here the tickets and records travel by direct handover,
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, holder_of, AddrInfoOptions, ConnectionMetadataStore, Contact, GrantRead,
+    claim_id_of, identity_of, AddrInfoOptions, ConnectionMetadataStore, Contact, GrantRead,
     GrantedClaim, PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
@@ -241,7 +241,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         carol.list(ids::CAROL, ids::BOB, None).await?.is_empty(),
-        "a ticket holder without a grant must obtain nothing"
+        "a ticket identity without a grant must obtain nothing"
     );
     assert!(carol.read(ids::CAROL, ids::BOB, &email).await?.is_none());
 
@@ -762,7 +762,7 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
 }
 
 /// Mixed rights in one grant. Allowed: the write-granted claim round-trips.
-/// Denied: the same holder's write at the read-only claim, signed with the
+/// Denied: the same identity's write at the read-only claim, signed with the
 /// very secret the write ticket carries, never reaches the issuer.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
@@ -1085,7 +1085,10 @@ async fn a_device_the_issuer_has_not_seen_published_is_served_once_it_publishes(
     phone.set_doc_contacts(
         ids::ALICE,
         phone_own.namespace(),
-        vec![Contact::new(bob.dial_handle().addr(), holder_of(ids::BOB))],
+        vec![Contact::new(
+            bob.dial_handle().addr(),
+            identity_of(ids::BOB),
+        )],
     )?;
     phone_own.publish_device(phone.node_id()).await?;
 
@@ -1167,7 +1170,7 @@ async fn grant_one_claim_to(
 /// receive exactly the claim granted to it: rights follow the identity a
 /// session names, and are never the union of what the node's identities
 /// hold (ADR-0013). Both audiences dial from one node id, so only the
-/// holder the session names tells the two apart.
+/// identity the session names tells the two apart.
 ///
 /// Denied: neither audience obtains the other's claim — over the network
 /// from the issuer or over the in-process path from its co-located
@@ -1294,7 +1297,7 @@ async fn two_co_located_audiences_of_one_issuer_receive_each_its_own_claim() -> 
 }
 
 /// A data replica is refused a caller its identity's records entitle to
-/// nothing, the holder of that replica's own read ticket included, while
+/// nothing, the identity of that replica's own read ticket included, while
 /// the identity's directory and its connection metadata store stay bound
 /// to their tickets (Invariants 1 and 3).
 ///
@@ -1394,7 +1397,7 @@ async fn a_data_replica_no_record_judges_is_refused_its_own_ticket() -> Result<(
 ///
 /// Denied: the impersonating node's session is refused and its replica
 /// stays empty over several of its passes, beside the identical session
-/// from Alice's own node that succeeds. Both sessions name the holders
+/// from Alice's own node that succeeds. Both sessions name the identities
 /// themselves, through the fixture that lets a caller choose them, the
 /// way a forced write produces an entry the gate refuses.
 #[tokio::test(flavor = "multi_thread")]
@@ -1465,13 +1468,13 @@ async fn a_caller_is_admitted_only_where_the_named_identity_lists_its_node() -> 
     // Allowed: Alice's own node, naming her identity, is served — the
     // session itself is the verdict, and the entry follows it once its
     // payload has been fetched.
-    let toward_bob = Contact::new(bob.dial_handle().addr(), holder_of(ids::BOB));
+    let toward_bob = Contact::new(bob.dial_handle().addr(), identity_of(ids::BOB));
     alice
         .sync_as_for_test(
             ids::ALICE,
             ids::BOB,
             toward_bob.clone(),
-            holder_of(ids::ALICE),
+            identity_of(ids::ALICE),
         )
         .await?;
     assert!(
@@ -1491,7 +1494,7 @@ async fn a_caller_is_admitted_only_where_the_named_identity_lists_its_node() -> 
         .await?;
     mallory.set_namespace_contacts(ids::DAVE, ids::BOB, Vec::new())?;
     let refused = mallory
-        .sync_as_for_test(ids::DAVE, ids::BOB, toward_bob, holder_of(ids::ALICE))
+        .sync_as_for_test(ids::DAVE, ids::BOB, toward_bob, identity_of(ids::ALICE))
         .await
         .expect_err("a caller the named identity's records do not list must be refused");
     assert!(

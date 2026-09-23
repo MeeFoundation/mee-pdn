@@ -152,7 +152,7 @@ pub struct RetractionMarker {
     pub timestamp: u64,
 }
 
-/// The owning identity is not kept here — the handle's holder knows which
+/// The owning identity is not kept here — the handle's identity knows which
 /// identity it serves.
 #[derive(Debug)]
 pub struct PrivateMetadataStore {
@@ -344,7 +344,7 @@ impl PrivateMetadataStore {
     }
 
     /// Promote `device` from pending to confirmed. Written by the newcomer
-    /// itself: only a holder of the write ticket can, so the record is
+    /// itself: only a identity of the write ticket can, so the record is
     /// evidence the linking reply arrived — which the inviter cannot
     /// establish on its own.
     pub async fn confirm_device(&self, device: NodeId) -> Result<()> {

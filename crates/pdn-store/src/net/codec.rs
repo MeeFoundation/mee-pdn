@@ -13,7 +13,7 @@ use tracing::{debug, trace, Span};
 use crate::{
     actor::SyncHandle,
     net::{AbortReason, AcceptError, AcceptOutcome, ConnectError},
-    Holder, NamespaceId, SyncOutcome,
+    Identity, NamespaceId, SyncOutcome,
 };
 
 #[derive(Debug, Default)]
@@ -69,8 +69,8 @@ impl Encoder<Message> for SyncCodec {
 
 /// Sync Protocol
 ///
-/// - Init message: names the namespace, the holder whose replica is
-///   addressed and the holder the caller acts for
+/// - Init message: names the namespace, the identity whose replica is
+///   addressed and the identity the caller acts for
 /// - N Sync messages
 ///
 /// On any error and on success the substream is closed.
@@ -84,7 +84,7 @@ pub(super) enum Message {
     Abort { reason: AbortReason },
 }
 
-/// A session's first message. The two holders are what an accepted
+/// A session's first message. The two identities are what an accepted
 /// connection is dispatched by, so they are read before any replica is
 /// touched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,16 +92,16 @@ pub(super) struct Init {
     /// Namespace to sync
     pub(super) namespace: NamespaceId,
     /// Whose replica the session addresses.
-    pub(super) holder: Holder,
+    pub(super) identity: Identity,
     /// Whom the caller acts for.
-    pub(super) caller: Holder,
+    pub(super) caller: Identity,
     /// Initial message
     pub(super) message: crate::sync::ProtocolMessage,
 }
 
 /// Runs the initiator side of the sync protocol.
 ///
-/// `holder` names whose replica this session addresses on the peer and
+/// `identity` names whose replica this session addresses on the peer and
 /// `caller` whom this side acts for; the peer dispatches the connection by
 /// the first and judges the session by the second.
 ///
@@ -119,8 +119,8 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     handle: &SyncHandle,
     namespace: NamespaceId,
-    holder: Holder,
-    caller: Holder,
+    identity: Identity,
+    caller: Identity,
     peer: PublicKey,
     filter: Option<crate::filter::EntryFilter>,
     ingest: Option<crate::filter::SessionIngest>,
@@ -145,7 +145,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .map_err(ConnectError::sync)?;
     let init_message = Message::Init(Init {
         namespace,
-        holder,
+        identity,
         caller,
         message,
     });
@@ -245,12 +245,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> SessionOpening<R, W> {
 
 impl<R, W> SessionOpening<R, W> {
     /// Whose replica this session addresses.
-    pub fn holder(&self) -> Holder {
-        self.init.holder
+    pub fn identity(&self) -> Identity {
+        self.init.identity
     }
 
     /// Whom the caller acts for.
-    pub fn caller(&self) -> Holder {
+    pub fn caller(&self) -> Identity {
         self.init.caller
     }
 
@@ -281,7 +281,7 @@ impl<R, W> std::fmt::Debug for SessionOpening<R, W> {
         f.debug_struct("SessionOpening")
             .field("peer", &self.peer.fmt_short().to_string())
             .field("namespace", &self.init.namespace.fmt_short().to_string())
-            .field("holder", &self.init.holder)
+            .field("identity", &self.init.identity)
             .field("caller", &self.init.caller)
             .finish()
     }
@@ -299,7 +299,7 @@ pub(super) async fn run_bob<R, W, F, Fut>(
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
     let opening = SessionOpening::read(writer, reader, peer).await?;
@@ -370,7 +370,7 @@ impl BobState {
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
-        F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+        F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
         Fut: Future<Output = AcceptOutcome>,
     {
         let res = self.run_rounds(writer, reader, init, sync, accept_cb).await;
@@ -406,12 +406,12 @@ impl BobState {
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
-        F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut,
+        F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
         Fut: Future<Output = AcceptOutcome>,
     {
         let Init {
             namespace,
-            holder,
+            identity,
             caller,
             message,
         } = init;
@@ -423,7 +423,7 @@ impl BobState {
         // the caller is never told the exchange ended and holds the pair
         // until restart.
         self.namespace = Some(namespace);
-        match accept_cb(namespace, holder, caller, self.peer).await {
+        match accept_cb(namespace, identity, caller, self.peer).await {
             AcceptOutcome::Allow { filter, ingest } => {
                 trace!("allow request");
                 self.filter = filter;
@@ -537,19 +537,19 @@ mod tests {
         AuthorId, NamespaceSecret,
     };
 
-    /// One holder on both sides: these scenarios test the codec, not the
-    /// dispatch the holders exist for.
-    const TEST_HOLDER: Holder = Holder::from_bytes([0u8; 32]);
+    /// One identity on both sides: these scenarios test the codec, not the
+    /// dispatch the identities exist for.
+    const TEST_HOLDER: Identity = Identity::from_bytes([0u8; 32]);
     /// A cache big enough that nothing in a scenario evicts.
     #[cfg(feature = "fs-store")]
     const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
-    /// An empty first message for `namespace`, under the one test holder.
+    /// An empty first message for `namespace`, under the one test identity.
     /// `super::`: this module shadows the wire `Message` with its own alias.
     fn init_frame(namespace: NamespaceId) -> super::Message {
         super::Message::Init(super::Init {
             namespace,
-            holder: TEST_HOLDER,
+            identity: TEST_HOLDER,
             caller: TEST_HOLDER,
             message: crate::ranger::Message::from_parts(vec![]),
         })
@@ -640,7 +640,7 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_handle2,
-                |_namespace, _holder, _caller, _peer| {
+                |_namespace, _identity, _caller, _peer| {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
                         ingest: None,
@@ -849,7 +849,7 @@ mod tests {
             bob_handle,
             bob_node_pubkey,
             namespace,
-            |_namespace, _holder, _caller, _peer| {
+            |_namespace, _identity, _caller, _peer| {
                 std::future::ready(AcceptOutcome::Allow {
                     filter: None,
                     ingest: None,
@@ -877,7 +877,7 @@ mod tests {
         Result<(NamespaceId, SyncOutcome), AcceptError>,
     )>
     where
-        F: Fn(NamespaceId, Holder, Holder, PublicKey) -> Fut + Send + 'static,
+        F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut + Send + 'static,
         Fut: Future<Output = AcceptOutcome> + Send,
     {
         alice_handle
@@ -1015,20 +1015,20 @@ mod tests {
         Ok((handle, namespace.id()))
     }
 
-    /// A session carries both holders to the serving side, over a stream
+    /// A session carries both identities to the serving side, over a stream
     /// pair with no network under it.
     ///
-    /// Denied: a caller that names a holder the serving side refuses sees
+    /// Denied: a caller that names a identity the serving side refuses sees
     /// its request declined and no entry served.
     #[tokio::test]
-    async fn a_session_names_both_holders_to_the_serving_side() -> Result<()> {
+    async fn a_session_names_both_identities_to_the_serving_side() -> Result<()> {
         let mut rng = rand::rng();
         let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
         let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
         let namespace = NamespaceSecret::new(&mut rng);
         let ns = namespace.id();
-        let addressed = Holder::from_bytes([7u8; 32]);
-        let acting = Holder::from_bytes([9u8; 32]);
+        let addressed = Identity::from_bytes([7u8; 32]);
+        let acting = Identity::from_bytes([9u8; 32]);
 
         let mut alice_store = store::Store::memory();
         let author = alice_store.new_author(&mut rng)?;
@@ -1042,7 +1042,7 @@ mod tests {
         alice.open(ns, OpenOpts::default().sync()).await?;
         bob.open(ns, OpenOpts::default().sync()).await?;
 
-        let seen: Arc<Mutex<Vec<(Holder, Holder)>>> = Arc::default();
+        let seen: Arc<Mutex<Vec<(Identity, Identity)>>> = Arc::default();
         let (alice_io, bob_io) = tokio::io::duplex(1024);
         let (mut alice_reader, mut alice_writer) = tokio::io::split(alice_io);
         let (bob_reader, bob_writer) = tokio::io::split(bob_io);
@@ -1066,8 +1066,8 @@ mod tests {
         let observed = Arc::clone(&seen);
         let serve = async move {
             let opening = SessionOpening::read(bob_writer, bob_reader, alice_peer).await?;
-            assert_eq!(opening.holder(), addressed, "the addressed holder");
-            assert_eq!(opening.caller(), acting, "the caller's holder");
+            assert_eq!(opening.identity(), addressed, "the addressed identity");
+            assert_eq!(opening.caller(), acting, "the caller's identity");
             let (peer, init, mut reader, mut writer) = opening.into_parts();
             let mut state = BobState::new(peer);
             state
@@ -1076,8 +1076,8 @@ mod tests {
                     &mut reader,
                     init,
                     bob.clone(),
-                    move |_ns, holder, caller, _peer| {
-                        observed.lock().unwrap().push((holder, caller));
+                    move |_ns, identity, caller, _peer| {
+                        observed.lock().unwrap().push((identity, caller));
                         std::future::ready(AcceptOutcome::Allow {
                             filter: None,
                             ingest: None,
@@ -1096,22 +1096,22 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             &[(addressed, acting)],
-            "the accept decision saw the holders the caller named"
+            "the accept decision saw the identities the caller named"
         );
 
         alice.shutdown().await?;
         Ok(())
     }
 
-    /// A first message missing the caller's holder does not decode, so no
+    /// A first message missing the caller's identity does not decode, so no
     /// session can be opened without one.
     #[test]
     fn an_init_without_the_caller_does_not_decode() {
-        /// The first message as it would read without the second holder.
+        /// The first message as it would read without the second identity.
         #[derive(Serialize)]
         struct InitWithoutCaller {
             namespace: NamespaceId,
-            holder: Holder,
+            identity: Identity,
             message: crate::sync::ProtocolMessage,
         }
         #[derive(Serialize)]
@@ -1122,13 +1122,13 @@ mod tests {
         let namespace = NamespaceSecret::from_bytes(&[3u8; 32]).id();
         let bytes = postcard::to_stdvec(&Truncated::Init(InitWithoutCaller {
             namespace,
-            holder: TEST_HOLDER,
+            identity: TEST_HOLDER,
             message: crate::ranger::Message::from_parts(vec![]),
         }))
         .expect("serialize");
 
         postcard::from_bytes::<super::Message>(&bytes)
-            .expect_err("a first message without the caller's holder decoded");
+            .expect_err("a first message without the caller's identity decoded");
     }
 
     /// Both sides of a completed sync exchange release their session
@@ -1148,7 +1148,7 @@ mod tests {
             bob_handle.clone(),
             bob_peer_id,
             namespace_id,
-            |_namespace, _holder, _caller, _peer| {
+            |_namespace, _identity, _caller, _peer| {
                 std::future::ready(AcceptOutcome::Allow {
                     filter: None,
                     ingest: None,
@@ -1186,7 +1186,7 @@ mod tests {
             bob_handle.clone(),
             bob_peer_id,
             namespace_id,
-            |_namespace, _holder, _caller, _peer| {
+            |_namespace, _identity, _caller, _peer| {
                 std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound))
             },
         )
@@ -1331,7 +1331,7 @@ mod tests {
         // namespace used to be lost.
         handle.open(namespace_id, OpenOpts::default()).await?;
 
-        let allow = |_ns, _holder, _caller, _peer| {
+        let allow = |_ns, _identity, _caller, _peer| {
             std::future::ready(AcceptOutcome::Allow {
                 filter: None,
                 ingest: None,
@@ -1473,7 +1473,7 @@ mod tests {
         peer_writer
             .send(super::Message::Init(super::Init {
                 namespace: namespace_id,
-                holder: TEST_HOLDER,
+                identity: TEST_HOLDER,
                 caller: TEST_HOLDER,
                 message: refused,
             }))
@@ -1489,7 +1489,7 @@ mod tests {
                 &mut bob_reader,
                 init,
                 handle.clone(),
-                |_ns, _holder, _caller, _peer| {
+                |_ns, _identity, _caller, _peer| {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
                         ingest: None,
@@ -1850,7 +1850,7 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_run,
-                |_namespace, _holder, _caller, _peer| {
+                |_namespace, _identity, _caller, _peer| {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
                         ingest: None,
@@ -1940,7 +1940,7 @@ mod tests {
                     &mut reader,
                     init,
                     bob_run,
-                    |_namespace, _holder, _caller, _peer| {
+                    |_namespace, _identity, _caller, _peer| {
                         std::future::ready(AcceptOutcome::Allow {
                             filter: None,
                             ingest: None,
@@ -1958,7 +1958,7 @@ mod tests {
             writer
                 .send(super::Message::Init(super::Init {
                     namespace: ns,
-                    holder: TEST_HOLDER,
+                    identity: TEST_HOLDER,
                     caller: TEST_HOLDER,
                     message,
                 }))
@@ -2039,7 +2039,7 @@ mod tests {
         alice_framed
             .send(super::Message::Init(super::Init {
                 namespace: ns,
-                holder: TEST_HOLDER,
+                identity: TEST_HOLDER,
                 caller: TEST_HOLDER,
                 message,
             }))
@@ -2051,7 +2051,7 @@ mod tests {
         let alice_end = std::sync::Arc::new(std::sync::Mutex::new(Some(alice_framed)));
         let accept_cb = {
             let alice_end = std::sync::Arc::clone(&alice_end);
-            move |_namespace, _holder, _caller, _peer| {
+            move |_namespace, _identity, _caller, _peer| {
                 alice_end.lock().unwrap().take();
                 std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound))
             }

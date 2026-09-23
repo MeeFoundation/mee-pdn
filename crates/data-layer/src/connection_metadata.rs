@@ -109,7 +109,7 @@ pub fn peer_ticket_kind(peer: &PdnId) -> String {
 }
 
 /// One direction of a connection's metadata channel. The issuing identity
-/// and the counterparty are not kept here — the handle's holder knows which
+/// and the counterparty are not kept here — the handle's identity knows which
 /// connection and direction it serves.
 #[derive(Debug, Clone)]
 pub struct ConnectionMetadataStore {
@@ -355,7 +355,7 @@ mod tests {
         DocTicket::new(
             Capability::Write(NamespaceSecret::from_bytes(&[7u8; 32])),
             vec![EndpointAddr::new(node)],
-            crate::holder_of(pdn_types::PdnId::from_bytes([3u8; 32])),
+            crate::identity_of(pdn_types::PdnId::from_bytes([3u8; 32])),
         )
     }
 

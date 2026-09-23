@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, holder_of, AddrInfoOptions, ConnectionMetadataStore, Contact, DocTicket,
+    claim_id_of, identity_of, AddrInfoOptions, ConnectionMetadataStore, Contact, DocTicket,
     EndpointId, GrantedClaim, PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NodeId, NonEmpty, PdnId};
@@ -517,7 +517,7 @@ async fn an_import_naming_another_issuer_is_refused_before_it_rewrites_tracking(
 
     // A sibling device of Alice's own, as the product's contacts name one.
     let sibling_node = spawn_node().await?;
-    let sibling = Contact::new(sibling_node.dial_handle().addr(), holder_of(ids::ALICE));
+    let sibling = Contact::new(sibling_node.dial_handle().addr(), identity_of(ids::ALICE));
     alice.set_namespace_contacts(ids::ALICE, ids::ALICE, vec![sibling.clone()])?;
 
     // What a counterparty publishes: a ticket on Alice's own namespace,

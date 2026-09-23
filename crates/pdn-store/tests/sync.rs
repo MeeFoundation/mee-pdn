@@ -143,7 +143,7 @@ async fn sync_simple() -> Result<()> {
 /// One undecodable gossip message does not end a namespace's receive loop:
 /// what comes after it is still delivered, and the next write still arrives
 /// live. The sender is a bare gossip peer, not a docs node — the topic id is
-/// the namespace id, which any ticket carries, so this is what a ticket holder
+/// the namespace id, which any ticket carries, so this is what a ticket identity
 /// can do with the ticket alone.
 ///
 /// Ordering: the sender leaves the topic right after the message, and its

@@ -80,7 +80,7 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
 }
 
 /// A node holding `ticket` and nothing else, pointed at `target`'s address:
-/// the bare ticket holder the denials probe with. It holds the ticket for
+/// the bare ticket identity the denials probe with. It holds the ticket for
 /// [`PROBE`], an identity of its own, because every replica sits in one.
 /// Its import fires a sync attempt now and every interval after.
 async fn ticket_holder_dialing(
@@ -99,7 +99,7 @@ async fn ticket_holder_dialing(
     Ok(probe)
 }
 
-/// The identity the bare ticket holder acts as.
+/// The identity the bare ticket identity acts as.
 const PROBE: pdn_types::PdnId = ids::DAVE;
 
 /// The hosted-identities record's file name, as the runtime writes it.
@@ -394,7 +394,7 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
 /// evidence is the counterparty's replica, not the memo the restart
 /// cleared. The re-grant imports again with no ceremony, and a withdrawal
 /// after the restart removes exactly that binding. Denied throughout: a
-/// bare holder of the read ticket, pointed at the restarted runtime by
+/// bare identity of the read ticket, pointed at the restarted runtime by
 /// hand, obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one outage, its denial and its re-grant in the same place
@@ -482,7 +482,7 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
         "the withdrawal written during the outage must close the replica"
     );
 
-    // Denial: the ticket holder, dialing the restarted runtime itself;
+    // Denial: the ticket identity, dialing the restarted runtime itself;
     // asserted below, after a proven wave.
     let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
 
@@ -515,11 +515,11 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         probe.read(PROBE, issuer, &path).await?.is_none(),
-        "a ticket holder with no grant must obtain nothing from the restarted node"
+        "a ticket identity with no grant must obtain nothing from the restarted node"
     );
     assert!(
         probe.list(PROBE, issuer, None).await?.is_empty(),
-        "a ticket holder with no grant must not even list the namespace"
+        "a ticket identity with no grant must not even list the namespace"
     );
 
     // The withdrawal with the runtime on removes the binding the re-import
@@ -653,7 +653,7 @@ async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
 /// A connection and its grant come back after a restart from the durable
 /// records alone — listed, readable, the granted entries readable once the
 /// pair's first sweep has run — and an entry the issuer writes afterwards
-/// arrives, so what came back is a live replica. Denied: a bare holder of
+/// arrives, so what came back is a live replica. Denied: a bare identity of
 /// the read ticket pointed at the restarted runtime obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one restart, its liveness and its denial in the same place
@@ -757,11 +757,11 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         probe.read(PROBE, issuer, &path).await?.is_none(),
-        "a ticket holder with no grant must obtain nothing from the restarted node"
+        "a ticket identity with no grant must obtain nothing from the restarted node"
     );
     assert!(
         probe.list(PROBE, issuer, None).await?.is_empty(),
-        "a ticket holder with no grant must not even list the namespace"
+        "a ticket identity with no grant must not even list the namespace"
     );
 
     probe.shutdown().await?;
@@ -771,9 +771,9 @@ async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
 }
 
 /// A grant published from a device that is then lost reaches the issuer's
-/// other device from the audience's, the only live holder of the record;
+/// other device from the audience's, the only live identity of the record;
 /// without it the sibling would refuse the audience fail-closed while the
-/// issuer believes the grant published. Denied: a bare holder of the read
+/// issuer believes the grant published. Denied: a bare identity of the read
 /// ticket obtains nothing from the recovered device.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the loss and the recovery in one place
@@ -865,11 +865,11 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
         probe.read(PROBE, issuer, &path).await?.is_none(),
-        "a ticket holder with no grant must obtain nothing from the recovered device"
+        "a ticket identity with no grant must obtain nothing from the recovered device"
     );
     assert!(
         probe.list(PROBE, issuer, None).await?.is_empty(),
-        "a ticket holder with no grant must not even list the namespace"
+        "a ticket identity with no grant must not even list the namespace"
     );
 
     probe.shutdown().await?;

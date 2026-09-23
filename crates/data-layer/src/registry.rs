@@ -12,7 +12,7 @@ use pdn_types::PdnId;
 /// on the tracked doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServingPosture {
-    /// Ticket-bounded: the whole replica to any ticket holder — the stance a
+    /// Ticket-bounded: the whole replica to any ticket identity — the stance a
     /// device replicating a store re-serves the next device under.
     Serve,
     /// Grantee: the slice is served to the devices of the grant's audience

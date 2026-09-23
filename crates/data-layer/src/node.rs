@@ -31,7 +31,7 @@ use pdn_store::{
     },
     protocol::{Docs, DocsDispatch},
     store::Query,
-    AuthorId, Contact, DocTicket, Holder, NamespaceId, ALPN as DOCS_ALPN,
+    AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
 };
 use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
 use tokio::sync::oneshot;
@@ -255,16 +255,16 @@ enum SyncStrategy {
 /// One doc under the reconcile pass. The engine records a peer only after
 /// one successful exchange, so the import-time contacts are the only
 /// recovery path for a replica whose initial exchange died. Each contact
-/// carries the holder it is dialed as.
+/// carries the identity it is dialed as.
 #[derive(Debug, Clone)]
 struct TrackedDoc {
     doc: Doc,
     contacts: Vec<Contact>,
     strategy: SyncStrategy,
     /// Whom a peer of this replica is dialed as when no contact names one
-    /// — the swarm's own holder: the issuer for a data namespace, the
+    /// — the swarm's own identity: the issuer for a data namespace, the
     /// identity for a store its devices share.
-    default_holder: Holder,
+    default_identity: Identity,
 }
 
 /// What one [`SyncNode::import_namespace`] did, so that
@@ -300,15 +300,15 @@ struct HostedStack {
     /// cannot pile up attempts against one replica.
     nudges_in_flight: Mutex<HashSet<NamespaceId>>,
     /// Announcements of a local write already on their way to a co-located
-    /// holder. One write that finds the pair busy is queued by the engine
+    /// identity. One write that finds the pair busy is queued by the engine
     /// and replayed, so the rest of a batch buys nothing but a task, a pipe
     /// and a message through the actor's inbox each.
-    announcements_in_flight: Mutex<HashSet<(NamespaceId, Holder)>>,
+    announcements_in_flight: Mutex<HashSet<(NamespaceId, Identity)>>,
 }
 
 impl HostedStack {
-    fn holder(&self) -> pdn_store::Holder {
-        crate::access::holder_of(self.identity)
+    fn identity(&self) -> pdn_store::Identity {
+        crate::access::identity_of(self.identity)
     }
 
     fn track(
@@ -316,7 +316,7 @@ impl HostedStack {
         doc: &Doc,
         contacts: Vec<Contact>,
         strategy: SyncStrategy,
-        default_holder: Holder,
+        default_identity: Identity,
     ) -> Result<()> {
         let mut docs = self
             .tracked_docs
@@ -328,7 +328,7 @@ impl HostedStack {
                 doc: doc.clone(),
                 contacts,
                 strategy,
-                default_holder,
+                default_identity,
             },
         );
         Ok(())
@@ -429,13 +429,13 @@ impl SyncNode {
         let retraction = Arc::new(retraction);
 
         let identities: Identities = Arc::default();
-        let resolver: pdn_store::protocol::HolderResolver = {
+        let resolver: pdn_store::protocol::IdentityResolver = {
             let identities = Arc::clone(&identities);
-            Arc::new(move |holder: pdn_store::Holder| {
+            Arc::new(move |identity: pdn_store::Identity| {
                 let hosted = identities.read().ok()?;
                 hosted
                     .values()
-                    .find(|stack| stack.holder() == holder)
+                    .find(|stack| stack.identity() == identity)
                     .map(|stack| stack.docs.clone())
             })
         };
@@ -495,7 +495,7 @@ impl SyncNode {
                 observer_tracker.record_rejection(identity, namespace, reject, peer);
             }))
             // A node's own gossip broadcast never reaches its other
-            // subscribers, so a co-located holder of the namespace is told
+            // subscribers, so a co-located identity of the namespace is told
             // here and reconciles over the in-process path.
             .local_write_announcer({
                 let identities = Arc::clone(&identities);
@@ -504,12 +504,12 @@ impl SyncNode {
                 })
             })
             // A contact naming this node — from a ticket, a device record,
-            // a contact list — reaches its holder inside the process.
+            // a contact list — reaches its identity inside the process.
             .in_process_dialer(Arc::new(move |namespace, callee| {
                 reconcile_with_co_located(
                     &identities,
                     namespace,
-                    crate::access::holder_of(identity),
+                    crate::access::identity_of(identity),
                     Some(callee),
                 );
             }))
@@ -576,10 +576,12 @@ impl SyncNode {
         access: &Arc<AccessBook>,
         registry: &Arc<Registry>,
     ) -> Result<(pdn_store::protocol::Builder, Option<usize>)> {
-        let holder = crate::access::holder_of(identity);
+        // The store's own name for the identity: the same one, as opaque
+        // bytes it compares and never interprets.
+        let held_for = crate::access::identity_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
         Ok(match &self.storage {
-            StorageConfig::Memory => (Docs::memory(holder, provider), None),
+            StorageConfig::Memory => (Docs::memory(held_for, provider), None),
             StorageConfig::Directory(directory) => {
                 let own = identity_directory(directory, identity);
                 std::fs::create_dir_all(&own).with_context(|| {
@@ -596,7 +598,10 @@ impl SyncNode {
                     identities = held,
                     "the replica store opens at its share of the node's cache budget"
                 );
-                (Docs::persistent(own, share, holder, provider), Some(share))
+                (
+                    Docs::persistent(own, share, held_for, provider),
+                    Some(share),
+                )
             }
         })
     }
@@ -706,7 +711,7 @@ impl SyncNode {
             &doc,
             contacts.clone(),
             SyncStrategy::Swarm,
-            crate::access::holder_of(issuer),
+            crate::access::identity_of(issuer),
         )?;
         let _displaced =
             stack
@@ -714,7 +719,7 @@ impl SyncNode {
                 .register_data(issuer, doc.clone(), ServingPosture::Serve)?;
         let import = NamespaceImport { identity, issuer };
         if let Err(err) = doc
-            .start_sync(contacts, crate::access::holder_of(issuer))
+            .start_sync(contacts, crate::access::identity_of(issuer))
             .await
         {
             let _ = self.undo_import_namespace(import).await;
@@ -770,7 +775,7 @@ impl SyncNode {
             &doc,
             contacts.clone(),
             SyncStrategy::ContactsOnly,
-            crate::access::holder_of(issuer),
+            crate::access::identity_of(issuer),
         )?;
         let _displaced =
             stack
@@ -784,7 +789,7 @@ impl SyncNode {
             return Err(err);
         }
         if let Err(err) = doc
-            .start_sync_scoped(contacts, crate::access::holder_of(issuer))
+            .start_sync_scoped(contacts, crate::access::identity_of(issuer))
             .await
         {
             let _ = self.undo_import_namespace(import).await;
@@ -795,7 +800,7 @@ impl SyncNode {
 
     /// Replace the reconciliation contacts of `issuer`'s data namespace —
     /// replacement is what lets a withdrawn device stop being dialed. Each
-    /// contact names the holder it is dialed as.
+    /// contact names the identity it is dialed as.
     /// Refuses with [`UnknownIssuer`] whether the issuer was never bound or
     /// is bound but untracked: silently dropping the set would starve the
     /// replica unattributably.
@@ -903,7 +908,7 @@ impl SyncNode {
     }
 
     /// Open one session for `issuer`'s replica against `contact`, naming
-    /// `caller` as the holder this side acts for — whoever this node
+    /// `caller` as the identity this side acts for — whoever this node
     /// hosts. The session a caller that claims an identity it does not
     /// hold produces, as [`write`](Self::write) past a grant produces an
     /// entry the issuer's gate refuses. `Err` is the peer's refusal.
@@ -913,7 +918,7 @@ impl SyncNode {
         identity: PdnId,
         issuer: PdnId,
         contact: Contact,
-        caller: Holder,
+        caller: Identity,
     ) -> Result<()> {
         let stack = self.require(identity)?;
         let namespace = stack
@@ -932,7 +937,7 @@ impl SyncNode {
                 self.router.endpoint(),
                 &stack.docs.engine().sync,
                 namespace,
-                contact.holder,
+                contact.identity,
                 caller,
                 contact.addr.clone(),
                 None,
@@ -1170,7 +1175,7 @@ impl SyncNode {
     pub(crate) async fn new_doc(&self, identity: PdnId) -> Result<Doc> {
         let stack = self.require(identity)?;
         let doc = stack.api.create().await?;
-        stack.track(&doc, Vec::new(), SyncStrategy::Swarm, stack.holder())?;
+        stack.track(&doc, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
         Ok(doc)
     }
 
@@ -1202,7 +1207,7 @@ impl SyncNode {
         else {
             return Ok(None);
         };
-        stack.track(&doc, Vec::new(), SyncStrategy::Swarm, stack.holder())?;
+        stack.track(&doc, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
         Ok(Some(doc))
     }
 
@@ -1231,7 +1236,7 @@ impl SyncNode {
         let stack = self.require(identity)?;
         Self::guard_shared_import(&stack, ticket.capability.id())?;
         let contacts = ticket.contacts();
-        let minted_by = ticket.holder;
+        let minted_by = ticket.identity;
         let doc = stack.api.import(ticket).await?;
         stack.track(&doc, contacts, SyncStrategy::Swarm, minted_by)?;
         Ok(doc)
@@ -1366,7 +1371,7 @@ impl SyncNode {
         let _detached = tokio::spawn(async move {
             let _ = tracked
                 .doc
-                .start_sync_scoped(tracked.contacts, tracked.default_holder)
+                .start_sync_scoped(tracked.contacts, tracked.default_identity)
                 .await;
             if let Ok(mut in_flight) = stack.nudges_in_flight.lock() {
                 in_flight.remove(&namespace);
@@ -1547,39 +1552,39 @@ async fn holds_namespace(api: &DocsApi, namespace: NamespaceId) -> Result<bool> 
     Ok(false)
 }
 
-/// Reconcile `namespace` between `source` and the holders of this same
+/// Reconcile `namespace` between `source` and the identities of this same
 /// node that hold it — `callee` alone when a contact named one, every
-/// other holder of it when a write announces. Content-free either way:
+/// other identity of it when a write announces. Content-free either way:
 /// what the receiving identity obtains comes through the session and its
 /// filter.
 fn reconcile_with_co_located(
     identities: &Identities,
     namespace: NamespaceId,
-    source: Holder,
-    callee: Option<Holder>,
+    source: Identity,
+    callee: Option<Identity>,
 ) {
     let Ok(hosted) = identities.read() else {
         return;
     };
-    let Some(from) = hosted.values().find(|stack| stack.holder() == source) else {
+    let Some(from) = hosted.values().find(|stack| stack.identity() == source) else {
         return;
     };
     let from = Arc::clone(from);
     let targets: Vec<Arc<HostedStack>> = hosted
         .values()
-        .filter(|stack| stack.holder() != source)
-        .filter(|stack| callee.is_none_or(|callee| stack.holder() == callee))
+        .filter(|stack| stack.identity() != source)
+        .filter(|stack| callee.is_none_or(|callee| stack.identity() == callee))
         .filter(|stack| matches!(stack.tracked(namespace), Ok(Some(_))))
         .cloned()
         .collect();
     drop(hosted);
     for target in targets {
-        let holder = target.holder();
+        let identity = target.identity();
         {
             let Ok(mut in_flight) = from.announcements_in_flight.lock() else {
                 continue;
             };
-            if !in_flight.insert((namespace, holder)) {
+            if !in_flight.insert((namespace, identity)) {
                 continue;
             }
         }
@@ -1588,10 +1593,10 @@ fn reconcile_with_co_located(
             let _ = from
                 .docs
                 .engine()
-                .sync_in_process(target.docs.engine(), namespace, holder)
+                .sync_in_process(target.docs.engine(), namespace, identity)
                 .await;
             if let Ok(mut in_flight) = from.announcements_in_flight.lock() {
-                in_flight.remove(&(namespace, holder));
+                in_flight.remove(&(namespace, identity));
             }
         });
     }
@@ -1907,13 +1912,13 @@ async fn reconcile_pass(
                     SyncStrategy::ContactsOnly => {
                         tracked
                             .doc
-                            .start_sync_scoped(tracked.contacts, tracked.default_holder)
+                            .start_sync_scoped(tracked.contacts, tracked.default_identity)
                             .await
                     }
                     SyncStrategy::Swarm => {
                         tracked
                             .doc
-                            .start_sync(tracked.contacts, tracked.default_holder)
+                            .start_sync(tracked.contacts, tracked.default_identity)
                             .await
                     }
                 };
@@ -2034,7 +2039,7 @@ async fn reconcile_co_located(
                 let reconciliation = source
                     .docs
                     .engine()
-                    .sync_in_process(target.docs.engine(), namespace, target.holder())
+                    .sync_in_process(target.docs.engine(), namespace, target.identity())
                     .await;
                 // The reading taken before the session is what is kept, and
                 // only if the session went through. Reading again after it

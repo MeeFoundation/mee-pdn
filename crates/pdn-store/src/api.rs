@@ -37,7 +37,7 @@ use crate::{
     actor::OpenState,
     engine::{Engine, LiveEvent},
     store::{DownloadPolicy, Query},
-    Author, AuthorId, Capability, CapabilityKind, Contact, DocTicket, Entry, Holder, NamespaceId,
+    Author, AuthorId, Capability, CapabilityKind, Contact, DocTicket, Entry, Identity, NamespaceId,
     PeerIdBytes,
 };
 
@@ -143,7 +143,7 @@ impl DocsApi {
         Ok(response.author_id)
     }
 
-    /// Sets the default author of this engine, the one holder its
+    /// Sets the default author of this engine, the one identity its
     /// replicas are held for.
     ///
     /// If the author does not exist, an error is returned.
@@ -222,9 +222,9 @@ impl DocsApi {
     /// Imports a document from a ticket and joins all peers in the ticket.
     pub async fn import(&self, ticket: DocTicket) -> Result<Doc> {
         let contacts = ticket.contacts();
-        let holder = ticket.holder;
+        let identity = ticket.identity;
         let doc = self.import_namespace(ticket.capability).await?;
-        doc.start_sync(contacts, holder).await?;
+        doc.start_sync(contacts, identity).await?;
         Ok(doc)
     }
 
@@ -239,7 +239,7 @@ impl DocsApi {
         ticket: DocTicket,
     ) -> Result<(Doc, impl Stream<Item = Result<LiveEvent>>)> {
         let contacts = ticket.contacts();
-        let holder = ticket.holder;
+        let identity = ticket.identity;
         let response = self
             .inner
             .rpc(ImportRequest {
@@ -248,7 +248,7 @@ impl DocsApi {
             .await??;
         let doc = Doc::new(self.inner.clone(), response.doc_id);
         let events = doc.subscribe().await?;
-        doc.start_sync(contacts, holder).await?;
+        doc.start_sync(contacts, identity).await?;
         Ok((doc, events))
     }
 
@@ -471,14 +471,14 @@ impl Doc {
     }
 
     /// Starts to sync this document with a list of peers, each paired
-    /// with the holder it is dialed as.
-    pub async fn start_sync(&self, peers: Vec<Contact>, default_holder: Holder) -> Result<()> {
+    /// with the identity it is dialed as.
+    pub async fn start_sync(&self, peers: Vec<Contact>, default_identity: Identity) -> Result<()> {
         self.ensure_open()?;
         self.inner
             .rpc(StartSyncRequest {
                 doc_id: self.namespace_id,
                 peers,
-                default_holder,
+                default_identity,
                 join_gossip: true,
             })
             .await??;
@@ -493,14 +493,14 @@ impl Doc {
     pub async fn start_sync_scoped(
         &self,
         peers: Vec<Contact>,
-        default_holder: Holder,
+        default_identity: Identity,
     ) -> Result<()> {
         self.ensure_open()?;
         self.inner
             .rpc(StartSyncRequest {
                 doc_id: self.namespace_id,
                 peers,
-                default_holder,
+                default_identity,
                 join_gossip: false,
             })
             .await??;

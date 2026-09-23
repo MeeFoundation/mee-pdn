@@ -1133,7 +1133,7 @@ async fn a_linked_device_serves_a_grant_established_and_published_elsewhere() ->
     // liveness.
     assert!(
         rt_carol.data().list(carol, alice, None).await?.is_empty(),
-        "a bare ticket holder must get nothing from a linked device"
+        "a bare ticket identity must get nothing from a linked device"
     );
     assert!(rt_carol.data().read(carol, alice, &email).await?.is_none());
 

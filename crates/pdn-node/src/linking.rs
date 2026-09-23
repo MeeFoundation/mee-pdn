@@ -6,7 +6,7 @@
 //! connection's authenticated node id, and replies with fresh write tickets
 //! to the directory and the data namespace. Pending confers nothing; the
 //! newcomer confirms itself once the tickets are in hand, since only a
-//! holder of the directory's write ticket can, which is evidence the reply
+//! identity of the directory's write ticket can, which is evidence the reply
 //! arrived. The dial side arms classification the moment the directory is
 //! imported — before the data namespace exists, so no serving window opens
 //! on the long-lived namespace id — and rolls everything back on any
