@@ -347,22 +347,35 @@ async fn link_via_dialogue_inner(
             .node
             .provision_identity(payload.identity)
             .await?;
-        let directory =
-            PrivateMetadataStore::import(&state_guard.node, payload.identity, directory_ticket)
-                .await?;
+        // Armed before the directory exists: an inviter whose ticket does
+        // not import would otherwise leave that half of the node standing.
         rollback = LinkRollbackGuard::new(
             rollback_state,
             payload.identity,
-            directory.namespace(),
             rollback_owns_cleanup,
             cleanup_tasks,
         );
-        // Armed before the data namespace exists: a still-catching-up book
-        // refuses callers it cannot resolve, and no serving window opens on
-        // the long-lived namespace id.
+        let directory = match PrivateMetadataStore::import(
+            &state_guard.node,
+            payload.identity,
+            directory_ticket,
+        )
+        .await
+        {
+            Ok(directory) => directory,
+            Err(err) => {
+                drop(state_guard);
+                undo_link(state, payload.identity, None, None).await;
+                rollback.disarm();
+                return Err(err);
+            }
+        };
+        rollback.armed_directory(directory.namespace());
+        // The book refuses callers it cannot resolve while it catches up,
+        // so no serving window opens on the long-lived namespace id.
         if let Err(err) = state_guard.node.host_identity(payload.identity, &directory) {
             drop(state_guard);
-            undo_link(state, payload.identity, directory.namespace(), None).await;
+            undo_link(state, payload.identity, Some(directory.namespace()), None).await;
             rollback.disarm();
             return Err(err);
         }
@@ -374,7 +387,7 @@ async fn link_via_dialogue_inner(
             Ok(data_import) => rollback.set_data_import(data_import),
             Err(err) => {
                 drop(state_guard);
-                undo_link(state, payload.identity, directory.namespace(), None).await;
+                undo_link(state, payload.identity, Some(directory.namespace()), None).await;
                 rollback.disarm();
                 return Err(err);
             }
@@ -516,7 +529,10 @@ impl Drop for LinkingReservation {
 struct LinkRollbackGuard {
     state: Arc<Mutex<State>>,
     identity: PdnId,
-    directory_namespace: NamespaceId,
+    /// `None` until the directory is imported: the identity's half of the
+    /// node comes up before it, and that half is the first thing a failure
+    /// has to take back down.
+    directory_namespace: Option<NamespaceId>,
     data_import: Option<SelfCleaningImport>,
     owns_reservation_cleanup: Arc<AtomicBool>,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
@@ -524,10 +540,11 @@ struct LinkRollbackGuard {
 }
 
 impl LinkRollbackGuard {
+    /// Armed as soon as the identity is provisioned, which is the first
+    /// act with anything to undo.
     fn new(
         state: Arc<Mutex<State>>,
         identity: PdnId,
-        directory_namespace: NamespaceId,
         owns_reservation_cleanup: Arc<AtomicBool>,
         cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
@@ -535,12 +552,16 @@ impl LinkRollbackGuard {
         Self {
             state,
             identity,
-            directory_namespace,
+            directory_namespace: None,
             data_import: None,
             owns_reservation_cleanup,
             cleanup_tasks,
             armed: true,
         }
+    }
+
+    fn armed_directory(&mut self, namespace: NamespaceId) {
+        self.directory_namespace = Some(namespace);
     }
 
     fn set_data_import(&mut self, data_import: NamespaceImport) {
@@ -695,14 +716,16 @@ async fn run_linking_dialogue(
 async fn undo_link(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
-    directory_namespace: NamespaceId,
+    directory_namespace: Option<NamespaceId>,
     data_import: Option<SelfCleaningImport>,
 ) {
     if let Some(import) = data_import {
         import.undo().await;
     }
     let state = state.lock().await;
-    let _ = state.node.forget_doc(identity, directory_namespace).await;
+    if let Some(directory) = directory_namespace {
+        let _ = state.node.forget_doc(identity, directory).await;
+    }
     let _ = state.node.unhost_identity(identity).await;
 }
 

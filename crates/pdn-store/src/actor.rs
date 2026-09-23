@@ -643,12 +643,13 @@ impl SyncHandle {
         rx.await?
     }
 
-    /// Per author, the timestamp of the entry this replica inserted last —
-    /// the table is overwritten by every insert, so the value moves
-    /// backwards when an older entry arrives. Equality of two replicas'
-    /// heads therefore means neither equal contents nor equal progress; it
-    /// answers "there may be something new", the question reconciliation
-    /// asks, and never "we are in sync".
+    /// Per author, the greatest timestamp this replica holds. Equality of
+    /// two replicas' heads does not mean equal contents: a maximum cannot
+    /// show a missing entry older than itself, and a retraction leaves the
+    /// head where it was on purpose. So this answers "there may be
+    /// something new" — the question reconciliation asks, where a false
+    /// yes costs one empty round — and never "we are in sync", where a
+    /// false yes would end the exchange that was owed.
     /// How many writes this replica has taken since the store opened —
     /// what tells a caller that a replica changed without reading it. Its
     /// own earlier reading is the only thing it compares against.

@@ -29,6 +29,47 @@ async fn memory_rt() -> Result<Runtime> {
     .await
 }
 
+/// A create that fails after the identity's half of the node is up leaves
+/// nothing of it: the node hosts no more identities than before, and the
+/// next create still works. Provisioning is the first act with something
+/// to undo — an actor thread, an open store, an entry in the hosted set —
+/// and the failure is injected where the directory would be made, the one
+/// step between provisioning and hosting, which a full disk is the
+/// product's reason to reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_fails_leaves_no_half_hosted_identity() -> Result<()> {
+    let runtime = memory_rt().await?;
+    let before = runtime.provisioned_identities_for_test().await?.len();
+
+    runtime.fail_next_directory_create_for_test().await;
+    assert!(
+        runtime.identity().create().await.is_err(),
+        "the injected failure did not fail the create"
+    );
+    // The node's own halves, not the runtime's hosted set: the failure
+    // lands between the two, so only the first shows what was left.
+    assert_eq!(
+        runtime.provisioned_identities_for_test().await?.len(),
+        before,
+        "the failed create left the identity's half of the node standing"
+    );
+
+    // The node is not poisoned by the attempt: the next create goes through.
+    let created = runtime.identity().create().await?;
+    assert!(
+        runtime.sync().hosted_identities().await?.contains(&created),
+        "the create after the failed one did not host its identity"
+    );
+    assert_eq!(
+        runtime.provisioned_identities_for_test().await?.len(),
+        before + 1,
+        "the node holds a half it does not host"
+    );
+
+    runtime.shutdown().await?;
+    Ok(())
+}
+
 /// The node that restarts.
 async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
     Runtime::spawn(SpawnOptions {

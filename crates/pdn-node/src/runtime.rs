@@ -143,6 +143,11 @@ pub(crate) struct State {
     pub(crate) link_before_commit_pause: Option<Arc<LinkAfterImportPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
+    /// Fails the next `create` where its directory would be made — the one
+    /// step between provisioning an identity and hosting it, which a full
+    /// disk is the product's reason to reach.
+    #[cfg(feature = "test-util")]
+    pub(crate) fail_next_directory_create: bool,
     /// `Some(n)` fails every pair arming and counts the failures. Sticky:
     /// the armer retries every sweep, and the count is the positive control
     /// for "repeated attempts leave nothing open".
@@ -282,6 +287,8 @@ impl Runtime {
             #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
+            fail_next_directory_create: false,
+            #[cfg(feature = "test-util")]
             pair_arm_failures: None,
             retraction_events,
             data_dir,
@@ -336,6 +343,20 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn fail_next_pending_device_write_for_test(&self) {
         self.state.lock().await.fail_next_pending_device_write = true;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn fail_next_directory_create_for_test(&self) {
+        self.state.lock().await.fail_next_directory_create = true;
+    }
+
+    /// The identities the node has a half of — its own engine, store and
+    /// author. Wider than what the runtime hosts: an identity is
+    /// provisioned first and hosted at the commit point, and a create that
+    /// fails in between must leave neither.
+    #[cfg(feature = "test-util")]
+    pub async fn provisioned_identities_for_test(&self) -> anyhow::Result<Vec<pdn_types::PdnId>> {
+        self.state.lock().await.node.hosted_identities()
     }
 
     /// Fail every pair arming from now on.

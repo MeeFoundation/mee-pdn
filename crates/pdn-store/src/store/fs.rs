@@ -932,10 +932,22 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             );
             tables.records_by_key.insert(key, ())?;
 
-            // insert into latest table
+            // The latest table keeps the author's greatest timestamp, not
+            // the one written last: entries arrive out of order — a
+            // reconciliation catching up on an older one is the ordinary
+            // case — and a value that moved backwards would make this
+            // replica report less than it holds, so a peer comparing
+            // against it would stop offering what it has.
             let key = (&e.id().namespace().to_bytes(), &e.id().author().to_bytes());
-            let value = (e.timestamp(), e.id().key());
-            tables.latest_per_author.insert(key, value)?;
+            let latest = tables
+                .latest_per_author
+                .get(key)?
+                .map(|value| value.value().0)
+                .unwrap_or_default();
+            if e.timestamp() >= latest {
+                let value = (e.timestamp(), e.id().key());
+                tables.latest_per_author.insert(key, value)?;
+            }
             Ok(())
         })
     }
@@ -985,6 +997,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     #[cfg(test)]
     fn entry_remove(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
+        self.store.wrote(id.namespace());
         self.store.as_mut().modify(|tables| {
             let entry = {
                 let (namespace, author, key) = id.as_byte_tuple();

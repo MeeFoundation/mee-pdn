@@ -2870,6 +2870,44 @@ mod tests {
         test_latest_iter(store).await
     }
 
+    /// An entry that arrives out of order leaves the author's head where it
+    /// was: the head is the greatest timestamp the replica holds, not the
+    /// one written last. A head that moved backwards would make this
+    /// replica report less than it holds, and a peer comparing against it
+    /// would stop offering what it has.
+    #[tokio::test]
+    async fn an_older_entry_does_not_move_the_author_head_back() -> Result<()> {
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut store = store::fs::Store::memory();
+        let mut replica = store.new_replica(namespace.clone())?;
+
+        let signed = |key: &[u8], timestamp: u64| {
+            let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+            let record = Record::from_data(b"hi", timestamp);
+            Entry::new(id, record).sign(&namespace, &author)
+        };
+        replica
+            .insert_entry(signed(b"newer", 20), InsertOrigin::Local)
+            .await?;
+        replica
+            .insert_entry(signed(b"older", 10), InsertOrigin::Local)
+            .await?;
+        store.close_replica(namespace.id());
+
+        let latest = store
+            .get_latest_for_each_author(namespace.id())?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(latest.len(), 1, "one author, one head");
+        assert_eq!(
+            (latest[0].1, latest[0].2.as_slice()),
+            (20, b"newer".as_ref()),
+            "the older entry took the head"
+        );
+        Ok(())
+    }
+
     async fn test_latest_iter(mut store: Store) -> Result<()> {
         let mut rng = rand::rng();
         let author0 = Author::new(&mut rng);
