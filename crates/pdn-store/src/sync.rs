@@ -49,6 +49,11 @@ pub type PeerIdBytes = [u8; 32];
 /// Value is 10 minutes.
 pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_micros() as u64;
 
+/// The longest key a replica holds: a longer one is refused on a local
+/// write and dropped at ingest, so the first message a replica sends —
+/// its first key, twice — stays under the ceiling a peer reads it with.
+pub const MAX_KEY_BYTES: usize = 8 * 1024;
+
 /// How many in-band rejections one message may surface to the rejection
 /// observer. A message is bounded only by the frame size, and each rejection
 /// is a claim about an entry the receiver holds, so an unbounded reply would
@@ -747,6 +752,7 @@ pub struct ReadOnly;
 /// * the entry's author and namespace signatures are correct
 /// * the entry's namespace matches the current replica
 /// * the entry's timestamp is not more than 10 minutes in the future of our system time
+/// * the entry's key is no longer than [`MAX_KEY_BYTES`]
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
@@ -760,6 +766,10 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     // Verify the namespace
     if entry.namespace() != expected_namespace {
         return Err(ValidationFailure::InvalidNamespace);
+    }
+
+    if entry.key().len() > MAX_KEY_BYTES {
+        return Err(ValidationFailure::KeyTooLong);
     }
 
     // Verify signature for non-local entries.
@@ -842,6 +852,9 @@ pub enum ValidationFailure {
     /// Entry timestamp is too far in the future.
     #[error("Entry timestamp is too far in the future.")]
     TooFarInTheFuture,
+    /// Entry key is longer than [`MAX_KEY_BYTES`].
+    #[error("Entry key is longer than {MAX_KEY_BYTES} bytes")]
+    KeyTooLong,
     /// Entry has length 0 but not the empty hash, or the empty hash but not length 0.
     #[error("Entry has length 0 but not the empty hash, or the empty hash but not length 0")]
     InvalidEmptyEntry,
@@ -2609,6 +2622,32 @@ mod tests {
             entry
         );
         store.flush()?;
+        Ok(())
+    }
+
+    /// A local write at a key longer than `MAX_KEY_BYTES` is refused, and
+    /// one at exactly the bound is written.
+    #[tokio::test]
+    async fn a_key_over_the_bound_is_refused_on_a_local_write() -> Result<()> {
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut replica = store.new_replica(namespace.clone())?;
+
+        let at_bound = vec![b'k'; MAX_KEY_BYTES];
+        replica.hash_and_insert(&at_bound, &author, "v").await?;
+        let over = vec![b'k'; MAX_KEY_BYTES + 1];
+        let res = replica.hash_and_insert(&over, &author, "v").await;
+        assert!(
+            matches!(
+                res,
+                Err(InsertError::Validation(ValidationFailure::KeyTooLong))
+            ),
+            "a key over the bound was written: {res:?}"
+        );
+        drop(replica);
+        assert!(get_entry(&mut store, namespace.id(), author.id(), &at_bound).is_ok());
         Ok(())
     }
 

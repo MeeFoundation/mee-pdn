@@ -16,10 +16,38 @@ use crate::{
     Identity, NamespaceId, SyncOutcome,
 };
 
-#[derive(Debug, Default)]
-pub(super) struct SyncCodec;
+/// Frames longer than `ceiling` are refused on their length prefix, before
+/// their body is read.
+#[derive(Debug)]
+pub(super) struct SyncCodec {
+    ceiling: usize,
+}
+
+impl Default for SyncCodec {
+    fn default() -> Self {
+        Self {
+            ceiling: MAX_MESSAGE_SIZE,
+        }
+    }
+}
+
+impl SyncCodec {
+    /// The codec a session's first frame is read with, before anything
+    /// classifies the caller.
+    fn opening() -> Self {
+        Self {
+            ceiling: MAX_OPENING_FRAME,
+        }
+    }
+}
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // This is likely too large, but lets have some restrictions
+
+/// The ceiling on a session's first frame, read before anything classifies
+/// the caller: its two range boundaries carry one key each, at most
+/// [`MAX_KEY_BYTES`](crate::sync::MAX_KEY_BYTES), and
+/// `the_largest_honest_opening_fits_under_the_ceiling` holds the margin.
+const MAX_OPENING_FRAME: usize = 32 * 1024;
 
 impl Decoder for SyncCodec {
     type Item = Message;
@@ -31,7 +59,7 @@ impl Decoder for SyncCodec {
         let bytes: [u8; 4] = src[..4].try_into().unwrap();
         let frame_len = u32::from_be_bytes(bytes) as usize;
         ensure!(
-            frame_len <= MAX_MESSAGE_SIZE,
+            frame_len <= self.ceiling,
             "received message that is too large: {}",
             frame_len
         );
@@ -126,8 +154,8 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     ingest: Option<crate::filter::SessionIngest>,
 ) -> Result<SyncOutcome, ConnectError> {
     let peer_bytes = *peer.as_bytes();
-    let mut reader = FramedRead::new(reader, SyncCodec);
-    let mut writer = FramedWrite::new(writer, SyncCodec);
+    let mut reader = FramedRead::new(reader, SyncCodec::default());
+    let mut writer = FramedWrite::new(writer, SyncCodec::default());
 
     let mut progress = SyncOutcome::default();
 
@@ -210,8 +238,8 @@ pub struct SessionOpening<R, W> {
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> SessionOpening<R, W> {
     /// Read the session's first message off `reader`.
     pub(crate) async fn read(writer: W, reader: R, peer: PublicKey) -> Result<Self, AcceptError> {
-        let mut reader = FramedRead::new(reader, SyncCodec);
-        let writer = FramedWrite::new(writer, SyncCodec);
+        let mut reader = FramedRead::new(reader, SyncCodec::opening());
+        let writer = FramedWrite::new(writer, SyncCodec::default());
         let opened = reader.next().await.ok_or_else(|| {
             AcceptError::sync(peer, None, anyhow!("stream closed before the init message"))
         })?;
@@ -272,7 +300,11 @@ impl<R, W> SessionOpening<R, W> {
         FramedRead<R, SyncCodec>,
         FramedWrite<W, SyncCodec>,
     ) {
-        (self.peer, self.init, self.reader, self.writer)
+        // Past the opening the caller is classified, and its frames read
+        // under the session ceiling.
+        let mut reader = self.reader;
+        *reader.decoder_mut() = SyncCodec::default();
+        (self.peer, self.init, reader, self.writer)
     }
 }
 
@@ -1340,7 +1372,7 @@ mod tests {
 
         let (bob_side, peer_side) = tokio::io::duplex(1024);
         let (bob_reader, bob_writer) = tokio::io::split(bob_side);
-        let mut peer_writer = FramedWrite::new(peer_side, SyncCodec);
+        let mut peer_writer = FramedWrite::new(peer_side, SyncCodec::default());
         peer_writer.send(init_frame(namespace_id)).await?;
         drop(peer_writer);
 
@@ -1469,7 +1501,7 @@ mod tests {
         let (bob_reader, bob_writer) = tokio::io::split(bob_side);
         // Sent up front and the peer end closed, so an unexpectedly served
         // round runs into end-of-stream instead of parking the test.
-        let mut peer_writer = FramedWrite::new(peer_side, SyncCodec);
+        let mut peer_writer = FramedWrite::new(peer_side, SyncCodec::default());
         peer_writer
             .send(super::Message::Init(super::Init {
                 namespace: namespace_id,
@@ -1592,7 +1624,7 @@ mod tests {
         let initial = replica.sync_initial_message(None)?;
         drop(replica);
 
-        let mut codec = SyncCodec;
+        let mut codec = SyncCodec::default();
         let mut frame = BytesMut::new();
         codec.encode(super::Message::Sync(initial), &mut frame)?;
 
@@ -1951,8 +1983,8 @@ mod tests {
         };
 
         let drive_alice = async {
-            let mut reader = FramedRead::new(alice_reader, SyncCodec);
-            let mut writer = FramedWrite::new(alice_writer, SyncCodec);
+            let mut reader = FramedRead::new(alice_reader, SyncCodec::default());
+            let mut writer = FramedWrite::new(alice_writer, SyncCodec::default());
             let session = alice.sync_session_start(ns).await?;
             let message = alice.sync_initial_message(ns, session.id(), None).await?;
             writer
@@ -2035,7 +2067,7 @@ mod tests {
 
         let session = alice.sync_session_start(ns).await?;
         let message = alice.sync_initial_message(ns, session.id(), None).await?;
-        let mut alice_framed = FramedWrite::new(alice_io, SyncCodec);
+        let mut alice_framed = FramedWrite::new(alice_io, SyncCodec::default());
         alice_framed
             .send(super::Message::Init(super::Init {
                 namespace: ns,
@@ -2272,6 +2304,180 @@ mod tests {
         );
 
         handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// An entry whose key is longer than `MAX_KEY_BYTES` is dropped at
+    /// ingest, and the session goes on to deliver the rest. The long key is
+    /// written past validation, as a modified node's store holds it.
+    #[tokio::test]
+    async fn an_entry_with_a_key_over_the_bound_is_dropped_at_ingest() -> Result<()> {
+        use crate::ranger::Store as _;
+
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let mut alice_store = store::Store::memory();
+        let author = alice_store.new_author(&mut rng)?;
+        drop(alice_store.new_replica(namespace.clone())?);
+        alice_store.close_replica(namespace.id());
+        let short = b"short".to_vec();
+        let long = vec![b'k'; crate::sync::MAX_KEY_BYTES + 1];
+        {
+            let mut raw = crate::store::fs::StoreInstance::new(namespace.id(), &mut alice_store);
+            for key in [&short, &long] {
+                raw.entry_put(crate::SignedEntry::from_parts(
+                    &namespace,
+                    &author,
+                    key,
+                    crate::Record::current_from_data("v"),
+                ))?;
+            }
+        }
+        let mut bob_store = store::Store::memory();
+        drop(bob_store.new_replica(namespace.clone())?);
+        bob_store.close_replica(namespace.id());
+
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        alice
+            .open(namespace.id(), OpenOpts::default().sync())
+            .await?;
+        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        bob.open(namespace.id(), OpenOpts::default().sync()).await?;
+        run_sync(
+            alice.clone(),
+            alice_peer,
+            bob.clone(),
+            bob_peer,
+            namespace.id(),
+        )
+        .await?;
+        let _alice_store = alice.shutdown().await?;
+        let mut bob_store = bob.shutdown().await?;
+
+        let held = bob_store
+            .get_many(namespace.id(), Query::all())?
+            .map(|entry| entry.map(|entry| entry.key().to_vec()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            held,
+            vec![short],
+            "the receiving side must hold the short entry and not the long one"
+        );
+        Ok(())
+    }
+
+    /// A first frame announcing more than the opening ceiling is refused on
+    /// its length prefix, while the peer holds the stream open and sends no
+    /// body.
+    #[tokio::test]
+    async fn an_opening_frame_over_the_ceiling_is_refused_before_its_body() -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let (ours, theirs) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(ours);
+        let (_their_reader, mut their_writer) = tokio::io::split(theirs);
+        let announced = u32::try_from(MAX_OPENING_FRAME + 1)?;
+        their_writer.write_all(&announced.to_be_bytes()).await?;
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SessionOpening::read(writer, reader, peer),
+        )
+        .await;
+        assert!(
+            matches!(read, Ok(Err(_))),
+            "the opening must be refused on its length, not wait for its body: {read:?}"
+        );
+        drop(their_writer);
+        Ok(())
+    }
+
+    /// The first message of a replica whose first key is `MAX_KEY_BYTES`
+    /// long — the largest an honest node sends — opens a session.
+    #[tokio::test]
+    async fn the_largest_honest_opening_fits_under_the_ceiling() -> Result<()> {
+        let mut rng = rand::rng();
+        let peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let mut store = store::Store::memory();
+        let author = store.new_author(&mut rng)?;
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica
+            .hash_and_insert(vec![b'k'; crate::sync::MAX_KEY_BYTES], &author, "v")
+            .await?;
+        let message = replica.sync_initial_message(None)?;
+        drop(replica);
+
+        // Room for the whole frame, so the write completes before the read.
+        let (ours, theirs) = tokio::io::duplex(2 * MAX_OPENING_FRAME);
+        let (reader, writer) = tokio::io::split(ours);
+        let (_their_reader, their_writer) = tokio::io::split(theirs);
+        let mut framed = FramedWrite::new(their_writer, SyncCodec::default());
+        framed
+            .send(super::Message::Init(super::Init {
+                namespace: namespace.id(),
+                identity: TEST_HOLDER,
+                caller: TEST_HOLDER,
+                message,
+            }))
+            .await?;
+
+        let opening = SessionOpening::read(writer, reader, peer)
+            .await
+            .map_err(|err| anyhow!("the largest honest opening was refused: {err:?}"))?;
+        assert_eq!(opening.namespace(), namespace.id());
+        Ok(())
+    }
+
+    /// Past its opening a session reads frames larger than the opening
+    /// ceiling: a replica that crosses in one message of that size reaches
+    /// the empty side whole.
+    #[tokio::test]
+    async fn a_session_reads_frames_above_the_opening_ceiling_past_its_opening() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        // Sized past the ceiling: every entry carries a key of 400 bytes.
+        let count = 2 * MAX_OPENING_FRAME / 400;
+        let mut alice_store = store::Store::memory();
+        let author = alice_store.new_author(&mut rng)?;
+        let mut replica = alice_store.new_replica(namespace.clone())?;
+        for i in 0..count {
+            replica
+                .hash_and_insert(format!("{i:0>400}"), &author, "v")
+                .await?;
+        }
+        drop(replica);
+        alice_store.close_replica(namespace.id());
+        let mut bob_store = store::Store::memory();
+        drop(bob_store.new_replica(namespace.clone())?);
+        bob_store.close_replica(namespace.id());
+
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        alice
+            .open(namespace.id(), OpenOpts::default().sync())
+            .await?;
+        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        bob.open(namespace.id(), OpenOpts::default().sync()).await?;
+        run_sync(
+            alice.clone(),
+            alice_peer,
+            bob.clone(),
+            bob_peer,
+            namespace.id(),
+        )
+        .await?;
+        let _alice_store = alice.shutdown().await?;
+        let mut bob_store = bob.shutdown().await?;
+
+        let held = bob_store.get_many(namespace.id(), Query::all())?.count();
+        assert_eq!(held, count, "the replica did not cross whole");
         Ok(())
     }
 }
