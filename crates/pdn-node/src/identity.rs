@@ -222,8 +222,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
         };
         rollback.armed_hosting();
         // The commit point, and the last step that can fail. The lock is
-        // taken here: the record is built from the hosted set, so building
-        // it and adding to it are one act.
+        // held across it, so the record and the hosted set change as one act.
         let mut state = self.runtime.state.lock().await;
         if let Err(err) = state.commit_hosting(identity, directory.namespace()).await {
             drop(state);

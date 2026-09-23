@@ -1,7 +1,7 @@
 //! Restart recovery at the runtime level: a runtime spawned on a shut-down
-//! one's directory hosts what the hosted-identities record names, and
-//! everything else re-derives from each identity's directory. An
-//! in-process respawn proves the recovery logic — the record's commit
+//! one's directory hosts the identities whose subdirectory records their
+//! hosting, and everything else re-derives from each identity's directory.
+//! An in-process respawn proves the recovery logic — the record's commit
 //! point, the re-derivation paths, a withdrawal during the outage — not a
 //! process that exits; that half is the container stand.
 
@@ -102,23 +102,31 @@ async fn ticket_holder_dialing(
 /// The identity the bare ticket identity acts as.
 const PROBE: pdn_types::PdnId = ids::DAVE;
 
-/// The hosted-identities record's file name, as the runtime writes it.
-const RECORD: &str = "hosted-identities.json";
-
-/// Left opaque: the scenarios move a line between two disks rather than
-/// construct one.
-fn record_lines(dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
-    Ok(serde_json::from_slice(&std::fs::read(dir.join(RECORD))?)?)
+/// Where `identity`'s subdirectory lands under `dir`.
+fn subdirectory_of(dir: &std::path::Path, identity: pdn_types::PdnId) -> std::path::PathBuf {
+    dir.join("identities").join(identity.to_string())
 }
 
-/// Replace `dir`'s record with `lines`.
-fn write_record_lines(dir: &std::path::Path, lines: &[serde_json::Value]) -> Result<()> {
-    std::fs::write(dir.join(RECORD), serde_json::to_vec(lines)?)?;
+/// Where `identity`'s hosting record lands under `dir`, as the node writes
+/// it.
+fn record_of(dir: &std::path::Path, identity: pdn_types::PdnId) -> std::path::PathBuf {
+    subdirectory_of(dir, identity).join("directory")
+}
+
+/// Copy the files of one identity's subdirectory — it holds no others.
+fn copy_subdirectory(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name()))?;
+        }
+    }
     Ok(())
 }
 
 /// An identity created before the restart is hosted after it, with no peer
-/// and no ceremony repeated. Denied: with the record's line removed, the
+/// and no ceremony repeated. Denied: with its hosting record removed, the
 /// same directory hosts nothing; with the record unreadable, the start
 /// fails naming the file.
 #[tokio::test(flavor = "multi_thread")]
@@ -158,12 +166,12 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     second.shutdown().await?;
     drop(second);
 
-    // Denial (line removed).
-    std::fs::write(dir.path().join(RECORD), b"[]")?;
+    // Denial (record removed).
+    std::fs::remove_file(record_of(dir.path(), alice))?;
     let third = runtime_on(dir.path()).await?;
     assert!(
         third.sync().hosted_identities().await?.is_empty(),
-        "an empty record must host nothing"
+        "a directory with no hosting record must host nothing"
     );
     assert!(
         third.data().read(alice, alice, &path).await.is_err(),
@@ -173,12 +181,13 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     drop(third);
 
     // Denial (record unreadable): the start fails naming the file.
-    std::fs::write(dir.path().join(RECORD), b"not json")?;
+    let record = record_of(dir.path(), alice);
+    std::fs::write(&record, b"not a namespace")?;
     let Err(err) = runtime_on(dir.path()).await else {
         anyhow::bail!("an unreadable record must stop the start");
     };
     assert!(
-        format!("{err:#}").contains("hosted-identities.json"),
+        format!("{err:#}").contains(&record.display().to_string()),
         "the refusal must name the record: {err:#}"
     );
     Ok(())
@@ -322,38 +331,20 @@ async fn two_identities_recover_each_its_own_granted_claim() -> Result<()> {
     Ok(())
 }
 
-/// The record writer at its edges: a create whose record replacement fails
-/// (the directory made unwritable, the closest stand-in for a full disk)
-/// fails whole and keeps the first identity hosted; the store set it
-/// provisioned is hosted by nobody after a restart. A successful change
-/// replaces the file, observed by its inode.
+/// A create whose hosting record is refused at the commit point fails
+/// whole and keeps the first identity hosted, and the store set it
+/// provisioned is hosted by nobody after a restart.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
+async fn a_refused_hosting_record_fails_the_create_and_keeps_the_first() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let record_path = dir.path().join(RECORD);
-
     let runtime = runtime_on(dir.path()).await?;
     let alice = runtime.identity().create().await?;
-    let record_after_first = std::fs::read(&record_path)?;
-    let inode_after_first = std::fs::metadata(&record_path)?.ino();
     let tracked_after_first = runtime.sync().tracked_doc_count(alice).await?;
 
-    // The directory refuses new files, so staging the replacement fails
-    // while the stores — already open, in writable subdirectories — keep
-    // working.
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))?;
-    let refused = runtime.identity().create().await;
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    runtime.fail_next_hosting_record_for_test().await;
     assert!(
-        refused.is_err(),
-        "a create whose record cannot be written must fail"
-    );
-    assert_eq!(
-        std::fs::read(&record_path)?,
-        record_after_first,
-        "the failed replacement must leave the previous record intact"
+        runtime.identity().create().await.is_err(),
+        "a create whose hosting record is refused must fail"
     );
     assert_eq!(
         runtime.sync().hosted_identities().await?,
@@ -368,16 +359,9 @@ async fn a_failed_record_write_fails_the_create_and_keeps_the_first() -> Result<
         tracked_after_first,
         "the failed create must leave no replica tracked in the running node"
     );
-
-    // A fresh inode, never an edit in place.
     let bob = runtime.identity().create().await?;
-    assert_ne!(
-        std::fs::metadata(&record_path)?.ino(),
-        inode_after_first,
-        "the record must be replaced by rename, not edited in place"
-    );
 
-    // The restart hosts exactly what the record names.
+    // The restart hosts exactly the identities whose commit went through.
     runtime.shutdown().await?;
     drop(runtime);
     let recovered = runtime_on(dir.path()).await?;
@@ -546,28 +530,28 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
     Ok(())
 }
 
-/// A record line whose directory replica the store does not hold is
+/// A hosting record whose directory replica the store does not hold is
 /// skipped: the start succeeds, that identity is not hosted, and every
-/// healthy line beside it comes back. The commit precedes the rename, so
-/// the state is arranged the only way left — a real record line carried
-/// from one node's disk onto another's. The denials keep the skip from
-/// being a shrug: the skipped identity is refused, not re-created, and the
-/// record is left as it was.
+/// healthy identity beside it comes back — whether the replica store is
+/// gone from the record's subdirectory or holds no such replica. The
+/// commit flushes the replicas before it writes the record, so the state
+/// is arranged the only way left: subdirectories carried from another
+/// node's disk. The denials keep the skip from being a shrug: a skipped
+/// identity is refused, not re-created, a store that is gone stays gone,
+/// and a create after the start leaves both records as they were.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> Result<()> {
+async fn a_record_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> Result<()> {
     let path = EntryPath::new("contact/email")?;
 
-    // A real record line, written by a real create on a disk this test
+    // Real subdirectories, written by real creates on a disk this test
     // leaves behind.
     let elsewhere = tempfile::tempdir()?;
-    let stranger_rt = runtime_on(elsewhere.path()).await?;
-    let stranger = stranger_rt.identity().create().await?;
-    stranger_rt.shutdown().await?;
-    drop(stranger_rt);
-    let stranger_line = record_lines(elsewhere.path())?;
+    let other_rt = runtime_on(elsewhere.path()).await?;
+    let storeless = other_rt.identity().create().await?;
+    let mismatched = other_rt.identity().create().await?;
+    other_rt.shutdown().await?;
+    drop(other_rt);
 
-    // The disk under test: one healthy identity, and the stranger's line
-    // appended to its record.
     let dir = tempfile::tempdir()?;
     let first = runtime_on(dir.path()).await?;
     let alice = first.identity().create().await?;
@@ -577,16 +561,32 @@ async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> 
         .await?;
     first.shutdown().await?;
     drop(first);
-    let mut lines = record_lines(dir.path())?;
-    lines.extend(stranger_line);
-    write_record_lines(dir.path(), &lines)?;
-    let record_as_arranged = std::fs::read(dir.path().join(RECORD))?;
+
+    // One record without its replica store, and one whose store holds a
+    // replica other than the one its record names.
+    std::fs::create_dir_all(subdirectory_of(dir.path(), storeless))?;
+    std::fs::copy(
+        record_of(elsewhere.path(), storeless),
+        record_of(dir.path(), storeless),
+    )?;
+    copy_subdirectory(
+        &subdirectory_of(elsewhere.path(), mismatched),
+        &subdirectory_of(dir.path(), mismatched),
+    )?;
+    std::fs::copy(
+        record_of(elsewhere.path(), storeless),
+        record_of(dir.path(), mismatched),
+    )?;
+    let records_as_arranged = [
+        std::fs::read(record_of(dir.path(), storeless))?,
+        std::fs::read(record_of(dir.path(), mismatched))?,
+    ];
 
     let second = runtime_on(dir.path()).await?;
     assert_eq!(
         second.sync().hosted_identities().await?,
         vec![alice],
-        "the healthy line must come back and the absent one must be skipped"
+        "the healthy identity must come back and both others must be skipped"
     );
     assert!(
         eventually(|| async {
@@ -598,20 +598,34 @@ async fn a_line_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> 
         .await?,
         "the healthy identity's entry must read back across the skip"
     );
+    for skipped in [storeless, mismatched] {
+        assert!(
+            second.data().read(skipped, skipped, &path).await.is_err(),
+            "a skipped identity must be refused, not hosted from a fresh replica"
+        );
+    }
     assert!(
-        second.data().read(alice, stranger, &path).await.is_err(),
-        "the skipped identity must be refused, not hosted from a fresh replica"
+        !subdirectory_of(dir.path(), storeless)
+            .join("docs.redb")
+            .exists(),
+        "the skip must not open a store where the record's store is gone"
     );
+
+    // A create after the start leaves the skipped records where they were.
+    let _carol = second.identity().create().await?;
     assert_eq!(
-        std::fs::read(dir.path().join(RECORD))?,
-        record_as_arranged,
-        "the skip must leave the record as it was"
+        [
+            std::fs::read(record_of(dir.path(), storeless))?,
+            std::fs::read(record_of(dir.path(), mismatched))?,
+        ],
+        records_as_arranged,
+        "the skip and the create after it must leave the skipped records as they were"
     );
     second.shutdown().await?;
     Ok(())
 }
 
-/// A start that fails after the stores are open (the unreadable record is
+/// A start that fails once the node is up (an unreadable hosting record is
 /// raised after the node exists) leaves the directory reusable in the same
 /// process. The wait is bounded on purpose: without the shutdown on the
 /// failing path the retry hangs rather than fails.
@@ -625,17 +639,18 @@ async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
     first.shutdown().await?;
     drop(first);
 
-    // The record cannot be parsed, and the refusal comes after the stores
-    // are open.
-    let record = std::fs::read(dir.path().join(RECORD))?;
-    std::fs::write(dir.path().join(RECORD), b"not json")?;
+    // The record cannot be parsed, and the refusal comes after the node is
+    // up.
+    let record_path = record_of(dir.path(), alice);
+    let record = std::fs::read(&record_path)?;
+    std::fs::write(&record_path, b"not a namespace")?;
     assert!(
         runtime_on(dir.path()).await.is_err(),
         "an unreadable record must stop the start"
     );
 
     // The retry, on the same directory in the same process.
-    std::fs::write(dir.path().join(RECORD), &record)?;
+    std::fs::write(&record_path, &record)?;
     let retried = tokio::time::timeout(RETRY_BUDGET, runtime_on(dir.path()))
         .await
         .map_err(|_elapsed| {
@@ -881,9 +896,10 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
 /// A link whose record cannot be written leaves nothing anywhere: the
 /// identity's directory never names the device, because the confirmation
 /// is written after the record, and a start on the directory the failed
-/// link left hosts nothing from it. The injected failure is the directory
-/// made unwritable; the retry with permissions back is what makes the
-/// absence the failure's doing.
+/// link left hosts nothing from it. The injected failure is the identity's
+/// subdirectory made unwritable while a pause holds the link at its commit
+/// point; the retry with permissions back is what makes the absence the
+/// failure's doing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -894,18 +910,28 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
     let (probe, directory) = common::link_probe(&inviter, identity).await?;
 
     let dir = tempfile::tempdir()?;
-    let dialer = runtime_on(dir.path()).await?;
+    let dialer = std::sync::Arc::new(runtime_on(dir.path()).await?);
     let newcomer = dialer.node_id();
+    let pause = dialer.pause_next_link_before_commit().await;
 
-    // The directory refuses new files, so staging the record fails while
-    // the stores carry the ceremony.
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))?;
     let payload = inviter.identity().linking_invite(identity, None).await?;
-    let refused = dialer
-        .identity()
-        .link(payload, Duration::from_secs(30))
-        .await;
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let linking = {
+        let dialer = std::sync::Arc::clone(&dialer);
+        tokio::spawn(async move {
+            dialer
+                .identity()
+                .link(payload, Duration::from_secs(30))
+                .await
+        })
+    };
+    // The subdirectory refuses new files, so staging the record fails while
+    // the stores the ceremony opened keep working.
+    pause.wait_until_reached().await;
+    let subdirectory = dir.path().join("identities").join(identity.to_string());
+    std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o500))?;
+    pause.release();
+    let refused = linking.await?;
+    std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o700))?;
     assert!(
         refused.is_err(),
         "a link whose record cannot be written must fail"
@@ -915,10 +941,11 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
         "the failed link must leave nothing hosted"
     );
 
-    // And a start on that directory brings none of it back: the record
-    // names nothing, so whatever stores the link opened come back to
+    // And a start on that directory brings none of it back: no record
+    // names the identity, so whatever stores the link opened come back to
     // nobody.
     dialer.shutdown().await?;
+    drop(dialer);
     let dialer = runtime_on(dir.path()).await?;
     assert!(
         dialer.sync().hosted_identities().await?.is_empty(),

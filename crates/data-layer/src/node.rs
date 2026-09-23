@@ -291,6 +291,16 @@ pub struct NamespaceImport {
     bound: bool,
 }
 
+/// An identity whose subdirectory records its hosting, as a start finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedHosting {
+    pub identity: PdnId,
+    /// The namespace of the identity's private metadata directory.
+    pub directory: NamespaceId,
+    /// Whether the replica store beside the record is on disk.
+    pub store_present: bool,
+}
+
 /// The hosted identities of one node, shared with the docs dispatcher and
 /// the reconcile pass.
 type Identities = Arc<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>;
@@ -603,10 +613,10 @@ impl SyncNode {
                 std::fs::create_dir_all(&own).with_context(|| {
                     format!("cannot create the identity directory {}", own.display())
                 })?;
-                // Counted once this identity has its own subdirectory, so
-                // the nth identity of a directory opens at an nth of the
-                // budget and a device carrying one gives it the whole.
-                let held = identity_directories(directory)?.max(1);
+                // Cut from the identities the directory records as hosted,
+                // this one included: the nth opens at an nth of the budget,
+                // and what an unfinished create left takes no share.
+                let held = hosted_identity_count(directory, identity)?;
                 let share = self.cache_budget_bytes / held;
                 tracing::info!(
                     identity = %identity,
@@ -645,6 +655,33 @@ impl SyncNode {
     /// storing in memory, where a store carries no bound.
     pub fn replica_cache_share_bytes(&self, identity: PdnId) -> Result<Option<usize>> {
         Ok(self.require(identity)?.cache_share_bytes)
+    }
+
+    /// Record `identity` as hosted here, with `directory` as its private
+    /// metadata directory: the commit point of a create or a link. The
+    /// replicas are flushed first, so the record never names one the store
+    /// has not written, and the record is written beside and renamed over,
+    /// so a failure leaves none. A node in memory records nothing.
+    pub async fn record_hosting(&self, identity: PdnId, directory: NamespaceId) -> Result<()> {
+        let StorageConfig::Directory(root) = &self.storage else {
+            return Ok(());
+        };
+        self.flush_replicas(identity, directory).await?;
+        let own = identity_directory(root, identity);
+        tokio::task::spawn_blocking(move || write_hosting_record(&own, directory))
+            .await
+            .context("the hosting record writer did not run")?
+    }
+
+    /// Every identity whose subdirectory records its hosting. A
+    /// subdirectory without a record — an unfinished create or link — is
+    /// not listed, and an unreadable record fails, naming its file. Empty on
+    /// a node in memory.
+    pub fn recorded_hosting(&self) -> Result<Vec<RecordedHosting>> {
+        let StorageConfig::Directory(root) = &self.storage else {
+            return Ok(Vec::new());
+        };
+        read_hosting_records(root)
     }
 
     /// Arm `identity`'s directory for session classification: its device
@@ -1599,27 +1636,99 @@ pub struct IdentityNotProvisioned {
 /// The identities the storage directory holds, one subdirectory each:
 /// what a store's share of the cache budget is cut from, so no host
 /// states a count of its own (ADR-0013).
-fn identity_directories(directory: &std::path::Path) -> Result<usize> {
+/// The identities whose subdirectory holds a hosting record, plus
+/// `opening` when its own does not yet.
+fn hosted_identity_count(directory: &std::path::Path, opening: PdnId) -> Result<usize> {
     let identities = directory.join(IDENTITIES_DIR);
-    let read = std::fs::read_dir(&identities).with_context(|| {
+    let context = || {
         format!(
             "cannot read the identities directory {}",
             identities.display()
         )
-    })?;
-    let mut held = 0usize;
-    for entry in read {
-        let entry = entry.with_context(|| {
-            format!(
-                "cannot read the identities directory {}",
-                identities.display()
-            )
-        })?;
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            held = held.saturating_add(1);
+    };
+    let own = identity_directory(directory, opening);
+    let mut recorded = 0usize;
+    let mut opening_recorded = false;
+    for entry in std::fs::read_dir(&identities).with_context(context)? {
+        let entry = entry.with_context(context)?;
+        if entry.path().join(HOSTING_RECORD_FILE).is_file() {
+            recorded = recorded.saturating_add(1);
+            opening_recorded |= entry.path() == own;
         }
     }
-    Ok(held)
+    Ok(if opening_recorded {
+        recorded
+    } else {
+        recorded.saturating_add(1)
+    })
+}
+
+fn write_hosting_record(own: &std::path::Path, directory: NamespaceId) -> Result<()> {
+    use std::io::Write as _;
+    let path = own.join(HOSTING_RECORD_FILE);
+    let staged = own.join(format!("{HOSTING_RECORD_FILE}.tmp"));
+    let context = || format!("cannot write the hosting record {}", path.display());
+    {
+        let mut file = std::fs::File::create(&staged).with_context(context)?;
+        file.write_all(directory.to_string().as_bytes())
+            .with_context(context)?;
+        // A rename can commit before the data reaches the disk.
+        file.sync_all().with_context(context)?;
+    }
+    std::fs::rename(&staged, &path).with_context(context)
+}
+
+fn read_hosting_records(directory: &std::path::Path) -> Result<Vec<RecordedHosting>> {
+    let identities = directory.join(IDENTITIES_DIR);
+    let context = || {
+        format!(
+            "cannot read the identities directory {}",
+            identities.display()
+        )
+    };
+    let listing = match std::fs::read_dir(&identities) {
+        Ok(listing) => listing,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(context),
+    };
+    let mut recorded = Vec::new();
+    for entry in listing {
+        let entry = entry.with_context(context)?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(identity) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<PdnId>().ok())
+        else {
+            tracing::warn!(
+                entry = %entry.path().display(),
+                "a subdirectory of the identities directory names no identity; left alone"
+            );
+            continue;
+        };
+        let path = entry.path().join(HOSTING_RECORD_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("cannot read the hosting record {}", path.display()))
+            }
+        };
+        let directory = text
+            .trim()
+            .parse::<NamespaceId>()
+            .with_context(|| format!("cannot parse the hosting record {}", path.display()))?;
+        let store_present = entry.path().join(REPLICA_STORE_FILE).is_file();
+        recorded.push(RecordedHosting {
+            identity,
+            directory,
+            store_present,
+        });
+    }
+    Ok(recorded)
 }
 
 /// One subdirectory per hosted identity, named by the identity, each
@@ -1693,10 +1802,15 @@ fn reconcile_with_co_located(
     }
 }
 
-/// One subdirectory per hosted identity, each holding that identity's
-/// replica store (`docs.redb`) and its persisted author
-/// (`default-author`).
+/// One subdirectory per identity, each holding that identity's replica
+/// store (`docs.redb`), its persisted author (`default-author`) and, once
+/// a create or link commits, its hosting record (`directory`).
 const IDENTITIES_DIR: &str = "identities";
+/// The store pdn-store opens in an identity's subdirectory.
+const REPLICA_STORE_FILE: &str = "docs.redb";
+/// The namespace of the identity's private metadata directory, as text: a
+/// start hosts exactly the identities whose subdirectory holds one.
+const HOSTING_RECORD_FILE: &str = "directory";
 const BLOBS_DIR: &str = "blobs";
 /// The endpoint's secret key, hex-encoded.
 const NODE_KEY_FILE: &str = "node.key";

@@ -439,7 +439,7 @@ async fn link_via_dialogue_inner(
     {
         drop(guard);
         rollback.roll_back().await;
-        return Err(err).context("the hosted-identities record could not be written");
+        return Err(err).context("the hosting record could not be written");
     }
     let author = guard.node.default_author(payload.identity)?;
     guard

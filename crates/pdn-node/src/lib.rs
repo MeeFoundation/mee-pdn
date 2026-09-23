@@ -7,7 +7,6 @@
 
 pub mod connections;
 pub mod data;
-mod hosted;
 pub mod identity;
 pub mod linking;
 pub mod pairing;

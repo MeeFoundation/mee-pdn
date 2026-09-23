@@ -7,7 +7,8 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, DirectoryHeld, PrivateMetadataStore, ShareMode, SpawnOptions, SyncNode,
+    AddrInfoOptions, DirectoryHeld, PrivateMetadataStore, RecordedHosting, ShareMode, SpawnOptions,
+    SyncNode,
 };
 use pdn_types::EntryPath;
 use test_utils::{host_identity, ids};
@@ -458,6 +459,50 @@ async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result
         reopened.live_device_record_count(device).await?,
         2,
         "a second author's record must be countable, or the assertion above proves nothing"
+    );
+    second.shutdown().await?;
+    Ok(())
+}
+
+/// A start finds exactly the identities whose hosting was recorded, each
+/// with its directory's namespace and its replica store. Denied: an
+/// identity provisioned and never recorded is not listed, and neither is
+/// one whose record the disk refused — a read-only subdirectory, the
+/// closest stand-in for a full disk at the commit point.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_finds_the_identities_whose_hosting_was_recorded() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let work = host_identity(&first, ids::ALICE_AT_WORK).await?;
+    first
+        .record_hosting(ids::ALICE_AT_WORK, work.namespace())
+        .await?;
+    let _never_recorded = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
+
+    let carol = host_identity(&first, ids::CAROL).await?;
+    let carol_subdirectory = dir.path().join("identities").join(ids::CAROL.to_string());
+    std::fs::set_permissions(&carol_subdirectory, std::fs::Permissions::from_mode(0o500))?;
+    let refused = first.record_hosting(ids::CAROL, carol.namespace()).await;
+    std::fs::set_permissions(&carol_subdirectory, std::fs::Permissions::from_mode(0o700))?;
+    assert!(
+        refused.is_err(),
+        "a record the disk refuses must fail the commit"
+    );
+    first.shutdown().await?;
+    drop(first);
+
+    let second = node_on(dir.path()).await?;
+    assert_eq!(
+        second.recorded_hosting()?,
+        vec![RecordedHosting {
+            identity: ids::ALICE_AT_WORK,
+            directory: work.namespace(),
+            store_present: true,
+        }],
+        "a start must find the recorded identity and nothing else"
     );
     second.shutdown().await?;
     Ok(())

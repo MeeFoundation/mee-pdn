@@ -65,13 +65,15 @@ async fn each_identity_opens_its_replica_store_under_its_own_subdirectory() -> R
 }
 
 /// A replica store opens at the node's budget divided by the identities
-/// the storage directory holds once that store has its own
-/// subdirectory: the whole budget for a device carrying one, half each
-/// once two are on disk, and a store in memory carries no bound at all.
-/// A second identity provisioned while the node runs leaves the first's
-/// bound where it is, so the bounds handed out pass the budget until the
-/// next start cuts them from the whole set.
+/// the storage directory records as hosted, its own included: the whole
+/// budget for a device carrying one, half each once two are recorded, and
+/// a store in memory carries no bound at all. A second identity
+/// provisioned while the node runs leaves the first's bound where it is,
+/// so the bounds handed out pass the budget until the next start cuts them
+/// from the whole set. Denied: a store set no commit recorded — what an
+/// unfinished create leaves — takes no share at the next start.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, memory, a plain directory and a budgeted one in one place
 async fn a_store_opens_at_its_share_of_the_node_budget() -> Result<()> {
     let memory = SyncNode::spawn(SpawnOptions::memory()).await?;
     memory.provision_identity(ids::ALICE).await?;
@@ -103,7 +105,9 @@ async fn a_store_opens_at_its_share_of_the_node_budget() -> Result<()> {
         ..SpawnOptions::on_directory(dir.path())
     })
     .await?;
-    node.provision_identity(ids::ALICE_AT_WORK).await?;
+    let work = host_identity(&node, ids::ALICE_AT_WORK).await?;
+    node.record_hosting(ids::ALICE_AT_WORK, work.namespace())
+        .await?;
     assert_eq!(
         node.replica_cache_share_bytes(ids::ALICE_AT_WORK)?,
         Some(budget),
@@ -114,7 +118,9 @@ async fn a_store_opens_at_its_share_of_the_node_budget() -> Result<()> {
         "one store at the whole budget is within it"
     );
 
-    node.provision_identity(ids::ALICE_AT_LEISURE).await?;
+    let leisure = host_identity(&node, ids::ALICE_AT_LEISURE).await?;
+    node.record_hosting(ids::ALICE_AT_LEISURE, leisure.namespace())
+        .await?;
     assert_eq!(
         node.replica_cache_share_bytes(ids::ALICE_AT_LEISURE)?,
         Some(budget / 2),
@@ -129,7 +135,12 @@ async fn a_store_opens_at_its_share_of_the_node_budget() -> Result<()> {
         node.replica_cache_budget_exceeded()?,
         "a node grown while it ran must report that the bounds handed out pass its budget"
     );
+    // What a create that never reached its commit point leaves on disk.
+    node.provision_identity(ids::CAROL).await?;
+    node.unhost_identity(ids::CAROL).await?;
     node.shutdown().await?;
+    drop(work);
+    drop(leisure);
 
     let again = SyncNode::spawn(SpawnOptions {
         replica_cache_budget_bytes: budget,
@@ -141,7 +152,7 @@ async fn a_store_opens_at_its_share_of_the_node_budget() -> Result<()> {
         assert_eq!(
             again.replica_cache_share_bytes(identity)?,
             Some(budget / 2),
-            "a start must cut every share from the identities the directory holds"
+            "a start must cut every share from the identities the directory records, and no more"
         );
     }
     assert!(

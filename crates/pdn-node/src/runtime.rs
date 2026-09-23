@@ -4,20 +4,16 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    path::PathBuf,
     sync::Arc,
 };
 
 use anyhow::{Context as _, Result};
 use data_layer::{
-    AuthorId, ConnectionMetadata, NamespaceId, PrivateMetadataStore, SpawnOptions, StorageConfig,
-    SyncNode,
+    AuthorId, ConnectionMetadata, NamespaceId, PrivateMetadataStore, SpawnOptions, SyncNode,
 };
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
-
-use crate::hosted::{self, HostedLine};
 
 #[derive(Clone)]
 pub(crate) struct CleanupSupervisor {
@@ -148,6 +144,10 @@ pub(crate) struct State {
     /// disk is the product's reason to reach.
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_directory_create: bool,
+    /// Fails the next commit point's hosting record, the write a full disk
+    /// refuses there.
+    #[cfg(feature = "test-util")]
+    pub(crate) fail_next_hosting_record: bool,
     /// `Some(n)` fails every pair arming and counts the failures. Sticky:
     /// the armer retries every sweep, and the count is the positive control
     /// for "repeated attempts leave nothing open".
@@ -157,8 +157,6 @@ pub(crate) struct State {
     /// sweeping anyway — the spawn's reconcile interval.
     pub(crate) sweep_interval: std::time::Duration,
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
-    /// `None` on a memory node, which records nothing.
-    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl State {
@@ -168,42 +166,20 @@ impl State {
             .ok_or(UnknownIdentity { identity })
     }
 
-    /// Replace the hosted-identities record with the hosted set plus
-    /// `identity`. Called after the store set is provisioned and before the
-    /// identity is hosted; a failure leaves the previous record intact. The
-    /// replicas are flushed first: the file becomes durable inside
-    /// `write_record`, while the replicas it names sit in the store's open
-    /// write transaction, and a kill between the two would leave a line
-    /// naming a replica the store does not hold.
+    /// The commit point of a create or a link: record `identity` as hosted
+    /// with `directory` as its private metadata directory. Called after the
+    /// store set is provisioned and before the identity is hosted; a
+    /// failure leaves no record, and the identity comes back at no start.
     pub(crate) async fn commit_hosting(
-        &self,
+        &mut self,
         identity: PdnId,
         directory: NamespaceId,
     ) -> Result<()> {
-        let Some(dir) = &self.data_dir else {
-            return Ok(());
-        };
-        self.node.flush_replicas(identity, directory).await?;
-        let mut lines: Vec<HostedLine> = self
-            .identities
-            .iter()
-            .map(|(hosted_identity, hosted)| HostedLine {
-                identity: *hosted_identity,
-                directory: hosted.directory.namespace(),
-            })
-            .collect();
-        lines.retain(|line| line.identity != identity);
-        lines.push(HostedLine {
-            identity,
-            directory,
-        });
-        // Off the worker thread: a `sync_all` and a rename block the thread.
-        // The caller's lock stays held — the record must not be built from
-        // a set another commit is changing meanwhile.
-        let dir = dir.clone();
-        tokio::task::spawn_blocking(move || hosted::write_record(&dir, &lines))
-            .await
-            .context("the hosted-identities record writer did not run")?
+        #[cfg(feature = "test-util")]
+        if std::mem::take(&mut self.fail_next_hosting_record) {
+            anyhow::bail!("recording the hosting failed for test");
+        }
+        self.node.record_hosting(identity, directory).await
     }
 }
 
@@ -218,14 +194,13 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// On a directory-configured runtime, every identity the record names
-    /// is hosted again before the spawn returns, through the same tail
-    /// `create` runs: the directory opens from the replica the node holds,
-    /// arms classification, and its connection armer's sweeps bring the
-    /// rest back. No ceremony, no dial; an unreadable record stops the
-    /// spawn, an absent one is a first start.
+    /// On a directory-configured runtime, every identity whose subdirectory
+    /// records its hosting is hosted again before the spawn returns, through
+    /// the same tail `create` runs: the directory opens from the replica the
+    /// node holds, arms classification, and its connection armer's sweeps
+    /// bring the rest back. No ceremony, no dial; an unreadable record stops
+    /// the spawn, and a directory with none is a first start.
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
-        let data_dir = data_dir_of(&options.storage);
         let sweep_interval = options.reconcile_interval;
         let pairing = PairingHandler::new();
         let pairing_slot = pairing.slot();
@@ -249,8 +224,7 @@ impl Runtime {
             let verdicts = node
                 .take_retraction_verdicts()
                 .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
-            let (identities, armers) =
-                recover_hosted_identities(&node, data_dir.as_deref()).await?;
+            let (identities, armers) = recover_hosted_identities(&node).await?;
             anyhow::Ok((verdicts, identities, armers))
         }
         .await;
@@ -289,9 +263,10 @@ impl Runtime {
             #[cfg(feature = "test-util")]
             fail_next_directory_create: false,
             #[cfg(feature = "test-util")]
+            fail_next_hosting_record: false,
+            #[cfg(feature = "test-util")]
             pair_arm_failures: None,
             retraction_events,
-            data_dir,
             sweep_interval,
         }));
         for (identity, changes) in armers {
@@ -348,6 +323,11 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn fail_next_directory_create_for_test(&self) {
         self.state.lock().await.fail_next_directory_create = true;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn fail_next_hosting_record_for_test(&self) {
+        self.state.lock().await.fail_next_hosting_record = true;
     }
 
     /// The identities the node has a half of — its own engine, store and
@@ -429,59 +409,55 @@ impl Runtime {
 
 type DirectoryChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static>;
 
-/// Host every identity the record names from the replicas the node holds.
-/// A replica the store does not hold is skipped, loudly, and the rest of
-/// the record comes back; one the store holds but cannot open fails the
-/// start, because a runtime hosting less than its record names would look
-/// healthy while refusing everything.
+/// Host every identity whose subdirectory records its hosting. An
+/// identity whose record names a directory replica the store does not hold
+/// is skipped, loudly, and the rest come back; one the store holds but
+/// cannot open fails the start, because a runtime hosting less than its
+/// records name would look healthy while refusing everything.
 async fn recover_hosted_identities(
     node: &SyncNode,
-    data_dir: Option<&std::path::Path>,
 ) -> Result<(
     HashMap<PdnId, HostedIdentity>,
     Vec<(PdnId, DirectoryChanges)>,
 )> {
-    let recovered = match data_dir {
-        Some(directory) => hosted::read_record(directory)?,
-        None => Vec::new(),
-    };
     let mut identities = HashMap::new();
     let mut armers: Vec<(PdnId, DirectoryChanges)> = Vec::new();
-    for line in recovered {
+    // Each skip leaves its record where it is, so it repeats on every start
+    // rather than being erased by one.
+    for record in node.recorded_hosting()? {
+        if !record.store_present {
+            tracing::warn!(
+                identity = %record.identity,
+                directory = %record.directory,
+                "a hosting record names an identity whose replica store is absent; the identity is not hosted"
+            );
+            continue;
+        }
         // The identity's own half of the node comes up first: its store is
         // where its directory replica lives.
-        node.provision_identity(line.identity).await?;
-        let opened = PrivateMetadataStore::open(node, line.identity, line.directory)
+        node.provision_identity(record.identity).await?;
+        let opened = PrivateMetadataStore::open(node, record.identity, record.directory)
             .await
             .with_context(|| {
                 format!(
                     "cannot recover hosted identity {}: its directory replica did not open",
-                    line.identity
+                    record.identity
                 )
             })?;
         let Some(directory) = opened else {
-            let _ = node.unhost_identity(line.identity).await;
-            // The line stays in the record, so the skip is visible on every
-            // start rather than erased by a start deciding on its own.
+            let _ = node.unhost_identity(record.identity).await;
             tracing::warn!(
-                identity = %line.identity,
-                directory = %line.directory,
-                "hosted-identities record names a directory replica this node's store does not hold; the identity is not hosted"
+                identity = %record.identity,
+                directory = %record.directory,
+                "a hosting record names a directory replica this node's store does not hold; the identity is not hosted"
             );
             continue;
         };
         let changes = directory.changes().await?;
-        let author = node.default_author(line.identity)?;
-        node.host_identity(line.identity, &directory)?;
-        identities.insert(line.identity, HostedIdentity { directory, author });
-        armers.push((line.identity, Box::new(changes)));
+        let author = node.default_author(record.identity)?;
+        node.host_identity(record.identity, &directory)?;
+        identities.insert(record.identity, HostedIdentity { directory, author });
+        armers.push((record.identity, Box::new(changes)));
     }
     Ok((identities, armers))
-}
-
-fn data_dir_of(storage: &StorageConfig) -> Option<PathBuf> {
-    match storage {
-        StorageConfig::Directory(directory) => Some(directory.clone()),
-        StorageConfig::Memory => None,
-    }
 }
