@@ -405,20 +405,14 @@ impl SyncHandle {
     ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
-        let actor = Actor {
-            actor_id: NEXT_ACTOR_ID.fetch_add(1, AtomicOrdering::Relaxed),
+        let actor = Actor::new(
             store,
-            states: Default::default(),
-            sessions: Default::default(),
-            next_session_id: 0,
-            last_session_sweep: Instant::now(),
             action_rx,
             content_status_callback,
             capability_validator,
             rejection_observer,
-            tasks: Default::default(),
-            metrics: metrics.clone(),
-        };
+            metrics.clone(),
+        );
 
         let span = error_span!("sync", %me);
         #[cfg(wasm_browser)]
@@ -902,6 +896,30 @@ struct Actor {
 }
 
 impl Actor {
+    fn new(
+        store: Store,
+        action_rx: async_channel::Receiver<Action>,
+        content_status_callback: Option<ContentStatusCallback>,
+        capability_validator: Option<CapabilityValidator>,
+        rejection_observer: Option<RejectionObserver>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            actor_id: NEXT_ACTOR_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            store,
+            states: Default::default(),
+            sessions: Default::default(),
+            next_session_id: 0,
+            last_session_sweep: Instant::now(),
+            action_rx,
+            content_status_callback,
+            capability_validator,
+            rejection_observer,
+            tasks: Default::default(),
+            metrics,
+        }
+    }
+
     #[cfg(not(wasm_browser))]
     fn run_in_thread(self) -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -962,6 +980,12 @@ impl Actor {
                 }
             }
         };
+
+        // A request queued behind the shutdown keeps its reply channel for
+        // as long as any handle lives, so its caller would wait forever:
+        // closed first, so no request lands after the drain.
+        self.action_rx.close();
+        while self.action_rx.try_recv().is_ok() {}
 
         if let Err(cause) = self.store.flush() {
             warn!(?cause, "failed to flush store");
@@ -1565,6 +1589,54 @@ mod tests {
         sync.subscribe(id, tx).await?;
         sync.close(id).await?;
         assert!(rx.recv().await.is_err());
+        Ok(())
+    }
+
+    /// A request queued behind the shutdown fails its caller instead of
+    /// leaving it waiting while a handle lives. Both are in the channel
+    /// before the actor starts, so the shutdown is the first thing it reads.
+    #[tokio::test]
+    async fn a_request_queued_behind_the_shutdown_fails() -> anyhow::Result<()> {
+        let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
+        let (shutdown_reply, shutdown_rx) = oneshot::channel();
+        assert!(action_tx
+            .try_send(Action::Shutdown {
+                reply: Some(shutdown_reply)
+            })
+            .is_ok());
+        let (open_reply, open_rx) = oneshot::channel();
+        let namespace = NamespaceSecret::new(&mut rand::rng()).id();
+        assert!(action_tx
+            .try_send(Action::Replica(
+                namespace,
+                ReplicaAction::Open {
+                    reply: open_reply,
+                    opts: Default::default(),
+                },
+            ))
+            .is_ok());
+
+        let actor = Actor::new(
+            store::Store::memory(),
+            action_rx,
+            None,
+            None,
+            None,
+            Arc::new(Metrics::default()),
+        );
+        tokio::task::LocalSet::new()
+            .run_until(actor.run_async())
+            .await;
+        let _store = shutdown_rx.await?;
+
+        let queued = tokio::time::timeout(Duration::from_secs(5), open_rx)
+            .await
+            .context("the queued request's caller was left waiting")?;
+        assert!(queued.is_err(), "the queued request must not be served");
+        assert!(
+            action_tx.is_closed(),
+            "a request sent after the shutdown must fail at once"
+        );
         Ok(())
     }
 

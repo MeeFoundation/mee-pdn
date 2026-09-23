@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashSet,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -28,12 +29,54 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::{read_payload, SyncNode};
 
-/// The wait of [`PrivateMetadataStore::wait_caught_up`] elapsed. Downcast
+/// The wait of [`CatchUpWatch::wait`] elapsed. Downcast
 /// from its `anyhow::Error` to tell "did not catch up in time" from this
 /// node's own failures.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("no successful sync session of the replica within the wait")]
 pub struct CatchUpTimeout;
+
+/// A subscription to one replica's sync sessions, from
+/// [`PrivateMetadataStore::watch_catch_up`]. Unread, it holds back the
+/// engine's events once its buffer fills, so the wait follows promptly.
+pub struct CatchUpWatch {
+    events: Pin<Box<dyn Stream<Item = Result<LiveEvent>> + Send>>,
+    since: SystemTime,
+}
+
+impl std::fmt::Debug for CatchUpWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatchUpWatch")
+            .field("since", &self.since)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatchUpWatch {
+    /// Wait for the first successful sync session started since the watch
+    /// was taken, or fail with [`CatchUpTimeout`]. A completed session, not
+    /// arrived content: a replica that synced and found nothing new and one
+    /// that never synced read the same.
+    pub async fn wait(mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CatchUpTimeout.into());
+            }
+            let Ok(event) = tokio::time::timeout(remaining, self.events.next()).await else {
+                return Err(CatchUpTimeout.into());
+            };
+            let event =
+                event.context("replica event stream ended while waiting for a sync session")??;
+            if let LiveEvent::SyncFinished(sync) = event {
+                if sync.result.is_ok() && sync.started >= self.since {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
 
 /// The one key shape shared by the directory's device set, the connection
 /// metadata store's published device sets, and the access book's probe:
@@ -549,29 +592,16 @@ impl PrivateMetadataStore {
         self.doc.id()
     }
 
-    /// Wait for the first successful sync session started after `since`, or
-    /// fail with [`CatchUpTimeout`]. A completed session, not arrived
-    /// content: a replica that synced and found nothing new and one that
-    /// never synced read the same.
-    pub async fn wait_caught_up(&self, since: SystemTime, timeout: Duration) -> Result<()> {
-        let mut events = self.events().await?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(CatchUpTimeout.into());
-            }
-            let Ok(event) = tokio::time::timeout(remaining, events.next()).await else {
-                return Err(CatchUpTimeout.into());
-            };
-            let event =
-                event.context("replica event stream ended while waiting for a sync session")??;
-            if let LiveEvent::SyncFinished(sync) = event {
-                if sync.result.is_ok() && sync.started >= since {
-                    return Ok(());
-                }
-            }
-        }
+    /// Taken before whatever starts the replica's sessions — before
+    /// `host_identity` arms a directory — or a session finished before the
+    /// subscription goes unseen and the wait holds out for the next one.
+    pub async fn watch_catch_up(&self) -> Result<CatchUpWatch> {
+        let since = SystemTime::now();
+        let events = self.events().await?;
+        Ok(CatchUpWatch {
+            events: Box::pin(events),
+            since,
+        })
     }
 
     /// The kinds under which tickets are published, record-level.

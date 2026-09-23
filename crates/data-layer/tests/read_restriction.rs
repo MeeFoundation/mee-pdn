@@ -1165,6 +1165,110 @@ async fn grant_one_claim_to(
     Ok(())
 }
 
+/// A session the issuer opens toward a node hosting two of its audiences
+/// is served by the stack of the audience it names: each audience holds
+/// the issuer's new value on its own claim once the session naming it
+/// returns. The audiences cannot fetch it themselves — their contacts are
+/// cleared, which also empties the reads' nudge, and a scoped replica has
+/// no gossip path — so the issuer's session is the only way it arrives,
+/// and a misaddressed one fails here rather than as a slow convergence.
+///
+/// Paired denial: a session naming an identity the node does not host is
+/// refused as not hosted; its hand-made contact is the negative control.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, both audiences and the denial in one place
+async fn an_issuers_session_is_served_by_the_audience_it_names() -> Result<()> {
+    // A session's last message lands within milliseconds of its return.
+    const LANDED: Duration = Duration::from_secs(2);
+    let bob = spawn_node().await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let alice = spawn_node().await?;
+    let _work_dir = host_identity(&alice, ids::ALICE_AT_WORK).await?;
+    let _leisure_dir = host_identity(&alice, ids::ALICE_AT_LEISURE).await?;
+
+    bob.create_namespace(ids::BOB, ids::BOB).await?;
+    write_bobs_entries(&bob).await?;
+    let work_claim = EntryPath::new(GRANTED)?;
+    let leisure_claim = EntryPath::new(WITHHELD_A)?;
+    grant_one_claim_to(&bob, &alice, ids::ALICE_AT_WORK, &work_claim).await?;
+    grant_one_claim_to(&bob, &alice, ids::ALICE_AT_LEISURE, &leisure_claim).await?;
+    for (audience, claim) in [
+        (ids::ALICE_AT_WORK, &work_claim),
+        (ids::ALICE_AT_LEISURE, &leisure_claim),
+    ] {
+        assert!(
+            eventually(|| async { Ok(alice.read(audience, ids::BOB, claim).await?.is_some()) })
+                .await?,
+            "the granted claim did not reach {audience}"
+        );
+        alice.set_namespace_contacts(audience, ids::BOB, Vec::new())?;
+    }
+    // A session an audience opened before its clearing ends well inside this.
+    tokio::time::sleep(RECONCILE).await;
+
+    let bob_author = bob.default_author(ids::BOB)?;
+    let alice_addr = alice.dial_handle().addr();
+    for (audience, claim, value) in [
+        (
+            ids::ALICE_AT_WORK,
+            &work_claim,
+            b"bob@second.example.org".as_slice(),
+        ),
+        (
+            ids::ALICE_AT_LEISURE,
+            &leisure_claim,
+            b"+44-20-7946-0000".as_slice(),
+        ),
+    ] {
+        bob.write(ids::BOB, ids::BOB, bob_author, claim, value)
+            .await?;
+        bob.sync_as_for_test(
+            ids::BOB,
+            ids::BOB,
+            Contact::new(alice_addr.clone(), identity_of(audience)),
+            identity_of(ids::BOB),
+        )
+        .await?;
+        let len = u64::try_from(value.len())?;
+        let landed = tokio::time::timeout(LANDED, async {
+            loop {
+                let listed = alice.list(audience, ids::BOB, None).await?;
+                if listed
+                    .iter()
+                    .any(|entry| &entry.path == claim && entry.payload_len == len)
+                {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            matches!(landed, Ok(Ok(()))),
+            "the session naming {audience} was not served by its stack: {landed:?}"
+        );
+    }
+
+    // Denied.
+    let refused = bob
+        .sync_as_for_test(
+            ids::BOB,
+            ids::BOB,
+            Contact::new(alice_addr, identity_of(ids::CAROL)),
+            identity_of(ids::BOB),
+        )
+        .await
+        .expect_err("a session naming an identity the node does not host must be refused");
+    assert!(
+        format!("{refused:#}").contains("NotFound"),
+        "the refusal must be the not-hosted abort, got: {refused:#}"
+    );
+
+    bob.shutdown().await?;
+    alice.shutdown().await?;
+    Ok(())
+}
+
 /// Two audiences of one issuer hosted side by side on one node each
 /// receive exactly the claim granted to it: rights follow the identity a
 /// session names, and are never the union of what the node's identities

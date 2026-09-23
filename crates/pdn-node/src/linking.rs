@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     pairing::{read_message, write_message, StateSlot},
-    runtime::{HostedIdentity, State},
+    runtime::{HostedIdentity, ServingHalves, State},
 };
 
 pub(crate) const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
@@ -118,25 +118,18 @@ struct LinkingResponse {
     data: DocTicket,
 }
 
-/// Never meant to bound anything: exists so `shutdown`'s `acquire_many` has
-/// a fixed permit count to wait for.
-const MAX_CONCURRENT_LINKINGS: usize = 1_048_576;
-
-const SHUTDOWN_LINKING_BUDGET: Duration = Duration::from_secs(10);
-
 /// The accept side of the linking dialogue.
 #[derive(Debug, Clone)]
 pub(crate) struct LinkingHandler {
     state: StateSlot,
-    /// One permit per `accept` in flight; see `PairingHandler`.
-    in_flight: Arc<tokio::sync::Semaphore>,
+    serving_halves: ServingHalves,
 }
 
 impl LinkingHandler {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(serving_halves: ServingHalves) -> Self {
         Self {
             state: Arc::default(),
-            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LINKINGS)),
+            serving_halves,
         }
     }
 
@@ -243,25 +236,15 @@ impl LinkingHandler {
 
 impl ProtocolHandler for LinkingHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // The `let else` is exhaustiveness: the semaphore is never closed.
-        let Ok(_permit) = self.in_flight.acquire().await else {
-            return Ok(());
+        let served = match self.serving_halves.enter().await {
+            Some(_permit) => self.serve(&connection).await,
+            None => None,
         };
-        if self.serve(&connection).await.is_none() {
+        if served.is_none() {
             // The one uniform refusal.
             connection.close(0u32.into(), b"");
         }
         Ok(())
-    }
-
-    /// See `PairingHandler::shutdown`.
-    async fn shutdown(&self) {
-        let permits = u32::try_from(MAX_CONCURRENT_LINKINGS).unwrap_or(u32::MAX);
-        let _ = tokio::time::timeout(
-            SHUTDOWN_LINKING_BUDGET,
-            self.in_flight.acquire_many(permits),
-        )
-        .await;
     }
 }
 
@@ -331,13 +314,11 @@ async fn link_via_dialogue_inner(
             Err(_budget_spent) => return Err(DialogueTimeout.into()),
         };
 
-    // Sessions the imports start count for the catch-up: they start after
-    // this instant. The lock is dropped before every `undo_link` call:
-    // `undo_link` locks `state` itself, so a detached rollback can call it.
-    let before_import = SystemTime::now();
+    // The lock is dropped before every `undo_link` call: `undo_link` locks
+    // `state` itself, so a detached rollback can call it.
     let rollback_state = Arc::clone(state);
     let mut rollback;
-    let directory = {
+    let (directory, catch_up) = {
         let state_guard = state.lock().await;
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
@@ -371,6 +352,16 @@ async fn link_via_dialogue_inner(
             }
         };
         rollback.armed_directory(directory.namespace());
+        // Before the arming starts the directory's sync.
+        let catch_up = match directory.watch_catch_up().await {
+            Ok(catch_up) => catch_up,
+            Err(err) => {
+                drop(state_guard);
+                undo_link(state, payload.identity, Some(directory.namespace()), None).await;
+                rollback.disarm();
+                return Err(err);
+            }
+        };
         // The book refuses callers it cannot resolve while it catches up,
         // so no serving window opens on the long-lived namespace id.
         if let Err(err) = state_guard.node.host_identity(payload.identity, &directory) {
@@ -392,7 +383,7 @@ async fn link_via_dialogue_inner(
                 return Err(err);
             }
         }
-        directory
+        (directory, catch_up)
     };
 
     #[cfg(feature = "test-util")]
@@ -404,7 +395,7 @@ async fn link_via_dialogue_inner(
     // No lock held: a cancellation here is what `rollback`'s `Drop` exists
     // for — the explicit branch covers only a completed wait.
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if let Err(err) = directory.wait_caught_up(before_import, remaining).await {
+    if let Err(err) = catch_up.wait(remaining).await {
         rollback.roll_back().await;
         return Err(err).context("the imported directory did not catch up in time");
     }

@@ -45,14 +45,54 @@ impl CleanupSupervisor {
     }
 }
 
+const MAX_SERVING_HALVES: usize = 1_048_576;
+const MAX_SERVING_HALVES_U32: u32 = 1_048_576;
+
+/// How long [`Runtime::shutdown`] waits for the ceremonies' serving halves
+/// in flight before it stops the node anyway.
+pub const SHUTDOWN_SERVING_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One permit per serving half of either ceremony in flight, over either
+/// transport. [`Runtime::shutdown`] drains them before the node stops, since
+/// the router stops the blob store beside the handlers it would wait for.
+/// The count bounds nothing: it gives the drain a fixed number to wait for.
+#[derive(Debug, Clone)]
+pub(crate) struct ServingHalves(Arc<tokio::sync::Semaphore>);
+
+impl ServingHalves {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(MAX_SERVING_HALVES)))
+    }
+
+    /// `None` once the drain has run: the serving half refuses before it
+    /// burns anything.
+    pub(crate) async fn enter(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.0).acquire_owned().await.ok()
+    }
+
+    async fn drain(&self) {
+        let _ = tokio::time::timeout(
+            SHUTDOWN_SERVING_BUDGET,
+            self.0.acquire_many(MAX_SERVING_HALVES_U32),
+        )
+        .await;
+        self.0.close();
+    }
+
+    #[cfg(feature = "test-util")]
+    fn any_in_flight(&self) -> bool {
+        self.0.available_permits() < MAX_SERVING_HALVES
+    }
+}
+
 #[cfg(feature = "test-util")]
-pub struct LinkAfterImportPause {
+pub struct CeremonyPause {
     pub(crate) reached: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
 }
 
 #[cfg(feature = "test-util")]
-impl LinkAfterImportPause {
+impl CeremonyPause {
     pub async fn wait_until_reached(&self) {
         self.reached.notified().await;
     }
@@ -129,14 +169,18 @@ pub(crate) struct State {
     /// stopping the node.
     pub(crate) cleanup_tasks: CleanupSupervisor,
     pub(crate) linking_failures: tokio::sync::broadcast::Sender<LinkingLocalFailure>,
+    /// The in-process serving half enters here as `accept` does.
+    pub(crate) serving_halves: ServingHalves,
     #[cfg(feature = "test-util")]
-    pub(crate) pairing_in_flight: Arc<tokio::sync::Semaphore>,
+    pub(crate) link_after_import_pause: Option<Arc<CeremonyPause>>,
+    /// A pause of the pairing dialogue's serving half, after it read the
+    /// request and before it takes the state lock to verify and burn.
     #[cfg(feature = "test-util")]
-    pub(crate) link_after_import_pause: Option<Arc<LinkAfterImportPause>>,
+    pub(crate) pairing_serve_pause: Option<Arc<CeremonyPause>>,
     /// A pause just before the linking commit point, where a scenario reads
     /// what a link has published before it commits — nothing.
     #[cfg(feature = "test-util")]
-    pub(crate) link_before_commit_pause: Option<Arc<LinkAfterImportPause>>,
+    pub(crate) link_before_commit_pause: Option<Arc<CeremonyPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
     /// Fails the next `create` where its directory would be made — the one
@@ -202,11 +246,10 @@ impl Runtime {
     /// the spawn, and a directory with none is a first start.
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
         let sweep_interval = options.reconcile_interval;
-        let pairing = PairingHandler::new();
+        let serving_halves = ServingHalves::new();
+        let pairing = PairingHandler::new(serving_halves.clone());
         let pairing_slot = pairing.slot();
-        #[cfg(feature = "test-util")]
-        let pairing_in_flight = pairing.in_flight_probe();
-        let linking = LinkingHandler::new();
+        let linking = LinkingHandler::new(serving_halves.clone());
         let linking_slot = linking.slot();
         let node = SyncNode::spawn_with(
             vec![
@@ -252,10 +295,11 @@ impl Runtime {
             establishing_in_flight: HashSet::new(),
             cleanup_tasks: CleanupSupervisor::new(),
             linking_failures,
-            #[cfg(feature = "test-util")]
-            pairing_in_flight,
+            serving_halves,
             #[cfg(feature = "test-util")]
             link_after_import_pause: None,
+            #[cfg(feature = "test-util")]
+            pairing_serve_pause: None,
             #[cfg(feature = "test-util")]
             link_before_commit_pause: None,
             #[cfg(feature = "test-util")]
@@ -353,12 +397,7 @@ impl Runtime {
 
     #[cfg(feature = "test-util")]
     pub async fn pairing_accept_in_flight_for_test(&self) -> bool {
-        self.state
-            .lock()
-            .await
-            .pairing_in_flight
-            .available_permits()
-            < crate::pairing::MAX_CONCURRENT_ESTABLISHMENTS
+        self.state.lock().await.serving_halves.any_in_flight()
     }
 
     #[cfg(feature = "test-util")]
@@ -373,8 +412,8 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
-    pub async fn pause_next_link_after_import(&self) -> Arc<LinkAfterImportPause> {
-        let pause = Arc::new(LinkAfterImportPause {
+    pub async fn pause_next_link_after_import(&self) -> Arc<CeremonyPause> {
+        let pause = Arc::new(CeremonyPause {
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -383,8 +422,18 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
-    pub async fn pause_next_link_before_commit(&self) -> Arc<LinkAfterImportPause> {
-        let pause = Arc::new(LinkAfterImportPause {
+    pub async fn pause_next_pairing_serve(&self) -> Arc<CeremonyPause> {
+        let pause = Arc::new(CeremonyPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        self.state.lock().await.pairing_serve_pause = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn pause_next_link_before_commit(&self) -> Arc<CeremonyPause> {
+        let pause = Arc::new(CeremonyPause {
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -392,15 +441,22 @@ impl Runtime {
         pause
     }
 
-    /// Idempotent. The state lock is dropped before the shutdown is
-    /// awaited: `SyncNode::shutdown` waits for in-flight accepts, and one of
-    /// them may be trying to take that very lock.
+    /// Idempotent. The state lock is dropped before the drain: a serving
+    /// half in flight may be waiting for that very lock. The host's own
+    /// calls in flight — an `establish`, a `link` — are not waited for: a
+    /// host awaits them before it stops the runtime.
     pub async fn shutdown(&self) -> Result<()> {
         const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-        let (node, cleanup_tasks) = {
+        let (node, cleanup_tasks, serving_halves) = {
             let state = self.state.lock().await;
-            (Arc::clone(&state.node), state.cleanup_tasks.clone())
+            (
+                Arc::clone(&state.node),
+                state.cleanup_tasks.clone(),
+                state.serving_halves.clone(),
+            )
         };
+        // First: a serving half's own rollback lands in the cleanup tasks.
+        serving_halves.drain().await;
         cleanup_tasks.close();
         let _ = tokio::time::timeout(CLEANUP_BUDGET, cleanup_tasks.wait()).await;
         node.shutdown().await

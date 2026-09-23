@@ -193,18 +193,20 @@ impl AccessBook {
         // (Invariants 1 and 3). Classifying them against their own, possibly
         // not yet converged, device records would deadlock the bootstrap
         // that delivers those records.
-        if self.directory_is(namespace)? || self.connection_by_namespace(namespace)?.is_some() {
-            return Ok(SessionAccess::whole());
+        let ticket_bound =
+            self.directory_is(namespace)? || self.connection_by_namespace(namespace)?.is_some();
+        match (registry.binding_of(namespace)?, ticket_bound) {
+            (None, true) => Ok(SessionAccess::whole()),
+            (Some((issuer, posture)), false) => {
+                self.classify_data(registry, issuer, posture, remote, peer, role)
+                    .await
+            }
+            // Held in no role, or none at all: nothing here can judge the
+            // caller, and a ticket bounds no data replica by itself. Held in
+            // both, which the import guards keep out: neither role's rule
+            // outranks the other's, so neither decides.
+            (Some(_), true) | (None, false) => Ok(SessionAccess::Deny),
         }
-
-        let Some((issuer, posture)) = registry.binding_of(namespace)? else {
-            // A replica this identity holds under no data binding, or none
-            // at all: nothing here can judge the caller, and a ticket bounds
-            // no data replica by itself.
-            return Ok(SessionAccess::Deny);
-        };
-        self.classify_data(registry, issuer, posture, remote, peer, role)
-            .await
     }
 
     /// The party across the session names one identity; it is admitted

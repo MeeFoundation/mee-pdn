@@ -3,7 +3,7 @@
 //! product does — her own stores, her directory naming the device — so a
 //! session is judged by her records rather than by ticket possession.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{AddrInfoOptions, CatchUpTimeout, PrivateMetadataStore, ShareMode};
@@ -237,8 +237,9 @@ async fn directory_carries_arbitrary_tickets() -> Result<()> {
 }
 
 /// The directory's catch-up wait returns on a completed sync session, not
-/// on arrived content: the first wait covers the import's own session (and
-/// the content it carried), and a second wait from a fresh instant — after
+/// on arrived content: the first wait, watched from before the arming,
+/// covers the arming's first session (and the content it carried), and a
+/// second wait from a fresh instant — after
 /// which no new content will ever arrive — still returns, woken by a later
 /// session that found nothing new. A content poll cannot see that session;
 /// the wait must.
@@ -253,10 +254,11 @@ async fn directory_wait_returns_on_a_session_not_on_content() -> Result<()> {
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
-    // Sessions the import starts count: they start after this instant.
-    let before_import = SystemTime::now();
-    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
-    laptop_dir.wait_caught_up(before_import, TIMEOUT).await?;
+    laptop.provision_identity(ids::ALICE).await?;
+    let laptop_dir = PrivateMetadataStore::import(&laptop, ids::ALICE, ticket).await?;
+    let catch_up = laptop_dir.watch_catch_up().await?;
+    laptop.host_identity(ids::ALICE, &laptop_dir)?;
+    catch_up.wait(TIMEOUT).await?;
     // The session that returned the wait carried the pre-import record.
     assert!(
         laptop_dir.is_connected(ids::BOB).await?,
@@ -265,9 +267,7 @@ async fn directory_wait_returns_on_a_session_not_on_content() -> Result<()> {
 
     // From a fresh instant nothing new will arrive — the wait returns on
     // the next completed session alone (the node's periodic reconcile pass).
-    laptop_dir
-        .wait_caught_up(SystemTime::now(), TIMEOUT)
-        .await?;
+    laptop_dir.watch_catch_up().await?.wait(TIMEOUT).await?;
 
     phone.shutdown().await?;
     laptop.shutdown().await?;
@@ -288,12 +288,11 @@ async fn directory_wait_times_out_without_a_reachable_peer() -> Result<()> {
     // The ticket's only contact goes away before the import.
     phone.shutdown().await?;
 
-    let before_import = SystemTime::now();
-    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
-    let err = laptop_dir
-        .wait_caught_up(before_import, Duration::from_secs(2))
-        .await
-        .unwrap_err();
+    laptop.provision_identity(ids::ALICE).await?;
+    let laptop_dir = PrivateMetadataStore::import(&laptop, ids::ALICE, ticket).await?;
+    let catch_up = laptop_dir.watch_catch_up().await?;
+    laptop.host_identity(ids::ALICE, &laptop_dir)?;
+    let err = catch_up.wait(Duration::from_secs(2)).await.unwrap_err();
     assert!(
         err.downcast_ref::<CatchUpTimeout>().is_some(),
         "expected the typed catch-up timeout, got: {err:#}"

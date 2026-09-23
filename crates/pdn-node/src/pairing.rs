@@ -25,7 +25,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::runtime::State;
+use crate::runtime::{ServingHalves, State};
 
 pub(crate) const PAIRING_ALPN: &[u8] = b"/pdn/pairing/0";
 
@@ -163,39 +163,23 @@ impl PendingInvites {
 /// state alive. A connection arriving before the slot is filled is refused.
 pub(crate) type StateSlot = Arc<OnceLock<Weak<Mutex<State>>>>;
 
-/// Never meant to bound anything: exists so `shutdown`'s `acquire_many` has
-/// a fixed permit count to wait for.
-pub(crate) const MAX_CONCURRENT_ESTABLISHMENTS: usize = 1_048_576;
-const MAX_CONCURRENT_ESTABLISHMENTS_U32: u32 = 1_048_576;
-
-/// How long `shutdown` waits for in-flight `accept` calls before letting
-/// the router close the endpoint anyway.
-pub const SHUTDOWN_ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(10);
-
 /// The accept side of the pairing dialogue.
 #[derive(Debug, Clone)]
 pub(crate) struct PairingHandler {
     state: StateSlot,
-    /// One permit per `accept` in flight; `shutdown` waits for every permit
-    /// rather than letting the router abort an establishment outright.
-    in_flight: Arc<tokio::sync::Semaphore>,
+    serving_halves: ServingHalves,
 }
 
 impl PairingHandler {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(serving_halves: ServingHalves) -> Self {
         Self {
             state: Arc::default(),
-            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ESTABLISHMENTS)),
+            serving_halves,
         }
     }
 
     pub(crate) fn slot(&self) -> StateSlot {
         Arc::clone(&self.state)
-    }
-
-    #[cfg(feature = "test-util")]
-    pub(crate) fn in_flight_probe(&self) -> Arc<tokio::sync::Semaphore> {
-        Arc::clone(&self.in_flight)
     }
 
     /// `None` is a refusal, any reason at all, answered by the caller with
@@ -228,6 +212,15 @@ where
     let request: PairingRequest = read_message(recv).await.ok()?;
     if request.version != INVITE_FORMAT_VERSION {
         return None;
+    }
+
+    #[cfg(feature = "test-util")]
+    {
+        let pause = state_arc.lock().await.pairing_serve_pause.take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     // The state is held only for the local verify-and-assemble: the guard
@@ -299,28 +292,15 @@ where
 
 impl ProtocolHandler for PairingHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // `acquire` only errs once the semaphore is closed, which never
-        // happens: the `let else` is exhaustiveness.
-        let Ok(_permit) = self.in_flight.acquire().await else {
-            return Ok(());
+        let served = match self.serving_halves.enter().await {
+            Some(_permit) => self.serve(&connection).await,
+            None => None,
         };
-        if self.serve(&connection).await.is_none() {
+        if served.is_none() {
             // The one uniform refusal.
             connection.close(0u32.into(), b"");
         }
         Ok(())
-    }
-
-    /// `Router::shutdown` stops dispatching new `accept` calls before
-    /// awaiting this, so `acquire_many` reaching every permit means every
-    /// `accept` in flight when shutdown began has returned.
-    async fn shutdown(&self) {
-        let _ = tokio::time::timeout(
-            SHUTDOWN_ESTABLISHMENT_BUDGET,
-            self.in_flight
-                .acquire_many(MAX_CONCURRENT_ESTABLISHMENTS_U32),
-        )
-        .await;
     }
 }
 
@@ -374,17 +354,21 @@ const PAIRING_PIPE_BYTES: usize = MAX_WIRE_MESSAGE_LEN as usize + 4;
 /// The dialogue between two identities of one node, run over a pipe: the
 /// same messages, the same verify-and-burn and the same assembly as
 /// between two nodes, with the serving half taken from this runtime's own
-/// state.
+/// state and entered into the serving halves as `accept` enters it.
 async fn pair_in_process(
     state: &Arc<Mutex<State>>,
     request: &PairingRequest,
 ) -> Result<PairingResponse> {
+    // Before the spawn, so the permit covers the whole serving half.
+    let serving_halves = state.lock().await.serving_halves.clone();
+    let permit = serving_halves.enter().await.ok_or(EstablishmentRefused)?;
     let (dialing, serving) = tokio::io::duplex(PAIRING_PIPE_BYTES);
     let (mut dial_recv, mut dial_send) = tokio::io::split(dialing);
     let (mut serve_recv, mut serve_send) = tokio::io::split(serving);
     let served = {
         let state = Arc::clone(state);
         tokio::spawn(async move {
+            let _permit = permit;
             serve_pairing(&state, &mut serve_send, &mut serve_recv)
                 .await
                 .is_some()

@@ -75,7 +75,8 @@ struct CoLocatedPair {
 /// node reachable — while the withheld claim stays absent.
 ///
 /// Denied: a third identity of the same node, holding the very ticket the
-/// grant carried, obtains nothing from it; and the grantee's own session
+/// grant carried, obtains nothing from it and is reached by none of the
+/// grantee's dials, which name the issuer; and the grantee's own session
 /// carries nothing of the withheld claim, whose absence a proven second
 /// wave orders.
 #[tokio::test(flavor = "multi_thread")]
@@ -187,14 +188,41 @@ async fn two_identities_of_one_node_converge_what_the_grant_covers() -> Result<(
     // Denied (a co-located identity with the ticket and no grant). Several
     // reconcile passes: a scoped identity has no gossip path, so what it
     // would obtain it obtains on a pass.
+    let namespace = ticket.capability.id();
     node.import_namespace_scoped(ids::CAROL, ids::ALICE_AT_WORK, ticket)
         .await?;
+    // The periodic pass reconciles every co-located pair holding the
+    // namespace, whatever a dial named, so the window below opens once the
+    // pass has gone quiet: two intervals without a session of its own.
+    assert!(
+        eventually(|| async {
+            let before = node.co_located_pass_sessions_of(namespace);
+            tokio::time::sleep(RECONCILE * 2).await;
+            Ok(node.co_located_pass_sessions_of(namespace) == before)
+        })
+        .await?,
+        "the periodic pass over the namespace's co-located holders never went quiet"
+    );
+    let work_served = node.in_process_sessions_served(ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE)?;
+    let carol_served = node.in_process_sessions_served(ids::CAROL, ids::ALICE_AT_LEISURE)?;
     tokio::time::sleep(RECONCILE * 6).await;
     assert_eq!(
         node.read(ids::CAROL, ids::ALICE_AT_WORK, &granted_path)
             .await?,
         None,
         "a co-located identity holding the ticket and no grant obtained the entry"
+    );
+
+    // The grantee's contact names the issuer, so its passes reach the
+    // issuer every interval and never the third holder of the namespace.
+    assert!(
+        node.in_process_sessions_served(ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE)? > work_served,
+        "the grantee's passes reached no one"
+    );
+    assert_eq!(
+        node.in_process_sessions_served(ids::CAROL, ids::ALICE_AT_LEISURE)?,
+        carol_served,
+        "a dial naming the issuer reached a co-located identity it did not name"
     );
 
     node.shutdown().await?;

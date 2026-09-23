@@ -36,6 +36,7 @@ pub struct Docs {
     /// The task serving `api`, which holds the engine: it stops with the
     /// last clone of this, whatever handles into the API remain.
     _rpc: Arc<n0_future::task::AbortOnDropHandle<()>>,
+    replica_cache_bytes: Option<usize>,
 }
 
 impl Docs {
@@ -97,12 +98,19 @@ impl Docs {
             engine,
             api,
             _rpc: Arc::new(rpc),
+            replica_cache_bytes: None,
         }
     }
 
     /// Returns the API for this docs instance.
     pub fn api(&self) -> &DocsApi {
         &self.api
+    }
+
+    /// The cache bound the replica store was opened with; `None` for a
+    /// store in memory, or for docs built with [`Docs::new`] from an engine.
+    pub fn replica_cache_bytes(&self) -> Option<usize> {
+        self.replica_cache_bytes
     }
 }
 
@@ -122,8 +130,7 @@ impl ProtocolHandler for Docs {
         let opening = accept_session(&connection)
             .await
             .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?;
-        let mine = opening.identity() == self.engine.identity();
-        serve_dispatched(connection, opening, mine.then_some(self)).await
+        serve_dispatched(connection, opening, Some(self)).await
     }
 
     async fn shutdown(&self) {
@@ -192,12 +199,13 @@ impl Builder {
         blobs: BlobsStore,
         gossip: Gossip,
     ) -> anyhow::Result<Docs> {
-        let replica_store = match &self.storage {
-            Storage::Memory => Store::memory(),
+        let (replica_store, replica_cache_bytes) = match &self.storage {
+            Storage::Memory => (Store::memory(), None),
             #[cfg(feature = "fs-store")]
-            Storage::Persistent { path, cache_bytes } => {
-                Store::persistent(path.join("docs.redb"), *cache_bytes)?
-            }
+            Storage::Persistent { path, cache_bytes } => (
+                Store::persistent(path.join("docs.redb"), *cache_bytes)?,
+                Some(*cache_bytes),
+            ),
         };
         let author_store = match &self.storage {
             Storage::Memory => DefaultAuthorStorage::Mem,
@@ -222,7 +230,9 @@ impl Builder {
             self.co_located,
         )
         .await?;
-        Ok(Docs::new(engine))
+        let mut docs = Docs::new(engine);
+        docs.replica_cache_bytes = replica_cache_bytes;
+        Ok(docs)
     }
 }
 
@@ -261,13 +271,15 @@ impl ProtocolHandler for DocsDispatch {
 /// Hand a read session to the engine that answers for the identity it names,
 /// or refuse it. The only way a session enters an engine: reading the first
 /// message is the caller's, so nothing hands an engine a raw connection and
-/// no accept path waits on the wire inside the actor loop.
+/// no accept path waits on the wire inside the actor loop. An engine of
+/// another identity is refused as none: its book would judge a session
+/// addressed to a replica it does not answer for.
 async fn serve_dispatched(
     connection: Connection,
     opening: crate::net::SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     docs: Option<&Docs>,
 ) -> Result<(), iroh::protocol::AcceptError> {
-    match docs {
+    match docs.filter(|docs| docs.engine.identity() == opening.identity()) {
         Some(docs) => docs
             .engine
             .handle_session(connection, opening)

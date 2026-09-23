@@ -50,5 +50,5 @@ pub use pdn_store::{
     api::protocol::{AddrInfoOptions, ShareMode},
     AuthorId, Contact, DocTicket, Identity, NamespaceId,
 };
-pub use private_metadata::{CatchUpTimeout, PrivateMetadataStore, RetractionMarker};
+pub use private_metadata::{CatchUpTimeout, CatchUpWatch, PrivateMetadataStore, RetractionMarker};
 pub use retraction::RetractionVerdict;

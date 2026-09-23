@@ -87,6 +87,9 @@ pub struct Engine {
     /// Sessions opened over the in-process path, so a pass over a quiet
     /// pair of co-located identities can be shown to open none.
     in_process_sessions: Arc<std::sync::atomic::AtomicU64>,
+    /// Sessions handed to this engine over the in-process path, per caller,
+    /// so a dial can be shown to reach only the identity it named.
+    in_process_served: std::sync::Mutex<std::collections::HashMap<Identity, u64>>,
     _gc_protect_task: AbortOnDropHandle<()>,
 }
 
@@ -207,6 +210,7 @@ impl Engine {
             blob_store: bao_store,
             identity,
             in_process_sessions,
+            in_process_served: std::sync::Mutex::default(),
             _gc_protect_task: gc_protect_task,
         })
     }
@@ -391,9 +395,13 @@ impl Engine {
                 })
                 .await;
         });
+        let opening = opening?;
+        if let Ok(mut served) = serve.in_process_served.lock() {
+            *served.entry(self.identity).or_default() += 1;
+        }
         serve
             .to_live_actor
-            .send(ToLiveActor::AcceptInProcess { opening: opening? })
+            .send(ToLiveActor::AcceptInProcess { opening })
             .await?;
         Ok(())
     }
@@ -402,6 +410,16 @@ impl Engine {
     pub fn in_process_sessions(&self) -> u64 {
         self.in_process_sessions
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sessions handed to this engine over the in-process path by the
+    /// engine of `caller`.
+    pub fn in_process_sessions_served(&self, caller: Identity) -> u64 {
+        self.in_process_served
+            .lock()
+            .ok()
+            .and_then(|served| served.get(&caller).copied())
+            .unwrap_or_default()
     }
 
     /// Shutdown the engine.

@@ -1225,6 +1225,42 @@ mod tests {
         Ok(())
     }
 
+    /// A persistent store's cache holds to the bound it was opened with: a
+    /// working set many times the bound evicts, and what stays resident fits
+    /// it. Were the bound lost on the way to the database, the store would
+    /// open at redb's own default, which nothing here comes near.
+    #[tokio::test]
+    async fn a_persistent_store_opens_its_cache_at_the_bound_it_is_given() -> Result<()> {
+        const BOUND: usize = 256 * 1024;
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path(), BOUND)?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        {
+            let mut replica = store.new_replica(namespace.clone())?;
+            for i in 0..8_000u32 {
+                replica
+                    .hash_and_insert(format!("key/{i}"), &author, i.to_be_bytes())
+                    .await?;
+            }
+        }
+        store.flush()?;
+        let read = store.get_many(namespace.id(), Query::all())?.count();
+        assert_eq!(read, 8_000);
+
+        let stats = store.db.cache_stats();
+        assert!(
+            stats.evictions() > 0,
+            "a working set past the bound evicted nothing: the bound did not reach the database"
+        );
+        assert!(
+            stats.used_bytes() <= BOUND,
+            "the cache holds {} bytes past its bound of {BOUND}",
+            stats.used_bytes()
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_basics() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;

@@ -97,6 +97,12 @@ struct Serving {
 }
 
 async fn serving_node() -> Result<Serving> {
+    serving_node_routing(|named| named).await
+}
+
+/// `route` says whose engine the resolver answers a session naming an
+/// identity with: that identity's own on a node that routes correctly.
+async fn serving_node_routing(route: fn(Identity) -> Identity) -> Result<Serving> {
     let endpoint = loopback_endpoint().await?;
     let blobs = MemStore::new();
     let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -111,7 +117,7 @@ async fn serving_node() -> Result<Serving> {
     let resolve: IdentityResolver = {
         let work = work.clone();
         let leisure = leisure.clone();
-        Arc::new(move |identity| match identity {
+        Arc::new(move |identity| match route(identity) {
             h if h == WORK => Some(work.clone()),
             h if h == LEISURE => Some(leisure.clone()),
             _ => None,
@@ -302,6 +308,61 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
             "a identity the node does not host reached an engine"
         );
     }
+
+    serving.router.shutdown().await?;
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A session the resolver hands to another identity's engine is refused as
+/// not hosted, and that engine's provider is never asked about it: a
+/// routing defect costs the session, never a judgement by the records of
+/// an identity the session did not name. The resolver here answers every
+/// session with the first identity's engine; a session naming that
+/// identity is served.
+///
+/// Denied: a session naming the co-located identity, for a replica the
+/// first identity's engine holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_handed_to_another_identitys_engine_is_refused() -> Result<()> {
+    let serving = serving_node_routing(|_named| WORK).await?;
+    let dialing = dialing_node().await?;
+    let serving_addr = serving.router.endpoint().addr();
+
+    let (_work_doc, work_here) =
+        namespace_with(serving.work.api(), dialing.docs.api(), WORK_VALUE).await?;
+    work_here
+        .start_sync_scoped(vec![Contact::new(serving_addr.clone(), WORK)], WORK)
+        .await?;
+    assert!(
+        eventually(|| holds(&work_here, WORK_VALUE)).await?,
+        "the session naming the routed identity carried nothing"
+    );
+
+    // Denied.
+    let misrouted = connect_and_sync(
+        dialing.router.endpoint(),
+        &dialing.docs.engine().sync,
+        work_here.id(),
+        LEISURE,
+        CALLER,
+        serving_addr,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a session handed to another identity's engine must be refused");
+    assert!(
+        matches!(misrouted, ConnectError::RemoteAbort(AbortReason::NotFound)),
+        "the refusal was not the not-found abort: {misrouted:?}"
+    );
+    assert!(
+        asked(&serving.work_log)
+            .iter()
+            .all(|asked| asked.identity != LEISURE),
+        "the misrouted session was judged by the records of an identity it did not name"
+    );
 
     serving.router.shutdown().await?;
     dialing.router.shutdown().await?;

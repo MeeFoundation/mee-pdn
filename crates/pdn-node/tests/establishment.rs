@@ -5,7 +5,7 @@
 //! verify-and-burn requirement — each refusal probed for no observable
 //! state on the inviter, next to its allowed counterpart.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use data_layer::{
@@ -89,7 +89,7 @@ async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<(
 /// Shutdown waits for an accept in flight and stops waiting once it
 /// returns: a raw dialer leaves the inviter's `accept` parked mid-request,
 /// shutdown is still running against that, and returns once the dialer goes
-/// away — well inside the handler's budget, so the accept finishing is what
+/// away — well inside the shutdown's budget, so the accept finishing is what
 /// ended the wait.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
@@ -136,7 +136,7 @@ async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
         .context("shutdown never returned after the accept it waited for finished")?
         .context("the shutdown task panicked")??;
     assert!(
-        elapsed < pdn_node::pairing::SHUTDOWN_ESTABLISHMENT_BUDGET,
+        elapsed < pdn_node::runtime::SHUTDOWN_SERVING_BUDGET,
         "shutdown took {elapsed:?} — its budget elapsing, not the accept finishing, ended the wait"
     );
 
@@ -982,6 +982,103 @@ async fn two_identities_of_one_node_establish_inside_the_process() -> Result<()>
     );
 
     rt.shutdown().await?;
+    Ok(())
+}
+
+/// A stop that begins while two identities of one node are mid-dialogue
+/// waits for the serving half, and its commit outlives the stop: the
+/// inviter lists the connection once the runtime is back on its directory.
+/// The pause parks the serving half after it read the request and before
+/// it takes the state lock, the point a stop could otherwise overtake it;
+/// the hold sits well inside the shutdown budget.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_waits_for_the_serving_half_of_a_co_located_dialogue() -> Result<()> {
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let rt = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let work = rt.identity().create().await?;
+    let leisure = rt.identity().create().await?;
+    let invite = rt.connections().invite(work, None).await?;
+    let pause = rt.pause_next_pairing_serve().await;
+    let establishing = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.connections().establish(leisure, invite).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !shutting_down.is_finished(),
+        "the stop must wait for the co-located serving half in flight"
+    );
+    pause.release();
+    tokio::time::timeout(TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    // The scanning half meets a stopping node: its outcome is not what this
+    // scenario is about.
+    let _scanned = establishing.await?;
+    drop(rt);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert_eq!(
+        restarted.connections().list(work).await?,
+        vec![leisure],
+        "the serving half's commit did not survive the stop"
+    );
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+/// The same stop on a dialogue from another node: the inviter's serving
+/// half finishes under the stop, and the inviter lists the connection once
+/// it is back on its directory. Paused and held as the co-located case is.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_waits_for_the_serving_half_of_a_dialogue_from_another_node() -> Result<()> {
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let inviter = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let scanner = Arc::new(memory_runtime().await?);
+    let x = inviter.identity().create().await?;
+    let p = scanner.identity().create().await?;
+    let invite = inviter.connections().invite(x, None).await?;
+    let pause = inviter.pause_next_pairing_serve().await;
+    let establishing = {
+        let scanner = Arc::clone(&scanner);
+        tokio::spawn(async move { scanner.connections().establish(p, invite).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let inviter = Arc::clone(&inviter);
+        tokio::spawn(async move { inviter.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !shutting_down.is_finished(),
+        "the stop must wait for the serving half in flight"
+    );
+    pause.release();
+    tokio::time::timeout(TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    let _scanned = tokio::time::timeout(TIMEOUT, establishing).await;
+    drop(inviter);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert_eq!(
+        restarted.connections().list(x).await?,
+        vec![p],
+        "the serving half's commit did not survive the stop"
+    );
+    restarted.shutdown().await?;
+    scanner.shutdown().await?;
     Ok(())
 }
 

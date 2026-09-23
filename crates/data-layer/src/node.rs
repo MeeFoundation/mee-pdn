@@ -319,9 +319,6 @@ struct HostedStack {
     registry: Arc<Registry>,
     access: Arc<AccessBook>,
     author: AuthorId,
-    /// The bound this identity's replica store opened at, which the node
-    /// tallies against its budget; a store in memory carries none.
-    cache_share_bytes: Option<usize>,
     /// Keyed by namespace, so a re-import replaces its entry rather than
     /// accreting a second one.
     tracked_docs: Mutex<HashMap<NamespaceId, TrackedDoc>>,
@@ -559,8 +556,8 @@ impl SyncNode {
         let access = Arc::new(AccessBook::new(identity));
         access.set_blobs(self.blobs.clone());
         let observer_tracker = Arc::clone(&self.retraction);
-        let (builder, cache_share_bytes) = self.docs_builder(identity, &access, &registry)?;
-        let docs = builder
+        let docs = self
+            .docs_builder(identity, &access, &registry)?
             .capability_validator(capability_ingest_validator(&access, &registry))
             .rejection_observer(Arc::new(move |namespace, reject, peer| {
                 observer_tracker.record_rejection(identity, namespace, reject, peer);
@@ -583,7 +580,6 @@ impl SyncNode {
             registry,
             access,
             author,
-            cache_share_bytes,
             tracked_docs: Mutex::new(HashMap::new()),
             nudges_in_flight: Mutex::new(HashSet::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
@@ -621,20 +617,19 @@ impl SyncNode {
 
     /// The store one hosted identity opens: in memory, or under that
     /// identity's own subdirectory, bounded at the node's budget divided
-    /// by the identities that directory holds. The bound is returned
-    /// beside the builder, since a store in memory carries none.
+    /// by the identities that directory holds.
     fn docs_builder(
         &self,
         identity: PdnId,
         access: &Arc<AccessBook>,
         registry: &Arc<Registry>,
-    ) -> Result<(pdn_store::protocol::Builder, Option<usize>)> {
+    ) -> Result<pdn_store::protocol::Builder> {
         // The store's own name for the identity: the same one, as opaque
         // bytes it compares and never interprets.
         let held_for = crate::access::identity_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
         Ok(match &self.storage {
-            StorageConfig::Memory => (Docs::memory(held_for, provider), None),
+            StorageConfig::Memory => Docs::memory(held_for, provider),
             StorageConfig::Directory(directory) => {
                 let own = identity_directory(directory, identity);
                 std::fs::create_dir_all(&own).with_context(|| {
@@ -651,10 +646,7 @@ impl SyncNode {
                     identities = held,
                     "the replica store opens at its share of the node's cache budget"
                 );
-                (
-                    Docs::persistent(own, share, held_for, provider),
-                    Some(share),
-                )
+                Docs::persistent(own, share, held_for, provider)
             }
         })
     }
@@ -669,7 +661,7 @@ impl SyncNode {
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("hosted identities lock poisoned"))?
             .values()
-            .filter_map(|stack| stack.cache_share_bytes)
+            .filter_map(|stack| stack.docs.replica_cache_bytes())
             .sum())
     }
 
@@ -678,10 +670,11 @@ impl SyncNode {
         Ok(self.replica_cache_ceilings_bytes()? > self.cache_budget_bytes)
     }
 
-    /// The bound `identity`'s replica store opened at; `None` on a node
-    /// storing in memory, where a store carries no bound.
+    /// The bound `identity`'s replica store opened at, as the store reports
+    /// it; `None` on a node storing in memory, where a store carries no
+    /// bound.
     pub fn replica_cache_share_bytes(&self, identity: PdnId) -> Result<Option<usize>> {
-        Ok(self.require(identity)?.cache_share_bytes)
+        Ok(self.require(identity)?.docs.replica_cache_bytes())
     }
 
     /// Record `identity` as hosted here, with `directory` as its private
@@ -1095,6 +1088,21 @@ impl SyncNode {
         Ok(self
             .stack(identity)?
             .map(|stack| stack.docs.engine().in_process_sessions())
+            .unwrap_or_default())
+    }
+
+    /// Sessions `identity` was handed over the in-process path by `caller`:
+    /// what shows a dial reached only the identity it named.
+    #[cfg(feature = "test-util")]
+    pub fn in_process_sessions_served(&self, identity: PdnId, caller: PdnId) -> Result<u64> {
+        Ok(self
+            .stack(identity)?
+            .map(|stack| {
+                stack
+                    .docs
+                    .engine()
+                    .in_process_sessions_served(crate::access::identity_of(caller))
+            })
             .unwrap_or_default())
     }
 

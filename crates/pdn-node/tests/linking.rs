@@ -16,7 +16,7 @@ use data_layer::{
 };
 use pdn_node::{
     ConnectionsService as _, DataService as _, DialogueTimeout, IdentityService as _,
-    InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, SpawnOptions,
+    InviterUnreachable, LinkingLocalFailure, LinkingPayload, LinkingRefused, Runtime, SpawnOptions,
     SyncService as _, UnknownIdentity, UnknownIssuer, UnsupportedLinkingVersion, WriteNotGranted,
     LINKING_FORMAT_VERSION,
 };
@@ -714,6 +714,45 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
         .await?,
         "cancelled link left hosted state, a replica, or a reservation"
     );
+
+    rt_inviter.shutdown().await?;
+    rt.shutdown().await?;
+    Ok(())
+}
+
+/// A link whose directory finished its first sync exchanges before the
+/// catch-up wait began still returns caught up, inside a budget that ends
+/// long before the next periodic reconcile pass. The pause after the
+/// imports holds the wait back past those exchanges: a loopback exchange
+/// finishes well inside the hold.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_exchange_finished_before_the_wait_still_counts() -> Result<()> {
+    const HOLD: Duration = Duration::from_secs(3);
+    const BUDGET: Duration = Duration::from_secs(20);
+    let no_pass_within_the_budget = || SpawnOptions {
+        reconcile_interval: Duration::from_secs(600),
+        ..SpawnOptions::memory()
+    };
+    let rt_inviter = Runtime::spawn(no_pass_within_the_budget()).await?;
+    let x = rt_inviter.identity().create().await?;
+    let rt = Arc::new(Runtime::spawn(no_pass_within_the_budget()).await?);
+    let pause = rt.pause_next_link_after_import().await;
+    let payload = rt_inviter.identity().linking_invite(x, None).await?;
+    let attempt = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.identity().link(payload, BUDGET).await })
+    };
+    pause.wait_until_reached().await;
+    tokio::time::sleep(HOLD).await;
+    pause.release();
+
+    let linked = attempt.await?;
+    assert!(
+        linked.is_ok(),
+        "the first exchange must end the wait however early it finished: {linked:?}"
+    );
+    assert_eq!(rt.sync().hosted_identities().await?, vec![x]);
 
     rt_inviter.shutdown().await?;
     rt.shutdown().await?;
