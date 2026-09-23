@@ -547,8 +547,10 @@ impl SyncNode {
     /// engine and replica store, its registry and the book that judges
     /// its sessions (ADR-0013). The store opens under the identity's own
     /// subdirectory, bounded at its share of the node's cache budget, cut
-    /// as the store opens. Provisioning an identity already hosted is a
-    /// no-op.
+    /// as the store opens. Provisioning an identity hosted before the call
+    /// starts is a no-op; two calls for one identity at once are not
+    /// supported — the check and the insert are two awaits apart — and the
+    /// caller serializes them.
     pub async fn provision_identity(&self, identity: PdnId) -> Result<()> {
         if self.stack(identity)?.is_some() {
             return Ok(());
