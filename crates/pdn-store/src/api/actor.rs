@@ -33,14 +33,20 @@ pub(crate) struct RpcActor {
 }
 
 impl RpcActor {
-    pub(crate) fn spawn(engine: Arc<Engine>) -> DocsApi {
+    /// The actor holds the engine, and a handle into the API can sit
+    /// inside something the engine holds, so the task is returned for its
+    /// owner to stop rather than left to end with its last client.
+    pub(crate) fn spawn(engine: Arc<Engine>) -> (DocsApi, task::AbortOnDropHandle<()>) {
         let (tx, rx) = tokio_mpsc::channel(64);
         let actor = Self { recv: rx, engine };
-        task::spawn(actor.run());
+        let running = task::AbortOnDropHandle::new(task::spawn(actor.run()));
         let local = LocalSender::<DocsProtocol>::from(tx);
-        DocsApi {
-            inner: local.into(),
-        }
+        (
+            DocsApi {
+                inner: local.into(),
+            },
+            running,
+        )
     }
 
     pub(crate) async fn run(mut self) {

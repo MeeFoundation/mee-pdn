@@ -330,12 +330,10 @@ pub struct LiveActor {
     /// In-process sessions opened, so a pass over a quiet pair can be
     /// shown to open none.
     in_process_sessions: Arc<AtomicU64>,
-    /// Told of every local write, with the identity of the replica that
-    /// wrote: what reaches the identities of this same node.
-    announce_local: crate::engine::LocalWriteAnnouncer,
-    /// Asked to reconcile with a identity of this same node, for a contact
-    /// whose address carries this node's own wire identity.
-    dial_in_process: crate::engine::InProcessDialer,
+    /// Where a local write and a contact naming this node are handed to
+    /// the node, which alone knows its other identities; `None` hands them
+    /// to nobody.
+    co_located: Option<crate::engine::CoLocatedRequests>,
     metrics: Arc<Metrics>,
 }
 impl LiveActor {
@@ -352,8 +350,7 @@ impl LiveActor {
         session_access: crate::filter::SessionAccessProvider,
         identity: Identity,
         in_process_sessions: Arc<AtomicU64>,
-        announce_local: crate::engine::LocalWriteAnnouncer,
-        dial_in_process: crate::engine::InProcessDialer,
+        co_located: Option<crate::engine::CoLocatedRequests>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
@@ -385,10 +382,17 @@ impl LiveActor {
             peer_identities: Default::default(),
             default_identities: Default::default(),
             in_process_sessions,
-            announce_local,
-            dial_in_process,
+            co_located,
             metrics,
         })
+    }
+
+    /// Best effort: the node's periodic pass over its co-located pairs
+    /// reconciles whatever a request lost to a full channel would have.
+    fn ask_co_located(&self, request: crate::engine::CoLocatedRequest) {
+        if let Some(requests) = &self.co_located {
+            let _ = requests.try_send(request);
+        }
     }
 
     /// Run the actor loop.
@@ -617,7 +621,11 @@ impl LiveActor {
         // ticket, a device record, a contact list — reaches its identity
         // inside the process or not at all.
         if peer == self.endpoint.id() {
-            (self.dial_in_process)(namespace, callee);
+            self.ask_co_located(crate::engine::CoLocatedRequest::Dial {
+                namespace,
+                caller: self.identity,
+                callee,
+            });
             return;
         }
         if !self.state.start_connect(&namespace, peer, callee, reason) {
@@ -1220,7 +1228,10 @@ impl LiveActor {
                 // here or on the periodic pass (ADR-0013). Content-free like
                 // the broadcast: what the co-located identity obtains comes
                 // through the session its reconcile opens, and its filter.
-                (self.announce_local)(namespace, self.identity);
+                self.ask_co_located(crate::engine::CoLocatedRequest::Announce {
+                    namespace,
+                    writer: self.identity,
+                });
             }
             crate::Event::RemoteInsert {
                 namespace,

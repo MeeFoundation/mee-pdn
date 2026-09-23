@@ -31,26 +31,35 @@ mod gossip;
 mod live;
 mod state;
 
-/// Told of every entry this engine writes locally, with the identity of the
-/// replica that wrote it. A node's own gossip broadcast never reaches its
-/// other subscribers, so this is what tells a co-located identity.
-pub type LocalWriteAnnouncer = Arc<dyn Fn(NamespaceId, Identity) + Send + Sync + 'static>;
-
-/// An announcer that tells nobody — what a node hosting one identity states.
-pub fn announce_nobody() -> LocalWriteAnnouncer {
-    Arc::new(|_namespace, _identity| {})
+/// What an engine asks of the node it runs in about that node's other
+/// identities. iroh refuses a connection to the endpoint's own id, and a
+/// node's own gossip broadcast never reaches its other subscribers, so both
+/// reach a co-located identity through the node or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoLocatedRequest {
+    /// An identity of this node wrote to a namespace locally.
+    Announce {
+        /// The namespace written to.
+        namespace: NamespaceId,
+        /// The identity whose replica holds the write.
+        writer: Identity,
+    },
+    /// A contact of a namespace names this node's own endpoint: reconcile
+    /// it between two identities of this node.
+    Dial {
+        /// The namespace to reconcile.
+        namespace: NamespaceId,
+        /// The identity whose engine holds the contact.
+        caller: Identity,
+        /// The identity the contact names.
+        callee: Identity,
+    },
 }
 
-/// Asked to reconcile `namespace` with a identity of this same node, when a
-/// contact's address carries this node's own wire identity. iroh refuses a
-/// connection to its own endpoint, so a dial that resolves here reaches
-/// the callee through the process or not at all.
-pub type InProcessDialer = Arc<dyn Fn(NamespaceId, Identity) + Send + Sync + 'static>;
-
-/// A dialer that reaches nobody — what a node hosting one identity states.
-pub fn dial_nobody() -> InProcessDialer {
-    Arc::new(|_namespace, _identity| {})
-}
+/// The end of a channel an engine sends its [`CoLocatedRequest`]s into —
+/// the only thing of its node an engine holds, so nothing the node owns
+/// lives on through an engine the node owns.
+pub type CoLocatedRequests = mpsc::Sender<CoLocatedRequest>;
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
 const ACTOR_CHANNEL_CAP: usize = 64;
@@ -99,8 +108,7 @@ impl Engine {
         rejection_observer: Option<RejectionObserver>,
         session_access: crate::filter::SessionAccessProvider,
         identity: Identity,
-        announce_local: LocalWriteAnnouncer,
-        dial_in_process: InProcessDialer,
+        co_located: Option<CoLocatedRequests>,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -164,18 +172,20 @@ impl Engine {
             session_access,
             identity,
             Arc::clone(&in_process_sessions),
-            announce_local,
-            dial_in_process,
+            co_located,
             sync.metrics().clone(),
         )?;
-        let actor_handle = n0_future::task::spawn(
+        // Held from the spawn: the actor holds its node's request channel,
+        // so a bare handle dropped by a failed or cancelled spawn would
+        // leave the actor running for the rest of the process.
+        let actor_handle = AbortOnDropHandle::new(n0_future::task::spawn(
             async move {
                 if let Err(err) = actor.run().await {
                     error!("sync actor failed: {err:?}");
                 }
             }
             .instrument(error_span!("sync", %me)),
-        );
+        ));
 
         let default_author = match DefaultAuthor::load(default_author_storage, &sync).await {
             Ok(author) => author,
@@ -191,7 +201,7 @@ impl Engine {
             endpoint,
             sync,
             to_live_actor: live_actor_tx,
-            actor_handle: AbortOnDropHandle::new(actor_handle),
+            actor_handle,
             content_status_cb,
             default_author,
             blob_store: bao_store,

@@ -1041,3 +1041,40 @@ async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
     inviter.shutdown().await?;
     Ok(())
 }
+
+/// A runtime dropped without `shutdown` while the process goes on lets go
+/// of its directory: a runtime spawned on it again in the same process
+/// hosts what the first one hosted. The release runs on the dropped
+/// runtime's own tasks, so the respawn is retried within a budget, each
+/// attempt bounded because a store still held makes a spawn wait rather
+/// than fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runtime_dropped_without_shutdown_releases_its_directory() -> Result<()> {
+    const RELEASE_BUDGET: Duration = Duration::from_secs(20);
+    const ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
+
+    let dir = tempfile::tempdir()?;
+    let first = runtime_on(dir.path()).await?;
+    let alice = first.identity().create().await?;
+    drop(first);
+
+    let deadline = std::time::Instant::now() + RELEASE_BUDGET;
+    let second = loop {
+        if let Ok(Ok(runtime)) = tokio::time::timeout(ATTEMPT_BUDGET, runtime_on(dir.path())).await
+        {
+            break runtime;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the dropped runtime never released its directory"
+        );
+        tokio::time::sleep(RECONCILE).await;
+    };
+    assert_eq!(
+        second.sync().hosted_identities().await?,
+        vec![alice],
+        "the respawned runtime must host what the dropped one hosted"
+    );
+    second.shutdown().await?;
+    Ok(())
+}

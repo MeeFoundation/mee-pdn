@@ -250,6 +250,9 @@ pub struct SyncNode {
     /// Taken once, so a repeated `shutdown` is a no-op under a shared
     /// reference.
     reconciler_stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Cloned into every hosted identity's engine; the task at the other
+    /// end holds the identity map weakly (`serve_co_located`).
+    co_located_requests: pdn_store::engine::CoLocatedRequests,
     /// Released by `shutdown` with the stores, or with the process. `None`
     /// on a memory node.
     directory_lock: Option<std::fs::File>,
@@ -475,6 +478,9 @@ impl SyncNode {
         }
         let router = router.spawn();
 
+        let (co_located_requests, requests) =
+            tokio::sync::mpsc::channel(CO_LOCATED_REQUESTS_CAPACITY);
+        let _detached = tokio::spawn(serve_co_located(Arc::downgrade(&identities), requests));
         let (reconciler_stop, stop) = oneshot::channel();
         let co_located_sessions: CoLocatedPassSessions = Arc::default();
         let _detached = tokio::spawn(reconcile_pass(
@@ -495,6 +501,7 @@ impl SyncNode {
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
+            co_located_requests,
             directory_lock,
         })
     }
@@ -514,31 +521,12 @@ impl SyncNode {
         access.set_blobs(self.blobs.clone());
         let observer_tracker = Arc::clone(&self.retraction);
         let (builder, cache_share_bytes) = self.docs_builder(identity, &access, &registry)?;
-        let identities = Arc::clone(&self.identities);
         let docs = builder
             .capability_validator(capability_ingest_validator(&access, &registry))
             .rejection_observer(Arc::new(move |namespace, reject, peer| {
                 observer_tracker.record_rejection(identity, namespace, reject, peer);
             }))
-            // A node's own gossip broadcast never reaches its other
-            // subscribers, so a co-located identity of the namespace is told
-            // here and reconciles over the in-process path.
-            .local_write_announcer({
-                let identities = Arc::clone(&identities);
-                Arc::new(move |namespace, writer| {
-                    reconcile_with_co_located(&identities, namespace, writer, None);
-                })
-            })
-            // A contact naming this node — from a ticket, a device record,
-            // a contact list — reaches its identity inside the process.
-            .in_process_dialer(Arc::new(move |namespace, callee| {
-                reconcile_with_co_located(
-                    &identities,
-                    namespace,
-                    crate::access::identity_of(identity),
-                    Some(callee),
-                );
-            }))
+            .co_located_requests(self.co_located_requests.clone())
             .spawn(
                 self.router.endpoint().clone(),
                 self.blobs.clone(),
@@ -1580,10 +1568,17 @@ impl SyncNode {
         {
             let _ = stop.send(());
         }
-        self.router.shutdown().await?;
+        // Everything below runs whatever the router answers: a stop that
+        // returned early would leave every engine, the blob store and the
+        // directory lock held for the rest of the process.
+        let routed = self.router.shutdown().await;
         // The router serves the dispatcher, not the engines, so each
         // identity's engine is shut down by name.
-        for stack in self.stacks()? {
+        let stacks: Vec<Arc<HostedStack>> = match self.identities.read() {
+            Ok(hosted) => hosted.values().cloned().collect(),
+            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
+        };
+        for stack in stacks {
             let _ = stack.docs.engine().shutdown().await;
         }
         // Explicit rather than on the last handle's drop: a node respawned
@@ -1596,6 +1591,7 @@ impl SyncNode {
         if let Some(lock) = &self.directory_lock {
             let _ = lock.unlock();
         }
+        routed?;
         Ok(())
     }
 
@@ -1750,6 +1746,37 @@ async fn holds_namespace(api: &DocsApi, namespace: NamespaceId) -> Result<bool> 
         }
     }
     Ok(false)
+}
+
+/// What the engines ask about the node's other identities waits here: a
+/// full channel drops a request, which the periodic co-located pass makes
+/// up for.
+const CO_LOCATED_REQUESTS_CAPACITY: usize = 1024;
+
+/// Carry out what the engines ask about the node's other identities. The
+/// identity map is held weakly: the engines hold the other end of the
+/// channel, so a strong hold would keep the node alive through its own
+/// engines, and the task ends once the last of them is gone.
+async fn serve_co_located(
+    identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
+    mut requests: tokio::sync::mpsc::Receiver<pdn_store::engine::CoLocatedRequest>,
+) {
+    use pdn_store::engine::CoLocatedRequest;
+    while let Some(request) = requests.recv().await {
+        let Some(identities) = identities.upgrade() else {
+            return;
+        };
+        match request {
+            CoLocatedRequest::Announce { namespace, writer } => {
+                reconcile_with_co_located(&identities, namespace, writer, None);
+            }
+            CoLocatedRequest::Dial {
+                namespace,
+                caller,
+                callee,
+            } => reconcile_with_co_located(&identities, namespace, caller, Some(callee)),
+        }
+    }
 }
 
 /// Reconcile `namespace` between `source` and the identities of this same

@@ -33,6 +33,9 @@ enum Storage {
 pub struct Docs {
     engine: Arc<Engine>,
     api: DocsApi,
+    /// The task serving `api`, which holds the engine: it stops with the
+    /// last clone of this, whatever handles into the API remain.
+    _rpc: Arc<n0_future::task::AbortOnDropHandle<()>>,
 }
 
 impl Docs {
@@ -52,8 +55,7 @@ impl Docs {
             rejection_observer: None,
             identity,
             session_access_provider,
-            announce_local: crate::engine::announce_nobody(),
-            dial_in_process: crate::engine::dial_nobody(),
+            co_located: None,
         }
     }
 
@@ -77,8 +79,7 @@ impl Docs {
             rejection_observer: None,
             identity,
             session_access_provider,
-            announce_local: crate::engine::announce_nobody(),
-            dial_in_process: crate::engine::dial_nobody(),
+            co_located: None,
         }
     }
 
@@ -91,8 +92,12 @@ impl Docs {
     /// Creates a new [`Docs`] from an [`Engine`].
     pub fn new(engine: Engine) -> Self {
         let engine = Arc::new(engine);
-        let api = DocsApi::spawn(engine.clone());
-        Self { engine, api }
+        let (api, rpc) = DocsApi::spawn(engine.clone());
+        Self {
+            engine,
+            api,
+            _rpc: Arc::new(rpc),
+        }
     }
 
     /// Returns the API for this docs instance.
@@ -140,10 +145,7 @@ pub struct Builder {
     identity: Identity,
     #[debug("SessionAccessProvider")]
     session_access_provider: crate::filter::SessionAccessProvider,
-    #[debug("LocalWriteAnnouncer")]
-    announce_local: crate::engine::LocalWriteAnnouncer,
-    #[debug("InProcessDialer")]
-    dial_in_process: crate::engine::InProcessDialer,
+    co_located: Option<crate::engine::CoLocatedRequests>,
 }
 
 impl Builder {
@@ -175,19 +177,11 @@ impl Builder {
         self
     }
 
-    /// Set what is told of every local write, with the identity of the
-    /// replica that wrote: what reaches the other identities of this node,
-    /// which a gossip broadcast never does. Unset, nothing is told.
-    pub fn local_write_announcer(mut self, announcer: crate::engine::LocalWriteAnnouncer) -> Self {
-        self.announce_local = announcer;
-        self
-    }
-
-    /// Set what reconciles with a identity of this same node when a contact
-    /// names this node's own wire identity. Unset, such a contact is
-    /// unreachable.
-    pub fn in_process_dialer(mut self, dialer: crate::engine::InProcessDialer) -> Self {
-        self.dial_in_process = dialer;
+    /// Set where this engine sends what it asks of its node about the
+    /// node's other identities: a local write to announce, a contact naming
+    /// this node to reconcile inside the process. Unset, both reach nobody.
+    pub fn co_located_requests(mut self, requests: crate::engine::CoLocatedRequests) -> Self {
+        self.co_located = Some(requests);
         self
     }
 
@@ -225,8 +219,7 @@ impl Builder {
             self.rejection_observer,
             self.session_access_provider,
             self.identity,
-            self.announce_local,
-            self.dial_in_process,
+            self.co_located,
         )
         .await?;
         Ok(Docs::new(engine))

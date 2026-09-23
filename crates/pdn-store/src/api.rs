@@ -56,8 +56,8 @@ pub struct DocsApi {
 }
 
 impl DocsApi {
-    /// Create a new docs API from an engine
-    pub fn spawn(engine: Arc<Engine>) -> Self {
+    /// Create a new docs API from an engine, with the task serving it.
+    pub(crate) fn spawn(engine: Arc<Engine>) -> (Self, n0_future::task::AbortOnDropHandle<()>) {
         RpcActor::spawn(engine)
     }
 
