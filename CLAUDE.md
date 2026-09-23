@@ -47,6 +47,8 @@ default width would saturate it.
 
 Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI installs it via `taiki-e/install-action`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
 
+On macOS a stress run now and then marks a test `LEAK`: it passed, and its stdout or stderr closed more than nextest's 100 ms after the process exited. The test holds nothing open. Rust's standard library creates a pipe on macOS with `pipe()` and marks it close-on-exec in a second call, so a test process nextest spawns from another thread in between inherits that pipe and keeps it until it exits itself. The marks fall on tests of the first spawn burst of an iteration and do not occur on Linux, where the pipe is created close-on-exec atomically. A `LEAK` that also shows on Linux is a real one.
+
 Run a single crate's tests: `just test -p <crate-name>`.
 Run a single test: `just test -E 'test(<test_name>)'`.
 
