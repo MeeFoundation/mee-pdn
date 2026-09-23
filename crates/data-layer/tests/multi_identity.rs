@@ -337,3 +337,42 @@ async fn an_import_onto_another_replica_forgets_the_one_it_replaced() -> Result<
     node.shutdown().await?;
     Ok(())
 }
+
+/// An import onto the replica its issuer already resolves to binds
+/// nothing, on the device-replication and the grantee path alike:
+/// undoing it leaves the issuer bound and the replica held.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_onto_the_replica_its_issuer_resolves_to_binds_nothing() -> Result<()> {
+    let node = memory_node().await?;
+    for identity in [ids::ALICE, ids::BOB, ids::CAROL] {
+        node.provision_identity(identity).await?;
+    }
+    node.create_namespace(ids::CAROL, ids::CAROL).await?;
+    let ticket = node
+        .share_ticket(
+            ids::CAROL,
+            ids::CAROL,
+            ShareMode::Read,
+            AddrInfoOptions::Addresses,
+        )
+        .await?;
+    let namespace = ticket.capability.id();
+
+    for (holder, scoped) in [(ids::ALICE, false), (ids::BOB, true)] {
+        let _first = import_under(&node, holder, ids::CAROL, ticket.clone(), scoped).await?;
+        let again = import_under(&node, holder, ids::CAROL, ticket.clone(), scoped).await?;
+        node.undo_import_namespace(again).await?;
+        assert_eq!(
+            node.data_namespace_of(holder, ids::CAROL)?,
+            Some(namespace),
+            "undoing the re-import unbound the issuer (scoped: {scoped})"
+        );
+        assert!(
+            node.holds_replica(holder, namespace).await?,
+            "undoing the re-import dropped the replica (scoped: {scoped})"
+        );
+    }
+
+    node.shutdown().await?;
+    Ok(())
+}

@@ -286,6 +286,9 @@ struct TrackedDoc {
 pub struct NamespaceImport {
     identity: PdnId,
     issuer: PdnId,
+    /// False for an import onto the replica the issuer already resolved
+    /// to: it bound nothing, so undoing it forgets nothing.
+    bound: bool,
 }
 
 /// The hosted identities of one node, shared with the docs dispatcher and
@@ -709,7 +712,8 @@ impl SyncNode {
     /// The device-replication import: a device of `identity` brings its
     /// own data replica up this way, joining its swarm. A namespace
     /// reached through a grant uses
-    /// [`import_namespace_scoped`](Self::import_namespace_scoped).
+    /// [`import_namespace_scoped`](Self::import_namespace_scoped). Binds
+    /// nothing when the issuer already resolves to the ticket's replica.
     pub async fn import_namespace(
         &self,
         identity: PdnId,
@@ -719,7 +723,14 @@ impl SyncNode {
         let stack = self.require(identity)?;
         let namespace = ticket.capability.id();
         Self::guard_data_import(&stack, issuer, namespace)?;
-        let rebound = Self::rebound_from(&stack, issuer, namespace)?;
+        let current = stack.registry.data_doc(issuer)?.map(|doc| doc.id());
+        if current == Some(namespace) {
+            return Ok(NamespaceImport {
+                identity,
+                issuer,
+                bound: false,
+            });
+        }
         let contacts = ticket.contacts();
         let doc = stack.api.import_namespace(ticket.capability).await?;
         stack.track(
@@ -728,14 +739,18 @@ impl SyncNode {
             SyncStrategy::Swarm,
             crate::access::identity_of(issuer),
         )?;
-        if let Some(previous) = rebound {
+        if let Some(previous) = current {
             self.forget_rebound(&stack, identity, previous).await;
         }
         let _displaced =
             stack
                 .registry
                 .register_data(issuer, doc.clone(), ServingPosture::Serve)?;
-        let import = NamespaceImport { identity, issuer };
+        let import = NamespaceImport {
+            identity,
+            issuer,
+            bound: true,
+        };
         if let Err(err) = doc
             .start_sync(contacts, crate::access::identity_of(issuer))
             .await
@@ -775,18 +790,33 @@ impl SyncNode {
     /// Refuses a ticket naming a tracked but not data-bound replica: honoring
     /// it would downgrade that store's sync strategy — leaving the gossip
     /// swarm, cutting its live path — on the word of whoever minted the
-    /// ticket.
+    /// ticket. Refuses any ticket under the identity's own id, and binds
+    /// nothing when the issuer already resolves to the ticket's replica.
     async fn import_grantee_namespace(
         &self,
         identity: PdnId,
         issuer: PdnId,
         ticket: DocTicket,
     ) -> Result<NamespaceImport> {
+        // An identity holds its own data as its issuer: a grantee binding
+        // under its own id would demote that replica, or drop it for another.
+        if issuer == identity {
+            return Err(anyhow::anyhow!(
+                "{identity} cannot hold its own data under a grant"
+            ));
+        }
         let stack = self.require(identity)?;
         let contacts = ticket.contacts();
         let namespace = ticket.capability.id();
         Self::guard_data_import(&stack, issuer, namespace)?;
-        let rebound = Self::rebound_from(&stack, issuer, namespace)?;
+        let current = stack.registry.data_doc(issuer)?.map(|doc| doc.id());
+        if current == Some(namespace) {
+            return Ok(NamespaceImport {
+                identity,
+                issuer,
+                bound: false,
+            });
+        }
         // The capability only — no `start_sync`, which would join the
         // swarm. The binding registers before the first sync, so even that
         // session is judged under the grantee rules.
@@ -797,16 +827,20 @@ impl SyncNode {
             SyncStrategy::ContactsOnly,
             crate::access::identity_of(issuer),
         )?;
-        if let Some(previous) = rebound {
+        if let Some(previous) = current {
             self.forget_rebound(&stack, identity, previous).await;
         }
         let _displaced =
             stack
                 .registry
                 .register_data(issuer, doc.clone(), ServingPosture::AudienceDevices)?;
-        let import = NamespaceImport { identity, issuer };
-        // A device-replicated import downgraded to a grantee binding leaves
-        // the swarm now, so membership cannot outlive the strategy.
+        let import = NamespaceImport {
+            identity,
+            issuer,
+            bound: true,
+        };
+        // A grantee binding stays outside the swarm, whatever joined the
+        // replica before.
         if let Err(err) = doc.leave_gossip().await {
             let _ = self.undo_import_namespace(import).await;
             return Err(err);
@@ -1040,20 +1074,6 @@ impl SyncNode {
         Ok(())
     }
 
-    /// The replica `issuer` resolves to when an import onto `namespace`
-    /// binds it elsewhere.
-    fn rebound_from(
-        stack: &HostedStack,
-        issuer: PdnId,
-        namespace: NamespaceId,
-    ) -> Result<Option<NamespaceId>> {
-        Ok(stack
-            .registry
-            .data_doc(issuer)?
-            .map(|doc| doc.id())
-            .filter(|bound| *bound != namespace))
-    }
-
     /// Drop the replica an import rebinds its issuer away from, while that
     /// binding still stands — the order `forget_namespace` keeps — so an
     /// issuer keeps one data binding and nothing outlives it. The import
@@ -1069,7 +1089,14 @@ impl SyncNode {
 
     /// Leave exactly the state that preceded the import.
     pub async fn undo_import_namespace(&self, import: NamespaceImport) -> Result<()> {
-        let NamespaceImport { identity, issuer } = import;
+        let NamespaceImport {
+            identity,
+            issuer,
+            bound,
+        } = import;
+        if !bound {
+            return Ok(());
+        }
         self.forget_namespace(identity, issuer).await
     }
 

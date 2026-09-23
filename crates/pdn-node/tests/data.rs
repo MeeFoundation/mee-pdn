@@ -282,3 +282,50 @@ async fn a_namespace_held_as_a_grantee_is_not_shared() -> Result<()> {
     audience_rt.shutdown().await?;
     Ok(())
 }
+
+/// A ticket imported under the identity's own id is refused, whether it
+/// names that identity's own namespace or another's, and the identity goes
+/// on issuing its data: it still shares it and reads it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_under_the_identitys_own_id_is_refused() -> Result<()> {
+    let rt = common::memory_runtime().await?;
+    let alice = rt.identity().create().await?;
+    let bob = rt.identity().create().await?;
+    let email = EntryPath::new("contact/email")?;
+    rt.data()
+        .write(alice, alice, &email, b"alice@example.org")
+        .await?;
+    let own = rt.data().share(alice, alice, ShareMode::Read).await?;
+    let foreign = rt.data().share(bob, bob, ShareMode::Read).await?;
+
+    for (ticket, names) in [
+        (own, "its own namespace"),
+        (foreign, "another identity's namespace"),
+    ] {
+        assert!(
+            rt.data()
+                .import(alice, alice, ticket.clone())
+                .await
+                .is_err(),
+            "an import under the identity's own id naming {names} was accepted"
+        );
+        assert!(
+            rt.data().import_scoped(alice, alice, ticket).await.is_err(),
+            "a scoped import under the identity's own id naming {names} was accepted"
+        );
+        rt.data()
+            .share(alice, alice, ShareMode::Read)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("the identity stopped issuing after {names}: {err:#}")
+            })?;
+        assert_eq!(
+            rt.data().read(alice, alice, &email).await?.as_deref(),
+            Some(b"alice@example.org".as_slice()),
+            "the identity's own data is gone after an import naming {names}"
+        );
+    }
+
+    rt.shutdown().await?;
+    Ok(())
+}

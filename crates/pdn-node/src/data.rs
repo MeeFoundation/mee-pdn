@@ -66,7 +66,9 @@ pub trait DataService {
     /// needed for a namespace reached through a grant — the runtime binds
     /// those by itself, and never unbinds what was imported here. With no
     /// grant record behind it the ticket delivers nothing from an armed
-    /// issuer, and this node re-serves it to no one.
+    /// issuer, and this node re-serves it to no one. Refused under
+    /// `identity`'s own id; an issuer already resolving to the ticket's
+    /// replica is left as it is.
     async fn import(&self, identity: PdnId, issuer: PdnId, ticket: DocTicket) -> Result<()>;
 
     /// [`import`](Self::import) for a ticket that arrived with a grant —
