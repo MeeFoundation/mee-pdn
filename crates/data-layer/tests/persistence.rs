@@ -7,10 +7,11 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, DirectoryHeld, PrivateMetadataStore, ShareMode, SpawnOptions, SyncNode,
+    AddrInfoOptions, DirectoryHeld, PrivateMetadataStore, RecordedHosting, ShareMode, SpawnOptions,
+    SyncNode,
 };
 use pdn_types::EntryPath;
-use test_utils::ids;
+use test_utils::{host_identity, ids};
 
 /// Spawn a node on `dir` — the directory-configured counterpart of the
 /// suites' `memory_node`.
@@ -32,15 +33,21 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
 
     let first = node_on(dir.path()).await?;
     let first_id = first.node_id();
-    let author = first.default_author().await?;
 
-    let directory = PrivateMetadataStore::create(&first).await?;
-    directory.add_device(first.node_id()).await?;
+    let directory = host_identity(&first, ids::ALICE).await?;
+    let author = first.default_author(ids::ALICE)?;
     let directory_namespace = directory.namespace();
-    first.create_namespace(ids::ALICE).await?;
-    first.write(ids::ALICE, author, &path, payload).await?;
+    first.create_namespace(ids::ALICE, ids::ALICE).await?;
+    first
+        .write(ids::ALICE, ids::ALICE, author, &path, payload)
+        .await?;
     let data_ticket = first
-        .share_ticket(ids::ALICE, ShareMode::Write, AddrInfoOptions::Addresses)
+        .share_ticket(
+            ids::ALICE,
+            ids::ALICE,
+            ShareMode::Write,
+            AddrInfoOptions::Addresses,
+        )
         .await?;
     directory.put_ticket("data", &data_ticket).await?;
     first.shutdown().await?;
@@ -53,9 +60,11 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         first_id,
         "the node id must come from the stored key"
     );
-    let reopened = PrivateMetadataStore::open(&second, directory_namespace)
+    second.provision_identity(ids::ALICE).await?;
+    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, directory_namespace)
         .await?
         .expect("the respawned store must still hold the directory replica");
+    second.host_identity(ids::ALICE, &reopened)?;
     assert!(
         reopened.list_devices().await?.contains(&first_id),
         "the directory's device set must survive the respawn"
@@ -64,9 +73,11 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         .get_ticket("data")
         .await?
         .expect("the data ticket and its payload are local");
-    let _rebound = second.import_namespace(ids::ALICE, stored_ticket).await?;
+    let _rebound = second
+        .import_namespace(ids::ALICE, ids::ALICE, stored_ticket)
+        .await?;
     assert_eq!(
-        second.read(ids::ALICE, &path).await?.as_deref(),
+        second.read(ids::ALICE, ids::ALICE, &path).await?.as_deref(),
         Some(payload.as_slice()),
         "the entry and its payload must come back from the directory alone"
     );
@@ -79,12 +90,13 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         first_id,
         "a fresh directory must be a different node"
     );
+    fresh.provision_identity(ids::ALICE).await?;
     assert!(
-        fresh.read(ids::ALICE, &path).await.is_err(),
+        fresh.read(ids::ALICE, ids::ALICE, &path).await.is_err(),
         "a fresh node must refuse the issuer as unknown"
     );
     assert!(
-        PrivateMetadataStore::open(&fresh, directory_namespace)
+        PrivateMetadataStore::open(&fresh, ids::ALICE, directory_namespace)
             .await?
             .is_none(),
         "a replica this store never held must be reported absent, not as a failure to open"
@@ -94,10 +106,10 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
     Ok(())
 }
 
-/// One author per node, persisted with the stores: a path rewritten after
-/// a restart replaces its predecessor instead of accreting beside it under
-/// a second author. Every latest-wins read hides the difference, so the
-/// assertion counts live records across authors.
+/// One author per hosted identity, persisted with that identity's stores:
+/// a path rewritten after a restart replaces its predecessor instead of
+/// accreting beside it under a second author. Every latest-wins read hides
+/// the difference, so the assertion counts live records across authors.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
@@ -105,13 +117,20 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     let path = EntryPath::new("contact/email")?;
 
     let first = node_on(dir.path()).await?;
-    let directory = PrivateMetadataStore::create(&first).await?;
+    let directory = host_identity(&first, ids::ALICE).await?;
     let directory_namespace = directory.namespace();
-    first.create_namespace(ids::ALICE).await?;
-    let author = first.default_author().await?;
-    first.write(ids::ALICE, author, &path, b"before").await?;
+    first.create_namespace(ids::ALICE, ids::ALICE).await?;
+    let author = first.default_author(ids::ALICE)?;
+    first
+        .write(ids::ALICE, ids::ALICE, author, &path, b"before")
+        .await?;
     let ticket = first
-        .share_ticket(ids::ALICE, ShareMode::Write, AddrInfoOptions::Addresses)
+        .share_ticket(
+            ids::ALICE,
+            ids::ALICE,
+            ShareMode::Write,
+            AddrInfoOptions::Addresses,
+        )
         .await?;
     directory.put_ticket("data", &ticket).await?;
     first.shutdown().await?;
@@ -119,25 +138,89 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     drop(first);
 
     let second = node_on(dir.path()).await?;
-    let reopened = PrivateMetadataStore::open(&second, directory_namespace)
+    second.provision_identity(ids::ALICE).await?;
+    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, directory_namespace)
         .await?
         .expect("the respawned store must still hold the directory replica");
+    second.host_identity(ids::ALICE, &reopened)?;
     let stored_ticket = reopened
         .get_ticket("data")
         .await?
         .expect("the data ticket and its payload are local");
-    let _rebound = second.import_namespace(ids::ALICE, stored_ticket).await?;
-    let author = second.default_author().await?;
-    second.write(ids::ALICE, author, &path, b"after").await?;
+    let _rebound = second
+        .import_namespace(ids::ALICE, ids::ALICE, stored_ticket)
+        .await?;
+    let author = second.default_author(ids::ALICE)?;
+    second
+        .write(ids::ALICE, ids::ALICE, author, &path, b"after")
+        .await?;
     assert_eq!(
-        second.read(ids::ALICE, &path).await?.as_deref(),
+        second.read(ids::ALICE, ids::ALICE, &path).await?.as_deref(),
         Some(b"after".as_slice())
     );
     assert_eq!(
-        second.live_record_count(ids::ALICE, &path).await?,
+        second
+            .live_record_count(ids::ALICE, ids::ALICE, &path)
+            .await?,
         1,
         "a rewrite as the persisted author must replace, not accrete"
     );
+
+    // Denial: a record under a separate author accretes, so the count
+    // above is an instrument and not a constant.
+    let other_author = second.create_author(ids::ALICE).await?;
+    second
+        .write(ids::ALICE, ids::ALICE, other_author, &path, b"elsewhere")
+        .await?;
+    assert_eq!(
+        second
+            .live_record_count(ids::ALICE, ids::ALICE, &path)
+            .await?,
+        2,
+        "a second author's record must be countable, or the assertion above proves nothing"
+    );
+    second.shutdown().await?;
+    Ok(())
+}
+
+/// Two identities of one node each keep their own author across a restart:
+/// what a counterparty or a cell binds to an identity on this device is
+/// that identity's author, not the node's.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let first = node_on(dir.path()).await?;
+    let work_dir = host_identity(&first, ids::ALICE_AT_WORK).await?;
+    let leisure_dir = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
+    let (work_namespace, leisure_namespace) = (work_dir.namespace(), leisure_dir.namespace());
+    let work_author = first.default_author(ids::ALICE_AT_WORK)?;
+    let leisure_author = first.default_author(ids::ALICE_AT_LEISURE)?;
+    assert_ne!(
+        work_author, leisure_author,
+        "two identities of one node wrote under one author"
+    );
+    first.shutdown().await?;
+    drop(work_dir);
+    drop(leisure_dir);
+    drop(first);
+
+    let second = node_on(dir.path()).await?;
+    for (identity, namespace, before) in [
+        (ids::ALICE_AT_WORK, work_namespace, work_author),
+        (ids::ALICE_AT_LEISURE, leisure_namespace, leisure_author),
+    ] {
+        second.provision_identity(identity).await?;
+        let reopened = PrivateMetadataStore::open(&second, identity, namespace)
+            .await?
+            .expect("the respawned store must still hold the directory replica");
+        second.host_identity(identity, &reopened)?;
+        assert_eq!(
+            second.default_author(identity)?,
+            before,
+            "an identity came back writing as another author"
+        );
+    }
     second.shutdown().await?;
     Ok(())
 }
@@ -147,8 +230,14 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
 /// that record live in the replica, and the set reads the device as absent
 /// only because the latest-per-key collapse sees the tombstone before empty
 /// entries are excluded. The restart is load-bearing twice: the tombstone
-/// must be written by the author this node had before it, and the buried
-/// record must have survived on disk.
+/// must be written by the author this identity had before it, and the
+/// buried record must have survived on disk.
+///
+/// The second author is a sibling device of the same identity, which is
+/// where two authors on one connection metadata store come from. Each
+/// side's counterpart half is created locally: registering the pair is
+/// what arms a connection metadata store's ticket bound (Invariant 3),
+/// and only the `own` half is this scenario's subject.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     use std::str::FromStr as _;
@@ -166,34 +255,46 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     );
 
     let first = node_on(dir.path()).await?;
-    let cms = ConnectionMetadataStore::create(&first).await?;
+    let directory = host_identity(&first, ids::ALICE).await?;
     let own_node = first.node_id();
+    let cms = ConnectionMetadataStore::create(&first, ids::ALICE).await?;
+    let counterpart = ConnectionMetadataStore::create(&first, ids::ALICE).await?;
+    first.host_connection(ids::ALICE, ids::BOB, &cms, &counterpart)?;
     cms.ensure_device_published(own_node).await?;
     let ticket = cms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
+    let directory_ticket = directory
+        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
 
-    // The withdrawn device's record comes from another node, so it stands
-    // under another author than the tombstone below.
-    let other = test_utils::memory_node().await?;
-    let other_cms = ConnectionMetadataStore::import(&other, ticket.clone()).await?;
-    other_cms.ensure_device_published(withdrawn).await?;
+    // A sibling device of the same identity writes the withdrawn device's
+    // record, so it stands under another author than the tombstone below.
+    let sibling = test_utils::memory_node().await?;
+    let sibling_dir = test_utils::join_identity(&sibling, ids::ALICE, directory_ticket).await?;
+    directory.add_device(sibling.node_id()).await?;
+    sibling_dir.add_device(sibling.node_id()).await?;
+    let sibling_cms = ConnectionMetadataStore::import(&sibling, ids::ALICE, ticket.clone()).await?;
+    let sibling_counterpart = ConnectionMetadataStore::create(&sibling, ids::ALICE).await?;
+    sibling.host_connection(ids::ALICE, ids::BOB, &sibling_cms, &sibling_counterpart)?;
+    sibling_cms.ensure_device_published(withdrawn).await?;
     assert!(
         test_utils::eventually(|| async {
             Ok(cms.published_devices().await?.contains(&withdrawn))
         })
         .await?,
-        "the other node's record never reached this replica"
+        "the sibling's record never reached this replica"
     );
-    other.shutdown().await?;
-    drop(other_cms);
-    drop(other);
+    sibling.shutdown().await?;
+    drop(sibling_cms);
+    drop(sibling);
     first.shutdown().await?;
     drop(cms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
-    let cms = ConnectionMetadataStore::import(&second, ticket).await?;
+    second.provision_identity(ids::ALICE).await?;
+    let cms = ConnectionMetadataStore::import(&second, ids::ALICE, ticket).await?;
     cms.withdraw_device(withdrawn).await?;
     let published = cms.published_devices().await?;
     assert!(
@@ -218,8 +319,9 @@ async fn a_second_node_on_a_held_directory_is_refused_by_name() -> Result<()> {
     let path = EntryPath::new("contact/email")?;
 
     let running = node_on(dir.path()).await?;
-    running.create_namespace(ids::ALICE).await?;
-    let author = running.default_author().await?;
+    let _directory = host_identity(&running, ids::ALICE).await?;
+    running.create_namespace(ids::ALICE, ids::ALICE).await?;
+    let author = running.default_author(ids::ALICE)?;
 
     let err = node_on(dir.path())
         .await
@@ -231,10 +333,13 @@ async fn a_second_node_on_a_held_directory_is_refused_by_name() -> Result<()> {
 
     // The running node is unaffected by the refused start.
     running
-        .write(ids::ALICE, author, &path, b"still mine")
+        .write(ids::ALICE, ids::ALICE, author, &path, b"still mine")
         .await?;
     assert_eq!(
-        running.read(ids::ALICE, &path).await?.as_deref(),
+        running
+            .read(ids::ALICE, ids::ALICE, &path)
+            .await?
+            .as_deref(),
         Some(b"still mine".as_slice())
     );
     running.shutdown().await?;
@@ -310,8 +415,8 @@ async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
 
 /// A device record rewritten after a restart replaces its predecessor
 /// instead of accreting beside it under a second author: the directory
-/// writes with the node's one author — the half a store that minted its
-/// own author would break invisibly, since every product read is
+/// writes with its identity's one author — the half a store that minted
+/// its own author would break invisibly, since every product read is
 /// latest-wins. The denial beside it: a record under a separate author does
 /// accrete, so the count is an instrument and not a constant.
 #[cfg(feature = "test-util")]
@@ -320,9 +425,8 @@ async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result
     let dir = tempfile::tempdir()?;
     let first = node_on(dir.path()).await?;
     let device = first.node_id();
-    let directory = PrivateMetadataStore::create(&first).await?;
+    let directory = host_identity(&first, ids::ALICE).await?;
     let namespace = directory.namespace();
-    directory.add_device(device).await?;
     assert_eq!(
         directory.live_device_record_count(device).await?,
         1,
@@ -333,9 +437,11 @@ async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result
     drop(first);
 
     let second = node_on(dir.path()).await?;
-    let reopened = PrivateMetadataStore::open(&second, namespace)
+    second.provision_identity(ids::ALICE).await?;
+    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, namespace)
         .await?
         .expect("the respawned store must still hold the directory replica");
+    second.host_identity(ids::ALICE, &reopened)?;
     reopened.add_device(device).await?;
     assert_eq!(
         reopened.live_device_record_count(device).await?,
@@ -345,7 +451,7 @@ async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result
 
     // Denial: a record written under another author accretes — the count
     // above is not one by construction.
-    let other_author = second.create_author().await?;
+    let other_author = second.create_author(ids::ALICE).await?;
     reopened
         .add_device_as_for_test(device, other_author)
         .await?;
@@ -353,6 +459,50 @@ async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result
         reopened.live_device_record_count(device).await?,
         2,
         "a second author's record must be countable, or the assertion above proves nothing"
+    );
+    second.shutdown().await?;
+    Ok(())
+}
+
+/// A start finds exactly the identities whose hosting was recorded, each
+/// with its directory's namespace and its replica store. Denied: an
+/// identity provisioned and never recorded is not listed, and neither is
+/// one whose record the disk refused — a read-only subdirectory, the
+/// closest stand-in for a full disk at the commit point.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_finds_the_identities_whose_hosting_was_recorded() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let work = host_identity(&first, ids::ALICE_AT_WORK).await?;
+    first
+        .record_hosting(ids::ALICE_AT_WORK, work.namespace())
+        .await?;
+    let _never_recorded = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
+
+    let carol = host_identity(&first, ids::CAROL).await?;
+    let carol_subdirectory = dir.path().join("identities").join(ids::CAROL.to_string());
+    std::fs::set_permissions(&carol_subdirectory, std::fs::Permissions::from_mode(0o500))?;
+    let refused = first.record_hosting(ids::CAROL, carol.namespace()).await;
+    std::fs::set_permissions(&carol_subdirectory, std::fs::Permissions::from_mode(0o700))?;
+    assert!(
+        refused.is_err(),
+        "a record the disk refuses must fail the commit"
+    );
+    first.shutdown().await?;
+    drop(first);
+
+    let second = node_on(dir.path()).await?;
+    assert_eq!(
+        second.recorded_hosting()?,
+        vec![RecordedHosting {
+            identity: ids::ALICE_AT_WORK,
+            directory: work.namespace(),
+            store_present: true,
+        }],
+        "a start must find the recorded identity and nothing else"
     );
     second.shutdown().await?;
     Ok(())

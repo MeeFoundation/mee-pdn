@@ -1,9 +1,6 @@
 //! Network implementation of the iroh-docs protocol
 
-use std::{
-    future::Future,
-    sync::{Arc, OnceLock},
-};
+use std::future::Future;
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use n0_future::time::{self, Duration, Instant};
@@ -14,8 +11,10 @@ use crate::{
     actor::SyncHandle,
     metrics::Metrics,
     net::codec::{run_alice, BobState},
-    NamespaceId, SyncOutcome,
+    Identity, NamespaceId, SyncOutcome,
 };
+
+pub use crate::net::codec::SessionOpening;
 
 /// The ALPN identifier for the iroh-docs protocol
 pub const ALPN: &[u8] = b"/iroh-sync/1";
@@ -26,9 +25,13 @@ mod codec;
 ///
 /// Nothing below this point carries a timeout of its own, so a peer that
 /// stays connected and stops talking stalls forever. Two things ride on the
-/// bound. The live actor tracks one running exchange per namespace and peer
-/// and refuses to start another while one runs, so a stalled exchange
-/// blocks that pair and drops every later sync trigger silently. And a
+/// bound. The live actor tracks one running exchange per namespace, peer
+/// and identity — a node of two identities is two counterparts at one node
+/// id (ADR-0013) — and refuses to start another while one runs, so a
+/// stalled exchange blocks that counterpart and drops every later sync
+/// trigger for it silently. A counterpart exists only for a caller the
+/// access provider admitted, so what a peer can occupy is bounded by the
+/// identities it is entitled to act as. And a
 /// session holds a store snapshot, whose read transaction holds back
 /// reclamation of every page freed while it lives — of the oldest live one,
 /// so concurrent sessions cost the same window as a single one, and the
@@ -64,17 +67,23 @@ pub const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// written meanwhile travel on the next session. The snapshot is released
 /// when the session ends, on every path. The whole exchange is bounded by
 /// [`SYNC_SESSION_TIMEOUT`].
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_and_sync(
     endpoint: &Endpoint,
     sync: &SyncHandle,
     namespace: NamespaceId,
+    identity: Identity,
+    caller: Identity,
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     filter: Option<crate::filter::EntryFilter>,
+    ingest: Option<crate::filter::SessionIngest>,
 ) -> Result<SyncFinished, ConnectError> {
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
-        connect_and_sync_inner(endpoint, sync, namespace, peer, metrics, filter),
+        connect_and_sync_inner(
+            endpoint, sync, namespace, identity, caller, peer, metrics, filter, ingest,
+        ),
     )
     .await
     {
@@ -85,13 +94,17 @@ pub async fn connect_and_sync(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_sync_inner(
     endpoint: &Endpoint,
     sync: &SyncHandle,
     namespace: NamespaceId,
+    identity: Identity,
+    caller: Identity,
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     filter: Option<crate::filter::EntryFilter>,
+    ingest: Option<crate::filter::SessionIngest>,
 ) -> Result<SyncFinished, ConnectError> {
     let t_start = Instant::now();
     let peer_id = peer.id;
@@ -112,17 +125,28 @@ async fn connect_and_sync_inner(
         &mut recv_stream,
         sync,
         namespace,
+        identity,
+        caller,
         peer_id,
         filter,
+        ingest,
     )
     .await;
 
-    send_stream.finish().map_err(ConnectError::close)?;
-    send_stream.stopped().await.map_err(ConnectError::close)?;
-    recv_stream
-        .read_to_end(0)
-        .await
-        .map_err(ConnectError::close)?;
+    // The exchange's own result wins, as on the accept side: a teardown
+    // failure is a consequence of whatever ended the exchange, and the
+    // caller routes on the cause — a refusal the peer sent must not reach
+    // it as a lost connection.
+    let closed: Result<(), ConnectError> = async {
+        send_stream.finish().map_err(ConnectError::close)?;
+        send_stream.stopped().await.map_err(ConnectError::close)?;
+        recv_stream
+            .read_to_end(0)
+            .await
+            .map_err(ConnectError::close)?;
+        Ok(())
+    }
+    .await;
 
     if let Some(metrics) = metrics {
         if res.is_ok() {
@@ -149,6 +173,7 @@ async fn connect_and_sync_inner(
     }
 
     let outcome = res?;
+    closed?;
 
     let timings = Timings {
         connect: t_connect,
@@ -174,6 +199,10 @@ pub enum AcceptOutcome {
         /// node reveals of the replica to this peer. `None` serves the
         /// full view.
         filter: Option<crate::filter::EntryFilter>,
+        /// This side's ingest verdict for the session: what it admits of
+        /// what the peer offers. `None` leaves that to the consumer's
+        /// validator.
+        ingest: Option<crate::filter::SessionIngest>,
     },
     /// Decline the sync request
     Reject(AbortReason),
@@ -182,99 +211,132 @@ pub enum AcceptOutcome {
 impl std::fmt::Debug for AcceptOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcceptOutcome::Allow { filter: None } => write!(f, "Allow"),
-            AcceptOutcome::Allow { filter: Some(_) } => write!(f, "Allow(filtered)"),
+            AcceptOutcome::Allow { filter, ingest } => f
+                .debug_struct("Allow")
+                .field("filter", &filter.as_ref().map(|_| "filtered"))
+                .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .finish(),
             AcceptOutcome::Reject(reason) => write!(f, "Reject({reason:?})"),
         }
     }
 }
 
-/// Handle an iroh-docs connection and sync all shared documents in the replica store.
+/// Read an accepted connection's first message, before any replica is
+/// touched, so the session can be dispatched to the engine of the identity
+/// it names (ADR-0013).
+pub async fn accept_session(
+    connection: &iroh::endpoint::Connection,
+) -> Result<SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>, AcceptError> {
+    let peer = connection.remote_id();
+    // The stream the caller never opens is the same silence as the init
+    // message it never sends, so one bound covers both: outside it, a
+    // connection that stays open and quiet holds this task forever.
+    time::timeout(SYNC_SESSION_TIMEOUT, async {
+        let (send_stream, recv_stream) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| AcceptError::open(peer, e))?;
+        SessionOpening::read(send_stream, recv_stream, peer).await
+    })
+    .await
+    .map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            None,
+            anyhow::anyhow!("no init message within {SYNC_SESSION_TIMEOUT:?}"),
+        )
+    })?
+}
+
+/// Refuse a session read this far, with the reason a caller that named a
+/// identity this node does not host is given. The refusal is the whole
+/// message, so it is torn down like a served session: without waiting
+/// for the caller, the connection can end before the frame reaches it
+/// and the refusal arrives as a lost connection.
+pub async fn refuse_session(
+    opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    reason: AbortReason,
+) -> Result<(), AcceptError> {
+    let peer = opening.peer();
+    let namespace = Some(opening.namespace());
+    // Under the same bound as a served session: the teardown waits for the
+    // caller, and a caller that never closes its half would otherwise hold
+    // this task for as long as it keeps the connection alive.
+    time::timeout(SYNC_SESSION_TIMEOUT, async {
+        let (mut send_stream, mut recv_stream) = opening.refuse(reason).await?;
+        send_stream
+            .finish()
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        send_stream
+            .stopped()
+            .await
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        recv_stream
+            .read_to_end(0)
+            .await
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        Ok(())
+    })
+    .await
+    .map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            namespace,
+            anyhow::anyhow!("refusal not acknowledged within {SYNC_SESSION_TIMEOUT:?}"),
+        )
+    })?
+}
+
+/// Serve a session whose first message is already read, over an accepted
+/// iroh connection.
 ///
 /// An allowed session serves entries from a store snapshot frozen right
 /// after the accept decision (see [`connect_and_sync`] for the snapshot
 /// semantics); a rejected request never opens one. The whole exchange is
 /// bounded by [`SYNC_SESSION_TIMEOUT`], mirroring [`connect_and_sync`]: a
 /// stalled accept blocks the pair just the same.
-pub async fn handle_connection<F, Fut>(
+pub async fn handle_session<F, Fut>(
     sync: SyncHandle,
-    connection: iroh::endpoint::Connection,
+    opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     accept_cb: F,
     metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
-    F: Fn(NamespaceId, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
-    let peer = connection.remote_id();
-    // A timeout has to name the namespace to release the pair the accept
-    // decision registered as running — an error without one is routed as a
-    // failure before the first message and leaves the pair running for
-    // good. Named when the decision is asked for rather than when it comes
-    // back, because the bound can be reached while it is still running.
-    let accepted: Arc<OnceLock<NamespaceId>> = Default::default();
-    let observed_accept_cb = {
-        let accepted = Arc::clone(&accepted);
-        move |namespace, peer| {
-            let _ = accepted.set(namespace);
-            accept_cb(namespace, peer)
-        }
-    };
-
+    let peer = opening.peer();
+    let namespace = opening.namespace();
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
-        handle_connection_inner(sync, connection, observed_accept_cb, metrics),
+        handle_session_inner(sync, opening, accept_cb, metrics),
     )
     .await
     {
         Ok(res) => res,
         Err(_elapsed) => Err(AcceptError::sync(
             peer,
-            accepted.get().copied(),
+            Some(namespace),
             anyhow::anyhow!("sync exchange timed out after {SYNC_SESSION_TIMEOUT:?}"),
         )),
     }
 }
 
-async fn handle_connection_inner<F, Fut>(
+async fn handle_session_inner<F, Fut>(
     sync: SyncHandle,
-    connection: iroh::endpoint::Connection,
+    opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     accept_cb: F,
     metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
-    F: Fn(NamespaceId, PublicKey) -> Fut,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
     let t_start = Instant::now();
-    let peer = connection.remote_id();
-    let (mut send_stream, mut recv_stream) = connection
-        .accept_bi()
-        .await
-        .map_err(|e| AcceptError::open(peer, e))?;
-
-    let t_connect = t_start.elapsed();
-    let span = error_span!("accept", peer = %peer.fmt_short(), namespace = tracing::field::Empty);
-    span.in_scope(|| {
-        debug!(?t_connect, "connection established");
-    });
-
-    let mut state = BobState::new(peer);
-    let res = state
-        .run(&mut send_stream, &mut recv_stream, sync, accept_cb)
-        .instrument(span.clone())
-        .await;
-
-    if let Some(metrics) = metrics {
-        if res.is_ok() {
-            metrics.sync_via_accept_success.inc();
-        } else {
-            metrics.sync_via_accept_failure.inc();
-        }
-    }
-
-    let namespace = state.namespace();
-    let outcome = state.into_outcome();
+    let peer = opening.peer();
+    let (res, outcome, mut send_stream, mut recv_stream) =
+        run_session(sync, opening, accept_cb, metrics).await;
+    let namespace = res.as_ref().ok().copied();
 
     // The exchange's own result wins: teardown fails as a consequence of
     // whatever ended the exchange, so reporting the consequence buries the
@@ -297,36 +359,155 @@ where
     }
     .await;
 
-    let t_process = t_start.elapsed() - t_connect;
-    span.in_scope(|| match &res {
-        Ok(_res) => {
-            debug!(
-                ?t_connect,
-                ?t_process,
-                sent = %outcome.num_sent,
-                recv = %outcome.num_recv,
-                "done, ok"
-            );
-        }
-        Err(err) => {
-            debug!(?t_connect, ?t_process, ?err, "done, failed");
-        }
-    });
-
     let namespace = res.and_then(|namespace| closed.map(|()| namespace))?;
-
-    let timings = Timings {
-        connect: t_connect,
-        process: t_process,
-    };
-    let res = SyncFinished {
+    Ok(SyncFinished {
         namespace,
         outcome,
         peer,
-        timings,
-    };
+        timings: Timings {
+            connect: Duration::default(),
+            process: t_start.elapsed(),
+        },
+    })
+}
 
-    Ok(res)
+/// Serve a session whose first message is already read, over a stream pair
+/// inside this process. The codec, the session setup and the access
+/// provider calls are the network path's; only the teardown differs, a
+/// pipe having no peer to acknowledge the close.
+pub async fn handle_in_process_session<R, W, F, Fut>(
+    sync: SyncHandle,
+    opening: SessionOpening<R, W>,
+    accept_cb: F,
+    metrics: Option<&Metrics>,
+) -> Result<SyncFinished, AcceptError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
+    Fut: Future<Output = AcceptOutcome>,
+{
+    let t_start = Instant::now();
+    let peer = opening.peer();
+    // The same bound as a session over the wire: a pipe has no peer to go
+    // quiet on it, but the session holds a store snapshot and a
+    // counterpart's slot either way, and nothing below carries a timeout.
+    let session = time::timeout(SYNC_SESSION_TIMEOUT, async {
+        let (res, outcome, mut writer, _reader) =
+            run_session(sync, opening, accept_cb, metrics).await;
+        let _shut = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+        (res, outcome)
+    })
+    .await;
+    let (res, outcome) = session.map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            None,
+            anyhow::anyhow!("in-process exchange timed out after {SYNC_SESSION_TIMEOUT:?}"),
+        )
+    })?;
+    let namespace = res?;
+    Ok(SyncFinished {
+        namespace,
+        outcome,
+        peer,
+        timings: Timings {
+            connect: Duration::default(),
+            process: t_start.elapsed(),
+        },
+    })
+}
+
+/// The rounds themselves, over any stream pair; the streams come back for
+/// the caller's own teardown.
+async fn run_session<R, W, F, Fut>(
+    sync: SyncHandle,
+    opening: SessionOpening<R, W>,
+    accept_cb: F,
+    metrics: Option<&Metrics>,
+) -> (Result<NamespaceId, AcceptError>, SyncOutcome, W, R)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
+    Fut: Future<Output = AcceptOutcome>,
+{
+    let peer = opening.peer();
+    let span = error_span!("accept", peer = %peer.fmt_short(), namespace = tracing::field::Empty);
+    let (peer, init, mut reader, mut writer) = opening.into_parts();
+    let mut state = BobState::new(peer);
+    let res = state
+        .run(&mut writer, &mut reader, init, sync, accept_cb)
+        .instrument(span.clone())
+        .await;
+
+    if let Some(metrics) = metrics {
+        if res.is_ok() {
+            metrics.sync_via_accept_success.inc();
+        } else {
+            metrics.sync_via_accept_failure.inc();
+        }
+    }
+
+    let outcome = state.into_outcome();
+    span.in_scope(|| match &res {
+        Ok(_namespace) => debug!(sent = %outcome.num_sent, recv = %outcome.num_recv, "done, ok"),
+        Err(err) => debug!(?err, "done, failed"),
+    });
+    (res, outcome, writer.into_inner(), reader.into_inner())
+}
+
+/// Run the initiator side of a session over a stream pair inside this
+/// process, with the same codec and the same session setup the network
+/// path uses.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_in_process<R, W>(
+    sync: &SyncHandle,
+    namespace: NamespaceId,
+    identity: Identity,
+    caller: Identity,
+    peer: PublicKey,
+    writer: &mut W,
+    reader: &mut R,
+    metrics: Option<&Metrics>,
+    filter: Option<crate::filter::EntryFilter>,
+    ingest: Option<crate::filter::SessionIngest>,
+) -> Result<SyncFinished, ConnectError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let t_start = Instant::now();
+    // Bounded like the dial it stands in for; see `handle_in_process_session`.
+    let res = time::timeout(
+        SYNC_SESSION_TIMEOUT,
+        run_alice(
+            writer, reader, sync, namespace, identity, caller, peer, filter, ingest,
+        ),
+    )
+    .await
+    .map_err(|_elapsed| {
+        ConnectError::sync(anyhow::anyhow!(
+            "in-process exchange timed out after {SYNC_SESSION_TIMEOUT:?}"
+        ))
+    })?;
+    let _shut = tokio::io::AsyncWriteExt::shutdown(writer).await;
+    if let Some(metrics) = metrics {
+        if res.is_ok() {
+            metrics.sync_via_connect_success.inc();
+        } else {
+            metrics.sync_via_connect_failure.inc();
+        }
+    }
+    Ok(SyncFinished {
+        namespace,
+        peer,
+        outcome: res?,
+        timings: Timings {
+            connect: Duration::default(),
+            process: t_start.elapsed(),
+        },
+    })
 }
 
 /// Details of a finished sync operation.

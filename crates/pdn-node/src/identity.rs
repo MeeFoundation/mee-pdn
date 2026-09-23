@@ -31,27 +31,37 @@ pub(crate) const DATA_TICKET_KIND: &str = "data";
 struct CreateRollback {
     node: Arc<data_layer::SyncNode>,
     identity: PdnId,
-    directory_namespace: data_layer::NamespaceId,
+    /// `None` until the directory exists: the identity's half of the node
+    /// is brought up before it, and that half is the first thing a failure
+    /// has to take back down.
+    directory_namespace: Option<data_layer::NamespaceId>,
     hosting_armed: bool,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
     armed: bool,
 }
 
 impl CreateRollback {
+    /// Armed as soon as the identity is provisioned, which is the first
+    /// act with anything to undo: an actor thread, an open store and the
+    /// entry in the hosted set, all of which a failure below would
+    /// otherwise leave behind for the life of the process.
     fn new(
         node: Arc<data_layer::SyncNode>,
         identity: PdnId,
-        directory_namespace: data_layer::NamespaceId,
         cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
         Self {
             node,
             identity,
-            directory_namespace,
+            directory_namespace: None,
             hosting_armed: false,
             cleanup_tasks,
             armed: true,
         }
+    }
+
+    fn armed_directory(&mut self, namespace: data_layer::NamespaceId) {
+        self.directory_namespace = Some(namespace);
     }
 
     fn armed_hosting(&mut self) {
@@ -89,18 +99,21 @@ impl Drop for CreateRollback {
     }
 }
 
-/// Best effort: the caller is already receiving an error.
+/// Best effort: the caller is already receiving an error. Dropping the
+/// identity's half of the node takes its replicas with it, so the two
+/// stores this create brought up need no separate undo — they are named
+/// for the case where the identity stays.
 async fn undo_create(
     node: &data_layer::SyncNode,
     identity: PdnId,
-    directory_namespace: data_layer::NamespaceId,
-    hosting_armed: bool,
+    directory_namespace: Option<data_layer::NamespaceId>,
+    _hosting_armed: bool,
 ) {
-    if hosting_armed {
-        let _ = node.unhost_identity(identity);
+    let _ = node.forget_namespace(identity, identity).await;
+    if let Some(directory) = directory_namespace {
+        let _ = node.forget_doc(identity, directory).await;
     }
-    let _ = node.forget_namespace(identity).await;
-    let _ = node.forget_doc(directory_namespace).await;
+    let _ = node.unhost_identity(identity).await;
 }
 
 /// Creating and linking identities on a runtime.
@@ -146,26 +159,47 @@ impl IdentityService for RuntimeIdentityService<'_> {
         let identity = PdnId::from_bytes(rand::random());
         // Provisioning needs no coarse lock, and holding it across the
         // store work would put every other caller behind one ceremony.
-        let (node, cleanup_tasks) = {
+        let (node, cleanup_tasks, injected_failure) = {
+            #[cfg(feature = "test-util")]
+            let mut state = self.runtime.state.lock().await;
+            #[cfg(not(feature = "test-util"))]
             let state = self.runtime.state.lock().await;
-            (Arc::clone(&state.node), state.cleanup_tasks.clone())
+            #[cfg(feature = "test-util")]
+            let injected_failure = std::mem::take(&mut state.fail_next_directory_create);
+            #[cfg(not(feature = "test-util"))]
+            let injected_failure = false;
+            (
+                Arc::clone(&state.node),
+                state.cleanup_tasks.clone(),
+                injected_failure,
+            )
         };
-        let directory = PrivateMetadataStore::create(&node).await?;
-        // Armed as soon as there is a replica to undo.
-        let mut rollback = CreateRollback::new(
-            Arc::clone(&node),
-            identity,
-            directory.namespace(),
-            cleanup_tasks,
-        );
+        // The identity's own half of the node first: its replicas live in
+        // that store and nowhere else (ADR-0013).
+        node.provision_identity(identity).await?;
+        let mut rollback = CreateRollback::new(Arc::clone(&node), identity, cleanup_tasks);
+        let created = if injected_failure {
+            Err(anyhow::anyhow!("directory creation failed for test"))
+        } else {
+            PrivateMetadataStore::create(&node, identity).await
+        };
+        let directory = match created {
+            Ok(directory) => directory,
+            Err(err) => {
+                rollback.roll_back().await;
+                return Err(err);
+            }
+        };
+        rollback.armed_directory(directory.namespace());
         let provisioned = async {
             // Before the commit point, unlike a link's confirmation: no other
             // device holds a ticket to this fresh directory, so nothing
             // written here can reach anyone.
             directory.add_device(node.node_id()).await?;
-            node.create_namespace(identity).await?;
+            node.create_namespace(identity, identity).await?;
             let data_ticket = node
                 .share_ticket(
+                    identity,
                     identity,
                     ShareMode::Write,
                     AddrInfoOptions::RelayAndAddresses,
@@ -188,17 +222,17 @@ impl IdentityService for RuntimeIdentityService<'_> {
         };
         rollback.armed_hosting();
         // The commit point, and the last step that can fail. The lock is
-        // taken here: the record is built from the hosted set, so building
-        // it and adding to it are one act.
+        // held across it, so the record and the hosted set change as one act.
         let mut state = self.runtime.state.lock().await;
         if let Err(err) = state.commit_hosting(identity, directory.namespace()).await {
             drop(state);
             rollback.roll_back().await;
             return Err(err);
         }
+        let author = node.default_author(identity)?;
         state
             .identities
-            .insert(identity, HostedIdentity { directory });
+            .insert(identity, HostedIdentity { directory, author });
         drop(state);
         crate::connections::spawn_connection_armer(
             Arc::downgrade(&self.runtime.state),

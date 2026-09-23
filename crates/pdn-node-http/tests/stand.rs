@@ -32,6 +32,9 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
 
     let alice = inviter.create_identity().await?;
     let bob = scanner.create_identity().await?;
+    // The outsider hosts an identity of its own: every read names the
+    // identity performing it, so a node with none asks nothing.
+    let snoop = outsider.create_identity().await?;
 
     // The payload crosses as an opaque token, so this test never depends on
     // its fields. The lifetime is named explicitly.
@@ -68,14 +71,14 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
     // Alice's data: the claim the grant will name, and one it will withhold.
     inviter
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"alice@example.org"),
         )
         .await?
         .ok()?;
     inviter
         .put(
-            &format!("/debug/data/{alice}/notes/diary"),
+            &format!("/debug/data/{alice}/{alice}/notes/diary"),
             body(b"dear diary"),
         )
         .await?
@@ -127,14 +130,14 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
 
     // Allowed: the granted entry reads back through the grantee, waited for
     // by repeating the read.
-    entry_reads(&scanner, alice, "contact/email", b"alice@example.org")
+    entry_reads(&scanner, bob, alice, "contact/email", b"alice@example.org")
         .await
         .context("the granted entry did not reach the grantee")?;
 
     // Denied (outsider): refused as unknown — a refusal, not an absence, so
     // a renamed route cannot pass.
     let refused = outsider
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{snoop}/{alice}/contact/email"))
         .await?;
     assert_eq!(
         refused.status,
@@ -147,17 +150,26 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
     // Sentinel: a proven second wave orders the absence assertion below.
     inviter
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"alice@new.example.org"),
         )
         .await?
         .ok()?;
-    entry_reads(&scanner, alice, "contact/email", b"alice@new.example.org")
-        .await
-        .context("the sentinel update did not reach the grantee")?;
+    entry_reads(
+        &scanner,
+        bob,
+        alice,
+        "contact/email",
+        b"alice@new.example.org",
+    )
+    .await
+    .context("the sentinel update did not reach the grantee")?;
 
     // Denied (existence hidden).
-    let listed: Entries = scanner.get(&format!("/debug/data/{alice}")).await?.json()?;
+    let listed: Entries = scanner
+        .get(&format!("/debug/data/{bob}/{alice}"))
+        .await?
+        .json()?;
     let paths: Vec<String> = listed
         .entries
         .iter()
@@ -169,7 +181,7 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         "the grantee's view must carry exactly the granted subset"
     );
     let withheld = scanner
-        .get(&format!("/debug/data/{alice}/notes/diary"))
+        .get(&format!("/debug/data/{bob}/{alice}/notes/diary"))
         .await?;
     assert_eq!(
         withheld.status,
@@ -186,7 +198,7 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         .delete(&format!("/debug/identities/{alice}/grants/{bob}/{alice}"))
         .await?
         .ok()?;
-    entry_answers(&scanner, alice, "contact/email", StatusCode::CONFLICT)
+    entry_answers(&scanner, bob, alice, "contact/email", StatusCode::CONFLICT)
         .await
         .context("the withdrawn namespace stayed bound on the grantee")?;
     let after: PeerGrants = scanner
@@ -198,7 +210,7 @@ async fn the_whole_scenario_runs_across_containers() -> Result<()> {
         "the withdrawn grant must be gone from the grantee's view: {after:?}"
     );
     let issuer_side = inviter
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
@@ -225,9 +237,10 @@ async fn a_device_joins_across_containers() -> Result<()> {
     let stranger = stand.spawn("stranger").await?;
 
     let alice = first.create_identity().await?;
+    let snoop = stranger.create_identity().await?;
     first
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"written before the link"),
         )
         .await?
@@ -254,9 +267,15 @@ async fn a_device_joins_across_containers() -> Result<()> {
     );
 
     // And reads what the first device wrote before it joined.
-    entry_reads(&second, alice, "contact/email", b"written before the link")
-        .await
-        .context("the linked device did not catch up on the entry written before the link")?;
+    entry_reads(
+        &second,
+        alice,
+        alice,
+        "contact/email",
+        b"written before the link",
+    )
+    .await
+    .context("the linked device did not catch up on the entry written before the link")?;
 
     // Denied (a replayed payload): a refusal, distinguishable from a node
     // that never reached the inviter.
@@ -276,7 +295,7 @@ async fn a_device_joins_across_containers() -> Result<()> {
 
     // Denied (a node that never linked).
     let outsider = stranger
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{snoop}/{alice}/contact/email"))
         .await?;
     assert_eq!(
         outsider.status,
@@ -322,6 +341,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
 
     // The connection, established from the publishing device.
     let bob = audience.create_identity().await?;
+    let snoop = outsider.create_identity().await?;
     let invite = publisher
         .post(
             &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
@@ -338,7 +358,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     // demonstrably works.
     publisher
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"published from the first device"),
         )
         .await?
@@ -349,6 +369,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
         .ok()?;
     entry_reads(
         &audience,
+        bob,
         alice,
         "contact/email",
         b"published from the first device",
@@ -359,6 +380,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     // Replication between the issuer's devices has run.
     entry_reads(
         &sibling,
+        alice,
         alice,
         "contact/email",
         b"published from the first device",
@@ -384,12 +406,19 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     // The audience converges on a device whose address it was never given.
     sibling
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"served by the sibling"),
         )
         .await?
         .ok()?;
-    if let Err(err) = entry_reads(&audience, alice, "contact/email", b"served by the sibling").await
+    if let Err(err) = entry_reads(
+        &audience,
+        bob,
+        alice,
+        "contact/email",
+        b"served by the sibling",
+    )
+    .await
     {
         let logs = format!(
             "{}\n{}",
@@ -401,7 +430,7 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
 
     // Denied: the failover widened nothing.
     let refused = outsider
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{snoop}/{alice}/contact/email"))
         .await?;
     assert_eq!(
         refused.status,
@@ -446,14 +475,14 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
     // read-only.
     issuer
         .put(
-            &format!("/debug/data/{alice}/contact/phone"),
+            &format!("/debug/data/{alice}/{alice}/contact/phone"),
             body(b"+1-555-0100"),
         )
         .await?
         .ok()?;
     issuer
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"alice@example.org"),
         )
         .await?
@@ -475,7 +504,7 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
         .ok()?;
 
     // The precondition of writing over it: the namespace is bound here.
-    entry_reads(&grantee, alice, "contact/phone", b"+1-555-0100")
+    entry_reads(&grantee, bob, alice, "contact/phone", b"+1-555-0100")
         .await
         .context("the granted entry did not reach the grantee")?;
 
@@ -483,15 +512,15 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
     // crossed.
     grantee
         .put(
-            &format!("/debug/data/{alice}/contact/phone"),
+            &format!("/debug/data/{bob}/{alice}/contact/phone"),
             body(b"+1-555-0199"),
         )
         .await?
         .ok()?;
-    entry_reads(&grantee, alice, "contact/phone", b"+1-555-0199")
+    entry_reads(&grantee, bob, alice, "contact/phone", b"+1-555-0199")
         .await
         .context("the grantee's own write did not read back on the grantee")?;
-    entry_reads(&issuer, alice, "contact/phone", b"+1-555-0199")
+    entry_reads(&issuer, alice, alice, "contact/phone", b"+1-555-0199")
         .await
         .context("the grantee's write never reached the issuer")?;
 
@@ -499,7 +528,7 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
     // writing the claim that publication kept read-only.
     let refused = grantee
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{bob}/{alice}/contact/email"),
             body(b"bob@example.org"),
         )
         .await?;
@@ -515,17 +544,17 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
     // issuer-side read below would pass either way.
     issuer
         .put(
-            &format!("/debug/data/{alice}/contact/phone"),
+            &format!("/debug/data/{alice}/{alice}/contact/phone"),
             body(b"+1-555-0300"),
         )
         .await?
         .ok()?;
-    entry_reads(&grantee, alice, "contact/phone", b"+1-555-0300")
+    entry_reads(&grantee, bob, alice, "contact/phone", b"+1-555-0300")
         .await
         .context("the sentinel did not reach the grantee")?;
 
     let issuer_side = issuer
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
@@ -534,7 +563,7 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
         "the refused write must never reach the issuer"
     );
     let grantee_side = grantee
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{bob}/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
@@ -561,6 +590,7 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
     let alice_node = stand.spawn("alice").await?;
     let bob_node = stand.spawn("bob").await?;
     let carol_node = stand.spawn("carol").await?;
+    let outsider_node = stand.spawn("outsider").await?;
 
     // One node, two identities.
     let at_work = alice_node.create_identity().await?;
@@ -574,6 +604,7 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
 
     let bob = bob_node.create_identity().await?;
     let carol = carol_node.create_identity().await?;
+    let outsider = outsider_node.create_identity().await?;
 
     // Each persona meets its own peer.
     for (persona, peer_node, peer) in [(at_work, &bob_node, bob), (at_leisure, &carol_node, carol)]
@@ -595,14 +626,14 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
     // namespace answers the wrong bytes rather than nothing.
     alice_node
         .put(
-            &format!("/debug/data/{at_work}/contact/email"),
+            &format!("/debug/data/{at_work}/{at_work}/contact/email"),
             body(b"alice@acme.example"),
         )
         .await?
         .ok()?;
     alice_node
         .put(
-            &format!("/debug/data/{at_leisure}/contact/email"),
+            &format!("/debug/data/{at_leisure}/{at_leisure}/contact/email"),
             body(b"alice@bridgeclub.example"),
         )
         .await?
@@ -622,11 +653,18 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
         .ok()?;
 
     // Allowed, both ways: each peer reads its own persona's data.
-    entry_reads(&bob_node, at_work, "contact/email", b"alice@acme.example")
-        .await
-        .context("Bob did not read the work persona's entry")?;
+    entry_reads(
+        &bob_node,
+        bob,
+        at_work,
+        "contact/email",
+        b"alice@acme.example",
+    )
+    .await
+    .context("Bob did not read the work persona's entry")?;
     entry_reads(
         &carol_node,
+        carol,
         at_leisure,
         "contact/email",
         b"alice@bridgeclub.example",
@@ -652,18 +690,24 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
         "the leisure persona knows Carol and not Bob: {leisure_side:?}"
     );
 
-    // Denied, both ways: refused as unknown rather than answered as absent.
-    for (peer_node, other_persona, who) in [
-        (&bob_node, at_leisure, "Bob"),
-        (&carol_node, at_work, "Carol"),
+    // Denied, both ways and to a third party: refused as unknown rather
+    // than answered as absent. Ordered after both reads above, so what is
+    // refused here is a namespace this stand has proven it can serve.
+    for (peer_node, acting, other_persona, who) in [
+        (&bob_node, bob, at_leisure, "Bob"),
+        (&carol_node, carol, at_work, "Carol"),
+        (&outsider_node, outsider, at_work, "the outsider"),
+        (&outsider_node, outsider, at_leisure, "the outsider"),
     ] {
         let refused = peer_node
-            .get(&format!("/debug/data/{other_persona}/contact/email"))
+            .get(&format!(
+                "/debug/data/{acting}/{other_persona}/contact/email"
+            ))
             .await?;
         assert_eq!(
             refused.status,
             StatusCode::CONFLICT,
-            "{who} must be refused the other persona's namespace, got {}: {}",
+            "{who} must be refused that persona's namespace, got {}: {}",
             refused.status,
             refused.text()
         );

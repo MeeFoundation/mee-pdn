@@ -2,19 +2,25 @@ set dotenv-load
 set positional-arguments
 
 # Enables the write-retraction scenario tests' courtesy-bypass surface
-# (`pdn-node/test-util`). Dev builds only — never a product build.
+# (`pdn-node/test-util`, which turns on `data-layer/test-util` under it).
+# Dev builds only — never a product build.
 test_features := "--features pdn-node/test-util"
+# The same observation surface reached directly, for a selection that leaves
+# pdn-node out: cargo rejects a feature of an unselected package.
+data_layer_features := "--features data-layer/test-util"
 
 _default:
   @ just --list --unsorted
 
-# The feature flag for a forwarded arg list, empty when the caller narrowed
-# cargo's package selection away from pdn-node: `pdn-node/test-util` names a
-# feature of one package, and cargo rejects it unless that package is selected.
+# The feature flag for a forwarded arg list: the test-util of a package the
+# selection names, because cargo rejects a feature of a package it leaves
+# out. A selection naming neither package gets nothing — the scenarios that
+# need the surface live in these two crates.
 _features *args:
   #!/bin/sh
   case " $* " in
     *" -p pdn-node "*|*" --package pdn-node "*|*" --package=pdn-node "*) echo '{{ test_features }}' ;;
+    *" -p data-layer "*|*" --package data-layer "*|*" --package=data-layer "*) echo '{{ data_layer_features }}' ;;
     *" -p "*|*" --package "*|*" --package="*) ;;
     *) echo '{{ test_features }}' ;;
   esac

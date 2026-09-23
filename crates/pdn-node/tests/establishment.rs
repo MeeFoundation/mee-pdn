@@ -5,7 +5,7 @@
 //! verify-and-burn requirement — each refusal probed for no observable
 //! state on the inviter, next to its allowed counterpart.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use data_layer::{
@@ -15,8 +15,8 @@ use data_layer::{
 use pdn_node::{
     ConnectionsService as _, DataService as _, DelegationUnsupported, EstablishmentInProgress,
     EstablishmentRefused, EstablishmentTimeout, IdentityService as _, InvitePayload,
-    InviterUnreachable, Runtime, SpawnOptions, UnknownIdentity, UnsupportedInviteVersion,
-    INVITE_FORMAT_VERSION,
+    InviterUnreachable, Runtime, SpawnOptions, UnknownIdentity, UnknownIssuer,
+    UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
 use pdn_types::{EntryPath, NodeId};
 use test_utils::{eventually, ids, memory_node, TIMEOUT};
@@ -89,7 +89,7 @@ async fn a_hung_pairing_inviter_costs_the_ceiling_and_nothing_more() -> Result<(
 /// Shutdown waits for an accept in flight and stops waiting once it
 /// returns: a raw dialer leaves the inviter's `accept` parked mid-request,
 /// shutdown is still running against that, and returns once the dialer goes
-/// away — well inside the handler's budget, so the accept finishing is what
+/// away — well inside the shutdown's budget, so the accept finishing is what
 /// ended the wait.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
@@ -136,7 +136,7 @@ async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
         .context("shutdown never returned after the accept it waited for finished")?
         .context("the shutdown task panicked")??;
     assert!(
-        elapsed < pdn_node::pairing::SHUTDOWN_ESTABLISHMENT_BUDGET,
+        elapsed < pdn_node::runtime::SHUTDOWN_SERVING_BUDGET,
         "shutdown took {elapsed:?} — its budget elapsing, not the accept finishing, ended the wait"
     );
 
@@ -241,7 +241,7 @@ async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
     .await?;
     let rt = memory_runtime().await?;
     let y = rt.identity().create().await?;
-    let before = rt.sync().tracked_doc_count().await?;
+    let before = rt.sync().tracked_doc_count(y).await?;
 
     // Every delay cancels the future somewhere between the dial and the
     // reply.
@@ -264,7 +264,7 @@ async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
             () = tokio::time::sleep(delay) => {}
         }
         assert!(
-            eventually(|| async { Ok(rt.sync().tracked_doc_count().await? == before) }).await?,
+            eventually(|| async { Ok(rt.sync().tracked_doc_count(y).await? == before) }).await?,
             "cancelling establish at {delay:?} left a tracked replica behind"
         );
     }
@@ -328,11 +328,11 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
     // The grant flow, no new pairing and no import act: Y's binder imports
     // what the grant names.
     let path = EntryPath::new("contact/name")?;
-    rt_a.data().write(x, &path, b"X").await?;
+    rt_a.data().write(x, x, &path, b"X").await?;
     granted_patiently(&rt_a, x, &rt_b, y, x, common::claims_on(x, &path, true)).await?;
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, &path).await?.as_deref() == Some(&b"X"[..]))
+            Ok(rt_b.data().read(y, x, &path).await?.as_deref() == Some(&b"X"[..]))
         })
         .await?,
         "granted entries did not sync to the peer"
@@ -340,10 +340,10 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
 
     // The grant carries write, proven by the round trip: Y's overwrite
     // reaches X through the ingest gate (ADR-0008).
-    rt_b.data().write(x, &path, b"Y was here").await?;
+    rt_b.data().write(y, x, &path, b"Y was here").await?;
     assert!(
         eventually(|| async {
-            Ok(rt_a.data().read(x, &path).await?.as_deref() == Some(&b"Y was here"[..]))
+            Ok(rt_a.data().read(x, x, &path).await?.as_deref() == Some(&b"Y was here"[..]))
         })
         .await?,
         "the grantee's write did not reach the issuer — the grant's ticket is not a write ticket"
@@ -357,7 +357,7 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "the grant X published toward Y must not be visible to Z, a separate connection of X"
     );
     assert!(
-        rt_c.data().read(x, &path).await.is_err(),
+        rt_c.data().read(z, x, &path).await.is_err(),
         "Z must not reach X's granted data — it never received the grant to import"
     );
 
@@ -829,7 +829,7 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
 
     // X grants toward Y and Y reads it: the pair is live, and now cached on B.
     let path = EntryPath::new("contact/name")?;
-    rt_a.data().write(x, &path, b"X").await?;
+    rt_a.data().write(x, x, &path, b"X").await?;
     rt_a.connections()
         .publish_grant(x, y, x, common::nominal_claims(x))
         .await?;
@@ -842,7 +842,7 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     // Stand in for another device of Y: the linking reply carries a write
     // ticket to Y's directory.
     let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
-    let replacement = ConnectionMetadataStore::create(&probe_node).await?;
+    let replacement = ConnectionMetadataStore::create(&probe_node, y).await?;
     let replacement_ticket = replacement
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -887,19 +887,244 @@ async fn a_failed_pair_open_leaves_no_replica_behind() -> Result<()> {
     laptop.fail_pair_arm_for_test().await;
     link_patiently(&laptop, &phone, alice).await?;
 
-    let settled = laptop.sync().tracked_doc_count().await?;
+    let settled = laptop.sync().tracked_doc_count(alice).await?;
     assert!(
         eventually(|| async { Ok(laptop.pair_arm_failures_for_test().await >= 4) }).await?,
         "the linked device never attempted to open the pair, so nothing here is a denial"
     );
     assert!(
-        eventually(|| async { Ok(laptop.sync().tracked_doc_count().await? <= settled) }).await?,
+        eventually(|| async { Ok(laptop.sync().tracked_doc_count(alice).await? <= settled) })
+            .await?,
         "repeated failed pair opens left replicas open: {} tracked against {settled} before them",
-        laptop.sync().tracked_doc_count().await?
+        laptop.sync().tracked_doc_count(alice).await?
     );
 
     phone.shutdown().await?;
     laptop.shutdown().await?;
     peer.shutdown().await?;
+    Ok(())
+}
+
+/// Two identities of one node establish a connection inside the process:
+/// iroh refuses a connection to this node's own endpoint id, so the same
+/// dialogue runs over a pipe (ADR-0013). Both list the connection, and a
+/// grant from one reaches the other with no peer reachable at all.
+///
+/// Denied: the invite's secret is burned by the establishment, so a
+/// replay of it is refused; and a third identity hosted beside them
+/// lists neither of them and reaches nothing of what they published.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_identities_of_one_node_establish_inside_the_process() -> Result<()> {
+    // The grant binder acts on its connection armer's sweep, whose cadence
+    // is the reconcile interval; the default one would make this scenario
+    // wait tens of seconds for an act that takes microseconds.
+    let rt = Runtime::spawn(SpawnOptions {
+        reconcile_interval: Duration::from_millis(500),
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let work = rt.identity().create().await?;
+    let leisure = rt.identity().create().await?;
+    let outsider = rt.identity().create().await?;
+
+    let invite = rt.connections().invite(work, None).await?;
+    rt.connections().establish(leisure, invite.clone()).await?;
+
+    // Both sides assembled the same connection, mirrored.
+    assert_eq!(rt.connections().list(work).await?, vec![leisure]);
+    assert_eq!(rt.connections().list(leisure).await?, vec![work]);
+
+    // A grant crosses the pair and the granted claim follows it, with no
+    // node but this one running.
+    let path = EntryPath::new("contact/email")?;
+    rt.data()
+        .write(work, work, &path, b"alice@work.example")
+        .await?;
+    granted_patiently(
+        &rt,
+        work,
+        &rt,
+        leisure,
+        work,
+        common::claims_on(work, &path, false),
+    )
+    .await?;
+    assert!(
+        eventually(|| async {
+            Ok(rt.data().read(leisure, work, &path).await?.as_deref()
+                == Some(&b"alice@work.example"[..]))
+        })
+        .await?,
+        "the granted claim did not cross between two identities of one node"
+    );
+
+    // Denied: the secret was burned by the establishment above.
+    let replayed = rt.connections().establish(outsider, invite).await;
+    assert!(
+        replayed.is_err(),
+        "a replayed invite must be refused, even from a co-located identity"
+    );
+
+    // Denied: a third identity of this node sees neither the connection
+    // nor what the two published.
+    assert!(
+        rt.connections().list(outsider).await?.is_empty(),
+        "a co-located identity must not list a connection it is not party to"
+    );
+    let unknown = rt
+        .data()
+        .read(outsider, work, &path)
+        .await
+        .expect_err("a co-located identity must not reach an issuer it holds nothing of");
+    assert!(
+        unknown.downcast_ref::<UnknownIssuer>().is_some(),
+        "the refusal did not read as an unknown issuer: {unknown:#}"
+    );
+
+    rt.shutdown().await?;
+    Ok(())
+}
+
+/// A stop that begins while two identities of one node are mid-dialogue
+/// waits for the serving half, and its commit outlives the stop: the
+/// inviter lists the connection once the runtime is back on its directory.
+/// The pause parks the serving half after it read the request and before
+/// it takes the state lock, the point a stop could otherwise overtake it;
+/// the hold sits well inside the shutdown budget.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_waits_for_the_serving_half_of_a_co_located_dialogue() -> Result<()> {
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let rt = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let work = rt.identity().create().await?;
+    let leisure = rt.identity().create().await?;
+    let invite = rt.connections().invite(work, None).await?;
+    let pause = rt.pause_next_pairing_serve().await;
+    let establishing = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.connections().establish(leisure, invite).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !shutting_down.is_finished(),
+        "the stop must wait for the co-located serving half in flight"
+    );
+    pause.release();
+    tokio::time::timeout(TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    // The scanning half meets a stopping node: its outcome is not what this
+    // scenario is about.
+    let _scanned = establishing.await?;
+    drop(rt);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert_eq!(
+        restarted.connections().list(work).await?,
+        vec![leisure],
+        "the serving half's commit did not survive the stop"
+    );
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+/// The same stop on a dialogue from another node: the inviter's serving
+/// half finishes under the stop, and the inviter lists the connection once
+/// it is back on its directory. Paused and held as the co-located case is.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_waits_for_the_serving_half_of_a_dialogue_from_another_node() -> Result<()> {
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let inviter = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let scanner = Arc::new(memory_runtime().await?);
+    let x = inviter.identity().create().await?;
+    let p = scanner.identity().create().await?;
+    let invite = inviter.connections().invite(x, None).await?;
+    let pause = inviter.pause_next_pairing_serve().await;
+    let establishing = {
+        let scanner = Arc::clone(&scanner);
+        tokio::spawn(async move { scanner.connections().establish(p, invite).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let inviter = Arc::clone(&inviter);
+        tokio::spawn(async move { inviter.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !shutting_down.is_finished(),
+        "the stop must wait for the serving half in flight"
+    );
+    pause.release();
+    tokio::time::timeout(TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    let _scanned = tokio::time::timeout(TIMEOUT, establishing).await;
+    drop(inviter);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert_eq!(
+        restarted.connections().list(x).await?,
+        vec![p],
+        "the serving half's commit did not survive the stop"
+    );
+    restarted.shutdown().await?;
+    scanner.shutdown().await?;
+    Ok(())
+}
+
+/// Two identities of one node that establish a connection read each
+/// other's published devices from the first sessions of the stores the
+/// establishment imported, well inside one reconcile interval. They share
+/// no gossip, so the interval is set far past the budget and nothing but
+/// those first sessions can bring the records in time. Ten pairs, because
+/// which side arms first is the scheduler's choice, and a first session
+/// lost to the side that armed first shows only in some of the orders.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_co_located_establishment_reads_the_counterpartys_devices_at_once() -> Result<()> {
+    const INTERVAL: Duration = Duration::from_secs(120);
+    const BUDGET: Duration = Duration::from_secs(10);
+    const PAIRS: usize = 10;
+
+    let rt = Runtime::spawn(SpawnOptions {
+        reconcile_interval: INTERVAL,
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let device = rt.node_id();
+    for _ in 0..PAIRS {
+        let alice = rt.identity().create().await?;
+        let bob = rt.identity().create().await?;
+        let invite = rt.connections().invite(alice, None).await?;
+        rt.connections().establish(bob, invite).await?;
+
+        let deadline = std::time::Instant::now() + BUDGET;
+        for (identity, peer) in [(bob, alice), (alice, bob)] {
+            while !rt
+                .connections()
+                .published_devices_of(identity, peer)
+                .await?
+                .contains(&device)
+            {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "{identity} never read {peer}'s devices before the next reconcile pass"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    rt.shutdown().await?;
     Ok(())
 }

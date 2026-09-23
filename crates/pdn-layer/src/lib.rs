@@ -69,7 +69,9 @@ pub enum AccessMode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Capability {
-    pub holders: Vec<PdnId>,
+    /// Whom the capability is granted to. Not the party that ends up
+    /// holding a ticket for it: a ticket travels, the audience does not.
+    pub audience: Vec<PdnId>,
     pub access: AccessMode,
     /// Wall-clock expiry, unix ms. `None` = no explicit expiry
     pub expires_at: Option<u64>,

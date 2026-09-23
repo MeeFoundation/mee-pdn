@@ -1,7 +1,7 @@
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol, ALPN as BLOBS_ALPN};
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
-use pdn_store::{protocol::Docs, ALPN as DOCS_ALPN};
+use pdn_store::{filter::serve_whole, protocol::Docs, Identity, ALPN as DOCS_ALPN};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,8 +15,9 @@ async fn main() -> anyhow::Result<()> {
     // build the gossip protocol
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
-    // build the docs protocol
-    let docs = Docs::memory()
+    // build the docs protocol: the identity every replica here is held for,
+    // and what judges its sessions — `serve_whole` judging nothing
+    let docs = Docs::memory(Identity::from_bytes([0u8; 32]), serve_whole())
         .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
         .await?;
 

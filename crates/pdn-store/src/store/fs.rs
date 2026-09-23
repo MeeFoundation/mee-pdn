@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     iter::{Chain, Flatten},
     num::NonZeroU64,
     ops::Bound,
@@ -57,6 +57,13 @@ pub struct Store {
     transaction: CurrentTransaction,
     open_replicas: HashSet<NamespaceId>,
     pubkeys: MemPublicKeyStore,
+    /// How many times each namespace was written, counted where the write
+    /// is applied. A caller comparing two replicas of one namespace asks
+    /// this rather than a digest of their contents: it is the one value
+    /// that moves on every mutation and on nothing else. In memory, so a
+    /// restart resets it to zero and whoever compares treats the first
+    /// look after a start as a change.
+    writes: HashMap<NamespaceId, u64>,
     #[cfg(test)]
     commits: usize,
 }
@@ -91,8 +98,8 @@ enum CurrentTransaction {
 }
 
 #[cfg(feature = "fs-store")]
-fn open_database(path: &std::path::Path) -> Result<Database> {
-    match Database::create(path) {
+fn open_database(path: &std::path::Path, cache_bytes: usize) -> Result<Database> {
+    match Database::builder().set_cache_size(cache_bytes).create(path) {
         Ok(db) => Ok(db),
         Err(redb::DatabaseError::UpgradeRequired(v)) => Err(anyhow!(
             "Opening the database failed: Upgrading from redb {v} no longer supported. Use an older redb version first."
@@ -125,10 +132,15 @@ impl Store {
     /// Create or open a store from a `path` to a database file.
     ///
     /// The file will be created if it does not exist, otherwise it will be opened.
+    ///
+    /// `cache_bytes` caps the resident pages this store holds; it does not
+    /// reserve them. The bound cannot be changed on an open store, so a
+    /// consumer that divides one budget among several stores cuts the
+    /// share before opening any of them.
     #[cfg(feature = "fs-store")]
-    pub fn persistent(path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub fn persistent(path: impl AsRef<std::path::Path>, cache_bytes: usize) -> Result<Self> {
         let path = path.as_ref();
-        let db = open_database(path)?;
+        let db = open_database(path, cache_bytes)?;
         match Self::new_impl(db) {
             Ok(store) => Ok(store),
             Err(err) if is_redb_v2_tuple_mismatch(&err) => {
@@ -136,7 +148,7 @@ impl Store {
                 {
                     info!("redb 2.x tuple format detected, running migration");
                     migrate_redb_v2_tuples::run(path)?;
-                    Self::new_impl(open_database(path)?)
+                    Self::new_impl(open_database(path, cache_bytes)?)
                 }
                 #[cfg(not(feature = "redb-v2-migration"))]
                 {
@@ -164,6 +176,7 @@ impl Store {
             transaction: Default::default(),
             open_replicas: Default::default(),
             pubkeys: Default::default(),
+            writes: Default::default(),
             #[cfg(test)]
             commits: 0,
         })
@@ -465,6 +478,21 @@ impl Store {
             };
             Ok(outcome)
         })
+    }
+
+    /// Count one write of `namespace`. Called where the write is applied,
+    /// so nothing — a subscription, a channel, a healthy actor — stands
+    /// between a mutation and the count of it.
+    pub(crate) fn wrote(&mut self, namespace: NamespaceId) {
+        *self.writes.entry(namespace).or_default() += 1;
+    }
+
+    /// How many writes this replica has taken since the store opened. Two
+    /// replicas of one namespace are told apart by comparing each against
+    /// its own earlier reading, never against the other's: the number
+    /// counts writes, not entries.
+    pub fn writes_of(&self, namespace: NamespaceId) -> u64 {
+        self.writes.get(&namespace).copied().unwrap_or_default()
     }
 
     /// Remove a replica.
@@ -878,6 +906,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     fn entry_put(&mut self, e: SignedEntry) -> Result<()> {
         let id = e.id();
+        self.store.wrote(id.namespace());
         self.store.as_mut().modify(|tables| {
             // insert into record table
             let key = (
@@ -903,10 +932,22 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             );
             tables.records_by_key.insert(key, ())?;
 
-            // insert into latest table
+            // The latest table keeps the author's greatest timestamp, not
+            // the one written last: entries arrive out of order — a
+            // reconciliation catching up on an older one is the ordinary
+            // case — and a value that moved backwards would make this
+            // replica report less than it holds, so a peer comparing
+            // against it would stop offering what it has.
             let key = (&e.id().namespace().to_bytes(), &e.id().author().to_bytes());
-            let value = (e.timestamp(), e.id().key());
-            tables.latest_per_author.insert(key, value)?;
+            let latest = tables
+                .latest_per_author
+                .get(key)?
+                .map(|value| value.value().0)
+                .unwrap_or_default();
+            if e.timestamp() >= latest {
+                let value = (e.timestamp(), e.id().key());
+                tables.latest_per_author.insert(key, value)?;
+            }
             Ok(())
         })
     }
@@ -956,6 +997,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     #[cfg(test)]
     fn entry_remove(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
+        self.store.wrote(id.namespace());
         self.store.as_mut().modify(|tables| {
             let entry = {
                 let (namespace, author, key) = id.as_byte_tuple();
@@ -1002,6 +1044,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     ) -> Result<usize> {
         self.ensure_own_namespace(id)?;
         let bounds = RecordsBounds::author_prefix(self.namespace, id.author(), id.key_bytes());
+        self.store.wrote(self.namespace);
         self.store.as_mut().modify(|tables| {
             let cb = |_k: RecordsId, v: RecordsValue| {
                 let (timestamp, _namespace_sig, _author_sig, len, hash) = v;
@@ -1152,10 +1195,13 @@ mod tests {
     use super::*;
     use crate::ranger::Store as _;
 
+    /// A cache big enough that nothing in a scenario evicts.
+    const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
     #[tokio::test]
     async fn test_ranges() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let mut store = Store::persistent(dbfile.path())?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
         let author = store.new_author(&mut rand::rng())?;
         let namespace = NamespaceSecret::new(&mut rand::rng());
@@ -1179,10 +1225,46 @@ mod tests {
         Ok(())
     }
 
+    /// A persistent store's cache holds to the bound it was opened with: a
+    /// working set many times the bound evicts, and what stays resident fits
+    /// it. Were the bound lost on the way to the database, the store would
+    /// open at redb's own default, which nothing here comes near.
+    #[tokio::test]
+    async fn a_persistent_store_opens_its_cache_at_the_bound_it_is_given() -> Result<()> {
+        const BOUND: usize = 256 * 1024;
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path(), BOUND)?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        {
+            let mut replica = store.new_replica(namespace.clone())?;
+            for i in 0..8_000u32 {
+                replica
+                    .hash_and_insert(format!("key/{i}"), &author, i.to_be_bytes())
+                    .await?;
+            }
+        }
+        store.flush()?;
+        let read = store.get_many(namespace.id(), Query::all())?.count();
+        assert_eq!(read, 8_000);
+
+        let stats = store.db.cache_stats();
+        assert!(
+            stats.evictions() > 0,
+            "a working set past the bound evicted nothing: the bound did not reach the database"
+        );
+        assert!(
+            stats.used_bytes() <= BOUND,
+            "the cache holds {} bytes past its bound of {BOUND}",
+            stats.used_bytes()
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_basics() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let mut store = Store::persistent(dbfile.path())?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
         let authors: Vec<_> = store.list_authors()?.collect::<Result<_>>()?;
         assert!(authors.is_empty());
@@ -1279,7 +1361,7 @@ mod tests {
 
         // create a store and add some data
         let expected = {
-            let mut store = Store::persistent(dbfile.path())?;
+            let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
             let author1 = store.new_author(&mut rand::rng())?;
             let author2 = store.new_author(&mut rand::rng())?;
             let mut replica = store.new_replica(namespace.clone())?;
@@ -1306,7 +1388,7 @@ mod tests {
         })?;
 
         // open the copied db file, which will run the migration.
-        let mut store = Store::persistent(dbfile_before_migration.path())?;
+        let mut store = Store::persistent(dbfile_before_migration.path(), TEST_CACHE_BYTES)?;
         let actual = store
             .get_latest_for_each_author(namespace.id())?
             .collect::<Result<Vec<_>>>()?;
@@ -1321,7 +1403,7 @@ mod tests {
         use redb::ReadableTableMetadata;
         let dbfile = tempfile::NamedTempFile::new()?;
 
-        let mut store = Store::persistent(dbfile.path())?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
         // check that the new table is there, even if empty
         {
@@ -1376,7 +1458,7 @@ mod tests {
             );
         }
 
-        let store = Store::persistent(&path)?;
+        let store = Store::persistent(&path, TEST_CACHE_BYTES)?;
         drop(store);
 
         let backup: std::path::PathBuf = {
@@ -1421,7 +1503,7 @@ mod tests {
     fn test_no_migration_on_fresh_store() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let path = dbfile.path().to_path_buf();
-        let store = Store::persistent(&path)?;
+        let store = Store::persistent(&path, TEST_CACHE_BYTES)?;
         drop(store);
 
         let backup: std::path::PathBuf = {
@@ -1435,7 +1517,7 @@ mod tests {
             backup.display()
         );
 
-        let _store = Store::persistent(&path)?;
+        let _store = Store::persistent(&path, TEST_CACHE_BYTES)?;
         assert!(!backup.exists());
         Ok(())
     }

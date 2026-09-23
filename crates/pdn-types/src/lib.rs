@@ -60,10 +60,12 @@ macro_rules! define_byte_id {
         $vis:vis struct $Name:ident;
     ) => {
         $(#[$meta])*
-        // Deliberately no `Ord`: byte order of an opaque identifier carries
-        // no domain meaning, and a derive here is semver surface on every
-        // platform primitive. `Hash` covers set membership.
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        // `Ord` is byte order and nothing else: it ranks no identity above
+        // another, and no rule may be written in terms of it. It exists so
+        // these ids key ordered collections and settle ties — which of two
+        // sides a memo is written from, which of two dials survives — where
+        // the choice must only be the same on both sides and at both ends.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         $vis struct $Name([u8; 32]);
 
         impl $Name {

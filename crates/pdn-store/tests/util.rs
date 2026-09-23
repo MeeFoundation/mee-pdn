@@ -14,7 +14,22 @@ use iroh::{
 use iroh_blobs::store::GcConfig;
 use iroh_gossip::net::Gossip;
 use n0_error::Result;
-use pdn_store::{engine::ProtectCallbackHandler, protocol::Docs};
+use pdn_store::{
+    engine::ProtectCallbackHandler, filter::serve_whole, protocol::Docs, Contact, Identity,
+};
+
+/// One identity per node: these suites reconcile between two bare nodes.
+pub const TEST_HOLDER: Identity = Identity::from_bytes([0u8; 32]);
+/// A cache big enough that nothing in a scenario evicts.
+pub const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The addresses paired with the one identity these suites run under.
+pub fn contacts(addrs: impl IntoIterator<Item = iroh::EndpointAddr>) -> Vec<Contact> {
+    addrs
+        .into_iter()
+        .map(|addr| Contact::new(addr, TEST_HOLDER))
+        .collect()
+}
 
 pub async fn empty_endpoint() -> Result<Endpoint, BindError> {
     Endpoint::bind(presets::Minimal).await
@@ -92,10 +107,18 @@ impl Builder {
     ) -> anyhow::Result<Node> {
         let mut router = iroh::protocol::Router::builder(self.endpoint.clone());
         let gossip = Gossip::builder().spawn(self.endpoint.clone());
+        // These suites reconcile between two bare nodes: one identity each,
+        // and a provider that judges nothing — what a consumer states when
+        // its scenario is the codec rather than the access model.
         let mut docs_builder = match self.storage {
-            Storage::Memory => Docs::memory(),
+            Storage::Memory => Docs::memory(TEST_HOLDER, serve_whole()),
             #[cfg(feature = "fs-store")]
-            Storage::Persistent(ref path) => Docs::persistent(path.to_path_buf()),
+            Storage::Persistent(ref path) => Docs::persistent(
+                path.to_path_buf(),
+                TEST_CACHE_BYTES,
+                TEST_HOLDER,
+                serve_whole(),
+            ),
         };
         if let Some(protect_cb) = protect_cb {
             docs_builder = docs_builder.protect_handler(protect_cb);

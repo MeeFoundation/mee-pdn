@@ -1,8 +1,11 @@
 #![allow(missing_docs)]
 
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{Context, Result};
@@ -28,11 +31,49 @@ use crate::{
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
-        connect_and_sync, handle_connection, AbortReason, AcceptError, AcceptOutcome, ConnectError,
-        SyncFinished,
+        connect_and_sync, handle_in_process_session, handle_session, AbortReason, AcceptError,
+        AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
     },
-    AuthorHeads, ContentStatus, NamespaceId, SignedEntry,
+    AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
 };
+
+/// The stream halves an in-process session runs over: a pipe, since iroh
+/// refuses a connection to this endpoint's own id.
+pub type InProcessRecv = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+/// The writing half of an in-process session's pipe.
+pub type InProcessSend = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+/// Bytes an in-process pipe buffers before the writer waits. One sync
+/// message is delivered whole, so the buffer only decides how far ahead
+/// the sender runs.
+pub(super) const IN_PROCESS_PIPE_BYTES: usize = 64 * 1024;
+
+/// Read the first message of an in-process session; the caller resolved
+/// the engine already, so nothing dispatches on it.
+pub(super) async fn read_in_process_opening(
+    send: InProcessSend,
+    recv: InProcessRecv,
+    peer: PublicKey,
+) -> Result<SessionOpening<InProcessRecv, InProcessSend>, AcceptError> {
+    // Bounded like the first message of an accepted connection: the dialing
+    // half is a task of this process, and a task that never writes would
+    // otherwise hold this one for good.
+    n0_future::time::timeout(
+        crate::net::SYNC_SESSION_TIMEOUT,
+        SessionOpening::read(send, recv, peer),
+    )
+    .await
+    .map_err(|_elapsed| {
+        AcceptError::sync(
+            peer,
+            None,
+            anyhow::anyhow!(
+                "no in-process init message within {:?}",
+                crate::net::SYNC_SESSION_TIMEOUT
+            ),
+        )
+    })?
+}
 
 /// An iroh-docs operation
 ///
@@ -60,7 +101,8 @@ pub struct SyncReport {
 pub enum ToLiveActor {
     StartSync {
         namespace: NamespaceId,
-        peers: Vec<EndpointAddr>,
+        peers: Vec<Contact>,
+        default_identity: Identity,
         /// Whether to join the replica's gossip swarm. Scoped access syncs
         /// without ever joining the swarm.
         join_gossip: bool,
@@ -88,12 +130,33 @@ pub enum ToLiveActor {
         #[debug("oneshot::Sender")]
         reply: sync::oneshot::Sender<Result<()>>,
     },
-    HandleConnection {
+    /// A session dispatched here by the identity its first message named.
+    HandleSession {
         conn: iroh::endpoint::Connection,
+        #[debug("SessionOpening")]
+        opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    },
+    /// The serving half of a session between two identities of this node.
+    AcceptInProcess {
+        #[debug("SessionOpening")]
+        opening: SessionOpening<InProcessRecv, InProcessSend>,
+    },
+    /// The dialing half of the same session.
+    SyncInProcess {
+        namespace: NamespaceId,
+        callee: Identity,
+        peer: PublicKey,
+        #[debug("pipe")]
+        send: InProcessSend,
+        #[debug("pipe")]
+        recv: InProcessRecv,
     },
     AcceptSyncRequest {
         namespace: NamespaceId,
         peer: PublicKey,
+        /// The identity the caller acts for: two identities of one node are
+        /// two callers at one node id (ADR-0013).
+        caller: Identity,
         #[debug("oneshot::Sender")]
         reply: sync::oneshot::Sender<AcceptOutcome>,
     },
@@ -141,14 +204,70 @@ pub enum Event {
     PendingContentReady,
 }
 
+/// The identity is the callee the dial addressed: a node of two identities
+/// is two counterparts at one node id (ADR-0013).
 type SyncConnectRes = (
     NamespaceId,
     PublicKey,
+    Identity,
     SyncReason,
     Result<SyncFinished, ConnectError>,
 );
-type SyncAcceptRes = Result<SyncFinished, AcceptError>;
+/// The namespace and peer the session was opened on, then the identity it
+/// named as its caller: the pair is reported even when the exchange fails,
+/// because the identity it put in `peer_identities` is released by it.
+type SyncAcceptRes = (
+    NamespaceId,
+    PublicKey,
+    Identity,
+    Result<SyncFinished, AcceptError>,
+);
 type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
+
+/// The identities one peer of one replica is dialed as. Two sources, held
+/// apart because they are trusted and live differently: a contact is the
+/// consumer's own statement and stays, while a session's first message is
+/// the caller's word and stays only as long as that admitted session —
+/// otherwise any reachable peer could name identities until the map exhausts
+/// memory.
+#[derive(Default, Debug)]
+struct PeerIdentities {
+    stated: BTreeSet<Identity>,
+    /// Counted, because two sessions of one identity can run at once.
+    /// Taken when the access provider admits the session, given back when
+    /// it ends, so a refused caller leaves nothing.
+    in_session: BTreeMap<Identity, usize>,
+}
+
+impl PeerIdentities {
+    fn all(&self) -> impl Iterator<Item = Identity> + '_ {
+        self.stated
+            .iter()
+            .chain(self.in_session.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.stated.is_empty() && self.in_session.is_empty()
+    }
+
+    fn enter(&mut self, identity: Identity) {
+        *self.in_session.entry(identity).or_default() += 1;
+    }
+
+    fn leave(&mut self, identity: Identity) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) =
+            self.in_session.entry(identity)
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
 
 // Currently peers might double-sync in both directions.
 pub struct LiveActor {
@@ -195,8 +314,26 @@ pub struct LiveActor {
     state: NamespaceStates,
     /// The embedder's per-session access provider: consulted on both
     /// session roles — accept and dial — to decide what a peer may see of
-    /// a namespace. `None` keeps every session full (vanilla).
-    session_access: Option<crate::filter::SessionAccessProvider>,
+    /// a namespace.
+    session_access: crate::filter::SessionAccessProvider,
+    /// The identity every replica of this engine is held for, and the one
+    /// its dials act as.
+    identity: Identity,
+    /// Which identities a peer is dialed as, per replica. One node id hosts
+    /// several (ADR-0013), so the value is a set: a single slot would let
+    /// each of them displace the others and leave all but the last
+    /// undialed.
+    peer_identities: HashMap<(NamespaceId, PublicKey), PeerIdentities>,
+    /// Whom a peer of a replica is dialed as when nothing named one — the
+    /// consumer's statement, since only it knows whose replica this is.
+    default_identities: HashMap<NamespaceId, Identity>,
+    /// In-process sessions opened, so a pass over a quiet pair can be
+    /// shown to open none.
+    in_process_sessions: Arc<AtomicU64>,
+    /// Where a local write and a contact naming this node are handed to
+    /// the node, which alone knows its other identities; `None` hands them
+    /// to nobody.
+    co_located: Option<crate::engine::CoLocatedRequests>,
     metrics: Arc<Metrics>,
 }
 impl LiveActor {
@@ -210,7 +347,10 @@ impl LiveActor {
         downloader: Downloader,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
-        session_access: Option<crate::filter::SessionAccessProvider>,
+        session_access: crate::filter::SessionAccessProvider,
+        identity: Identity,
+        in_process_sessions: Arc<AtomicU64>,
+        co_located: Option<crate::engine::CoLocatedRequests>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
@@ -238,8 +378,21 @@ impl LiveActor {
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
             session_access,
+            identity,
+            peer_identities: Default::default(),
+            default_identities: Default::default(),
+            in_process_sessions,
+            co_located,
             metrics,
         })
+    }
+
+    /// Best effort: the node's periodic pass over its co-located pairs
+    /// reconciles whatever a request lost to a full channel would have.
+    fn ask_co_located(&self, request: crate::engine::CoLocatedRequest) {
+        if let Some(requests) = &self.co_located {
+            let _ = requests.try_send(request);
+        }
     }
 
     /// Run the actor loop.
@@ -290,15 +443,16 @@ impl LiveActor {
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
                     self.metrics.doc_live_tick_running_sync_connect.inc();
-                    let (namespace, peer, reason, res) = res.context("running_sync_connect closed")?;
-                    self.on_sync_via_connect_finished(namespace, peer, reason, res).await;
+                    let (namespace, peer, callee, reason, res) = res.context("running_sync_connect closed")?;
+                    self.on_sync_via_connect_finished(namespace, peer, callee, reason, res).await;
 
                 }
                 Some(res) = self.running_sync_accept.join_next(), if !self.running_sync_accept.is_empty() => {
                     trace!(?i, "tick: running_sync_accept");
                     self.metrics.doc_live_tick_running_sync_accept.inc();
-                    let res = res.context("running_sync_accept closed")?;
-                    self.on_sync_via_accept_finished(res).await;
+                    let (namespace, peer, caller, res) = res.context("running_sync_accept closed")?;
+                    self.release_peer_identity(namespace, peer, caller);
+                    self.on_sync_via_accept_finished(caller, res).await;
                 }
                 Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
                     trace!(?i, "tick: pending_downloads");
@@ -339,10 +493,13 @@ impl LiveActor {
             ToLiveActor::StartSync {
                 namespace,
                 peers,
+                default_identity,
                 join_gossip,
                 reply,
             } => {
-                let res = self.start_sync(namespace, peers, join_gossip).await;
+                let res = self
+                    .start_sync(namespace, peers, default_identity, join_gossip)
+                    .await;
                 reply.send(res).ok();
             }
             ToLiveActor::Leave {
@@ -365,15 +522,34 @@ impl LiveActor {
                 self.subscribers.subscribe(namespace, sender);
                 reply.send(Ok(())).ok();
             }
-            ToLiveActor::HandleConnection { conn } => {
-                self.handle_connection(conn).await;
+            ToLiveActor::HandleSession { conn, opening } => {
+                self.handle_session(conn, opening).await;
+            }
+            ToLiveActor::AcceptInProcess { opening } => {
+                self.accept_in_process(opening);
+            }
+            ToLiveActor::SyncInProcess {
+                namespace,
+                callee,
+                peer,
+                send,
+                recv,
+            } => {
+                self.sync_in_process(namespace, callee, peer, send, recv);
             }
             ToLiveActor::AcceptSyncRequest {
                 namespace,
                 peer,
+                caller,
                 reply,
             } => {
-                let outcome = self.accept_sync_request(namespace, peer);
+                // Reaching here means the access provider admitted the
+                // caller, so this is where its identity is learned.
+                self.peer_identities
+                    .entry((namespace, peer))
+                    .or_default()
+                    .enter(caller);
+                let outcome = self.accept_sync_request(namespace, peer, caller);
                 reply.send(outcome).ok();
             }
             ToLiveActor::NeighborContentReady {
@@ -387,51 +563,175 @@ impl LiveActor {
         Ok(true)
     }
 
-    #[instrument("connect", skip_all, fields(peer = %peer.fmt_short(), namespace = %namespace.fmt_short()))]
+    /// Which identity `peer` is dialed as for `namespace`: what a contact
+    /// or a past session named, else the consumer's default for the
+    /// replica, else this engine's own identity — what a sibling device of
+    /// the same identity is.
+    /// Give back the identity a finished session named, and drop the pair
+    /// once nothing names it: a session that was refused leaves no trace,
+    /// and one that ran leaves none either.
+    fn release_peer_identity(&mut self, namespace: NamespaceId, peer: PublicKey, caller: Identity) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.peer_identities.entry((namespace, peer))
+        {
+            entry.get_mut().leave(caller);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+    }
+
+    /// Every identity this peer is dialed as for `namespace`: what contacts
+    /// and running sessions named, else the consumer's default for the
+    /// replica, else this engine's own identity — what a sibling device of
+    /// the same identity is.
+    fn identities_of_peer(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Identity> {
+        let learned: Vec<Identity> = self
+            .peer_identities
+            .get(&(namespace, peer))
+            .map(|identities| identities.all().collect())
+            .unwrap_or_default();
+        if !learned.is_empty() {
+            return learned;
+        }
+        match self.default_identities.get(&namespace) {
+            Some(default) => vec![*default],
+            None => vec![self.identity],
+        }
+    }
+
+    /// One dial per identity the peer is known as: co-located identities of one
+    /// node id each get their own exchange, since one session addresses one.
     fn sync_with_peer(&mut self, namespace: NamespaceId, peer: PublicKey, reason: SyncReason) {
-        if !self.state.start_connect(&namespace, peer, reason) {
+        for callee in self.identities_of_peer(namespace, peer) {
+            self.sync_with_identity(namespace, peer, callee, reason);
+        }
+    }
+
+    #[instrument("connect", skip_all, fields(peer = %peer.fmt_short(), namespace = %namespace.fmt_short()))]
+    fn sync_with_identity(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        callee: Identity,
+        reason: SyncReason,
+    ) {
+        // iroh refuses a connection to this endpoint's own id before it
+        // looks at an address, so a contact that names this node — from a
+        // ticket, a device record, a contact list — reaches its identity
+        // inside the process or not at all.
+        if peer == self.endpoint.id() {
+            self.ask_co_located(crate::engine::CoLocatedRequest::Dial {
+                namespace,
+                caller: self.identity,
+                callee,
+            });
+            return;
+        }
+        if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
         }
         let endpoint = self.endpoint.clone();
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
+        let caller = self.identity;
         let fut = async move {
             // The dialing side serves entries too (reconciliation is
             // bidirectional), so the embedder's access provider gates this
             // role exactly like the accept role.
-            let access = match &session_access {
-                None => crate::filter::SessionAccess::Full,
-                Some(provider) => provider(namespace, peer, crate::filter::SessionRole::Dial).await,
-            };
+            // The addressed identity first, the acting one second, as on
+            // the accept path: dialing, the party across the session is
+            // the callee.
+            let access = session_access(
+                namespace,
+                callee,
+                caller,
+                peer,
+                crate::filter::SessionRole::Dial,
+            )
+            .await;
             let res = match access {
                 crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
                     "session denied by the local access provider"
                 ))),
-                crate::filter::SessionAccess::Full => {
+                crate::filter::SessionAccess::Allow { egress, ingest } => {
                     connect_and_sync(
                         &endpoint,
                         &sync,
                         namespace,
+                        callee,
+                        caller,
                         EndpointAddr::new(peer),
                         Some(&metrics),
-                        None,
-                    )
-                    .await
-                }
-                crate::filter::SessionAccess::Filtered(filter) => {
-                    connect_and_sync(
-                        &endpoint,
-                        &sync,
-                        namespace,
-                        EndpointAddr::new(peer),
-                        Some(&metrics),
-                        Some(filter),
+                        egress,
+                        ingest,
                     )
                     .await
                 }
             };
-            (namespace, peer, reason, res)
+            (namespace, peer, callee, reason, res)
+        }
+        .instrument(Span::current());
+        self.running_sync_connect.spawn(fut);
+    }
+
+    /// The dialing half of a session between two identities of this node.
+    /// The pipe replaces the transport and nothing else: the same codec,
+    /// the same session setup, the same access provider call.
+    fn sync_in_process(
+        &mut self,
+        namespace: NamespaceId,
+        callee: Identity,
+        peer: PublicKey,
+        mut send: InProcessSend,
+        mut recv: InProcessRecv,
+    ) {
+        // Announced, not a direct join: a write that finds the pair busy is
+        // queued and replayed, or a batch of writes would deliver only the
+        // one that happened to arrive between two sessions.
+        let reason = SyncReason::Announced;
+        if !self.state.start_connect(&namespace, peer, callee, reason) {
+            return;
+        }
+        let sync = self.sync.clone();
+        let metrics = self.metrics.clone();
+        let session_access = self.session_access.clone();
+        let caller = self.identity;
+        self.in_process_sessions.fetch_add(1, Ordering::Relaxed);
+        let fut = async move {
+            // The addressed identity first, the acting one second, as on
+            // the accept path: dialing, the party across the session is
+            // the callee.
+            let access = session_access(
+                namespace,
+                callee,
+                caller,
+                peer,
+                crate::filter::SessionRole::Dial,
+            )
+            .await;
+            let res = match access {
+                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
+                    "session denied by the local access provider"
+                ))),
+                crate::filter::SessionAccess::Allow { egress, ingest } => {
+                    crate::net::sync_in_process(
+                        &sync,
+                        namespace,
+                        callee,
+                        caller,
+                        peer,
+                        &mut send,
+                        &mut recv,
+                        Some(&metrics),
+                        egress,
+                        ingest,
+                    )
+                    .await
+                }
+            };
+            (namespace, peer, callee, reason, res)
         }
         .instrument(Span::current());
         self.running_sync_connect.spawn(fut);
@@ -455,9 +755,15 @@ impl LiveActor {
     async fn start_sync(
         &mut self,
         namespace: NamespaceId,
-        mut peers: Vec<EndpointAddr>,
+        peers: Vec<Contact>,
+        default_identity: Identity,
         join_gossip: bool,
     ) -> Result<()> {
+        // A peer the engine recorded carries a node id and nothing else,
+        // so the consumer states whom a peer of this replica is dialed as
+        // when neither a contact nor a past session named one.
+        self.default_identities.insert(namespace, default_identity);
+        let mut recorded: Vec<PublicKey> = Vec::new();
         debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
         // update state to allow sync
         if !self.state.is_syncing(&namespace) {
@@ -473,25 +779,29 @@ impl LiveActor {
                 // no peers for this document
             }
             Ok(Some(known_useful_peers)) => {
-                let as_node_addr = known_useful_peers.into_iter().filter_map(|peer_id_bytes| {
+                // A peer the engine recorded carries a node id and no
+                // identity, so it is dialed as whatever this replica already
+                // learned for it — never recorded as a identity of its own,
+                // or a guess would stick and outlive what a contact says.
+                recorded.extend(known_useful_peers.into_iter().filter_map(|peer_id_bytes| {
                     // peers are stored as bytes, don't fail the operation if they can't be
                     // decoded: simply ignore the peer
                     match PublicKey::from_bytes(&peer_id_bytes) {
-                        Ok(public_key) => Some(EndpointAddr::new(public_key)),
+                        Ok(public_key) => Some(public_key),
                         Err(_signing_error) => {
                             warn!("potential db corruption: peers per doc can't be decoded");
                             None
                         }
                     }
-                });
-                peers.extend(as_node_addr);
+                }));
             }
             Err(e) => {
                 // try to continue if peers per doc can't be read since they are not vital for sync
                 warn!(%e, "db error reading peers per document")
             }
         }
-        self.join_peers(namespace, peers, join_gossip).await?;
+        self.join_peers(namespace, peers, recorded, join_gossip)
+            .await?;
         Ok(())
     }
 
@@ -502,6 +812,8 @@ impl LiveActor {
     ) -> anyhow::Result<()> {
         // self.subscribers.remove(&namespace);
         if self.state.remove(&namespace) {
+            self.peer_identities
+                .retain(|(tracked, _peer), _identities| *tracked != namespace);
             self.sync.set_sync(namespace, false).await?;
             self.sync
                 .unsubscribe(namespace, self.replica_events_tx.clone())
@@ -533,20 +845,33 @@ impl LiveActor {
     async fn join_peers(
         &mut self,
         namespace: NamespaceId,
-        peers: Vec<EndpointAddr>,
+        peers: Vec<Contact>,
+        recorded: Vec<PublicKey>,
         join_gossip: bool,
     ) -> Result<()> {
         let mut peer_ids = Vec::new();
 
         // add addresses of peers to our endpoint address book
-        for peer in peers.into_iter() {
-            let peer_id = peer.id;
+        for Contact { addr, identity } in peers.into_iter() {
+            let peer_id = addr.id;
+            // The contact names the identity it is dialed as, so a later
+            // dial reaches the same one however it was triggered.
+            self.peer_identities
+                .entry((namespace, peer_id))
+                .or_default()
+                .stated
+                .insert(identity);
             // adding a node address without any addressing info fails with an error,
             // but we still want to include those peers because endpoint address lookup might find addresses for them
-            if !peer.is_empty() {
-                self.memory_lookup.add_endpoint_info(peer);
+            if !addr.is_empty() {
+                self.memory_lookup.add_endpoint_info(addr);
             }
             peer_ids.push(peer_id);
+        }
+        for peer_id in recorded {
+            if !peer_ids.contains(&peer_id) {
+                peer_ids.push(peer_id);
+            }
         }
 
         // tell gossip to join — unless this is scoped access, which stays
@@ -570,6 +895,7 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
+        callee: Identity,
         reason: SyncReason,
         result: Result<SyncFinished, ConnectError>,
     ) {
@@ -580,12 +906,13 @@ impl LiveActor {
                 // running. Nothing else will finish the dial recorded in our state, so clear
                 // it — otherwise this (namespace, peer) pair stays `Running` forever and every
                 // later sync trigger for it is silently dropped.
-                self.state.abort_connect(&namespace, peer, reason);
+                self.state.abort_connect(&namespace, peer, callee, reason);
             }
             res => {
                 self.on_sync_finished(
                     namespace,
                     peer,
+                    callee,
                     Origin::Connect(reason),
                     res.map_err(Into::into),
                 )
@@ -595,11 +922,21 @@ impl LiveActor {
     }
 
     #[instrument("accept", skip_all, fields(peer = %fmt_accept_peer(&res), namespace = %fmt_accept_namespace(&res)))]
-    async fn on_sync_via_accept_finished(&mut self, res: Result<SyncFinished, AcceptError>) {
+    async fn on_sync_via_accept_finished(
+        &mut self,
+        caller: Identity,
+        res: Result<SyncFinished, AcceptError>,
+    ) {
         match res {
             Ok(state) => {
-                self.on_sync_finished(state.namespace, state.peer, Origin::Accept, Ok(state))
-                    .await
+                self.on_sync_finished(
+                    state.namespace,
+                    state.peer,
+                    caller,
+                    Origin::Accept,
+                    Ok(state),
+                )
+                .await
             }
             Err(AcceptError::Abort { reason, .. }) if reason == AbortReason::AlreadySyncing => {
                 // In case we aborted the sync: do nothing (our outgoing sync is in progress)
@@ -610,6 +947,7 @@ impl LiveActor {
                     self.on_sync_finished(
                         namespace,
                         peer,
+                        caller,
                         Origin::Accept,
                         Err(anyhow::Error::from(err)),
                     )
@@ -625,6 +963,7 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
+        counterpart: Identity,
         origin: Origin,
         result: Result<SyncFinished>,
     ) {
@@ -642,12 +981,20 @@ impl LiveActor {
                 );
 
                 // register the peer as useful for the document
-                if let Err(e) = self
-                    .sync
-                    .register_useful_peer(namespace, *peer.as_bytes())
-                    .await
-                {
-                    debug!(%e, "failed to register peer for document")
+                //
+                // This node's own id is never one: the table names nodes to
+                // dial, and a dial that resolves here is an in-process one,
+                // which the consumer asks for through its own path. Left in,
+                // it would make every later start of this replica dial this
+                // node again, converged or not.
+                if peer != self.endpoint.id() {
+                    if let Err(e) = self
+                        .sync
+                        .register_useful_peer(namespace, *peer.as_bytes())
+                        .await
+                    {
+                        debug!(%e, "failed to register peer for document")
+                    }
                 }
 
                 // Retry content that is still missing for this namespace: the peer we
@@ -706,7 +1053,10 @@ impl LiveActor {
             Err(err) => Err(err.to_string()),
         };
 
-        let Some((started, resync)) = self.state.finish(&namespace, peer, &origin, result) else {
+        let Some((started, resync)) =
+            self.state
+                .finish(&namespace, peer, counterpart, &origin, result)
+        else {
             return;
         };
 
@@ -873,6 +1223,15 @@ impl LiveActor {
                 if self.state.is_syncing(&namespace) {
                     self.broadcast_local_head(namespace, &entry).await;
                 }
+                // A node's own gossip broadcast never reaches its other
+                // subscribers, so a identity co-located with this one is told
+                // here or on the periodic pass (ADR-0013). Content-free like
+                // the broadcast: what the co-located identity obtains comes
+                // through the session its reconcile opens, and its filter.
+                self.ask_co_located(crate::engine::CoLocatedRequest::Announce {
+                    namespace,
+                    writer: self.identity,
+                });
             }
             crate::Event::RemoteInsert {
                 namespace,
@@ -946,62 +1305,109 @@ impl LiveActor {
         }
     }
 
-    #[instrument("accept", skip_all)]
-    pub async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) {
+    /// The accept decision: the engine's own session state first, then the
+    /// consumer's access provider. A denial is indistinguishable from the
+    /// namespace not being hosted.
+    fn accept_callback(
+        &self,
+    ) -> impl Fn(NamespaceId, Identity, Identity, PublicKey) -> n0_future::future::Boxed<AcceptOutcome>
+           + Clone
+           + use<> {
         let to_actor_tx = self.sync_actor_tx.clone();
         let session_access = self.session_access.clone();
-        let accept_request_cb = move |namespace, peer| {
+        move |namespace, identity, caller, peer| {
             let to_actor_tx = to_actor_tx.clone();
             let session_access = session_access.clone();
             async move {
+                // Rights before state: the identity and the namespace are the
+                // caller's own word, and asking the actor first would let a
+                // caller the provider denies leave a slot of its choosing
+                // behind on every attempt.
+                let admitted = session_access(
+                    namespace,
+                    identity,
+                    caller,
+                    peer,
+                    crate::filter::SessionRole::Accept,
+                )
+                .await;
+                let (egress, ingest) = match admitted {
+                    crate::filter::SessionAccess::Allow { egress, ingest } => (egress, ingest),
+                    // The one uniform refusal.
+                    crate::filter::SessionAccess::Deny => {
+                        return AcceptOutcome::Reject(AbortReason::NotFound)
+                    }
+                };
                 let (reply_tx, reply_rx) = oneshot::channel();
                 to_actor_tx
                     .send(ToLiveActor::AcceptSyncRequest {
                         namespace,
                         peer,
+                        caller,
                         reply: reply_tx,
                     })
                     .await
                     .ok();
-                let outcome = match reply_rx.await {
-                    Ok(outcome) => outcome,
+                match reply_rx.await {
+                    Ok(AcceptOutcome::Allow { .. }) => AcceptOutcome::Allow {
+                        filter: egress,
+                        ingest,
+                    },
+                    Ok(reject) => reject,
                     Err(err) => {
                         warn!(
                             "accept request callback failed to retrieve reply from actor: {err:?}"
                         );
                         AcceptOutcome::Reject(AbortReason::InternalServerError)
                     }
-                };
-                // Consult the embedder's access provider only after the
-                // engine's own session state allowed the request; a denial
-                // is indistinguishable from the namespace not being hosted.
-                match (outcome, session_access) {
-                    (AcceptOutcome::Allow { .. }, Some(provider)) => {
-                        match provider(namespace, peer, crate::filter::SessionRole::Accept).await {
-                            crate::filter::SessionAccess::Full => {
-                                AcceptOutcome::Allow { filter: None }
-                            }
-                            crate::filter::SessionAccess::Filtered(filter) => {
-                                AcceptOutcome::Allow {
-                                    filter: Some(filter),
-                                }
-                            }
-                            crate::filter::SessionAccess::Deny => {
-                                AcceptOutcome::Reject(AbortReason::NotFound)
-                            }
-                        }
-                    }
-                    (outcome, _) => outcome,
                 }
             }
             .boxed()
-        };
-        debug!("incoming connection");
+        }
+    }
+
+    /// An engine that is the whole node's docs handler: read the first
+    /// message here, then serve it. A node of several identities dispatches
+    /// before this point ([`crate::protocol::Docs`]).
+    #[instrument("accept", skip_all)]
+    /// Serve a session whose first message named this engine's identity.
+    #[instrument("accept", skip_all)]
+    pub async fn handle_session(
+        &mut self,
+        conn: iroh::endpoint::Connection,
+        opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    ) {
+        let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
+        let accept_request_cb = self.accept_callback();
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
         self.running_sync_accept.spawn(
-            async move { handle_connection(sync, conn, accept_request_cb, Some(&metrics)).await }
-                .instrument(Span::current()),
+            async move {
+                let res = handle_session(sync, opening, accept_request_cb, Some(&metrics)).await;
+                // The connection outlives the session it carries: dropping
+                // it at the dispatcher would cut the streams mid-exchange.
+                drop(conn);
+                (namespace, peer, caller, res)
+            }
+            .instrument(Span::current()),
+        );
+    }
+
+    /// The serving half of a session between two identities of this node.
+    #[instrument("accept-in-process", skip_all)]
+    fn accept_in_process(&mut self, opening: SessionOpening<InProcessRecv, InProcessSend>) {
+        let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
+        let accept_request_cb = self.accept_callback();
+        let sync = self.sync.clone();
+        let metrics = self.metrics.clone();
+        self.running_sync_accept.spawn(
+            async move {
+                let res =
+                    handle_in_process_session(sync, opening, accept_request_cb, Some(&metrics))
+                        .await;
+                (namespace, peer, caller, res)
+            }
+            .instrument(Span::current()),
         );
     }
 
@@ -1009,9 +1415,10 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
+        caller: Identity,
     ) -> AcceptOutcome {
         self.state
-            .accept_request(&self.endpoint.id(), &namespace, peer)
+            .accept_request(&self.endpoint.id(), self.identity, &namespace, peer, caller)
     }
 }
 
@@ -1189,5 +1596,40 @@ mod tests {
         drop(a_rx);
         drop(b_rx);
         subscribers.send(Event::NeighborUp(pk)).await;
+    }
+
+    /// A peer of one replica is dialed as every identity it is known by, and
+    /// a session's identity is known only while that session runs: two
+    /// sessions of one identity both have to end before it is forgotten, and
+    /// a contact the consumer stated outlives all of them.
+    #[test]
+    fn a_session_identity_lives_as_long_as_its_session_and_a_stated_one_outlives_it() {
+        let stated = Identity::from_bytes([1; 32]);
+        let named = Identity::from_bytes([2; 32]);
+        let mut identities = PeerIdentities::default();
+        identities.stated.insert(stated);
+
+        identities.enter(named);
+        identities.enter(named);
+        assert_eq!(identities.all().collect::<Vec<_>>(), vec![stated, named]);
+
+        // One of the two sessions ends: the identity is still named by the other.
+        identities.leave(named);
+        assert_eq!(identities.all().collect::<Vec<_>>(), vec![stated, named]);
+
+        identities.leave(named);
+        assert_eq!(
+            identities.all().collect::<Vec<_>>(),
+            vec![stated],
+            "the identity outlived the sessions that named it"
+        );
+        assert!(
+            !identities.is_empty(),
+            "a stated contact was dropped with the sessions"
+        );
+
+        // A release with nothing to release leaves the stated one alone.
+        identities.leave(named);
+        assert_eq!(identities.all().collect::<Vec<_>>(), vec![stated]);
     }
 }

@@ -1,18 +1,23 @@
 //! The data service end to end: local write/read/list, the unknown-issuer
 //! denies paired with each allowed path, and the out-of-band ticket
 //! handover as a denial — an armed issuer serves fail-closed, so a ticket
-//! alone delivers nothing. The sanctioned channel is the connections grant
-//! surface (`establishment` and `scoped_grants` suites).
+//! alone delivers nothing, and only the issuer mints one. The sanctioned
+//! channel is the connections grant surface (`establishment` and
+//! `scoped_grants` suites).
 
 use std::time::Duration;
 
 use anyhow::Result;
 use pdn_node::{
-    DataService as _, IdentityService as _, Runtime, ShareMode, SpawnOptions, UnknownIssuer,
+    ConnectionsService as _, DataService as _, GranteeCannotShare, IdentityService as _, Runtime,
+    ShareMode, SpawnOptions, UnknownIdentity, UnknownIssuer,
 };
 use pdn_types::EntryPath;
+use test_utils::eventually;
 
-/// "Nothing arrived" is probed by waiting out a few of the ticket holder's
+mod common;
+
+/// "Nothing arrived" is probed by waiting out a few of the ticket identity's
 /// reconcile intervals.
 const RECONCILE: Duration = Duration::from_millis(500);
 
@@ -33,21 +38,24 @@ async fn writes_read_back_list_exactly_and_hand_over_by_ticket() -> Result<()> {
     let b = Runtime::spawn(options).await?;
 
     let alice = a.identity().create().await?;
+    let bob = b.identity().create().await?;
     let email = EntryPath::new("contact/email")?;
     let phone = EntryPath::new("contact/phone")?;
 
     // Local write then read.
-    a.data().write(alice, &email, b"alice@example.org").await?;
-    a.data().write(alice, &phone, b"+1-555-0100").await?;
+    a.data()
+        .write(alice, alice, &email, b"alice@example.org")
+        .await?;
+    a.data().write(alice, alice, &phone, b"+1-555-0100").await?;
     assert_eq!(
-        a.data().read(alice, &email).await?.as_deref(),
+        a.data().read(alice, alice, &email).await?.as_deref(),
         Some(&b"alice@example.org"[..])
     );
 
     // Listing yields exactly the written paths, without payload bytes.
     let mut listed: Vec<String> = a
         .data()
-        .list(alice, None)
+        .list(alice, alice, None)
         .await?
         .iter()
         .map(|e| e.path.to_string())
@@ -58,42 +66,266 @@ async fn writes_read_back_list_exactly_and_hand_over_by_ticket() -> Result<()> {
     // Paired deny, before any handover: on B the issuer was neither
     // created nor imported, so read, write, and list are each refused as
     // specifically unknown, and nothing is read, written, or listed.
-    let read_err = b.data().read(alice, &email).await.unwrap_err();
+    let read_err = b.data().read(bob, alice, &email).await.unwrap_err();
     assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
     let write_err = b
         .data()
-        .write(alice, &email, b"intruder")
+        .write(bob, alice, &email, b"intruder")
         .await
         .unwrap_err();
     assert!(write_err.downcast_ref::<UnknownIssuer>().is_some());
-    let list_err = b.data().list(alice, None).await.unwrap_err();
+    let list_err = b.data().list(bob, alice, None).await.unwrap_err();
     assert!(list_err.downcast_ref::<UnknownIssuer>().is_some());
 
     // Denied: B resolves to no device and no grant in A's book, so A
     // refuses B's sessions as if the replica were not hosted. The import
     // succeeds as a local registration, several intervals pass, and nothing
     // has arrived.
-    let ticket = a.data().share(alice, ShareMode::Write).await?;
-    b.data().import(alice, ticket).await?;
+    let ticket = a.data().share(alice, alice, ShareMode::Write).await?;
+    b.data().import(bob, alice, ticket).await?;
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
-        b.data().list(alice, None).await?.is_empty(),
+        b.data().list(bob, alice, None).await?.is_empty(),
         "a bare ticket must not deliver entries from an armed issuer"
     );
-    assert!(b.data().read(alice, &email).await?.is_none());
+    assert!(b.data().read(bob, alice, &email).await?.is_none());
 
     // The gossip channel stays closed too: a write made after the import,
     // past any window in which a swarm would have formed, must not arrive.
     let after = EntryPath::new("contact/after")?;
-    a.data().write(alice, &after, b"post-import").await?;
+    a.data().write(alice, alice, &after, b"post-import").await?;
     tokio::time::sleep(SWARM_WINDOW).await;
     assert!(
-        b.data().list(alice, None).await?.is_empty(),
-        "a post-import write must not reach a bare-ticket holder over gossip"
+        b.data().list(bob, alice, None).await?.is_empty(),
+        "a post-import write must not reach a bare-ticket identity over gossip"
     );
-    assert!(b.data().read(alice, &after).await?.is_none());
+    assert!(b.data().read(bob, alice, &after).await?.is_none());
 
     a.shutdown().await?;
     b.shutdown().await?;
+    Ok(())
+}
+
+/// Every operation acts for the identity it names and for that one
+/// alone: an issuer only a co-located identity holds is unknown to its
+/// sibling, exactly as an issuer no identity of this node holds is.
+///
+/// Denied: the sibling's read, write and list are each refused as
+/// specifically unknown, beside the same three succeeding for the
+/// identity that holds the issuer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operation_acts_for_the_identity_it_names() -> Result<()> {
+    let runtime = Runtime::spawn(SpawnOptions::memory()).await?;
+    let work = runtime.identity().create().await?;
+    let leisure = runtime.identity().create().await?;
+    let email = EntryPath::new("contact/email")?;
+
+    runtime
+        .data()
+        .write(work, work, &email, b"alice@work.example")
+        .await?;
+
+    // Allowed: the identity that holds the issuer.
+    assert_eq!(
+        runtime.data().read(work, work, &email).await?.as_deref(),
+        Some(&b"alice@work.example"[..])
+    );
+    assert_eq!(runtime.data().list(work, work, None).await?.len(), 1);
+
+    // Denied: its co-located sibling, which holds no replica of that
+    // issuer, is answered as for an issuer nobody here holds.
+    for refusal in [
+        runtime.data().read(leisure, work, &email).await.err(),
+        runtime
+            .data()
+            .write(leisure, work, &email, b"intruder")
+            .await
+            .err(),
+        runtime.data().list(leisure, work, None).await.err(),
+    ] {
+        let refusal = refusal.expect("a co-located identity must not reach the issuer");
+        assert!(
+            refusal.downcast_ref::<UnknownIssuer>().is_some(),
+            "the refusal did not read as an unknown issuer: {refusal:#}"
+        );
+    }
+
+    runtime.shutdown().await?;
+    Ok(())
+}
+
+/// A ticket is imported for the identity it is named for, and an import
+/// naming an identity this node does not host is refused where the grant
+/// binder's own import would be — before anything is registered.
+///
+/// Denied: the unhosted identity's import refuses as unknown, and the
+/// hosted identity beside it gains no issuer from the attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_names_the_identity_it_is_held_for() -> Result<()> {
+    let issuer_rt = Runtime::spawn(SpawnOptions::memory()).await?;
+    let identity_rt = Runtime::spawn(SpawnOptions::memory()).await?;
+    let issuer = issuer_rt.identity().create().await?;
+    let identity = identity_rt.identity().create().await?;
+    let unhosted = issuer_rt.identity().create().await?;
+
+    let path = EntryPath::new("contact/email")?;
+    issuer_rt
+        .data()
+        .write(issuer, issuer, &path, b"issuer@example.org")
+        .await?;
+    let ticket = issuer_rt
+        .data()
+        .share(issuer, issuer, ShareMode::Read)
+        .await?;
+
+    // Allowed: the identity that holds it registers the issuer.
+    identity_rt
+        .data()
+        .import(identity, issuer, ticket.clone())
+        .await?;
+    assert!(
+        identity_rt
+            .data()
+            .list(identity, issuer, None)
+            .await
+            .is_ok(),
+        "the importing identity must resolve the issuer it named"
+    );
+
+    // Denied: an identity this node does not host, refused at the same
+    // call the binder makes.
+    let refused = identity_rt
+        .data()
+        .import(unhosted, issuer, ticket)
+        .await
+        .expect_err("an import naming an identity this node does not host must be refused");
+    assert!(
+        refused.downcast_ref::<UnknownIdentity>().is_some(),
+        "the refusal did not name the unhosted identity: {refused:#}"
+    );
+    let unknown = identity_rt
+        .data()
+        .list(unhosted, issuer, None)
+        .await
+        .expect_err("the refused import must leave nothing registered");
+    assert!(unknown.downcast_ref::<UnknownIdentity>().is_some());
+
+    issuer_rt.shutdown().await?;
+    identity_rt.shutdown().await?;
+    Ok(())
+}
+
+/// An identity holding a namespace as a grantee is refused a ticket on it,
+/// whether the namespace came under a grant or was imported out of band.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_held_as_a_grantee_is_not_shared() -> Result<()> {
+    let options = SpawnOptions {
+        reconcile_interval: RECONCILE,
+        ..SpawnOptions::memory()
+    };
+    let issuer_rt = Runtime::spawn(options.clone()).await?;
+    let audience_rt = Runtime::spawn(options).await?;
+    let bob = issuer_rt.identity().create().await?;
+    let alice = audience_rt.identity().create().await?;
+    let carol = audience_rt.identity().create().await?;
+
+    let email = EntryPath::new("contact/email")?;
+    issuer_rt
+        .data()
+        .write(bob, bob, &email, b"bob@example.org")
+        .await?;
+    let invite = issuer_rt.connections().invite(bob, None).await?;
+    common::establish_patiently(&audience_rt, alice, &issuer_rt, bob, invite).await?;
+    issuer_rt
+        .connections()
+        .publish_grant(bob, alice, bob, common::claims_on(bob, &email, false))
+        .await?;
+    // The binder has imported once the claim reads back.
+    assert!(
+        eventually(|| async {
+            Ok(matches!(
+                audience_rt.data().read(alice, bob, &email).await,
+                Ok(Some(payload)) if payload == b"bob@example.org"
+            ))
+        })
+        .await?,
+        "the granted claim did not reach the audience"
+    );
+
+    // Allowed: the issuer shares the same namespace.
+    let ticket = issuer_rt.data().share(bob, bob, ShareMode::Read).await?;
+
+    // Denied: the replica under the grant.
+    let refused = audience_rt
+        .data()
+        .share(alice, bob, ShareMode::Read)
+        .await
+        .expect_err("a namespace held under a grant must not be shared");
+    assert!(
+        refused.downcast_ref::<GranteeCannotShare>().is_some(),
+        "the refusal did not name the grantee: {refused:#}"
+    );
+
+    // Denied: the replica imported out of band.
+    audience_rt.data().import(carol, bob, ticket).await?;
+    let refused = audience_rt
+        .data()
+        .share(carol, bob, ShareMode::Read)
+        .await
+        .expect_err("a namespace imported out of band must not be shared");
+    assert!(
+        refused.downcast_ref::<GranteeCannotShare>().is_some(),
+        "the refusal did not name the grantee: {refused:#}"
+    );
+
+    issuer_rt.shutdown().await?;
+    audience_rt.shutdown().await?;
+    Ok(())
+}
+
+/// A ticket imported under the identity's own id is refused, whether it
+/// names that identity's own namespace or another's, and the identity goes
+/// on issuing its data: it still shares it and reads it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_under_the_identitys_own_id_is_refused() -> Result<()> {
+    let rt = common::memory_runtime().await?;
+    let alice = rt.identity().create().await?;
+    let bob = rt.identity().create().await?;
+    let email = EntryPath::new("contact/email")?;
+    rt.data()
+        .write(alice, alice, &email, b"alice@example.org")
+        .await?;
+    let own = rt.data().share(alice, alice, ShareMode::Read).await?;
+    let foreign = rt.data().share(bob, bob, ShareMode::Read).await?;
+
+    for (ticket, names) in [
+        (own, "its own namespace"),
+        (foreign, "another identity's namespace"),
+    ] {
+        assert!(
+            rt.data()
+                .import(alice, alice, ticket.clone())
+                .await
+                .is_err(),
+            "an import under the identity's own id naming {names} was accepted"
+        );
+        assert!(
+            rt.data().import_scoped(alice, alice, ticket).await.is_err(),
+            "a scoped import under the identity's own id naming {names} was accepted"
+        );
+        rt.data()
+            .share(alice, alice, ShareMode::Read)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("the identity stopped issuing after {names}: {err:#}")
+            })?;
+        assert_eq!(
+            rt.data().read(alice, alice, &email).await?.as_deref(),
+            Some(b"alice@example.org".as_slice()),
+            "the identity's own data is gone after an import naming {names}"
+        );
+    }
+
+    rt.shutdown().await?;
     Ok(())
 }

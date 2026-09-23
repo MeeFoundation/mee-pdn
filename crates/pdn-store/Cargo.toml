@@ -64,6 +64,8 @@ nested_enum_utils = "0.2"
 parking_lot = "0.12.3"
 proptest = "1.2.0"
 rand = { version = "0.10", features = ["chacha"] }
+# The cache statistics a test reads to see the bound reach the database.
+redb = { version = "4.1", features = ["cache_metrics"] }
 tempfile = "3.4"
 test-strategy = "0.4"
 testdir = "0.10"

@@ -10,8 +10,9 @@ use iroh_gossip::net::Gossip;
 use crate::{
     api::DocsApi,
     engine::{DefaultAuthorStorage, Engine, ProtectCallbackHandler},
+    net::{accept_session, refuse_session, AbortReason},
     store::Store,
-    CapabilityValidator,
+    CapabilityValidator, Identity,
 };
 
 #[derive(Default, Debug)]
@@ -19,7 +20,12 @@ enum Storage {
     #[default]
     Memory,
     #[cfg(feature = "fs-store")]
-    Persistent(std::path::PathBuf),
+    Persistent {
+        path: std::path::PathBuf,
+        /// What the replica store's cache may hold. Fixed here because a
+        /// bound cannot be changed on an open store.
+        cache_bytes: usize,
+    },
 }
 
 /// Docs protocol.
@@ -27,37 +33,84 @@ enum Storage {
 pub struct Docs {
     engine: Arc<Engine>,
     api: DocsApi,
+    /// The task serving `api`, which holds the engine: it stops with the
+    /// last clone of this, whatever handles into the API remain.
+    _rpc: Arc<n0_future::task::AbortOnDropHandle<()>>,
+    replica_cache_bytes: Option<usize>,
 }
 
 impl Docs {
     /// Create a new [`Builder`] for the docs protocol, using in memory replica and author storage.
-    pub fn memory() -> Builder {
-        Builder::default()
+    ///
+    /// `identity` is whom every replica of this engine is held for, and
+    /// `session_access_provider` what judges its sessions: an assembly
+    /// that states neither cannot serve one.
+    pub fn memory(
+        identity: Identity,
+        session_access_provider: crate::filter::SessionAccessProvider,
+    ) -> Builder {
+        Builder {
+            storage: Storage::Memory,
+            protect_cb: None,
+            capability_validator: None,
+            rejection_observer: None,
+            identity,
+            session_access_provider,
+            co_located: None,
+        }
     }
 
     /// Create a new [`Builder`] for the docs protocol, using a persistent replica and author storage
     /// in the given directory.
     #[cfg(feature = "fs-store")]
-    pub fn persistent(path: std::path::PathBuf) -> Builder {
+    ///
+    /// `cache_bytes` caps what this store's cache holds; the bound cannot
+    /// be changed once the store is open, so a node dividing one budget
+    /// among several identities cuts the share before opening any of them.
+    pub fn persistent(
+        path: std::path::PathBuf,
+        cache_bytes: usize,
+        identity: Identity,
+        session_access_provider: crate::filter::SessionAccessProvider,
+    ) -> Builder {
         Builder {
-            storage: Storage::Persistent(path),
+            storage: Storage::Persistent { path, cache_bytes },
             protect_cb: None,
             capability_validator: None,
             rejection_observer: None,
-            session_access_provider: None,
+            identity,
+            session_access_provider,
+            co_located: None,
         }
+    }
+
+    /// The engine under this handler, for a node that dispatches accepted
+    /// connections to the identity each names.
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
     }
 
     /// Creates a new [`Docs`] from an [`Engine`].
     pub fn new(engine: Engine) -> Self {
         let engine = Arc::new(engine);
-        let api = DocsApi::spawn(engine.clone());
-        Self { engine, api }
+        let (api, rpc) = DocsApi::spawn(engine.clone());
+        Self {
+            engine,
+            api,
+            _rpc: Arc::new(rpc),
+            replica_cache_bytes: None,
+        }
     }
 
     /// Returns the API for this docs instance.
     pub fn api(&self) -> &DocsApi {
         &self.api
+    }
+
+    /// The cache bound the replica store was opened with; `None` for a
+    /// store in memory, or for docs built with [`Docs::new`] from an engine.
+    pub fn replica_cache_bytes(&self) -> Option<usize> {
+        self.replica_cache_bytes
     }
 }
 
@@ -70,12 +123,14 @@ impl std::ops::Deref for Docs {
 }
 
 impl ProtocolHandler for Docs {
+    /// The one-identity half of the dispatch: this engine answers for its own
+    /// identity and refuses every other, which is what a resolver of one
+    /// identity does.
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        self.engine
-            .handle_connection(connection)
+        let opening = accept_session(&connection)
             .await
             .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?;
-        Ok(())
+        serve_dispatched(connection, opening, Some(self)).await
     }
 
     async fn shutdown(&self) {
@@ -86,7 +141,7 @@ impl ProtocolHandler for Docs {
 }
 
 /// Builder for the docs protocol.
-#[derive(derive_more::Debug, Default)]
+#[derive(derive_more::Debug)]
 pub struct Builder {
     storage: Storage,
     protect_cb: Option<ProtectCallbackHandler>,
@@ -94,8 +149,10 @@ pub struct Builder {
     capability_validator: Option<CapabilityValidator>,
     #[debug("RejectionObserver")]
     rejection_observer: Option<crate::RejectionObserver>,
+    identity: Identity,
     #[debug("SessionAccessProvider")]
-    session_access_provider: Option<crate::filter::SessionAccessProvider>,
+    session_access_provider: crate::filter::SessionAccessProvider,
+    co_located: Option<crate::engine::CoLocatedRequests>,
 }
 
 impl Builder {
@@ -127,17 +184,11 @@ impl Builder {
         self
     }
 
-    /// Set a per-session access provider consulted on both session roles —
-    /// accepting a sync request and dialing out — to decide what a peer may
-    /// see of a namespace.
-    ///
-    /// If unset, every session serves the full replica (vanilla iroh-docs
-    /// behaviour).
-    pub fn session_access_provider(
-        mut self,
-        provider: crate::filter::SessionAccessProvider,
-    ) -> Self {
-        self.session_access_provider = Some(provider);
+    /// Set where this engine sends what it asks of its node about the
+    /// node's other identities: a local write to announce, a contact naming
+    /// this node to reconcile inside the process. Unset, both reach nobody.
+    pub fn co_located_requests(mut self, requests: crate::engine::CoLocatedRequests) -> Self {
+        self.co_located = Some(requests);
         self
     }
 
@@ -148,15 +199,18 @@ impl Builder {
         blobs: BlobsStore,
         gossip: Gossip,
     ) -> anyhow::Result<Docs> {
-        let replica_store = match &self.storage {
-            Storage::Memory => Store::memory(),
+        let (replica_store, replica_cache_bytes) = match &self.storage {
+            Storage::Memory => (Store::memory(), None),
             #[cfg(feature = "fs-store")]
-            Storage::Persistent(path) => Store::persistent(path.join("docs.redb"))?,
+            Storage::Persistent { path, cache_bytes } => (
+                Store::persistent(path.join("docs.redb"), *cache_bytes)?,
+                Some(*cache_bytes),
+            ),
         };
         let author_store = match &self.storage {
             Storage::Memory => DefaultAuthorStorage::Mem,
             #[cfg(feature = "fs-store")]
-            Storage::Persistent(path) => {
+            Storage::Persistent { path, .. } => {
                 DefaultAuthorStorage::Persistent(path.join("default-author"))
             }
         };
@@ -172,8 +226,70 @@ impl Builder {
             self.capability_validator,
             self.rejection_observer,
             self.session_access_provider,
+            self.identity,
+            self.co_located,
         )
         .await?;
-        Ok(Docs::new(engine))
+        let mut docs = Docs::new(engine);
+        docs.replica_cache_bytes = replica_cache_bytes;
+        Ok(docs)
     }
+}
+
+/// Resolves the identity an accepted session names to the engine that holds
+/// its replicas. `None` refuses the session as not hosted.
+pub type IdentityResolver = Arc<dyn Fn(Identity) -> Option<Docs> + Send + Sync + 'static>;
+
+/// The docs handler of a node hosting several identities: it reads an
+/// accepted connection's first message and hands the session to the
+/// engine of the identity that message names, before any replica is touched
+/// (ADR-0013).
+#[derive(derive_more::Debug, Clone)]
+pub struct DocsDispatch {
+    #[debug("IdentityResolver")]
+    resolve: IdentityResolver,
+}
+
+impl DocsDispatch {
+    /// Dispatch by `resolve`, which answers with the engine of a identity
+    /// this node hosts.
+    pub fn new(resolve: IdentityResolver) -> Self {
+        Self { resolve }
+    }
+}
+
+impl ProtocolHandler for DocsDispatch {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let opening = accept_session(&connection)
+            .await
+            .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?;
+        let resolved = (self.resolve)(opening.identity());
+        serve_dispatched(connection, opening, resolved.as_ref()).await
+    }
+}
+
+/// Hand a read session to the engine that answers for the identity it names,
+/// or refuse it. The only way a session enters an engine: reading the first
+/// message is the caller's, so nothing hands an engine a raw connection and
+/// no accept path waits on the wire inside the actor loop. An engine of
+/// another identity is refused as none: its book would judge a session
+/// addressed to a replica it does not answer for.
+async fn serve_dispatched(
+    connection: Connection,
+    opening: crate::net::SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    docs: Option<&Docs>,
+) -> Result<(), iroh::protocol::AcceptError> {
+    match docs.filter(|docs| docs.engine.identity() == opening.identity()) {
+        Some(docs) => docs
+            .engine
+            .handle_session(connection, opening)
+            .await
+            .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
+        // Byte-identical to the refusal a replica this node does not
+        // hold draws, so naming a identity tells a caller nothing.
+        None => refuse_session(opening, AbortReason::NotFound)
+            .await
+            .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
+    }
+    Ok(())
 }

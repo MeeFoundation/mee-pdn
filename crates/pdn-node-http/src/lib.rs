@@ -139,9 +139,9 @@ fn debug_routes() -> Router<Arc<Runtime>> {
             "/debug/identities/{identity}/grants/{peer}/{issuer}",
             delete(connections::withdraw_grant),
         )
-        .route("/debug/data/{issuer}", get(data::list))
+        .route("/debug/data/{identity}/{issuer}", get(data::list))
         .route(
-            "/debug/data/{issuer}/{*path}",
+            "/debug/data/{identity}/{issuer}/{*path}",
             put(data::write).get(data::read),
         )
 }

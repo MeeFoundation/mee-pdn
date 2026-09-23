@@ -34,7 +34,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
 
     inviter
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"alice@example.org"),
         )
         .await?
@@ -175,12 +175,12 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
 
     // Allowed, then denied on the same claim: the grant covers it read-only,
     // and the prior value still reads back on both sides.
-    entry_reads(&scanner, alice, "contact/email", b"alice@example.org")
+    entry_reads(&scanner, bob, alice, "contact/email", b"alice@example.org")
         .await
         .context("the granted entry did not reach the grantee")?;
     let refused_write = scanner
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{bob}/{alice}/contact/email"),
             body(b"overwrite"),
         )
         .await?;
@@ -192,7 +192,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         refused_write.text()
     );
     let grantee_side = scanner
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{bob}/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
@@ -205,13 +205,14 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // than timing.
     inviter
         .put(
-            &format!("/debug/data/{alice}/contact/sentinel"),
+            &format!("/debug/data/{alice}/{alice}/contact/sentinel"),
             body(b"alice@new.example.org"),
         )
         .await?
         .ok()?;
     entry_reads(
         &scanner,
+        bob,
         alice,
         "contact/sentinel",
         b"alice@new.example.org",
@@ -219,7 +220,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     .await
     .context("the sentinel update did not reach the grantee")?;
     let issuer_side = inviter
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
         .await?
         .ok()?;
     assert_eq!(
@@ -231,7 +232,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // Denied (an absent entry): 404, the one status reserved for nothing
     // being there — the issuer is hosted, so this is not a refusal.
     let absent = inviter
-        .get(&format!("/debug/data/{alice}/contact/phone"))
+        .get(&format!("/debug/data/{alice}/{alice}/contact/phone"))
         .await?;
     assert_eq!(
         absent.status,
@@ -256,7 +257,10 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
     // that is the request being wrong rather than the host not knowing what
     // happened. Beside it, one byte at the same path is accepted.
     let empty = inviter
-        .put(&format!("/debug/data/{alice}/contact/note"), body(b""))
+        .put(
+            &format!("/debug/data/{alice}/{alice}/contact/note"),
+            body(b""),
+        )
         .await?;
     assert_eq!(
         empty.status,
@@ -266,7 +270,10 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         empty.text()
     );
     inviter
-        .put(&format!("/debug/data/{alice}/contact/note"), body(b"."))
+        .put(
+            &format!("/debug/data/{alice}/{alice}/contact/note"),
+            body(b"."),
+        )
         .await?
         .ok()?;
 

@@ -33,7 +33,7 @@ async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
     };
     tokio::time::timeout(Duration::from_secs(5), acquired.notified())
         .await
-        .context("state-lock holder did not acquire the lock")?;
+        .context("state-lock identity did not acquire the lock")?;
 
     let live = app
         .clone()

@@ -214,7 +214,10 @@ async fn test_default_author_persist() -> TestResult<()> {
 
     // check that the node fails to start if the default author is missing from the docs store.
     {
-        let mut docs_store = pdn_store::store::fs::Store::persistent(iroh_root.join("docs.redb"))?;
+        let mut docs_store = pdn_store::store::fs::Store::persistent(
+            iroh_root.join("docs.redb"),
+            util::TEST_CACHE_BYTES,
+        )?;
         docs_store.delete_author(default_author)?;
         docs_store.flush()?;
         drop(docs_store);

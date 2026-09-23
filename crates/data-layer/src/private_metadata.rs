@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashSet,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -28,12 +29,54 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::{read_payload, SyncNode};
 
-/// The wait of [`PrivateMetadataStore::wait_caught_up`] elapsed. Downcast
+/// The wait of [`CatchUpWatch::wait`] elapsed. Downcast
 /// from its `anyhow::Error` to tell "did not catch up in time" from this
 /// node's own failures.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("no successful sync session of the replica within the wait")]
 pub struct CatchUpTimeout;
+
+/// A subscription to one replica's sync sessions, from
+/// [`PrivateMetadataStore::watch_catch_up`]. Unread, it holds back the
+/// engine's events once its buffer fills, so the wait follows promptly.
+pub struct CatchUpWatch {
+    events: Pin<Box<dyn Stream<Item = Result<LiveEvent>> + Send>>,
+    since: SystemTime,
+}
+
+impl std::fmt::Debug for CatchUpWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatchUpWatch")
+            .field("since", &self.since)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatchUpWatch {
+    /// Wait for the first successful sync session started since the watch
+    /// was taken, or fail with [`CatchUpTimeout`]. A completed session, not
+    /// arrived content: a replica that synced and found nothing new and one
+    /// that never synced read the same.
+    pub async fn wait(mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CatchUpTimeout.into());
+            }
+            let Ok(event) = tokio::time::timeout(remaining, self.events.next()).await else {
+                return Err(CatchUpTimeout.into());
+            };
+            let event =
+                event.context("replica event stream ended while waiting for a sync session")??;
+            if let LiveEvent::SyncFinished(sync) = event {
+                if sync.result.is_ok() && sync.started >= self.since {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
 
 /// The one key shape shared by the directory's device set, the connection
 /// metadata store's published device sets, and the access book's probe:
@@ -152,7 +195,7 @@ pub struct RetractionMarker {
     pub timestamp: u64,
 }
 
-/// The owning identity is not kept here — the handle's holder knows which
+/// The owning identity is not kept here — the handle's identity knows which
 /// identity it serves.
 #[derive(Debug)]
 pub struct PrivateMetadataStore {
@@ -163,14 +206,15 @@ pub struct PrivateMetadataStore {
 }
 
 impl PrivateMetadataStore {
-    pub async fn create(node: &SyncNode) -> Result<Self> {
+    pub async fn create(node: &SyncNode, identity: PdnId) -> Result<Self> {
         // Author first, tracked doc last: nothing awaits between the
         // tracking and the handle reaching the caller, so a dropped future
-        // cannot leave a tracked replica no handle refers to. The node's one
-        // author: per-store authors would leave a record written before a
-        // restart standing beside its replacement written after one.
-        let author = node.default_author().await?;
-        let doc = node.new_doc().await?;
+        // cannot leave a tracked replica no handle refers to. The
+        // identity's one author: per-store authors would leave a record
+        // written before a restart standing beside its replacement written
+        // after one.
+        let author = node.default_author(identity)?;
+        let doc = node.new_doc(identity).await?;
         Ok(Self {
             doc,
             author,
@@ -180,10 +224,10 @@ impl PrivateMetadataStore {
     }
 
     /// Import via the write ticket the linking reply carries.
-    pub async fn import(node: &SyncNode, ticket: DocTicket) -> Result<Self> {
+    pub async fn import(node: &SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see `create`.
-        let author = node.default_author().await?;
-        let doc = node.import_doc(ticket).await?;
+        let author = node.default_author(identity)?;
+        let doc = node.import_doc(identity, ticket).await?;
         Ok(Self {
             doc,
             author,
@@ -196,9 +240,13 @@ impl PrivateMetadataStore {
     /// namespace the store does not hold is `Ok(None)`, so a caller acting on
     /// a durable record tells an absent replica from a store that failed to
     /// answer.
-    pub async fn open(node: &SyncNode, namespace: NamespaceId) -> Result<Option<Self>> {
-        let author = node.default_author().await?;
-        let Some(doc) = node.open_doc(namespace).await? else {
+    pub async fn open(
+        node: &SyncNode,
+        identity: PdnId,
+        namespace: NamespaceId,
+    ) -> Result<Option<Self>> {
+        let author = node.default_author(identity)?;
+        let Some(doc) = node.open_doc(identity, namespace).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -324,8 +372,8 @@ impl PrivateMetadataStore {
     }
 
     /// Live records at `device`'s key across authors — what every product
-    /// read collapses latest-wins, so this is the only way to assert the
-    /// node's one author.
+    /// read collapses latest-wins, so this is the only way to assert one
+    /// author per hosted identity.
     #[cfg(feature = "test-util")]
     pub async fn live_device_record_count(&self, device: NodeId) -> Result<usize> {
         let query = Query::all().key_exact(device_key(&device).into_bytes());
@@ -339,7 +387,7 @@ impl PrivateMetadataStore {
     }
 
     /// Promote `device` from pending to confirmed. Written by the newcomer
-    /// itself: only a holder of the write ticket can, so the record is
+    /// itself: only a identity of the write ticket can, so the record is
     /// evidence the linking reply arrived — which the inviter cannot
     /// establish on its own.
     pub async fn confirm_device(&self, device: NodeId) -> Result<()> {
@@ -544,29 +592,16 @@ impl PrivateMetadataStore {
         self.doc.id()
     }
 
-    /// Wait for the first successful sync session started after `since`, or
-    /// fail with [`CatchUpTimeout`]. A completed session, not arrived
-    /// content: a replica that synced and found nothing new and one that
-    /// never synced read the same.
-    pub async fn wait_caught_up(&self, since: SystemTime, timeout: Duration) -> Result<()> {
-        let mut events = self.events().await?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(CatchUpTimeout.into());
-            }
-            let Ok(event) = tokio::time::timeout(remaining, events.next()).await else {
-                return Err(CatchUpTimeout.into());
-            };
-            let event =
-                event.context("replica event stream ended while waiting for a sync session")??;
-            if let LiveEvent::SyncFinished(sync) = event {
-                if sync.result.is_ok() && sync.started >= since {
-                    return Ok(());
-                }
-            }
-        }
+    /// Taken before whatever starts the replica's sessions — before
+    /// `host_identity` arms a directory — or a session finished before the
+    /// subscription goes unseen and the wait holds out for the next one.
+    pub async fn watch_catch_up(&self) -> Result<CatchUpWatch> {
+        let since = SystemTime::now();
+        let events = self.events().await?;
+        Ok(CatchUpWatch {
+            events: Box::pin(events),
+            since,
+        })
     }
 
     /// The kinds under which tickets are published, record-level.

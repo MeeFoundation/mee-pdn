@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, ConnectionMetadata, ConnectionMetadataStore, DocTicket, EndpointAddr,
-    EndpointId, GrantedClaim, ReadGrant, ShareMode,
+    identity_of, AddrInfoOptions, ConnectionMetadata, ConnectionMetadataStore, Contact, DocTicket,
+    EndpointAddr, EndpointId, GrantedClaim, ReadGrant, ShareMode,
 };
 use futures_lite::{Stream, StreamExt};
 use pdn_types::{NodeId, NonEmpty, PdnId};
@@ -131,15 +131,15 @@ impl<'rt> RuntimeConnectionsService<'rt> {
         let Some(pair) = state.metadata_pairs.get(&(identity, peer)) else {
             return Ok((Vec::new(), Vec::new()));
         };
-        let devices = |contacts: Vec<EndpointAddr>| {
+        let devices = |contacts: Vec<Contact>| {
             contacts
                 .iter()
-                .map(|contact| NodeId::from_bytes(*contact.id.as_bytes()))
+                .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
                 .collect::<Vec<_>>()
         };
         Ok((
-            devices(state.node.doc_contacts(pair.own.namespace())?),
-            devices(state.node.doc_contacts(pair.peer.namespace())?),
+            devices(state.node.doc_contacts(identity, pair.own.namespace())?),
+            devices(state.node.doc_contacts(identity, pair.peer.namespace())?),
         ))
     }
 
@@ -257,7 +257,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         };
         let ticket = state
             .node
-            .share_ticket(issuer, mode, AddrInfoOptions::RelayAndAddresses)
+            .share_ticket(identity, issuer, mode, AddrInfoOptions::RelayAndAddresses)
             .await?;
         pair.own.publish_grant(&grant, &ticket).await
     }
@@ -271,13 +271,19 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
         let Some(pair) = pair else {
             return Ok(Vec::new());
         };
-        let mut grants = Vec::new();
-        for issuer in pair.peer.list_grants().await? {
-            if let Some((grant, ticket)) = pair.peer.read_grant(issuer, identity).await?.granted() {
-                grants.push(PeerGrant { grant, ticket });
-            }
-        }
-        Ok(grants)
+        // The one key this counterparty can have written, read exactly
+        // rather than found by scanning: a record keyed by a third identity
+        // is its word over data that is not its own, and the binder ignores
+        // it, so reporting it as a grant would describe a state no read or
+        // write follows.
+        Ok(pair
+            .peer
+            .read_grant(peer, identity)
+            .await?
+            .granted()
+            .map(|(grant, ticket)| PeerGrant { grant, ticket })
+            .into_iter()
+            .collect())
     }
 
     async fn read_own_grants(&self, identity: PdnId, peer: PdnId) -> Result<Option<ReadGrant>> {
@@ -400,9 +406,17 @@ async fn bind_grants(
         Some(pair) if pair.peer.namespace() == peer_store.namespace() => {}
         _ => return false,
     }
-    let Ok(granted) = peer_store.list_grants().await else {
+    let Ok(listed) = peer_store.list_grants().await else {
         return true;
     };
+    // In its own store a counterparty speaks for itself alone: `publish_grant`
+    // refuses any other issuer, so a record keyed by a third identity is the
+    // counterparty's word over data that is not its own, and binding it would
+    // displace that identity's real binding in this registry.
+    let granted: Vec<PdnId> = listed
+        .into_iter()
+        .filter(|issuer| *issuer == peer)
+        .collect();
     for issuer in &granted {
         let _cold_until_next_change = bind_one_grant(state, identity, peer, *issuer, peer_store)
             .await
@@ -414,9 +428,10 @@ async fn bind_grants(
     true
 }
 
-/// Import the namespace behind one live grant. The record is read before
-/// the decision: the ticket inside it says which replica, so a grant
-/// republished onto a fresh store rebinds too.
+/// Import the namespace behind one live grant, for the identity the grant
+/// addresses. The record is read before the decision: the
+/// ticket inside it says which replica, so a grant republished onto a
+/// fresh store rebinds too.
 async fn bind_one_grant(
     state: &mut State,
     identity: PdnId,
@@ -431,25 +446,31 @@ async fn bind_one_grant(
         return Ok(());
     };
     let namespace = ticket.capability.id();
-    let ticket_nodes = ticket.nodes.clone();
+    let ticket_contacts = ticket.contacts();
     let bound = (identity, peer, issuer);
     // The memo is an optimization, the registry the arbiter, both ways: an
-    // issuer already resolving to this namespace (another pair's binder
-    // imported the shared replica) is adopted, since each import holds one
-    // more handle and the last unbind must find exactly one; an issuer
-    // resolving to nothing is re-imported even when the memo matches.
-    let memo_current = state.bound_grants.get(&bound) == Some(&namespace);
-    let registered = state.node.data_namespace_of(issuer)?;
+    // issuer already resolving to this namespace is adopted, since each
+    // import holds one more handle and the last unbind must find exactly
+    // one; an issuer resolving to nothing is re-imported even when the memo
+    // matches.
+    let memo = state.bound_grants.get(&bound).copied();
+    let registered = state.node.data_namespace_of(identity, issuer)?;
     if registered == Some(namespace) {
-        if !memo_current {
+        if memo != Some(namespace) {
             state.bound_grants.insert(bound, namespace);
         }
-    } else if !memo_current || registered.is_none() {
-        let _displaced = state.node.import_namespace_scoped(issuer, ticket).await?;
+    } else if registered.is_none() || registered == memo {
+        // A grant moved off the replica this binder imported: the import
+        // forgets that replica.
+        let _import = state
+            .node
+            .import_namespace_scoped(identity, issuer, ticket)
+            .await?;
         state.bound_grants.insert(bound, namespace);
     } else {
-        // An import that arrived another way owns the replica; re-importing
-        // would have two owners displace each other sweep by sweep.
+        // An import that arrived another way owns the replica: importing
+        // over it would forget it, and two owners would displace each other
+        // sweep by sweep.
         tracing::debug!(%issuer, "grant defers to a namespace imported another way");
     }
     // Refreshed even when the binding is unchanged: the device set moves
@@ -457,148 +478,114 @@ async fn bind_one_grant(
     // pair whose records have not replicated reads like one that published
     // nothing — so both derived sets are left as they were until a device
     // appears.
-    let bound_pairs = pairs_bound_to(state, issuer);
-    let devices = published_issuer_devices(state, &bound_pairs).await;
+    let devices = published_issuer_devices(state, identity, peer).await;
     if devices.is_empty() {
         return Ok(());
     }
-    let _unbound_meanwhile = state.node.track_retraction_peers(issuer, devices.clone());
-    refresh_replica_contacts(state, issuer, &ticket_nodes, &devices, &bound_pairs).await
+    let _unbound_meanwhile = state
+        .node
+        .track_retraction_peers(identity, issuer, devices.clone());
+    refresh_replica_contacts(state, identity, issuer, &ticket_contacts, &devices).await
 }
 
-/// The pairs whose grant binds `issuer` here. Several hosted audiences
-/// share one replica (ADR-0009), so what is derived for it is derived
-/// across all of them, or each binder's sweep would replace what the
-/// others established.
-fn pairs_bound_to(state: &State, issuer: PdnId) -> Vec<(PdnId, PdnId)> {
-    state
-        .bound_grants
-        .keys()
-        .filter(|(_identity, _peer, bound_issuer)| *bound_issuer == issuer)
-        .map(|(identity, peer, _issuer)| (*identity, *peer))
-        .collect()
-}
-
-/// The issuer's devices unioned over every bound pair: the pairs replicate
-/// independently, and one pair's word alone would strip a device the issuer
-/// never withdrew.
-async fn published_issuer_devices(state: &State, bound_pairs: &[(PdnId, PdnId)]) -> Vec<NodeId> {
-    let stores: Vec<ConnectionMetadataStore> = bound_pairs
-        .iter()
-        .filter_map(|pair| state.metadata_pairs.get(pair).map(|open| open.peer.clone()))
-        .collect();
-    let mut seen: HashSet<[u8; 32]> = HashSet::new();
-    let mut devices = Vec::new();
-    for store in stores {
-        let published = match store.published_devices().await {
-            Ok(published) => published,
-            Err(err) => {
-                tracing::debug!("skipped an unreadable pair in the device union: {err:#}");
-                continue;
-            }
-        };
-        for device in published {
-            if seen.insert(*device.as_bytes()) {
-                devices.push(device);
-            }
+/// The devices the issuing identity published in the one connection whose
+/// grant bound this replica. Another counterparty's word never reaches it:
+/// the replica is held for one identity under one connection.
+async fn published_issuer_devices(state: &State, identity: PdnId, peer: PdnId) -> Vec<NodeId> {
+    let Some(pair) = state.metadata_pairs.get(&(identity, peer)) else {
+        return Vec::new();
+    };
+    match pair.peer.published_devices().await {
+        Ok(published) => published,
+        Err(err) => {
+            tracing::debug!("the pair's published device set was unreadable: {err:#}");
+            Vec::new()
         }
     }
-    devices
 }
 
-/// Set the granted replica's whole contact list: the issuer's published
-/// devices, every bound audience's siblings, and the ticket's addressing
-/// for the published devices it names. Derived from the device records on
-/// every sweep, never kept — a stored list would be a second source of
-/// truth, the one that goes stale — so removal is re-derivation. A contact
+/// Set the granted replica's whole contact list: the issuing identity's
+/// published devices, this identity's own siblings, and the ticket's
+/// addressing for the published devices it names — each paired with the
+/// identity it is dialed as. Derived from the device records on every
+/// sweep, never kept — a stored list would be a second source of truth,
+/// the one that goes stale — so removal is re-derivation. A contact
 /// derived from a record carries the endpoint id alone; the endpoint
 /// resolves paths it has spoken to.
 async fn refresh_replica_contacts(
     state: &mut State,
+    identity: PdnId,
     issuer: PdnId,
-    ticket_nodes: &[EndpointAddr],
+    ticket_contacts: &[Contact],
     issuer_devices: &[NodeId],
-    bound_pairs: &[(PdnId, PdnId)],
 ) -> Result<()> {
     let own = state.node.node_id();
-    let mut siblings: Vec<NodeId> = Vec::new();
-    for (audience, _peer) in bound_pairs {
-        if let Ok(hosted) = state.hosted(*audience) {
-            siblings.extend(hosted.directory.list_devices().await?);
-        } else {
-            tracing::debug!(%audience, "skipped a bound pair whose audience is not hosted");
-        }
-    }
+    let siblings: Vec<NodeId> = match state.hosted(identity) {
+        Ok(hosted) => hosted.directory.list_devices().await?,
+        Err(_not_hosted) => Vec::new(),
+    };
+    // Keyed by bytes because two id types meet here: a contact carries the
+    // endpoint's own id, a device record this crate's `NodeId`.
     let mut covered: HashSet<[u8; 32]> = HashSet::new();
     covered.insert(*own.as_bytes());
-    let mut contacts = Vec::new();
+    let mut contacts: Vec<Contact> = Vec::new();
     // The ticket's entries carry address detail beyond the endpoint id, and
     // stay only while the issuer still publishes the device they name.
-    for node in ticket_nodes {
-        let id = *node.id.as_bytes();
+    for contact in ticket_contacts {
+        let id = *contact.addr.id.as_bytes();
         if issuer_devices.iter().any(|device| *device.as_bytes() == id) && covered.insert(id) {
-            contacts.push(node.clone());
+            contacts.push(contact.clone());
         }
     }
-    for device in issuer_devices.iter().chain(siblings.iter()) {
+    for (device, identity) in issuer_devices
+        .iter()
+        .map(|device| (device, issuer))
+        .chain(siblings.iter().map(|device| (device, identity)))
+    {
         if covered.insert(*device.as_bytes()) {
-            contacts.push(EndpointAddr::new(EndpointId::from_bytes(
-                device.as_bytes(),
-            )?));
+            contacts.push(Contact::new(
+                EndpointAddr::new(EndpointId::from_bytes(device.as_bytes())?),
+                identity_of(identity),
+            ));
         }
     }
     if contacts.is_empty() {
         return Ok(());
     }
-    state.node.set_namespace_contacts(issuer, contacts)
+    state
+        .node
+        .set_namespace_contacts(identity, issuer, contacts)
 }
 
-/// Whether another pair still holds `issuer`'s replica — by memo, or by a
-/// live readable grant record. The memo alone undercounts after a restart,
-/// so the decision that destroys a replica consults the records too.
-/// `Unreadable` does not hold: it would pin the replica forever, and a live
-/// grant gone uncounted re-imports on its own next sweep.
-async fn held_by_another_pair(state: &State, unbinding: (PdnId, PdnId), issuer: PdnId) -> bool {
-    let memoized = state
-        .bound_grants
-        .keys()
-        .any(|(identity, peer, bound)| *bound == issuer && (*identity, *peer) != unbinding);
-    if memoized {
-        return true;
-    }
-    for ((audience, peer), open) in &state.metadata_pairs {
-        if (*audience, *peer) == unbinding {
-            continue;
-        }
-        if let Ok(data_layer::GrantRead::Granted(..)) =
-            open.peer.read_grant(issuer, *audience).await
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Unbind the namespaces whose grant this pair no longer carries, bounded
-/// to what this binder brought in. The shared replica (ADR-0009) leaves
-/// with the last bound pair.
 async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live: &[PdnId]) {
-    let withdrawn: Vec<PdnId> = state
+    let withdrawn: Vec<(PdnId, data_layer::NamespaceId)> = state
         .bound_grants
-        .keys()
-        .filter(|(bound_identity, bound_peer, issuer)| {
+        .iter()
+        .filter(|((bound_identity, bound_peer, issuer), _namespace)| {
             *bound_identity == identity && *bound_peer == peer && !live.contains(issuer)
         })
-        .map(|(_identity, _peer, issuer)| *issuer)
+        .map(|((_identity, _peer, issuer), namespace)| (*issuer, *namespace))
         .collect();
-    for issuer in withdrawn {
+    for (issuer, imported) in withdrawn {
         // Forget first, prune second, and drop the memo only if the forget
         // went through: a failed forget keeps the retry, and markers pruned
         // ahead of it would take away the only thing that could re-arm
-        // them. A hosted identity's own namespace is never forgotten here.
-        if !state.is_hosted(issuer) && !held_by_another_pair(state, (identity, peer), issuer).await
-        {
-            match state.node.forget_namespace(issuer).await {
+        // them. The replica belongs to the identity this grant addresses,
+        // so the pair that was swept decides alone. Own against granted is
+        // the pair of ids, never what else the node hosts (ADR-0013): the
+        // identity's own namespace is registered under its own id, and
+        // only a forget naming it on both sides could take it away.
+        if issuer != identity {
+            // Only the replica this binder imported: one another route has
+            // bound to the issuer since is not the grant's to take.
+            let forgotten = match state.node.data_namespace_of(identity, issuer) {
+                Ok(Some(current)) if current == imported => {
+                    state.node.forget_namespace(identity, issuer).await
+                }
+                Ok(_other) => Ok(()),
+                Err(err) => Err(err),
+            };
+            match forgotten {
                 Ok(()) => {}
                 Err(err) if err.downcast_ref::<data_layer::UnknownIssuer>().is_some() => {}
                 Err(err) => {
@@ -610,8 +597,6 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
                 }
             }
         }
-        // Markers leave with the grant binding, whether the replica stayed
-        // with another pair or left with this one.
         if let Ok(hosted) = state.hosted(identity) {
             let _cold_until_next_sweep = hosted.directory.prune_retractions(issuer).await;
         }
@@ -677,7 +662,7 @@ pub(crate) async fn ensure_own_device_confirmed(state: &mut State, identity: Pdn
 /// the replica and the `data` ticket while its registry starts empty. The
 /// import is idempotent against a replica the store already holds.
 async fn bind_data_namespace(state: &mut State, identity: PdnId) {
-    match state.node.data_namespace_of(identity) {
+    match state.node.data_namespace_of(identity, identity) {
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return,
     }
@@ -691,7 +676,11 @@ async fn bind_data_namespace(state: &mut State, identity: PdnId) {
     else {
         return;
     };
-    if let Err(err) = state.node.import_namespace(identity, ticket).await {
+    if let Err(err) = state
+        .node
+        .import_namespace(identity, identity, ticket)
+        .await
+    {
         // Warn: an import that keeps failing leaves the identity hosted and
         // unreadable with nothing else to say so.
         tracing::warn!(%identity, "re-binding the data namespace failed: {err:#}");
@@ -725,20 +714,28 @@ async fn open_pair(
     // re-import of a still-current `own`.
     let own_namespace = own_ticket.capability.id();
     let peer_namespace = peer_ticket.capability.id();
-    let ticket_addressing = (own_ticket.nodes.clone(), peer_ticket.nodes.clone());
+    let ticket_addressing = (own_ticket.contacts(), peer_ticket.contacts());
     let cached = state.metadata_pairs.get(&(identity, peer)).cloned();
     let reuses_own = matches!(&cached, Some(pair) if pair.own.namespace() == own_namespace);
     let reuses_peer = matches!(&cached, Some(pair) if pair.peer.namespace() == peer_namespace);
     let own = match &cached {
         Some(pair) if reuses_own => pair.own.clone(),
-        _ => data_layer::ConnectionMetadataStore::import(&state.node, own_ticket).await?,
+        _ => data_layer::ConnectionMetadataStore::import(&state.node, identity, own_ticket).await?,
     };
     let peer_store = match &cached {
         Some(pair) if reuses_peer => pair.peer.clone(),
-        _ => match data_layer::ConnectionMetadataStore::import(&state.node, peer_ticket).await {
+        _ => match data_layer::ConnectionMetadataStore::import(&state.node, identity, peer_ticket)
+            .await
+        {
             Ok(store) => store,
             Err(err) => {
-                forget_imported(state, (!reuses_own).then_some(own_namespace), None).await;
+                forget_imported(
+                    state,
+                    identity,
+                    (!reuses_own).then_some(own_namespace),
+                    None,
+                )
+                .await;
                 return Err(err);
             }
         },
@@ -750,6 +747,7 @@ async fn open_pair(
     if let Err(err) = arm_open_pair(state, identity, peer, &pair, ticket_addressing).await {
         forget_imported(
             state,
+            identity,
             (!reuses_own).then_some(own_namespace),
             (!reuses_peer).then_some(peer_namespace),
         )
@@ -765,11 +763,12 @@ async fn open_pair(
 /// half taken from the cache is left alone.
 async fn forget_imported(
     state: &State,
+    identity: PdnId,
     own: Option<data_layer::NamespaceId>,
     peer: Option<data_layer::NamespaceId>,
 ) {
     for namespace in [own, peer].into_iter().flatten() {
-        if let Err(err) = state.node.forget_doc(namespace).await {
+        if let Err(err) = state.node.forget_doc(identity, namespace).await {
             tracing::warn!(%namespace, "a metadata half stayed open after a failed pair open: {err:#}");
         }
     }
@@ -783,7 +782,7 @@ async fn arm_open_pair(
     identity: PdnId,
     peer: PdnId,
     pair: &ConnectionMetadata,
-    ticket_addressing: (Vec<EndpointAddr>, Vec<EndpointAddr>),
+    ticket_addressing: (Vec<Contact>, Vec<Contact>),
 ) -> Result<()> {
     #[cfg(feature = "test-util")]
     if let Some(failures) = state.pair_arm_failures.as_mut() {
@@ -796,7 +795,7 @@ async fn arm_open_pair(
     state
         .node
         .host_connection(identity, peer, &pair.own, &pair.peer)?;
-    if let Err(err) = point_pair_at(state, identity, pair, ticket_addressing).await {
+    if let Err(err) = point_pair_at(state, identity, peer, pair, ticket_addressing).await {
         tracing::warn!(%identity, %peer, "the pair kept its import-time contacts: {err:#}");
     }
     Ok(())
@@ -819,14 +818,14 @@ async fn point_pair_at_its_devices(
     let own_nodes = directory
         .get_ticket(&data_layer::own_ticket_kind(&peer))
         .await?
-        .map(|ticket| ticket.nodes)
+        .map(|ticket| ticket.contacts())
         .unwrap_or_default();
     let peer_nodes = directory
         .get_ticket(&data_layer::peer_ticket_kind(&peer))
         .await?
-        .map(|ticket| ticket.nodes)
+        .map(|ticket| ticket.contacts())
         .unwrap_or_default();
-    point_pair_at(state, identity, pair, (own_nodes, peer_nodes)).await
+    point_pair_at(state, identity, peer, pair, (own_nodes, peer_nodes)).await
 }
 
 /// [`point_pair_at_its_devices`] for a caller that already holds what the
@@ -834,18 +833,28 @@ async fn point_pair_at_its_devices(
 async fn point_pair_at(
     state: &State,
     identity: PdnId,
+    peer: PdnId,
     pair: &ConnectionMetadata,
-    (own_nodes, peer_nodes): (Vec<EndpointAddr>, Vec<EndpointAddr>),
+    (own_nodes, peer_nodes): (Vec<Contact>, Vec<Contact>),
 ) -> Result<()> {
     let directory = &state.hosted(identity)?.directory;
-    let mut devices = directory.list_devices().await?;
-    devices.extend(pair.peer.published_devices().await?);
+    let siblings = directory.list_devices().await?;
+    let counterparty = pair.peer.published_devices().await?;
 
     let own_device = state.node.node_id();
-    let mut holders = Vec::new();
-    for device in devices.iter().filter(|device| **device != own_device) {
+    // A device is dialed as the identity it belongs to: this node's
+    // siblings act for `identity`, the counterparty's devices for `peer`.
+    let mut identities = Vec::new();
+    for (device, identity) in siblings
+        .iter()
+        .map(|device| (device, identity))
+        .chain(counterparty.iter().map(|device| (device, peer)))
+    {
+        if *device == own_device {
+            continue;
+        }
         match EndpointId::from_bytes(device.as_bytes()) {
-            Ok(id) => holders.push(EndpointAddr::new(id)),
+            Ok(id) => identities.push(Contact::new(EndpointAddr::new(id), identity_of(identity))),
             Err(err) => tracing::warn!(%device, "undialable device record: {err:#}"),
         }
     }
@@ -855,19 +864,21 @@ async fn point_pair_at(
     ] {
         // This device is covered first: a ticket it minted names it, and
         // the endpoint refuses a path to itself.
+        // Keyed by bytes, like the sweep's own set: a contact's address
+        // carries the endpoint's id and a device record this crate's.
         let mut seen: HashSet<[u8; 32]> = HashSet::from([*own_device.as_bytes()]);
         let mut contacts = Vec::new();
         for node in nodes {
-            if seen.insert(*node.id.as_bytes()) {
+            if seen.insert(*node.addr.id.as_bytes()) {
                 contacts.push(node);
             }
         }
-        for holder in &holders {
-            if seen.insert(*holder.id.as_bytes()) {
-                contacts.push(holder.clone());
+        for identity in &identities {
+            if seen.insert(*identity.addr.id.as_bytes()) {
+                contacts.push(identity.clone());
             }
         }
-        state.node.set_doc_contacts(namespace, contacts)?;
+        state.node.set_doc_contacts(identity, namespace, contacts)?;
     }
     Ok(())
 }

@@ -6,17 +6,20 @@
 //!
 //! Establishment (the pairing dialogue) lives in pdn-node; here the tickets
 //! travel by direct handover, exactly the store-level acts the dialogue and
-//! the directory perform.
+//! the directory perform. Registering the pair is what arms the ticket
+//! bound Invariant 3 gives these stores, so every scenario arms the halves
+//! it holds; a scenario that models one direction gets a locally created
+//! stand-in for the other, which takes no part in what it asserts.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, DocTicket, EndpointId, GrantedClaim,
-    PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
+    claim_id_of, identity_of, AddrInfoOptions, ConnectionMetadataStore, Contact, DocTicket,
+    EndpointId, GrantedClaim, PrivateMetadataStore, ReadGrant, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{EntryPath, NodeId, NonEmpty, PdnId};
-use test_utils::{eventually, ids, memory_node, wait_entry_is};
+use test_utils::{eventually, host_identity, ids, memory_node, wait_entry_is};
 
 /// A grantee replica has no gossip path, so every denial is "the reader
 /// retried over several intervals and was refused" — milliseconds at this
@@ -32,10 +35,39 @@ async fn spawn_node() -> Result<SyncNode> {
 }
 
 /// A real read ticket for grants to carry.
-async fn data_ticket(node: &mut SyncNode, issuer: PdnId) -> Result<DocTicket> {
-    node.create_namespace(issuer).await?;
-    node.share_ticket(issuer, ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await
+async fn data_ticket(node: &mut SyncNode, identity: PdnId, issuer: PdnId) -> Result<DocTicket> {
+    node.create_namespace(identity, issuer).await?;
+    node.share_ticket(
+        identity,
+        issuer,
+        ShareMode::Read,
+        AddrInfoOptions::RelayAndAddresses,
+    )
+    .await
+}
+
+/// Arm `own` as `identity`'s connection half toward `peer`, with a local
+/// stand-in for the direction the scenario does not model.
+async fn arm_own(
+    node: &SyncNode,
+    identity: PdnId,
+    peer: PdnId,
+    own: &ConnectionMetadataStore,
+) -> Result<()> {
+    let counterpart = ConnectionMetadataStore::create(node, identity).await?;
+    node.host_connection(identity, peer, own, &counterpart)
+}
+
+/// Arm `peer_half` as the counterparty's direction of `identity`'s
+/// connection toward `peer`, with a local stand-in for this side's own.
+async fn arm_peer(
+    node: &SyncNode,
+    identity: PdnId,
+    peer: PdnId,
+    peer_half: &ConnectionMetadataStore,
+) -> Result<()> {
+    let own = ConnectionMetadataStore::create(node, identity).await?;
+    node.host_connection(identity, peer, &own, peer_half)
 }
 
 /// The store carries a capability and never evaluates one, so one nominal
@@ -76,15 +108,21 @@ async fn wait_grant_is(
 /// before content: the handle reads absent at once and converges without
 /// re-import.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, both directions and the isolation in one place
 async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     let mut alice = memory_node().await?;
     let bob = memory_node().await?;
     let carol = memory_node().await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _carol_dir = host_identity(&carol, ids::CAROL).await?;
 
     // Alice issues one store per counterparty; Bob issues one toward Alice.
-    let a_own_b = ConnectionMetadataStore::create(&alice).await?;
-    let a_own_c = ConnectionMetadataStore::create(&alice).await?;
-    let b_own_a = ConnectionMetadataStore::create(&bob).await?;
+    let a_own_b = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
+    let a_own_c = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
+    let b_own_a = ConnectionMetadataStore::create(&bob, ids::BOB).await?;
+    arm_own(&alice, ids::ALICE, ids::BOB, &a_own_b).await?;
+    arm_own(&alice, ids::ALICE, ids::CAROL, &a_own_c).await?;
 
     // Every direction is its own replica: all three namespaces differ.
     let ns_toward_bob = a_own_b
@@ -115,18 +153,22 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     // exists, so the absent read below is deterministic.
     let b_peer_a = ConnectionMetadataStore::import(
         &bob,
+        ids::BOB,
         a_own_b
             .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
+    bob.host_connection(ids::BOB, ids::ALICE, &b_own_a, &b_peer_a)?;
     let c_peer_a = ConnectionMetadataStore::import(
         &carol,
+        ids::CAROL,
         a_own_c
             .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
+    arm_peer(&carol, ids::CAROL, ids::ALICE, &c_peer_a).await?;
 
     // Import binds before content arrives: the handle is usable at once and
     // reads return absent — nothing has been published yet.
@@ -138,8 +180,8 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     assert!(b_peer_a.list_grants().await?.is_empty());
 
     // Alice grants her data store toward Bob and a second one toward Carol.
-    let ticket_for_bob = data_ticket(&mut alice, ids::ALICE).await?;
-    let ticket_for_carol = data_ticket(&mut alice, ids::ALICE_AT_WORK).await?;
+    let ticket_for_bob = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
+    let ticket_for_carol = data_ticket(&mut alice, ids::ALICE, ids::ALICE_AT_WORK).await?;
     a_own_b
         .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &ticket_for_bob)
         .await?;
@@ -193,23 +235,32 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     let mut a_laptop = memory_node().await?;
     let b_phone = memory_node().await?;
     let b_laptop = memory_node().await?;
+    let _a_phone_dir = host_identity(&a_phone, ids::ALICE).await?;
+    let _a_laptop_dir = host_identity(&a_laptop, ids::ALICE).await?;
+    let _b_phone_dir = host_identity(&b_phone, ids::BOB).await?;
+    let _b_laptop_dir = host_identity(&b_laptop, ids::BOB).await?;
 
     // The laptop opens from the write ticket, Bob's devices from the read
     // ticket.
-    let own_phone = ConnectionMetadataStore::create(&a_phone).await?;
+    let own_phone = ConnectionMetadataStore::create(&a_phone, ids::ALICE).await?;
+    arm_own(&a_phone, ids::ALICE, ids::BOB, &own_phone).await?;
     let write_ticket = own_phone
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     let read_ticket = own_phone
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let own_laptop = ConnectionMetadataStore::import(&a_laptop, write_ticket).await?;
-    let peer_b_phone = ConnectionMetadataStore::import(&b_phone, read_ticket.clone()).await?;
-    let peer_b_laptop = ConnectionMetadataStore::import(&b_laptop, read_ticket).await?;
+    let own_laptop = ConnectionMetadataStore::import(&a_laptop, ids::ALICE, write_ticket).await?;
+    arm_own(&a_laptop, ids::ALICE, ids::BOB, &own_laptop).await?;
+    let peer_b_phone =
+        ConnectionMetadataStore::import(&b_phone, ids::BOB, read_ticket.clone()).await?;
+    arm_peer(&b_phone, ids::BOB, ids::ALICE, &peer_b_phone).await?;
+    let peer_b_laptop = ConnectionMetadataStore::import(&b_laptop, ids::BOB, read_ticket).await?;
+    arm_peer(&b_laptop, ids::BOB, ids::ALICE, &peer_b_laptop).await?;
 
     // Written on the issuer's phone, read on the issuer's laptop and on
     // both of the counterparty's devices.
-    let first = data_ticket(&mut a_phone, ids::ALICE).await?;
+    let first = data_ticket(&mut a_phone, ids::ALICE, ids::ALICE).await?;
     own_phone
         .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &first)
         .await?;
@@ -226,7 +277,7 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
 
     // A grant published after the exchange crosses with no new tickets
     // handed over — the channel outlives the pairing moment.
-    let second = data_ticket(&mut a_phone, ids::ALICE_AT_WORK).await?;
+    let second = data_ticket(&mut a_phone, ids::ALICE, ids::ALICE_AT_WORK).await?;
     own_phone
         .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &second)
         .await?;
@@ -257,8 +308,8 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
 
     // Concurrent updates of one grant key from the issuer's two devices:
     // every device of both identities resolves to the same single entry.
-    let from_phone = data_ticket(&mut a_phone, ids::ALICE_AT_LEISURE).await?;
-    let from_laptop = data_ticket(&mut a_laptop, ids::ALICE_AT_LEISURE).await?;
+    let from_phone = data_ticket(&mut a_phone, ids::ALICE, ids::ALICE_AT_LEISURE).await?;
+    let from_laptop = data_ticket(&mut a_laptop, ids::ALICE, ids::ALICE_AT_LEISURE).await?;
     own_phone
         .publish_grant(&nominal_grant(ids::ALICE_AT_LEISURE, ids::BOB), &from_phone)
         .await?;
@@ -306,17 +357,22 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
 async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     let mut alice = memory_node().await?;
     let bob = memory_node().await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
 
     // Alice's own store toward Bob; Bob imports the read ticket.
-    let own = ConnectionMetadataStore::create(&alice).await?;
+    let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
+    arm_own(&alice, ids::ALICE, ids::BOB, &own).await?;
     let b_peer = ConnectionMetadataStore::import(
         &bob,
+        ids::BOB,
         own.share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
+    arm_peer(&bob, ids::BOB, ids::ALICE, &b_peer).await?;
 
-    let ticket = data_ticket(&mut alice, ids::ALICE).await?;
+    let ticket = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
     let email = EntryPath::new("contact/email")?;
     let grant = ReadGrant {
         issuer: ids::ALICE,
@@ -335,7 +391,7 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     );
 
     // Republished onto a second replica: the one record is replaced wholesale.
-    let replacement = data_ticket(&mut alice, ids::ALICE_AT_WORK).await?;
+    let replacement = data_ticket(&mut alice, ids::ALICE, ids::ALICE_AT_WORK).await?;
     own.publish_grant(&grant, &replacement).await?;
     assert!(
         wait_grant_is(&b_peer, ids::ALICE, ids::BOB, &replacement).await?,
@@ -375,20 +431,24 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
     let alice = memory_node().await?;
-    let directory = PrivateMetadataStore::create(&alice).await?;
-    directory.add_device(alice.node_id()).await?;
-    alice.create_namespace(ids::ALICE).await?;
+    let directory = host_identity(&alice, ids::ALICE).await?;
+    alice.create_namespace(ids::ALICE, ids::ALICE).await?;
     let data = alice
-        .share_ticket(ids::ALICE, ShareMode::Read, AddrInfoOptions::Addresses)
+        .share_ticket(
+            ids::ALICE,
+            ids::ALICE,
+            ShareMode::Read,
+            AddrInfoOptions::Addresses,
+        )
         .await?;
 
     assert!(
-        PrivateMetadataStore::open(&alice, data.capability.id())
+        PrivateMetadataStore::open(&alice, ids::ALICE, data.capability.id())
             .await
             .is_err(),
         "a data replica must not open as a device-shared store"
     );
-    let reopened = PrivateMetadataStore::open(&alice, directory.namespace())
+    let reopened = PrivateMetadataStore::open(&alice, ids::ALICE, directory.namespace())
         .await?
         .expect("the node holds its own directory replica");
     assert!(
@@ -407,20 +467,24 @@ async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     let alice = memory_node().await?;
-    let own = ConnectionMetadataStore::create(&alice).await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     let ticket = own
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
     assert!(
         alice
-            .import_namespace_scoped(ids::BOB, ticket.clone())
+            .import_namespace_scoped(ids::ALICE, ids::BOB, ticket.clone())
             .await
             .is_err(),
         "a scoped data import must refuse a device-shared replica's namespace"
     );
     assert!(
-        alice.import_namespace(ids::BOB, ticket).await.is_err(),
+        alice
+            .import_namespace(ids::ALICE, ids::BOB, ticket)
+            .await
+            .is_err(),
         "a device data import must refuse a device-shared replica's namespace"
     );
     // The store is untouched: still writable through its own surface.
@@ -431,6 +495,153 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     Ok(())
 }
 
+/// A grant record naming a foreign issuer over a namespace the identity
+/// already holds for itself is refused before it changes anything: the
+/// import is rejected and the replica keeps the contacts it was reconciling
+/// by. The registry refuses a second issuer on its own, but only after the
+/// tracking entry — keyed by namespace and overwritten blind — is already
+/// gone, and nothing puts it back.
+///
+/// Denied: both import paths, the grantee one and the device one, each
+/// naming an issuer the namespace is not bound to.
+///
+/// The ticket is minted here rather than carried by a grant record because
+/// a counterparty choosing what the record points at is the subject: the
+/// namespace id of any grant an identity ever published is known to its
+/// audience, and a read capability is that id.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_naming_another_issuer_is_refused_before_it_rewrites_tracking() -> Result<()> {
+    let mut alice = spawn_node().await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let own = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
+
+    // A sibling device of Alice's own, as the product's contacts name one.
+    let sibling_node = spawn_node().await?;
+    let sibling = Contact::new(sibling_node.dial_handle().addr(), identity_of(ids::ALICE));
+    alice.set_namespace_contacts(ids::ALICE, ids::ALICE, vec![sibling.clone()])?;
+
+    // What a counterparty publishes: a ticket on Alice's own namespace,
+    // carrying its own addressing, under a record naming a third issuer.
+    let counterparty = spawn_node().await?;
+    let mut planted = own.clone();
+    planted.nodes = vec![counterparty.dial_handle().addr()];
+
+    for (path, refused) in [
+        (
+            "grantee",
+            alice
+                .import_namespace_scoped(ids::ALICE, ids::CAROL, planted.clone())
+                .await,
+        ),
+        (
+            "device",
+            alice
+                .import_namespace(ids::ALICE, ids::CAROL, planted.clone())
+                .await,
+        ),
+    ] {
+        // Denied (a record naming an issuer the namespace is not bound to).
+        assert!(
+            refused.is_err(),
+            "the {path} import took a namespace bound to another issuer"
+        );
+    }
+
+    assert_eq!(
+        alice.namespace_contacts(ids::ALICE, ids::ALICE)?,
+        vec![sibling],
+        "the refused import rewrote the contacts of the identity's own replica"
+    );
+    assert_eq!(
+        alice.data_namespace_of(ids::ALICE, ids::ALICE)?,
+        Some(own.capability.id()),
+        "the refused import moved the identity's own binding"
+    );
+    assert!(
+        alice.data_namespace_of(ids::ALICE, ids::CAROL)?.is_none(),
+        "the refused import registered the issuer it named"
+    );
+
+    alice.shutdown().await?;
+    sibling_node.shutdown().await?;
+    counterparty.shutdown().await?;
+    Ok(())
+}
+
+/// A ticket naming a namespace the identity already holds in another role
+/// is refused as a device-shared import, and a namespace it holds in none
+/// is imported as before. A device-shared store is served on its ticket
+/// alone (Invariants 1 and 3), so honoring such a ticket would hand the
+/// replica over entire, past the grant that bounds it.
+///
+/// Denied: three roles in turn — the identity's own data replica, a
+/// replica it holds under a grant, and its directory — each offered the
+/// way a counterparty offers its connection metadata store.
+///
+/// The tickets are minted here rather than handed over by a ceremony
+/// because a counterparty choosing the namespace is the subject: a read
+/// capability is the namespace id, so anyone who learns one can mint the
+/// ticket this test refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_held_in_another_role_refuses_a_device_shared_import() -> Result<()> {
+    let mut alice = spawn_node().await?;
+    let directory = host_identity(&alice, ids::ALICE).await?;
+
+    // The identity's own data replica, and one it holds under a grant.
+    let own_data = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
+    let mut bob = spawn_node().await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let bobs_data = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
+    alice
+        .import_namespace_scoped(ids::ALICE, ids::BOB, bobs_data.clone())
+        .await?;
+
+    let directory_ticket = directory
+        .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
+        .await?;
+
+    let own_data_namespace = own_data.capability.id();
+    for (role, ticket) in [
+        ("its own data replica", own_data),
+        ("a replica held under a grant", bobs_data),
+        ("its directory", directory_ticket),
+    ] {
+        // Denied (a counterparty naming a namespace already in use).
+        assert!(
+            ConnectionMetadataStore::import(&alice, ids::ALICE, ticket)
+                .await
+                .is_err(),
+            "{role} was repurposed as a device-shared store"
+        );
+    }
+
+    // Allowed: a namespace in no other role imports as before, and the
+    // data replica the first denial protected still reads back.
+    let fresh = ConnectionMetadataStore::create(&bob, ids::BOB).await?;
+    let imported = ConnectionMetadataStore::import(
+        &alice,
+        ids::ALICE,
+        fresh
+            .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
+            .await?,
+    )
+    .await?;
+    assert_eq!(
+        imported.namespace(),
+        fresh.namespace(),
+        "a namespace held in no other role must import as the counterparty's store"
+    );
+    assert_eq!(
+        alice.data_namespace_of(ids::ALICE, ids::ALICE)?,
+        Some(own_data_namespace),
+        "the identity's data replica lost its binding to a refused import"
+    );
+
+    alice.shutdown().await?;
+    bob.shutdown().await?;
+    Ok(())
+}
+
 /// Opening a pair does not resurrect a withdrawn device record: a first
 /// touch publishes, a tombstone holds, and deliberate re-assertion
 /// (`publish_device`) is a distinct act. The tombstone is an agreement
@@ -438,7 +649,8 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Result<()> {
     let alice = memory_node().await?;
-    let own = ConnectionMetadataStore::create(&alice).await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     let device = alice.node_id();
 
     // First touch publishes.
@@ -471,7 +683,8 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
 #[tokio::test(flavor = "multi_thread")]
 async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
     let alice = memory_node().await?;
-    let own = ConnectionMetadataStore::create(&alice).await?;
+    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
 
     let device = alice.node_id();
     own.publish_device(device).await?;
@@ -504,36 +717,48 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     let mut a_laptop = memory_node().await?;
     let mut bob = memory_node().await?;
     let carol = memory_node().await?;
+    let _a_phone_dir = host_identity(&a_phone, ids::ALICE).await?;
+    let _a_laptop_dir = host_identity(&a_laptop, ids::ALICE).await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _carol_dir = host_identity(&carol, ids::CAROL).await?;
 
     // The A→B pair: laptop on the write ticket, Bob on the read ticket.
-    let own_b_phone = ConnectionMetadataStore::create(&a_phone).await?;
+    let own_b_phone = ConnectionMetadataStore::create(&a_phone, ids::ALICE).await?;
+    arm_own(&a_phone, ids::ALICE, ids::BOB, &own_b_phone).await?;
     let own_b_laptop = ConnectionMetadataStore::import(
         &a_laptop,
+        ids::ALICE,
         own_b_phone
             .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
+    arm_own(&a_laptop, ids::ALICE, ids::BOB, &own_b_laptop).await?;
     let b_peer = ConnectionMetadataStore::import(
         &bob,
+        ids::BOB,
         own_b_phone
             .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
+    arm_peer(&bob, ids::BOB, ids::ALICE, &b_peer).await?;
 
     // Carol shares state with Alice too — her own pair, a distinct replica.
-    let own_toward_carol = ConnectionMetadataStore::create(&a_phone).await?;
+    let own_toward_carol = ConnectionMetadataStore::create(&a_phone, ids::ALICE).await?;
+    arm_own(&a_phone, ids::ALICE, ids::CAROL, &own_toward_carol).await?;
     let c_peer = ConnectionMetadataStore::import(
         &carol,
+        ids::CAROL,
         own_toward_carol
             .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
+    arm_peer(&carol, ids::CAROL, ids::ALICE, &c_peer).await?;
 
     // Allowed: the issuer's second device writes, the counterparty reads.
-    let from_laptop = data_ticket(&mut a_laptop, ids::ALICE_AT_WORK).await?;
+    let from_laptop = data_ticket(&mut a_laptop, ids::ALICE, ids::ALICE_AT_WORK).await?;
     own_b_laptop
         .publish_grant(&nominal_grant(ids::ALICE_AT_WORK, ids::BOB), &from_laptop)
         .await?;
@@ -544,7 +769,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
 
     // Denied: the counterparty holds only the read ticket — its write is
     // refused outright.
-    let bob_ticket = data_ticket(&mut bob, ids::BOB).await?;
+    let bob_ticket = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
     assert!(
         b_peer
             .publish_grant(&nominal_grant(ids::BOB, ids::ALICE), &bob_ticket)
@@ -556,7 +781,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     // ...and created no entry: a later legitimate write converges — so
     // replication demonstrably flowed after the refusal — while the refused
     // key reads absent at the issuer and at the counterparty itself.
-    let sentinel = data_ticket(&mut a_phone, ids::ALICE).await?;
+    let sentinel = data_ticket(&mut a_phone, ids::ALICE, ids::ALICE).await?;
     own_b_phone
         .publish_grant(&nominal_grant(ids::ALICE, ids::BOB), &sentinel)
         .await?;
@@ -577,7 +802,7 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
 
     // Denied: Carol's store carries exactly what Alice granted her, none of
     // Bob's grants.
-    let for_carol = data_ticket(&mut a_phone, ids::ALICE_AT_LEISURE).await?;
+    let for_carol = data_ticket(&mut a_phone, ids::ALICE, ids::ALICE_AT_LEISURE).await?;
     own_toward_carol
         .publish_grant(
             &nominal_grant(ids::ALICE_AT_LEISURE, ids::CAROL),
@@ -621,11 +846,14 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     Ok(())
 }
 
-/// The sibling path preserves the issuer's scope (withheld entries stay
-/// hidden although the serving device holds them), refuses a device listed
+/// The sibling path preserves the issuer's scope, refuses a device listed
 /// only in a co-located identity's directory, and honors the withdrawal
-/// from the next session while retaining what was delivered. Every denial
-/// is ordered after a write that demonstrably reached the audience.
+/// from the next session while retaining what was delivered.
+///
+/// Denied: the intruder resolves in the co-located identity's directory
+/// alone, so the phone refuses it although it holds the replica; and
+/// after the withdrawal neither device advances. Every denial is ordered
+/// after a write that demonstrably reached the audience.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, allowed and denied sides in one place
 async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
@@ -636,25 +864,27 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
 
     // Alice's directory lists her devices. A co-located second identity's
     // directory — hosted on the same phone — lists the intruder.
-    let directory = PrivateMetadataStore::create(&a_phone).await?;
-    directory.add_device(a_phone.node_id()).await?;
+    let directory = host_identity(&a_phone, ids::ALICE).await?;
     directory.add_device(a_laptop.node_id()).await?;
-    a_phone.host_identity(ids::ALICE, &directory)?;
-    let leisure_dir = PrivateMetadataStore::create(&a_phone).await?;
+    let leisure_dir = host_identity(&a_phone, ids::ALICE_AT_LEISURE).await?;
     leisure_dir.add_device(intruder.node_id()).await?;
-    a_phone.host_identity(ids::ALICE_AT_LEISURE, &leisure_dir)?;
+    let laptop_dir = host_identity(&a_laptop, ids::ALICE).await?;
+    laptop_dir.add_device(a_phone.node_id()).await?;
+    let _intruder_dir = host_identity(&intruder, ids::ALICE_AT_LEISURE).await?;
 
     // Bob's namespace holds a granted claim and a withheld one; his store
     // toward Alice carries a scoped grant on the granted claim alone.
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
     let email = EntryPath::new("contact/email")?;
     let withheld = EntryPath::new("contact/phone")?;
-    let data_read = data_ticket(&mut bob, ids::BOB).await?;
-    let author = bob.create_author().await?;
-    bob.write(ids::BOB, author, &email, b"bob@example.org")
+    let data_read = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
+    let author = bob.default_author(ids::BOB)?;
+    bob.write(ids::BOB, ids::BOB, author, &email, b"bob@example.org")
         .await?;
-    bob.write(ids::BOB, author, &withheld, b"+1-555-0100")
+    bob.write(ids::BOB, ids::BOB, author, &withheld, b"+1-555-0100")
         .await?;
-    let b_own = ConnectionMetadataStore::create(&bob).await?;
+    let b_own = ConnectionMetadataStore::create(&bob, ids::BOB).await?;
+    b_own.publish_device(bob.node_id()).await?;
     let grant = ReadGrant {
         issuer: ids::BOB,
         audience: ids::ALICE,
@@ -665,18 +895,28 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     };
     b_own.publish_grant(&grant, &data_read).await?;
 
-    // Bob's node is unarmed, so the phone holds the withheld entry too: the
-    // sibling filter must narrow the session regardless of what the serving
-    // device holds.
+    // The pair, as establishment leaves it: Alice publishes the phone in
+    // her own half, which is what makes Bob serve the phone at all.
+    let a_own = ConnectionMetadataStore::create(&a_phone, ids::ALICE).await?;
+    a_own.publish_device(a_phone.node_id()).await?;
     let phone_peer = ConnectionMetadataStore::import(
         &a_phone,
+        ids::ALICE,
         b_own
             .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await?,
     )
     .await?;
-    let a_own = ConnectionMetadataStore::create(&a_phone).await?;
     a_phone.host_connection(ids::ALICE, ids::BOB, &a_own, &phone_peer)?;
+    let bob_peer = ConnectionMetadataStore::import(
+        &bob,
+        ids::BOB,
+        a_own
+            .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await?,
+    )
+    .await?;
+    bob.host_connection(ids::BOB, ids::ALICE, &b_own, &bob_peer)?;
     assert!(
         eventually(|| async {
             Ok(phone_peer
@@ -688,64 +928,91 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
         .await?,
         "the scoped grant did not reach the phone"
     );
-    a_phone
-        .import_namespace_scoped(ids::BOB, data_read.clone())
-        .await?;
-    for (name, path, payload) in [
-        ("granted", &email, b"bob@example.org".as_slice()),
-        ("withheld", &withheld, b"+1-555-0100".as_slice()),
-    ] {
-        assert!(
-            wait_entry_is(&a_phone, ids::BOB, path, payload).await?,
-            "the {name} entry did not reach the phone from the unarmed issuer"
-        );
-    }
 
-    // The laptop's only contact is the phone: the sibling session serves
-    // exactly the claim set.
-    let phone_ticket = a_phone
-        .share_ticket(
-            ids::BOB,
-            ShareMode::Read,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    a_laptop
-        .import_namespace_scoped(ids::BOB, phone_ticket.clone())
+    // Allowed: the phone receives exactly the granted claim from the
+    // armed issuer.
+    a_phone
+        .import_namespace_scoped(ids::ALICE, ids::BOB, data_read.clone())
         .await?;
     assert!(
-        wait_entry_is(&a_laptop, ids::BOB, &email, b"bob@example.org").await?,
+        wait_entry_is(&a_phone, ids::ALICE, ids::BOB, &email, b"bob@example.org").await?,
+        "the granted entry did not reach the phone"
+    );
+
+    // The laptop's only contact is the phone: the sibling session serves
+    // exactly the claim set. Bob's ticket is aimed at the phone by hand,
+    // since a grantee mints none.
+    let mut phone_ticket = data_read.clone();
+    phone_ticket.nodes = vec![a_phone.dial_handle().addr()];
+    phone_ticket.identity = identity_of(ids::ALICE);
+    a_laptop
+        .import_namespace_scoped(ids::ALICE, ids::BOB, phone_ticket.clone())
+        .await?;
+    assert!(
+        wait_entry_is(&a_laptop, ids::ALICE, ids::BOB, &email, b"bob@example.org").await?,
         "the granted entry did not reach the laptop through the sibling"
     );
 
     // A proven second wave through the same sibling: the update arrives,
     // the withheld entry still does not — hidden, not merely late.
-    bob.write(ids::BOB, author, &email, b"bob@new.example.org")
+    bob.write(ids::BOB, ids::BOB, author, &email, b"bob@new.example.org")
         .await?;
     assert!(
-        wait_entry_is(&a_laptop, ids::BOB, &email, b"bob@new.example.org").await?,
+        wait_entry_is(
+            &a_laptop,
+            ids::ALICE,
+            ids::BOB,
+            &email,
+            b"bob@new.example.org"
+        )
+        .await?,
         "the granted update did not reach the laptop through the sibling"
     );
-    assert!(a_laptop.read(ids::BOB, &withheld).await?.is_none());
+    assert!(a_laptop
+        .read(ids::ALICE, ids::BOB, &withheld)
+        .await?
+        .is_none());
+    assert!(a_phone
+        .read(ids::ALICE, ids::BOB, &withheld)
+        .await?
+        .is_none());
 
     // Denied: the intruder resolves only in the co-located identity's
     // directory. Bob's next update reaching the laptop orders the refusal
     // after a window in which the phone demonstrably serves the audience.
     intruder
-        .import_namespace_scoped(ids::BOB, phone_ticket)
+        .import_namespace_scoped(ids::ALICE_AT_LEISURE, ids::BOB, phone_ticket)
         .await?;
-    bob.write(ids::BOB, author, &email, b"bob@sentinel.example.org")
-        .await?;
+    bob.write(
+        ids::BOB,
+        ids::BOB,
+        author,
+        &email,
+        b"bob@sentinel.example.org",
+    )
+    .await?;
     assert!(
-        wait_entry_is(&a_laptop, ids::BOB, &email, b"bob@sentinel.example.org").await?,
+        wait_entry_is(
+            &a_laptop,
+            ids::ALICE,
+            ids::BOB,
+            &email,
+            b"bob@sentinel.example.org"
+        )
+        .await?,
         "the sentinel update did not reach the audience laptop"
     );
     tokio::time::sleep(RECONCILE * 3).await;
-    assert!(intruder.read(ids::BOB, &email).await?.is_none());
-    assert!(intruder.list(ids::BOB, None).await?.is_empty());
+    assert!(intruder
+        .read(ids::ALICE_AT_LEISURE, ids::BOB, &email)
+        .await?
+        .is_none());
+    assert!(intruder
+        .list(ids::ALICE_AT_LEISURE, ids::BOB, None)
+        .await?
+        .is_empty());
 
-    // Withdrawal: the phone, served whole by the unarmed issuer, still
-    // converges; the laptop keeps what it was delivered and never advances.
+    // Withdrawal: neither device advances past what it was delivered.
     b_own.withdraw_grant(ids::BOB).await?;
     assert!(
         eventually(|| async {
@@ -758,20 +1025,17 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
         .await?,
         "the withdrawal did not reach the phone"
     );
-    bob.write(ids::BOB, author, &email, b"bob@after-withdrawal")
+    bob.write(ids::BOB, ids::BOB, author, &email, b"bob@after-withdrawal")
         .await?;
-    assert!(
-        wait_entry_is(&a_phone, ids::BOB, &email, b"bob@after-withdrawal").await?,
-        "the post-withdrawal write did not reach the phone"
-    );
-    tokio::time::sleep(RECONCILE * 3).await;
-    assert!(
-        a_laptop
-            .read(ids::BOB, &email)
-            .await?
-            .is_some_and(|p| p == b"bob@sentinel.example.org"),
-        "the laptop advanced past its last-granted value after withdrawal"
-    );
+    tokio::time::sleep(RECONCILE * 6).await;
+    for (name, node) in [("phone", &a_phone), ("laptop", &a_laptop)] {
+        assert!(
+            node.read(ids::ALICE, ids::BOB, &email)
+                .await?
+                .is_some_and(|p| p == b"bob@sentinel.example.org"),
+            "the {name} advanced past its last-granted value after withdrawal"
+        );
+    }
 
     a_phone.shutdown().await?;
     a_laptop.shutdown().await?;

@@ -66,7 +66,7 @@ async fn assert_recovered(
     );
     // What was acknowledged before the stop reads back — polled, because
     // the data namespace re-binds on the armer's first sweep.
-    entry_reads(issuer, alice, "contact/email", previous)
+    entry_reads(issuer, alice, alice, "contact/email", previous)
         .await
         .context("the entry acknowledged before the stop did not read back")?;
     // The recovered connection carries a fresh write to the counterparty —
@@ -74,12 +74,12 @@ async fn assert_recovered(
     // or linked a device.
     issuer
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(sentinel),
         )
         .await?
         .ok()?;
-    entry_reads(audience, alice, "contact/email", sentinel)
+    entry_reads(audience, bob, alice, "contact/email", sentinel)
         .await
         .context("the counterparty did not converge with the restarted node")?;
     // The grant published before the stop still stands on the audience.
@@ -123,7 +123,7 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
         .ok()?;
     issuer
         .put(
-            &format!("/debug/data/{alice}/contact/email"),
+            &format!("/debug/data/{alice}/{alice}/contact/email"),
             body(b"before the stop"),
         )
         .await?
@@ -132,7 +132,7 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
         .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
         .await?
         .ok()?;
-    entry_reads(&audience, alice, "contact/email", b"before the stop")
+    entry_reads(&audience, bob, alice, "contact/email", b"before the stop")
         .await
         .context("the audience never read the granted entry before the stop")?;
     let id_before = node_id(&issuer).await?;
@@ -207,7 +207,7 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
         "a fresh node must host nothing: {hosted:?}"
     );
     let refused = fresh
-        .get(&format!("/debug/data/{alice}/contact/email"))
+        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
         .await?;
     ensure!(
         refused.status == StatusCode::CONFLICT,
@@ -263,7 +263,7 @@ async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
             loop {
                 let put = node
                     .put(
-                        &format!("/debug/data/{alice}/stream/{index:04}"),
+                        &format!("/debug/data/{alice}/{alice}/stream/{index:04}"),
                         format!("value-{index:04}").into_bytes(),
                     )
                     .await;
@@ -330,6 +330,7 @@ async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
         entry_reads(
             &node,
             alice,
+            alice,
             &format!("stream/{index:04}"),
             format!("value-{index:04}").as_bytes(),
         )
@@ -341,7 +342,7 @@ async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
     // partial and never an error the surface cannot name.
     for index in settled..=cut_at {
         let cut = node
-            .get(&format!("/debug/data/{alice}/stream/{index:04}"))
+            .get(&format!("/debug/data/{alice}/{alice}/stream/{index:04}"))
             .await?;
         let whole =
             cut.status == StatusCode::OK && cut.body == format!("value-{index:04}").as_bytes();
@@ -386,7 +387,7 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
     for index in 0..256usize {
         let answer = node
             .put(
-                &format!("/debug/data/{alice}/fill/{index:04}"),
+                &format!("/debug/data/{alice}/{alice}/fill/{index:04}"),
                 payload_for(index),
             )
             .await?;
@@ -407,7 +408,9 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
     // The refused write is not stored: reading it back must not answer the
     // payload as if it were.
     let read = node
-        .get(&format!("/debug/data/{alice}/fill/{refused_index:04}"))
+        .get(&format!(
+            "/debug/data/{alice}/{alice}/fill/{refused_index:04}"
+        ))
         .await?;
     ensure!(
         !(read.status == StatusCode::OK && read.body == payload_for(refused_index)),

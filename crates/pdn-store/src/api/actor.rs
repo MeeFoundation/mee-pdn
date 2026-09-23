@@ -33,14 +33,20 @@ pub(crate) struct RpcActor {
 }
 
 impl RpcActor {
-    pub(crate) fn spawn(engine: Arc<Engine>) -> DocsApi {
+    /// The actor holds the engine, and a handle into the API can sit
+    /// inside something the engine holds, so the task is returned for its
+    /// owner to stop rather than left to end with its last client.
+    pub(crate) fn spawn(engine: Arc<Engine>) -> (DocsApi, task::AbortOnDropHandle<()>) {
         let (tx, rx) = tokio_mpsc::channel(64);
         let actor = Self { recv: rx, engine };
-        task::spawn(actor.run());
+        let running = task::AbortOnDropHandle::new(task::spawn(actor.run()));
         let local = LocalSender::<DocsProtocol>::from(tx);
-        DocsApi {
-            inner: local.into(),
-        }
+        (
+            DocsApi {
+                inner: local.into(),
+            },
+            running,
+        )
     }
 
     pub(crate) async fn run(mut self) {
@@ -417,13 +423,17 @@ impl RpcActor {
                 crate::Capability::Write(secret)
             }
         };
-        self.start_sync(doc_id, vec![])
+        // Restates this store's identity as whom recorded peers are dialed as:
+        // a document whose default names another identity — a grantee
+        // replica, a connection's peer store — must not be shared.
+        self.start_sync(doc_id, vec![], self.identity())
             .await
             .map_err(|e| RpcError::new(&*e))?;
 
         Ok(ShareResponse(DocTicket {
             capability,
             nodes: vec![me],
+            identity: self.identity(),
         }))
     }
 
@@ -484,14 +494,15 @@ impl RpcActor {
         let StartSyncRequest {
             doc_id,
             peers,
+            default_identity,
             join_gossip,
         } = req;
         if join_gossip {
-            self.start_sync(doc_id, peers)
+            self.start_sync(doc_id, peers, default_identity)
                 .await
                 .map_err(|e| RpcError::new(&*e))?;
         } else {
-            self.start_sync_scoped(doc_id, peers)
+            self.start_sync_scoped(doc_id, peers, default_identity)
                 .await
                 .map_err(|e| RpcError::new(&*e))?;
         }

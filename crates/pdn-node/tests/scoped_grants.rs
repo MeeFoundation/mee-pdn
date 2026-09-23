@@ -4,9 +4,9 @@
 //! capability-filtered reconciliation delivers exactly the granted
 //! subset — with the paired denials of
 //! `code-practices/access-control-tests.md` probed in the same place: the
-//! outsider (no connection, no ticket — refused as unknown), the holder of
+//! outsider (no connection, no ticket — refused as unknown), the identity of
 //! the replica's leaked ticket without a grant (obtains nothing), the
-//! existence-hidden withheld claims, and the read-only holder's refused
+//! existence-hidden withheld claims, and the read-only identity's refused
 //! write.
 
 use std::{cell::RefCell, time::Duration};
@@ -62,7 +62,7 @@ async fn scoped_grant_patiently(
 
 /// Allowed: X grants Y read on exactly one claim, and Y converges on
 /// exactly that entry, updates included. Denied: an outsider with no
-/// connection and no ticket is refused as unknown; a holder of the leaked
+/// connection and no ticket is refused as unknown; a identity of the leaked
 /// ticket without a grant obtains nothing; X's other entries never reach Y
 /// (existence hidden); Y's read-only ticket carries no namespace secret, so
 /// its local write is refused.
@@ -74,7 +74,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
     let rt_c = spawn_runtime().await?;
     let x = rt_a.identity().create().await?;
     let y = rt_b.identity().create().await?;
-    let _z = rt_c.identity().create().await?;
+    let z = rt_c.identity().create().await?;
 
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_b, y, &rt_a, x, invite).await?;
@@ -87,7 +87,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
         ("notes/diary", b"dear diary".as_slice()),
     ] {
         rt_a.data()
-            .write(x, &EntryPath::new(path)?, payload)
+            .write(x, x, &EntryPath::new(path)?, payload)
             .await?;
     }
 
@@ -104,7 +104,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
 
     // Denied (outsider): refused as specifically unknown before holding any
     // ticket.
-    let outsider_err = rt_c.data().read(x, &email).await.unwrap_err();
+    let outsider_err = rt_c.data().read(z, x, &email).await.unwrap_err();
     assert!(
         outsider_err.downcast_ref::<UnknownIssuer>().is_some(),
         "an outsider must be refused as unknown, got: {outsider_err:?}"
@@ -113,12 +113,12 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
     // The leaked ticket, imported scoped on the third runtime: X's book
     // resolves it to no device and no grant. Asserted below, after the
     // proven second wave.
-    rt_c.data().import_scoped(x, leaked_ticket).await?;
+    rt_c.data().import_scoped(z, x, leaked_ticket).await?;
 
     // Allowed: exactly the granted entry converges.
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, &email).await?.as_deref() == Some(&b"x@example.org"[..]))
+            Ok(rt_b.data().read(y, x, &email).await?.as_deref() == Some(&b"x@example.org"[..]))
         })
         .await?,
         "the granted entry did not reach the granted peer"
@@ -127,25 +127,27 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
     // Denied (read-only cannot write): refused, and nothing acquired by it —
     // neither side's value moves.
     assert!(
-        rt_b.data().write(x, &email, b"overwrite").await.is_err(),
+        rt_b.data().write(y, x, &email, b"overwrite").await.is_err(),
         "a write through a read-only scoped grant must be refused"
     );
     assert_eq!(
-        rt_b.data().read(x, &email).await?.as_deref(),
+        rt_b.data().read(y, x, &email).await?.as_deref(),
         Some(&b"x@example.org"[..]),
         "the refused write must not touch the grantee's own replica"
     );
     assert_eq!(
-        rt_a.data().read(x, &email).await?.as_deref(),
+        rt_a.data().read(x, x, &email).await?.as_deref(),
         Some(&b"x@example.org"[..]),
         "the refused write must never reach the issuer"
     );
 
     // Sentinel: a proven second wave orders the absence assertions below.
-    rt_a.data().write(x, &email, b"x@new.example.org").await?;
+    rt_a.data()
+        .write(x, x, &email, b"x@new.example.org")
+        .await?;
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, &email).await?.as_deref() == Some(&b"x@new.example.org"[..]))
+            Ok(rt_b.data().read(y, x, &email).await?.as_deref() == Some(&b"x@new.example.org"[..]))
         })
         .await?,
         "the sentinel update did not reach the granted peer"
@@ -154,7 +156,7 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
     // Denied (existence hidden).
     let listed: Vec<String> = rt_b
         .data()
-        .list(x, None)
+        .list(y, x, None)
         .await?
         .into_iter()
         .map(|e| e.path.to_string())
@@ -169,10 +171,10 @@ async fn scoped_grant_flows_through_the_services() -> Result<()> {
     // second wave make this "tried and refused".
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
-        rt_c.data().list(x, None).await?.is_empty(),
+        rt_c.data().list(z, x, None).await?.is_empty(),
         "a leaked scoped ticket without a grant must deliver nothing"
     );
-    assert!(rt_c.data().read(x, &email).await?.is_none());
+    assert!(rt_c.data().read(z, x, &email).await?.is_none());
 
     rt_a.shutdown().await?;
     rt_b.shutdown().await?;

@@ -669,24 +669,33 @@ where
 /// Poll until reading `path` answers exactly `expected`; the failure names
 /// the last answer, since a bare timeout would collapse "not yet" and
 /// "refused".
-pub async fn entry_reads(host: &Host, issuer: PdnId, path: &str, expected: &[u8]) -> Result<()> {
-    poll_read(host, issuer, path, |answer| {
+pub async fn entry_reads(
+    host: &Host,
+    acting: PdnId,
+    issuer: PdnId,
+    path: &str,
+    expected: &[u8],
+) -> Result<()> {
+    poll_read(host, acting, issuer, path, |answer| {
         answer.status == StatusCode::OK && answer.body == expected
     })
     .await
-    .with_context(|| format!("{path} under {issuer} never read back as expected"))
+    .with_context(|| format!("{path} under {issuer} never read back as expected for {acting}"))
 }
 
 /// The wait for a read to stop working, as after a withdrawal.
 pub async fn entry_answers(
     host: &Host,
+    acting: PdnId,
     issuer: PdnId,
     path: &str,
     status: StatusCode,
 ) -> Result<()> {
-    poll_read(host, issuer, path, |answer| answer.status == status)
+    poll_read(host, acting, issuer, path, |answer| answer.status == status)
         .await
-        .with_context(|| format!("reading {path} under {issuer} never answered {status}"))
+        .with_context(|| {
+            format!("reading {path} under {issuer} as {acting} never answered {status}")
+        })
 }
 
 /// Poll until this host reads back the grant it serves the audience by;
@@ -719,11 +728,12 @@ pub async fn own_grant_reads(
 /// "no answer at all" and "the wrong answer" are different diagnoses.
 async fn poll_read(
     host: &Host,
+    acting: PdnId,
     issuer: PdnId,
     path: &str,
     holds: impl Fn(&Answer) -> bool,
 ) -> Result<()> {
-    let route = format!("/debug/data/{issuer}/{}", encode_path(path));
+    let route = format!("/debug/data/{acting}/{issuer}/{}", encode_path(path));
     let deadline = tokio::time::Instant::now() + CONVERGENCE_BUDGET;
     let mut last: Option<Answer> = None;
     loop {

@@ -5,7 +5,7 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::{Endpoint, PublicKey};
 use iroh_blobs::{
     api::{blobs::BlobStatus, downloader::Downloader, Store},
     store::{ProtectCb, ProtectOutcome},
@@ -23,13 +23,43 @@ pub use self::{
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, ContentStatus,
-    ContentStatusCallback, Entry, NamespaceId, RejectionObserver,
+    actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, Contact,
+    ContentStatus, ContentStatusCallback, Entry, Identity, NamespaceId, RejectionObserver,
 };
 
 mod gossip;
 mod live;
 mod state;
+
+/// What an engine asks of the node it runs in about that node's other
+/// identities. iroh refuses a connection to the endpoint's own id, and a
+/// node's own gossip broadcast never reaches its other subscribers, so both
+/// reach a co-located identity through the node or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoLocatedRequest {
+    /// An identity of this node wrote to a namespace locally.
+    Announce {
+        /// The namespace written to.
+        namespace: NamespaceId,
+        /// The identity whose replica holds the write.
+        writer: Identity,
+    },
+    /// A contact of a namespace names this node's own endpoint: reconcile
+    /// it between two identities of this node.
+    Dial {
+        /// The namespace to reconcile.
+        namespace: NamespaceId,
+        /// The identity whose engine holds the contact.
+        caller: Identity,
+        /// The identity the contact names.
+        callee: Identity,
+    },
+}
+
+/// The end of a channel an engine sends its [`CoLocatedRequest`]s into —
+/// the only thing of its node an engine holds, so nothing the node owns
+/// lives on through an engine the node owns.
+pub type CoLocatedRequests = mpsc::Sender<CoLocatedRequest>;
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
 const ACTOR_CHANNEL_CAP: usize = 64;
@@ -52,6 +82,14 @@ pub struct Engine {
     #[debug("ContentStatusCallback")]
     content_status_cb: ContentStatusCallback,
     blob_store: iroh_blobs::api::Store,
+    /// The identity every replica of this engine is held for.
+    identity: Identity,
+    /// Sessions opened over the in-process path, so a pass over a quiet
+    /// pair of co-located identities can be shown to open none.
+    in_process_sessions: Arc<std::sync::atomic::AtomicU64>,
+    /// Sessions handed to this engine over the in-process path, per caller,
+    /// so a dial can be shown to reach only the identity it named.
+    in_process_served: std::sync::Mutex<std::collections::HashMap<Identity, u64>>,
     _gc_protect_task: AbortOnDropHandle<()>,
 }
 
@@ -71,7 +109,9 @@ impl Engine {
         protect_cb: Option<ProtectCallbackHandler>,
         capability_validator: Option<CapabilityValidator>,
         rejection_observer: Option<RejectionObserver>,
-        session_access: Option<crate::filter::SessionAccessProvider>,
+        session_access: crate::filter::SessionAccessProvider,
+        identity: Identity,
+        co_located: Option<CoLocatedRequests>,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -123,6 +163,7 @@ impl Engine {
             }
         }));
 
+        let in_process_sessions = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let actor = LiveActor::new(
             sync.clone(),
             endpoint.clone(),
@@ -132,16 +173,22 @@ impl Engine {
             to_live_actor_recv,
             live_actor_tx.clone(),
             session_access,
+            identity,
+            Arc::clone(&in_process_sessions),
+            co_located,
             sync.metrics().clone(),
         )?;
-        let actor_handle = n0_future::task::spawn(
+        // Held from the spawn: the actor holds its node's request channel,
+        // so a bare handle dropped by a failed or cancelled spawn would
+        // leave the actor running for the rest of the process.
+        let actor_handle = AbortOnDropHandle::new(n0_future::task::spawn(
             async move {
                 if let Err(err) = actor.run().await {
                     error!("sync actor failed: {err:?}");
                 }
             }
             .instrument(error_span!("sync", %me)),
-        );
+        ));
 
         let default_author = match DefaultAuthor::load(default_author_storage, &sync).await {
             Ok(author) => author,
@@ -157,10 +204,13 @@ impl Engine {
             endpoint,
             sync,
             to_live_actor: live_actor_tx,
-            actor_handle: AbortOnDropHandle::new(actor_handle),
+            actor_handle,
             content_status_cb,
             default_author,
             blob_store: bao_store,
+            identity,
+            in_process_sessions,
+            in_process_served: std::sync::Mutex::default(),
             _gc_protect_task: gc_protect_task,
         })
     }
@@ -179,12 +229,18 @@ impl Engine {
     ///
     /// If `peers` is non-empty, it will both do an initial set-reconciliation sync with each peer,
     /// and join an iroh-gossip swarm with these peers to receive and broadcast document updates.
-    pub async fn start_sync(&self, namespace: NamespaceId, peers: Vec<EndpointAddr>) -> Result<()> {
+    pub async fn start_sync(
+        &self,
+        namespace: NamespaceId,
+        peers: Vec<Contact>,
+        default_identity: Identity,
+    ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
+                default_identity,
                 join_gossip: true,
                 reply,
             })
@@ -202,13 +258,15 @@ impl Engine {
     pub async fn start_sync_scoped(
         &self,
         namespace: NamespaceId,
-        peers: Vec<EndpointAddr>,
+        peers: Vec<Contact>,
+        default_identity: Identity,
     ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
+                default_identity,
                 join_gossip: false,
                 reply,
             })
@@ -289,12 +347,79 @@ impl Engine {
         Ok(a.or(b))
     }
 
-    /// Handle an incoming iroh-docs connection.
-    pub async fn handle_connection(&self, conn: iroh::endpoint::Connection) -> anyhow::Result<()> {
+    /// The identity every replica of this engine is held for.
+    pub fn identity(&self) -> Identity {
+        self.identity
+    }
+
+    /// Serve a connection dispatched here by the identity its first message
+    /// named. The connection travels with the session it carries: dropping
+    /// it at the dispatcher would cut the streams mid-exchange.
+    pub async fn handle_session(
+        &self,
+        conn: iroh::endpoint::Connection,
+        opening: crate::net::SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    ) -> anyhow::Result<()> {
         self.to_live_actor
-            .send(ToLiveActor::HandleConnection { conn })
+            .send(ToLiveActor::HandleSession { conn, opening })
             .await?;
         Ok(())
+    }
+
+    /// Open a session with a identity of this same node, over a pipe: iroh
+    /// refuses a connection to its own endpoint id, so co-located identities
+    /// meet here or not at all. `serve` is the callee's engine.
+    pub async fn sync_in_process(
+        &self,
+        serve: &Engine,
+        namespace: NamespaceId,
+        callee: Identity,
+    ) -> anyhow::Result<()> {
+        let (dialing, serving) = tokio::io::duplex(live::IN_PROCESS_PIPE_BYTES);
+        let (dial_recv, dial_send) = tokio::io::split(dialing);
+        let (serve_recv, serve_send) = tokio::io::split(serving);
+        let peer = self.endpoint.id();
+        // The callee reads the first message itself: the caller already
+        // resolved which engine holds the replica, so nothing dispatches
+        // between the two.
+        let opening = live::read_in_process_opening(serve_send, serve_recv, peer);
+        let (opening, ()) = tokio::join!(opening, async {
+            let _sent = self
+                .to_live_actor
+                .send(ToLiveActor::SyncInProcess {
+                    namespace,
+                    callee,
+                    peer,
+                    send: dial_send,
+                    recv: dial_recv,
+                })
+                .await;
+        });
+        let opening = opening?;
+        if let Ok(mut served) = serve.in_process_served.lock() {
+            *served.entry(self.identity).or_default() += 1;
+        }
+        serve
+            .to_live_actor
+            .send(ToLiveActor::AcceptInProcess { opening })
+            .await?;
+        Ok(())
+    }
+
+    /// Sessions this engine opened over the in-process path.
+    pub fn in_process_sessions(&self) -> u64 {
+        self.in_process_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sessions handed to this engine over the in-process path by the
+    /// engine of `caller`.
+    pub fn in_process_sessions_served(&self, caller: Identity) -> u64 {
+        self.in_process_served
+            .lock()
+            .ok()
+            .and_then(|served| served.get(&caller).copied())
+            .unwrap_or_default()
     }
 
     /// Shutdown the engine.

@@ -7,7 +7,9 @@ use data_layer::{
     AddrInfoOptions, DocTicket, PrivateMetadataStore, ShareMode, SyncNode, UnknownIssuer,
 };
 use pdn_types::{EntryPath, PdnId};
-use test_utils::{ids, memory_node, wait_connected, wait_devices, wait_entry_is};
+use test_utils::{
+    host_identity, ids, join_identity, memory_node, wait_connected, wait_devices, wait_entry_is,
+};
 
 /// Bring one identity up on `phone` with its fixtures: a directory with the
 /// phone registered and a connection to `peer`, plus `value` at `path` in
@@ -20,12 +22,11 @@ async fn provision_with_fixtures(
     path: &EntryPath,
     value: &[u8],
 ) -> Result<(PrivateMetadataStore, DocTicket)> {
-    let directory = PrivateMetadataStore::create(phone).await?;
-    directory.add_device(phone.node_id()).await?;
+    let directory = host_identity(phone, issuer).await?;
     directory.connect(peer).await?;
-    let author = phone.create_author().await?;
-    phone.create_namespace(issuer).await?;
-    phone.write(issuer, author, path, value).await?;
+    let author = phone.default_author(issuer)?;
+    phone.create_namespace(issuer, issuer).await?;
+    phone.write(issuer, issuer, author, path, value).await?;
     let ticket = directory
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -33,9 +34,14 @@ async fn provision_with_fixtures(
 }
 
 /// Bring the identity behind `ticket` up on `node`, as device linking does
-/// at the store level: import the directory and join the device set.
-async fn join_from(node: &SyncNode, ticket: DocTicket) -> Result<PrivateMetadataStore> {
-    let directory = PrivateMetadataStore::import(node, ticket).await?;
+/// at the store level: bring up the identity's stores, import the
+/// directory and join the device set.
+async fn join_from(
+    node: &SyncNode,
+    identity: PdnId,
+    ticket: DocTicket,
+) -> Result<PrivateMetadataStore> {
+    let directory = join_identity(node, identity, ticket).await?;
     directory.add_device(node.node_id()).await?;
     Ok(directory)
 }
@@ -43,9 +49,14 @@ async fn join_from(node: &SyncNode, ticket: DocTicket) -> Result<PrivateMetadata
 /// Hand `issuer`'s data namespace from one node to another by ticket.
 async fn import_data_from(from: &SyncNode, to: &mut SyncNode, issuer: PdnId) -> Result<()> {
     let ticket = from
-        .share_ticket(issuer, ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(
+            issuer,
+            issuer,
+            ShareMode::Write,
+            AddrInfoOptions::RelayAndAddresses,
+        )
         .await?;
-    to.import_namespace(issuer, ticket).await?;
+    to.import_namespace(issuer, issuer, ticket).await?;
     Ok(())
 }
 
@@ -55,6 +66,7 @@ async fn import_data_from(from: &SyncNode, to: &mut SyncNode, issuer: PdnId) -> 
 /// asymmetric (work: three, leisure: two), and the tablet knows nothing of
 /// the leisure identity.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, three devices and two identities in one place
 async fn three_devices_two_identities() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;
 
@@ -85,11 +97,18 @@ async fn three_devices_two_identities() -> Result<()> {
 
     // Laptop joins both identities from phone's tickets and imports the
     // work data namespace.
-    let work_laptop_dir = join_from(&laptop, work_ticket).await?;
-    let leisure_laptop_dir = join_from(&laptop, leisure_ticket).await?;
+    let work_laptop_dir = join_from(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
+    let leisure_laptop_dir = join_from(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
     import_data_from(&phone, &mut laptop, ids::ALICE_AT_WORK).await?;
     assert!(
-        wait_entry_is(&laptop, ids::ALICE_AT_WORK, &path, b"Acme Engineering").await?,
+        wait_entry_is(
+            &laptop,
+            ids::ALICE_AT_WORK,
+            ids::ALICE_AT_WORK,
+            &path,
+            b"Acme Engineering"
+        )
+        .await?,
         "work data did not reach laptop"
     );
 
@@ -98,7 +117,7 @@ async fn three_devices_two_identities() -> Result<()> {
     let tablet_ticket = work_laptop_dir
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let work_tablet_dir = join_from(&tablet, tablet_ticket).await?;
+    let work_tablet_dir = join_from(&tablet, ids::ALICE_AT_WORK, tablet_ticket).await?;
     import_data_from(&laptop, &mut tablet, ids::ALICE_AT_WORK).await?;
 
     // Transitive catch-up: state authored on phone reaches the tablet
@@ -108,7 +127,14 @@ async fn three_devices_two_identities() -> Result<()> {
         "the Bob connection did not reach the tablet"
     );
     assert!(
-        wait_entry_is(&tablet, ids::ALICE_AT_WORK, &path, b"Acme Engineering").await?,
+        wait_entry_is(
+            &tablet,
+            ids::ALICE_AT_WORK,
+            ids::ALICE_AT_WORK,
+            &path,
+            b"Acme Engineering"
+        )
+        .await?,
         "work data did not reach the tablet"
     );
 
@@ -143,8 +169,12 @@ async fn three_devices_two_identities() -> Result<()> {
         "the tablet leaked into the leisure device set"
     );
 
-    // And the tablet knows nothing of leisure: the namespace is unknown there.
-    let err = tablet.read(ids::ALICE_AT_LEISURE, &path).await.unwrap_err();
+    // And the tablet knows nothing of leisure: read as the identity it
+    // does host, the leisure issuer resolves to nothing there.
+    let err = tablet
+        .read(ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE, &path)
+        .await
+        .unwrap_err();
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
 
     phone.shutdown().await?;

@@ -4,7 +4,6 @@
 //! ingest refusal.
 
 use std::{
-    collections::HashSet,
     sync::Weak,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -46,27 +45,18 @@ pub(crate) fn spawn_retraction_consumer(
     });
 }
 
-/// The marker goes into the directory of every hosted identity granted by
-/// the issuer: one replica serves them all, and a marker reaches only the
-/// devices of the identity whose directory carries it.
+/// The marker goes into the directory of the identity whose replica holds
+/// the retracted entry — the identity the verdict itself names. A
+/// co-located identity's replica holds what its own grant covers, so a
+/// marker there would address entries this verdict never judged.
 async fn record_verdict(state: &State, verdict: &RetractionVerdict, decided_by: NodeId) {
-    let Ok(Some(issuer)) = state.node.issuer_of_namespace(verdict.namespace) else {
+    let identity = verdict.identity;
+    let Ok(Some(issuer)) = state
+        .node
+        .issuer_of_held_namespace(identity, verdict.namespace)
+    else {
         return;
     };
-    let identities: HashSet<PdnId> = state
-        .bound_grants
-        .keys()
-        .filter(|(_identity, _peer, bound_issuer)| *bound_issuer == issuer)
-        .map(|(identity, _peer, _issuer)| *identity)
-        .collect();
-    if identities.is_empty() {
-        tracing::warn!(
-            %issuer,
-            "a write was not accepted, but no hosted identity holds a grant on that issuer any \
-             more; nothing is recorded"
-        );
-        return;
-    }
     let Ok(path) = std::str::from_utf8(&verdict.key) else {
         return;
     };
@@ -76,7 +66,10 @@ async fn record_verdict(state: &State, verdict: &RetractionVerdict, decided_by: 
     // The verdict's fields are the refusing peer's word; only the local
     // record makes them true.
     if !matches!(
-        state.node.holds_rejected_entry(issuer, verdict).await,
+        state
+            .node
+            .holds_rejected_entry(identity, issuer, verdict)
+            .await,
         Ok(true)
     ) {
         return;
@@ -87,24 +80,21 @@ async fn record_verdict(state: &State, verdict: &RetractionVerdict, decided_by: 
         content_hash: *verdict.content_hash.as_bytes(),
         timestamp: verdict.timestamp,
     };
-    let mut recorded = false;
-    for identity in identities {
-        let Ok(hosted) = state.hosted(identity) else {
-            continue;
-        };
-        match hosted
-            .directory
-            .record_retraction(issuer, verdict.author, path.as_str(), &marker)
-            .await
-        {
-            Ok(()) => recorded = true,
-            Err(err) => {
-                tracing::warn!(%issuer, path = %path, "failed to record retraction marker: {err:#}");
-            }
-        }
-    }
-    // Nothing durable was written, so nothing happened.
-    if !recorded {
+    let Ok(hosted) = state.hosted(identity) else {
+        tracing::warn!(
+            %issuer,
+            "a write was not accepted, but the identity that holds the replica is not hosted \
+             any more; nothing is recorded"
+        );
+        return;
+    };
+    if let Err(err) = hosted
+        .directory
+        .record_retraction(issuer, verdict.author, path.as_str(), &marker)
+        .await
+    {
+        tracing::warn!(%issuer, path = %path, "failed to record retraction marker: {err:#}");
+        // Nothing durable was written, so nothing happened.
         return;
     }
     tracing::warn!(
@@ -153,7 +143,7 @@ pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
         for (issuer, author, path) in dropped {
             let _unbound = state
                 .node
-                .disarm_retraction(issuer, author, path.as_bytes());
+                .disarm_retraction(identity, issuer, author, path.as_bytes());
         }
     }
     let Ok(markers) = hosted.directory.list_retractions().await else {
@@ -163,14 +153,20 @@ pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
         // An unbound issuer stays cold until the binder's sweep re-runs this.
         if state
             .node
-            .arm_retraction(issuer, author, path.clone().into_bytes(), marker.bound)
+            .arm_retraction(
+                identity,
+                issuer,
+                author,
+                path.clone().into_bytes(),
+                marker.bound,
+            )
             .is_err()
         {
             continue;
         }
         let _already_gone = state
             .node
-            .retract_entry(issuer, author, path.as_bytes(), marker.bound)
+            .retract_entry(identity, issuer, author, path.as_bytes(), marker.bound)
             .await;
     }
 }

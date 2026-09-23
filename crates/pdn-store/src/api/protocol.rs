@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use iroh::EndpointAddr;
 use iroh_blobs::{api::blobs::ExportMode, Hash};
 use irpc::{
     channel::{mpsc, oneshot},
@@ -16,8 +15,8 @@ use crate::{
     actor::OpenState,
     engine::LiveEvent,
     store::{DownloadPolicy, Query},
-    Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
-    SignedEntry,
+    Author, AuthorId, Capability, CapabilityKind, Contact, DocTicket, Entry, Identity, NamespaceId,
+    PeerIdBytes, SignedEntry,
 };
 
 /// Progress during import operations
@@ -193,7 +192,12 @@ pub struct RetractResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StartSyncRequest {
     pub doc_id: NamespaceId,
-    pub peers: Vec<EndpointAddr>,
+    /// Each peer paired with the identity it is dialed as.
+    pub peers: Vec<Contact>,
+    /// The identity a peer of this replica is dialed as when no contact and
+    /// no past session named one — an address book entry the engine
+    /// recorded carries a node id and nothing else.
+    pub default_identity: Identity,
     /// Whether to join the replica's gossip swarm. Scoped access syncs
     /// without ever joining the swarm.
     #[serde(default = "default_join_gossip")]

@@ -83,6 +83,8 @@ Each angle's prompt carries: the dump paths, the file list, the map from the "Ma
 
 **At most 5 findings per angle, each with a mechanism the agent traced through the sources itself and is prepared to defend.** A guess with no line of code behind it is not returned.
 
+**Every finding names its reach, per `code-practices/defect-reachability.md`:** `product` — a host calling the public surface of `pdn-node` triggers it under some operating condition; `network` — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; `internal` — neither; `n/a` — not a defect in behaviour: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path behind the word. Reach decides whether a fix is obliged, severity how urgent it is, and neither stands in for the other.
+
 **A second bar, on worth rather than evidence: return a finding only if you would advise a human to spend an hour of their working day on it.** In 1,000 changed lines there is always one more true-but-inconsequential thing to say, so the quota is a ceiling, never a target — an angle returning two findings has done its job as well as one returning five. Findings are worked down one at a time by a person reading the code around each; a file of 68 is not five times more useful than a file of 15, it is a week the change does not have. Clears the bar: a wrong answer under some input, data crossing where it must not, unbounded growth, an invariant a future edit will break unknowingly, a test that passes with the mechanism removed. Does not, unless it causes one of those: naming, phrasing, a comment, an import, a shape you would have written differently.
 
 **A claim about what a build, a test run, or a feature lane would produce is either run or marked as reasoning.** "The result is predetermined, so I did not check" already topped one run's findings and was wrong — one `cargo tree` away from being caught. Execute under the rules below, or state in `evidence` that the claim was derived by reading and never run.
@@ -107,6 +109,8 @@ A verifier is asked to **refute** a finding, not confirm it, and leans "refuted"
 **A majority of `REFUTED` kills a finding; a split resolves to `PLAUSIBLE`** — disagreement between careful readers is itself an honest verdict, not something an extra vote is invented to break. The arithmetic stays in the journal; the file gets the word (§3).
 
 **Verification runs in severity order** — critical, then medium, then structural — sorted before the pipeline is built, so the deadline cuts the tail rather than the head.
+
+**Reach is checked, not taken on trust, and an unreachable mechanism is not refuted.** A path no code can take is `REFUTED`; a mechanism that holds but that neither a host nor a modified node reaches is a real defect whose fix is optional, so the verifier returns reach `internal` rather than killing it.
 
 A verifier opens the sources and cites lines. **A verifier that sharpens a finding is doing its job**: where the mechanism holds but the wording overreaches, the correction goes in `corrections` and is applied in §3 — the three best findings of one run were all narrowed this way. Changing files in the working tree is **forbidden**.
 
@@ -198,7 +202,7 @@ The flag is honoured whether the run is still going or was stopped earlier.
 1. **Stop the fan-out.** `TaskStop` the workflow's task id and the heartbeat. Nothing else is killed, no file is touched.
 2. **Harvest `journal.jsonl` in the run's transcript directory.** Every `"type":"result"` line carries that agent's complete return value — findings are not reconstructed from prose, and since fixes travel with mechanisms, a harvested finding is complete whether or not a vote was cast on it. Shapes as in the heartbeat section; triage's `members` are indices into the candidate list in angle-return order. Cut before triage returned — the candidates are raw and the merge falls to §3 by hand: the one case where the dedup this command moved upstream is redone downstream.
 3. **Re-attach verdicts to findings.** The journal holds `agentId` and the verdict, not the link; it lives in the verifier's own transcript, `agent-<agentId>.jsonl`, whose prompt carries the `Title:` line it was given. Match on that title.
-4. **Consolidate per §3, with one change: a finding's verdict is whatever its returned votes say.** Two of three back, both confirming — `CONFIRMED`; a returned refuting majority — the refuted section.
+4. **Consolidate per §3, with one change: a finding's verdict is whatever its returned votes say.** Two of three back, both confirming — `CONFIRMED`; a returned refuting majority — dropped.
 5. **A finding with no returned votes is `NOT VERIFIED`, never `CONFIRMED`.** It stays in the level its severity claims — not hidden, and not read as established: verification exists because plausible-looking findings die under it.
 6. **A finding keeps its angle's fixes, whatever the deadline did to its votes.** The one case that loses them is an angle that never returned at all — that subject is named under "Not covered" instead.
 7. **Write "Not covered" by hand.** An early finalize almost always means the gap sweep never ran (it sits behind the full-set barrier). Say that, and name: the findings that went unverified, the subjects nobody searched — as coverage holes ("concurrency was not examined"), never as agent bookkeeping — and that no gap sweep was performed. Nothing here is left to be inferred from silence.
@@ -209,11 +213,11 @@ The flag is honoured whether the run is still going or was stopped earlier.
 
 ## 3. Consolidation — do this yourself, after the workflow
 
-1. **Drop the `REFUTED`** into their own section, one line each with the refuting reason. A refuting majority kills; a split is `PLAUSIBLE` and stays.
+1. **Drop the `REFUTED`; they do not enter the file.** A refuting majority kills; a split is `PLAUSIBLE` and stays.
 2. **Check the merge rather than redo it.** Catch what triage could not see: two groups the verdicts reveal as one mechanism, one group whose verifiers split because it was two. The same file and line with different mechanisms is not a duplicate — true in triage, true here.
-3. **Apply the `corrections`** from the verifiers — the sharpened wording goes into the file.
-4. **Strip the machinery from the prose.** Vote counts, angle names and counts, agent counts, phase names — none reaches the file: "найдено четырьмя углами" is how the run convinced itself; the reader is convinced by the mechanism and the lines. Exactly three traces survive, because they change what the reader does: the verdict word (`CONFIRMED` / `PLAUSIBLE` / `NOT VERIFIED` — trust it, weigh it, or verify it first), the refuted section (do not rediscover these), and the coverage holes under "Not covered".
-5. **Number them `F1..Fn`** in final order — most important first, numbering running through every section. A number is never reused: a closed finding keeps its number in the file.
+3. **Apply the `corrections`** from the verifiers — the sharpened wording goes into the file. A verifier's `reach` is a correction too; where verifiers disagree on it, the reach that obliges a fix stands, and the symptom is rewritten to name that path.
+4. **Strip the machinery from the prose.** Vote counts, angle names and counts, agent counts, phase names — none reaches the file: "найдено четырьмя углами" is how the run convinced itself; the reader is convinced by the mechanism and the lines. Exactly two traces survive, because they change what the reader does: the verdict word (`CONFIRMED` / `PLAUSIBLE` / `NOT VERIFIED` — trust it, weigh it, or verify it first) and the coverage holes under "Not covered".
+5. **Number them `F1..Fn`** in final order — most important first, numbering running through every section. A number is never reused: a closed finding leaves the file with its number, and the gap in the numbering is its only trace.
 6. **Sort into levels.** The order of sections is fixed:
    - **Critical — correctness and security.** Data crossing between identities or namespaces; a capability or grant bypassed; a panic or a degradation of the whole node; data lost or corrupted.
    - **Medium — reliability and resources.** Leaks, unbounded growth, degradation under load, rare races. Mechanism confirmed, trigger conditional.
@@ -224,11 +228,13 @@ The flag is honoured whether the run is still going or was stopped earlier.
 
    **A coupling shapes the route's structure, never only its prose.** Fixes for one sitting share one bullet; a prerequisite stands directly before its dependent — whatever their severities. Severity ranks the findings sections, dependencies rank the route, and the two orderings may disagree; a bullet carrying mixed severities says which, so the ranking stays legible. "Take together with F2" three items away from F2's own bullet has already lost the coupling — the route is worked top-down.
 
+   **A finding of reach `n/a` is fixed by the rule it breaks**, or by correcting the spec, and its bullet names which. **A finding of reach `internal` is optional: its bullet says so** — "optional: unreachable", in the file's language, with the one-line argument — **and stands below every obliged fix, above only the full stress pass**, whatever its severity. The one exception is an optional fix that makes an obliged one possible or testable — a guard that turns a race into a deterministic failure a test can catch, a restructuring the obliged fix is written on top of: it joins that fix's bullet, which says what it buys the obliged fix.
+
    **Bulleted, never numbered** — a number in this file must name exactly one thing, and a numbered route would stand a second, shifting numbering beside the stable `Fn`.
 
-   **Every `Fn` in this section is a link to its finding** — `[F4](#f4)` — in the bullets and in the closing paragraphs. Each finding heading carries `<a id="f4"></a>` on the line above it, in every section including the refuted one. Inside a finding a reference to another one stays bare — linking there would put a link in nearly every paragraph, and the route would stop being the thing built for jumping.
+   **Every `Fn` in this section is a link to its finding** — `[F4](#f4)` — in the bullets and in the closing paragraphs. Each finding heading carries `<a id="f4"></a>` on the line above it, in every section. Inside a finding a reference to another one stays bare — linking there would put a link in nearly every paragraph, and the route would stop being the thing built for jumping.
 
-   **The anchor is written, never derived from the heading.** Headings get edited — `[DONE <dd-mm>]` on closing, titles sharpened after the fact, review languages whose headings do not transliterate — and a written `f4` survives all of it.
+   **The anchor is written, never derived from the heading.** Headings get edited — titles sharpened after the fact, review languages whose headings do not transliterate — and a written `f4` survives all of it.
 
 ## 4. The final file
 
@@ -250,7 +256,7 @@ The template below is in English. When the review language is something else, th
 <One line, only when the run did not reach its own end: "Review cut at the 50-minute budget." or "Review finalized early on request.">
 
 
-**How to keep this file.** A closed finding is marked `[DONE <dd-mm>]` in its heading, the account of the fix is appended to it under a "What was done" block, and its line in the fixing order is struck through. The text of the finding is not deleted — it stays as the thing the fix is checked against. Finding numbers live only as long as this file: `.code-review/` is not under git, so nothing that is — no code, no documentation — may reference an `F<n>`, which would resolve to nothing for anyone without this file. A comment or a spec line that wants to cite a finding inlines its substance instead. Between one fix and the next the touched tests are stressed briefly and narrowly — a set cut down to what that fix reaches, minutes rather than tens of minutes — and what came back is recorded in that fix's "What was done" block; the full pass is its own item in the fixing order, never something a single fix claims in passing.
+**How to keep this file.** The file holds only what is still to be done, so it shrinks as fixes land until nothing is left. A closed finding is deleted from it together with its line in the fixing order, and so is a finding a later check refutes; its number is not reused, so a gap in the numbering is the only trace. An optional finding leaves either fixed or with the decision to leave it written where the next reader of that code looks — the crate's `CLAUDE.md`, a comment at the place, the change's design — never only here. What a fix did and what its short stress run showed goes into the report that hands the fix over, for the commit that carries it, not into this file. When the last finding is gone the file is deleted, and whatever "Not covered" still names is said in that last report. Finding numbers live only as long as this file: `.code-review/` is not under git, so nothing that is — no code, no documentation — may reference an `F<n>`, which would resolve to nothing for anyone without this file. A comment or a spec line that wants to cite a finding inlines its substance instead. Between one fix and the next the touched tests are stressed briefly and narrowly — a set cut down to what that fix reaches, minutes rather than tens of minutes; the full pass is its own item in the fixing order, never something a single fix claims in passing.
 
 ## Fixing order
 
@@ -269,9 +275,9 @@ The template below is in English. When the review language is something else, th
 
 <a id="f1"></a>
 ### F1 — <symptom → consequence, in one line>
-**File:** `<path:line>` · **CONFIRMED** <or **PLAUSIBLE**, or **NOT VERIFIED** when the run ended before a single verifier reached it — the word alone, never a vote tally, an angle name, or a count of who found it> · *new in this change* | *pre-existing, but in scope because <reason>*
+**File:** `<path:line>` · **CONFIRMED** <or **PLAUSIBLE**, or **NOT VERIFIED** when the run ended before a single verifier reached it — the word alone, never a vote tally, an angle name, or a count of who found it> · *new in this change* | *pre-existing, but in scope because <reason>* · **Reach:** product path | network | internal | n/a
 
-**How it shows up:** <the exact trigger: which input, which state, what the affected party observes. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
+**How it shows up:** <the exact trigger: which input, which state, what the affected party observes, and the path behind the reach — the public `pdn-node` operation and the condition, the input a modified node sends, or why neither reaches it. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
 
 **What causes it:** <the mechanism through the code with line references: what exactly permits this and why the existing checks do not catch it.>
 
@@ -296,12 +302,6 @@ The template below is in English. When the review language is something else, th
 ## Structural — altitude of the implementation
 
 ## Cleanup and tests
-
-## Refuted during verification
-
-<a id="f<n>"></a>
-### F<n> — REFUTED — <title>
-<One or two lines: what was supposed and what refuted it.>
 
 ## Not covered
 
@@ -335,7 +335,7 @@ The working tree is never touched. The order: `git -C <repo> diff HEAD > <scratc
 - **No invented abbreviations or notation.** Invariants and ADRs by number; `Dn` only when it is said whose decisions those are.
 - **"Checked" means executed.** What was read with eyes is called read.
 - **Line numbers are as they stand in the working tree** at the time of the review, and are not adjusted afterwards.
-- **No votes, no angles, no agents in the file** — §3's strip rule. The verdict word, the refuted section, and "Not covered" are the only traces of the machinery.
+- **No votes, no angles, no agents in the file** — §3's strip rule. The verdict word and "Not covered" are the only traces of the machinery.
 - **None of these rules is written into the file.** They govern how it is produced; the reader is not told how the sausage is made.
 - **Prototypes**: the pre-pivot one is `v3-single-device`, the rebuild after it is `v3-multi-device`, the current generation is `v4-non-keri`; never a bare number.
 

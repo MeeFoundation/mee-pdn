@@ -49,6 +49,11 @@ pub type PeerIdBytes = [u8; 32];
 /// Value is 10 minutes.
 pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_micros() as u64;
 
+/// The longest key a replica holds: a longer one is refused on a local
+/// write and dropped at ingest, so the first message a replica sends —
+/// its first key, twice — stays under the ceiling a peer reads it with.
+pub const MAX_KEY_BYTES: usize = 8 * 1024;
+
 /// How many in-band rejections one message may surface to the rejection
 /// observer. A message is bounded only by the frame size, and each rejection
 /// is a claim about an entry the receiver holds, so an unbounded reply would
@@ -529,6 +534,7 @@ where
             &entry,
             &origin,
             self.info.capability_validator.as_ref(),
+            None,
         )?;
 
         let outcome = self.store.put(entry.clone()).map_err(InsertError::Store)?;
@@ -614,6 +620,7 @@ where
         from_peer: PeerIdBytes,
         state: &mut SyncOutcome,
         filter: Option<crate::filter::EntryFilter>,
+        ingest: Option<crate::filter::SessionIngest>,
     ) -> Result<Option<crate::ranger::Message<SignedEntry>>, anyhow::Error> {
         self.info.ensure_open()?;
         let my_namespace = self.id();
@@ -674,6 +681,7 @@ where
                         entry,
                         &origin,
                         capability_validator.as_ref(),
+                        ingest.as_ref(),
                     ) {
                         Ok(()) => ValidateOutcome::Accept,
                         Err(ValidationFailure::Unauthorized) => ValidateOutcome::Reject,
@@ -744,6 +752,7 @@ pub struct ReadOnly;
 /// * the entry's author and namespace signatures are correct
 /// * the entry's namespace matches the current replica
 /// * the entry's timestamp is not more than 10 minutes in the future of our system time
+/// * the entry's key is no longer than [`MAX_KEY_BYTES`]
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
@@ -752,10 +761,15 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     entry: &SignedEntry,
     origin: &InsertOrigin,
     validator: Option<&CapabilityValidator>,
+    ingest: Option<&crate::filter::SessionIngest>,
 ) -> Result<(), ValidationFailure> {
     // Verify the namespace
     if entry.namespace() != expected_namespace {
         return Err(ValidationFailure::InvalidNamespace);
+    }
+
+    if entry.key().len() > MAX_KEY_BYTES {
+        return Err(ValidationFailure::KeyTooLong);
     }
 
     // Verify signature for non-local entries.
@@ -768,18 +782,24 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
         return Err(ValidationFailure::TooFarInTheFuture);
     }
 
-    // here: capability-chain check — gate only remote entries, mirroring the
-    // signature check above, and hand the policy the transmitting peer.
-    // `validator` is the injected PdnId / UWill policy; `None` keeps vanilla
-    // accept-all. Both ingest paths (set reconciliation + live inserts)
-    // funnel through this one chokepoint.
+    // here: capability-chain check — gate only remote entries, mirroring
+    // the signature check above. The session's own verdict decides where
+    // there is a session: the write set was frozen at its setup and holds
+    // for it alone. Without one — an insert outside any session — the
+    // consumer's standing validator decides, and `None` keeps vanilla
+    // accept-all.
     if let InsertOrigin::Sync { from, .. } = origin {
-        if let Some(validate) = validator {
-            match validate(entry, from) {
-                ValidateOutcome::Accept => {}
-                ValidateOutcome::Drop => return Err(ValidationFailure::NotAdmitted),
-                ValidateOutcome::Reject => return Err(ValidationFailure::Unauthorized),
-            }
+        let outcome = match ingest {
+            Some(ingest) => ingest(entry),
+            None => match validator {
+                Some(validate) => validate(entry, from),
+                None => ValidateOutcome::Accept,
+            },
+        };
+        match outcome {
+            ValidateOutcome::Accept => {}
+            ValidateOutcome::Drop => return Err(ValidationFailure::NotAdmitted),
+            ValidateOutcome::Reject => return Err(ValidationFailure::Unauthorized),
         }
     }
     Ok(())
@@ -832,6 +852,9 @@ pub enum ValidationFailure {
     /// Entry timestamp is too far in the future.
     #[error("Entry timestamp is too far in the future.")]
     TooFarInTheFuture,
+    /// Entry key is longer than [`MAX_KEY_BYTES`].
+    #[error("Entry key is longer than {MAX_KEY_BYTES} bytes")]
+    KeyTooLong,
     /// Entry has length 0 but not the empty hash, or the empty hash but not length 0.
     #[error("Entry has length 0 but not the empty hash, or the empty hash but not length 0")]
     InvalidEmptyEntry,
@@ -1467,6 +1490,10 @@ mod tests {
     use rand::SeedableRng;
 
     use super::*;
+
+    /// A cache big enough that nothing in a scenario evicts.
+    #[cfg(feature = "fs-store")]
+    const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
     use crate::{
         actor::SyncHandle,
         ranger::{Range, Store as _},
@@ -1485,7 +1512,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_basics_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_basics(store).await?;
         Ok(())
     }
@@ -1675,7 +1702,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_content_hashes_iterator_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_content_hashes_iterator(store).await
     }
 
@@ -1803,7 +1830,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_timestamps_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_timestamps(store).await?;
         Ok(())
     }
@@ -1867,9 +1894,9 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_sync_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
-        let alice_store = store::fs::Store::persistent(alice_dbfile.path())?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
         let bob_dbfile = tempfile::NamedTempFile::new()?;
-        let bob_store = store::fs::Store::persistent(bob_dbfile.path())?;
+        let bob_store = store::fs::Store::persistent(bob_dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_sync(alice_store, bob_store).await?;
 
         Ok(())
@@ -1921,9 +1948,9 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_timestamp_sync_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
-        let alice_store = store::fs::Store::persistent(alice_dbfile.path())?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
         let bob_dbfile = tempfile::NamedTempFile::new()?;
-        let bob_store = store::fs::Store::persistent(bob_dbfile.path())?;
+        let bob_store = store::fs::Store::persistent(bob_dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_timestamp_sync(alice_store, bob_store).await?;
 
         Ok(())
@@ -1987,9 +2014,9 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_session_snapshot_freezes_egress_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
-        let alice_store = store::fs::Store::persistent(alice_dbfile.path())?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
         let bob_dbfile = tempfile::NamedTempFile::new()?;
-        let bob_store = store::fs::Store::persistent(bob_dbfile.path())?;
+        let bob_store = store::fs::Store::persistent(bob_dbfile.path(), TEST_CACHE_BYTES)?;
         test_session_snapshot_freezes_egress(alice_store, bob_store).await
     }
 
@@ -2210,7 +2237,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn a_session_over_an_unwritten_store_commits_nothing_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         a_session_over_an_unwritten_store_commits_nothing(store).await
     }
 
@@ -2272,7 +2299,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_session_snapshot_commits_pending_write_batch_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_session_snapshot_commits_pending_write_batch(store).await
     }
 
@@ -2492,7 +2519,7 @@ mod tests {
 
         let mut state = SyncOutcome::default();
         let reply = replica
-            .sync_process_message(crafted, [9u8; 32], &mut state, None)
+            .sync_process_message(crafted, [9u8; 32], &mut state, None, None)
             .await;
         assert!(reply.is_err(), "the crafted range was served");
         assert_eq!(state.num_sent, 0);
@@ -2598,6 +2625,32 @@ mod tests {
         Ok(())
     }
 
+    /// A local write at a key longer than `MAX_KEY_BYTES` is refused, and
+    /// one at exactly the bound is written.
+    #[tokio::test]
+    async fn a_key_over_the_bound_is_refused_on_a_local_write() -> Result<()> {
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut replica = store.new_replica(namespace.clone())?;
+
+        let at_bound = vec![b'k'; MAX_KEY_BYTES];
+        replica.hash_and_insert(&at_bound, &author, "v").await?;
+        let over = vec![b'k'; MAX_KEY_BYTES + 1];
+        let res = replica.hash_and_insert(&over, &author, "v").await;
+        assert!(
+            matches!(
+                res,
+                Err(InsertError::Validation(ValidationFailure::KeyTooLong))
+            ),
+            "a key over the bound was written: {res:?}"
+        );
+        drop(replica);
+        assert!(get_entry(&mut store, namespace.id(), author.id(), &at_bound).is_ok());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_insert_empty() -> Result<()> {
         let mut store = store::Store::memory();
@@ -2623,7 +2676,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_prefix_delete_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_prefix_delete(store).await?;
         Ok(())
     }
@@ -2678,9 +2731,9 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_sync_delete_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
-        let alice_store = store::fs::Store::persistent(alice_dbfile.path())?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
         let bob_dbfile = tempfile::NamedTempFile::new()?;
-        let bob_store = store::fs::Store::persistent(bob_dbfile.path())?;
+        let bob_store = store::fs::Store::persistent(bob_dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_sync_delete(alice_store, bob_store).await
     }
 
@@ -2731,7 +2784,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_remove_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
-        let alice_store = store::fs::Store::persistent(alice_dbfile.path())?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_remove(alice_store).await
     }
 
@@ -2784,7 +2837,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_delete_edge_cases_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_delete_edge_cases(store).await
     }
 
@@ -2852,8 +2905,46 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_latest_iter_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_latest_iter(store).await
+    }
+
+    /// An entry that arrives out of order leaves the author's head where it
+    /// was: the head is the greatest timestamp the replica holds, not the
+    /// one written last. A head that moved backwards would make this
+    /// replica report less than it holds, and a peer comparing against it
+    /// would stop offering what it has.
+    #[tokio::test]
+    async fn an_older_entry_does_not_move_the_author_head_back() -> Result<()> {
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut store = store::fs::Store::memory();
+        let mut replica = store.new_replica(namespace.clone())?;
+
+        let signed = |key: &[u8], timestamp: u64| {
+            let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+            let record = Record::from_data(b"hi", timestamp);
+            Entry::new(id, record).sign(&namespace, &author)
+        };
+        replica
+            .insert_entry(signed(b"newer", 20), InsertOrigin::Local)
+            .await?;
+        replica
+            .insert_entry(signed(b"older", 10), InsertOrigin::Local)
+            .await?;
+        store.close_replica(namespace.id());
+
+        let latest = store
+            .get_latest_for_each_author(namespace.id())?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(latest.len(), 1, "one author, one head");
+        assert_eq!(
+            (latest[0].1, latest[0].2.as_slice()),
+            (20, b"newer".as_ref()),
+            "the older entry took the head"
+        );
+        Ok(())
     }
 
     async fn test_latest_iter(mut store: Store) -> Result<()> {
@@ -2895,7 +2986,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_byte_keys_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_byte_keys(store).await?;
 
         Ok(())
@@ -2944,7 +3035,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_capability_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_capability(store).await
     }
 
@@ -2993,7 +3084,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_actor_capability_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_actor_capability(store).await
     }
 
@@ -3460,12 +3551,12 @@ mod tests {
 
         let from1 = replica1.sync_initial_message(None)?;
         let from2 = replica2
-            .sync_process_message(from1, peer1, &mut state2, None)
+            .sync_process_message(from1, peer1, &mut state2, None, None)
             .await
             .unwrap()
             .unwrap();
         let from1 = replica1
-            .sync_process_message(from2, peer2, &mut state1, None)
+            .sync_process_message(from2, peer2, &mut state1, None, None)
             .await
             .unwrap()
             .unwrap();
@@ -3474,7 +3565,7 @@ mod tests {
         // sure that no InsertRemote event is emitted for this entry.
         replica2.hash_and_insert(b"foo", &author, b"update").await?;
         let from2 = replica2
-            .sync_process_message(from1, peer1, &mut state2, None)
+            .sync_process_message(from1, peer1, &mut state2, None, None)
             .await
             .unwrap();
         assert!(from2.is_none());
@@ -3505,7 +3596,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     async fn test_replica_queries_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path())?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_replica_queries(store).await?;
 
         Ok(())
@@ -3694,7 +3785,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     fn test_dl_policies_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
-        let mut store = store::fs::Store::persistent(dbfile.path())?;
+        let mut store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
         test_dl_policies(&mut store)
     }
 
@@ -3798,11 +3889,11 @@ mod tests {
             rounds += 1;
             println!("round {rounds}");
             if let Some(msg) = bob
-                .sync_process_message(msg, alice_peer_id, &mut bob_state, bob_filter.clone())
+                .sync_process_message(msg, alice_peer_id, &mut bob_state, bob_filter.clone(), None)
                 .await?
             {
                 next_to_bob = alice
-                    .sync_process_message(msg, bob_peer_id, &mut alice_state, None)
+                    .sync_process_message(msg, bob_peer_id, &mut alice_state, None, None)
                     .await?
             }
         }

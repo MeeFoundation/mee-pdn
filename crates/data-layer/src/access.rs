@@ -1,9 +1,10 @@
-//! Caller classification for reconciliation sessions, decided from material
-//! this node already holds — hosted identities' directories and connection
-//! metadata pairs. Nothing is presented over the wire: the
-//! transport-authenticated caller node id and the requested namespace are
-//! the only inputs. A replica the book knows nothing about is served whole
-//! to any ticket holder.
+//! Caller classification for reconciliation sessions, decided from
+//! material one hosted identity already holds — its own directory and its
+//! connection metadata pairs. Nothing is presented over the wire: the
+//! transport-authenticated caller node id, the identities the session names
+//! and the requested namespace are the only inputs. One book per hosted
+//! identity, so a verdict is never widened by what a co-located identity
+//! holds (ADR-0013).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -13,8 +14,8 @@ use std::{
 use anyhow::Result;
 use iroh_blobs::Hash;
 use pdn_store::{
-    api::Doc, store::Query, AuthorId, EntryFilter, NamespaceId, SessionAccess, SessionRole,
-    ValidateOutcome,
+    api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, SessionAccess,
+    SessionIngest, SessionRole, ValidateOutcome,
 };
 use pdn_types::{ClaimId, NodeId, PdnId};
 
@@ -24,12 +25,17 @@ use crate::{
     registry::{Registry, ServingPosture},
 };
 
-/// The directional stores of `identity` toward `peer`: `own` carries the
-/// grants this identity issued, `peer_doc` the counterparty's published
+/// A hosted identity as the store names it on the wire: the 32 bytes of
+/// its `PdnId`, which the store compares and never interprets.
+pub fn identity_of(identity: PdnId) -> Identity {
+    Identity::from_bytes(*identity.as_bytes())
+}
+
+/// The directional stores of this book's identity toward `peer`: `own`
+/// carries the grants it issued, `peer_doc` the counterparty's published
 /// device set and grants.
 #[derive(Debug, Clone)]
 struct HostedConnection {
-    identity: PdnId,
     peer: PdnId,
     own: Doc,
     peer_doc: Doc,
@@ -42,8 +48,7 @@ enum GrantWidth {
     None,
 }
 
-/// The union of the grants every matching connection carries. Write never
-/// exceeds read.
+/// The rights one grant record carries. Write never exceeds read.
 #[derive(Debug, Default)]
 pub(crate) struct EffectiveRights {
     pub(crate) read: HashSet<ClaimId>,
@@ -61,22 +66,31 @@ impl EffectiveRights {
     }
 }
 
-/// The write-side half of a classification, deposited per `(replica, peer)`
-/// at session setup; a later session overwrites it.
-#[derive(Debug)]
+/// The write-side half of a classification. It rides the session it was
+/// decided for, so a set frozen at setup holds for that session alone.
+#[derive(Debug, Clone)]
 enum WriteAdmission {
-    Full,
+    /// Everything the peer offers — what an own device is admitted.
+    Whole,
+    /// Exactly the claims the grant read at setup covers.
     Claims(HashSet<ClaimId>),
+    /// Nothing: no session vouched for the writer.
+    Nothing,
 }
 
 /// Timestamp bound per retracted `(author, key)` of one granted namespace.
 type ArmedRetractions = HashMap<(AuthorId, Vec<u8>), u64>;
 
-/// The classification material one node holds, consulted per session by
-/// the access provider wired into the fork at spawn.
-#[derive(Debug, Default)]
+/// The classification material one hosted identity holds, consulted per
+/// session by the access provider its engine was assembled with.
+#[derive(Debug)]
 pub(crate) struct AccessBook {
-    directories: RwLock<HashMap<PdnId, Doc>>,
+    /// Whom this book judges for.
+    identity: PdnId,
+    /// This identity's own directory, armed by `host_identity`. Until it
+    /// is here every data session is refused: the records that judge one
+    /// are in it.
+    directory: RwLock<Option<Doc>>,
     connections: RwLock<Vec<HostedConnection>>,
     /// Set right after the stack spawns, before any session can arrive.
     blobs: OnceLock<iroh_blobs::api::Store>,
@@ -84,50 +98,52 @@ pub(crate) struct AccessBook {
     /// republish or withdrawal changes the hash and misses. A payload not
     /// yet replicated is never cached, so it is re-checked every session.
     grant_cache: RwLock<HashMap<NamespaceId, (Hash, Option<ReadGrant>)>>,
-    /// The classifier is the async half that reads grant records; the ingest
-    /// gate is the sync half that only looks up.
-    write_sets: RwLock<HashMap<(NamespaceId, NodeId), WriteAdmission>>,
     /// Consulted on data replicas only — the only replicas whose entries a
-    /// marker can name.
-    retractions: RwLock<HashMap<NamespaceId, ArmedRetractions>>,
+    /// marker can name. Shared, because a session's ingest verdict reads
+    /// it per entry and must see what a marker recorded meanwhile.
+    retractions: Arc<RwLock<HashMap<NamespaceId, ArmedRetractions>>>,
 }
 
 impl AccessBook {
+    pub(crate) fn new(identity: PdnId) -> Self {
+        Self {
+            identity,
+            directory: RwLock::new(None),
+            connections: RwLock::new(Vec::new()),
+            blobs: OnceLock::new(),
+            grant_cache: RwLock::new(HashMap::new()),
+            retractions: Arc::default(),
+        }
+    }
+
     pub(crate) fn set_blobs(&self, blobs: iroh_blobs::api::Store) {
         let _ = self.blobs.set(blobs);
     }
 
-    pub(crate) fn host_identity(&self, identity: PdnId, directory: Doc) -> Result<()> {
-        self.directories
+    pub(crate) fn arm_directory(&self, directory: Doc) -> Result<()> {
+        *self
+            .directory
             .write()
-            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
-            .insert(identity, directory);
+            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))? = Some(directory);
         Ok(())
     }
 
-    pub(crate) fn unhost_identity(&self, identity: PdnId) -> Result<()> {
-        self.directories
+    pub(crate) fn disarm_directory(&self) -> Result<()> {
+        *self
+            .directory
             .write()
-            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
-            .remove(&identity);
+            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))? = None;
         Ok(())
     }
 
-    pub(crate) fn host_connection(
-        &self,
-        identity: PdnId,
-        peer: PdnId,
-        own: Doc,
-        peer_doc: Doc,
-    ) -> Result<()> {
+    pub(crate) fn host_connection(&self, peer: PdnId, own: Doc, peer_doc: Doc) -> Result<()> {
         let mut connections = self
             .connections
             .write()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?;
-        // One record per (identity, peer): re-registration replaces.
-        connections.retain(|c| !(c.identity == identity && c.peer == peer));
+        // One record per peer: re-registration replaces.
+        connections.retain(|c| c.peer != peer);
         connections.push(HostedConnection {
-            identity,
             peer,
             own,
             peer_doc,
@@ -135,16 +151,31 @@ impl AccessBook {
         Ok(())
     }
 
-    /// Fail-closed wherever the book can judge; a namespace it knows nothing
-    /// about is served whole.
+    /// Fail-closed everywhere but the two ticket-bound store kinds
+    /// (Invariants 1 and 3).
+    ///
+    /// `addressed` is the identity whose replica the session names and
+    /// `acting` the identity its caller acts for. Which of the two is the
+    /// party across the session follows the role: accepting, it is the
+    /// caller; dialing, this node is the caller and the party is the
+    /// identity it addressed.
     pub(crate) async fn classify(
         &self,
-        registry: &Registry,
+        registry: Arc<Registry>,
         namespace: NamespaceId,
-        caller: NodeId,
+        addressed: Identity,
+        acting: Identity,
+        peer: NodeId,
         role: SessionRole,
     ) -> SessionAccess {
-        match self.try_classify(registry, namespace, caller, role).await {
+        let remote = match role {
+            SessionRole::Accept => acting,
+            SessionRole::Dial => addressed,
+        };
+        match self
+            .try_classify(registry, namespace, remote, peer, role)
+            .await
+        {
             Ok(access) => access,
             Err(_storage_error) => SessionAccess::Deny,
         }
@@ -152,130 +183,199 @@ impl AccessBook {
 
     async fn try_classify(
         &self,
-        registry: &Registry,
+        registry: Arc<Registry>,
         namespace: NamespaceId,
-        caller: NodeId,
+        remote: Identity,
+        peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
-        // Directories and connection metadata stores are ticket-gated
+        // The directory and the connection metadata stores are ticket-gated
         // (Invariants 1 and 3). Classifying them against their own, possibly
         // not yet converged, device records would deadlock the bootstrap
         // that delivers those records.
-        if self.directory_by_namespace(namespace)?.is_some()
-            || self.connection_by_namespace(namespace)?.is_some()
-        {
-            return Ok(SessionAccess::Full);
+        let ticket_bound =
+            self.directory_is(namespace)? || self.connection_by_namespace(namespace)?.is_some();
+        match (registry.binding_of(namespace)?, ticket_bound) {
+            (None, true) => Ok(SessionAccess::whole()),
+            (Some((issuer, posture)), false) => {
+                self.classify_data(registry, issuer, posture, remote, peer, role)
+                    .await
+            }
+            // Held in no role, or none at all: nothing here can judge the
+            // caller, and a ticket bounds no data replica by itself. Held in
+            // both, which the import guards keep out: neither role's rule
+            // outranks the other's, so neither decides.
+            (Some(_), true) | (None, false) => Ok(SessionAccess::Deny),
         }
-
-        if let Some((issuer, posture)) = registry.binding_of(namespace)? {
-            return self
-                .classify_data(namespace, issuer, posture, caller, role)
-                .await;
-        }
-
-        // Unknown to the book: ticket possession is the only bound.
-        Ok(SessionAccess::Full)
     }
 
+    /// The party across the session names one identity; it is admitted
+    /// only when the records this identity holds of that one list the
+    /// party's node id. Every path this identity cannot resolve ends in
+    /// `refused`: denied when accepting, a closed egress when dialing.
+    /// What such a dial then admits follows the posture — nothing on a
+    /// replica this identity issues, and on one held under a grant what
+    /// the serving side's egress delivers.
     async fn classify_data(
         &self,
-        namespace: NamespaceId,
+        registry: Arc<Registry>,
         issuer: PdnId,
         posture: ServingPosture,
-        caller: NodeId,
+        remote: Identity,
+        peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
-        let caller_key = crate::private_metadata::device_key(&caller);
-        let grant_key = crate::connection_metadata::grant_key(&issuer);
-
-        // Hosted issuer: own devices see everything; counterparties get the
-        // union of the grants every matching connection carries, each read
-        // from the connection's `own` store and gated on the caller being a
-        // device the counterparty published.
-        if let Some(directory) = self.directory_of(issuer)? {
-            if device_listed(&directory, caller_key.as_bytes()).await? {
-                self.deposit_write_admission(namespace, caller, WriteAdmission::Full)?;
-                return Ok(SessionAccess::Full);
-            }
-            let grants = self
-                .connections_of_identity(issuer)?
-                .into_iter()
-                .map(|c| (c.peer_doc, c.own, c.peer));
-            let rights = self
-                .union_rights(caller_key.as_bytes(), issuer, grant_key.as_bytes(), grants)
-                .await?;
-            if rights.read.is_empty() {
-                return Ok(SessionAccess::Deny);
-            }
-            self.deposit_write_admission(namespace, caller, WriteAdmission::Claims(rights.write))?;
-            return Ok(SessionAccess::Filtered(egress_filter(issuer, rights.read)));
-        }
-
-        // Not hosted here. A grantee binding gives the issuer's own devices
-        // (per their published set) the full view, serves a device of the
-        // grant's audience identity — resolved through that identity's own
-        // directory, never a counterparty-written record — per the local
-        // grant record, and refuses everyone else uniformly with not-hosted.
-        // Dialing out toward an unresolved callee keeps a closed egress:
-        // serve nothing, receive what the callee's own filter admits.
+        let peer_key = crate::private_metadata::device_key(&peer);
+        let refused = match role {
+            // A dial toward a callee this identity cannot resolve keeps a
+            // closed egress: serve nothing, and pull whatever the callee's
+            // own filter reveals — admitted or dropped by the posture, as
+            // `ingest` decides.
+            SessionRole::Dial => SessionAccess::Allow {
+                egress: Some(closed_egress()),
+                ingest: Some(self.ingest(&registry, WriteAdmission::Nothing)),
+            },
+            SessionRole::Accept => SessionAccess::Deny,
+        };
         match posture {
-            ServingPosture::AudienceDevices => {
-                let mut grants = Vec::new();
-                for connection in self.connections_with_peer(issuer)? {
-                    if device_listed(&connection.peer_doc, caller_key.as_bytes()).await? {
-                        return Ok(SessionAccess::Full);
-                    }
-                    if let Some(directory) = self.directory_of(connection.identity)? {
-                        grants.push((directory, connection.peer_doc, connection.identity));
-                    }
-                }
-                let rights = self
-                    .union_rights(caller_key.as_bytes(), issuer, grant_key.as_bytes(), grants)
-                    .await?;
-                if !rights.read.is_empty() {
-                    return Ok(SessionAccess::Filtered(egress_filter(issuer, rights.read)));
-                }
-                Ok(match role {
-                    SessionRole::Accept => SessionAccess::Deny,
-                    SessionRole::Dial => SessionAccess::Filtered(closed_egress()),
-                })
+            ServingPosture::Serve => {
+                self.classify_issued(&registry, issuer, remote, peer_key.as_bytes(), refused)
+                    .await
             }
-            ServingPosture::Serve => Ok(SessionAccess::Full),
+            ServingPosture::AudienceDevices => {
+                self.classify_held(&registry, issuer, remote, peer_key.as_bytes(), refused)
+                    .await
+            }
         }
     }
 
-    /// The union of the rights the listed grants carry for the caller. Each
-    /// item is `(probe, grant_doc, audience)`: the caller must be a device
-    /// listed in `probe`, and the claims come from `grant_doc`'s grant
-    /// record only when its capability names this `issuer` and `audience`.
-    /// The hosted side and the grantee side differ only in which doc probes
-    /// and which carries the grant.
-    async fn union_rights(
+    /// A data replica this identity issues: its own devices see it whole,
+    /// a counterparty sees what this identity granted that counterparty.
+    async fn classify_issued(
         &self,
-        caller_key: &[u8],
+        registry: &Arc<Registry>,
         issuer: PdnId,
+        remote: Identity,
+        peer_key: &[u8],
+        refused: SessionAccess,
+    ) -> Result<SessionAccess> {
+        if remote == identity_of(self.identity) {
+            if !self.peer_is_own_device(peer_key).await? {
+                return Ok(refused);
+            }
+            return Ok(SessionAccess::Allow {
+                egress: None,
+                ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+            });
+        }
+        let Some(connection) = self.connection_with(remote)? else {
+            return Ok(refused);
+        };
+        // The counterparty's own statement of its devices, which is the
+        // only record this identity holds of it.
+        if !device_listed(&connection.peer_doc, peer_key).await? {
+            return Ok(refused);
+        }
+        let grant_key = crate::connection_metadata::grant_key(&issuer);
+        let rights = self
+            .granted_rights(
+                &connection.own,
+                issuer,
+                connection.peer,
+                grant_key.as_bytes(),
+            )
+            .await?;
+        if rights.read.is_empty() {
+            return Ok(refused);
+        }
+        Ok(SessionAccess::Allow {
+            egress: Some(egress_filter(issuer, rights.read)),
+            ingest: Some(self.ingest(registry, WriteAdmission::Claims(rights.write))),
+        })
+    }
+
+    /// A data replica this identity holds under a grant: the issuer's own
+    /// devices see it whole, this identity's own devices see what the
+    /// grant covers. What either may put into it is bounded by the
+    /// issuer's own gate, so nothing is admitted here beyond the marker
+    /// check.
+    async fn classify_held(
+        &self,
+        registry: &Arc<Registry>,
+        issuer: PdnId,
+        remote: Identity,
+        peer_key: &[u8],
+        refused: SessionAccess,
+    ) -> Result<SessionAccess> {
+        let connection = self.connection_with_peer(issuer)?;
+        if remote == identity_of(issuer) {
+            let listed = match &connection {
+                Some(connection) => device_listed(&connection.peer_doc, peer_key).await?,
+                None => false,
+            };
+            if !listed {
+                return Ok(refused);
+            }
+            return Ok(SessionAccess::Allow {
+                egress: None,
+                ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+            });
+        }
+        if remote != identity_of(self.identity) || !self.peer_is_own_device(peer_key).await? {
+            return Ok(refused);
+        }
+        let Some(connection) = connection else {
+            return Ok(refused);
+        };
+        let grant_key = crate::connection_metadata::grant_key(&issuer);
+        let rights = self
+            .granted_rights(
+                &connection.peer_doc,
+                issuer,
+                self.identity,
+                grant_key.as_bytes(),
+            )
+            .await?;
+        if rights.read.is_empty() {
+            return Ok(refused);
+        }
+        Ok(SessionAccess::Allow {
+            egress: Some(egress_filter(issuer, rights.read)),
+            ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+        })
+    }
+
+    /// Whether the peer is a device of this book's own identity.
+    async fn peer_is_own_device(&self, peer_key: &[u8]) -> Result<bool> {
+        let Some(directory) = self.own_directory()? else {
+            return Ok(false);
+        };
+        device_listed(&directory, peer_key).await
+    }
+
+    /// The claims one grant record carries toward `audience`. Claims come
+    /// only from a present, decoded record whose capability names this very
+    /// issuer and audience: position says who wrote a record, only
+    /// `cap.audience` says whom it was written for.
+    async fn granted_rights(
+        &self,
+        grant_doc: &Doc,
+        issuer: PdnId,
+        audience: PdnId,
         grant_key: &[u8],
-        grants: impl IntoIterator<Item = (Doc, Doc, PdnId)>,
     ) -> Result<EffectiveRights> {
         let mut rights = EffectiveRights::default();
-        for (probe, grant_doc, audience) in grants {
-            if !device_listed(&probe, caller_key).await? {
-                continue;
-            }
-            if let GrantWidth::Claims(grant_claims) = self
-                .grant_width_in(&grant_doc, issuer, audience, grant_key)
-                .await?
-            {
-                rights.extend(grant_claims);
-            }
+        if let GrantWidth::Claims(claims) = self
+            .grant_width_in(grant_doc, issuer, audience, grant_key)
+            .await?
+        {
+            rights.extend(claims);
         }
         Ok(rights)
     }
 
     /// The grant on `issuer`'s data toward `audience` as one metadata replica
-    /// records it. Claims come only from a present, decoded record whose
-    /// capability names this very issuer and audience: position says who
-    /// wrote a record, only `cap.audience` says whom it was written for.
+    /// records it.
     async fn grant_width_in(
         &self,
         doc: &Doc,
@@ -334,68 +434,53 @@ impl AccessBook {
         Ok(cap)
     }
 
-    fn deposit_write_admission(
-        &self,
-        namespace: NamespaceId,
-        caller: NodeId,
-        admission: WriteAdmission,
-    ) -> Result<()> {
-        self.write_sets
-            .write()
-            .map_err(|_poisoned| anyhow::anyhow!("write admissions lock poisoned"))?
-            .insert((namespace, caller), admission);
-        Ok(())
-    }
-
-    /// The synchronous ingest verdict, consulted by the fork inside its
+    /// The session's ingest verdict, consulted by the fork inside its
     /// insert path — nothing here may block or read a replica. Only a
-    /// capability verdict against the caller's deposit is
-    /// [`ValidateOutcome::Reject`], which the fork echoes back for the sender
-    /// to retract on; everything else refused is [`ValidateOutcome::Drop`],
-    /// because a marker match or an unreadable state judges nobody and must
-    /// not cost a peer its own legitimately written entry.
-    pub(crate) fn admit_ingest(
-        &self,
-        registry: &Registry,
-        entry: &pdn_store::SignedEntry,
-        from: &pdn_store::PeerIdBytes,
-    ) -> ValidateOutcome {
-        let id = entry.id();
-        let namespace = id.namespace();
-        let issuer = match registry.binding_of(namespace) {
-            Ok(Some((issuer, _posture))) => issuer,
-            // Not a data replica: ticket-bounded admission. Markers are
-            // consulted below this exit, so one unreadable map cannot silence
-            // the stores linking and pairing stand on.
-            Ok(None) => return ValidateOutcome::Accept,
-            Err(_poisoned) => return ValidateOutcome::Drop,
-        };
-        if self.retraction_names(namespace, entry) {
-            return ValidateOutcome::Drop;
-        }
-        match self.directory_of(issuer) {
-            // Not hosted here: inbound entries are bounded by the serving
-            // side's egress filter.
-            Ok(None) => return ValidateOutcome::Accept,
-            Ok(Some(_directory)) => {}
-            Err(_poisoned) => return ValidateOutcome::Drop,
-        }
-        let caller = NodeId::from_bytes(*from);
-        let Ok(admissions) = self.write_sets.read() else {
-            return ValidateOutcome::Drop;
-        };
-        match admissions.get(&(namespace, caller)) {
-            Some(WriteAdmission::Full) => ValidateOutcome::Accept,
-            Some(WriteAdmission::Claims(claims)) => {
-                if covers_key(claims, issuer, id.key()) {
-                    ValidateOutcome::Accept
-                } else {
-                    ValidateOutcome::Reject
-                }
+    /// capability verdict against `admission` is
+    /// [`ValidateOutcome::Reject`], which the fork echoes back for the
+    /// sender to retract on; everything else refused is
+    /// [`ValidateOutcome::Drop`], because a marker match or an unreadable
+    /// state judges nobody and must not cost a peer its own legitimately
+    /// written entry.
+    fn ingest(&self, registry: &Arc<Registry>, admission: WriteAdmission) -> SessionIngest {
+        let registry = Arc::clone(registry);
+        let book = Arc::clone(&self.retractions);
+        let identity = self.identity;
+        Arc::new(move |entry: &pdn_store::SignedEntry| {
+            let id = entry.id();
+            let namespace = id.namespace();
+            let issuer = match registry.binding_of(namespace) {
+                // Not a data replica: ticket-bounded admission. Markers
+                // are consulted below this exit, so one unreadable map
+                // cannot silence the stores linking and pairing stand on.
+                Ok(None) => return ValidateOutcome::Accept,
+                Ok(Some((issuer, _posture))) => issuer,
+                // An unreadable registry judges nobody: taking it for "no
+                // data replica" would admit whatever the session carries.
+                Err(_poisoned) => return ValidateOutcome::Drop,
+            };
+            if retraction_names(&book, namespace, entry) {
+                return ValidateOutcome::Drop;
             }
-            // No classified session: not a verdict on the caller's authority.
-            None => ValidateOutcome::Drop,
-        }
+            if issuer != identity {
+                // Held under a grant: inbound entries are bounded by the
+                // serving side's egress filter.
+                return ValidateOutcome::Accept;
+            }
+            match &admission {
+                WriteAdmission::Whole => ValidateOutcome::Accept,
+                WriteAdmission::Claims(claims) => {
+                    if covers_key(claims, issuer, id.key()) {
+                        ValidateOutcome::Accept
+                    } else {
+                        ValidateOutcome::Reject
+                    }
+                }
+                // No session vouched for the writer: not a verdict on its
+                // authority, so the sender re-offers and self-heals.
+                WriteAdmission::Nothing => ValidateOutcome::Drop,
+            }
+        })
     }
 
     /// A wider bound replaces a narrower one, never the reverse.
@@ -445,38 +530,36 @@ impl AccessBook {
         Ok(())
     }
 
+    #[cfg(test)]
     fn retraction_names(&self, namespace: NamespaceId, entry: &pdn_store::SignedEntry) -> bool {
-        let Ok(retractions) = self.retractions.read() else {
-            // Fail-closed, and a marker match is a silent drop, so it costs
-            // the sender nothing.
-            return true;
-        };
-        let Some(armed) = retractions.get(&namespace) else {
-            return false;
-        };
-        let id = entry.id();
-        armed
-            .get(&(id.author(), id.key().to_vec()))
-            .is_some_and(|bound| entry.timestamp() <= *bound)
+        retraction_names(&self.retractions, namespace, entry)
     }
 
-    fn directory_by_namespace(&self, namespace: NamespaceId) -> Result<Option<Doc>> {
+    fn own_directory(&self) -> Result<Option<Doc>> {
         Ok(self
-            .directories
+            .directory
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
-            .values()
-            .find(|doc| doc.id() == namespace)
-            .cloned())
+            .clone())
     }
 
-    fn directory_of(&self, identity: PdnId) -> Result<Option<Doc>> {
+    /// Which ticket-bound role this identity already holds `namespace` in,
+    /// named for the refusal that quotes it. Both roles are classified on
+    /// the ticket alone (Invariants 1 and 3), so a replica that took one
+    /// by mistake is served whole.
+    pub(crate) fn ticket_bound_role(&self, namespace: NamespaceId) -> Result<Option<&'static str>> {
+        if self.directory_is(namespace)? {
+            return Ok(Some("this identity's directory"));
+        }
         Ok(self
-            .directories
-            .read()
-            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
-            .get(&identity)
-            .cloned())
+            .connection_by_namespace(namespace)?
+            .map(|_connection| "a connection metadata store of this identity"))
+    }
+
+    fn directory_is(&self, namespace: NamespaceId) -> Result<bool> {
+        Ok(self
+            .own_directory()?
+            .is_some_and(|doc| doc.id() == namespace))
     }
 
     fn connection_by_namespace(&self, namespace: NamespaceId) -> Result<Option<HostedConnection>> {
@@ -489,27 +572,60 @@ impl AccessBook {
             .cloned())
     }
 
-    fn connections_of_identity(&self, identity: PdnId) -> Result<Vec<HostedConnection>> {
+    /// The connection with the identity a caller named, if the identity names
+    /// one this identity is connected to.
+    fn connection_with(&self, identity: Identity) -> Result<Option<HostedConnection>> {
         Ok(self
             .connections
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
             .iter()
-            .filter(|c| c.identity == identity)
-            .cloned()
-            .collect())
+            .find(|c| identity_of(c.peer) == identity)
+            .cloned())
     }
 
-    fn connections_with_peer(&self, peer: PdnId) -> Result<Vec<HostedConnection>> {
+    /// The two metadata replicas of the connection with `peer`, if one is
+    /// hosted: where the grants that bound what flows between these two
+    /// identities are written and where they arrive.
+    pub(crate) fn connection_stores(
+        &self,
+        peer: PdnId,
+    ) -> Result<Option<(NamespaceId, NamespaceId)>> {
+        Ok(self
+            .connection_with_peer(peer)?
+            .map(|connection| (connection.own.id(), connection.peer_doc.id())))
+    }
+
+    fn connection_with_peer(&self, peer: PdnId) -> Result<Option<HostedConnection>> {
         Ok(self
             .connections
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
             .iter()
-            .filter(|c| c.peer == peer)
-            .cloned()
-            .collect())
+            .find(|c| c.peer == peer)
+            .cloned())
     }
+}
+
+/// Whether an armed marker of `namespace` names this entry — its author,
+/// its key, and a timestamp at or below the bound.
+fn retraction_names(
+    retractions: &RwLock<HashMap<NamespaceId, ArmedRetractions>>,
+    namespace: NamespaceId,
+    entry: &pdn_store::SignedEntry,
+) -> bool {
+    let Ok(retractions) = retractions.read() else {
+        // Fail-closed, and a marker match is a silent drop, so it costs
+        // the sender nothing.
+        return true;
+    };
+    let Some(armed) = retractions.get(&namespace) else {
+        return false;
+    };
+    let id = entry.id();
+    armed
+        .get(&(id.author(), id.key().to_vec()))
+        .is_some_and(|bound| entry.timestamp() <= *bound)
 }
 
 /// Record-level membership (tombstones excluded). `device_key` is the one
@@ -520,7 +636,7 @@ async fn device_listed(doc: &Doc, device_key: &[u8]) -> Result<bool> {
     Ok(doc.get_one(query).await?.is_some())
 }
 
-/// Dial-side stance toward callers a scoped holder cannot resolve: serve
+/// Dial-side stance toward callers a scoped identity cannot resolve: serve
 /// nothing while still pulling its own updates.
 fn closed_egress() -> EntryFilter {
     Arc::new(|_entry: &pdn_store::SignedEntry| false)
@@ -542,21 +658,29 @@ pub(crate) fn session_access_provider(
     book: Arc<AccessBook>,
     registry: Arc<Registry>,
 ) -> pdn_store::SessionAccessProvider {
-    Arc::new(move |namespace, peer, role| {
+    Arc::new(move |namespace, addressed, acting, peer, role| {
         let book = Arc::clone(&book);
         let registry = Arc::clone(&registry);
-        let caller = NodeId::from_bytes(*peer.as_bytes());
-        Box::pin(async move { book.classify(&registry, namespace, caller, role).await })
+        let peer = NodeId::from_bytes(*peer.as_bytes());
+        Box::pin(async move {
+            book.classify(registry, namespace, addressed, acting, peer, role)
+                .await
+        })
     })
 }
 
-/// The fork's ingest validator (ADR-0008), installed beside
-/// [`session_access_provider`] at spawn.
+/// The fork's standing ingest validator (ADR-0008), installed beside
+/// [`session_access_provider`] at spawn. It answers where no session
+/// vouched for an entry — a path the platform has none of, since the
+/// swarm is content-free and reconciliation is the only ingest — so it
+/// refuses anything addressed at a data replica this identity issues and
+/// leaves the rest to the ticket bound Invariants 1 and 3 give it.
 pub(crate) fn capability_ingest_validator(
-    book: Arc<AccessBook>,
-    registry: Arc<Registry>,
+    book: &Arc<AccessBook>,
+    registry: &Arc<Registry>,
 ) -> pdn_store::CapabilityValidator {
-    Arc::new(move |entry, from| book.admit_ingest(&registry, entry, from))
+    let sessionless = book.ingest(registry, WriteAdmission::Nothing);
+    Arc::new(move |entry, _from| sessionless(entry))
 }
 
 #[cfg(test)]
@@ -593,7 +717,7 @@ mod tests {
     fn a_marker_names_its_entry_up_to_the_bound_only() {
         let namespace = NamespaceSecret::from_bytes(&[7u8; 32]);
         let author = Author::from_bytes(&[5u8; 32]);
-        let book = AccessBook::default();
+        let book = AccessBook::new(pdn_types::PdnId::from_bytes([1u8; 32]));
         book.arm_retraction(namespace.id(), author.id(), b"contact/email".to_vec(), 50)
             .expect("arm");
 
@@ -625,7 +749,7 @@ mod tests {
     fn arming_widens_and_never_narrows() {
         let namespace = NamespaceSecret::from_bytes(&[7u8; 32]);
         let author = Author::from_bytes(&[5u8; 32]);
-        let book = AccessBook::default();
+        let book = AccessBook::new(pdn_types::PdnId::from_bytes([1u8; 32]));
         let arm = |bound| {
             book.arm_retraction(
                 namespace.id(),
@@ -653,20 +777,17 @@ mod tests {
     fn an_unreadable_retraction_map_reaches_no_further_than_data_replicas() {
         let namespace = NamespaceSecret::from_bytes(&[7u8; 32]);
         let author = Author::from_bytes(&[5u8; 32]);
-        let book = AccessBook::default();
+        let book = AccessBook::new(pdn_types::PdnId::from_bytes([1u8; 32]));
         poison(&book.retractions);
         assert!(
             book.retraction_names(namespace.id(), &signed(&namespace, &author, "devices/x", 1)),
             "unreadable: claiming the match is the fail-closed side"
         );
 
-        let registry = Registry::default();
+        let registry = Arc::new(Registry::default());
+        let verdict = book.ingest(&registry, WriteAdmission::Nothing);
         assert_eq!(
-            book.admit_ingest(
-                &registry,
-                &signed(&namespace, &author, "devices/x", 1),
-                &[9u8; 32]
-            ),
+            verdict(&signed(&namespace, &author, "devices/x", 1)),
             ValidateOutcome::Accept
         );
     }

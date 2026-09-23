@@ -18,7 +18,7 @@ The template below is in English. When the review language is something else, th
 <One line, only when the run did not reach its own end: "Review cut at the 50-minute budget." or "Review finalized early on request.">
 
 
-**How to keep this file.** A closed finding is marked `[DONE <dd-mm>]` in its heading, the account of the fix is appended to it under a "What was done" block, and its line in the fixing order is struck through. The text of the finding is not deleted — it stays as the thing the fix is checked against. Finding numbers live only as long as this file: `.code-review/` is not under git, so nothing that is — no code, no documentation — may reference an `F<n>`, which would resolve to nothing for anyone without this file. A comment or a spec line that wants to cite a finding inlines its substance instead. Between one fix and the next the touched tests are stressed briefly and narrowly — a set cut down to what that fix reaches, minutes rather than tens of minutes — and what came back is recorded in that fix's "What was done" block; the full pass is its own item in the fixing order, never something a single fix claims in passing.
+**How to keep this file.** The file holds only what is still to be done, so it shrinks as fixes land until nothing is left. A closed finding is deleted from it together with its line in the fixing order, and so is a finding a later check refutes; its number is not reused, so a gap in the numbering is the only trace. An optional finding leaves either fixed or with the decision to leave it written where the next reader of that code looks — the crate's `CLAUDE.md`, a comment at the place, the change's design — never only here. What a fix did and what its short stress run showed goes into the report that hands the fix over, for the commit that carries it, not into this file. When the last finding is gone the file is deleted, and whatever "Not covered" still names is said in that last report. Finding numbers live only as long as this file: `.code-review/` is not under git, so nothing that is — no code, no documentation — may reference an `F<n>`, which would resolve to nothing for anyone without this file. A comment or a spec line that wants to cite a finding inlines its substance instead. Between one fix and the next the touched tests are stressed briefly and narrowly — a set cut down to what that fix reaches, minutes rather than tens of minutes; the full pass is its own item in the fixing order, never something a single fix claims in passing.
 
 ## Fixing order
 
@@ -37,9 +37,9 @@ The template below is in English. When the review language is something else, th
 
 <a id="f1"></a>
 ### F1 — <symptom → consequence, in one line>
-**File:** `<path:line>` · **CONFIRMED** <or **PLAUSIBLE**, or **NOT VERIFIED** when the run ended before a single verifier reached it — the word alone, never a vote tally, an angle name, or a count of who found it> · *new in this change* | *pre-existing, but in scope because <reason>*
+**File:** `<path:line>` · **CONFIRMED** <or **PLAUSIBLE**, or **NOT VERIFIED** when the run ended before a single verifier reached it — the word alone, never a vote tally, an angle name, or a count of who found it> · *new in this change* | *pre-existing, but in scope because <reason>* · **Reach:** product path | network | internal | n/a
 
-**How it shows up:** <the exact trigger: which input, which state, what the affected party observes. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
+**How it shows up:** <the exact trigger: which input, which state, what the affected party observes, and the path behind the reach — the public `pdn-node` operation and the condition, the input a modified node sends, or why neither reaches it. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
 
 **What causes it:** <the mechanism through the code with line references: what exactly permits this and why the existing checks do not catch it.>
 
@@ -65,12 +65,6 @@ The template below is in English. When the review language is something else, th
 
 ## Cleanup and tests
 
-## Refuted during verification
-
-<a id="f<n>"></a>
-### F<n> — REFUTED — <title>
-<One or two lines: what was supposed and what refuted it.>
-
 ## Not covered
 
 <From the gap sweep: which seam nobody read, which findings went unverified, which subject was not searched, what cannot be confirmed without a run that never happened. Everything the header no longer carries lands here: a repository looked at and found clean, an intent that could not be measured for want of a change document, whether the gap sweep itself ran, and whether any mutation check was made — naming the findings that asked for one. Coverage holes are named as subjects — "concurrency was not examined" — never as agent or vote bookkeeping. This section is mandatory — if there are no gaps, say that in one line.>
@@ -87,8 +81,8 @@ There is sometimes only one way to fix something — then there is one option, b
 - **No invented abbreviations or notation.** Invariants and ADRs by number; `Dn` only when it is said whose decisions those are.
 - **"Checked" means executed.** What was read with eyes is called read.
 - **Line numbers are as they stand in the working tree** at the time of the review, and are not adjusted afterwards.
-- **No votes, no angles, no agents in the file.** The verdict word, the refuted section, and "Not covered" are the only traces of the machinery.
-- **A number names exactly one thing.** `F1..Fn` run through every section in final order; a number is never reused, and a closed finding keeps its number.
-- **Anchors are written, never derived from a heading.** Headings get edited — `[DONE <dd-mm>]` on closing, titles sharpened, languages whose headings do not transliterate — and a written `f4` survives all of it.
+- **No votes, no angles, no agents in the file.** The verdict word and "Not covered" are the only traces of the machinery.
+- **A number names exactly one thing.** `F1..Fn` run through every section in final order; a number is never reused, and a closed finding takes its number out of the file with it.
+- **Anchors are written, never derived from a heading.** Headings get edited — titles sharpened, languages whose headings do not transliterate — and a written `f4` survives all of it.
 - **None of these rules is written into the file.** They govern how it is produced; the reader is not told how the sausage is made.
 - **Prototypes**: the pre-pivot one is `v3-single-device`, the rebuild after it is `v3-multi-device`, the current generation is `v4-non-keri`; never a bare number.

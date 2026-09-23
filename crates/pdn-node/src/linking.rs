@@ -6,7 +6,7 @@
 //! connection's authenticated node id, and replies with fresh write tickets
 //! to the directory and the data namespace. Pending confers nothing; the
 //! newcomer confirms itself once the tickets are in hand, since only a
-//! holder of the directory's write ticket can, which is evidence the reply
+//! identity of the directory's write ticket can, which is evidence the reply
 //! arrived. The dial side arms classification the moment the directory is
 //! imported — before the data namespace exists, so no serving window opens
 //! on the long-lived namespace id — and rolls everything back on any
@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     pairing::{read_message, write_message, StateSlot},
-    runtime::{HostedIdentity, State},
+    runtime::{HostedIdentity, ServingHalves, State},
 };
 
 pub(crate) const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
@@ -118,25 +118,18 @@ struct LinkingResponse {
     data: DocTicket,
 }
 
-/// Never meant to bound anything: exists so `shutdown`'s `acquire_many` has
-/// a fixed permit count to wait for.
-const MAX_CONCURRENT_LINKINGS: usize = 1_048_576;
-
-const SHUTDOWN_LINKING_BUDGET: Duration = Duration::from_secs(10);
-
 /// The accept side of the linking dialogue.
 #[derive(Debug, Clone)]
 pub(crate) struct LinkingHandler {
     state: StateSlot,
-    /// One permit per `accept` in flight; see `PairingHandler`.
-    in_flight: Arc<tokio::sync::Semaphore>,
+    serving_halves: ServingHalves,
 }
 
 impl LinkingHandler {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(serving_halves: ServingHalves) -> Self {
         Self {
             state: Arc::default(),
-            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LINKINGS)),
+            serving_halves,
         }
     }
 
@@ -210,6 +203,7 @@ impl LinkingHandler {
                 .node
                 .share_ticket(
                     identity,
+                    identity,
                     ShareMode::Write,
                     AddrInfoOptions::RelayAndAddresses,
                 )
@@ -242,25 +236,15 @@ impl LinkingHandler {
 
 impl ProtocolHandler for LinkingHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // The `let else` is exhaustiveness: the semaphore is never closed.
-        let Ok(_permit) = self.in_flight.acquire().await else {
-            return Ok(());
+        let served = match self.serving_halves.enter().await {
+            Some(_permit) => self.serve(&connection).await,
+            None => None,
         };
-        if self.serve(&connection).await.is_none() {
+        if served.is_none() {
             // The one uniform refusal.
             connection.close(0u32.into(), b"");
         }
         Ok(())
-    }
-
-    /// See `PairingHandler::shutdown`.
-    async fn shutdown(&self) {
-        let permits = u32::try_from(MAX_CONCURRENT_LINKINGS).unwrap_or(u32::MAX);
-        let _ = tokio::time::timeout(
-            SHUTDOWN_LINKING_BUDGET,
-            self.in_flight.acquire_many(permits),
-        )
-        .await;
     }
 }
 
@@ -330,47 +314,76 @@ async fn link_via_dialogue_inner(
             Err(_budget_spent) => return Err(DialogueTimeout.into()),
         };
 
-    // Sessions the imports start count for the catch-up: they start after
-    // this instant. The lock is dropped before every `undo_link` call:
-    // `undo_link` locks `state` itself, so a detached rollback can call it.
-    let before_import = SystemTime::now();
+    // The lock is dropped before every `undo_link` call: `undo_link` locks
+    // `state` itself, so a detached rollback can call it.
     let rollback_state = Arc::clone(state);
     let mut rollback;
-    let directory = {
+    let (directory, catch_up) = {
         let state_guard = state.lock().await;
         let mut directory_ticket = response.directory;
         directory_ticket.nodes.push(payload.inviter_addr.clone());
-        let directory = PrivateMetadataStore::import(&state_guard.node, directory_ticket).await?;
+        // The identity's own half of the node, brought up by this link and
+        // dropped whole if it fails (ADR-0013).
+        state_guard
+            .node
+            .provision_identity(payload.identity)
+            .await?;
+        // Armed before the directory exists: an inviter whose ticket does
+        // not import would otherwise leave that half of the node standing.
         rollback = LinkRollbackGuard::new(
             rollback_state,
             payload.identity,
-            directory.namespace(),
             rollback_owns_cleanup,
             cleanup_tasks,
         );
-        // Armed before the data namespace exists: a still-catching-up book
-        // refuses callers it cannot resolve, and no serving window opens on
-        // the long-lived namespace id.
+        let directory = match PrivateMetadataStore::import(
+            &state_guard.node,
+            payload.identity,
+            directory_ticket,
+        )
+        .await
+        {
+            Ok(directory) => directory,
+            Err(err) => {
+                drop(state_guard);
+                undo_link(state, payload.identity, None, None).await;
+                rollback.disarm();
+                return Err(err);
+            }
+        };
+        rollback.armed_directory(directory.namespace());
+        // Before the arming starts the directory's sync.
+        let catch_up = match directory.watch_catch_up().await {
+            Ok(catch_up) => catch_up,
+            Err(err) => {
+                drop(state_guard);
+                undo_link(state, payload.identity, Some(directory.namespace()), None).await;
+                rollback.disarm();
+                return Err(err);
+            }
+        };
+        // The book refuses callers it cannot resolve while it catches up,
+        // so no serving window opens on the long-lived namespace id.
         if let Err(err) = state_guard.node.host_identity(payload.identity, &directory) {
             drop(state_guard);
-            undo_link(state, payload.identity, directory.namespace(), None).await;
+            undo_link(state, payload.identity, Some(directory.namespace()), None).await;
             rollback.disarm();
             return Err(err);
         }
         let data_import = state_guard
             .node
-            .import_namespace(payload.identity, response.data)
+            .import_namespace(payload.identity, payload.identity, response.data)
             .await;
         match data_import {
             Ok(data_import) => rollback.set_data_import(data_import),
             Err(err) => {
                 drop(state_guard);
-                undo_link(state, payload.identity, directory.namespace(), None).await;
+                undo_link(state, payload.identity, Some(directory.namespace()), None).await;
                 rollback.disarm();
                 return Err(err);
             }
         }
-        directory
+        (directory, catch_up)
     };
 
     #[cfg(feature = "test-util")]
@@ -382,7 +395,7 @@ async fn link_via_dialogue_inner(
     // No lock held: a cancellation here is what `rollback`'s `Drop` exists
     // for — the explicit branch covers only a completed wait.
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if let Err(err) = directory.wait_caught_up(before_import, remaining).await {
+    if let Err(err) = catch_up.wait(remaining).await {
         rollback.roll_back().await;
         return Err(err).context("the imported directory did not catch up in time");
     }
@@ -417,11 +430,12 @@ async fn link_via_dialogue_inner(
     {
         drop(guard);
         rollback.roll_back().await;
-        return Err(err).context("the hosted-identities record could not be written");
+        return Err(err).context("the hosting record could not be written");
     }
+    let author = guard.node.default_author(payload.identity)?;
     guard
         .identities
-        .insert(payload.identity, HostedIdentity { directory });
+        .insert(payload.identity, HostedIdentity { directory, author });
 
     // The confirmation, after the commit point and never before it: written
     // before the commit it would stand on every sibling with no local
@@ -506,7 +520,10 @@ impl Drop for LinkingReservation {
 struct LinkRollbackGuard {
     state: Arc<Mutex<State>>,
     identity: PdnId,
-    directory_namespace: NamespaceId,
+    /// `None` until the directory is imported: the identity's half of the
+    /// node comes up before it, and that half is the first thing a failure
+    /// has to take back down.
+    directory_namespace: Option<NamespaceId>,
     data_import: Option<SelfCleaningImport>,
     owns_reservation_cleanup: Arc<AtomicBool>,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
@@ -514,10 +531,11 @@ struct LinkRollbackGuard {
 }
 
 impl LinkRollbackGuard {
+    /// Armed as soon as the identity is provisioned, which is the first
+    /// act with anything to undo.
     fn new(
         state: Arc<Mutex<State>>,
         identity: PdnId,
-        directory_namespace: NamespaceId,
         owns_reservation_cleanup: Arc<AtomicBool>,
         cleanup_tasks: crate::runtime::CleanupSupervisor,
     ) -> Self {
@@ -525,12 +543,16 @@ impl LinkRollbackGuard {
         Self {
             state,
             identity,
-            directory_namespace,
+            directory_namespace: None,
             data_import: None,
             owns_reservation_cleanup,
             cleanup_tasks,
             armed: true,
         }
+    }
+
+    fn armed_directory(&mut self, namespace: NamespaceId) {
+        self.directory_namespace = Some(namespace);
     }
 
     fn set_data_import(&mut self, data_import: NamespaceImport) {
@@ -677,23 +699,25 @@ async fn run_linking_dialogue(
 }
 
 /// Undo an abandoned link's local effects in reverse order, best-effort.
-/// The data namespace is undone rather than forgotten by issuer: a peer's
-/// granted namespace binds the same issuer without making the identity
-/// hosted, and forgetting it would destroy a replica this link never
-/// imported. Locks `state` only after the import is undone —
-/// [`SelfCleaningImport::undo`] locks it itself.
+/// The link brought up the identity's own half of the node, so dropping
+/// it reaches exactly what the link imported and nothing else: a
+/// namespace of the same issuer held under another identity's grant is in
+/// that identity's stores and is untouched. Locks `state` only after the
+/// import is undone — [`SelfCleaningImport::undo`] locks it itself.
 async fn undo_link(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
-    directory_namespace: NamespaceId,
+    directory_namespace: Option<NamespaceId>,
     data_import: Option<SelfCleaningImport>,
 ) {
     if let Some(import) = data_import {
         import.undo().await;
     }
     let state = state.lock().await;
-    let _ = state.node.unhost_identity(identity);
-    let _ = state.node.forget_doc(directory_namespace).await;
+    if let Some(directory) = directory_namespace {
+        let _ = state.node.forget_doc(identity, directory).await;
+    }
+    let _ = state.node.unhost_identity(identity).await;
 }
 
 // `tracked_doc_count` is behind `test-util`.
@@ -714,9 +738,11 @@ mod tests {
         let state = Arc::clone(&rt.state);
 
         let scratch = SyncNode::spawn(data_layer::SpawnOptions::memory()).await?;
-        scratch.create_namespace(ids::DAVE).await?;
+        scratch.provision_identity(ids::DAVE).await?;
+        scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
         let ticket = scratch
             .share_ticket(
+                ids::DAVE,
                 ids::DAVE,
                 ShareMode::Write,
                 AddrInfoOptions::RelayAndAddresses,
@@ -725,8 +751,12 @@ mod tests {
 
         let (import, before) = {
             let guard = state.lock().await;
-            let import = guard.node.import_namespace(ids::DAVE, ticket).await?;
-            let before = guard.node.tracked_doc_count()?;
+            guard.node.provision_identity(ids::ALICE).await?;
+            let import = guard
+                .node
+                .import_namespace(ids::ALICE, ids::DAVE, ticket)
+                .await?;
+            let before = guard.node.tracked_doc_count(ids::ALICE)?;
             (import, before)
         };
 
@@ -739,7 +769,7 @@ mod tests {
 
         let settled = test_utils::eventually(|| async {
             let guard = state.lock().await;
-            Ok(guard.node.tracked_doc_count()? < before)
+            Ok(guard.node.tracked_doc_count(ids::ALICE)? < before)
         })
         .await?;
         assert!(
