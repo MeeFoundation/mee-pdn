@@ -1069,7 +1069,8 @@ async fn sync_big() -> Result<()> {
     let mut ticket = doc0
         .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    // do not join for now, just import without any peer info
+    // Imported without peer info: each node's own data is asserted before
+    // any node joins.
     let peer0 = ticket.nodes[0].clone();
     ticket.nodes = vec![];
 
@@ -1625,14 +1626,11 @@ async fn next_event_matching(
 /// A record can arrive from a peer that does not have the record's content:
 /// the sender is a relay that received the record but never fetched the
 /// bytes. The receiver then has no provider to download from, and the
-/// content hash is parked. Unparking used to depend solely on a
-/// best-effort gossip `ContentReady` broadcast from some neighbor that
-/// downloaded the content; when no such broadcast ever comes — nobody else
-/// downloads, or the message is lost — the content starved forever, even
-/// though the receiver keeps completing sync exchanges with peers that do
-/// have the bytes. Every successful sync now retries the namespace's
+/// content hash is parked. Every successful sync retries the namespace's
 /// parked hashes against the just-synced peer, so the first sync with a
-/// peer that has the content delivers it.
+/// peer that has the content delivers it; without that retry the hash
+/// waits on a best-effort gossip `ContentReady` broadcast that may never
+/// come, while sync exchanges with peers holding the bytes go on.
 ///
 /// The writer leaves the document while the receiver joins, so the record
 /// can only reach the receiver through the relay — without that, gossip

@@ -1359,8 +1359,8 @@ mod tests {
         let namespace = NamespaceSecret::new(&mut rng);
         let (handle, namespace_id) = spawn_handle_with_replica(&namespace, "bob")?;
         // Open, but not for sync: the request is allowed and the session
-        // then refuses — a failure between the two, which is where the
-        // namespace used to be lost.
+        // then refuses — the failure between the two, which still has to
+        // name the namespace.
         handle.open(namespace_id, OpenOpts::default()).await?;
 
         let allow = |_ns, _identity, _caller, _peer| {
@@ -1485,7 +1485,7 @@ mod tests {
 
         // A boundary naming another namespace: the store refuses it, so the
         // round fails after the state was taken out for the call — the one
-        // window where the state used to be left unreadable.
+        // window in which a failure could leave the state unreadable.
         let range = crate::ranger::Range::new(
             RecordIdentifier::new(foreign.id(), author.id(), b""),
             RecordIdentifier::new(foreign.id(), author.id(), b"\xff"),
