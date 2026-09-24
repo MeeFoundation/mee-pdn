@@ -132,6 +132,7 @@ SETTINGS
 - Tokens are stored only on the host machine in `~/.config/sandcat/settings.json`
 - Inside the container, each token's environment variable holds a placeholder (`SANDCAT_PLACEHOLDER_GITHUB_TOKEN`), never the token
 - Mitmproxy intercepts HTTP(S) requests and replaces placeholders with real tokens, only for the hosts the secret names; a placeholder on its way to any other host gets the request refused
+- The replacement covers request bodies too. Text that quotes a placeholder and goes to one of the secret's hosts carries the real token: a pull request description or a comment sent through `gh` publishes the `GITHUB_TOKEN`, and a prompt to Claude sends it to Anthropic if the secret lists Anthropic's hosts. Never put a placeholder string into such text, and list only the hosts that need the token
 - Tokens **are not logged** and **not saved in command history**
 - The container gets only mitmproxy's public CA certificate and the generated environment file; the CA private key and the WireGuard keys stay in a volume it does not mount
 - The mitmweb UI listens on `http://127.0.0.1:8081` of the host only (password `mitmproxy`)
