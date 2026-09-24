@@ -38,6 +38,8 @@ Task runner is [just](https://github.com/casey/just) — `just --list` prints ev
 
 `rust-toolchain.toml` pins the compiler, its components and the wasm targets for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
 
+`tools.toml` pins the developer tools — just, cargo-nextest, cargo-deny, cargo-watch. `just setup-tooling` installs every one, and each pipeline job installs the ones it names through `.github/actions/install-tools`. The devcontainer image builds from `.devcontainer/` alone and repeats the versions as `ARG`s, which `just check` compares against the file. Dependabot moves the actions' commit pins, not these versions.
+
 Every test of the HTTP surface is a container test. They carry `#[ignore]`, so
 `just test` on a machine without a daemon or an image stays green and reports
 them skipped; `just test-docker` and the pipeline's own job run them with
@@ -45,7 +47,7 @@ them skipped; `just test-docker` and the pipeline's own job run them with
 parallelism: the daemon holds a fixed share of the machine, and the runner's
 default width would saturate it.
 
-Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI installs it via `taiki-e/install-action`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
+Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI through `.github/actions/install-tools`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
 
 On macOS a stress run now and then marks a test `LEAK`: it passed, and its stdout or stderr closed more than nextest's 100 ms after the process exited. The test holds nothing open. Rust's standard library creates a pipe on macOS with `pipe()` and marks it close-on-exec in a second call, so a test process nextest spawns from another thread in between inherits that pipe and keeps it until it exits itself. The marks fall on tests of the first spawn burst of an iteration and do not occur on Linux, where the pipe is created close-on-exec atomically. A `LEAK` that also shows on Linux is a real one.
 
