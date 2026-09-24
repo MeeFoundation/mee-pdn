@@ -1,32 +1,23 @@
 name: mee-pdn
 include:
   - path: sandcat/compose-proxy.yml
+  # Constant parts of the agent service: image build, no-new-privileges,
+  # network through wg-client. `services.agent` below merges over it.
+  - path: sandcat/compose-agent.yml
 services:
   agent:
-    build:
-      context: .
-      dockerfile: Dockerfile.app
-    # Share wg-client's network namespace so all traffic goes through its
-    # WireGuard tunnel. The app container has no NET_ADMIN capability,
-    # so processes inside cannot modify routing, iptables, or the tunnel.
-    network_mode: "service:wg-client"
+    environment:
+      - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+    working_dir: /workspaces/mee-pdn
     volumes:
-      # Named volume for the home directory so Claude/Codex auth state, shell
-      # history, and other user-level config persist across rebuilds.
-      - app-home:/home/vscode
-      # Mount Docker socket for testcontainers (integration tests)
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Shared volume from mitmproxy containing the CA cert and
-      # sandcat.env (env vars + secret placeholders). Read-only — app
-      # containers should never write to this.
-      - mitmproxy-config:/mitmproxy-config:ro
       # Mount the project's code
       - ..:/workspaces/mee-pdn
-      # Keep host build artifacts out of the mount (host macOS/aarch64 vs Linux
-      # container; cargo/rust-analyzer/watchers must not traverse host target
-      # trees). The container builds into its own volume here.
+      # Host target trees are macOS builds; the container builds into its own volumes.
       - /workspaces/mee-pdn/target
       - /workspaces/mee-pdn/mee-v3-single-device/target
+      # testcontainers and the demo. A container started through it is outside
+      # the tunnel; see README.md, Security.
+      - /var/run/docker.sock:/var/run/docker.sock
       # Read-only devcontainer directory
       - ../.devcontainer:/workspaces/mee-pdn/.devcontainer:ro
       # Read-only settings directory
@@ -35,23 +26,16 @@ services:
       - ${HOME}/.claude/CLAUDE.md:/home/vscode/.claude/CLAUDE.md:ro
       - ${HOME}/.claude/agents:/home/vscode/.claude/agents:ro
       - ${HOME}/.claude/commands:/home/vscode/.claude/commands:ro
-      # Read-only Git directory
-      # - ../.git:/workspace/.git:ro
-      # Read-only IntelliJ IDEA project directory
-      # - ../.idea:/workspace/.idea:ro
-    command: sleep infinity
-    environment:
-      - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-    depends_on:
-      wg-client:
-        condition: service_healthy
-    working_dir: /workspaces/mee-pdn
   mitmproxy:
+    # sandcat publishes the UI on a dynamic port of every host interface.
+    ports: !override
+      - "127.0.0.1:8081:8081"
     volumes:
-      - ../.sandcat:/config/project:ro
       # Project-level settings (.sandcat/ directory). If the directory does
       # not exist on the host, Docker creates an empty one and the addon
       # simply finds no files — no error.
+      - ../.sandcat:/config/project:ro
 volumes:
-  app-home:
+  # The name predates sandcat's rename of the volume; auth and history live in it.
+  agent-home:
     name: mee-pdn-home

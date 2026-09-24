@@ -1,0 +1,27 @@
+name: Install tools
+description: Install the named tools at the versions tools.toml pins. Needs the checkout.
+inputs:
+  tools:
+    description: Space-separated crate names, as tools.toml keys them
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Read the versions from tools.toml
+      id: versions
+      shell: bash
+      env:
+        TOOLS: ${{ inputs.tools }}
+      run: |
+        specs=""
+        for tool in $TOOLS; do
+          version="$(awk -F'"' -v k="$tool" '$1 ~ "^" k " *= *$" { print $2 }' "$GITHUB_WORKSPACE/tools.toml")"
+          [ -n "$version" ] || { echo "tools.toml pins no $tool"; exit 1; }
+          specs="${specs:+$specs,}$tool@$version"
+        done
+        echo "specs=$specs" >> "$GITHUB_OUTPUT"
+
+    - name: Install
+      uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+      with:
+        tool: ${{ steps.versions.outputs.specs }}

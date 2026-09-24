@@ -19,22 +19,22 @@ permissions:
 
 jobs:
   lint-test-wasm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Channel, components and targets from rust-toolchain.toml, in every job.
       - name: Install Rust toolchain
         run: rustup toolchain install
 
       - name: Install just + nextest
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just,nextest
+          tools: just cargo-nextest
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
 
@@ -49,21 +49,21 @@ jobs:
   # invisible to the job above. Its own job, so its two extra builds of the
   # iroh stack run beside the workspace's rather than after it.
   store:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup toolchain install
 
       - name: Install just + nextest
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just,nextest
+          tools: just cargo-nextest
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
 
@@ -74,35 +74,35 @@ jobs:
         run: just test-store
 
   stand:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # A release image build plus the container suite. Past this the job is
     # stuck rather than slow, and the runner's own ceiling is six hours.
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup toolchain install
 
       - name: Install just + nextest
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just,nextest
+          tools: just cargo-nextest
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
 
       - name: Set up buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The image the scenarios look for, built with a layer cache so a run
       # pays for the dependency stage once. Built here rather than through
       # `just test-docker`, which builds without that cache.
       - name: Build the stand's image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ops/Dockerfile

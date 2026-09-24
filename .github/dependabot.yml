@@ -1,0 +1,18 @@
+# Moves the actions' commit pins in .github/workflows and the local actions.
+# The tools those actions install are pinned in tools.toml.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # `/` alone covers .github/workflows and a root action.yml, not the
+    # local actions under .github/actions.
+    directories: ["/", "/.github/actions/*"]
+    schedule:
+      interval: weekly
+    # A release younger than this is not proposed: a compromised tag is
+    # usually caught and pulled within days.
+    cooldown:
+      default-days: 7
+    # One pull request a week for all of them, not one per action.
+    groups:
+      actions:
+        patterns: ["*"]

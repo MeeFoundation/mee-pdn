@@ -1,0 +1,6 @@
+# Personal overrides (a local `[patch]`) go in config.local.toml, which .gitignore keeps out of git.
+# include = [{ path = "config.local.toml", optional = true }]
+
+# Resolution skips registry versions younger than this; to be uncommented after Cargo 1.100 is released.
+# [registry]
+# global-min-publish-age = "7 days"
