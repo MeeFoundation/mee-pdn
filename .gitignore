@@ -1,5 +1,6 @@
-/mia-docs/
-/mia-ontologies/
+# Note: `/mia-docs/` and other sub-repos are not added here because this way Zed ignores them.
+# And without `.gitignore` multi-repo workspaces work fine in both Zed and VS Code.
+
 /.code-review/
 local-data
 .env
