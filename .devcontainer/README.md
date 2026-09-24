@@ -21,6 +21,7 @@ The container is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: all 
 3. Set **Expiration** — recommended: 90 days
 4. Select scopes:
    - ✅ **repo** — full access to private repositories (clone, push, pull)
+   - ✅ **workflow** — push commits that change `.github/workflows/`; without it GitHub rejects such a push
    - ✅ **read:packages** — read packages from GitHub Package Registry (if project uses it)
    - ✅ **read:org** — read organization membership (needed if repository is in an organization)
 5. Click **Generate token**
