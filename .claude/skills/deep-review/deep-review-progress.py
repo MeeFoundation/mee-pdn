@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """Progress counter for the /deep-review workflow, and the run's only clock.
 
 A workflow script cannot read the time — Date.now() throws inside one, so that
 a resumed run replays identically. So the budget lives here: this prints one
 status line per call, and a FINALIZE-NOW line once the deadline has passed.
 
-    deep-review-progress.py <transcriptDir> <numLenses> <T0 epoch> <deadline s>
+    python3 -I deep-review-progress.py <transcriptDir> <numLenses> <T0 epoch> <deadline s>
 
 Counts come from "type":"result" lines in journal.jsonl, never from "started" —
 that one is written when an agent gets a concurrency slot, not when the script
@@ -18,9 +18,14 @@ Phases are told apart by the shape of the result field:
     a bare string        the map or the gap sweep
 """
 
+import sys
+
+# Before any other import: without -I a module file beside the script shadows the standard library.
+if not sys.flags.isolated:
+    sys.exit(f'{sys.argv[0]}: run in isolated mode, python3 -I')
+
 import json
 import os
-import sys
 import time
 
 COST = {'critical': 5, 'medium': 3, 'structural': 3, 'cleanup': 0}

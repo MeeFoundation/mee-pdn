@@ -60,6 +60,12 @@ Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/te
 
 Strict safety-first linting, configured in the workspace `Cargo.toml`, `clippy.toml` and `rustfmt.toml`, enforced by `just check`. Prefer `.get()` and `TryFrom`/`TryInto` over indexing and `as`.
 
+## Scripts
+
+A recipe in the `justfile` is an interface — its doc line, its parameters, how to call it — over a flat list of commands. Anything beyond that — a `case`, a loop, a `trap`, output parsed with awk, sed or Python — lives in its own file under [`scripts/`](scripts/) that the recipe calls, with the comment that explains the mechanism, never as a heredoc or a `python3 -c`: embedded code gets no syntax highlighting and no linting, and it cannot run on its own. A script finds the repository root from its own location, and the caller names the interpreter — `sh scripts/<name>.sh`, `python3 -I scripts/<name>.py` — since nothing relies on the executable bit.
+
+A Python script always runs in isolated mode: its first statements exit unless `sys.flags.isolated` is set, before any other import. Without `-I` Python searches the script's own directory first, and a stray `scripts/shutil.py` would run in place of the standard module. The shebang, `#!/usr/bin/env -S python3 -I`, serves only a run by hand (`-S` makes Linux pass `-I` as an argument of its own). A script that belongs to a skill lives beside that skill's `SKILL.md` under the same rules. It imports the standard library only: nothing to install, no third-party code to vet.
+
 ## Code practices
 
 Cross-cutting practices live in `mia-docs/openspec/specs/code-practices/`:

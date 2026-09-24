@@ -169,7 +169,7 @@ NL=<number of search angles>      # 9 whole-change angles + the splittable fan: 
 T0=<epoch seconds>                # from §1 step 7, `date +%s`
 END=$((SECONDS + 3900))
 while [ $SECONDS -lt $END ]; do
-  .claude/skills/deep-review/deep-review-progress.py "$D" "$NL" "$T0" 3000
+  python3 -I .claude/skills/deep-review/deep-review-progress.py "$D" "$NL" "$T0" 3000
   [ -f "$D/../done" ] && break
   sleep 180
 done
