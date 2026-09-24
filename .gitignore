@@ -18,6 +18,7 @@ build
 **/xcuserdata
 tmp
 var
-.cargo
+/.cargo/*
+!/.cargo/config.toml
 .claude/settings.local.json
 CLAUDE.local.md
