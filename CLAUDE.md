@@ -38,6 +38,8 @@ Task runner is [just](https://github.com/casey/just) — `just --list` prints ev
 
 `rust-toolchain.toml` pins the compiler, its components and the wasm targets for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
 
+The devcontainer is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: `.devcontainer/sandcat/` is sandcat's generated setup copied unchanged, and this workspace's additions live in the files around it. [`.devcontainer/UPSTREAM.md`](.devcontainer/UPSTREAM.md) records each sync with upstream, the decisions taken in it, and how to run the next one.
+
 `tools.toml` pins the developer tools — just, cargo-nextest, cargo-deny, cargo-watch. `just setup-tooling` installs every one, and each pipeline job installs the ones it names through `.github/actions/install-tools`. The devcontainer image builds from `.devcontainer/` alone and repeats the versions as `ARG`s, which `just check` compares against the file. Dependabot moves the actions' commit pins, not these versions.
 
 Every test of the HTTP surface is a container test. They carry `#[ignore]`, so

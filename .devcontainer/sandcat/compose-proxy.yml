@@ -7,36 +7,89 @@ services:
       dockerfile: Dockerfile.wg-client
     volumes:
       - mitmproxy-config:/mitmproxy-config:ro
+      # Sibling containers share wg-client's network namespace via network_mode
+      # but each get their own /etc/resolv.conf; this volume lets wg-client
+      # publish its resolv.conf for siblings to copy on init.
+      - wg-runtime:/run/sandcat
     cap_add:
       - NET_ADMIN # required for WireGuard interface and iptables setup
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1 # required by WireGuard fwmark routing; can't be set inside the container (/proc/sys is read-only)
-    command: sleep infinity
-    ports:
-      - "8070:8070"
+    # DNS exfiltration sink for Docker's embedded resolver at 127.0.0.11.
+    # Sibling-container names are still resolved locally by the embedded DNS;
+    # any other name under the compose project's search domain (e.g. an
+    # attacker-crafted `<payload>.<project>_default`) gets forwarded by the
+    # daemon to this address, which is unroutable per RFC 5737 (TEST-NET-1)
+    # and so fails fast without ever leaving the host. Closes the bypass that
+    # would otherwise route such queries to the host's upstream resolver,
+    # invisible to mitmproxy.
+    dns:
+      - 192.0.2.1
+    # Backstop for script-level crashes (oom, SIGKILL); dnsmasq itself is
+    # supervised in-script to keep the network namespace alive for siblings.
+    restart: unless-stopped
     depends_on:
       mitmproxy:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "test", "-f", "/tmp/wg-ready"]
+      # /tmp/wg-ready is touched once at end of init; dnsmasq-ready (shared
+      # with the in-script wait loop) detects a dead dnsmasq, since every
+      # sibling container's DNS funnels through 127.0.0.1:53 and a silent
+      # crash would black-hole resolution.
+      test: ["CMD-SHELL", "test -f /tmp/wg-ready && /usr/local/bin/dnsmasq-ready"]
       interval: 2s
       timeout: 2s
       retries: 15
+      # Without a start_period, retries*interval (~30s) is the whole window to
+      # finish init and touch /tmp/wg-ready. On a cold Docker VM the init's many
+      # forked steps (jq, wg, ip, iptables, dnsmasq, ss) run slowly and can
+      # exceed 30s, so early failures exhaust the retries and the container is
+      # wrongly marked unhealthy — aborting the run with "dependency wg-client
+      # failed to start ... is unhealthy". Failures during the start_period
+      # don't count; a single success ends it immediately, so a healthy start
+      # is still detected without delay.
+      start_period: 120s
 
   mitmproxy:
-    image: mitmproxy/mitmproxy:latest
-    command: mitmweb --mode wireguard --web-host 0.0.0.0 --set web_password=mitmproxy -s /scripts/mitmproxy_addon.py
+    image: mitmproxy/mitmproxy:12.2.3
+    # Delete the stale dns.conf sentinel before mitmweb starts (see healthcheck
+    # below). The mitmproxy-config volume persists across restarts, so a dns.conf
+    # left by a previous run would satisfy the healthcheck immediately — letting
+    # wg-client start and read outdated upstream DNS (e.g. after editing
+    # `dns_servers`) before the addon rewrites it. Wrap the image entrypoint (not
+    # the command) so docker-entrypoint.sh still sees `mitmweb` as $1 and drops
+    # privileges to the mitmproxy user.
+    entrypoint: ["/bin/sh", "-c", "chown -R mitmproxy:mitmproxy /mitmproxy-public && rm -f /home/mitmproxy/.mitmproxy/dns.conf /mitmproxy-public/mitmproxy-ca-cert.pem && (while [ ! -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem ]; do sleep 1; done; cp /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem /mitmproxy-public/mitmproxy-ca-cert.pem.tmp && mv /mitmproxy-public/mitmproxy-ca-cert.pem.tmp /mitmproxy-public/mitmproxy-ca-cert.pem) & exec docker-entrypoint.sh \"$@\"", "sh"]
+    command: mitmweb --mode wireguard --web-host 0.0.0.0 --set web_password=mitmproxy --set http2=true  -s /scripts/mitmproxy_addon_claude.py
     ports:
-      - "127.0.0.1:8081:8081" # mitmweb UI, loopback only
+      - "8081" # mitmweb UI; host port assigned dynamically to avoid conflicts
     volumes:
       - mitmproxy-config:/home/mitmproxy/.mitmproxy
-      - ./scripts/mitmproxy_addon.py:/scripts/mitmproxy_addon.py:ro
+      - ./scripts/mitmproxy_addon_claude.py:/scripts/mitmproxy_addon_claude.py:ro
+      - ./scripts/mitmproxy_addon_common.py:/scripts/mitmproxy_addon_common.py:ro
       - ~/.config/sandcat/settings.json:/config/settings.json:ro
+      # Agent-facing volume — public CA cert + sandcat.env + cursor-cli-config.
+      # Split from mitmproxy-config so the agent container cannot read the CA
+      # private key (mitmproxy-ca.pem) or WireGuard private keys
+      # (wireguard.conf) — see issue #25.
+      - mitmproxy-public:/mitmproxy-public
     healthcheck:
-      test: ["CMD", "test", "-f", "/home/mitmproxy/.mitmproxy/wireguard.conf"]
+      # dns.conf is written (last) by the addon's load() hook and cleared by
+      # the entrypoint above on each start, so gating on its presence means
+      # wg-client (which reads it at startup) cannot race ahead of the addon
+      # and silently fall back to defaults or a stale upstream.
+      test: ["CMD", "sh", "-c", "test -f /home/mitmproxy/.mitmproxy/wireguard.conf && test -f /mitmproxy-public/mitmproxy-ca-cert.pem && test -f /home/mitmproxy/.mitmproxy/dns.conf"]
       interval: 2s
       timeout: 2s
       retries: 15
+      # dns.conf is written only after the addon resolves every op:// secret,
+      # and sequential `op read` calls to 1Password can take ~30s. Without a
+      # start_period those early failures count toward retries and the proxy is
+      # wrongly marked unhealthy, so dependents fail to start. Failures during
+      # the start_period don't count; a single success ends it immediately.
+      start_period: 90s
 
 volumes:
   mitmproxy-config:
+  mitmproxy-public:
+  wg-runtime:

@@ -1,0 +1,8 @@
+#!/bin/sh
+#
+# Returns 0 iff a UDP socket is bound to 127.0.0.1:53 — i.e. dnsmasq is
+# listening. Used by wg-client-init.sh's startup wait loop and the
+# docker-compose healthcheck so the two cannot drift out of sync about
+# what "dnsmasq is up" means.
+#
+ss -lnu 2>/dev/null | grep -qE '127\.0\.0\.1:53($|[[:space:]])'

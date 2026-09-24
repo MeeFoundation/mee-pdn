@@ -26,16 +26,29 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
+# Every root step runs in the entrypoint before it drops to vscode, so vscode
+# needs no sudo; compose-agent.yml's no-new-privileges is the runtime half.
+RUN rm -f /etc/sudoers.d/vscode
 
 COPY --chmod=755 sandcat/scripts/app-init.sh /usr/local/bin/app-init.sh
 COPY --chmod=755 sandcat/scripts/app-user-init.sh /usr/local/bin/app-user-init.sh
+COPY --chmod=644 sandcat/scripts/java-env.sh /etc/profile.d/sandcat-java.sh
+COPY --chmod=755 scripts/project-init.sh /usr/local/bin/project-init.sh
+COPY --chmod=755 scripts/project-user-init.sh /usr/local/bin/project-user-init.sh
 COPY --chown=vscode:vscode sandcat/tmux.conf /home/vscode/.tmux.conf
+COPY codex/config.toml /etc/codex/config.toml
 
-# Add vscode user to docker group for socket access
 RUN groupadd -f docker \
     && usermod -aG docker vscode
 
+# Outside the home volume, so a rebuild upgrades it. CODEX_HOME applies to the
+# installer only; at runtime Codex reads ~/.codex.
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | \
+    CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/opt/codex-home sh
+
 USER vscode
+
+ENV LANG="en_US.UTF-8"
 
 # Install Claude Code (native binary — no Node.js required).
 RUN curl -fsSL https://claude.ai/install.sh | bash
@@ -55,11 +68,7 @@ ARG CARGO_DENY_VERSION=0.20.2
 # Install just command runner
 RUN curl -fsSL https://just.systems/install.sh | bash -s -- --tag "$JUST_VERSION" --to ~/.local/bin
 
-# Development stacks (managed by sandcat init --stacks):
 RUN mise use -g rust@latest
-
-
-# END STACKS
 
 # The workspace's rust-toolchain.toml selects the toolchain here as it does for
 # rustup elsewhere; without this mise would hold `rust@latest` over it.
@@ -79,37 +88,16 @@ RUN ARCH="$(uname -m)"; \
     curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$TAG/cargo-deny-$TAG-$T.tar.gz" \
     | tar zxf - --strip-components=1 -C /home/vscode/.local/bin "cargo-deny-$TAG-$T/cargo-deny"
 
-# Node.js + OpenSpec CLI + Codex CLI (used by the repo-scoped agent skills).
-# Kept outside the sandcat-managed stacks block so `sandcat init --stacks` won't overwrite it.
+# Node.js + OpenSpec CLI (used by the repo-scoped agent skills).
 RUN mise use -g node@latest \
-    && npm install -g @fission-ai/openspec @openai/codex
-
-# If Java was installed above, bake JAVA_HOME and JAVA_TOOL_OPTIONS into
-# .bashrc so VS Code's env probe picks them up before the entrypoint runs.
-# Without JAVA_HOME, JVM tooling like Metals fails to find the JDK.
-# JAVA_TOOL_OPTIONS points to a trust store copy that the entrypoint will
-# populate with the mitmproxy CA at runtime; until then it holds the default
-# Java CAs (harmless — equivalent to not setting it at all).
-# A version-independent symlink is used so .bashrc doesn't need updating
-# when the Java version changes — only the symlink target is updated.
-RUN if MISE_JAVA=$(mise where java 2>/dev/null); then \
-    dir="$HOME/.local/share/sandcat"; mkdir -p "$dir"; \
-    ln -sfn "$MISE_JAVA" "$dir/java-home"; \
-    cp "$MISE_JAVA/lib/security/cacerts" "$dir/cacerts" 2>/dev/null || true; \
-    { echo ''; \
-    echo '# sandcat-java-env'; \
-    echo '[ -L "$HOME/.local/share/sandcat/java-home" ] && export JAVA_HOME="$HOME/.local/share/sandcat/java-home"'; \
-    echo '[ -f "$HOME/.local/share/sandcat/cacerts" ] && export JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$HOME/.local/share/sandcat/cacerts -Djavax.net.ssl.trustStorePassword=changeit"'; \
-    } >> "$HOME/.bashrc"; \
-    fi
+    && npm install -g @fission-ai/openspec
 
 # Pre-create agent state directories so bind mounts and first-run setup do not
-# create them as root-owned. Both live on the persistent app-home volume.
+# create them as root-owned. Both live on the persistent home volume.
 RUN mkdir -p /home/vscode/.claude /home/vscode/.codex
 
 RUN echo 'alias claude-yolo="claude --dangerously-skip-permissions"' >> /home/vscode/.bashrc
 RUN echo 'alias codex-yolo="codex --dangerously-bypass-approvals-and-sandbox"' >> /home/vscode/.bashrc
 
 USER root
-COPY codex/config.toml /etc/codex/config.toml
-ENTRYPOINT ["/usr/local/bin/app-init.sh"]
+ENTRYPOINT ["/usr/local/bin/project-init.sh"]

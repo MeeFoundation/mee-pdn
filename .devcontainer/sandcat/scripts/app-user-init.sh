@@ -6,6 +6,19 @@
 #
 set -e
 
+# app-init uses `su - vscode` (login shell). Keep HOME explicit so git config
+# and related tools always write to the expected location.
+export HOME="/home/vscode"
+
+# VS Code's Dev Containers extension reads dev.containers.copyGitConfig
+# from HOST user settings, not from devcontainer.json — so a host
+# ~/.gitconfig may have been copied in even though our template
+# declares copyGitConfig: false (see issue #34). Remove any leftover
+# gitconfig so it can't leak host credential helpers / signing keys
+# or override the env-derived identity we're about to apply.
+# Unconditional and idempotent — `-f` swallows the missing-file case.
+rm -f "$HOME/.gitconfig"
+
 if [ -n "${GIT_USER_NAME:-}" ]; then
     git config --global user.name "$GIT_USER_NAME"
 fi
@@ -26,55 +39,65 @@ git config --global commit.gpgsign false
 git config --global --replace-all url."https://github.com/".insteadOf "git@github.com:" "git@github.com:"
 git config --global --replace-all url."https://github.com/".insteadOf "ssh://git@github.com/" "ssh://git@github.com/"
 
-git config --global --add safe.directory /workspaces/mee-pdn
+# Mark mounted workspaces as safe Git directories to avoid
+# "detected dubious ownership" errors in devcontainers.
+for ws_dir in /workspaces/*; do
+    [ -d "$ws_dir" ] || continue
+    if ! git config --global --get-all safe.directory | grep -Fx "$ws_dir" >/dev/null 2>&1; then
+        git config --global --add safe.directory "$ws_dir"
+    fi
+done
 
-# When GITHUB_TOKEN is available (injected as a Sandcat placeholder),
-# register gh as git's credential helper so git sends the placeholder
-# token in Basic auth headers. mitmproxy then swaps the placeholder
-# for the real token in flight.
-if command -v gh >/dev/null 2>&1 && [ -n "${GITHUB_TOKEN:-}" ]; then
-    gh auth setup-git
-fi
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    echo "//npm.pkg.github.com/:_authToken=\${GITHUB_TOKEN}" >> "$HOME/.npmrc"
-fi
-
-# If Java is installed (via mise), import the mitmproxy CA into Java's trust
-# store. Java uses its own cacerts and ignores the system CA store.
+# If openjdk was installed via devbox (as a --stacks java or scala package,
+# or explicitly in devbox.tools.json), import the mitmproxy CA into a
+# writable Java trust store copy. Java has its own cacerts and ignores
+# the system CA store.
+#
+# Key difference from the previous mise-based flow: Nix stores are
+# read-only, so the openjdk cacerts inside the Nix store cannot be
+# modified in place. We copy it to $SANDCAT_DIR first (cp preserves
+# the read-only mode), chmod it writable, and then run keytool on the
+# copy. JAVA_TOOL_OPTIONS in Dockerfile.app already points every JVM
+# at this copy.
 CA_CERT="/mitmproxy-config/mitmproxy-ca-cert.pem"
 
-# Ensure mise is on PATH. `su - vscode` resets the environment and sources
-# only the first of ~/.bash_profile, ~/.bash_login, ~/.profile.  If
-# ~/.bash_profile exists (e.g. created by VS Code on a persistent volume),
-# ~/.profile — where the Dockerfile adds mise — is never read.
-if ! command -v mise >/dev/null 2>&1; then
-    export PATH="/home/vscode/.local/bin:/home/vscode/.local/share/mise/shims:$PATH"
+# JDK-distribution-agnostic: follow devbox profile's bin/java symlink
+# into /nix/store/ and strip bin/ to get the canonical JAVA_HOME.
+# Works for openjdk, temurin-bin-*, jdk, jetbrains.jdk*, and any other
+# valid JDK derivation — no hardcoded layout assumptions. See the same
+# pattern in Dockerfile.app for the build-time equivalent.
+DEVBOX_JAVA_BIN="$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin/java"
+DEVBOX_JAVA_HOME=""
+if [ -e "$DEVBOX_JAVA_BIN" ]; then
+    DEVBOX_JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$DEVBOX_JAVA_BIN")")")"
 fi
 
-MISE_JAVA_HOME="$(mise where java 2>/dev/null || true)"
-if [ -n "$MISE_JAVA_HOME" ] && [ -f "$CA_CERT" ]; then
-    # Create a version-independent symlink so JAVA_HOME doesn't depend
-    # on the mise Java version.
+if [ -n "$DEVBOX_JAVA_HOME" ] && [ -f "$CA_CERT" ]; then
     SANDCAT_DIR="$HOME/.local/share/sandcat"
     mkdir -p "$SANDCAT_DIR"
-    ln -sfn "$MISE_JAVA_HOME" "$SANDCAT_DIR/java-home"
+    # Refresh the symlink each start so a devbox openjdk update lands here.
+    ln -sfn "$DEVBOX_JAVA_HOME" "$SANDCAT_DIR/java-home"
 
-    JAVA_CACERTS="$MISE_JAVA_HOME/lib/security/cacerts"
+    NIX_CACERTS="$DEVBOX_JAVA_HOME/lib/security/cacerts"
     SANDCAT_CACERTS="$SANDCAT_DIR/cacerts"
-    if [ -f "$JAVA_CACERTS" ]; then
-        # Import on first start; on restart the alias already exists (harmless failure).
-        if keytool -importcert -trustcacerts -noprompt \
+    if [ -f "$NIX_CACERTS" ]; then
+        # Copy first (destination inherits Nix store's 0444 mode), then
+        # make writable so keytool can update it. Copying happens every
+        # start so a devbox update to openjdk gets a fresh baseline
+        # before we re-import mitmproxy CA.
+        cp "$NIX_CACERTS" "$SANDCAT_CACERTS"
+        chmod 0644 "$SANDCAT_CACERTS"
+
+        # Import into the writable copy only. The Nix store original stays
+        # untouched (immutable by design). On restart the alias already
+        # exists and the second import is a harmless no-op.
+        if "$DEVBOX_JAVA_HOME/bin/keytool" -importcert -trustcacerts -noprompt \
             -alias mitmproxy \
             -file "$CA_CERT" \
-            -keystore "$JAVA_CACERTS" \
+            -keystore "$SANDCAT_CACERTS" \
             -storepass changeit >/dev/null 2>&1; then
             echo "Imported mitmproxy CA into Java trust store"
         fi
-
-        # Create/update a standalone copy of the trust store (with the mitmproxy
-        # CA) so JAVA_TOOL_OPTIONS can point all JVMs to it — including
-        # ones downloaded later by tools like Coursier (Scala Metals).
-        cp "$JAVA_CACERTS" "$SANDCAT_CACERTS"
 
         # scala-cli is a GraalVM native binary that ignores JAVA_TOOL_OPTIONS
         # and JAVA_HOME for trust store resolution. Pre-create its config
@@ -93,28 +116,13 @@ EOFJSON
     fi
 fi
 
-# Seed the onboarding flag so Claude Code skips interactive setup.
-# CLAUDE_CODE_OAUTH_TOKEN is picked up automatically by Claude Code.
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+# Seed the onboarding flag so Claude Code uses the API key without interactive
+# setup. Only written when the user configured an ANTHROPIC_API_KEY secret.
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     echo '{"hasCompletedOnboarding":true}' > "$HOME/.claude.json"
 fi
 
-# Keep only the sandcat placeholder in Codex's persistent auth cache. The proxy
-# substitutes the real API key on requests to the hosts allowed by the secret's
-# settings entry, so the real key never enters the app container or its volume.
-if command -v codex >/dev/null 2>&1 \
-    && [ -n "${OPENAI_API_KEY:-}" ] \
-    && ! codex login status >/dev/null 2>&1; then
-    printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null
-fi
-
-# The toolchain the workspace pins (rust-toolchain.toml: channel, components,
-# targets), on every start since the home volume outlives the image. rustup's
-# own binary rather than the mise shim: the shim fixes the toolchain through
-# RUSTUP_TOOLCHAIN, and rustup then reads nothing from the file.
-(cd /workspaces/mee-pdn && "$HOME/.cargo/bin/rustup" toolchain install) \
-    || echo "rust toolchain install failed; in the container run: just setup-tooling"
-
-# Claude Code and Codex are installed at build time (Dockerfile.app).
+# Claude Code is installed at build time (Dockerfile.app).
 # Background update so it doesn't block startup.
 (claude install >/dev/null 2>&1 &)
+

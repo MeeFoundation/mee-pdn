@@ -2,6 +2,8 @@
 
 One-time setup on the host machine to work with devcontainers. The devcontainer runs in both VS Code and Zed.
 
+The container is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: all of its traffic goes through a WireGuard tunnel into mitmproxy, which applies the network rules and puts the real secrets into requests in place of placeholders. `sandcat/` is sandcat's generated setup, copied unchanged; everything this workspace adds lives in `Dockerfile.app`, `compose-all.yml`, `devcontainer.json` and `scripts/`. [UPSTREAM.md](UPSTREAM.md) records each sync with sandcat, what was decided in it, and how to run the next one.
+
 ## Required Tokens
 
 1. **GitHub Personal Access Token** — for cloning private repositories, push/pull, access to GitHub Packages
@@ -75,10 +77,9 @@ The login survives rebuilds in the `mee-pdn-home` Docker volume. Device-code log
 
 Tokens are stored in `~/.config/sandcat/settings.json` on the **host machine**.
 
-Codex runs with full access inside the devcontainer by default
-(`sandbox_mode = "danger-full-access"`, `approval_policy = "never"`). Docker
-and Sandcat remain the outer filesystem and network security boundaries. This
-default is container-scoped and does not change the host Codex configuration.
+mitmproxy merges three settings layers, highest precedence last: that user file, the project's `.sandcat/settings.json` (committed), and `.sandcat/settings.local.json` (gitignored, for rules of your own on this project). Network rules from all three are evaluated top to bottom, highest-precedence layer first; the first match wins and anything unmatched is denied.
+
+Codex runs with full access inside the devcontainer by default (`sandbox_mode = "danger-full-access"`, `approval_policy = "never"`). Docker and Sandcat remain the outer filesystem and network security boundaries. This default is container-scoped and does not change the host Codex configuration.
 
 ### Creating configuration:
 
@@ -128,9 +129,12 @@ SETTINGS
 ### Security
 
 - Tokens are stored only on the host machine in `~/.config/sandcat/settings.json`
-- Inside the container, tokens are available as environment variables
-- Mitmproxy intercepts HTTP(S) requests and replaces placeholders with real tokens
+- Inside the container, each token's environment variable holds a placeholder (`SANDCAT_PLACEHOLDER_GITHUB_TOKEN`), never the token
+- Mitmproxy intercepts HTTP(S) requests and replaces placeholders with real tokens, only for the hosts the secret names; a placeholder on its way to any other host gets the request refused
 - Tokens **are not logged** and **not saved in command history**
+- The container gets only mitmproxy's public CA certificate and the generated environment file; the CA private key and the WireGuard keys stay in a volume it does not mount
+- The mitmweb UI listens on `http://127.0.0.1:8081` of the host only (password `mitmproxy`)
+- **The Docker socket is the one way around all of this.** It is mounted for the container tests. A container started through it runs on the host's daemon, outside the tunnel, the network rules and secret substitution, and it can mount any host directory — `~/.config/sandcat/settings.json` with the real tokens included. Anything running in the devcontainer can use it
 
 ### Token Expiration
 
@@ -193,15 +197,9 @@ codex login status
 
 ### Build-time installs from `Dockerfile.app` not visible after rebuild
 
-The `/home/vscode` directory is backed by the named Docker volume
-`mee-pdn-home` so Claude/Codex auth, shell history, and similar
-user state survive rebuilds. The trade-off: the volume is populated from
-the image only on **first** container creation. Subsequent rebuilds keep
-the existing volume contents, so anything new the Dockerfile installs into
-`/home/vscode/...` (mise toolchains, npm globals, Codex, etc.) is shadowed.
+The `/home/vscode` directory is backed by the named Docker volume `mee-pdn-home` so Claude/Codex auth, shell history, and similar user state survive rebuilds. The trade-off: the volume is populated from the image only on **first** container creation. Subsequent rebuilds keep the existing volume contents, so anything new the Dockerfile installs into `/home/vscode/...` (mise toolchains, npm globals, just, cargo-nextest, cargo-deny) is shadowed. Codex, the Docker CLI and the apt packages live outside the home directory, and a rebuild does update them.
 
-Symptom: `openspec --version` (or another tool just added to `Dockerfile.app`)
-returns `command not found` after **Rebuild Container**.
+Symptom: `openspec --version` (or another tool just added to `Dockerfile.app`) returns `command not found` after **Rebuild Container**.
 
 Fix — wipe the home volume, then rebuild:
 
