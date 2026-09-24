@@ -6,11 +6,12 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 # gh:       GitHub CLI
 # gosu:     drops privileges in the entrypoint
 # jq:       JSON processor
+# python3:  runs the repository's scripts/*.py
 # ripgrep:  fast recursive grep (rg)
 # tmux:     terminal multiplexer
 # vim:      text editor
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fd-find fzf gh gosu jq ripgrep tmux vim \
+    && apt-get install -y --no-install-recommends fd-find fzf gh gosu jq python3 ripgrep tmux vim \
     && ln -s $(which fdfind) /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -64,6 +65,7 @@ ENV PATH="/home/vscode/.local/bin:/home/vscode/.local/share/mise/shims:$PATH"
 ARG JUST_VERSION=1.58.0
 ARG CARGO_NEXTEST_VERSION=0.9.146
 ARG CARGO_DENY_VERSION=0.20.2
+ARG CARGO_WATCH_VERSION=8.5.3
 
 # Install just command runner
 RUN curl -fsSL https://just.systems/install.sh | bash -s -- --tag "$JUST_VERSION" --to ~/.local/bin
@@ -87,6 +89,16 @@ RUN ARCH="$(uname -m)"; \
     TAG="$CARGO_DENY_VERSION"; \
     curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$TAG/cargo-deny-$TAG-$T.tar.gz" \
     | tar zxf - --strip-components=1 -C /home/vscode/.local/bin "cargo-deny-$TAG-$T/cargo-deny"
+
+# Install cargo-watch (pre-built, arch-aware): `just build-watch`. Outside the
+# home volume, so a rebuild upgrades it.
+USER root
+RUN ARCH="$(uname -m)"; \
+    case "$ARCH" in aarch64|arm64) T=aarch64-unknown-linux-gnu ;; *) T=x86_64-unknown-linux-gnu ;; esac; \
+    TAG="v$CARGO_WATCH_VERSION"; \
+    curl -fsSL "https://github.com/watchexec/cargo-watch/releases/download/$TAG/cargo-watch-$TAG-$T.tar.xz" \
+    | tar Jxf - --strip-components=1 --no-same-owner -C /usr/local/bin "cargo-watch-$TAG-$T/cargo-watch"
+USER vscode
 
 # Node.js + OpenSpec CLI (used by the repo-scoped agent skills).
 RUN mise use -g node@latest \
