@@ -46,8 +46,14 @@ RUN curl https://mise.run | sh
 RUN echo 'export PATH="/home/vscode/.local/bin:/home/vscode/.local/share/mise/shims:$PATH"' >> /home/vscode/.profile
 ENV PATH="/home/vscode/.local/bin:/home/vscode/.local/share/mise/shims:$PATH"
 
+# The versions tools.toml pins: this image builds from .devcontainer/ alone and
+# cannot read it, so `just check` compares the two.
+ARG JUST_VERSION=1.58.0
+ARG CARGO_NEXTEST_VERSION=0.9.146
+ARG CARGO_DENY_VERSION=0.20.2
+
 # Install just command runner
-RUN curl -fsSL https://just.systems/install.sh | bash -s -- --to ~/.local/bin
+RUN curl -fsSL https://just.systems/install.sh | bash -s -- --tag "$JUST_VERSION" --to ~/.local/bin
 
 # Development stacks (managed by sandcat init --stacks):
 RUN mise use -g rust@latest
@@ -63,13 +69,13 @@ RUN mise settings add idiomatic_version_file_enable_tools rust
 # Required by `just test` / `just stress`. Local machines: `just setup-tooling`.
 RUN ARCH="$(uname -m)"; \
     case "$ARCH" in aarch64|arm64) NX=linux-arm ;; *) NX=linux ;; esac; \
-    curl -LsSf "https://get.nexte.st/latest/$NX" | tar zxf - -C /home/vscode/.local/bin
+    curl -LsSf "https://get.nexte.st/$CARGO_NEXTEST_VERSION/$NX" | tar zxf - -C /home/vscode/.local/bin
 
 # Install cargo-deny (pre-built, arch-aware) to ~/.local/bin: `just audit`,
 # the same deny.toml check the nightly dependency-audit job runs.
 RUN ARCH="$(uname -m)"; \
     case "$ARCH" in aarch64|arm64) T=aarch64-unknown-linux-musl ;; *) T=x86_64-unknown-linux-musl ;; esac; \
-    TAG="$(curl -fsSL https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"; \
+    TAG="$CARGO_DENY_VERSION"; \
     curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$TAG/cargo-deny-$TAG-$T.tar.gz" \
     | tar zxf - --strip-components=1 -C /home/vscode/.local/bin "cargo-deny-$TAG-$T/cargo-deny"
 

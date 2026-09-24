@@ -1,0 +1,9 @@
+# The developer tools and their versions, keyed by crate name. `just
+# setup-tooling` installs every one; the pipeline installs the ones a job
+# names through .github/actions/install-tools. .devcontainer/Dockerfile.app
+# builds without the workspace and repeats them, which `just check` compares.
+# One `name = "version"` per line: both readers take it apart with awk.
+just = "1.58.0"
+cargo-nextest = "0.9.146"
+cargo-deny = "0.20.2"
+cargo-watch = "8.5.3"
