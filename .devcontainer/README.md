@@ -199,7 +199,7 @@ codex login status
 
 ### Build-time installs from `Dockerfile.app` not visible after rebuild
 
-The `/home/vscode` directory is backed by the named Docker volume `mee-pdn-home` so Claude/Codex auth, shell history, and similar user state survive rebuilds. The trade-off: the volume is populated from the image only on **first** container creation. Subsequent rebuilds keep the existing volume contents, so anything new the Dockerfile installs into `/home/vscode/...` (mise toolchains, npm globals, just, cargo-nextest, cargo-deny) is shadowed. Codex, cargo-watch, the Docker CLI and the apt packages live outside the home directory, and a rebuild does update them.
+The `/home/vscode` directory is backed by the named Docker volume `mee-pdn-home` so Claude/Codex auth, shell history, and similar user state survive rebuilds. The trade-off: the volume is populated from the image only on **first** container creation. Subsequent rebuilds keep the existing volume contents, so anything new the Dockerfile installs into `/home/vscode/...` (mise toolchains, npm globals) is shadowed. Codex, the tools `tools.toml` pins, the Docker CLI and the apt packages live outside the home directory, and a rebuild does update them.
 
 Symptom: `openspec --version` (or another tool just added to `Dockerfile.app`) returns `command not found` after **Rebuild Container**.
 
