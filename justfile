@@ -224,27 +224,29 @@ check-store:
   RUSTDOCFLAGS=-Dwarnings cargo doc -p pdn-store --all-features --no-deps
   RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build -p pdn-store --target wasm32-unknown-unknown --no-default-features
 
-# Includes the container suite, as `fix` does: every test of the HTTP surface
-# is one. Needs a container daemon, and builds the image. The store's other
-# feature sets and its wasm build run here as the pipeline runs them.
-[doc("Audit, lint, build, test, store matrix, container suite (needs docker)")]
+# Every test of the HTTP surface is a container test: needs a container
+# daemon and builds the image. The store's feature sets and wasm build run as
+# in the pipeline. `clean-stale --init` marks an unmarked target/, so a first
+# run cleans too; `clean-stale` runs only after every step passed, since a
+# failed run leaves unread what its later steps build.
+[doc("Audit, lint, build, test, store matrix, container suite, drop stale target/ (needs docker)")]
 precommit-check:
   #!/bin/sh
   set -eux
+  just clean-stale --init
   just audit
   just check
   just check-store
   just test
   just test-store
   just test-docker
+  just clean-stale
 
-# Includes the container suite: every test of the HTTP surface is one, so a
-# pass without it says nothing about that crate. Needs a container daemon,
-# and builds the image. The store's other feature sets and its wasm build
-# run here as the pipeline runs them. `clean-stale --init` marks a target/
-# no run has marked yet, so the first run cleans too; `clean-stale` runs only
-# after every step passed: a failed run leaves unread what its later steps
-# build.
+# Every test of the HTTP surface is a container test: needs a container
+# daemon and builds the image. The store's feature sets and wasm build run as
+# in the pipeline. `clean-stale --init` marks an unmarked target/, so a first
+# run cleans too; `clean-stale` runs only after every step passed, since a
+# failed run leaves unread what its later steps build.
 [doc("Audit, lint, build, test, store matrix, container suite, attempt fixes, drop stale target/ (needs docker)")]
 fix:
   #!/bin/sh
