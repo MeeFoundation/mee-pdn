@@ -510,23 +510,29 @@ impl PrivateMetadataStore {
         Ok(markers)
     }
 
-    /// Drop every marker for `issuer` — with the granted namespace binding.
+    /// Drop every marker this device recorded for `issuer` — with the
+    /// granted namespace binding. Only own-author markers, since deletion is
+    /// per directory author; each sibling prunes its own at its unbind.
     pub async fn prune_retractions(&self, issuer: PdnId) -> Result<()> {
-        self.doc
-            .del(
-                self.author,
-                format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes(),
-            )
-            .await?;
+        let query = Query::author(self.author)
+            .key_prefix(format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes());
+        let mut keys = Vec::new();
+        {
+            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+            while let Some(entry) = stream.next().await {
+                keys.push(entry?.key().to_vec());
+            }
+        }
+        for key in keys {
+            self.doc.del(self.author, key).await?;
+        }
         Ok(())
     }
 
     /// Drop the markers this device recorded whose entry aged past
     /// `retention` (microseconds, like entry timestamps). Only own-author
-    /// markers, since deletion is per directory author. Deletion is by key
-    /// prefix, so a marker whose path prefixes another's drops that one too
-    /// — an over-drop self-heals through the issuer's rejection. Returns the
-    /// dropped addresses so the caller can disarm what each one armed.
+    /// markers, since deletion is per directory author. Returns the dropped
+    /// addresses so the caller can disarm what each one armed.
     pub async fn prune_aged_retractions(
         &self,
         now: u64,

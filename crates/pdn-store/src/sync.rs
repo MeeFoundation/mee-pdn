@@ -475,19 +475,17 @@ where
         self.insert_entry(signed_entry, InsertOrigin::Local).await
     }
 
-    /// Delete entries that match the given `author` and key `prefix`.
+    /// Delete `author`'s entry at `key` by inserting an empty entry there;
+    /// no other key is touched.
     ///
-    /// This inserts an empty entry with the key set to `prefix`, effectively clearing all other
-    /// entries whose key starts with or is equal to the given `prefix`.
-    ///
-    /// Returns the number of entries deleted.
-    pub async fn delete_prefix(
+    /// Returns 1 when an older entry at `key` was replaced, 0 otherwise.
+    pub async fn delete(
         &mut self,
-        prefix: impl AsRef<[u8]>,
+        key: impl AsRef<[u8]>,
         author: &Author,
     ) -> Result<usize, InsertError> {
         self.info.ensure_open()?;
-        let id = RecordIdentifier::new(self.id(), author.id(), prefix);
+        let id = RecordIdentifier::new(self.id(), author.id(), key);
         let entry = Entry::new_empty(id);
         let signed_entry = entry.sign(self.secret_key()?, author);
         self.insert_entry(signed_entry, InsertOrigin::Local).await
@@ -814,8 +812,8 @@ pub enum InsertError {
     /// Validation failure
     #[error("validation failure")]
     Validation(#[from] ValidationFailure),
-    /// A newer entry exists for either this entry's key or a prefix of the key.
-    #[error("A newer entry exists for either this entry's key or a prefix of the key.")]
+    /// A newer entry exists at this entry's key.
+    #[error("A newer entry exists at this entry's key.")]
     NewerEntryExists,
     /// Attempted to insert an empty entry.
     #[error("Attempted to insert an empty entry")]
@@ -2439,8 +2437,8 @@ mod tests {
         Ok(())
     }
 
-    /// An identifier naming another namespace is refused by the prefix
-    /// reads and the prefix delete, so `put` on a store instance is safe
+    /// An identifier naming another namespace is refused by the ingest read
+    /// and the prefix read, so `put` on a store instance is safe
     /// without `validate_entry` in front of it. The neighbour's rows are
     /// read back at the end: a refusal has to leave them as they were.
     #[tokio::test]
@@ -2459,21 +2457,16 @@ mod tests {
         let mut inst = StoreInstance::new(mine.id(), &mut store);
 
         // Allowed: this namespace's identifier reads its own rows.
-        assert_eq!(inst.prefixes_of(&at(&mine, b"mine"))?.count(), 1);
+        assert!(inst.entry_get(&at(&mine, b"mine"))?.is_some());
 
-        // Denied: the neighbour's identifier, on every prefix operation.
+        // Denied: the neighbour's identifier, on every keyed read.
         assert!(
-            inst.prefixes_of(&at(&neighbour, b"secret-a")).is_err(),
-            "a foreign identifier read the neighbour's parents"
+            inst.entry_get(&at(&neighbour, b"secret-a")).is_err(),
+            "a foreign identifier read the neighbour's entry"
         );
         assert!(
             inst.prefixed_by(&at(&neighbour, b"secret")).is_err(),
             "a foreign identifier read the neighbour's prefix"
-        );
-        assert!(
-            inst.remove_prefix_filtered(&at(&neighbour, b"secret"), |_| true)
-                .is_err(),
-            "a foreign identifier deleted under the neighbour's prefix"
         );
 
         // Denied: a well-signed neighbour entry through `put` itself.
@@ -2484,12 +2477,14 @@ mod tests {
         let entry = SignedEntry::from_entry(entry, &neighbour, &author);
         assert!(inst.put(entry).is_err(), "a foreign entry was taken in");
 
-        // Allowed: this namespace's identifier deletes its own rows, so the
-        // denials above are refusals rather than a delete that does nothing.
-        assert_eq!(
-            inst.remove_prefix_filtered(&at(&mine, b"mine"), |_| true)?,
-            1
-        );
+        // Allowed: this namespace's entry through `put`, so the denial above
+        // is a refusal rather than a `put` that takes nothing.
+        let entry = Entry::new(at(&mine, b"mine"), Record::current_from_data(b"newer"));
+        let entry = SignedEntry::from_entry(entry, &mine, &author);
+        assert!(matches!(
+            inst.put(entry)?,
+            crate::ranger::InsertOutcome::Inserted { removed: 1 }
+        ));
 
         assert_eq!(rows(&mut store, &neighbour)?, before);
         Ok(())
@@ -2665,60 +2660,65 @@ mod tests {
         Ok(())
     }
 
+    /// A delete at a key removes the entry there and leaves every longer
+    /// key it prefixes standing.
     #[tokio::test]
-    async fn test_prefix_delete_memory() -> Result<()> {
+    async fn test_delete_touches_only_its_key_memory() -> Result<()> {
         let store = store::Store::memory();
-        test_prefix_delete(store).await?;
+        test_delete_touches_only_its_key(store).await?;
         Ok(())
     }
 
+    /// The fs-store twin of `test_delete_touches_only_its_key_memory`.
     #[tokio::test]
     #[cfg(feature = "fs-store")]
-    async fn test_prefix_delete_fs() -> Result<()> {
+    async fn test_delete_touches_only_its_key_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-        test_prefix_delete(store).await?;
+        test_delete_touches_only_its_key(store).await?;
         Ok(())
     }
 
-    async fn test_prefix_delete(mut store: Store) -> Result<()> {
+    async fn test_delete_touches_only_its_key(mut store: Store) -> Result<()> {
         let mut rng = rand::rng();
         let alice = Author::new(&mut rng);
         let myspace = NamespaceSecret::new(&mut rng);
         let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert(b"foo", &alice, b"parent").await?;
         let hash1 = replica.hash_and_insert(b"foobar", &alice, b"hello").await?;
-        let hash2 = replica.hash_and_insert(b"fooboo", &alice, b"world").await?;
+        let hash2 = replica
+            .hash_and_insert(b"foo/bar", &alice, b"world")
+            .await?;
 
-        // sanity checks
+        let mut replica = store.new_replica(myspace.clone())?;
+        let deleted = replica.delete(b"foo", &alice).await?;
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            store.get_exact(myspace.id(), alice.id(), b"foo", false)?,
+            None
+        );
         assert_eq!(
             get_content_hash(&mut store, myspace.id(), alice.id(), b"foobar")?,
             Some(hash1)
         );
         assert_eq!(
-            get_content_hash(&mut store, myspace.id(), alice.id(), b"fooboo")?,
+            get_content_hash(&mut store, myspace.id(), alice.id(), b"foo/bar")?,
             Some(hash2)
         );
 
-        // delete
+        // A write at a key likewise leaves the longer keys it prefixes.
         let mut replica = store.new_replica(myspace.clone())?;
-        let deleted = replica.delete_prefix(b"foo", &alice).await?;
-        assert_eq!(deleted, 2);
+        replica.hash_and_insert(b"foo", &alice, b"again").await?;
         assert_eq!(
-            store.get_exact(myspace.id(), alice.id(), b"foobar", false)?,
-            None
-        );
-        assert_eq!(
-            store.get_exact(myspace.id(), alice.id(), b"fooboo", false)?,
-            None
-        );
-        assert_eq!(
-            store.get_exact(myspace.id(), alice.id(), b"foo", false)?,
-            None
+            get_content_hash(&mut store, myspace.id(), alice.id(), b"foobar")?,
+            Some(hash1)
         );
         store.flush()?;
         Ok(())
     }
 
+    /// A delete at one key reaches the peer over a session, and the entries
+    /// at the longer keys it prefixes stand on both replicas.
     #[tokio::test]
     async fn test_replica_sync_delete_memory() -> Result<()> {
         let alice_store = store::Store::memory();
@@ -2727,6 +2727,7 @@ mod tests {
         test_replica_sync_delete(alice_store, bob_store).await
     }
 
+    /// The fs-store twin of `test_replica_sync_delete_memory`.
     #[tokio::test]
     #[cfg(feature = "fs-store")]
     async fn test_replica_sync_delete_fs() -> Result<()> {
@@ -2763,12 +2764,20 @@ mod tests {
 
         let mut alice = alice_store.new_replica(myspace.clone())?;
         let mut bob = bob_store.new_replica(myspace.clone())?;
-        alice.delete_prefix("foo", &author).await?;
+        alice.delete("foo", &author).await?;
         bob.hash_and_insert("fooz", &author, "fooz".as_bytes())
             .await?;
         sync(&mut alice, &mut bob).await?;
-        check_entries(&mut alice_store, &myspace.id(), &author, &["fog", "fooz"])?;
-        check_entries(&mut bob_store, &myspace.id(), &author, &["fog", "fooz"])?;
+        let standing = ["foot", "fool", "fog", "fooz"];
+        check_entries(&mut alice_store, &myspace.id(), &author, &standing)?;
+        check_entries(&mut bob_store, &myspace.id(), &author, &standing)?;
+        for store in [&mut alice_store, &mut bob_store] {
+            assert_eq!(
+                store.get_exact(myspace.id(), author.id(), b"foo", false)?,
+                None,
+                "the deleted key came back"
+            );
+        }
         alice_store.flush()?;
         bob_store.flush()?;
         Ok(())
@@ -2827,12 +2836,16 @@ mod tests {
         Ok(())
     }
 
+    /// A delete removes only its own key at the byte values 0 and 255 too:
+    /// the two-byte keys a one-byte key prefixes stand, and a delete between
+    /// two neighbours leaves both.
     #[tokio::test]
     async fn test_replica_delete_edge_cases_memory() -> Result<()> {
         let store = store::Store::memory();
         test_replica_delete_edge_cases(store).await
     }
 
+    /// The fs-store twin of `test_replica_delete_edge_cases_memory`.
     #[tokio::test]
     #[cfg(feature = "fs-store")]
     async fn test_replica_delete_edge_cases_fs() -> Result<()> {
@@ -2850,47 +2863,27 @@ mod tests {
         let prefixes = [0u8, 255u8];
         let hash = Hash::new(b"foo");
         let len = 3;
+        let mut expected = vec![];
         for prefix in prefixes {
-            let mut expected = vec![];
             let mut replica = store.new_replica(namespace.clone())?;
+            replica.insert([prefix], &author, hash, len).await?;
             for suffix in edgecases {
                 let key = [prefix, suffix].to_vec();
                 expected.push(key.clone());
                 replica.insert(&key, &author, hash, len).await?;
             }
-            assert_keys(&mut store, namespace.id(), expected);
             let mut replica = store.new_replica(namespace.clone())?;
-            replica.delete_prefix([prefix], &author).await?;
-            assert_keys(&mut store, namespace.id(), vec![]);
+            replica.delete([prefix], &author).await?;
+            assert_keys(&mut store, namespace.id(), expected.clone());
         }
 
         let mut replica = store.new_replica(namespace.clone())?;
-        let key = vec![1u8, 0u8];
-        replica.insert(key, &author, hash, len).await?;
-        let key = vec![1u8, 1u8];
-        replica.insert(key, &author, hash, len).await?;
-        let key = vec![1u8, 2u8];
-        replica.insert(key, &author, hash, len).await?;
-        let prefix = vec![1u8, 1u8];
-        replica.delete_prefix(prefix, &author).await?;
-        assert_keys(
-            &mut store,
-            namespace.id(),
-            vec![vec![1u8, 0u8], vec![1u8, 2u8]],
-        );
-
-        let mut replica = store.new_replica(namespace.clone())?;
-        let key = vec![0u8, 255u8];
-        replica.insert(key, &author, hash, len).await?;
-        let key = vec![0u8, 0u8];
-        replica.insert(key, &author, hash, len).await?;
-        let prefix = vec![0u8];
-        replica.delete_prefix(prefix, &author).await?;
-        assert_keys(
-            &mut store,
-            namespace.id(),
-            vec![vec![1u8, 0u8], vec![1u8, 2u8]],
-        );
+        for key in [[1u8, 0u8], [1u8, 1u8], [1u8, 2u8]] {
+            replica.insert(key, &author, hash, len).await?;
+        }
+        replica.delete([1u8, 1u8], &author).await?;
+        expected.extend([vec![1u8, 0u8], vec![1u8, 2u8]]);
+        assert_keys(&mut store, namespace.id(), expected);
         store.flush()?;
         Ok(())
     }
@@ -3751,7 +3744,7 @@ mod tests {
         );
 
         let mut replica = store.new_replica(namespace)?;
-        replica.delete_prefix("hi/world", &a2).await?;
+        replica.delete("hi/world", &a2).await?;
         let mut qt = QueryTester {
             store: &mut store,
             namespace: namespace_id,
@@ -3981,5 +3974,83 @@ mod tests {
             hex::encode(&bytes),
             "20b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
         );
+    }
+
+    /// An older entry offered after a delete at its key is refused, so the
+    /// delete stands.
+    #[tokio::test]
+    async fn an_older_entry_does_not_replace_a_delete_at_its_key() -> Result<()> {
+        let mut store = store::Store::memory();
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let old = Entry::new(
+            RecordIdentifier::new(namespace.id(), author.id(), b"k"),
+            Record::new(Hash::new(b"v"), 1, 1_000),
+        )
+        .sign(&namespace, &author);
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica
+            .insert_remote_entry(old.clone(), [0u8; 32], ContentStatus::Complete)
+            .await?;
+        replica.delete(b"k", &author).await?;
+
+        let res = replica
+            .insert_remote_entry(old, [0u8; 32], ContentStatus::Complete)
+            .await;
+        assert!(matches!(res, Err(InsertError::NewerEntryExists)));
+        let held = store
+            .get_exact(namespace.id(), author.id(), b"k", true)?
+            .expect("the delete is held");
+        assert!(held.is_empty(), "the older entry replaced the delete");
+        Ok(())
+    }
+
+    /// Two replicas converge on a delete whichever side opens the session,
+    /// and stay converged over later sessions.
+    #[tokio::test]
+    async fn replicas_converge_on_a_delete_whichever_side_initiates() -> Result<()> {
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let old = Entry::new(
+            RecordIdentifier::new(namespace.id(), author.id(), b"k"),
+            Record::new(Hash::new(b"v"), 1, 1_000),
+        )
+        .sign(&namespace, &author);
+        let mut writer_store = store::Store::memory();
+        let mut holder_store = store::Store::memory();
+        for store in [&mut writer_store, &mut holder_store] {
+            store
+                .new_replica(namespace.clone())?
+                .insert_remote_entry(old.clone(), [0u8; 32], ContentStatus::Complete)
+                .await?;
+        }
+        writer_store
+            .new_replica(namespace.clone())?
+            .delete(b"k", &author)
+            .await?;
+
+        // The writer opens first: the holder's older entry then reaches the
+        // writer before the delete reaches the holder.
+        for writer_initiates in [true, false, true, false] {
+            {
+                let mut writer = writer_store.new_replica(namespace.clone())?;
+                let mut holder = holder_store.new_replica(namespace.clone())?;
+                if writer_initiates {
+                    sync(&mut writer, &mut holder).await?;
+                } else {
+                    sync(&mut holder, &mut writer).await?;
+                }
+            }
+            for store in [&mut writer_store, &mut holder_store] {
+                let held = store.get_exact(namespace.id(), author.id(), b"k", true)?;
+                assert!(
+                    held.is_some_and(|entry| entry.is_empty()),
+                    "a replica lost the delete (writer initiated: {writer_initiates})"
+                );
+            }
+        }
+        Ok(())
     }
 }

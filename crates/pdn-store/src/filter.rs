@@ -6,9 +6,9 @@
 //! iterations, fingerprints, counts — sees only admitted entries. Filtering
 //! the iterators filters the fingerprints by construction (fingerprints are
 //! computed by iterating ranges), so no unadmitted entry can leak through a
-//! fingerprint, a split boundary, or an item transmission. Write-side
-//! methods (`entry_put`, `prefixes_of`, `remove_prefix_filtered`) pass
-//! through unfiltered — ingest is the `validate_entry` hook's concern.
+//! fingerprint, a split boundary, or an item transmission. Ingest-side
+//! methods (`entry_get`, `entry_put`) pass through unfiltered — ingest is
+//! the `validate_entry` hook's concern.
 //!
 //! The domain meaning of a filter (grants, identities) stays outside this
 //! crate: an embedder hands in opaque predicates over [`SignedEntry`]
@@ -157,10 +157,6 @@ impl<S: Store<SignedEntry>> Store<SignedEntry> for SessionStore<S> {
         = FilteredIter<S::RangeIterator<'a>>
     where
         S: 'a;
-    type ParentIterator<'a>
-        = S::ParentIterator<'a>
-    where
-        S: 'a;
 
     fn get_first(&mut self) -> Result<RecordIdentifier, Self::Error> {
         let Some(filter) = self.filter.clone() else {
@@ -237,11 +233,8 @@ impl<S: Store<SignedEntry>> Store<SignedEntry> for SessionStore<S> {
         })
     }
 
-    fn prefixes_of(
-        &mut self,
-        key: &RecordIdentifier,
-    ) -> Result<Self::ParentIterator<'_>, Self::Error> {
-        self.inner.prefixes_of(key)
+    fn entry_get(&mut self, key: &RecordIdentifier) -> Result<Option<SignedEntry>, Self::Error> {
+        self.inner.entry_get(key)
     }
 
     #[cfg(test)]
@@ -255,14 +248,6 @@ impl<S: Store<SignedEntry>> Store<SignedEntry> for SessionStore<S> {
     #[cfg(test)]
     fn entry_remove(&mut self, key: &RecordIdentifier) -> Result<Option<SignedEntry>, Self::Error> {
         self.inner.entry_remove(key)
-    }
-
-    fn remove_prefix_filtered(
-        &mut self,
-        prefix: &RecordIdentifier,
-        predicate: impl Fn(&crate::sync::Record) -> bool,
-    ) -> Result<usize, Self::Error> {
-        self.inner.remove_prefix_filtered(prefix, predicate)
     }
 }
 

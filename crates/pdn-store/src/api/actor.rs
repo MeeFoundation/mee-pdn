@@ -559,11 +559,11 @@ impl RpcActor {
         let DelRequest {
             doc_id,
             author_id,
-            prefix,
+            key,
         } = req;
         let removed = self
             .sync
-            .delete_prefix(doc_id, author_id, prefix)
+            .delete(doc_id, author_id, key)
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(DelResponse { removed })

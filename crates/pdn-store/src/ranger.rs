@@ -20,8 +20,8 @@ pub trait RangeEntry: Debug + Clone {
 
     /// The value type for this entry. See
     ///
-    /// The type must implement [`Ord`] to define the time ordering of entries used in the prefix
-    /// deletion algorithm.
+    /// The type must implement [`Ord`] to define which of two entries at one key supersedes the
+    /// other.
     ///
     /// See [`RangeValue`] for details.
     type Value: RangeValue;
@@ -271,11 +271,6 @@ pub trait Store<E: RangeEntry>: Sized {
         Self: 'a,
         E: 'a;
 
-    type ParentIterator<'a>: Iterator<Item = Result<E, Self::Error>>
-    where
-        Self: 'a,
-        E: 'a;
-
     /// Get a the first key (or the default if none is available).
     fn get_first(&mut self) -> Result<E::Key, Self::Error>;
 
@@ -295,11 +290,12 @@ pub trait Store<E: RangeEntry>: Sized {
     /// Calculate the fingerprint of the given range.
     fn get_fingerprint(&mut self, range: &Range<E::Key>) -> Result<Fingerprint, Self::Error>;
 
-    /// Insert just the given key value pair.
-    ///
-    /// This will replace just the existing entry, but will not perform prefix
-    /// deletion.
+    /// Insert just the given key value pair, replacing the entry at its key.
     fn entry_put(&mut self, entry: E) -> Result<(), Self::Error>;
+
+    /// The entry at `key`, an empty one included, read from the live store
+    /// even inside a session.
+    fn entry_get(&mut self, key: &E::Key) -> Result<Option<E>, Self::Error>;
 
     /// Returns all entries in the given range.
     fn get_range(&mut self, range: Range<E::Key>) -> Result<Self::RangeIterator<'_>, Self::Error>;
@@ -321,31 +317,14 @@ pub trait Store<E: RangeEntry>: Sized {
     #[allow(unused)]
     fn prefixed_by(&mut self, prefix: &E::Key) -> Result<Self::RangeIterator<'_>, Self::Error>;
 
-    /// Returns all entries that share a prefix with `key`, including the entry for `key` itself.
-    fn prefixes_of(&mut self, key: &E::Key) -> Result<Self::ParentIterator<'_>, Self::Error>;
-
     /// Get all entries in the store
     #[cfg(test)]
     fn all(&mut self) -> Result<Self::RangeIterator<'_>, Self::Error>;
 
-    /// Remove an entry from the store.
-    ///
-    /// This will remove just the entry with the given key, but will not perform prefix deletion.
+    /// Remove the entry with the given key.
     #[cfg(test)]
     #[allow(unused)]
     fn entry_remove(&mut self, key: &E::Key) -> Result<Option<E>, Self::Error>;
-
-    /// Remove all entries whose key start with a prefix and for which the `predicate` callback
-    /// returns true.
-    ///
-    /// Returns the number of elements removed.
-    // TODO: We might want to return an iterator with the removed elements instead to emit as
-    // events to the application potentially.
-    fn remove_prefix_filtered(
-        &mut self,
-        prefix: &E::Key,
-        predicate: impl Fn(&E::Value) -> bool,
-    ) -> Result<usize, Self::Error>;
 
     /// Generates the initial message.
     fn initial_message(&mut self) -> Result<Message<E>, Self::Error> {
@@ -360,8 +339,8 @@ pub trait Store<E: RangeEntry>: Sized {
     /// (which means the entry will be dropped and not stored).
     ///
     /// `on_insert_cb` is called for each entry that was actually inserted into the store (so not
-    /// for entries which validated, but are not inserted because they are older than one of their
-    /// prefixes).
+    /// for entries which validated, but are not inserted because the store holds a newer entry at
+    /// their key).
     ///
     /// `content_status_cb` is called for each outgoing entry about to be sent to the remote.
     /// It must return a [`ContentStatus`], which will be sent to the remote with the entry.
@@ -610,48 +589,29 @@ pub trait Store<E: RangeEntry>: Sized {
         }
     }
 
-    /// Insert a key value pair.
-    ///
-    /// Entries are inserted if they compare strictly greater than all entries in the set of
-    /// entries which have the same key as `entry` or have a key which is a prefix of `entry`.
-    ///
-    /// Additionally, entries that have a key which is a prefix of the entry's key and whose
-    /// timestamp is not strictly greater than that of the new entry are deleted
-    ///
-    /// Note: The deleted entries are simply dropped right now. We might want to make this return
-    /// an iterator, to potentially log or expose the deleted entries.
-    ///
-    /// Returns `true` if the entry was inserted.
-    /// Returns `false` if it was not inserted.
+    /// Insert `entry` if it compares strictly greater than the entry at its
+    /// key, an empty one included, replacing that entry; no other key is
+    /// touched.
     fn put(&mut self, entry: E) -> Result<InsertOutcome, Self::Error> {
-        if !self.would_insert(&entry)? {
+        let previous = self.entry_get(entry.key())?;
+        if previous
+            .as_ref()
+            .is_some_and(|previous| entry.value() <= previous.value())
+        {
             return Ok(InsertOutcome::NotInserted);
         }
-
-        // Now we remove all entries that have our key as a prefix and are older than our entry.
-        let removed = self.remove_prefix_filtered(entry.key(), |value| entry.value() >= value)?;
-
-        // Insert our new entry.
         self.entry_put(entry)?;
-        Ok(InsertOutcome::Inserted { removed })
+        Ok(InsertOutcome::Inserted {
+            removed: usize::from(previous.is_some()),
+        })
     }
 
-    /// Whether [`put`](Self::put) would take `entry` in — the store holds no
-    /// entry that already supersedes it.
-    ///
-    /// From the willow spec: "Remove all entries whose timestamp is strictly
-    /// less than the timestamp of any other entry [..] whose path is a prefix
-    /// of p." and then "remove all but those whose record has the greatest
-    /// hash component". This is the contract of the `Ord` impl for
-    /// `E::Value`, and the set of prefixes includes the entry's own key, so
-    /// an entry this store already holds is not news.
+    /// Whether [`put`](Self::put) would take `entry` in — the entry at its
+    /// key, an empty one included, does not already supersede it.
     fn would_insert(&mut self, entry: &E) -> Result<bool, Self::Error> {
-        for prefix_entry in self.prefixes_of(entry.key())? {
-            if entry.value() <= prefix_entry?.value() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(self
+            .entry_get(entry.key())?
+            .is_none_or(|existing| entry.value() > existing.value()))
     }
 }
 
@@ -660,12 +620,6 @@ impl<E: RangeEntry, S: Store<E>> Store<E> for &mut S {
 
     type RangeIterator<'a>
         = S::RangeIterator<'a>
-    where
-        Self: 'a,
-        E: 'a;
-
-    type ParentIterator<'a>
-        = S::ParentIterator<'a>
     where
         Self: 'a,
         E: 'a;
@@ -700,6 +654,10 @@ impl<E: RangeEntry, S: Store<E>> Store<E> for &mut S {
         (**self).entry_put(entry)
     }
 
+    fn entry_get(&mut self, key: &<E as RangeEntry>::Key) -> Result<Option<E>, Self::Error> {
+        (**self).entry_get(key)
+    }
+
     fn get_range(
         &mut self,
         range: Range<<E as RangeEntry>::Key>,
@@ -715,13 +673,6 @@ impl<E: RangeEntry, S: Store<E>> Store<E> for &mut S {
         (**self).prefixed_by(prefix)
     }
 
-    fn prefixes_of(
-        &mut self,
-        key: &<E as RangeEntry>::Key,
-    ) -> Result<Self::ParentIterator<'_>, Self::Error> {
-        (**self).prefixes_of(key)
-    }
-
     #[cfg(test)]
     fn all(&mut self) -> Result<Self::RangeIterator<'_>, Self::Error> {
         (**self).all()
@@ -730,14 +681,6 @@ impl<E: RangeEntry, S: Store<E>> Store<E> for &mut S {
     #[cfg(test)]
     fn entry_remove(&mut self, key: &<E as RangeEntry>::Key) -> Result<Option<E>, Self::Error> {
         (**self).entry_remove(key)
-    }
-
-    fn remove_prefix_filtered(
-        &mut self,
-        prefix: &<E as RangeEntry>::Key,
-        predicate: impl Fn(&<E as RangeEntry>::Value) -> bool,
-    ) -> Result<usize, Self::Error> {
-        (**self).remove_prefix_filtered(prefix, predicate)
     }
 }
 
@@ -761,13 +704,11 @@ impl Default for SyncConfig {
 /// The outcome of a [`Store::put`] operation.
 #[derive(Debug)]
 pub(crate) enum InsertOutcome {
-    /// The entry was not inserted because a newer entry for its key or a
-    /// prefix of its key exists.
+    /// The entry was not inserted because the entry at its key is not older.
     NotInserted,
     /// The entry was inserted.
     Inserted {
-        /// Number of entries that were removed as a consequence of this insert operation.
-        /// The removed entries had a key that starts with the new entry's key and a lower value.
+        /// 1 when the insert replaced an older entry at its key, 0 otherwise.
         removed: usize,
     },
 }
@@ -843,7 +784,6 @@ mod tests {
         V: RangeValue,
     {
         type Error = Infallible;
-        type ParentIterator<'a> = std::vec::IntoIter<Result<(K, V), Infallible>>;
 
         fn get_first(&mut self) -> Result<K, Self::Error> {
             if let Some((k, _)) = self.data.first_key_value() {
@@ -883,6 +823,10 @@ mod tests {
             Ok(())
         }
 
+        fn entry_get(&mut self, key: &K) -> Result<Option<(K, V)>, Self::Error> {
+            Ok(self.data.get(key).cloned().map(|v| (key.clone(), v)))
+        }
+
         type RangeIterator<'a>
             = SimpleRangeIterator<'a, K, V>
         where
@@ -912,36 +856,12 @@ mod tests {
             })
         }
 
-        // TODO: Not horrible.
-        fn prefixes_of(&mut self, key: &K) -> Result<Self::ParentIterator<'_>, Self::Error> {
-            let mut res = vec![];
-            for (k, v) in self.data.iter() {
-                if k.is_prefix_of(key) {
-                    res.push(Ok((k.clone(), v.clone())));
-                }
-            }
-            Ok(res.into_iter())
-        }
-
         fn prefixed_by(&mut self, prefix: &K) -> Result<Self::RangeIterator<'_>, Self::Error> {
             let iter = self.data.iter();
             Ok(SimpleRangeIterator {
                 iter,
                 filter: SimpleFilter::Prefix(prefix.clone()),
             })
-        }
-
-        fn remove_prefix_filtered(
-            &mut self,
-            prefix: &K,
-            predicate: impl Fn(&V) -> bool,
-        ) -> Result<usize, Self::Error> {
-            let old_len = self.data.len();
-            self.data.retain(|k, v| {
-                let remove = prefix.is_prefix_of(k) && predicate(v);
-                !remove
-            });
-            Ok(old_len - self.data.len())
         }
     }
 
@@ -1349,21 +1269,7 @@ mod tests {
     }
 
     fn insert_if_larger<K: RangeKey, V: RangeValue>(map: &mut BTreeMap<K, V>, key: K, value: V) {
-        let mut insert = true;
-        for (k, v) in map.iter() {
-            if k.is_prefix_of(&key) && v >= &value {
-                insert = false;
-            }
-        }
-        if insert {
-            #[allow(clippy::needless_bool)]
-            map.retain(|k, v| {
-                if key.is_prefix_of(k) && value >= *v {
-                    false
-                } else {
-                    true
-                }
-            });
+        if map.get(&key).is_none_or(|v| &value > v) {
             map.insert(key, value);
         }
     }

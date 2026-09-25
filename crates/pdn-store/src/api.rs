@@ -357,20 +357,18 @@ impl Doc {
         Ok(())
     }
 
-    /// Deletes entries that match the given `author` and key `prefix`.
+    /// Deletes `author_id`'s entry at `key` by writing an empty entry there;
+    /// no other key is touched.
     ///
-    /// This inserts an empty entry with the key set to `prefix`, effectively clearing all other
-    /// entries whose key starts with or is equal to the given `prefix`.
-    ///
-    /// Returns the number of entries deleted.
-    pub async fn del(&self, author_id: AuthorId, prefix: impl Into<Bytes>) -> Result<usize> {
+    /// Returns 1 when an older entry at `key` was replaced, 0 otherwise.
+    pub async fn del(&self, author_id: AuthorId, key: impl Into<Bytes>) -> Result<usize> {
         self.ensure_open()?;
         let response = self
             .inner
             .rpc(DelRequest {
                 doc_id: self.namespace_id,
                 author_id,
-                prefix: prefix.into(),
+                key: key.into(),
             })
             .await??;
         Ok(response.removed)

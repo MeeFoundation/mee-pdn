@@ -11,7 +11,7 @@ use anyhow::Result;
 use data_layer::{AddrInfoOptions, RetractionMarker, RetractionVerdict, ShareMode};
 use iroh_blobs::Hash;
 use pdn_types::{EntryPath, NodeId, PdnId};
-use test_utils::{eventually, host_identity, ids, memory_node};
+use test_utils::{eventually, host_identity, ids, join_identity, memory_node};
 
 fn marker(bound: u64) -> RetractionMarker {
     RetractionMarker {
@@ -149,6 +149,50 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
     );
 
     node.shutdown().await?;
+    Ok(())
+}
+
+/// A marker at a path leaves the markers at longer paths standing, on the
+/// device that recorded them and on its sibling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_marker_at_a_path_leaves_the_markers_at_longer_paths() -> Result<()> {
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+    let author = phone.default_author(ids::ALICE)?;
+
+    phone_dir
+        .record_retraction(ids::BOB, author, "contact/email", &marker(10))
+        .await?;
+    phone_dir
+        .record_retraction(ids::BOB, author, "contact", &marker(20))
+        .await?;
+
+    for (device, directory) in [("phone", &phone_dir), ("laptop", &laptop_dir)] {
+        assert!(
+            eventually(|| async {
+                let mut paths: Vec<String> = directory
+                    .list_retractions()
+                    .await?
+                    .into_iter()
+                    .map(|(_issuer, _author, path, _marker)| path)
+                    .collect();
+                paths.sort_unstable();
+                Ok(paths == ["contact", "contact/email"])
+            })
+            .await?,
+            "both markers must list on the {device}"
+        );
+    }
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
     Ok(())
 }
 

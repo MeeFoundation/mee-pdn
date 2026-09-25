@@ -165,7 +165,7 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
     },
-    DeletePrefix {
+    Delete {
         author: AuthorId,
         key: Bytes,
         #[debug("reply")]
@@ -507,14 +507,14 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn delete_prefix(
+    pub async fn delete(
         &self,
         namespace: NamespaceId,
         author: AuthorId,
         key: Bytes,
     ) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::DeletePrefix { author, key, reply };
+        let action = ReplicaAction::Delete { author, key, reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -1131,11 +1131,11 @@ impl Actor {
                 })
                 .await
             }
-            ReplicaAction::DeletePrefix { author, key, reply } => {
+            ReplicaAction::Delete { author, key, reply } => {
                 send_reply_with_async(reply, self, async |this| {
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
-                    let res = replica.delete_prefix(&key, &author).await?;
+                    let res = replica.delete(&key, &author).await?;
                     Ok(res)
                 })
                 .await

@@ -1043,13 +1043,45 @@ impl SyncNode {
         contact: Contact,
         caller: Identity,
     ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let namespace = stack
+        let namespace = self
+            .require(identity)?
             .registry
             .binding(issuer)?
             .ok_or(UnknownIssuer { issuer })?
             .doc
             .id();
+        self.sync_namespace_as_for_test(identity, namespace, contact, caller)
+            .await
+    }
+
+    /// Take `identity`'s replica of `namespace` out of its gossip swarm,
+    /// its reconciliation left running: no announcement reaches it, so the
+    /// side that opens the next session is the caller's choice.
+    #[cfg(feature = "test-util")]
+    pub async fn leave_swarm_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+    ) -> Result<()> {
+        let tracked = self
+            .require(identity)?
+            .tracked(namespace)?
+            .context("the identity tracks no replica of that namespace")?;
+        tracked.doc.leave_gossip().await
+    }
+
+    /// [`sync_as_for_test`](Self::sync_as_for_test) for any replica
+    /// `identity` holds, named by its namespace — a directory or a
+    /// connection metadata store as well as a data replica.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_namespace_as_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        contact: Contact,
+        caller: Identity,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
         // A session for a pair the engines are already reconciling is
         // refused for that alone, whatever the records say, so the
         // verdict asked for here is the next one. The budget covers a few

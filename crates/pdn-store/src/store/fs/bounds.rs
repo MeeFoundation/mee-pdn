@@ -45,6 +45,7 @@ impl RecordsBounds {
         Self(Bound::Included(start), end)
     }
 
+    #[cfg(test)]
     pub fn author_prefix(ns: NamespaceId, author: AuthorId, prefix: Bytes) -> Self {
         RecordsBounds::author_key(ns, author, KeyFilter::Prefix(prefix))
     }

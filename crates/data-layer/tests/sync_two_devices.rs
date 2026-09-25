@@ -198,6 +198,82 @@ async fn concurrent_writes_converge() -> Result<()> {
     Ok(())
 }
 
+/// A write at a shorter path leaves the entries at longer paths sharing its
+/// components or its bytes standing, on the writing device and on its
+/// sibling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_at_a_shorter_path_leaves_the_longer_ones_standing() -> Result<()> {
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    phone.create_namespace(ids::ALICE, ids::ALICE).await?;
+    let author = phone.default_author(ids::ALICE)?;
+
+    let dir_ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, dir_ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+    let ticket = phone
+        .share_ticket(
+            ids::ALICE,
+            ids::ALICE,
+            ShareMode::Write,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    laptop
+        .import_namespace(ids::ALICE, ids::ALICE, ticket)
+        .await?;
+
+    let written: [(&str, &[u8]); 3] = [
+        ("contact/email", b"email"),
+        ("contacts/emergency", b"emergency"),
+        ("contact", b"contact"),
+    ];
+    for (path, payload) in written {
+        phone
+            .write(
+                ids::ALICE,
+                ids::ALICE,
+                author,
+                &EntryPath::new(path)?,
+                payload,
+            )
+            .await?;
+    }
+
+    for node in [&phone, &laptop] {
+        for (path, payload) in written {
+            assert!(
+                wait_entry_is(
+                    node,
+                    ids::ALICE,
+                    ids::ALICE,
+                    &EntryPath::new(path)?,
+                    payload
+                )
+                .await?,
+                "{path} does not read what was written at it"
+            );
+        }
+        let mut listed: Vec<String> = node
+            .list(ids::ALICE, ids::ALICE, None)
+            .await?
+            .into_iter()
+            .map(|entry| entry.path.as_str().to_owned())
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["contact", "contact/email", "contacts/emergency"]);
+    }
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
+    Ok(())
+}
+
 /// The directory carries tickets of any kind: published on one device, a
 /// ticket becomes readable on another once its payload arrives (`get_ticket`
 /// is `None` on the record alone). `data` is the kind creation actually

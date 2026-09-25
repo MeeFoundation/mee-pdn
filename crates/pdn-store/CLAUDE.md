@@ -86,5 +86,6 @@ Docs (protocol.rs)          ── iroh ProtocolHandler; entry point. Builder: D
 
 - `#![deny(missing_docs, rustdoc::broken_intra_doc_links)]` at the crate root: every public item needs a doc comment and intra-doc links must resolve. Some internal modules opt out with `#![allow(missing_docs)]`. `missing_debug_implementations` is also warned.
 - `EntrySignature` deliberately wraps `iroh::Signature` (not the raw `ed25519_dalek` type) to keep the on-wire `SignedEntry` format independent of upstream ed25519 serde changes — don't "simplify" this.
+- An entry affects only its own key, per author: `ranger::Store::put` and `would_insert` compare against the entry at that key alone, an empty one included, read through `entry_get`, and `Replica::delete` / `Doc::del` write an empty entry at one key. Upstream's prefix semantics — `prefixes_of`, `remove_prefix_filtered`, `delete_prefix` — are gone, so an upstream patch touching them or `put` is adapted, not taken as it is. The rule is specified in the data layer's specs (`subset-reconciliation`, `data-store`).
 - `wasm_browser` is a `cfg` alias defined in `build.rs` (`all(target_family = "wasm", target_os = "unknown")`); use it to gate browser-specific code paths (notably the actor-as-task fallback).
 - Property tests use `proptest` + `test-strategy`; regression seeds are checked in under `proptest-regressions/`.
