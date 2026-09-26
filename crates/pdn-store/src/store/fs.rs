@@ -761,15 +761,14 @@ pub struct StoreInstance<'a> {
     /// When set, the reads that serve the peer — `get_first`, `get_range`,
     /// and the fingerprints computed from them — come from this snapshot,
     /// so the served view is stable for the whole session while writes
-    /// continue on the live store. Ingest stays live: `prefixes_of`,
-    /// `entry_put`, and `remove_prefix_filtered` always operate on the
-    /// current state. Two things ride on that. The newer-than comparison
-    /// of `ranger::Store::put` — judged against a stale snapshot, an older
-    /// entry could overwrite a concurrent session's insert. And
-    /// `ranger::Store::would_insert`, the gate on the rejection echoed to
-    /// a sender: judged against the snapshot it would name an entry the
-    /// store took in after session setup, and the sender retracts its own
-    /// copy on that word.
+    /// continue on the live store. Ingest stays live: `entry_get` and
+    /// `entry_put` always operate on the current state. Two things ride on
+    /// that. The newer-than comparison of `ranger::Store::put` — judged
+    /// against a stale snapshot, an older entry could overwrite a
+    /// concurrent session's insert. And `ranger::Store::would_insert`, the
+    /// gate on the rejection echoed to a sender: judged against the
+    /// snapshot it would name an entry the store took in after session
+    /// setup, and the sender retracts its own copy on that word.
     pub(crate) session_snapshot: Option<&'a ReadOnlyTables>,
 }
 
@@ -783,9 +782,8 @@ impl<'a> StoreInstance<'a> {
     }
 
     /// Every namespace's records share one table, so an identifier naming
-    /// another namespace would read — or, in `remove_prefix_filtered`,
-    /// delete — that namespace's rows. Refused, as `get_range` refuses a
-    /// foreign boundary.
+    /// another namespace would read — or, through `put`, overwrite — that
+    /// namespace's rows. Refused, as `get_range` refuses a foreign boundary.
     fn ensure_own_namespace(&self, id: &RecordIdentifier) -> Result<()> {
         anyhow::ensure!(
             id.namespace() == self.namespace,
@@ -851,10 +849,6 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     type Error = anyhow::Error;
     type RangeIterator<'x>
         = Chain<RecordsRange<'x>, Flatten<std::option::IntoIter<RecordsRange<'x>>>>
-    where
-        'a: 'x;
-    type ParentIterator<'x>
-        = ParentIterator
     where
         'a: 'x;
 
@@ -1019,13 +1013,11 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         Ok(chain_none(iter))
     }
 
-    fn prefixes_of(
-        &mut self,
-        id: &RecordIdentifier,
-    ) -> Result<Self::ParentIterator<'_>, Self::Error> {
+    fn entry_get(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
         self.ensure_own_namespace(id)?;
-        let tables = self.store.as_mut().tables()?;
-        ParentIterator::new(tables, self.namespace, id.author(), id.key().to_vec())
+        self.store
+            .as_mut()
+            .get_exact(id.namespace(), id.author(), id.key(), true)
     }
 
     #[cfg(test)]
@@ -1036,27 +1028,6 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
         Ok(chain_none(iter))
     }
-
-    fn remove_prefix_filtered(
-        &mut self,
-        id: &RecordIdentifier,
-        predicate: impl Fn(&Record) -> bool,
-    ) -> Result<usize> {
-        self.ensure_own_namespace(id)?;
-        let bounds = RecordsBounds::author_prefix(self.namespace, id.author(), id.key_bytes());
-        self.store.wrote(self.namespace);
-        self.store.as_mut().modify(|tables| {
-            let cb = |_k: RecordsId, v: RecordsValue| {
-                let (timestamp, _namespace_sig, _author_sig, len, hash) = v;
-                let record = Record::new(hash.into(), len, timestamp);
-
-                predicate(&record)
-            };
-            let iter = tables.records.extract_from_if(bounds.as_ref(), cb)?;
-            let count = iter.count();
-            Ok(count)
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1064,56 +1035,6 @@ fn chain_none<'a, I: Iterator<Item = T> + 'a, T>(
     iter: I,
 ) -> Chain<I, Flatten<std::option::IntoIter<I>>> {
     iter.chain(None.into_iter().flatten())
-}
-
-/// Iterator over parent entries, i.e. entries with the same namespace and author, and a key which
-/// is a prefix of the key passed to the iterator.
-#[derive(Debug)]
-pub struct ParentIterator {
-    inner: std::vec::IntoIter<anyhow::Result<SignedEntry>>,
-}
-
-impl ParentIterator {
-    fn new(
-        tables: &Tables,
-        namespace: NamespaceId,
-        author: AuthorId,
-        key: Vec<u8>,
-    ) -> anyhow::Result<Self> {
-        let parents = parents(&tables.records, namespace, author, key.clone());
-        Ok(Self {
-            inner: parents.into_iter(),
-        })
-    }
-}
-
-fn parents(
-    table: &impl ReadableTable<RecordsId<'static>, RecordsValue<'static>>,
-    namespace: NamespaceId,
-    author: AuthorId,
-    mut key: Vec<u8>,
-) -> Vec<anyhow::Result<SignedEntry>> {
-    let mut res = Vec::new();
-
-    while !key.is_empty() {
-        let entry = get_exact(table, namespace, author, &key, false);
-        key.pop();
-        match entry {
-            Err(err) => res.push(Err(err)),
-            Ok(Some(entry)) => res.push(Ok(entry)),
-            Ok(None) => continue,
-        }
-    }
-    res.reverse();
-    res
-}
-
-impl Iterator for ParentIterator {
-    type Item = Result<SignedEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
 }
 
 /// Iterator for all content hashes

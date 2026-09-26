@@ -1043,13 +1043,46 @@ impl SyncNode {
         contact: Contact,
         caller: Identity,
     ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let namespace = stack
+        let namespace = self
+            .require(identity)?
             .registry
             .binding(issuer)?
             .ok_or(UnknownIssuer { issuer })?
             .doc
             .id();
+        self.sync_namespace_as_for_test(identity, namespace, contact, caller)
+            .await
+    }
+
+    /// Take `identity`'s replica of `namespace` out of its gossip swarm,
+    /// its reconciliation left running: no announcement reaches it. It holds
+    /// until this node's next reconcile pass, which re-joins the swarm and
+    /// opens sessions to the contacts itself.
+    #[cfg(feature = "test-util")]
+    pub async fn leave_swarm_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+    ) -> Result<()> {
+        let tracked = self
+            .require(identity)?
+            .tracked(namespace)?
+            .context("the identity tracks no replica of that namespace")?;
+        tracked.doc.leave_gossip().await
+    }
+
+    /// [`sync_as_for_test`](Self::sync_as_for_test) for any replica
+    /// `identity` holds, named by its namespace — a directory or a
+    /// connection metadata store as well as a data replica.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_namespace_as_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        contact: Contact,
+        caller: Identity,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
         // A session for a pair the engines are already reconciling is
         // refused for that alone, whatever the records say, so the
         // verdict asked for here is the next one. The budget covers a few
@@ -1273,6 +1306,48 @@ impl SyncNode {
             .data_doc(issuer)?
             .ok_or(UnknownIssuer { issuer })?;
         stack.access.arm_retraction(doc.id(), author, key, bound)
+    }
+
+    /// Whether `marker`'s version is armed on `issuer`'s replica and its
+    /// removal ran. `None` when the issuer resolves to no replica here.
+    pub fn retraction_applied(
+        &self,
+        identity: PdnId,
+        issuer: PdnId,
+        author: AuthorId,
+        key: &[u8],
+        marker: [u8; 32],
+    ) -> Result<Option<bool>> {
+        let Some(stack) = self.stack(identity)? else {
+            return Ok(None);
+        };
+        let Some(doc) = stack.registry.data_doc(issuer)? else {
+            return Ok(None);
+        };
+        stack
+            .access
+            .retraction_applied(doc.id(), author, key, marker)
+            .map(Some)
+    }
+
+    /// Record that `marker`'s removal ran after its arming, so a sweep
+    /// skips it until a disarm.
+    pub fn mark_retraction_applied(
+        &self,
+        identity: PdnId,
+        issuer: PdnId,
+        author: AuthorId,
+        key: &[u8],
+        marker: [u8; 32],
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = stack
+            .registry
+            .data_doc(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        stack
+            .access
+            .mark_retraction_applied(doc.id(), author, key, marker)
     }
 
     /// Whether this identity holds exactly the entry `verdict` names —

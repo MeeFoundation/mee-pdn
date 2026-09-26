@@ -167,7 +167,7 @@ pub struct ExportFileRequest {
 pub struct DelRequest {
     pub doc_id: NamespaceId,
     pub author_id: AuthorId,
-    pub prefix: Bytes,
+    pub key: Bytes,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -34,6 +34,7 @@ use crate::{
         connect_and_sync, handle_in_process_session, handle_session, AbortReason, AcceptError,
         AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
     },
+    subscribers::{Delivery, LagNotice, Subscribers},
     AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
 };
 
@@ -202,6 +203,15 @@ pub enum Event {
     /// Receiving this event does not guarantee that all content in the document is available. If
     /// blobs failed to download, this event will still be emitted after all operations completed.
     PendingContentReady,
+    /// Events were dropped since the last one received: the subscription's
+    /// buffer was full.
+    Lagged,
+}
+
+impl LagNotice for Event {
+    fn lagged(&self) -> Self {
+        Self::Lagged
+    }
 }
 
 /// The identity is the callee the dial addressed: a node of two identities
@@ -1253,6 +1263,9 @@ impl LiveActor {
                     }
                 }
             }
+            // The live actor's subscription is `Delivery::Blocking`: nothing
+            // is dropped on the way here.
+            crate::Event::Lagged { .. } => {}
         }
 
         Ok(())
@@ -1455,11 +1468,14 @@ impl From<&SyncFinished> for SyncDetails {
 }
 
 #[derive(Debug, Default)]
-struct SubscribersMap(HashMap<NamespaceId, Subscribers>);
+struct SubscribersMap(HashMap<NamespaceId, Subscribers<Event>>);
 
 impl SubscribersMap {
     fn subscribe(&mut self, namespace: NamespaceId, sender: async_channel::Sender<Event>) {
-        self.0.entry(namespace).or_default().subscribe(sender);
+        self.0
+            .entry(namespace)
+            .or_default()
+            .subscribe(sender, Delivery::Lossy);
     }
 
     async fn send(&mut self, namespace: &NamespaceId, event: Event) -> bool {
@@ -1467,8 +1483,8 @@ impl SubscribersMap {
         let Some(subscribers) = self.0.get_mut(namespace) else {
             return false;
         };
-
-        if !subscribers.send(event).await {
+        subscribers.send(event).await;
+        if subscribers.is_empty() {
             self.0.remove(namespace);
         }
         true
@@ -1540,27 +1556,6 @@ impl QueuedHashes {
     }
 }
 
-#[derive(Debug, Default)]
-struct Subscribers(Vec<async_channel::Sender<Event>>);
-
-impl Subscribers {
-    fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
-        self.0.push(sender)
-    }
-
-    async fn send(&mut self, event: Event) -> bool {
-        let futs = self.0.iter().map(|sender| sender.send(event.clone()));
-        let res = futures_buffered::join_all(futs).await;
-        // reverse the order so removing does not shift remaining indices
-        for (i, res) in res.into_iter().enumerate().rev() {
-            if res.is_err() {
-                self.0.remove(i);
-            }
-        }
-        !self.0.is_empty()
-    }
-}
-
 fn fmt_accept_peer(res: &Result<SyncFinished, AcceptError>) -> String {
     match res {
         Ok(res) => res.peer.fmt_short().to_string(),
@@ -1591,8 +1586,8 @@ mod tests {
         let (a_tx, a_rx) = async_channel::unbounded();
         let (b_tx, b_rx) = async_channel::unbounded();
         let mut subscribers = Subscribers::default();
-        subscribers.subscribe(a_tx);
-        subscribers.subscribe(b_tx);
+        subscribers.subscribe(a_tx, Delivery::Lossy);
+        subscribers.subscribe(b_tx, Delivery::Lossy);
         drop(a_rx);
         drop(b_rx);
         subscribers.send(Event::NeighborUp(pk)).await;

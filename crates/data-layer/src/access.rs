@@ -79,7 +79,15 @@ enum WriteAdmission {
 }
 
 /// Timestamp bound per retracted `(author, key)` of one granted namespace.
-type ArmedRetractions = HashMap<(AuthorId, Vec<u8>), u64>;
+/// One key's refusal: the widest bound armed, and the marker version whose
+/// removal has run too, so a sweep does neither again for it.
+#[derive(Debug)]
+struct Armed {
+    bound: u64,
+    applied: Option<[u8; 32]>,
+}
+
+type ArmedRetractions = HashMap<(AuthorId, Vec<u8>), Armed>;
 
 /// The classification material one hosted identity holds, consulted per
 /// session by the access provider its engine was assembled with.
@@ -496,9 +504,53 @@ impl AccessBook {
             .write()
             .map_err(|_poisoned| anyhow::anyhow!("retractions lock poisoned"))?;
         let armed = retractions.entry(namespace).or_default();
-        let slot = armed.entry((author, key)).or_insert(bound);
-        *slot = (*slot).max(bound);
+        let slot = armed.entry((author, key)).or_insert(Armed {
+            bound,
+            applied: None,
+        });
+        slot.bound = slot.bound.max(bound);
         Ok(())
+    }
+
+    /// Records that `marker`'s removal ran on an armed key; a key not armed
+    /// records nothing.
+    pub(crate) fn mark_retraction_applied(
+        &self,
+        namespace: NamespaceId,
+        author: AuthorId,
+        key: &[u8],
+        marker: [u8; 32],
+    ) -> Result<()> {
+        let mut retractions = self
+            .retractions
+            .write()
+            .map_err(|_poisoned| anyhow::anyhow!("retractions lock poisoned"))?;
+        if let Some(slot) = retractions
+            .get_mut(&namespace)
+            .and_then(|armed| armed.get_mut(&(author, key.to_vec())))
+        {
+            slot.applied = Some(marker);
+        }
+        Ok(())
+    }
+
+    /// Whether `marker` is armed and its removal ran. Disarming forgets it,
+    /// so a marker met again after a disarm is applied again.
+    pub(crate) fn retraction_applied(
+        &self,
+        namespace: NamespaceId,
+        author: AuthorId,
+        key: &[u8],
+        marker: [u8; 32],
+    ) -> Result<bool> {
+        let retractions = self
+            .retractions
+            .read()
+            .map_err(|_poisoned| anyhow::anyhow!("retractions lock poisoned"))?;
+        Ok(retractions
+            .get(&namespace)
+            .and_then(|armed| armed.get(&(author, key.to_vec())))
+            .is_some_and(|slot| slot.applied == Some(marker)))
     }
 
     /// Arming only widens, so without this a refusal whose marker aged out
@@ -625,7 +677,7 @@ fn retraction_names(
     let id = entry.id();
     armed
         .get(&(id.author(), id.key().to_vec()))
-        .is_some_and(|bound| entry.timestamp() <= *bound)
+        .is_some_and(|armed| entry.timestamp() <= armed.bound)
 }
 
 /// Record-level membership (tombstones excluded). `device_key` is the one
@@ -768,6 +820,45 @@ mod tests {
             ),
             "the wider bound of the two holds"
         );
+    }
+
+    /// A marker version whose removal ran is known as applied until a
+    /// disarm, of its key or of the whole namespace, forgets it; a newer
+    /// version of the same marker is not.
+    #[test]
+    fn an_applied_marker_is_forgotten_with_its_disarm() {
+        let namespace = NamespaceSecret::from_bytes(&[7u8; 32]).id();
+        let author = Author::from_bytes(&[5u8; 32]).id();
+        let book = AccessBook::new(pdn_types::PdnId::from_bytes([1u8; 32]));
+        let key = b"contact/email";
+        let (first, newer) = ([1u8; 32], [2u8; 32]);
+        let applied = |marker| {
+            book.retraction_applied(namespace, author, key, marker)
+                .expect("read")
+        };
+
+        book.mark_retraction_applied(namespace, author, key, first)
+            .expect("mark");
+        assert!(!applied(first), "a key never armed records nothing");
+
+        book.arm_retraction(namespace, author, key.to_vec(), 50)
+            .expect("arm");
+        assert!(!applied(first), "armed, its removal not yet run");
+        book.mark_retraction_applied(namespace, author, key, first)
+            .expect("mark");
+        assert!(applied(first));
+        assert!(!applied(newer), "a newer version is applied anew");
+
+        book.disarm_retraction(namespace, author, key)
+            .expect("disarm");
+        assert!(!applied(first), "forgotten with the key's disarm");
+
+        book.arm_retraction(namespace, author, key.to_vec(), 50)
+            .expect("arm");
+        book.mark_retraction_applied(namespace, author, key, first)
+            .expect("mark");
+        book.disarm_retractions(namespace).expect("disarm");
+        assert!(!applied(first), "forgotten with the namespace's disarm");
     }
 
     /// An unreadable retraction map refuses data replicas (silently) and

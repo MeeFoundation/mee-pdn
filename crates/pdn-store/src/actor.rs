@@ -35,6 +35,7 @@ use crate::{
         fs::{tables::ReadOnlyTables, ContentHashesIterator, StoreInstance},
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
+    subscribers::Delivery,
     Author, AuthorHeads, AuthorId, Capability, CapabilityValidator, ContentStatus,
     ContentStatusCallback, Event, NamespaceId, NamespaceSecret, PeerIdBytes, RejectionObserver,
     Replica, ReplicaInfo, SignedEntry, SyncOutcome,
@@ -165,7 +166,7 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
     },
-    DeletePrefix {
+    Delete {
         author: AuthorId,
         key: Bytes,
         #[debug("reply")]
@@ -376,8 +377,8 @@ pub struct SyncHandle {
 pub struct OpenOpts {
     /// Set to true to set sync state to true.
     pub sync: bool,
-    /// Optionally subscribe to replica events.
-    pub subscribe: Option<async_channel::Sender<Event>>,
+    /// A [`Delivery::Blocking`] subscription: only the live actor opens one.
+    pub(crate) subscribe: Option<async_channel::Sender<Event>>,
 }
 
 impl OpenOpts {
@@ -386,8 +387,7 @@ impl OpenOpts {
         self.sync = true;
         self
     }
-    /// Subscribe to replica events.
-    pub fn subscribe(mut self, subscribe: async_channel::Sender<Event>) -> Self {
+    pub(crate) fn subscribe(mut self, subscribe: async_channel::Sender<Event>) -> Self {
         self.subscribe = Some(subscribe);
         self
     }
@@ -507,14 +507,14 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn delete_prefix(
+    pub async fn delete(
         &self,
         namespace: NamespaceId,
         author: AuthorId,
         key: Bytes,
     ) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::DeletePrefix { author, key, reply };
+        let action = ReplicaAction::Delete { author, key, reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -1131,11 +1131,11 @@ impl Actor {
                 })
                 .await
             }
-            ReplicaAction::DeletePrefix { author, key, reply } => {
+            ReplicaAction::Delete { author, key, reply } => {
                 send_reply_with_async(reply, self, async |this| {
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
-                    let res = replica.delete_prefix(&key, &author).await?;
+                    let res = replica.delete(&key, &author).await?;
                     Ok(res)
                 })
                 .await
@@ -1476,7 +1476,7 @@ impl OpenReplicas {
             hash_map::Entry::Vacant(e) => {
                 let mut info = open_cb()?;
                 if let Some(sender) = opts.subscribe {
-                    info.subscribe(sender);
+                    info.subscribe_with(sender, Delivery::Blocking);
                 }
                 debug!(namespace = %namespace.fmt_short(), "open");
                 let state = OpenReplica {
@@ -1491,7 +1491,7 @@ impl OpenReplicas {
                 state.handles += 1;
                 state.sync = state.sync || opts.sync;
                 if let Some(sender) = opts.subscribe {
-                    state.info.subscribe(sender);
+                    state.info.subscribe_with(sender, Delivery::Blocking);
                 }
             }
         }

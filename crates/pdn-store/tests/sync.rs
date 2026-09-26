@@ -1747,3 +1747,52 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
     }
     Ok(())
 }
+
+/// A subscriber that stops reading holds up neither the replica nor the
+/// live engine: the importing node takes in more entries and their content
+/// than its unread subscription buffers, and every one becomes readable.
+///
+/// Six hundred entries of distinct content: each emits an insert and a
+/// content event, and a subscription buffers 256 of each.
+#[tokio::test]
+async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
+    const ENTRIES: usize = 600;
+    let mut rng = test_rng(b"an_unread_subscription_holds_up_no_sync");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let author0 = clients[0].docs().author_create().await?;
+    let doc0 = clients[0].docs().create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = clients[1].docs().import(ticket).await?;
+    let _unread = doc1.subscribe().await?;
+
+    for n in 0..ENTRIES {
+        doc0.set_bytes(author0, format!("k{n:04}"), format!("v{n:04}"))
+            .await?;
+    }
+    let blobs1 = clients[1].blobs();
+    tokio::time::timeout(TIMEOUT, async {
+        for n in 0..ENTRIES {
+            let key = format!("k{n:04}");
+            let value = format!("v{n:04}");
+            while get_latest(blobs1, &doc1, key.as_bytes())
+                .await
+                .ok()
+                .as_deref()
+                != Some(value.as_bytes())
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    })
+    .await
+    .context("the importing node stopped taking in entries past its unread subscription")?;
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

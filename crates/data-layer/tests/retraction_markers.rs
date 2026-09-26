@@ -8,10 +8,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, RetractionMarker, RetractionVerdict, ShareMode};
+use data_layer::{
+    AddrInfoOptions, AuthorId, PrivateMetadataStore, RetractionMarker, RetractionVerdict, ShareMode,
+};
 use iroh_blobs::Hash;
 use pdn_types::{EntryPath, NodeId, PdnId};
-use test_utils::{eventually, host_identity, ids, memory_node};
+use test_utils::{eventually, host_identity, ids, join_identity, memory_node};
 
 fn marker(bound: u64) -> RetractionMarker {
     RetractionMarker {
@@ -149,6 +151,121 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
     );
 
     node.shutdown().await?;
+    Ok(())
+}
+
+/// A marker at a path leaves the markers at longer paths standing, on the
+/// device that recorded them and on its sibling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_marker_at_a_path_leaves_the_markers_at_longer_paths() -> Result<()> {
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+    let author = phone.default_author(ids::ALICE)?;
+
+    phone_dir
+        .record_retraction(ids::BOB, author, "contact/email", &marker(10))
+        .await?;
+    phone_dir
+        .record_retraction(ids::BOB, author, "contact", &marker(20))
+        .await?;
+
+    for (device, directory) in [("phone", &phone_dir), ("laptop", &laptop_dir)] {
+        assert!(
+            eventually(|| async {
+                let mut paths: Vec<String> = directory
+                    .list_retractions()
+                    .await?
+                    .into_iter()
+                    .map(|(_issuer, _author, path, _marker)| path)
+                    .collect();
+                paths.sort_unstable();
+                Ok(paths == ["contact", "contact/email"])
+            })
+            .await?,
+            "both markers must list on the {device}"
+        );
+    }
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
+    Ok(())
+}
+
+/// Each marker as (issuer, recorded by `author`, path), sorted.
+async fn listed(
+    directory: &PrivateMetadataStore,
+    author: AuthorId,
+) -> Result<Vec<(PdnId, bool, String)>> {
+    let mut listed: Vec<(PdnId, bool, String)> = directory
+        .list_retractions()
+        .await?
+        .into_iter()
+        .map(|(issuer, by, path, _marker)| (issuer, by == author, path))
+        .collect();
+    listed.sort_unstable();
+    Ok(listed)
+}
+
+/// Pruning an issuer drops every marker this device recorded for it, nested
+/// paths included, and leaves a sibling's marker for that issuer and this
+/// device's marker for another issuer standing, on both devices.
+///
+/// The sibling's marker is the author scope: each device prunes the markers
+/// it recorded, the unbind running on every device for itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn pruning_an_issuer_drops_every_own_marker_and_spares_a_siblings() -> Result<()> {
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+    let phone_author = phone.default_author(ids::ALICE)?;
+    let laptop_author = laptop.default_author(ids::ALICE)?;
+
+    for path in ["contact", "contact/email", "notes/x"] {
+        phone_dir
+            .record_retraction(ids::BOB, phone_author, path, &marker(10))
+            .await?;
+    }
+    phone_dir
+        .record_retraction(ids::CAROL, phone_author, "contact/phone", &marker(10))
+        .await?;
+    laptop_dir
+        .record_retraction(ids::BOB, laptop_author, "notes/y", &marker(10))
+        .await?;
+
+    // Sentinel: every marker has replicated to the phone before it prunes.
+    assert!(
+        eventually(|| async { Ok(listed(&phone_dir, phone_author).await?.len() == 5) }).await?,
+        "every marker must list on the phone"
+    );
+
+    phone_dir.prune_retractions(ids::BOB).await?;
+    let mut standing = vec![
+        (ids::BOB, false, "notes/y".to_owned()),
+        (ids::CAROL, true, "contact/phone".to_owned()),
+    ];
+    standing.sort_unstable();
+    for (device, directory) in [("phone", &phone_dir), ("laptop", &laptop_dir)] {
+        assert!(
+            eventually(|| async { Ok(listed(directory, phone_author).await? == standing) }).await?,
+            "the {device} must list the sibling's marker and the other issuer's alone"
+        );
+    }
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
     Ok(())
 }
 

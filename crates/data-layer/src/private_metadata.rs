@@ -37,8 +37,9 @@ use crate::node::{read_payload, SyncNode};
 pub struct CatchUpTimeout;
 
 /// A subscription to one replica's sync sessions, from
-/// [`PrivateMetadataStore::watch_catch_up`]. Unread, it holds back the
-/// engine's events once its buffer fills, so the wait follows promptly.
+/// [`PrivateMetadataStore::watch_catch_up`]. Unread past its buffer it drops
+/// events, a session's among them, and the wait then holds out for the next
+/// session — one reconcile interval at most.
 pub struct CatchUpWatch {
     events: Pin<Box<dyn Stream<Item = Result<LiveEvent>> + Send>>,
     since: SystemTime,
@@ -179,6 +180,16 @@ fn retraction_of(key: &[u8]) -> Option<(PdnId, AuthorId, String)> {
 /// One listed marker: the addressed entry (issuer, author, path) and the
 /// decoded marker.
 pub type ListedRetraction = (PdnId, AuthorId, String, RetractionMarker);
+
+/// A marker as its entry lists it, payload unread: `marker` is the entry's
+/// content hash, which names the version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetractionHead {
+    pub issuer: PdnId,
+    pub author: AuthorId,
+    pub path: String,
+    pub marker: [u8; 32],
+}
 
 /// The payload of a retraction marker; the addressed entry lives in the
 /// key. JSON; a payload this build cannot decode reads as no marker
@@ -486,47 +497,68 @@ impl PrivateMetadataStore {
     /// The recorded markers whose payload is readable; an undecodable
     /// payload is skipped (fail-closed).
     pub async fn list_retractions(&self) -> Result<Vec<ListedRetraction>> {
-        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
-        let mut keys = Vec::new();
-        {
-            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-            while let Some(entry) = stream.next().await {
-                if let Some(parsed) = retraction_of(entry?.key()) {
-                    keys.push(parsed);
-                }
-            }
-        }
         let mut markers = Vec::new();
-        for (issuer, author, path) in keys {
-            let key = retraction_key(&issuer, &author, &path);
-            let Some(bytes) = read_payload(&self.doc, &self.blobs, key.as_bytes()).await? else {
-                continue;
-            };
-            let Ok(marker) = serde_json::from_slice::<RetractionMarker>(&bytes) else {
-                continue;
-            };
-            markers.push((issuer, author, path, marker));
+        for head in self.list_retraction_heads().await? {
+            if let Some(marker) = self.read_retraction(&head).await? {
+                markers.push((head.issuer, head.author, head.path, marker));
+            }
         }
         Ok(markers)
     }
 
-    /// Drop every marker for `issuer` — with the granted namespace binding.
+    /// The recorded markers from their entries alone, no payload read.
+    pub async fn list_retraction_heads(&self) -> Result<Vec<RetractionHead>> {
+        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut heads = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            if let Some((issuer, author, path)) = retraction_of(entry.key()) {
+                heads.push(RetractionHead {
+                    issuer,
+                    author,
+                    path,
+                    marker: *entry.content_hash().as_bytes(),
+                });
+            }
+        }
+        Ok(heads)
+    }
+
+    /// The version `head` names; `None` while its payload has not arrived or
+    /// when it does not decode (fail-closed).
+    pub async fn read_retraction(&self, head: &RetractionHead) -> Result<Option<RetractionMarker>> {
+        let hash = iroh_blobs::Hash::from_bytes(head.marker);
+        if !self.blobs.has(hash).await? {
+            return Ok(None);
+        }
+        let bytes = self.blobs.get_bytes(hash).await?;
+        Ok(serde_json::from_slice::<RetractionMarker>(&bytes).ok())
+    }
+
+    /// Drop every marker this device recorded for `issuer` — with the
+    /// granted namespace binding. Only own-author markers, since deletion is
+    /// per directory author; each sibling prunes its own at its unbind.
     pub async fn prune_retractions(&self, issuer: PdnId) -> Result<()> {
-        self.doc
-            .del(
-                self.author,
-                format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes(),
-            )
-            .await?;
+        let query = Query::author(self.author)
+            .key_prefix(format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes());
+        let mut keys = Vec::new();
+        {
+            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+            while let Some(entry) = stream.next().await {
+                keys.push(entry?.key().to_vec());
+            }
+        }
+        for key in keys {
+            self.doc.del(self.author, key).await?;
+        }
         Ok(())
     }
 
     /// Drop the markers this device recorded whose entry aged past
     /// `retention` (microseconds, like entry timestamps). Only own-author
-    /// markers, since deletion is per directory author. Deletion is by key
-    /// prefix, so a marker whose path prefixes another's drops that one too
-    /// — an over-drop self-heals through the issuer's rejection. Returns the
-    /// dropped addresses so the caller can disarm what each one armed.
+    /// markers, since deletion is per directory author. Returns the dropped
+    /// addresses so the caller can disarm what each one armed.
     pub async fn prune_aged_retractions(
         &self,
         now: u64,
@@ -572,8 +604,9 @@ impl PrivateMetadataStore {
         self.doc.subscribe().await
     }
 
-    /// One detail-free item per observed change — an entry written here,
-    /// arrived by sync, or a payload become readable. An `Err` item is the
+    /// A detail-free item after every observed change — an entry written
+    /// here, arrived by sync, or a payload become readable; a burst past the
+    /// subscription's buffer arrives as one item. An `Err` item is the
     /// subscription failing; the stream ends with the node.
     pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
         let events = self.events().await?;
@@ -581,7 +614,8 @@ impl PrivateMetadataStore {
             Ok(
                 LiveEvent::InsertLocal { .. }
                 | LiveEvent::InsertRemote { .. }
-                | LiveEvent::ContentReady { .. },
+                | LiveEvent::ContentReady { .. }
+                | LiveEvent::Lagged,
             ) => Some(Ok(())),
             Ok(_) => None,
             Err(err) => Some(Err(err)),

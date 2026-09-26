@@ -1043,3 +1043,144 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     bob.shutdown().await?;
     Ok(())
 }
+
+/// A withdrawal made on the publishing device holds when that device opens
+/// the next session of its store toward an audience device still holding
+/// the withdrawn record: both read no grant after it and after every later
+/// session.
+///
+/// Denied: the audience's data session the grant served before the
+/// withdrawal. The audience's replica leaves the swarm first, so no
+/// announcement makes it pull before the publisher opens: its pull is the
+/// order that converges without the per-key rule. The audience's node runs
+/// no reconcile pass during the scenario, since a pass re-joins the swarm
+/// and opens the session itself.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, served and refused sides in one place
+async fn a_withdrawal_holds_against_a_device_that_still_holds_the_record() -> Result<()> {
+    let mut bob = memory_node().await?;
+    let a_phone = SyncNode::spawn(SpawnOptions {
+        reconcile_interval: Duration::from_hours(1),
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _alice_dir = host_identity(&a_phone, ids::ALICE).await?;
+
+    let email = EntryPath::new("contact/email")?;
+    let data_read = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
+    let author = bob.default_author(ids::BOB)?;
+    bob.write(ids::BOB, ids::BOB, author, &email, b"bob@example.org")
+        .await?;
+    let b_own = ConnectionMetadataStore::create(&bob, ids::BOB).await?;
+    b_own.publish_device(bob.node_id()).await?;
+    let grant = ReadGrant {
+        issuer: ids::BOB,
+        audience: ids::ALICE,
+        claims: NonEmpty::new(GrantedClaim {
+            claim: claim_id_of(&ids::BOB, &email),
+            write: false,
+        }),
+    };
+    b_own.publish_grant(&grant, &data_read).await?;
+
+    let a_own = ConnectionMetadataStore::create(&a_phone, ids::ALICE).await?;
+    a_own.publish_device(a_phone.node_id()).await?;
+    let phone_peer = ConnectionMetadataStore::import(
+        &a_phone,
+        ids::ALICE,
+        b_own
+            .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await?,
+    )
+    .await?;
+    a_phone.host_connection(ids::ALICE, ids::BOB, &a_own, &phone_peer)?;
+    let bob_peer = ConnectionMetadataStore::import(
+        &bob,
+        ids::BOB,
+        a_own
+            .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await?,
+    )
+    .await?;
+    bob.host_connection(ids::BOB, ids::ALICE, &b_own, &bob_peer)?;
+    assert!(
+        eventually(|| async {
+            Ok(phone_peer
+                .read_grant(ids::BOB, ids::ALICE)
+                .await?
+                .granted()
+                .is_some())
+        })
+        .await?,
+        "the grant did not reach the audience"
+    );
+    a_phone
+        .import_namespace_scoped(ids::ALICE, ids::BOB, data_read)
+        .await?;
+    assert!(
+        wait_entry_is(&a_phone, ids::ALICE, ids::BOB, &email, b"bob@example.org").await?,
+        "the granted entry did not reach the audience"
+    );
+
+    let toward_bob = Contact::new(bob.dial_handle().addr(), identity_of(ids::BOB));
+    let toward_phone = Contact::new(a_phone.dial_handle().addr(), identity_of(ids::ALICE));
+    // Allowed: the audience's data session under the grant.
+    a_phone
+        .sync_as_for_test(
+            ids::ALICE,
+            ids::BOB,
+            toward_bob.clone(),
+            identity_of(ids::ALICE),
+        )
+        .await?;
+
+    a_phone
+        .leave_swarm_for_test(ids::ALICE, phone_peer.namespace())
+        .await?;
+    b_own.withdraw_grant(ids::BOB).await?;
+    for publisher_opens in [true, false, true, false] {
+        if publisher_opens {
+            bob.sync_namespace_as_for_test(
+                ids::BOB,
+                b_own.namespace(),
+                toward_phone.clone(),
+                identity_of(ids::BOB),
+            )
+            .await?;
+        } else {
+            a_phone
+                .sync_namespace_as_for_test(
+                    ids::ALICE,
+                    phone_peer.namespace(),
+                    toward_bob.clone(),
+                    identity_of(ids::ALICE),
+                )
+                .await?;
+        }
+        for (device, store) in [("publisher", &b_own), ("audience", &phone_peer)] {
+            assert!(
+                store
+                    .read_grant(ids::BOB, ids::ALICE)
+                    .await?
+                    .granted()
+                    .is_none(),
+                "the withdrawn grant reads again on the {device} (publisher opened: {publisher_opens})"
+            );
+        }
+    }
+
+    // Denied: the same data session, after the withdrawal.
+    let refused = a_phone
+        .sync_as_for_test(ids::ALICE, ids::BOB, toward_bob, identity_of(ids::ALICE))
+        .await
+        .expect_err("the audience's data session is served after the withdrawal");
+    assert!(
+        format!("{refused:#}").contains("NotFound"),
+        "the refusal must be the uniform one, got: {refused:#}"
+    );
+
+    bob.shutdown().await?;
+    a_phone.shutdown().await?;
+    Ok(())
+}

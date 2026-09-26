@@ -198,6 +198,82 @@ async fn concurrent_writes_converge() -> Result<()> {
     Ok(())
 }
 
+/// A write at a shorter path leaves the entries at longer paths sharing its
+/// components or its bytes standing, on the writing device and on its
+/// sibling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_at_a_shorter_path_leaves_the_longer_ones_standing() -> Result<()> {
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    phone.create_namespace(ids::ALICE, ids::ALICE).await?;
+    let author = phone.default_author(ids::ALICE)?;
+
+    let dir_ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, dir_ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+    let ticket = phone
+        .share_ticket(
+            ids::ALICE,
+            ids::ALICE,
+            ShareMode::Write,
+            AddrInfoOptions::RelayAndAddresses,
+        )
+        .await?;
+    laptop
+        .import_namespace(ids::ALICE, ids::ALICE, ticket)
+        .await?;
+
+    let written: [(&str, &[u8]); 3] = [
+        ("contact/email", b"email"),
+        ("contacts/emergency", b"emergency"),
+        ("contact", b"contact"),
+    ];
+    for (path, payload) in written {
+        phone
+            .write(
+                ids::ALICE,
+                ids::ALICE,
+                author,
+                &EntryPath::new(path)?,
+                payload,
+            )
+            .await?;
+    }
+
+    for node in [&phone, &laptop] {
+        for (path, payload) in written {
+            assert!(
+                wait_entry_is(
+                    node,
+                    ids::ALICE,
+                    ids::ALICE,
+                    &EntryPath::new(path)?,
+                    payload
+                )
+                .await?,
+                "{path} does not read what was written at it"
+            );
+        }
+        let mut listed: Vec<String> = node
+            .list(ids::ALICE, ids::ALICE, None)
+            .await?
+            .into_iter()
+            .map(|entry| entry.path.as_str().to_owned())
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["contact", "contact/email", "contacts/emergency"]);
+    }
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
+    Ok(())
+}
+
 /// The directory carries tickets of any kind: published on one device, a
 /// ticket becomes readable on another once its payload arrives (`get_ticket`
 /// is `None` on the record alone). `data` is the kind creation actually
@@ -333,5 +409,63 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
     );
 
     node.shutdown().await?;
+    Ok(())
+}
+
+/// A subscriber that stops reading holds up neither sync nor the device's
+/// own calls: the laptop's directory takes in more of the phone's records
+/// than its unread subscription buffers, reads them all, and still writes
+/// and lists, while the subscription reports the changes it dropped.
+///
+/// Six hundred records: a subscription buffers around 320 events. Each probe
+/// waits the whole budget: the store stopping for good is what it catches,
+/// and a loaded runner holds one call for seconds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
+    const RECORDS: u16 = 600;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+
+    let mut unread = laptop_dir.changes().await?;
+    let peer = |n: u16| {
+        let mut bytes = [0x5e; 32];
+        bytes[..2].copy_from_slice(&n.to_be_bytes());
+        pdn_types::PdnId::from_bytes(bytes)
+    };
+    for n in 0..RECORDS {
+        phone_dir.connect(peer(n)).await?;
+    }
+    assert!(
+        eventually(|| async {
+            let listed = tokio::time::timeout(TIMEOUT, laptop_dir.list_connections())
+                .await
+                .map_err(|_| anyhow::anyhow!("the laptop's store stopped answering"))??;
+            Ok(listed.len() >= usize::from(RECORDS))
+        })
+        .await?,
+        "the laptop did not take in every record past its unread subscription"
+    );
+    tokio::time::timeout(TIMEOUT, laptop_dir.connect(ids::BOB))
+        .await
+        .map_err(|_| anyhow::anyhow!("a local write waited on the unread subscription"))??;
+
+    // Read at last, the subscription still yields: the dropped changes are
+    // reported, not lost silently.
+    let reported = tokio::time::timeout(TIMEOUT, futures_lite::StreamExt::next(&mut unread)).await;
+    assert!(
+        matches!(reported, Ok(Some(Ok(())))),
+        "the subscription went silent over the changes it dropped"
+    );
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
     Ok(())
 }

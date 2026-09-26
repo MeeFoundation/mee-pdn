@@ -73,7 +73,10 @@ impl LatestPerKeySelector {
                 SelectorRes::Continue
             }
             Some(last) if last.key() == entry.key() => {
-                if entry.timestamp() > last.timestamp() {
+                // The order `put` keeps within an author, applied across authors.
+                if (entry.timestamp(), entry.content_hash())
+                    > (last.timestamp(), last.content_hash())
+                {
                     self.0 = Some(entry);
                 } else {
                     self.0 = Some(last);

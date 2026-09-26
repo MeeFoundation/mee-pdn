@@ -2214,6 +2214,123 @@ mod tests {
         Ok(())
     }
 
+    /// A delete that lands inside a session leaves the session serving the
+    /// deleted entry, and the next session carries the empty entry that
+    /// deletes it at the peer.
+    ///
+    /// The peer opens the next session, so it offers the older entry before
+    /// it receives the delete: the order in which an older entry could
+    /// replace a delete.
+    #[tokio::test]
+    async fn a_delete_inside_a_session_lands_in_two_parts() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        let mut alice_store = store::Store::memory();
+        alice_store.new_replica(namespace.clone())?;
+        alice_store.close_replica(ns);
+        let author = alice_store.new_author(&mut rng)?.id();
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+        for key in ["ape", "bee", "bee/x", "cat"] {
+            alice
+                .insert_local(
+                    ns,
+                    author,
+                    key.as_bytes().to_vec().into(),
+                    Hash::new(key),
+                    key.len() as u64,
+                )
+                .await?;
+        }
+        let held = |handle: &SyncHandle, key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                anyhow::Ok(
+                    handle
+                        .get_exact(ns, author, key.as_bytes().to_vec().into(), false)
+                        .await?
+                        .is_some(),
+                )
+            }
+        };
+        let deleted = |handle: &SyncHandle, key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                anyhow::Ok(
+                    handle
+                        .get_exact(ns, author, key.as_bytes().to_vec().into(), true)
+                        .await?
+                        .is_some_and(|entry| entry.is_empty()),
+                )
+            }
+        };
+
+        // The session's view is taken here; the delete lands after it.
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        assert_eq!(
+            alice.delete(ns, author, b"bee".to_vec().into()).await?,
+            1,
+            "the delete replaced nothing"
+        );
+
+        exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert!(
+            held(&bob, "bee").await? && !deleted(&bob, "bee").await?,
+            "the frozen view was expected to serve the deleted entry, not the delete"
+        );
+
+        drop((alice_session, bob_session));
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        exchange_over_sessions(
+            &bob,
+            &bob_session,
+            bob_peer,
+            &alice,
+            &alice_session,
+            alice_peer,
+            ns,
+        )
+        .await?;
+        assert!(
+            deleted(&bob, "bee").await?,
+            "the next session did not carry the delete"
+        );
+        assert!(
+            deleted(&alice, "bee").await?,
+            "the peer's older entry replaced the delete"
+        );
+        for handle in [&alice, &bob] {
+            assert!(
+                held(handle, "ape").await?
+                    && held(handle, "bee/x").await?
+                    && held(handle, "cat").await?,
+                "the delete reached a neighbouring key"
+            );
+        }
+
+        drop((alice_session, bob_session));
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
+
     /// A session released the ordinary way is never counted as reclaimed,
     /// even when the actor's queue falls behind.
     ///
@@ -2222,10 +2339,10 @@ mod tests {
     /// registration whose handle is gone — and the counter that is supposed
     /// to separate a lost release from an ordinary one would count both.
     ///
-    /// Admitted instrument: the actor is parked by a subscriber that stops
-    /// draining its bounded channel, because a release has to sit in the
-    /// queue across a reclaim pass and nothing else in the API holds the
-    /// actor still for that long.
+    /// Admitted instrument: the actor is parked by a blocking subscriber — the
+    /// live actor's delivery — that stops draining its bounded channel,
+    /// because a release has to sit in the queue across a reclaim pass and
+    /// nothing else holds the actor still for that long.
     #[tokio::test]
     async fn an_ordinary_release_is_not_counted_as_reclaimed() -> Result<()> {
         let mut rng = rand::rng();
@@ -2236,10 +2353,10 @@ mod tests {
         let author = store.new_author(&mut rng)?.id();
         let handle = SyncHandle::spawn(store, None, None, None, "node".to_string());
         let ns = namespace.id();
-        handle.open(ns, OpenOpts::default().sync()).await?;
-
         let (events_tx, events_rx) = async_channel::bounded(1);
-        handle.subscribe(ns, events_tx).await?;
+        handle
+            .open(ns, OpenOpts::default().sync().subscribe(events_tx))
+            .await?;
 
         let write = |key: &'static str| {
             let handle = handle.clone();
