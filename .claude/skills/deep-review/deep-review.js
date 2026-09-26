@@ -8,6 +8,7 @@ export const meta = {
     { title: 'Triage', detail: 'merge duplicate mechanisms, rank' },
     { title: 'Verify', detail: 'an attempt to refute each mechanism, critical first' },
     { title: 'Gaps', detail: 'what stayed uncovered' },
+    { title: 'Proposals', detail: 'each surviving finding against the open changes' },
   ],
 }
 
@@ -20,6 +21,7 @@ export const meta = {
 //   files      string[]            changed files, repo-relative
 //   intentDir  string | undefined  the active change's artifacts, or absent
 //   groups     [{name, files}]     file groups the splittable angles fan over
+//   openChanges string[]           open change directories other than the intent
 //
 // A JSON-encoded string here is the one input mistake that costs a whole run:
 // it reaches the script as a string and the first `.join` throws before any
@@ -162,6 +164,28 @@ const VERDICT_SCHEMA = {
   },
 }
 
+// A finding an open change already describes is not the review's to report;
+// one it extends is reported as an addition to that change.
+const PROPOSALS_SCHEMA = {
+  type: 'object',
+  required: ['matches'],
+  properties: {
+    matches: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['index', 'coverage'],
+        properties: {
+          index: { type: 'integer' },
+          change: { type: 'string' },
+          coverage: { type: 'string', enum: ['covered', 'extends', 'none'] },
+          missing: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
 const LANG = A.language
   ? `\n\nWrite every prose field of your answer in ${A.language}. Identifiers, paths, and type names stay exactly as they are in the code. Never translate these domain terms: capability, connection metadata store / CMS, private metadata store / PMS, claim, lock, race, identity, audience, connection, binder, session, snapshot, ingress, egress.`
   : ''
@@ -182,7 +206,7 @@ phase('Search')
 const searched = await parallel(
   LENSES.map((lens) => () =>
     agent(
-      `${BASE}\n\nMap of the change:\n${map}\n\nYour angle is ${lens.key}. ${lens.prompt}\n\nReturn at most 5 findings, each with a mechanism you traced through the sources yourself. Do not return a guess with no line of code behind it. Five is a ceiling, not a target: return a finding only if you would advise a human to spend an hour of their working day on it, and return two rather than pad to five. What clears the bar — a wrong answer under some input, data that crosses where it must not, a resource that grows without bound, an invariant a future edit will break unknowingly, a test that would pass with the mechanism removed. What does not, unless it causes one of those — naming, phrasing, a comment, an import, a shape you would have written differently.\n\nFor each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: product — a host calling the public surface of pdn-node triggers it under some operating condition; network — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; internal — neither; n/a — not a defect in behaviour at all: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path: the public operation and the condition, the input a modified node sends, or why neither reaches it. In evidence, say what you actually checked it with — reading the code, running a test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). Then a recommendation: which option and why, or — where the fork needs a human decision — exactly which question is in front of them.`,
+      `${BASE}\n\nMap of the change:\n${map}\n\nYour angle is ${lens.key}. ${lens.prompt}\n\nReturn at most 5 findings, each with a mechanism you traced through the sources yourself. Do not return a guess with no line of code behind it. Five is a ceiling, not a target: return a finding only if you would advise a human to spend an hour of their working day on it, and return two rather than pad to five. What clears the bar — a wrong answer under some input, data that crosses where it must not, a resource that grows without bound, an invariant a future edit will break unknowingly, a test that would pass with the mechanism removed. What does not, unless it causes one of those — naming, phrasing, a comment, an import, a shape you would have written differently.\n\nFor each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: product — a host calling the public surface of pdn-node triggers it under some operating condition; network — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; internal — neither; n/a — not a defect in behaviour at all: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path: the public operation and the condition, the input a modified node sends, or why neither reaches it. In evidence, say what you actually checked it with — reading the code, running a test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). When the fix lies far outside the scope of the change under review, one of the options is moving the finding into a draft proposal: a new change holding only proposal.md with the case, its example and the options it opens, taking no decision among them. Then a recommendation: which option and why, weighed by mia-docs/openspec/specs/code-practices/decision-priorities.md, or — where the fork needs a human decision — exactly which question is in front of them.`,
       { label: `search:${lens.key}`, phase: 'Search', schema: CLAIM_SCHEMA, effort: lens.effort },
     ),
   ),
@@ -248,11 +272,25 @@ const results = await pipeline(
   },
 )
 
-phase('Gaps')
 const all = results.filter(Boolean)
-const gaps = await agent(
-  `${BASE}\n\nMap:\n${map}\n\nWhat was found:\n${JSON.stringify(all.map((f) => ({ t: f.title, f: f.file, s: f.severity })))}\n\nWhat stayed uncovered? Name: which file or seam of the diff nobody read; which finding went unverified; which subject was asking to be examined and was not; which property of the change cannot be confirmed without a run that was never made. Speak in subjects and seams ("concurrency was not examined", "no one read tables.rs"), never in agents, angles, or votes — this text reaches the reader. Do not invent new findings — name gaps in coverage.`,
-  { label: 'gaps', phase: 'Gaps' },
-)
+const open = A.openChanges || []
+// Both need the whole verified set, so they share the barrier and run side by side.
+const [gaps, proposals] = await parallel([
+  () => {
+    phase('Gaps')
+    return agent(
+      `${BASE}\n\nMap:\n${map}\n\nWhat was found:\n${JSON.stringify(all.map((f) => ({ t: f.title, f: f.file, s: f.severity })))}\n\nWhat stayed uncovered? Name: which file or seam of the diff nobody read; which finding went unverified; which subject was asking to be examined and was not; which property of the change cannot be confirmed without a run that was never made. Speak in subjects and seams ("concurrency was not examined", "no one read tables.rs"), never in agents, angles, or votes — this text reaches the reader. Do not invent new findings — name gaps in coverage.`,
+      { label: 'gaps', phase: 'Gaps' },
+    )
+  },
+  () => {
+    if (!open.length || !all.length) return Promise.resolve({ matches: [] })
+    phase('Proposals')
+    return agent(
+      `${BASE}\n\nThese changes are open under mia-docs/openspec/changes/, each a decision not yet taken or not yet built: ${open.join(', ')}. For every finding below, decide whether one of them already holds it. Read each change's proposal.md, and its design.md, tasks.md and specs/ where they exist.\n\nReturn per finding: its index; change — the directory name of the open change whose subject the finding falls under, absent when none does; coverage — covered when that change already describes this very case, the same mechanism under the same trigger, so the finding adds nothing to it; extends when the change is about this subject but lacks this case — a trigger, a party, a path, an operating condition, an option it does not name; none when no open change is about it. For extends, missing: what exactly the change lacks, in one or two sentences a person can paste into it as a case. A change that merely touches the same file or names the same function is not coverage: the question is whether its text describes this case. When torn between covered and extends, answer extends — a case dropped because a proposal seemed to hold it is lost, while a duplicate costs one reading.\n\nFindings:\n${JSON.stringify(all.map((f, index) => ({ index, title: f.title, at: `${f.file}:${f.line}`, symptom: f.symptom, cause: f.cause })))}`,
+      { label: 'proposals', phase: 'Proposals', schema: PROPOSALS_SCHEMA },
+    )
+  },
+])
 
-return { map, findings: all, gaps, lenses: LENSES.map((l) => l.key) }
+return { map, findings: all, gaps, proposals: (proposals && proposals.matches) || [], lenses: LENSES.map((l) => l.key) }

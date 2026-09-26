@@ -2,7 +2,7 @@
 
 These prompts are fixed by the skill. Copy them into `spawn_agent` verbatim, substituting the bracketed placeholders, and do not re-author them for the occasion: a prompt rewritten each run drifts, and the subject it names stops being the subject that was measured. Where a placeholder has no value, use the fallback wording given for it rather than deleting the sentence.
 
-Placeholders: `[DIFF_PATHS]` the scratch dumps; `[FILES]` the changed files, repo-relative; `[SCRATCH]` the scratch directory; `[CONTEXT]` the user's own words; `[LANGUAGE]` the review language; `[MAP]` the map paragraph; `[INTENT_DIR]` the active change's directory; `[GROUP]` a file group for a splittable angle.
+Placeholders: `[OPEN_CHANGES]` the open change directories other than the intent; `[DIFF_PATHS]` the scratch dumps; `[FILES]` the changed files, repo-relative; `[SCRATCH]` the scratch directory; `[CONTEXT]` the user's own words; `[LANGUAGE]` the review language; `[MAP]` the map paragraph; `[INTENT_DIR]` the active change's directory; `[GROUP]` a file group for a splittable angle.
 
 Every spawned agent is given `fork_turns: "none"`. It inherits no context, so everything it needs is in the message — that is what keeps the angles independent and blind to each other.
 
@@ -50,7 +50,7 @@ Your angle is [ANGLE KEY]. [ANGLE PROMPT]
 
 Return at most 5 findings, each with a mechanism you traced through the sources yourself. Do not return a guess with no line of code behind it. Five is a ceiling, not a target: return a finding only if you would advise a human to spend an hour of their working day on it, and return two rather than pad to five. What clears the bar — a wrong answer under some input, data that crosses where it must not, a resource that grows without bound, an invariant a future edit will break unknowingly, a test that would pass with the mechanism removed. What does not, unless it causes one of those — naming, phrasing, a comment, an import, a shape you would have written differently.
 
-For each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: `product` — a host calling the public surface of pdn-node triggers it under some operating condition; `network` — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; `internal` — neither; `n/a` — not a defect in behaviour at all: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path behind the word: the public operation and the condition, the input a modified node sends, or why neither reaches it. In `evidence`, say what you actually checked it with — reading the code, running a named test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). Then a recommendation: which option and why, or — where the fork needs a human decision — exactly which question is in front of them.
+For each finding fill in: how it shows up (symptom and exact trigger), what causes it (the mechanism through the code, with lines), who suffers. Then its reach, per mia-docs/openspec/specs/code-practices/defect-reachability.md: `product` — a host calling the public surface of pdn-node triggers it under some operating condition; `network` — a modified node, through what it sends, turns it into unauthorized access or a denial of service for honest nodes; `internal` — neither; `n/a` — not a defect in behaviour at all: a violation of a repository rule, or a spec promising more than code that does what is intended. The symptom names the path behind the word: the public operation and the condition, the input a modified node sends, or why neither reaches it. In `evidence`, say what you actually checked it with — reading the code, running a named test, a probe — and if it was not checked, say so plainly. Then the ways to fix it — one or more, and for each separately: what to do and the size of the edit, the consequences for the product (what changes in the scenarios, what becomes impossible), and the consequences for the architecture (which new constraint it introduces, which invariant appears or hardens, what cannot be done afterwards; if none, write that it introduces none). When the fix lies far outside the scope of the change under review, one of the options is moving the finding into a draft proposal: a new change holding only proposal.md with the case, its example and the options it opens, taking no decision among them. Then a recommendation: which option and why, weighed by mia-docs/openspec/specs/code-practices/decision-priorities.md, or — where the fork needs a human decision — exactly which question is in front of them.
 
 Write your answer to [SCRATCH]/findings-[ANGLE KEY].json before you return it, as one JSON object, and return the same JSON as your final answer:
 
@@ -139,4 +139,23 @@ What was found:
 [TITLE, FILE, SEVERITY per surviving finding]
 
 What stayed uncovered? Name: which file or seam of the diff nobody read; which finding went unverified; which subject was asking to be examined and was not; which property of the change cannot be confirmed without a run that was never made. Speak in subjects and seams ("concurrency was not examined", "no one read tables.rs"), never in agents, angles, or votes — this text reaches the reader. Do not invent new findings — name gaps in coverage. Write your answer to [SCRATCH]/gaps.md and return it.
+```
+
+## Open proposals
+
+One agent, spawned beside the gap sweep once verification is done, only when there is an open change.
+
+```
+[COMMON PREAMBLE]
+
+These changes are open under mia-docs/openspec/changes/, each a decision not yet taken or not yet built: [OPEN_CHANGES]. For every finding below, decide whether one of them already holds it. Read each change's proposal.md, and its design.md, tasks.md and specs/ where they exist.
+
+Return per finding: its index; change — the directory name of the open change whose subject the finding falls under, absent when none does; coverage — covered when that change already describes this very case, the same mechanism under the same trigger, so the finding adds nothing to it; extends when the change is about this subject but lacks this case — a trigger, a party, a path, an operating condition, an option it does not name; none when no open change is about it. For extends, missing: what exactly the change lacks, in one or two sentences a person can paste into it as a case. A change that merely touches the same file or names the same function is not coverage: the question is whether its text describes this case. When torn between covered and extends, answer extends — a case dropped because a proposal seemed to hold it is lost, while a duplicate costs one reading.
+
+Findings:
+[INDEX, TITLE, FILE:LINE, SYMPTOM, CAUSE per surviving finding]
+
+Write your answer to [SCRATCH]/proposals.json and return the same JSON:
+
+{"matches": [{"index": int, "change": str, "coverage": "covered"|"extends"|"none", "missing": str}]}
 ```
