@@ -41,6 +41,17 @@ pub(crate) fn spawn_retraction_consumer(
             };
             let guard = strong.lock().await;
             record_verdict(&guard, &verdict, decided_by).await;
+            // The verdicts queued by now go under the same lock, so the
+            // armer's next sweep takes all their markers at once. Only
+            // those: an entry not yet retracted is refused again on every
+            // session, and draining until empty would never let the sweep
+            // that retracts it take the lock.
+            for _ in 0..verdicts.len() {
+                let Ok(verdict) = verdicts.try_recv() else {
+                    break;
+                };
+                record_verdict(&guard, &verdict, decided_by).await;
+            }
         }
     });
 }
