@@ -1753,7 +1753,9 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
 /// than its unread subscription buffers, and every one becomes readable.
 ///
 /// Six hundred entries of distinct content: each emits an insert and a
-/// content event, and a subscription buffers 256 of each.
+/// content event, and a subscription buffers 256 of each. The importing node
+/// asks for a session every two seconds while it waits, as a reconcile pass
+/// does: a download that fails is retried only on a later session.
 #[tokio::test]
 async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
     const ENTRIES: usize = 600;
@@ -1766,6 +1768,7 @@ async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
     let ticket = doc0
         .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
+    let writer = util::contacts(ticket.nodes.clone());
     let doc1 = clients[1].docs().import(ticket).await?;
     let _unread = doc1.subscribe().await?;
 
@@ -1774,7 +1777,7 @@ async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
             .await?;
     }
     let blobs1 = clients[1].blobs();
-    tokio::time::timeout(TIMEOUT, async {
+    let taken_in = async {
         for n in 0..ENTRIES {
             let key = format!("k{n:04}");
             let value = format!("v{n:04}");
@@ -1787,9 +1790,42 @@ async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    };
+    let asking = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _next_pass = doc1.start_sync(writer.clone(), util::TEST_HOLDER).await;
+        }
+    };
+    let waited = tokio::time::timeout(TIMEOUT, async {
+        tokio::select! {
+            () = taken_in => {}
+            () = asking => {}
+        }
     })
-    .await
-    .context("the importing node stopped taking in entries past its unread subscription")?;
+    .await;
+    if waited.is_err() {
+        let counted = tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut entries, mut readable) = (0, 0);
+            for n in 0..ENTRIES {
+                let key = format!("k{n:04}");
+                if get_latest(blobs1, &doc1, key.as_bytes()).await.is_ok() {
+                    (entries, readable) = (entries + 1, readable + 1);
+                } else if doc1.get_exact(author0, key, false).await?.is_some() {
+                    entries += 1;
+                }
+            }
+            anyhow::Ok((entries, readable))
+        })
+        .await;
+        match counted {
+            Ok(Ok((entries, readable))) => bail!(
+                "the importing node stopped taking in entries past its unread subscription: \
+                 {entries} of {ENTRIES} entries, {readable} readable"
+            ),
+            _ => bail!("the importing node's store stopped answering"),
+        }
+    }
 
     for node in nodes {
         node.shutdown().await?;
