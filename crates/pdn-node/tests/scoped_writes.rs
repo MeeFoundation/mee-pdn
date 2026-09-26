@@ -501,21 +501,14 @@ async fn a_withdrawal_over_many_markers_leaves_the_runtime_serving() -> Result<(
             .write_unguarded(alice, bob, &path, b"forced")
             .await?;
     }
-    // Every marker that lands sweeps all markers recorded before it, so the
-    // four hundred take about 20 s here and several times that on a loaded
-    // runner.
-    let deadline = tokio::time::Instant::now() + TIMEOUT * 4;
-    loop {
-        let markers = rt_alice.sync().retraction_markers(alice).await?;
-        if markers.iter().filter(|(issuer, _)| *issuer == bob).count() >= MARKERS {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Bob's gate did not refuse every forced write"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    assert!(
+        eventually(|| async {
+            let markers = rt_alice.sync().retraction_markers(alice).await?;
+            Ok(markers.iter().filter(|(issuer, _)| *issuer == bob).count() >= MARKERS)
+        })
+        .await?,
+        "Bob's gate did not refuse every forced write"
+    );
 
     rt_bob.connections().withdraw_grant(bob, alice, bob).await?;
     assert!(

@@ -128,9 +128,11 @@ fn now_micros() -> u64 {
 }
 
 /// One marker sweep: age out this device's stale markers, then arm and
-/// remove for every readable marker. Idempotent, so it runs on every
-/// directory change and every grant-binder sweep — whichever of the marker
-/// and the namespace binding arrives second, the sweep after it acts.
+/// remove for every readable marker version not applied yet. Idempotent, so
+/// it runs on every directory change and every grant-binder sweep —
+/// whichever of the marker and the namespace binding arrives second, the
+/// sweep after it acts. A version is applied once, its payload read and its
+/// removal run then; a disarm forgets it.
 pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
     let Ok(hosted) = state.hosted(identity) else {
         return;
@@ -146,27 +148,51 @@ pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
                 .disarm_retraction(identity, issuer, author, path.as_bytes());
         }
     }
-    let Ok(markers) = hosted.directory.list_retractions().await else {
+    let Ok(heads) = hosted.directory.list_retraction_heads().await else {
         return;
     };
-    for (issuer, author, path, marker) in markers {
+    for head in heads {
+        let key = head.path.as_bytes();
         // An unbound issuer stays cold until the binder's sweep re-runs this.
+        if !matches!(
+            state
+                .node
+                .retraction_applied(identity, head.issuer, head.author, key, head.marker),
+            Ok(Some(false))
+        ) {
+            continue;
+        }
+        let Ok(Some(marker)) = hosted.directory.read_retraction(&head).await else {
+            continue;
+        };
         if state
             .node
             .arm_retraction(
                 identity,
-                issuer,
-                author,
-                path.clone().into_bytes(),
+                head.issuer,
+                head.author,
+                key.to_vec(),
                 marker.bound,
             )
             .is_err()
         {
             continue;
         }
-        let _already_gone = state
+        // Marked only once the removal went through, so a failed one is
+        // retried by the next sweep.
+        if state
             .node
-            .retract_entry(identity, issuer, author, path.as_bytes(), marker.bound)
-            .await;
+            .retract_entry(identity, head.issuer, head.author, key, marker.bound)
+            .await
+            .is_ok()
+        {
+            let _unbound = state.node.mark_retraction_applied(
+                identity,
+                head.issuer,
+                head.author,
+                key,
+                head.marker,
+            );
+        }
     }
 }

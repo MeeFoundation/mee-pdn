@@ -181,6 +181,16 @@ fn retraction_of(key: &[u8]) -> Option<(PdnId, AuthorId, String)> {
 /// decoded marker.
 pub type ListedRetraction = (PdnId, AuthorId, String, RetractionMarker);
 
+/// A marker as its entry lists it, payload unread: `marker` is the entry's
+/// content hash, which names the version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetractionHead {
+    pub issuer: PdnId,
+    pub author: AuthorId,
+    pub path: String,
+    pub marker: [u8; 32],
+}
+
 /// The payload of a retraction marker; the addressed entry lives in the
 /// key. JSON; a payload this build cannot decode reads as no marker
 /// (fail-closed: nothing is removed on its word).
@@ -487,28 +497,43 @@ impl PrivateMetadataStore {
     /// The recorded markers whose payload is readable; an undecodable
     /// payload is skipped (fail-closed).
     pub async fn list_retractions(&self) -> Result<Vec<ListedRetraction>> {
-        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
-        let mut keys = Vec::new();
-        {
-            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-            while let Some(entry) = stream.next().await {
-                if let Some(parsed) = retraction_of(entry?.key()) {
-                    keys.push(parsed);
-                }
+        let mut markers = Vec::new();
+        for head in self.list_retraction_heads().await? {
+            if let Some(marker) = self.read_retraction(&head).await? {
+                markers.push((head.issuer, head.author, head.path, marker));
             }
         }
-        let mut markers = Vec::new();
-        for (issuer, author, path) in keys {
-            let key = retraction_key(&issuer, &author, &path);
-            let Some(bytes) = read_payload(&self.doc, &self.blobs, key.as_bytes()).await? else {
-                continue;
-            };
-            let Ok(marker) = serde_json::from_slice::<RetractionMarker>(&bytes) else {
-                continue;
-            };
-            markers.push((issuer, author, path, marker));
-        }
         Ok(markers)
+    }
+
+    /// The recorded markers from their entries alone, no payload read.
+    pub async fn list_retraction_heads(&self) -> Result<Vec<RetractionHead>> {
+        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut heads = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            if let Some((issuer, author, path)) = retraction_of(entry.key()) {
+                heads.push(RetractionHead {
+                    issuer,
+                    author,
+                    path,
+                    marker: *entry.content_hash().as_bytes(),
+                });
+            }
+        }
+        Ok(heads)
+    }
+
+    /// The version `head` names; `None` while its payload has not arrived or
+    /// when it does not decode (fail-closed).
+    pub async fn read_retraction(&self, head: &RetractionHead) -> Result<Option<RetractionMarker>> {
+        let hash = iroh_blobs::Hash::from_bytes(head.marker);
+        if !self.blobs.has(hash).await? {
+            return Ok(None);
+        }
+        let bytes = self.blobs.get_bytes(hash).await?;
+        Ok(serde_json::from_slice::<RetractionMarker>(&bytes).ok())
     }
 
     /// Drop every marker this device recorded for `issuer` — with the

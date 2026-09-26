@@ -1308,6 +1308,48 @@ impl SyncNode {
         stack.access.arm_retraction(doc.id(), author, key, bound)
     }
 
+    /// Whether `marker`'s version is armed on `issuer`'s replica and its
+    /// removal ran. `None` when the issuer resolves to no replica here.
+    pub fn retraction_applied(
+        &self,
+        identity: PdnId,
+        issuer: PdnId,
+        author: AuthorId,
+        key: &[u8],
+        marker: [u8; 32],
+    ) -> Result<Option<bool>> {
+        let Some(stack) = self.stack(identity)? else {
+            return Ok(None);
+        };
+        let Some(doc) = stack.registry.data_doc(issuer)? else {
+            return Ok(None);
+        };
+        stack
+            .access
+            .retraction_applied(doc.id(), author, key, marker)
+            .map(Some)
+    }
+
+    /// Record that `marker`'s removal ran after its arming, so a sweep
+    /// skips it until a disarm.
+    pub fn mark_retraction_applied(
+        &self,
+        identity: PdnId,
+        issuer: PdnId,
+        author: AuthorId,
+        key: &[u8],
+        marker: [u8; 32],
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = stack
+            .registry
+            .data_doc(issuer)?
+            .ok_or(UnknownIssuer { issuer })?;
+        stack
+            .access
+            .mark_retraction_applied(doc.id(), author, key, marker)
+    }
+
     /// Whether this identity holds exactly the entry `verdict` names —
     /// author, key, timestamp, content hash. A verdict's fields are the
     /// refusing peer's word and retraction is destructive; a version a
