@@ -33,9 +33,10 @@ Run everything from the repository root. No absolute paths — the command works
 3. Write the dumps to the scratchpad (`<scratchpad>/wip-diff-<repo>.patch`, untracked content beside). Agents read them from disk — a large diff passed through prompts eats the context before the work starts.
 4. Note the size (files, `+N/-M`) to size the fan-out by. It does not go into the final file.
 5. Find the **intent**: an active change under `mia-docs/openspec/changes/*/` whose `proposal.md` / `design.md` / `tasks.md` covers the touched files. Found — its path goes to the "intent" angle; none — that angle runs on the main spec tree alone and the missing half is recorded under "Not covered". Note whether the artifacts are themselves uncommitted: then both sides are in flight, and a divergence can as easily be a spec that drifted as code that did.
-6. Invent a `topic` — a short English kebab-case slug (`session-snapshot-egress`, `scoped-grants-binder`).
-7. Two timestamps in one call: `date +"%Y-%m-%d_%H-%M"` for the file name, `date +%s` for **T0, the budget clock** (§2a). T0 is taken here, at the start of collecting — not when the `Workflow` call returns: everything before the fan-out is on the clock too.
-8. **No builds, tests, or lints — not here, not in any agent.** No `just check` / `just fix` / bare `just test`, no `cargo build` / `check` / `clippy` / `fmt`. Whether the tree compiles and passes is established by the implementer and again by CI on push; a review re-establishing it spends minutes on an answer two other places already report. The single exception is a targeted run producing evidence about one specific finding — §2, "What an agent may and may not run".
+6. List the **open changes**: every directory under `mia-docs/openspec/changes/` except `archive/` and the intent change of step 5. They go to the open-proposals check (§2) — a finding one of them already describes is not reported, and one it lacks is reported as an addition to it.
+7. Invent a `topic` — a short English kebab-case slug (`session-snapshot-egress`, `scoped-grants-binder`).
+8. Two timestamps in one call: `date +"%Y-%m-%d_%H-%M"` for the file name, `date +%s` for **T0, the budget clock** (§2a). T0 is taken here, at the start of collecting — not when the `Workflow` call returns: everything before the fan-out is on the clock too.
+9. **No builds, tests, or lints — not here, not in any agent.** No `just check` / `just fix` / bare `just test`, no `cargo build` / `check` / `clippy` / `fmt`. Whether the tree compiles and passes is established by the implementer and again by CI on push; a review re-establishing it spends minutes on an answer two other places already report. The single exception is a targeted run producing evidence about one specific finding — §2, "What an agent may and may not run".
 
 **Fix nothing, and run no state-changing git operations.** Per [CLAUDE.md](../../../CLAUDE.md) every `commit` / `add` / `checkout` / `stash` is done by a human, in all three repositories. The only write this command performs is the review file.
 
@@ -77,9 +78,11 @@ Each angle is its own agent, blind to the others. The eleven subjects are fixed 
 10. **gaps** — what the change forgot: observability, rollback, compatibility with written data and older peers, error paths, spec updates.
 11. **operating conditions** — the change against `code-practices/operating-conditions.md`, condition by condition; "this condition does not change the outcome" is a legitimate answer, but a stated one, never an implied one.
 
-Each angle's prompt carries: the dump paths, the file list, the map from the "Map" phase, the **verbatim context from `$ARGUMENTS`**, the execution rules (§1 step 8 and "What an agent may and may not run"), and the requirement to read the sources around the diff, not the diff alone.
+Each angle's prompt carries: the dump paths, the file list, the map from the "Map" phase, the **verbatim context from `$ARGUMENTS`**, the execution rules (§1 step 9 and "What an agent may and may not run"), and the requirement to read the sources around the diff, not the diff alone.
 
-**An angle returns whole findings, fixes included** — the mechanism, then fix options with product and architecture consequences separately, then a recommendation. Writing fixes on candidates that triage will merge and verification will kill is real waste, paid deliberately: fixes staged behind verification sit behind two barriers, and an early finalize then returns mechanisms with no fixes at all — measured, on all fourteen findings of the run that tried it. An unverified finding that says what to do about it is still worth reading; stripped of fixes it is a note to self.
+**An angle returns whole findings, fixes included** — the mechanism, then fix options with product and architecture consequences separately, then a recommendation weighed by `code-practices/decision-priorities.md`. Writing fixes on candidates that triage will merge and verification will kill is real waste, paid deliberately: fixes staged behind verification sit behind two barriers, and an early finalize then returns mechanisms with no fixes at all — measured, on all fourteen findings of the run that tried it. An unverified finding that says what to do about it is still worth reading; stripped of fixes it is a note to self.
+
+**A fix far outside the scope of the reviewed change is offered as its own option: move the finding into a draft proposal.** When closing a finding means work on a subject the change does not touch — the change removes prefix semantics from `pdn-store`, the finding is about clocks disagreeing between nodes — one of its options is a new change holding only a `proposal.md` with the case, its example and the options it opens, and taking no decision among them. The recommendation weighs it like any other option.
 
 **At most 5 findings per angle, each with a mechanism the agent traced through the sources itself and is prepared to defend.** A guess with no line of code behind it is not returned.
 
@@ -114,6 +117,14 @@ A verifier is asked to **refute** a finding, not confirm it, and leans "refuted"
 
 A verifier opens the sources and cites lines. **A verifier that sharpens a finding is doing its job**: where the mechanism holds but the wording overreaches, the correction goes in `corrections` and is applied in §3 — the three best findings of one run were all narrowed this way. Changing files in the working tree is **forbidden**.
 
+### Open proposals — beside the gap sweep
+
+**A finding an open change already describes is not this review's to report.** An open change is a decision taken but not built, or one deliberately left for later — `mia-docs/openspec/changes/*/` outside `archive/`, the change under review excepted. Reporting its case again sends a person to re-decide what is already on someone's table; missing the case it lacks leaves that change to be decided without it.
+
+One agent, after verification and beside the gap sweep — both need the verified set whole, so they share that barrier and cost no wall clock of their own. It reads every open change's `proposal.md`, and its `design.md`, `tasks.md` and `specs/` where they exist, and returns, per surviving finding, the change whose subject it falls under and one of three words: `covered` — the change already describes this very case, same mechanism under the same trigger; `extends` — the change is about this subject and lacks this case: a trigger, a party, a path, an operating condition, an option it does not name — with `missing`, what exactly to add; `none` — no open change is about it. A change that merely touches the same file is not coverage. **In doubt between `covered` and `extends`, it answers `extends`**: a case dropped because a proposal seemed to hold it is lost for good, a duplicate costs one reading. With no open change the check does not run.
+
+The change under review is never an open change here: findings against it are the review's own, and the intent angle measures them.
+
 ### What an agent may and may not run
 
 **The expectation first, because the prohibition below has been read as covering everything, and it does not:** an agent whose verdict turns on whether a path is reachable or a test vacuous **is expected to run the one named test that settles it** — not to consider running it. Three consecutive runs executed nothing and rested every finding on reading; the one run that executed produced the best-founded finding any of them carry — a panic reproduced twice, with the backtrace, plus a mutation that correctly reattributed it to upstream.
@@ -142,12 +153,13 @@ Workflow({ scriptPath: '.claude/skills/deep-review/deep-review.js', args: { … 
 | `files`     | string[]                   | Changed files, repo-relative.                                              |
 | `intentDir` | string, optional           | The active change's artifacts from §1 step 5. Absent when there is none, and the "intent" angle is told so rather than left to guess. |
 | `groups`    | `[{name, files}]`, optional | File groups the two splittable angles fan over. Absent means one group covering everything. |
+| `openChanges` | string[], optional       | The open change directories from §1 step 6. Absent or empty, the open-proposals check does not run. |
 
 The subjects and their prompts live in the script because they are fixed by this command, and re-authoring them per run is how they drift. The caller decides the file grouping — and only that.
 
 **The prose here is the policy; the file is the only implementation.** No fragment of the script is reproduced in this document — the markdown copy was both at once until it was extracted, which is exactly how the two came apart. Where a rule here and the file disagree, the file is what ran.
 
-Three properties worth knowing without opening it: **exactly two barriers** — triage and the gap sweep each need the whole set in front of them, and verification between them is a pipeline, so one mechanism's votes are cast while another's are still out; **mechanisms enter it sorted by severity**, so the deadline cuts the tail; **the splittable angles fan over `args.groups`**, merging groups down (and logging the merge) rather than dropping any when the fan would breach the 14-agent ceiling — a dropped group is a file nobody read, and silence about that reads afterwards as coverage.
+Three properties worth knowing without opening it: **exactly two barriers** — triage and the gap sweep each need the whole set in front of them, the open-proposals check sharing the second, and verification between them is a pipeline, so one mechanism's votes are cast while another's are still out; **mechanisms enter it sorted by severity**, so the deadline cuts the tail; **the splittable angles fan over `args.groups`**, merging groups down (and logging the merge) rather than dropping any when the fan would breach the 14-agent ceiling — a dropped group is a file nobody read, and silence about that reads afterwards as coverage.
 
 Both extracted artifacts are checkable without a run, and are checked when either is edited: `node --check .claude/skills/deep-review/deep-review.js` and `python3 -m py_compile .claude/skills/deep-review/deep-review-progress.py`.
 
@@ -157,7 +169,7 @@ The workflow runs in the background. Do not poll it by hand — arm the heartbea
 
 The run takes up to fifty minutes and says nothing while it works, so arm a `Monitor` immediately after the `Workflow` call returns — every stdout line becomes a notification. **It is also the run's only clock** (§2a): it carries the budget as well as the counters, and it is what ends the run at T0 + 50.
 
-Elapsed time is computed **from T0** (§1 step 7), not from when the monitor was armed — the gap is the diff collection and the intent hunt, real time the user waited, which a monitor-relative clock would silently forgive.
+Elapsed time is computed **from T0** (§1 step 8), not from when the monitor was armed — the gap is the diff collection and the intent hunt, real time the user waited, which a monitor-relative clock would silently forgive.
 
 The counters come from `journal.jsonl` (path in the `Workflow` result). **Count the phases apart, and never take `"type":"started"` for a denominator** — that line is written when an agent gets a concurrency slot, not when the script asks for it, so everything queued behind the cap is missing from it: one journal showed 29 started verifiers on a run holding 176. Count `"type":"result"` lines instead, and tell the phases apart by the result's shape: `findings` — a search angle; `groups` — triage; `state` — a verifier; a bare string — the map or the gap sweep. The search denominator is the number of angles, known up front. **The verify denominator is derived, not observed**: before triage it is findings × votes (5 critical, 3 medium/structural, 0 cleanup) — an upper bound wearing a trailing `+`; after triage it is the merged groups, exact.
 
@@ -166,7 +178,7 @@ Both the counting and the deadline live in [`deep-review-progress.py`](deep-revi
 ```bash
 D=<transcriptDir>                 # from the Workflow result
 NL=<number of search angles>      # 9 whole-change angles + the splittable fan: 11 with one file group, 13 with two or more
-T0=<epoch seconds>                # from §1 step 7, `date +%s`
+T0=<epoch seconds>                # from §1 step 8, `date +%s`
 END=$((SECONDS + 3900))
 while [ $SECONDS -lt $END ]; do
   python3 -I .claude/skills/deep-review/deep-review-progress.py "$D" "$NL" "$T0" 3000
@@ -205,7 +217,8 @@ The flag is honoured whether the run is still going or was stopped earlier.
 4. **Consolidate per §3, with one change: a finding's verdict is whatever its returned votes say.** Two of three back, both confirming — `CONFIRMED`; a returned refuting majority — dropped.
 5. **A finding with no returned votes is `NOT VERIFIED`, never `CONFIRMED`.** It stays in the level its severity claims — not hidden, and not read as established: verification exists because plausible-looking findings die under it.
 6. **A finding keeps its angle's fixes, whatever the deadline did to its votes.** The one case that loses them is an angle that never returned at all — that subject is named under "Not covered" instead.
-7. **Write "Not covered" by hand.** An early finalize almost always means the gap sweep never ran (it sits behind the full-set barrier). Say that, and name: the findings that went unverified, the subjects nobody searched — as coverage holes ("concurrency was not examined"), never as agent bookkeeping — and that no gap sweep was performed. Nothing here is left to be inferred from silence.
+7. **Run the open-proposals check by hand when it never ran.** Read each open change's proposal against the findings you are about to write and apply §3 step 4 yourself — a cut run is not a licence to re-report what an open change holds.
+8. **Write "Not covered" by hand.** An early finalize almost always means the gap sweep never ran (it sits behind the full-set barrier). Say that, and name: the findings that went unverified, the subjects nobody searched — as coverage holes ("concurrency was not examined"), never as agent bookkeeping — and that no gap sweep was performed. Nothing here is left to be inferred from silence.
 
 **The header says it in one line and no more:** "Review cut at the 50-minute budget." — or "Review finalized early on request." The cost lands where it bites — the `NOT VERIFIED` marks and "Not covered" — and the reader neither infers the cut from the shape of the file nor reads a paragraph about it.
 
@@ -216,15 +229,16 @@ The flag is honoured whether the run is still going or was stopped earlier.
 1. **Drop the `REFUTED`; they do not enter the file.** A refuting majority kills; a split is `PLAUSIBLE` and stays.
 2. **Check the merge rather than redo it.** Catch what triage could not see: two groups the verdicts reveal as one mechanism, one group whose verifiers split because it was two. The same file and line with different mechanisms is not a duplicate — true in triage, true here.
 3. **Apply the `corrections`** from the verifiers — the sharpened wording goes into the file. A verifier's `reach` is a correction too; where verifiers disagree on it, the reach that obliges a fix stands, and the symptom is rewritten to name that path.
-4. **Strip the machinery from the prose.** Vote counts, angle names and counts, agent counts, phase names — none reaches the file: "найдено четырьмя углами" is how the run convinced itself; the reader is convinced by the mechanism and the lines. Exactly two traces survive, because they change what the reader does: the verdict word (`CONFIRMED` / `PLAUSIBLE` / `NOT VERIFIED` — trust it, weigh it, or verify it first) and the coverage holes under "Not covered".
-5. **Number them `F1..Fn`** in final order — most important first, numbering running through every section. A number is never reused: a closed finding leaves the file with its number, and the gap in the numbering is its only trace.
-6. **Sort into levels.** The order of sections is fixed:
+4. **Apply the open-proposals check.** A `covered` finding does not enter the file; the reply that hands the file over names each one in a line — its title and the change that holds it — so a wrong match can still be caught. An `extends` finding enters the file as an addition to that change: its title says which change it extends and with what case, its one fix is adding `missing` to the change through the update workflow — where in it (an open question, a decision, a scenario), in words — and the fixes that choose among that change's own options stay out, since choosing is that change's business. Its severity and reach stay what verification left them, and its fixing-order bullet reads as an addition, in the file's language: "extend change `<name>` with this case, since it lacks it: <missing>". A `none` finding is written as always.
+5. **Strip the machinery from the prose.** Vote counts, angle names and counts, agent counts, phase names — none reaches the file: "найдено четырьмя углами" is how the run convinced itself; the reader is convinced by the mechanism and the lines. Exactly two traces survive, because they change what the reader does: the verdict word (`CONFIRMED` / `PLAUSIBLE` / `NOT VERIFIED` — trust it, weigh it, or verify it first) and the coverage holes under "Not covered".
+6. **Number them `F1..Fn`** in final order — most important first, numbering running through every section. A number is never reused: a closed finding leaves the file with its number, and the gap in the numbering is its only trace.
+7. **Sort into levels.** The order of sections is fixed:
    - **Critical — correctness and security.** Data crossing between identities or namespaces; a capability or grant bypassed; a panic or a degradation of the whole node; data lost or corrupted.
    - **Medium — reliability and resources.** Leaks, unbounded growth, degradation under load, rare races. Mechanism confirmed, trigger conditional.
    - **Structural — altitude of the implementation.** An invariant held by convention rather than structure; an API easy to use wrongly; code and spec that have drifted apart.
    - **Cleanup and tests.** Duplication, vacuous tests, missing denials, violations of [CLAUDE.md](../../../CLAUDE.md). Behaviour unchanged.
-7. **Within a section**: `CONFIRMED` before `PLAUSIBLE`; ties by convergence (the kept found-by count), then by blast radius — how many parties are touched and how irreversibly. Convergence orders; it is never written.
-8. **Assemble a fixing order** — a route, not a copy of the findings list: what comes first, what is fixed in one pass together, which fix opens another finding (as a timeout opens a cancellation window), which fork needs a human decision, and which decision.
+8. **Within a section**: `CONFIRMED` before `PLAUSIBLE`; ties by convergence (the kept found-by count), then by blast radius — how many parties are touched and how irreversibly. Convergence orders; it is never written.
+9. **Assemble a fixing order** — a route, not a copy of the findings list: what comes first, what is fixed in one pass together, which fix opens another finding (as a timeout opens a cancellation window), which fork needs a human decision, and which decision.
 
    **A coupling shapes the route's structure, never only its prose.** Fixes for one sitting share one bullet; a prerequisite stands directly before its dependent — whatever their severities. Severity ranks the findings sections, dependencies rank the route, and the two orderings may disagree; a bullet carrying mixed severities says which, so the ranking stays legible. "Take together with F2" three items away from F2's own bullet has already lost the coupling — the route is worked top-down.
 
@@ -306,6 +320,36 @@ The template below is in English. When the review language is something else, th
 ## Not covered
 
 <From the gap sweep: which seam nobody read, which findings went unverified, which subject was not searched, what cannot be confirmed without a run that never happened. Everything the header no longer carries lands here: a repository looked at and found clean, an intent that could not be measured for want of a change document, whether the gap sweep itself ran. Coverage holes are named as subjects — "concurrency was not examined" — never as agent or vote bookkeeping. This section is mandatory — if there are no gaps, say that in one line.>
+````
+
+A finding that extends an open change (§3 step 4) keeps the same fields, with these differences:
+
+````markdown
+<a id="f3"></a>
+### F3 — change `<name>` lacks <the case>
+**File:** … · **CONFIRMED** · … · **Reach:** …
+
+**How it shows up:** <as always.>
+
+**What causes it:** <as always.>
+
+**What the change lacks:** <what `<name>` says about this subject, and the case it does not name.>
+
+**How to fix it:**
+
+- **Extend change `<name>`.** <What to add — the case, its example, the options it opens — and where: an open question, a decision, a scenario. Through the update workflow.>
+  - *For the product:* <nothing changes until the change is decided; what the case adds to that decision.>
+  - *For the architecture:* introduces no constraint.
+
+**Recommendation:** extend change `<name>` with this case, since it lacks it.
+````
+
+A finding whose fix lies far outside the reviewed change's scope carries this option beside the others:
+
+````markdown
+- **Move to a draft proposal `<suggested-name>`.** <A new change holding only `proposal.md`: the case, its example and the options it opens, with none of them chosen.>
+  - *For the product:* nothing changes until the proposal is decided.
+  - *For the architecture:* introduces no constraint.
 ````
 
 There is sometimes only one way to fix something — then there is one option, but the "what to do / for the product / for the architecture" structure stays. An option introducing no architectural constraint says so: "introduces no constraint".

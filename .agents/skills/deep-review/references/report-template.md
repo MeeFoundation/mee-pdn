@@ -70,6 +70,36 @@ The template below is in English. When the review language is something else, th
 <From the gap sweep: which seam nobody read, which findings went unverified, which subject was not searched, what cannot be confirmed without a run that never happened. Everything the header no longer carries lands here: a repository looked at and found clean, an intent that could not be measured for want of a change document, whether the gap sweep itself ran, and whether any mutation check was made — naming the findings that asked for one. Coverage holes are named as subjects — "concurrency was not examined" — never as agent or vote bookkeeping. This section is mandatory — if there are no gaps, say that in one line.>
 ````
 
+A finding that extends an open change (SKILL.md §3 step 4) keeps the same fields, with these differences:
+
+````markdown
+<a id="f3"></a>
+### F3 — change `<name>` lacks <the case>
+**File:** … · **CONFIRMED** · … · **Reach:** …
+
+**How it shows up:** <as always.>
+
+**What causes it:** <as always.>
+
+**What the change lacks:** <what `<name>` says about this subject, and the case it does not name.>
+
+**How to fix it:**
+
+- **Extend change `<name>`.** <What to add — the case, its example, the options it opens — and where: an open question, a decision, a scenario. Through the update workflow.>
+  - *For the product:* <nothing changes until the change is decided; what the case adds to that decision.>
+  - *For the architecture:* introduces no constraint.
+
+**Recommendation:** extend change `<name>` with this case, since it lacks it.
+````
+
+A finding whose fix lies far outside the reviewed change's scope carries this option beside the others:
+
+````markdown
+- **Move to a draft proposal `<suggested-name>`.** <A new change holding only `proposal.md`: the case, its example and the options it opens, with none of them chosen.>
+  - *For the product:* nothing changes until the proposal is decided.
+  - *For the architecture:* introduces no constraint.
+````
+
 There is sometimes only one way to fix something — then there is one option, but the "what to do / for the product / for the architecture" structure stays. An option introducing no architectural constraint says so: "introduces no constraint".
 
 ## Rules for the text

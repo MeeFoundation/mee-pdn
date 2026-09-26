@@ -15,6 +15,7 @@ Phases are told apart by the shape of the result field:
     {"findings": [...]}  a search angle
     {"groups":   [...]}  triage
     {"state":     ...}   a verifier
+    {"matches":  [...]}  the open-proposals check, not counted
     a bare string        the map or the gap sweep
 """
 
