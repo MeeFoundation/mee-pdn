@@ -417,7 +417,9 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
 /// than its unread subscription buffers, reads them all, and still writes
 /// and lists, while the subscription reports the changes it dropped.
 ///
-/// Six hundred records: a subscription buffers around 320 events.
+/// Six hundred records: a subscription buffers around 320 events. Each probe
+/// waits the whole budget: the store stopping for good is what it catches,
+/// and a loaded runner holds one call for seconds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
     const RECORDS: u16 = 600;
@@ -443,26 +445,21 @@ async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
     }
     assert!(
         eventually(|| async {
-            let listed =
-                tokio::time::timeout(Duration::from_secs(5), laptop_dir.list_connections())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("the laptop's store stopped answering"))??;
+            let listed = tokio::time::timeout(TIMEOUT, laptop_dir.list_connections())
+                .await
+                .map_err(|_| anyhow::anyhow!("the laptop's store stopped answering"))??;
             Ok(listed.len() >= usize::from(RECORDS))
         })
         .await?,
         "the laptop did not take in every record past its unread subscription"
     );
-    tokio::time::timeout(Duration::from_secs(5), laptop_dir.connect(ids::BOB))
+    tokio::time::timeout(TIMEOUT, laptop_dir.connect(ids::BOB))
         .await
         .map_err(|_| anyhow::anyhow!("a local write waited on the unread subscription"))??;
 
     // Read at last, the subscription still yields: the dropped changes are
     // reported, not lost silently.
-    let reported = tokio::time::timeout(
-        Duration::from_secs(5),
-        futures_lite::StreamExt::next(&mut unread),
-    )
-    .await;
+    let reported = tokio::time::timeout(TIMEOUT, futures_lite::StreamExt::next(&mut unread)).await;
     assert!(
         matches!(reported, Ok(Some(Ok(())))),
         "the subscription went silent over the changes it dropped"

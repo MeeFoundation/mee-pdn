@@ -464,8 +464,9 @@ async fn a_retraction_marks_only_the_directory_of_the_author_it_names() -> Resul
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawal_over_many_markers_leaves_the_runtime_serving() -> Result<()> {
     const MARKERS: usize = 400;
-    /// A probe that waits on the runtime's state longer than this is stuck.
-    const PROBE: Duration = Duration::from_secs(5);
+    /// The whole budget: the state lock held for good is what a probe
+    /// catches, and a loaded runner holds one call for seconds.
+    const PROBE: Duration = TIMEOUT;
 
     let rt_bob = spawn_runtime().await?;
     let rt_alice = spawn_runtime().await?;
