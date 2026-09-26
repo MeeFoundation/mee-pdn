@@ -484,6 +484,10 @@ pub enum LiveEvent {
     NeighborDown(PublicKey),
     /// A set-reconciliation sync finished.
     SyncFinished(SyncEvent),
+    /// Events were dropped since the last one received: the subscription's
+    /// buffer was full. The entries they reported are in the replica by the
+    /// time this arrives; the sessions and downloads they reported are lost.
+    Lagged,
 }
 
 impl From<live::Event> for LiveEvent {
@@ -494,6 +498,7 @@ impl From<live::Event> for LiveEvent {
             live::Event::NeighborDown(peer) => Self::NeighborDown(peer),
             live::Event::SyncFinished(ev) => Self::SyncFinished(ev),
             live::Event::PendingContentReady => Self::PendingContentReady,
+            live::Event::Lagged => Self::Lagged,
         }
     }
 }
@@ -512,6 +517,7 @@ impl LiveEvent {
                 entry: entry.into(),
                 from: PublicKey::from_bytes(&from)?,
             },
+            crate::Event::Lagged { .. } => Self::Lagged,
         })
     }
 }

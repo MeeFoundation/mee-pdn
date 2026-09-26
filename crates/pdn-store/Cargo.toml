@@ -26,7 +26,6 @@ derive_more = { version = "2.0.1", features = [
     "into",
     "as_ref",
 ] }
-futures-buffered = "0.2.4"
 hex = "0.4"
 iroh = { version = "1", default-features = false }
 iroh-tickets = { version = "1" }
@@ -59,6 +58,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 data-encoding = "2.6.0"
+futures-buffered = "0.2.4"
 iroh = { version = "1", features = ["test-utils"] }
 nested_enum_utils = "0.2"
 parking_lot = "0.12.3"

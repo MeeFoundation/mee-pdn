@@ -21,10 +21,7 @@ use bytes::{Bytes, BytesMut};
 // `SignedEntry` format independent of upstream `ed25519` serde changes.
 use iroh::{KeyParsingError, Signature, SignatureError};
 use iroh_blobs::Hash;
-use n0_future::{
-    time::{Duration, SystemTime},
-    IterExt,
-};
+use n0_future::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 pub use crate::heads::AuthorHeads;
@@ -34,6 +31,7 @@ use crate::{
         self, Fingerprint, InsertOutcome, RangeEntry, RangeKey, RangeValue, Store, ValidateOutcome,
     },
     store::{self, fs::StoreInstance, DownloadPolicyStore, PublicKeyStore},
+    subscribers::{Delivery, LagNotice, Subscribers},
 };
 
 /// Protocol message for the set reconciliation protocol.
@@ -120,6 +118,24 @@ pub enum Event {
         /// [`ContentStatus`] for this entry in the remote's replica.
         remote_content_status: ContentStatus,
     },
+    /// Events were dropped since the last one received: the subscription's
+    /// buffer was full. What they reported is in the replica by the time this
+    /// arrives, so the subscriber reads the replica again.
+    Lagged {
+        /// Document whose events were dropped.
+        namespace: NamespaceId,
+    },
+}
+
+impl LagNotice for Event {
+    fn lagged(&self) -> Self {
+        let namespace = match self {
+            Self::LocalInsert { namespace, .. }
+            | Self::RemoteInsert { namespace, .. }
+            | Self::Lagged { namespace } => *namespace,
+        };
+        Self::Lagged { namespace }
+    }
 }
 
 /// Whether an entry was inserted locally or by a remote peer.
@@ -158,51 +174,6 @@ pub struct SyncOutcome {
     pub num_recv: usize,
     /// Number of entries we sent.
     pub num_sent: usize,
-}
-
-fn get_as_ptr<T>(value: &T) -> Option<usize> {
-    use std::mem;
-    if mem::size_of::<T>() == std::mem::size_of::<usize>()
-        && mem::align_of::<T>() == mem::align_of::<usize>()
-    {
-        // Safe only if size and alignment requirements are met
-        unsafe { Some(mem::transmute_copy(value)) }
-    } else {
-        None
-    }
-}
-
-fn same_channel<T>(a: &async_channel::Sender<T>, b: &async_channel::Sender<T>) -> bool {
-    get_as_ptr(a).unwrap() == get_as_ptr(b).unwrap()
-}
-
-#[derive(Debug, Default)]
-struct Subscribers(Vec<async_channel::Sender<Event>>);
-impl Subscribers {
-    pub fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
-        self.0.push(sender)
-    }
-    pub fn unsubscribe(&mut self, sender: &async_channel::Sender<Event>) {
-        self.0.retain(|s| !same_channel(s, sender));
-    }
-    pub async fn send(&mut self, event: Event) {
-        self.0 = std::mem::take(&mut self.0)
-            .into_iter()
-            .map(async |tx| tx.send(event.clone()).await.ok().map(|_| tx))
-            .join_all()
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
-    }
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    pub async fn send_with(&mut self, f: impl FnOnce() -> Event) {
-        if !self.0.is_empty() {
-            self.send(f()).await
-        }
-    }
 }
 
 /// Kind of capability of the namespace.
@@ -318,7 +289,7 @@ pub enum CapabilityError {
 #[derive(derive_more::Debug)]
 pub struct ReplicaInfo {
     pub(crate) capability: Capability,
-    subscribers: Subscribers,
+    subscribers: Subscribers<Event>,
     #[debug("ContentStatusCallback")]
     content_status_cb: Option<ContentStatusCallback>,
     #[debug("CapabilityValidator")]
@@ -342,13 +313,21 @@ impl ReplicaInfo {
         }
     }
 
-    /// Subscribe to insert events.
-    ///
-    /// When subscribing to a replica, you must ensure that the corresponding [`async_channel::Receiver`] is
-    /// received from in a loop. If not receiving, local and remote inserts will hang waiting for
-    /// the receiver to be received from.
+    /// Subscribe to insert events. A full channel drops them, and an
+    /// [`Event::Lagged`] follows the last one received; the sender is the
+    /// subscription's alone, or the lag accounting is off.
     pub fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
-        self.subscribers.subscribe(sender)
+        self.subscribers.subscribe(sender, Delivery::Lossy)
+    }
+
+    /// Inserts wait for room in the channel of a [`Delivery::Blocking`]
+    /// subscriber.
+    pub(crate) fn subscribe_with(
+        &mut self,
+        sender: async_channel::Sender<Event>,
+        delivery: Delivery,
+    ) {
+        self.subscribers.subscribe(sender, delivery)
     }
 
     /// Explicitly unsubscribe a sender.
@@ -1484,7 +1463,7 @@ impl Record {
 mod tests {
     use std::collections::HashSet;
 
-    use anyhow::Result;
+    use anyhow::{Context as _, Result};
     use rand::SeedableRng;
 
     use super::*;
@@ -2757,10 +2736,12 @@ mod tests {
 
         sync(&mut alice, &mut bob).await?;
 
-        check_entries(&mut alice_store, &myspace.id(), &author, &alice_set)?;
-        check_entries(&mut alice_store, &myspace.id(), &author, &bob_set)?;
-        check_entries(&mut bob_store, &myspace.id(), &author, &alice_set)?;
-        check_entries(&mut bob_store, &myspace.id(), &author, &bob_set)?;
+        let keys = |set: &[&str]| set.iter().map(|el| el.as_bytes().to_vec()).collect();
+        let synced = ["foot", "fool", "foo", "fog"];
+        for store in [&mut alice_store, &mut bob_store] {
+            check_entries(store, &myspace.id(), &author, &synced)?;
+            assert_keys(store, myspace.id(), keys(&synced));
+        }
 
         let mut alice = alice_store.new_replica(myspace.clone())?;
         let mut bob = bob_store.new_replica(myspace.clone())?;
@@ -2768,15 +2749,11 @@ mod tests {
         bob.hash_and_insert("fooz", &author, "fooz".as_bytes())
             .await?;
         sync(&mut alice, &mut bob).await?;
+        // Exact: a longer key gone missing fails it as the deleted one come back does.
         let standing = ["foot", "fool", "fog", "fooz"];
-        check_entries(&mut alice_store, &myspace.id(), &author, &standing)?;
-        check_entries(&mut bob_store, &myspace.id(), &author, &standing)?;
         for store in [&mut alice_store, &mut bob_store] {
-            assert_eq!(
-                store.get_exact(myspace.id(), author.id(), b"foo", false)?,
-                None,
-                "the deleted key came back"
-            );
+            check_entries(store, &myspace.id(), &author, &standing)?;
+            assert_keys(store, myspace.id(), keys(&standing));
         }
         alice_store.flush()?;
         bob_store.flush()?;
@@ -3895,6 +3872,7 @@ mod tests {
         Ok((alice_state, bob_state))
     }
 
+    /// Each key of `set` holds `author`'s entry whose content is the key itself.
     fn check_entries(
         store: &mut Store,
         namespace: &NamespaceId,
@@ -3902,7 +3880,13 @@ mod tests {
         set: &[&str],
     ) -> Result<()> {
         for el in set {
-            store.get_exact(*namespace, author.id(), el, false)?;
+            let entry = store
+                .get_exact(*namespace, author.id(), el, false)?
+                .with_context(|| format!("{el} missing"))?;
+            anyhow::ensure!(
+                entry.content_hash() == Hash::new(el),
+                "{el} holds other content"
+            );
         }
         Ok(())
     }
@@ -4003,6 +3987,46 @@ mod tests {
             .get_exact(namespace.id(), author.id(), b"k", true)?
             .expect("the delete is held");
         assert!(held.is_empty(), "the older entry replaced the delete");
+        Ok(())
+    }
+
+    /// Two authors' entries at one key with equal timestamps read as the one
+    /// with the greater content hash, whichever author holds it.
+    ///
+    /// The lower author gets the smaller hash: the author order alone picks
+    /// the other entry.
+    #[tokio::test]
+    async fn an_equal_timestamp_across_authors_resolves_by_content_hash() -> Result<()> {
+        let mut rng = rand::rng();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut authors = [Author::new(&mut rng), Author::new(&mut rng)];
+        authors.sort_by_key(|author| author.id().to_bytes());
+        let [low, high] = &authors;
+        let mut hashes = [Hash::new(b"a"), Hash::new(b"b")];
+        hashes.sort();
+        let [small, big] = hashes;
+        let mut store = store::Store::memory();
+        let mut replica = store.new_replica(namespace.clone())?;
+        for (author, hash) in [(low, small), (high, big)] {
+            let entry = Entry::new(
+                RecordIdentifier::new(namespace.id(), author.id(), b"k"),
+                Record::new(hash, 1, 1_000),
+            )
+            .sign(&namespace, author);
+            replica
+                .insert_remote_entry(entry, [0u8; 32], ContentStatus::Complete)
+                .await?;
+        }
+
+        let read: Vec<_> = store
+            .get_many(namespace.id(), Query::single_latest_per_key())?
+            .collect::<Result<_>>()?;
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read.first().map(SignedEntry::content_hash),
+            Some(big),
+            "the tie went by author, not by content hash"
+        );
         Ok(())
     }
 

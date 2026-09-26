@@ -52,6 +52,7 @@ mod heads;
 mod identity;
 mod keys;
 mod ranger;
+mod subscribers;
 
 #[doc(inline)]
 pub use net::ALPN;

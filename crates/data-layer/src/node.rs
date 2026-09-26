@@ -1055,8 +1055,9 @@ impl SyncNode {
     }
 
     /// Take `identity`'s replica of `namespace` out of its gossip swarm,
-    /// its reconciliation left running: no announcement reaches it, so the
-    /// side that opens the next session is the caller's choice.
+    /// its reconciliation left running: no announcement reaches it. It holds
+    /// until this node's next reconcile pass, which re-joins the swarm and
+    /// opens sessions to the contacts itself.
     #[cfg(feature = "test-util")]
     pub async fn leave_swarm_for_test(
         &self,

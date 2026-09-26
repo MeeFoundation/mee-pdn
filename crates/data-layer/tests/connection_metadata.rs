@@ -1052,12 +1052,18 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
 /// Denied: the audience's data session the grant served before the
 /// withdrawal. The audience's replica leaves the swarm first, so no
 /// announcement makes it pull before the publisher opens: its pull is the
-/// order that converges without the per-key rule.
+/// order that converges without the per-key rule. The audience's node runs
+/// no reconcile pass during the scenario, since a pass re-joins the swarm
+/// and opens the session itself.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, served and refused sides in one place
 async fn a_withdrawal_holds_against_a_device_that_still_holds_the_record() -> Result<()> {
     let mut bob = memory_node().await?;
-    let a_phone = memory_node().await?;
+    let a_phone = SyncNode::spawn(SpawnOptions {
+        reconcile_interval: Duration::from_hours(1),
+        ..SpawnOptions::memory()
+    })
+    .await?;
     let _bob_dir = host_identity(&bob, ids::BOB).await?;
     let _alice_dir = host_identity(&a_phone, ids::ALICE).await?;
 

@@ -173,9 +173,10 @@ impl ConnectionMetadataStore {
         self.doc.clone()
     }
 
-    /// One item per observed change of this replica — an entry written here,
-    /// an entry arrived by sync, or a payload blob become readable. Detail-free
-    /// on purpose: the fork's event vocabulary stays behind this layer.
+    /// An item after every observed change of this replica — an entry written
+    /// here, an entry arrived by sync, or a payload blob become readable; a
+    /// burst past the subscription's buffer arrives as one item. Detail-free:
+    /// the fork's event vocabulary stays behind this layer.
     /// `ContentReady` counts because grant payloads are blobs: only the
     /// payload event tells a consumer a record has become readable. An `Err`
     /// item is the subscription failing; the stream ends with the node.
@@ -185,7 +186,8 @@ impl ConnectionMetadataStore {
             Ok(
                 LiveEvent::InsertLocal { .. }
                 | LiveEvent::InsertRemote { .. }
-                | LiveEvent::ContentReady { .. },
+                | LiveEvent::ContentReady { .. }
+                | LiveEvent::Lagged,
             ) => Some(Ok(())),
             Ok(_) => None,
             Err(err) => Some(Err(err)),

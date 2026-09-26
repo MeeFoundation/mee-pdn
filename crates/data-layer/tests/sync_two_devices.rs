@@ -411,3 +411,64 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// A subscriber that stops reading holds up neither sync nor the device's
+/// own calls: the laptop's directory takes in more of the phone's records
+/// than its unread subscription buffers, reads them all, and still writes
+/// and lists, while the subscription reports the changes it dropped.
+///
+/// Six hundred records: a subscription buffers around 320 events.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
+    const RECORDS: u16 = 600;
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+
+    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_dir
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_dir.add_device(laptop.node_id()).await?;
+    laptop_dir.add_device(laptop.node_id()).await?;
+
+    let mut unread = laptop_dir.changes().await?;
+    let peer = |n: u16| {
+        let mut bytes = [0x5e; 32];
+        bytes[..2].copy_from_slice(&n.to_be_bytes());
+        pdn_types::PdnId::from_bytes(bytes)
+    };
+    for n in 0..RECORDS {
+        phone_dir.connect(peer(n)).await?;
+    }
+    assert!(
+        eventually(|| async {
+            let listed =
+                tokio::time::timeout(Duration::from_secs(5), laptop_dir.list_connections())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the laptop's store stopped answering"))??;
+            Ok(listed.len() >= usize::from(RECORDS))
+        })
+        .await?,
+        "the laptop did not take in every record past its unread subscription"
+    );
+    tokio::time::timeout(Duration::from_secs(5), laptop_dir.connect(ids::BOB))
+        .await
+        .map_err(|_| anyhow::anyhow!("a local write waited on the unread subscription"))??;
+
+    // Read at last, the subscription still yields: the dropped changes are
+    // reported, not lost silently.
+    let reported = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures_lite::StreamExt::next(&mut unread),
+    )
+    .await;
+    assert!(
+        matches!(reported, Ok(Some(Ok(())))),
+        "the subscription went silent over the changes it dropped"
+    );
+
+    phone.shutdown().await?;
+    laptop.shutdown().await?;
+    Ok(())
+}

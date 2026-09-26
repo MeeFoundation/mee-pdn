@@ -37,8 +37,9 @@ use crate::node::{read_payload, SyncNode};
 pub struct CatchUpTimeout;
 
 /// A subscription to one replica's sync sessions, from
-/// [`PrivateMetadataStore::watch_catch_up`]. Unread, it holds back the
-/// engine's events once its buffer fills, so the wait follows promptly.
+/// [`PrivateMetadataStore::watch_catch_up`]. Unread past its buffer it drops
+/// events, a session's among them, and the wait then holds out for the next
+/// session — one reconcile interval at most.
 pub struct CatchUpWatch {
     events: Pin<Box<dyn Stream<Item = Result<LiveEvent>> + Send>>,
     since: SystemTime,
@@ -578,8 +579,9 @@ impl PrivateMetadataStore {
         self.doc.subscribe().await
     }
 
-    /// One detail-free item per observed change — an entry written here,
-    /// arrived by sync, or a payload become readable. An `Err` item is the
+    /// A detail-free item after every observed change — an entry written
+    /// here, arrived by sync, or a payload become readable; a burst past the
+    /// subscription's buffer arrives as one item. An `Err` item is the
     /// subscription failing; the stream ends with the node.
     pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
         let events = self.events().await?;
@@ -587,7 +589,8 @@ impl PrivateMetadataStore {
             Ok(
                 LiveEvent::InsertLocal { .. }
                 | LiveEvent::InsertRemote { .. }
-                | LiveEvent::ContentReady { .. },
+                | LiveEvent::ContentReady { .. }
+                | LiveEvent::Lagged,
             ) => Some(Ok(())),
             Ok(_) => None,
             Err(err) => Some(Err(err)),

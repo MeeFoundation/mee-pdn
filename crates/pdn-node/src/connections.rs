@@ -324,6 +324,9 @@ pub(crate) fn spawn_connection_armer(
                     return;
                 };
                 let mut guard = strong.lock().await;
+                if !take_buffered(&mut changes).await {
+                    return;
+                }
                 arm_connections(&mut guard, identity, &state).await;
                 guard.sweep_interval
             };
@@ -364,6 +367,10 @@ pub(crate) fn spawn_grant_binder(
                     return;
                 };
                 let mut guard = strong.lock().await;
+                if !take_buffered(&mut changes).await {
+                    drop(guard);
+                    return release_binder(&state, identity, peer).await;
+                }
                 if !bind_grants(&mut guard, identity, peer, &peer_store).await {
                     // The successor starts against a replica that has not
                     // synced yet: an inherited memo would read as "granted
@@ -384,6 +391,19 @@ pub(crate) fn spawn_grant_binder(
             }
         }
     });
+}
+
+/// Consumes every change already buffered, taken under the lock, so the
+/// sweep after it covers them all and a burst costs one sweep; `false` once
+/// the subscription failed or ended.
+async fn take_buffered(changes: &mut (impl Stream<Item = Result<()>> + Unpin)) -> bool {
+    loop {
+        match futures_lite::future::poll_once(changes.next()).await {
+            None => return true,
+            Some(Some(Ok(()))) => {}
+            Some(Some(Err(_)) | None) => return false,
+        }
+    }
 }
 
 async fn release_binder(state: &Weak<Mutex<State>>, identity: PdnId, peer: PdnId) {

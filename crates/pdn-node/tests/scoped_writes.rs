@@ -453,3 +453,80 @@ async fn a_retraction_marks_only_the_directory_of_the_author_it_names() -> Resul
     rt_bob.shutdown().await?;
     Ok(())
 }
+
+/// A withdrawal reaching an audience that holds more of the issuer's
+/// retraction markers than a store subscription buffers unbinds and
+/// leaves the audience's runtime serving: the markers go, and every call
+/// that waits on the runtime's state answers.
+///
+/// Four hundred markers: a directory subscription buffers around 320
+/// events, and the unbind's deletes each emit one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawal_over_many_markers_leaves_the_runtime_serving() -> Result<()> {
+    const MARKERS: usize = 400;
+    /// A probe that waits on the runtime's state longer than this is stuck.
+    const PROBE: Duration = Duration::from_secs(5);
+
+    let rt_bob = spawn_runtime().await?;
+    let rt_alice = spawn_runtime().await?;
+    let bob = rt_bob.identity().create().await?;
+    let alice = rt_alice.identity().create().await?;
+    let invite = rt_bob.connections().invite(bob, None).await?;
+    establish_patiently(&rt_alice, alice, &rt_bob, bob, invite).await?;
+
+    let phone = EntryPath::new("contact/phone")?;
+    rt_bob
+        .connections()
+        .publish_grant(bob, alice, bob, common::claims_on(bob, &phone, true))
+        .await?;
+    assert!(
+        eventually(|| async {
+            Ok(!rt_alice
+                .connections()
+                .read_grants(alice, bob)
+                .await?
+                .is_empty())
+        })
+        .await?,
+        "the grant did not reach Alice"
+    );
+
+    // Every forced path lies outside the grant, so Bob's gate refuses each
+    // and Alice records a marker per path.
+    for n in 0..MARKERS {
+        let path = EntryPath::new(format!("forced/{n:04}"))?;
+        rt_alice
+            .data()
+            .write_unguarded(alice, bob, &path, b"forced")
+            .await?;
+    }
+    assert!(
+        eventually(|| async {
+            let markers = rt_alice.sync().retraction_markers(alice).await?;
+            Ok(markers.iter().filter(|(issuer, _)| *issuer == bob).count() >= MARKERS)
+        })
+        .await?,
+        "Bob's gate did not refuse every forced write"
+    );
+
+    rt_bob.connections().withdraw_grant(bob, alice, bob).await?;
+    assert!(
+        eventually(|| async {
+            let markers = tokio::time::timeout(PROBE, rt_alice.sync().retraction_markers(alice))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("the runtime's state stayed locked past the probe")
+                })??;
+            Ok(markers.iter().all(|(issuer, _)| *issuer != bob))
+        })
+        .await?,
+        "the unbind did not prune Bob's markers"
+    );
+    tokio::time::timeout(PROBE, rt_alice.connections().read_grants(alice, bob))
+        .await
+        .map_err(|_| anyhow::anyhow!("the runtime stopped answering after the unbind"))??;
+
+    rt_bob.shutdown().await?;
+    rt_alice.shutdown().await?;
+    Ok(())
+}
