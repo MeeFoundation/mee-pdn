@@ -181,6 +181,10 @@ pub(crate) struct State {
     /// what a link has published before it commits — nothing.
     #[cfg(feature = "test-util")]
     pub(crate) link_before_commit_pause: Option<Arc<CeremonyPause>>,
+    /// A pause just past the linking commit point, before the confirmation
+    /// write — the one await a cancellation of a committed link can land on.
+    #[cfg(feature = "test-util")]
+    pub(crate) link_after_commit_pause: Option<Arc<CeremonyPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
     /// Fails the next `create` where its directory would be made — the one
@@ -302,6 +306,8 @@ impl Runtime {
             pairing_serve_pause: None,
             #[cfg(feature = "test-util")]
             link_before_commit_pause: None,
+            #[cfg(feature = "test-util")]
+            link_after_commit_pause: None,
             #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
@@ -438,6 +444,16 @@ impl Runtime {
             release: tokio::sync::Notify::new(),
         });
         self.state.lock().await.link_before_commit_pause = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn pause_next_link_after_commit(&self) -> Arc<CeremonyPause> {
+        let pause = Arc::new(CeremonyPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        self.state.lock().await.link_after_commit_pause = Some(Arc::clone(&pause));
         pause
     }
 

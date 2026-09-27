@@ -909,6 +909,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     fn entry_put(&mut self, e: SignedEntry) -> Result<()> {
         let id = e.id();
+        self.ensure_own_namespace(id)?;
         self.store.wrote(id.namespace());
         self.store.as_mut().modify(|tables| {
             // insert into record table

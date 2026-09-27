@@ -720,6 +720,60 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
     Ok(())
 }
 
+/// A `link` future dropped after its commit point leaves the link standing:
+/// the node still hosts the identity, the reservation is released, and the
+/// device still ends up in the identity's confirmed set. The pause sits past
+/// the commit and before the confirmation write — the one await a committed
+/// link can be cancelled on. Hosting is asserted by a read through the node
+/// rather than by `hosted_identities`, which reports the runtime's own map:
+/// a rollback unhosts the identity below that map without removing it
+/// there. The confirmed set is read from a probe linked beforehand, since
+/// the directory lives inside the runtimes.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_cancelled_after_its_commit_point_stands() -> Result<()> {
+    let rt_inviter = memory_runtime().await?;
+    let x = rt_inviter.identity().create().await?;
+    let path = EntryPath::new("contact/name")?;
+    let (probe_node, probe_dir) = link_probe(&rt_inviter, x).await?;
+
+    let rt = Arc::new(memory_runtime().await?);
+    let pause = rt.pause_next_link_after_commit().await;
+    let payload = rt_inviter.identity().linking_invite(x, None).await?;
+    let attempt = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.identity().link(payload, TIMEOUT).await })
+    };
+    pause.wait_until_reached().await;
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    pause.release();
+
+    assert!(
+        eventually(|| async {
+            // A local read: it errs once the node no longer hosts the
+            // identity, and waits on nothing replicating.
+            rt.data().read(x, x, &path).await?;
+            Ok(!rt.sync().linking_in_flight_for_test(x).await)
+        })
+        .await?,
+        "a link cancelled after its commit point kept its reservation"
+    );
+    assert!(
+        wait_devices_exactly(
+            &probe_dir,
+            &[rt_inviter.node_id(), probe_node.node_id(), rt.node_id()]
+        )
+        .await?,
+        "a link cancelled after its commit point never confirmed its device"
+    );
+
+    rt_inviter.shutdown().await?;
+    rt.shutdown().await?;
+    probe_node.shutdown().await?;
+    Ok(())
+}
+
 /// A link whose directory finished its first sync exchanges before the
 /// catch-up wait began still returns caught up, inside a budget that ends
 /// long before the next periodic reconcile pass. The pause after the

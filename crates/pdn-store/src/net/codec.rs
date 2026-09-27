@@ -85,11 +85,12 @@ impl Encoder<Message> for SyncCodec {
             len
         );
 
+        // From the buffer's end, not from zero: a frame queued behind
+        // another would otherwise overwrite it.
+        let start = dst.len();
         dst.put_u32(u32::try_from(len).expect("already checked"));
-        if dst.len() < 4 + len {
-            dst.resize(4 + len, 0u8);
-        }
-        postcard::to_slice(&item, &mut dst[4..])?;
+        dst.resize(start + 4 + len, 0u8);
+        postcard::to_slice(&item, &mut dst[start + 4..])?;
 
         Ok(())
     }
@@ -2521,6 +2522,42 @@ mod tests {
             "the opening must be refused on its length, not wait for its body: {read:?}"
         );
         drop(their_writer);
+        Ok(())
+    }
+
+    /// Two frames encoded into one buffer decode back as those two frames,
+    /// in order. The two reasons differ, so a second frame written over the
+    /// first would decode as the second one twice.
+    #[test]
+    fn two_frames_in_one_buffer_decode_as_themselves() -> Result<()> {
+        let mut codec = SyncCodec::default();
+        let mut buffer = BytesMut::new();
+        codec.encode(
+            super::Message::Abort {
+                reason: AbortReason::NotFound,
+            },
+            &mut buffer,
+        )?;
+        codec.encode(
+            super::Message::Abort {
+                reason: AbortReason::AlreadySyncing,
+            },
+            &mut buffer,
+        )?;
+
+        let mut reasons = Vec::new();
+        while let Some(frame) = codec.decode(&mut buffer)? {
+            match frame {
+                super::Message::Abort { reason } => reasons.push(reason),
+                other => return Err(anyhow!("an abort decoded as {other:?}")),
+            }
+        }
+        assert_eq!(
+            reasons,
+            [AbortReason::NotFound, AbortReason::AlreadySyncing],
+            "the frames did not decode as they were encoded"
+        );
+        assert!(buffer.is_empty(), "bytes were left over after both frames");
         Ok(())
     }
 
