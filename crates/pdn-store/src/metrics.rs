@@ -29,7 +29,10 @@ pub struct Metrics {
     ///
     /// A snapshot holds back reclamation of every store page freed while it
     /// lives, so a value that does not fall back to zero when the node goes
-    /// quiet is the store growing for a reason no entry count explains.
+    /// quiet is the store growing for a reason no entry count explains. A
+    /// zero does not say the reverse: `get_many` and `content_hashes` hold
+    /// the same read transaction for as long as their iterator lives, and
+    /// neither is counted here.
     pub sync_sessions_open: Gauge,
     /// Sync session snapshots the actor reclaimed by itself, because the
     /// handle was gone and no release message arrived.

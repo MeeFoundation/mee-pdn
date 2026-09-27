@@ -202,6 +202,11 @@ impl Store {
     /// sync session opens a snapshot, which flushes. Dropping the
     /// transaction instead abandons no data — there is none — and leaves
     /// the same committed state for a reader to see.
+    ///
+    /// The skip has a second effect: a commit is also where redb returns
+    /// pages freed under a since-closed read transaction to the allocator,
+    /// so on a node that holds no writes those pages wait for the next real
+    /// one.
     fn finish_write(&mut self, w: TransactionAndTables) -> Result<()> {
         if !w.is_dirty() {
             return Ok(());
@@ -863,6 +868,10 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         Ok(first.unwrap_or_default())
     }
 
+    /// This and the other test-only readers below — `len`, `is_empty`,
+    /// `all`, `prefixed_by` — read the live store whatever
+    /// `session_snapshot` holds, so a test written through them
+    /// characterises something other than the frozen view.
     #[cfg(test)]
     fn get(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
         self.store

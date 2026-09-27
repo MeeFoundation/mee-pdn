@@ -21,40 +21,13 @@ pub const ALPN: &[u8] = b"/iroh-sync/1";
 
 mod codec;
 
-/// Bound on one whole sync exchange, connection establishment included.
+/// Bound on one whole sync exchange, connection establishment included —
+/// the requirement that a session is bounded in time, and what rests on it,
+/// are in the subset-reconciliation spec.
 ///
-/// Nothing below this point carries a timeout of its own, so a peer that
-/// stays connected and stops talking stalls forever. Two things ride on the
-/// bound. The live actor tracks one running exchange per namespace, peer
-/// and identity — a node of two identities is two counterparts at one node
-/// id (ADR-0013) — and refuses to start another while one runs, so a
-/// stalled exchange blocks that counterpart and drops every later sync
-/// trigger for it silently. A counterpart exists only for a caller the
-/// access provider admitted, so what a peer can occupy is bounded by the
-/// identities it is entitled to act as. And a
-/// session holds a store snapshot, whose read transaction holds back
-/// reclamation of every page freed while it lives — of the oldest live one,
-/// so concurrent sessions cost the same window as a single one, and the
-/// window is this bound.
-///
-/// The bound is on the exchange as a whole, not on the wait between
-/// messages, and there is no shorter liveness bound beside it. A peer
-/// sending one message every few seconds defeats a between-messages bound
-/// while holding both resources. A connection that goes dead rather than
-/// quiet — a phone entering a tunnel — is already cut below, by QUIC keep
-/// alives against its idle timeout, well inside this bound. And a
-/// between-messages bound could not tell a slow transfer from silence
-/// anyway: a message is delivered whole, so a peer sending one large
-/// message for minutes looks exactly like a peer sending nothing.
-///
-/// The value covers a first sync of a large store over a slow link: an
-/// entry is roughly 280 bytes on the wire, and a peer holding nothing
-/// receives the served set in one message, so 10,000 entries are about 2.8
-/// MB — five minutes carry that from about 75 kbit/s up. Beyond that the
-/// exchange cannot complete at all rather than completing slowly, because a
-/// message is ingested whole or not at all: a cut mid-message delivers
-/// nothing, and the next session starts over. Raising the bound moves that
-/// cliff; only bounding the size of a transmitted set removes it.
+/// The value carries a first sync of a large store over a slow link: about
+/// 2.8 MB, the served set of 10,000 entries in one message, from roughly 75
+/// kbit/s up.
 pub const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Connect to a peer and sync a replica.

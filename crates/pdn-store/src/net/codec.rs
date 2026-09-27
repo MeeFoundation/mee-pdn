@@ -1286,11 +1286,6 @@ mod tests {
         Ok(())
     }
 
-    /// A round that fails leaves the accumulated outcome readable.
-    /// `handle_connection` reads it on every path, before it looks at the
-    /// result, so a state left unreadable here panics an accept task — and
-    /// that panic leaves the actor driving every accepted sync, not just
-    /// this connection.
     /// A session id names the actor that issued it, so one handle refuses
     /// another's id instead of resolving its own session of that number.
     ///
@@ -1298,6 +1293,9 @@ mod tests {
     /// two handles carries the same number by construction — and both
     /// handles here hold the same namespace, which is the state the
     /// remaining checks (registered, right namespace) cannot tell apart.
+    /// The refusal is asserted by its message: the registry is keyed by the
+    /// whole id, so a foreign one is refused as unregistered even with the
+    /// check on the actor removed.
     #[tokio::test]
     async fn a_session_id_is_refused_by_a_handle_that_did_not_issue_it() -> Result<()> {
         let mut rng = rand::rng();
@@ -1312,28 +1310,32 @@ mod tests {
 
         let session = issuer.sync_session_start(namespace_id).await?;
         let other_session = other.sync_session_start(namespace_id).await?;
-        assert_eq!(
-            session.id(),
-            session.id(),
-            "an id is stable, so the comparison below is of actors"
-        );
         assert_ne!(
             session.id(),
             other_session.id(),
             "two actors issued the same id, so nothing distinguishes them"
         );
 
-        // Authorized: the issuing handle serves it.
+        // Authorized: each handle serves the id it issued.
         assert!(issuer
             .sync_initial_message(namespace_id, session.id(), None)
             .await
             .is_ok());
-        // Refused: the other handle holds this namespace and a session of
-        // its own, and still refuses an id it did not issue.
         assert!(other
+            .sync_initial_message(namespace_id, other_session.id(), None)
+            .await
+            .is_ok());
+        // Refused, and by the actor rather than by the registry: the other
+        // handle holds this namespace and a live session of its own, so a
+        // registry lookup alone would refuse for the wrong reason.
+        let refused = other
             .sync_initial_message(namespace_id, session.id(), None)
             .await
-            .is_err());
+            .expect_err("a handle must refuse an id it did not issue");
+        assert!(
+            format!("{refused:#}").contains("issued by another actor"),
+            "refused for the wrong reason: {refused:#}"
+        );
 
         drop(session);
         drop(other_session);
@@ -1464,6 +1466,15 @@ mod tests {
         Ok(())
     }
 
+    /// A round that fails leaves the accumulated outcome readable.
+    /// `handle_session` reads it on every path, before it looks at the
+    /// result, so a state left unreadable here panics an accept task — and
+    /// that panic leaves the actor driving every accepted sync, not just
+    /// this connection.
+    ///
+    /// A boundary naming another namespace is the trigger, not the subject:
+    /// it is what makes the round fail inside the one window: moving that
+    /// refusal elsewhere costs this test another trigger, not its deletion.
     #[tokio::test]
     async fn a_failed_round_leaves_the_outcome_readable() -> Result<()> {
         use crate::{
