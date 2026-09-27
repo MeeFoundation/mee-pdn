@@ -136,9 +136,9 @@ SETTINGS
 - Tokens **are not logged** and **not saved in command history**
 - The container gets only mitmproxy's public CA certificate and the generated environment file; the CA private key and the WireGuard keys stay in a volume it does not mount
 - The mitmweb UI listens on `http://127.0.0.1:8081` of the host only (password `mitmproxy`)
-- **Docker runs inside the sandbox.** The `dind` service is a rootless Docker daemon for the container tests and the demo; it shares `wg-client`'s network namespace with the agent, which reaches its API at `127.0.0.1:2375`. The daemon runs as an unprivileged user in a user namespace of its own, so a container on it holds no capability over the tunnel's iptables rules or over the Docker Desktop virtual machine, a bind mount resolves inside the `dind` service's own filesystem, and its pulls, builds and containers take the tunnel like the agent's own traffic. The host's Docker socket is mounted nowhere
+- **Docker runs inside the sandbox.** The `dind` service is a rootless Docker daemon for the container tests and the demo; it shares `wg-client`'s network namespace with the agent, which reaches its API at `127.0.0.1:2376`. The daemon runs as an unprivileged user in a user namespace of its own, so a container on it holds no capability over the tunnel's iptables rules or over the Docker Desktop virtual machine, a bind mount resolves inside the `dind` service's own filesystem, and its pulls, builds and containers take the tunnel like the agent's own traffic. The host's Docker socket is mounted nowhere
 - The `dind` service runs with seccomp unconfined, `/proc` unmasked and `/dev/net/tun`, and without `no-new-privileges`: rootlesskit needs the first three for its user namespace, and `newuidmap` gets its capabilities from file capabilities. No process in the service runs as root, which keeps the unmasked `/proc/sys` unwritable, and every capability but `SETUID` and `SETGID` is dropped
-- The API is unauthenticated on that loopback: anything in the devcontainer controls the daemon and every container on it. Such a container gets the agent's network policy and no secret placeholder unless one is passed in
+- The API takes TLS with a client certificate, which the daemon issues itself into the `dind-certs` volume and the agent reads from `/run/dind-certs`. That silences dockerd's warnings about a plain TCP API and guards nothing more: anything in the devcontainer can read the certificate, so it controls the daemon and every container on it. Such a container gets the agent's network policy and no secret placeholder unless one is passed in
 - VS Code installs a Docker credential helper in the container that answers from the host's credential store and helpers — a gcloud access token, a Docker Hub login — in plain text, where every other secret is a placeholder. `devcontainer.json` turns it off, and `scripts/project-user-init.sh` removes the `credsStore` it left in `~/.docker/config.json`. VS Code reads some Dev Containers settings from the host's user settings only, so set `"dev.containers.dockerCredentialHelper": false` and `"dev.containers.copyGitConfig": false` there as well. Check: after reconnecting, `~/.docker/config.json` in the container has no `credsStore`
 
 ### Token Expiration
@@ -199,6 +199,16 @@ codex login status
 ---
 
 ## Troubleshooting
+
+### Restart all containers, never one
+
+Stop them all on the host, from the workspace root, then reopen the devcontainer (**Dev Containers: Reopen in Container**):
+
+```bash
+docker compose -f .devcontainer/compose-all.yml stop
+```
+
+The agent and `dind` join `wg-client`'s network namespace once, when they start, so a `wg-client` restarted without them leaves them with no network.
 
 ### Build-time installs from `Dockerfile.app` not visible after rebuild
 
