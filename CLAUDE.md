@@ -30,7 +30,7 @@ Each crate carries its own `CLAUDE.md` with its contracts and what is deliberate
 - [`crates/data-layer`](crates/data-layer/) — the data layer over `crates/pdn-store`: the entries-only `DataLayer` trait, `SyncNode` stack assembly, the metadata stores, the protocol-agnostic ceremony slot.
 - [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model, the `PdnOp` operation AST, the `uwill` module. No iroh dependencies.
 - [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / connections / data / sync services over `data-layer`, plus the pairing (ADR-0011) and linking (ADR-0012) ceremonies. No host or HTTP dependencies.
-- [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime, with the `/debug/` subtree behind `PDN_DEBUG=1`.
+- [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime, with the `/debug/` subtree behind `PDN_DEBUG` (`1` or `true`).
 
 ## Commands
 

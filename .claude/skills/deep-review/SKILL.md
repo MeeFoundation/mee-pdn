@@ -293,7 +293,7 @@ The template below is in English. When the review language is something else, th
 
 **How it shows up:** <the exact trigger: which input, which state, what the affected party observes, and the path behind the reach — the public `pdn-node` operation and the condition, the input a modified node sends, or why neither reaches it. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
 
-**Example:** <the failure rendered as one concrete case per `mia-docs/openspec/specs/code-practices/examples.md`, on real values, in whatever shape the case calls for (a timeline for a race or the steps with what survives each for a crash, for instance) — a few rows in a fenced block, the wrong outcome last. A defect that only a future edit opens starts its trace with step 0, that edit. The field is left out where an example would be contrived.>
+**Example:** <the failure rendered as one concrete case per `mia-docs/openspec/specs/code-practices/examples.md`, on real values, in whatever shape the case calls for (a timeline for a race or the steps with what survives each for a crash, for instance) — a few rows, the wrong outcome last: a markdown table when it is a table, a fenced block otherwise. A defect that only a future edit opens starts its trace with step 0, that edit. The field is left out where an example would be contrived.>
 
 **What causes it:** <the mechanism through the code with line references: what exactly permits this and why the existing checks do not catch it.>
 
