@@ -424,6 +424,14 @@ async fn link_via_dialogue_inner(
     // the directory this device now shares — a failure rolls the link back
     // whole, and no sibling ever saw this attempt.
     let mut guard = state.lock().await;
+    let author = match guard.node.default_author(payload.identity) {
+        Ok(author) => author,
+        Err(err) => {
+            drop(guard);
+            rollback.roll_back().await;
+            return Err(err);
+        }
+    };
     if let Err(err) = guard
         .commit_hosting(payload.identity, directory.namespace())
         .await
@@ -432,15 +440,27 @@ async fn link_via_dialogue_inner(
         rollback.roll_back().await;
         return Err(err).context("the hosting record could not be written");
     }
-    let author = guard.node.default_author(payload.identity)?;
     guard
         .identities
         .insert(payload.identity, HostedIdentity { directory, author });
+    // Past the commit point the link stands: a failure below does not fail
+    // it, so a cancellation must not undo it either, and the armer starts
+    // before the one await that could be cancelled.
+    rollback.disarm();
+    crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
+
+    #[cfg(feature = "test-util")]
+    if let Some(pause) = guard.link_after_commit_pause.take() {
+        drop(guard);
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        guard = state.lock().await;
+    }
 
     // The confirmation, after the commit point and never before it: written
     // before the commit it would stand on every sibling with no local
     // failure able to take it back. A failure here neither fails the link
-    // nor rolls it back — the sweep repeats the write.
+    // nor rolls it back — the armer's sweep repeats the write.
     let own_device = NodeId::from_bytes(*dial.id().as_bytes());
     debug_assert_eq!(
         own_device,
@@ -457,8 +477,6 @@ async fn link_via_dialogue_inner(
         );
     }
     drop(guard);
-    crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
-    rollback.disarm();
     Ok(())
 }
 

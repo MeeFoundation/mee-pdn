@@ -2229,12 +2229,17 @@ mod tests {
         let myspace = NamespaceSecret::new(&mut rng);
         let ns = myspace.id();
 
-        // A write, then a session: the write is committed and served.
+        // A write, then a session: the write is committed and served. At
+        // least once, not exactly: a pause past `MAX_COMMIT_DELAY` between
+        // the two writes commits the first transaction on its own.
         let mut replica = store.new_replica(myspace.clone())?;
         replica.hash_and_insert("ape", &author, b"ape").await?;
         drop(replica);
         let snapshot = store.snapshot_owned()?;
-        assert_eq!(store.debug_commit_count(), 1);
+        assert!(
+            store.debug_commit_count() >= 1,
+            "the write was never committed"
+        );
         drop(snapshot);
         assert_keys(&mut store, ns, vec![b"ape".to_vec()]);
 
@@ -2259,7 +2264,10 @@ mod tests {
         replica.hash_and_insert("bee", &author, b"bee").await?;
         drop(replica);
         let snapshot = store.snapshot_owned()?;
-        assert_eq!(store.debug_commit_count(), commits_before + 1);
+        assert!(
+            store.debug_commit_count() > commits_before,
+            "a real write was skipped as if the transaction were clean"
+        );
         drop(snapshot);
         assert_keys(&mut store, ns, vec![b"ape".to_vec(), b"bee".to_vec()]);
         store.flush()?;
@@ -2416,10 +2424,12 @@ mod tests {
         Ok(())
     }
 
-    /// An identifier naming another namespace is refused by the ingest read
-    /// and the prefix read, so `put` on a store instance is safe
-    /// without `validate_entry` in front of it. The neighbour's rows are
-    /// read back at the end: a refusal has to leave them as they were.
+    /// An identifier naming another namespace is refused by the ingest read,
+    /// the prefix read and the write, so a store instance is safe without
+    /// `validate_entry` in front of it. The write is probed directly as well
+    /// as through `put`, since `put` reads before it writes and the read
+    /// alone would refuse. The neighbour's rows are read back at the end: a
+    /// refusal has to leave them as they were.
     #[tokio::test]
     async fn an_identifier_naming_another_namespace_is_refused() -> Result<()> {
         use crate::{ranger::Store as _, store::fs::StoreInstance};
@@ -2454,7 +2464,14 @@ mod tests {
             Record::current_from_data(b"forged"),
         );
         let entry = SignedEntry::from_entry(entry, &neighbour, &author);
-        assert!(inst.put(entry).is_err(), "a foreign entry was taken in");
+        assert!(
+            inst.put(entry.clone()).is_err(),
+            "a foreign entry was taken in"
+        );
+        assert!(
+            inst.entry_put(entry).is_err(),
+            "a foreign entry was written past the read"
+        );
 
         // Allowed: this namespace's entry through `put`, so the denial above
         // is a refusal rather than a `put` that takes nothing.

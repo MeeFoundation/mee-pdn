@@ -1486,8 +1486,11 @@ impl SyncNode {
         let Some(stack) = self.stack(identity)? else {
             return Ok(());
         };
-        stack.untrack(namespace)?;
+        // Drop first: untracked before a drop that fails, the replica stays
+        // open and served but leaves the reconcile pass, and nothing
+        // counted says so.
         stack.api.drop_doc(namespace).await?;
+        stack.untrack(namespace)?;
         Ok(())
     }
 

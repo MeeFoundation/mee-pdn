@@ -41,7 +41,8 @@ pub use crate::{
 /// entry, far short of `pdn-store`'s 1 GB wire ceiling. Past it, axum
 /// answers 413 directly, outside the error table.
 pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// Requests the `/debug/` subtree serves at once; past it, 503.
+pub const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 /// This one branch gates the whole `/debug/` subtree: off means absent, so
 /// requests there fall through to 404, not to an unauthorized answer.
@@ -186,6 +187,9 @@ mod tests {
         assert_eq!(elapsed, READINESS_BUDGET);
     }
 
+    /// A request past the admission limit is shed with 503. The admission
+    /// function alone, on a router of its own; that `router` attaches it is
+    /// `tests/admission.rs`.
     #[tokio::test]
     async fn a_request_above_the_concurrency_limit_is_shed() {
         let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));

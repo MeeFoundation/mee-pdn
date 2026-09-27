@@ -42,7 +42,10 @@ The devcontainer is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: `
 
 `tools.toml` pins the developer tools — just, cargo-nextest, cargo-deny, cargo-watch. `just setup-tooling` installs every one, and each pipeline job installs the ones it names through `.github/actions/install-tools`. The devcontainer image builds from `.devcontainer/` alone and repeats the versions as `ARG`s, which `just check` compares against the file. Dependabot moves the actions' commit pins, not these versions.
 
-Every test of the HTTP surface is a container test. They carry `#[ignore]`, so
+Every test that drives the HTTP surface of a running node is a container test;
+the few that stay in the test process, each for a property of the host no
+request on the surface can produce, are named in `crates/pdn-node-http/CLAUDE.md`.
+The container tests carry `#[ignore]`, so
 `just test` on a machine without a daemon or an image stays green and reports
 them skipped; `just test-docker` and the pipeline's own job run them with
 `--run-ignored all`. A test group in `.config/nextest.toml` bounds their

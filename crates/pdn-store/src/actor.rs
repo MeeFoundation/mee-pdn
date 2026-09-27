@@ -296,11 +296,12 @@ pub struct SyncSessionId {
 /// The handle's liveness, not the release message, is what the actor goes
 /// by, and the strong references to a registration are this handle plus a
 /// release message of its own still in the queue. An entry therefore
-/// outlives both by no more than the actor's next tick, whether the message
-/// was lost to a full queue or the handle was never built at all — a caller
-/// cancelled between registration and reply leaves the reference in the
-/// undelivered reply. The message is the prompt path; counting a queued one
-/// as lost would make the reclaim metric fire on ordinary exchanges.
+/// outlives both by no more than the actor's housekeeping cadence, at which
+/// the reclaim pass runs, whether the message was lost to a full queue or
+/// the handle was never built at all — a caller cancelled between
+/// registration and reply leaves the reference in the undelivered reply.
+/// The message is the prompt path; counting a queued one as lost would make
+/// the reclaim metric fire on ordinary exchanges.
 #[must_use = "dropping the handle ends the session and releases its snapshot"]
 #[derive(Debug)]
 pub struct SyncSession {
@@ -936,9 +937,11 @@ impl Actor {
             tokio::pin!(timeout);
             let action = tokio::select! {
                 _ = &mut timeout => {
-                    // Before the flush, not after: releasing the read
-                    // transactions of sessions whose handle is gone lets
-                    // this very commit reclaim the pages they pinned.
+                    // Before the flush, not after: a commit reclaims the
+                    // pages a released read transaction pinned, so the
+                    // release has to precede it. On a node that wrote
+                    // nothing the flush commits nothing and the pages wait
+                    // for the next write ([`Store::finish_write`]).
                     self.reclaim_abandoned_sessions();
                     if let Err(cause) = self.store.flush() {
                         error!(?cause, "failed to flush store");

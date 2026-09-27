@@ -85,11 +85,12 @@ impl Encoder<Message> for SyncCodec {
             len
         );
 
+        // From the buffer's end, not from zero: a frame queued behind
+        // another would otherwise overwrite it.
+        let start = dst.len();
         dst.put_u32(u32::try_from(len).expect("already checked"));
-        if dst.len() < 4 + len {
-            dst.resize(4 + len, 0u8);
-        }
-        postcard::to_slice(&item, &mut dst[4..])?;
+        dst.resize(start + 4 + len, 0u8);
+        postcard::to_slice(&item, &mut dst[start + 4..])?;
 
         Ok(())
     }
@@ -1286,11 +1287,6 @@ mod tests {
         Ok(())
     }
 
-    /// A round that fails leaves the accumulated outcome readable.
-    /// `handle_connection` reads it on every path, before it looks at the
-    /// result, so a state left unreadable here panics an accept task — and
-    /// that panic leaves the actor driving every accepted sync, not just
-    /// this connection.
     /// A session id names the actor that issued it, so one handle refuses
     /// another's id instead of resolving its own session of that number.
     ///
@@ -1298,6 +1294,9 @@ mod tests {
     /// two handles carries the same number by construction — and both
     /// handles here hold the same namespace, which is the state the
     /// remaining checks (registered, right namespace) cannot tell apart.
+    /// The refusal is asserted by its message: the registry is keyed by the
+    /// whole id, so a foreign one is refused as unregistered even with the
+    /// check on the actor removed.
     #[tokio::test]
     async fn a_session_id_is_refused_by_a_handle_that_did_not_issue_it() -> Result<()> {
         let mut rng = rand::rng();
@@ -1312,28 +1311,32 @@ mod tests {
 
         let session = issuer.sync_session_start(namespace_id).await?;
         let other_session = other.sync_session_start(namespace_id).await?;
-        assert_eq!(
-            session.id(),
-            session.id(),
-            "an id is stable, so the comparison below is of actors"
-        );
         assert_ne!(
             session.id(),
             other_session.id(),
             "two actors issued the same id, so nothing distinguishes them"
         );
 
-        // Authorized: the issuing handle serves it.
+        // Authorized: each handle serves the id it issued.
         assert!(issuer
             .sync_initial_message(namespace_id, session.id(), None)
             .await
             .is_ok());
-        // Refused: the other handle holds this namespace and a session of
-        // its own, and still refuses an id it did not issue.
         assert!(other
+            .sync_initial_message(namespace_id, other_session.id(), None)
+            .await
+            .is_ok());
+        // Refused, and by the actor rather than by the registry: the other
+        // handle holds this namespace and a live session of its own, so a
+        // registry lookup alone would refuse for the wrong reason.
+        let refused = other
             .sync_initial_message(namespace_id, session.id(), None)
             .await
-            .is_err());
+            .expect_err("a handle must refuse an id it did not issue");
+        assert!(
+            format!("{refused:#}").contains("issued by another actor"),
+            "refused for the wrong reason: {refused:#}"
+        );
 
         drop(session);
         drop(other_session);
@@ -1418,6 +1421,8 @@ mod tests {
         Ok(())
     }
 
+    /// A registration whose handle never reached its caller is reclaimed by
+    /// the actor, and a session whose handle is alive is not.
     #[tokio::test]
     async fn a_session_whose_handle_never_arrived_is_reclaimed() -> Result<()> {
         let mut rng = rand::rng();
@@ -1444,16 +1449,22 @@ mod tests {
         assert!(reclaimed, "the abandoned snapshot was never reclaimed");
         // The reclaim is counted, so the same event is visible on a running
         // node and not only from inside this test.
-        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
-        assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+            assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
+        }
 
         // A session whose handle is alive is not swept out from under it.
         let session = handle.sync_session_start(namespace_id).await?;
         tokio::time::sleep(crate::actor::MAX_COMMIT_DELAY * 3).await;
         assert_eq!(handle.debug_session_count().await?, 1);
-        assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
         // Held, not reclaimed: the ordinary path leaves this counter alone.
-        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
+            assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        }
         assert!(handle
             .sync_initial_message(namespace_id, session.id(), None)
             .await
@@ -1464,6 +1475,15 @@ mod tests {
         Ok(())
     }
 
+    /// A round that fails leaves the accumulated outcome readable.
+    /// `handle_session` reads it on every path, before it looks at the
+    /// result, so a state left unreadable here panics an accept task — and
+    /// that panic leaves the actor driving every accepted sync, not just
+    /// this connection.
+    ///
+    /// A boundary naming another namespace is the trigger, not the subject:
+    /// it is what makes the round fail inside the one window: moving that
+    /// refusal elsewhere costs this test another trigger, not its deletion.
     #[tokio::test]
     async fn a_failed_round_leaves_the_outcome_readable() -> Result<()> {
         use crate::{
@@ -2343,6 +2363,11 @@ mod tests {
     /// live actor's delivery — that stops draining its bounded channel,
     /// because a release has to sit in the queue across a reclaim pass and
     /// nothing else holds the actor still for that long.
+    ///
+    /// Its subject is the counter, which this crate's `metrics` feature
+    /// provides: without it the test would rest on the feature arriving
+    /// through another crate's defaults.
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn an_ordinary_release_is_not_counted_as_reclaimed() -> Result<()> {
         let mut rng = rand::rng();
@@ -2510,6 +2535,42 @@ mod tests {
             "the opening must be refused on its length, not wait for its body: {read:?}"
         );
         drop(their_writer);
+        Ok(())
+    }
+
+    /// Two frames encoded into one buffer decode back as those two frames,
+    /// in order. The two reasons differ, so a second frame written over the
+    /// first would decode as the second one twice.
+    #[test]
+    fn two_frames_in_one_buffer_decode_as_themselves() -> Result<()> {
+        let mut codec = SyncCodec::default();
+        let mut buffer = BytesMut::new();
+        codec.encode(
+            super::Message::Abort {
+                reason: AbortReason::NotFound,
+            },
+            &mut buffer,
+        )?;
+        codec.encode(
+            super::Message::Abort {
+                reason: AbortReason::AlreadySyncing,
+            },
+            &mut buffer,
+        )?;
+
+        let mut reasons = Vec::new();
+        while let Some(frame) = codec.decode(&mut buffer)? {
+            match frame {
+                super::Message::Abort { reason } => reasons.push(reason),
+                other => return Err(anyhow!("an abort decoded as {other:?}")),
+            }
+        }
+        assert_eq!(
+            reasons,
+            [AbortReason::NotFound, AbortReason::AlreadySyncing],
+            "the frames did not decode as they were encoded"
+        );
+        assert!(buffer.is_empty(), "bytes were left over after both frames");
         Ok(())
     }
 
