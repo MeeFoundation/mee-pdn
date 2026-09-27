@@ -17,7 +17,7 @@ use test_utils::eventually;
 
 mod common;
 
-/// "Nothing arrived" is probed by waiting out a few of the ticket identity's
+/// "Nothing arrived" is probed by waiting out a few of the ticket holder's
 /// reconcile intervals.
 const RECONCILE: Duration = Duration::from_millis(500);
 

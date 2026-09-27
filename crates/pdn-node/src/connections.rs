@@ -78,9 +78,9 @@ pub trait ConnectionsService {
     async fn list(&self, identity: PdnId) -> Result<Vec<PdnId>>;
 
     /// One tombstone over the single record; `issuer` must be `identity`
-    /// itself. The grantee unbinds once the tombstone replicates, and the
-    /// replica shared by co-hosted audiences (ADR-0009) leaves with the
-    /// last grant that binds it.
+    /// itself. The grantee unbinds once the tombstone replicates, forgetting
+    /// its own replica; a co-hosted audience's replica is its own and stays
+    /// (ADR-0013).
     async fn withdraw_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()>;
 
     /// `identity` grants `peer` read — and, per claim, write — on exactly

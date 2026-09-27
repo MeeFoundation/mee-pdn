@@ -22,7 +22,8 @@ pub enum SyncReason {
     SyncReport,
     /// We received a sync report while a sync was running, so run again afterwars
     Resync,
-    /// A write of this node announced itself to a identity of this same node.
+    /// An in-process session with an identity of this same node: a write's
+    /// announcement, a contact naming this node, or the periodic pass.
     Announced,
 }
 

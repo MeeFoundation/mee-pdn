@@ -366,7 +366,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Open a session with a identity of this same node, over a pipe: iroh
+    /// Open a session with an identity of this same node, over a pipe: iroh
     /// refuses a connection to its own endpoint id, so co-located identities
     /// meet here or not at all. `serve` is the callee's engine.
     pub async fn sync_in_process(
@@ -484,9 +484,10 @@ pub enum LiveEvent {
     NeighborDown(PublicKey),
     /// A set-reconciliation sync finished.
     SyncFinished(SyncEvent),
-    /// Events were dropped since the last one received: the subscription's
-    /// buffer was full. The entries they reported are in the replica by the
-    /// time this arrives; the sessions and downloads they reported are lost.
+    /// One of the subscription's two buffers was full and dropped events
+    /// since the last one it delivered; each buffer sends a notice of its
+    /// own. The entries they reported are in the replica by the time this
+    /// arrives; the sessions and downloads they reported are lost.
     Lagged,
 }
 

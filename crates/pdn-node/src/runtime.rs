@@ -187,9 +187,9 @@ pub(crate) struct State {
     pub(crate) link_after_commit_pause: Option<Arc<CeremonyPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
-    /// Fails the next `create` where its directory would be made — the one
-    /// step between provisioning an identity and hosting it, which a full
-    /// disk is the product's reason to reach.
+    /// Fails the next `create` where its directory would be made — a step
+    /// between provisioning an identity and hosting it, which a full disk is
+    /// the product's reason to reach.
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_directory_create: bool,
     /// Fails the next commit point's hosting record, the write a full disk
@@ -215,9 +215,10 @@ impl State {
     }
 
     /// The commit point of a create or a link: record `identity` as hosted
-    /// with `directory` as its private metadata directory. Called after the
-    /// store set is provisioned and before the identity is hosted; a
-    /// failure leaves no record, and the identity comes back at no start.
+    /// with `directory` as its private metadata directory. Called once the
+    /// store set is provisioned and armed for session classification, and
+    /// before the identity enters `identities`; a failure leaves no record,
+    /// and the identity comes back at no start.
     pub(crate) async fn commit_hosting(
         &mut self,
         identity: PdnId,

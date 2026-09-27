@@ -697,9 +697,9 @@ impl LiveActor {
         mut send: InProcessSend,
         mut recv: InProcessRecv,
     ) {
-        // Announced, not a direct join: a write that finds the pair busy is
-        // queued and replayed, or a batch of writes would deliver only the
-        // one that happened to arrive between two sessions.
+        // Announced, so a pair found busy queues a resync. The replay dials
+        // through `sync_with_peer`, which on this identity's own namespace
+        // resolves to this identity itself and reaches no co-located one.
         let reason = SyncReason::Announced;
         if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
@@ -791,7 +791,7 @@ impl LiveActor {
             Ok(Some(known_useful_peers)) => {
                 // A peer the engine recorded carries a node id and no
                 // identity, so it is dialed as whatever this replica already
-                // learned for it — never recorded as a identity of its own,
+                // learned for it — never recorded with an identity of its own,
                 // or a guess would stick and outlive what a contact says.
                 recorded.extend(known_useful_peers.into_iter().filter_map(|peer_id_bytes| {
                     // peers are stored as bytes, don't fail the operation if they can't be
@@ -1234,7 +1234,7 @@ impl LiveActor {
                     self.broadcast_local_head(namespace, &entry).await;
                 }
                 // A node's own gossip broadcast never reaches its other
-                // subscribers, so a identity co-located with this one is told
+                // subscribers, so an identity co-located with this one is told
                 // here or on the periodic pass (ADR-0013). Content-free like
                 // the broadcast: what the co-located identity obtains comes
                 // through the session its reconcile opens, and its filter.

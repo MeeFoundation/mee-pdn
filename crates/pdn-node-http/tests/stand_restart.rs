@@ -193,9 +193,9 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
     .await
     .context("recovery after the kill")?;
 
-    // Denial: the same image on an empty state directory hosts nothing,
-    // lists nothing, and refuses reads addressed to the restarted node's
-    // identity.
+    // Denial: the same image on an empty state directory has a node id of
+    // its own, hosts nothing, and refuses reads addressed to the restarted
+    // node's identity.
     let fresh = stand.spawn("fresh").await?;
     ensure!(
         node_id(&fresh).await? != id_before,

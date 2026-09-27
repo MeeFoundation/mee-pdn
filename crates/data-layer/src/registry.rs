@@ -7,18 +7,16 @@ use anyhow::{anyhow, Result};
 use pdn_store::{api::Doc, NamespaceId};
 use pdn_types::PdnId;
 
-/// How this node serves a data replica whose issuer it does not host.
-/// Independent of the sync strategy (swarm vs contacts-only), which lives
-/// on the tracked doc.
+/// How an identity serves a data replica it holds. Independent of the sync
+/// strategy (swarm vs contacts-only), which lives on the tracked doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServingPosture {
-    /// Ticket-bounded: the whole replica to any ticket identity — the stance a
-    /// device replicating a store re-serves the next device under.
+    /// As the issuer's own: the identity's devices see it whole, a
+    /// counterparty what the identity granted it.
     Serve,
-    /// Grantee: the slice is served to the devices of the grant's audience
-    /// identity, judged through that identity's directory and the locally
-    /// replicated grant record; everyone else is refused, their rights not
-    /// being computable here.
+    /// Grantee: the issuer's published devices see it whole, the identity's
+    /// own devices the slice its grant record covers; everyone else is
+    /// refused, their rights not being computable here.
     AudienceDevices,
 }
 

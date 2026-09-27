@@ -4,7 +4,7 @@
 //! capability-filtered reconciliation delivers exactly the granted
 //! subset — with the paired denials of
 //! `code-practices/access-control-tests.md` probed in the same place: the
-//! outsider (no connection, no ticket — refused as unknown), the identity of
+//! outsider (no connection, no ticket — refused as unknown), the holder of
 //! the replica's leaked ticket without a grant (obtains nothing), the
 //! existence-hidden withheld claims, and the read-only identity's refused
 //! write.
@@ -62,7 +62,7 @@ async fn scoped_grant_patiently(
 
 /// Allowed: X grants Y read on exactly one claim, and Y converges on
 /// exactly that entry, updates included. Denied: an outsider with no
-/// connection and no ticket is refused as unknown; a identity of the leaked
+/// connection and no ticket is refused as unknown; a holder of the leaked
 /// ticket without a grant obtains nothing; X's other entries never reach Y
 /// (existence hidden); Y's read-only ticket carries no namespace secret, so
 /// its local write is refused.

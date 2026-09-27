@@ -1248,8 +1248,7 @@ async fn a_linked_issuer_keeps_its_own_access_beside_its_grant_audience() -> Res
     let rt_x_device = memory_runtime().await?;
     let rt_shared = memory_runtime().await?;
 
-    // Connected while apart, then one of them linked over — the only path
-    // to two connected identities on one node.
+    // Connected while apart, then X linked over onto Y's node.
     let x = rt_x_device.identity().create().await?;
     let y = rt_shared.identity().create().await?;
     let invite = rt_x_device.connections().invite(x, None).await?;

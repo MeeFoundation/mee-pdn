@@ -576,12 +576,10 @@ async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
 
 /// Two personas of one person on one node, each with an audience of its
 /// own: sharing a process is not sharing an audience. The denials are read
-/// from the peers' side, where each node hosts one identity and the
-/// question is unambiguous — a read on Alice's node names the namespace and
-/// never the reader. Not asserted: that one persona cannot read the other's
-/// data on the node they share. Every enforcement point names the device,
-/// so a device in two device sets resolves to both by design; no layer
-/// draws that boundary.
+/// on the peers' nodes, each hosting one identity. Not asserted: that one
+/// persona cannot read the other's data on the node they share — the
+/// runtime's own refusal, proven by `an_operation_acts_for_the_identity_it_names`
+/// in `pdn-node`'s `tests/data.rs`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // two personas and two audiences, kept in one place

@@ -23,7 +23,7 @@ use crate::{
 /// directly); restart recovery re-binds the data namespace from it.
 pub(crate) const DATA_TICKET_KIND: &str = "data";
 
-/// The undo of a create that does not reach its commit point. A guard
+/// The undo of a create that fails or is dropped before it returns. A guard
 /// rather than a helper because a create can also end by its future being
 /// dropped — an HTTP client that disconnected — and only `Drop` runs then.
 /// The undo touches node-level state alone, never the runtime's coarse
@@ -221,8 +221,11 @@ impl IdentityService for RuntimeIdentityService<'_> {
             }
         };
         rollback.armed_hosting();
-        // The commit point, and the last step that can fail. The lock is
-        // held across it, so the record and the hosted set change as one act.
+        // The commit point, under the lock so the record and the hosted set
+        // change as one act. The author read after it fails only with the
+        // identity's half missing or the node's hosted-identities lock
+        // poisoned: the create then fails, the record stays, and the next
+        // start hosts the identity.
         let mut state = self.runtime.state.lock().await;
         if let Err(err) = state.commit_hosting(identity, directory.namespace()).await {
             drop(state);

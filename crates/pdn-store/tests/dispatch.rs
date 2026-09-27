@@ -207,7 +207,7 @@ async fn holds(doc: &Doc, value: &[u8]) -> Result<bool> {
 /// about the identities that session carries — the one addressed and the
 /// one the caller acts for.
 ///
-/// Denied: a session naming a identity the node does not host is refused
+/// Denied: a session naming an identity the node does not host is refused
 /// exactly as one naming a replica the addressed identity does not hold,
 /// and neither engine's provider is asked about it — the connection is
 /// dispatched before any replica is touched.
@@ -266,7 +266,7 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
         );
     }
 
-    // Denied: a identity this node does not host, and a replica the
+    // Denied: an identity this node does not host, and a replica the
     // addressed identity does not hold, refuse the same way.
     let unhosted = connect_and_sync(
         dialing.router.endpoint(),
