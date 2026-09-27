@@ -296,11 +296,12 @@ pub struct SyncSessionId {
 /// The handle's liveness, not the release message, is what the actor goes
 /// by, and the strong references to a registration are this handle plus a
 /// release message of its own still in the queue. An entry therefore
-/// outlives both by no more than the actor's next tick, whether the message
-/// was lost to a full queue or the handle was never built at all — a caller
-/// cancelled between registration and reply leaves the reference in the
-/// undelivered reply. The message is the prompt path; counting a queued one
-/// as lost would make the reclaim metric fire on ordinary exchanges.
+/// outlives both by no more than the actor's housekeeping cadence, at which
+/// the reclaim pass runs, whether the message was lost to a full queue or
+/// the handle was never built at all — a caller cancelled between
+/// registration and reply leaves the reference in the undelivered reply.
+/// The message is the prompt path; counting a queued one as lost would make
+/// the reclaim metric fire on ordinary exchanges.
 #[must_use = "dropping the handle ends the session and releases its snapshot"]
 #[derive(Debug)]
 pub struct SyncSession {

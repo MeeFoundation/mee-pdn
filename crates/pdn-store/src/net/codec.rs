@@ -1421,6 +1421,8 @@ mod tests {
         Ok(())
     }
 
+    /// A registration whose handle never reached its caller is reclaimed by
+    /// the actor, and a session whose handle is alive is not.
     #[tokio::test]
     async fn a_session_whose_handle_never_arrived_is_reclaimed() -> Result<()> {
         let mut rng = rand::rng();
@@ -1447,16 +1449,22 @@ mod tests {
         assert!(reclaimed, "the abandoned snapshot was never reclaimed");
         // The reclaim is counted, so the same event is visible on a running
         // node and not only from inside this test.
-        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
-        assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+            assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
+        }
 
         // A session whose handle is alive is not swept out from under it.
         let session = handle.sync_session_start(namespace_id).await?;
         tokio::time::sleep(crate::actor::MAX_COMMIT_DELAY * 3).await;
         assert_eq!(handle.debug_session_count().await?, 1);
-        assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
         // Held, not reclaimed: the ordinary path leaves this counter alone.
-        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
+            assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        }
         assert!(handle
             .sync_initial_message(namespace_id, session.id(), None)
             .await
@@ -2355,6 +2363,11 @@ mod tests {
     /// live actor's delivery — that stops draining its bounded channel,
     /// because a release has to sit in the queue across a reclaim pass and
     /// nothing else holds the actor still for that long.
+    ///
+    /// Its subject is the counter, which this crate's `metrics` feature
+    /// provides: without it the test would rest on the feature arriving
+    /// through another crate's defaults.
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn an_ordinary_release_is_not_counted_as_reclaimed() -> Result<()> {
         let mut rng = rand::rng();

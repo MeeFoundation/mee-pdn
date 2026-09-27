@@ -1,7 +1,7 @@
-//! `/live` answers while `/ready` reports a held state lock — the one
-//! property a node in a container cannot be made to show, since no request
-//! on the surface can stall that lock. The only test that builds its own
-//! runtime and router.
+//! `/live` answers while `/ready` reports a held state lock — a property a
+//! node in a container cannot be made to show, since no request on the
+//! surface can stall that lock. It builds its own runtime and router, as
+//! `tests/admission.rs` does for the same reason.
 
 use std::{sync::Arc, time::Duration};
 
