@@ -8,6 +8,9 @@ services:
   agent:
     environment:
       - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+      # The dind service. A TCP address, not a socket: testcontainers takes
+      # the address of the ports it publishes from it.
+      - DOCKER_HOST=tcp://127.0.0.1:2375
     working_dir: /workspaces/mee-pdn
     volumes:
       # Mount the project's code
@@ -15,9 +18,6 @@ services:
       # Host target trees are macOS builds; the container builds into its own volumes.
       - /workspaces/mee-pdn/target
       - /workspaces/mee-pdn/mee-v3-single-device/target
-      # testcontainers and the demo. A container started through it is outside
-      # the tunnel; see README.md, Security.
-      - /var/run/docker.sock:/var/run/docker.sock
       # Read-only devcontainer directory
       - ../.devcontainer:/workspaces/mee-pdn/.devcontainer:ro
       # Read-only settings directory
@@ -26,6 +26,12 @@ services:
       - ${HOME}/.claude/CLAUDE.md:/home/vscode/.claude/CLAUDE.md:ro
       - ${HOME}/.claude/agents:/home/vscode/.claude/agents:ro
       - ${HOME}/.claude/commands:/home/vscode/.claude/commands:ro
+  wg-client:
+    sysctls:
+      # The dind service publishes ports in this namespace from 32768 up, the
+      # range of its own; a local port the agent's connections draw from that
+      # range fails a publish with "address already in use".
+      - net.ipv4.ip_local_port_range=10000 32767
   mitmproxy:
     # sandcat publishes the UI on a dynamic port of every host interface.
     ports: !override
@@ -35,7 +41,45 @@ services:
       # not exist on the host, Docker creates an empty one and the addon
       # simply finds no files — no error.
       - ../.sandcat:/config/project:ro
+  # The stand's Docker daemon: rootless, in wg-client's network namespace, so
+  # its pulls, builds and containers take the tunnel. See README.md, Security.
+  dind:
+    image: docker:29.8.1-dind-rootless
+    network_mode: "service:wg-client"
+    # What rootlesskit needs for its user namespace: unshare, a fresh /proc,
+    # and /dev/net/tun for slirp4netns; newuidmap needs SETUID and SETGID
+    # through file capabilities, which no-new-privileges would block. No
+    # process here runs as root, so the unmasked /proc/sys stays unwritable.
+    security_opt:
+      - seccomp=unconfined
+      - systempaths=unconfined
+      - apparmor=unconfined
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]
+    devices:
+      - /dev/net/tun
+    environment:
+      # Every TLS connection the daemon makes goes through mitmproxy.
+      SSL_CERT_FILE: /mitmproxy-config/mitmproxy-ca-cert.pem
+      # The API on the agent's loopback only.
+      DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS: "-p 127.0.0.1:2375:2375/tcp"
+    command: ["dockerd", "--host=tcp://127.0.0.1:2375", "--tls=false"]
+    volumes:
+      - dind-storage:/home/rootless/.local/share/docker
+      - mitmproxy-public:/mitmproxy-config:ro
+    depends_on:
+      wg-client:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "version"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 60s
+    restart: unless-stopped
 volumes:
   # The name predates sandcat's rename of the volume; auth and history live in it.
   agent-home:
     name: mee-pdn-home
+  dind-storage:
+    name: mee-pdn-dind

@@ -21,6 +21,16 @@ if [ -n "${OPENAI_API_KEY:-}" ] && ! codex login status >/dev/null 2>&1; then
         || echo "codex login failed" >&2
 fi
 
+# VS Code's credential helper is off (devcontainer.json); a credsStore it wrote
+# before names a helper that no longer exists, and every pull fails on it.
+DOCKER_CONFIG_FILE="$HOME/.docker/config.json"
+if [ -f "$DOCKER_CONFIG_FILE" ] \
+    && jq -e '(.credsStore // "") | startswith("dev-containers-")' "$DOCKER_CONFIG_FILE" >/dev/null 2>&1; then
+    jq 'del(.credsStore)' "$DOCKER_CONFIG_FILE" > "$DOCKER_CONFIG_FILE.tmp" \
+        && mv "$DOCKER_CONFIG_FILE.tmp" "$DOCKER_CONFIG_FILE" \
+        || echo "could not remove VS Code's credsStore from $DOCKER_CONFIG_FILE" >&2
+fi
+
 # On every start, since the home volume outlives the image. rustup's own binary:
 # the mise shim sets RUSTUP_TOOLCHAIN, and rustup then ignores rust-toolchain.toml.
 (cd /workspaces/mee-pdn && "$HOME/.cargo/bin/rustup" toolchain install) \

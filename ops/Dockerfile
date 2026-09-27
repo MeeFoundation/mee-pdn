@@ -11,7 +11,12 @@
 # rust-toolchain.toml is outside the build context (.dockerignore), so this
 # tag alone picks the image's compiler: keep its minor with the file's.
 FROM rust:1.98-bookworm AS chef
-RUN cargo install cargo-chef --locked --version 0.1.77
+# A caller behind a TLS-intercepting proxy hands its CA bundle in as the
+# `ca-bundle` secret and points this at it (scripts/build-image.sh). Unset,
+# cargo trusts the image's own roots.
+ARG CARGO_HTTP_CAINFO
+RUN --mount=type=secret,id=ca-bundle,required=false \
+    cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /app
 
 FROM chef AS planner
@@ -19,8 +24,10 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+ARG CARGO_HTTP_CAINFO
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=secret,id=ca-bundle,required=false \
     cargo chef cook --release -p pdn-node-http --recipe-path recipe.json
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

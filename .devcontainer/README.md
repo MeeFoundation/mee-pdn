@@ -136,7 +136,10 @@ SETTINGS
 - Tokens **are not logged** and **not saved in command history**
 - The container gets only mitmproxy's public CA certificate and the generated environment file; the CA private key and the WireGuard keys stay in a volume it does not mount
 - The mitmweb UI listens on `http://127.0.0.1:8081` of the host only (password `mitmproxy`)
-- **The Docker socket is the one way around all of this.** It is mounted for the container tests. A container started through it runs on the host's daemon, outside the tunnel, the network rules and secret substitution, and it can mount any host directory — `~/.config/sandcat/settings.json` with the real tokens included. Anything running in the devcontainer can use it
+- **Docker runs inside the sandbox.** The `dind` service is a rootless Docker daemon for the container tests and the demo; it shares `wg-client`'s network namespace with the agent, which reaches its API at `127.0.0.1:2375`. The daemon runs as an unprivileged user in a user namespace of its own, so a container on it holds no capability over the tunnel's iptables rules or over the Docker Desktop virtual machine, a bind mount resolves inside the `dind` service's own filesystem, and its pulls, builds and containers take the tunnel like the agent's own traffic. The host's Docker socket is mounted nowhere
+- The `dind` service runs with seccomp unconfined, `/proc` unmasked and `/dev/net/tun`, and without `no-new-privileges`: rootlesskit needs the first three for its user namespace, and `newuidmap` gets its capabilities from file capabilities. No process in the service runs as root, which keeps the unmasked `/proc/sys` unwritable, and every capability but `SETUID` and `SETGID` is dropped
+- The API is unauthenticated on that loopback: anything in the devcontainer controls the daemon and every container on it. Such a container gets the agent's network policy and no secret placeholder unless one is passed in
+- VS Code installs a Docker credential helper in the container that answers from the host's credential store and helpers — a gcloud access token, a Docker Hub login — in plain text, where every other secret is a placeholder. `devcontainer.json` turns it off, and `scripts/project-user-init.sh` removes the `credsStore` it left in `~/.docker/config.json`. VS Code reads some Dev Containers settings from the host's user settings only, so set `"dev.containers.dockerCredentialHelper": false` and `"dev.containers.copyGitConfig": false` there as well. Check: after reconnecting, `~/.docker/config.json` in the container has no `credsStore`
 
 ### Token Expiration
 
@@ -211,3 +214,7 @@ docker volume rm mee-pdn-home
 ```
 
 Then rebuild the devcontainer. The volume is recreated from the fresh image, so the new tools land. You will lose container-local user state (shell history, Codex device login, anything cached only inside `/home/vscode`); configured Sandcat tokens re-authenticate on the next start.
+
+### Disk taken by the stand's images
+
+The `dind` service keeps its images, build cache and containers in the `mee-pdn-dind` volume, which every `just build-image` adds to and nothing prunes. `docker system prune` inside the devcontainer reclaims what no container uses; removing the volume on the host with the devcontainer stopped (`docker volume rm mee-pdn-dind`) starts the daemon empty, and the next build fetches its base images again.

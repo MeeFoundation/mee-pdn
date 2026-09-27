@@ -38,6 +38,11 @@
         // app-user-init.sh removes any .gitconfig that gets copied in
         // anyway, as a defense-in-depth cleanup.
         "dev.containers.copyGitConfig": false,
+        // VS Code's Docker credential helper answers from the host's
+        // credential store and helpers (a gcloud token, a Docker Hub
+        // login): a real secret where every other one is a placeholder.
+        // Also set it in host user settings (see README, Security).
+        "dev.containers.dockerCredentialHelper": false,
         // Prompt before trusting workspace settings, which container
         // code could modify via the bind-mounted project folder.
         "security.workspace.trust.enabled": true,

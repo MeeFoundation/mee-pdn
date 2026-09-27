@@ -1,10 +1,9 @@
 # One node of the stand is a container, and one test starts up to four of
 # them. Left to the default, the runner schedules a test per core of *this*
-# machine, which is not the machine the daemon runs on — a suite run inside a
-# development container talks to the host's daemon, and a daemon on a virtual
-# machine reports its own share rather than the host's cores. So the bound
-# comes from what the daemon says about itself: `just test-docker` reads its
-# CPU count and picks the matching profile below.
+# machine, which is not always the machine the daemon runs on — a daemon on a
+# virtual machine reports its own share rather than the host's cores. So the
+# bound comes from what the daemon says about itself: `just test-docker` reads
+# its CPU count and picks the matching profile below.
 #
 # The rungs are a ladder rather than an expression because the runner reads
 # this file before any code of ours runs, and its group bound takes a number,
