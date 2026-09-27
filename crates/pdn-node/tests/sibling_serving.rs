@@ -285,9 +285,9 @@ async fn a_withdrawn_grant_takes_the_namespace_back_out() -> Result<()> {
 }
 
 /// A namespace imported out of band stays readable to the identity that
-/// imported it and is re-served to nobody: neither an identity hosted
-/// beside it on the same node nor an outsider, both holding the very
-/// ticket the import used, obtains anything from it.
+/// imported it and is re-served neither to an identity hosted beside it on
+/// the same node nor to an outsider, though both hold the very ticket the
+/// import used.
 ///
 /// Denied: both probe over several of their own reconcile intervals,
 /// ordered after the importer's own read proves the entries are here to

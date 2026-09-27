@@ -398,7 +398,7 @@ impl PrivateMetadataStore {
     }
 
     /// Promote `device` from pending to confirmed. Written by the newcomer
-    /// itself: only a identity of the write ticket can, so the record is
+    /// itself: only a holder of the write ticket can, so the record is
     /// evidence the linking reply arrived — which the inviter cannot
     /// establish on its own.
     pub async fn confirm_device(&self, device: NodeId) -> Result<()> {
@@ -605,9 +605,10 @@ impl PrivateMetadataStore {
     }
 
     /// A detail-free item after every observed change — an entry written
-    /// here, arrived by sync, or a payload become readable; a burst past the
-    /// subscription's buffer arrives as one item. An `Err` item is the
-    /// subscription failing; the stream ends with the node.
+    /// here, arrived by sync, or a payload become readable; a burst past
+    /// either of the subscription's two buffers arrives as one item per
+    /// buffer. An `Err` item is the subscription failing; the stream ends
+    /// with the node.
     pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
         let events = self.events().await?;
         Ok(events.filter_map(|event| match event {

@@ -251,7 +251,7 @@ pub struct DocsDispatch {
 }
 
 impl DocsDispatch {
-    /// Dispatch by `resolve`, which answers with the engine of a identity
+    /// Dispatch by `resolve`, which answers with the engine of an identity
     /// this node hosts.
     pub fn new(resolve: IdentityResolver) -> Self {
         Self { resolve }
@@ -286,7 +286,7 @@ async fn serve_dispatched(
             .await
             .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,
         // Byte-identical to the refusal a replica this node does not
-        // hold draws, so naming a identity tells a caller nothing.
+        // hold draws, so naming an identity tells a caller nothing.
         None => refuse_session(opening, AbortReason::NotFound)
             .await
             .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?,

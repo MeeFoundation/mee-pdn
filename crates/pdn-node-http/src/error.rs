@@ -74,7 +74,8 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
         || err.downcast_ref::<WriteNotGranted>().is_some()
         || err.downcast_ref::<DelegationUnsupported>().is_some()
     {
-        // The runtime's rules said no.
+        // The runtime's rules said no, or a ceremony reached its inviter and
+        // no answer came back.
         StatusCode::FORBIDDEN
     } else if err.downcast_ref::<UnknownIdentity>().is_some()
         || err.downcast_ref::<UnknownIssuer>().is_some()

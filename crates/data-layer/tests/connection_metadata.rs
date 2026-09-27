@@ -226,8 +226,8 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
 /// round-trip, a grant published long after the exchange with no new
 /// tickets, a withdrawal that reads absent everywhere, and concurrent
 /// updates of one grant key converging to a single entry. A grant lists as
-/// soon as its record syncs and reads absent until its payload arrives; the
-/// polls ride that contract.
+/// soon as its record syncs and reads as unreadable until its payload
+/// arrives; the polls ride that contract.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the pair's whole lifetime in one place
 async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {

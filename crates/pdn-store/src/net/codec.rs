@@ -1051,7 +1051,7 @@ mod tests {
     /// A session carries both identities to the serving side, over a stream
     /// pair with no network under it.
     ///
-    /// Denied: a caller that names a identity the serving side refuses sees
+    /// Denied: a caller that names an identity the serving side refuses sees
     /// its request declined and no entry served.
     #[tokio::test]
     async fn a_session_names_both_identities_to_the_serving_side() -> Result<()> {

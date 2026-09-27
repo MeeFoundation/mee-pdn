@@ -301,12 +301,11 @@ async fn two_identities_of_one_node_write_as_two_authors() -> Result<()> {
     Ok(())
 }
 
-/// A co-located pair whose replicas differ is caught up by the periodic
-/// pass over the pairs, and a pair that has converged is left alone: the
-/// grantee holds no contact to dial and the grant is published after its
-/// import, so neither a write announcement nor a dial of its own can be
-/// what delivers; once delivered, the pair opens no further session over
-/// several intervals.
+/// A co-located pair is caught up by the periodic pass over the pairs, and
+/// a pair that has gone quiet is left alone: the grantee holds no contact
+/// to dial and the grant is published after its import, so neither a write
+/// announcement nor a dial of its own can be what delivers; once
+/// delivered, the pair opens no further session over several intervals.
 ///
 /// Denied: before the grant is published the same import obtains nothing
 /// over several passes, which is also what makes the delivery afterwards
@@ -361,7 +360,7 @@ async fn the_periodic_pass_catches_up_a_co_located_pair_and_leaves_a_quiet_one_a
     );
 
     // The grant alone, with no write into the namespace after it: what
-    // delivers can only be a pass over a pair that differs.
+    // delivers can only be a pass.
     pair.left_own
         .publish_grant(
             &ReadGrant {
@@ -571,7 +570,7 @@ async fn a_grant_widened_without_a_write_reaches_the_co_located_audience() -> Re
 ///
 /// Denied: the claim the grant withholds stays absent although the same
 /// announcement is what opened the session that carried the granted one
-/// — the announcement names a namespace and a identity, never an entry.
+/// — the announcement names a namespace and an identity, never an entry.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, the arrangement and both waves in one place
 async fn a_write_reaches_a_co_located_identity_before_the_next_pass() -> Result<()> {

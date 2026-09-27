@@ -3,9 +3,10 @@
 //! Environment: `PDN_DATA_DIR` (required — the runtime's storage directory;
 //! the host offers no in-memory mode, and unset stops the start),
 //! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`), and
-//! `PDN_DEBUG=1` to mount the scaffolding `/debug/` routes (absent
-//! otherwise). The binary is glue only — assembly and authorization
-//! posture live in `pdn-node` (see the library crate docs).
+//! `PDN_DEBUG` — `1` or `true` mounts the scaffolding `/debug/` routes,
+//! unset, `0` or `false` leaves them absent, and any other value stops the
+//! start. The binary is glue only — assembly and authorization posture
+//! live in `pdn-node` (see the library crate docs).
 
 use std::{sync::Arc, time::Duration};
 

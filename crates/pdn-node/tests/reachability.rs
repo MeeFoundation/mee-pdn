@@ -2,9 +2,10 @@
 //! that published the grant; the scenarios turn the publishing device off
 //! and require convergence from another, asserting the contact set through
 //! the `test-util` surface rather than sleeping on it. Paired denial: the
-//! serving sibling gives a bare ticket identity nothing. The grant sweep's
-//! replica lifecycle (ADR-0009: one shared replica, last withdrawal takes
-//! it) is asserted on the same surface. Compiles only under `test-util`.
+//! serving sibling gives a bare ticket holder nothing. The grant sweep's
+//! replica lifecycle (ADR-0013: a replica per audience, each withdrawal
+//! taking its own) is asserted on the same surface. Compiles only under
+//! `test-util`.
 #![cfg(feature = "test-util")]
 
 use std::{cell::RefCell, time::Duration};

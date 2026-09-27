@@ -6,7 +6,7 @@
 //! connection's authenticated node id, and replies with fresh write tickets
 //! to the directory and the data namespace. Pending confers nothing; the
 //! newcomer confirms itself once the tickets are in hand, since only a
-//! identity of the directory's write ticket can, which is evidence the reply
+//! holder of the directory's write ticket can, which is evidence the reply
 //! arrived. The dial side arms classification the moment the directory is
 //! imported — before the data namespace exists, so no serving window opens
 //! on the long-lived namespace id — and rolls everything back on any
@@ -420,9 +420,9 @@ async fn link_via_dialogue_inner(
         pause.release.notified().await;
     }
 
-    // The commit point: after the catch-up, before anything is written into
-    // the directory this device now shares — a failure rolls the link back
-    // whole, and no sibling ever saw this attempt.
+    // The commit point: after the catch-up, before this device confirms its
+    // own record in the directory it now shares — a failure rolls the link
+    // back whole, and no sibling ever sees this device confirmed.
     let mut guard = state.lock().await;
     let author = match guard.node.default_author(payload.identity) {
         Ok(author) => author,
@@ -716,11 +716,12 @@ async fn run_linking_dialogue(
     Ok(response)
 }
 
-/// Undo an abandoned link's local effects in reverse order, best-effort.
-/// The link brought up the identity's own half of the node, so dropping
-/// it reaches exactly what the link imported and nothing else: a
-/// namespace of the same issuer held under another identity's grant is in
-/// that identity's stores and is untouched. Locks `state` only after the
+/// Undo an abandoned link's local effects, best-effort: the data import,
+/// the directory, then the identity's half of the node, whose removal
+/// disarms it. The link brought up that half, so dropping it reaches
+/// exactly what the link imported and nothing else: a namespace of the same
+/// issuer held under another identity's grant is in that identity's stores
+/// and is untouched. Locks `state` only after the
 /// import is undone — [`SelfCleaningImport::undo`] locks it itself.
 async fn undo_link(
     state: &Arc<Mutex<State>>,

@@ -175,8 +175,9 @@ impl ConnectionMetadataStore {
 
     /// An item after every observed change of this replica — an entry written
     /// here, an entry arrived by sync, or a payload blob become readable; a
-    /// burst past the subscription's buffer arrives as one item. Detail-free:
-    /// the fork's event vocabulary stays behind this layer.
+    /// burst past either of the subscription's two buffers arrives as one
+    /// item per buffer. Detail-free: the fork's event vocabulary stays
+    /// behind this layer.
     /// `ContentReady` counts because grant payloads are blobs: only the
     /// payload event tells a consumer a record has become readable. An `Err`
     /// item is the subscription failing; the stream ends with the node.

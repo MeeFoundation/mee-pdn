@@ -417,9 +417,11 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
 /// than its unread subscription buffers, reads them all, and still writes
 /// and lists, while the subscription reports the changes it dropped.
 ///
-/// Six hundred records: a subscription buffers around 320 events. Each probe
-/// waits the whole budget: the store stopping for good is what it catches,
-/// and a loaded runner holds one call for seconds.
+/// Six hundred records: past the 256-slot insert buffer and the 64 slots of
+/// the RPC stream behind it, while the 256-slot live buffer does not fill,
+/// the records sharing one payload. Each probe waits the whole budget: the
+/// store stopping for good is what it catches, and a loaded runner holds
+/// one call for seconds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
     const RECORDS: u16 = 600;

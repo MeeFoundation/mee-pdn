@@ -80,7 +80,7 @@ Each angle is its own agent, blind to the others. The eleven subjects are fixed 
 
 Each angle's prompt carries: the dump paths, the file list, the map from the "Map" phase, the **verbatim context from `$ARGUMENTS`**, the execution rules (§1 step 9 and "What an agent may and may not run"), and the requirement to read the sources around the diff, not the diff alone.
 
-**An angle returns whole findings, fixes included** — the mechanism, then fix options with product and architecture consequences separately, then a recommendation weighed by `code-practices/decision-priorities.md`, argued in substance rather than by citing it. Writing fixes on candidates that triage will merge and verification will kill is real waste, paid deliberately: fixes staged behind verification sit behind two barriers, and an early finalize then returns mechanisms with no fixes at all — measured, on all fourteen findings of the run that tried it. An unverified finding that says what to do about it is still worth reading; stripped of fixes it is a note to self.
+**An angle returns whole findings, fixes included** — the mechanism and its example per `code-practices/examples.md`, then fix options with product and architecture consequences separately, then a recommendation weighed by `code-practices/decision-priorities.md`, argued in substance rather than by citing it. Writing fixes on candidates that triage will merge and verification will kill is real waste, paid deliberately: fixes staged behind verification sit behind two barriers, and an early finalize then returns mechanisms with no fixes at all — measured, on all fourteen findings of the run that tried it. An unverified finding that says what to do about it is still worth reading; stripped of fixes it is a note to self.
 
 **A fix far outside the scope of the reviewed change is offered as its own option: move the finding into a draft proposal.** When closing a finding means work on a subject the change does not touch — the change removes prefix semantics from `pdn-store`, the finding is about clocks disagreeing between nodes — one of its options is a new change holding only a `proposal.md` with the case, its example and the options it opens, and taking no decision among them. The recommendation weighs it like any other option.
 
@@ -293,6 +293,8 @@ The template below is in English. When the review language is something else, th
 
 **How it shows up:** <the exact trigger: which input, which state, what the affected party observes, and the path behind the reach — the public `pdn-node` operation and the condition, the input a modified node sends, or why neither reaches it. What it was checked with — a run, a mutation, a probe; if it was never reproduced, say so plainly.>
 
+**Example:** <the failure rendered as one concrete case per `mia-docs/openspec/specs/code-practices/examples.md`, on real values, in whatever shape the case calls for (a timeline for a race or the steps with what survives each for a crash, for instance) — a few rows, the wrong outcome last: a markdown table when it is a table, a fenced block otherwise. A defect that only a future edit opens starts its trace with step 0, that edit. The field is left out where an example would be contrived.>
+
 **What causes it:** <the mechanism through the code with line references: what exactly permits this and why the existing checks do not catch it.>
 
 **Who suffers:** <which party and what it loses: the node, the issuer, the audience, an embedder, an operator, a future refactor.>
@@ -330,6 +332,8 @@ A finding that extends an open change (§3 step 4) keeps the same fields, with t
 **File:** … · **CONFIRMED** · … · **Reach:** …
 
 **How it shows up:** <as always.>
+
+**Example:** <as always.>
 
 **What causes it:** <as always.>
 

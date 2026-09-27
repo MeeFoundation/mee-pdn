@@ -240,7 +240,7 @@ pub struct SyncNode {
     /// share of it is cut as that store opens.
     cache_budget_bytes: usize,
     /// Sessions [`reconcile_co_located`] has opened, so a scenario can
-    /// assert that a pass over a converged pair opens none.
+    /// assert that a pass over a quiet pair opens none.
     #[cfg(feature = "test-util")]
     co_located_sessions: CoLocatedPassSessions,
     storage: StorageConfig,
@@ -325,10 +325,12 @@ struct HostedStack {
     /// At most one nudge in flight per namespace, so a tight poll loop
     /// cannot pile up attempts against one replica.
     nudges_in_flight: Mutex<HashSet<NamespaceId>>,
-    /// Announcements of a local write already on their way to a co-located
-    /// identity. One write that finds the pair busy is queued by the engine
-    /// and replayed, so the rest of a batch buys nothing but a task, a pipe
-    /// and a message through the actor's inbox each.
+    /// Requests to reconcile with a co-located identity — a write's
+    /// announcement or a contact naming this node — each held from when the
+    /// node takes it up until the callee has read the session's first
+    /// message or the opening failed. Another for the same pair meanwhile is
+    /// dropped, not replayed to it: a later announcement or pass carries
+    /// what it would have.
     announcements_in_flight: Mutex<HashSet<(NamespaceId, Identity)>>,
 }
 
@@ -593,7 +595,7 @@ impl SyncNode {
     }
 
     /// Sessions the periodic pass over the co-located pairs has opened —
-    /// what shows that a pass over a converged pair opens none. Counted
+    /// what shows that a pass over a quiet pair opens none. Counted
     /// per namespace, because a pair holds its data replica and its two
     /// connection stores alike, and a scenario about one of them cannot be
     /// read off a total the other two move.
@@ -653,8 +655,9 @@ impl SyncNode {
 
     /// What the caches of this node's replica stores may together hold:
     /// the bounds handed out. An identity provisioned while the node runs
-    /// takes a share cut from a smaller set, so the sum passes the budget
-    /// until the next start cuts every share from the whole set.
+    /// leaves the stores already open at shares cut from a smaller set, so
+    /// the sum passes the budget until the next start cuts every share from
+    /// the whole set.
     pub fn replica_cache_ceilings_bytes(&self) -> Result<usize> {
         Ok(self
             .identities
@@ -680,8 +683,11 @@ impl SyncNode {
     /// Record `identity` as hosted here, with `directory` as its private
     /// metadata directory: the commit point of a create or a link. The
     /// replicas are flushed first, so the record never names one the store
-    /// has not written, and the record is written beside and renamed over,
-    /// so a failure leaves none. A node in memory records nothing.
+    /// has not written, and the record is written beside, synced and
+    /// renamed over, so a process that dies mid-write leaves none. The
+    /// parent directory is not synced after the rename, so an OS crash or a
+    /// power loss can take the record back after this returned `Ok`. A node
+    /// in memory records nothing.
     pub async fn record_hosting(&self, identity: PdnId, directory: NamespaceId) -> Result<()> {
         let StorageConfig::Directory(root) = &self.storage else {
             return Ok(());
@@ -841,8 +847,9 @@ impl SyncNode {
     }
 
     /// The grantee import: never joins the replica's gossip swarm, and
-    /// re-serves it only to the devices of the grant's audience identity per
-    /// the locally replicated grant record.
+    /// re-serves it only to the issuer's published devices, whole, and to
+    /// the audience identity's own devices per the locally replicated grant
+    /// record.
     pub async fn import_namespace_scoped(
         &self,
         identity: PdnId,
@@ -1220,10 +1227,8 @@ impl SyncNode {
     /// dropped replica.
     pub async fn forget_namespace(&self, identity: PdnId, issuer: PdnId) -> Result<()> {
         let stack = self.require(identity)?;
-        // Drop first: the reverse order opens a window in which the replica
-        // is alive but unknown to the book, and so served whole; a failed
-        // drop leaves the registration in place, so a retry still resolves
-        // the issuer.
+        // Drop first: a failed drop leaves the registration in place, so a
+        // retry still resolves the issuer.
         let binding = stack
             .registry
             .binding(issuer)?
@@ -1767,11 +1772,9 @@ pub struct IdentityNotProvisioned {
     pub identity: PdnId,
 }
 
-/// The identities the storage directory holds, one subdirectory each:
-/// what a store's share of the cache budget is cut from, so no host
-/// states a count of its own (ADR-0013).
 /// The identities whose subdirectory holds a hosting record, plus
-/// `opening` when its own does not yet.
+/// `opening` when its own does not yet: what a store's share of the cache
+/// budget is cut from, so no host states a count of its own (ADR-0013).
 fn hosted_identity_count(directory: &std::path::Path, opening: PdnId) -> Result<usize> {
     let identities = directory.join(IDENTITIES_DIR);
     let context = || {
@@ -2261,9 +2264,10 @@ pub(crate) async fn read_payload(
 
 /// Every `interval`, re-request a sync for each hosted identity's tracked
 /// docs with their contacts (the engine unions in the peers it recorded),
-/// and reconcile the co-located pairs whose replicas differ. A failed
-/// request is retried by the next pass. Ends when `stop` is sent or its
-/// sender is dropped with the node.
+/// and reconcile each co-located pair unless its write counts
+/// ([`PairReading`]) stand where its last successful pass session found
+/// them. A failed request is retried by the next pass. Ends when `stop` is
+/// sent or its sender is dropped with the node.
 async fn reconcile_pass(
     interval: Duration,
     identities: Identities,
@@ -2303,17 +2307,14 @@ async fn reconcile_pass(
 /// own.
 type CoLocatedPassSessions = Arc<Mutex<HashMap<NamespaceId, u64>>>;
 
-/// What a co-located pair looked like when it last reconciled: how many
-/// writes each side's replica had taken, and how many each side's
-/// connection stores had, both sides in the pair's canonical order. A pass
-/// skips the pair only while all four stand still.
+/// What a co-located pair looked like before its last successful pass
+/// session: how many writes each side's replica had taken, and how many
+/// each side's connection stores had, both sides in the pair's canonical
+/// order. A pass skips the pair only while all four stand still.
 ///
-/// Equality of the two replicas is not the question and cannot be: a
-/// replica held under a claim-scoped grant is poorer than the issuer's by
-/// construction, so the two are never equal and no digest of them says
-/// otherwise. What decides whether anything is owed is the grant, and it
-/// lives in the connection stores, where it changes with no write to the
-/// namespace at all.
+/// The two replicas are not compared: one held under a claim-scoped grant
+/// lacks for good what the grant withholds, and the grant lives in the
+/// connection stores, where it changes with no write to the namespace.
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct PairReading {
     source_writes: u64,
@@ -2381,8 +2382,9 @@ async fn pair_reading(
 }
 
 /// Reconcile each pair of hosted identities holding one namespace, and
-/// leave alone a pair where nothing has moved since they last reconciled —
-/// a pass over a quiet namespace must not accumulate sessions.
+/// leave alone a pair where nothing has moved since the pass last
+/// reconciled it — a pass over a quiet namespace must not accumulate
+/// sessions.
 async fn reconcile_co_located(
     stacks: &[Arc<HostedStack>],
     opened: &CoLocatedPassSessions,
