@@ -10,15 +10,6 @@
 # not a computation. A caller that names no profile gets `stand-2`, which is
 # safe on any daemon; the recipe names a wider rung when the daemon has the
 # cores to back it.
-#
-# Measured on a daemon holding 8 CPUs, over 15 tests in 4 binaries: 1 slot
-# takes 56 seconds, 2 takes 29, 4 takes 16, 8 takes 13. The floor is the
-# suite's longest single test, about 12 seconds, which 8 nearly reaches and
-# 4 does not — so on a daemon this size every rung up to 8 still buys time,
-# and the rung the daemon's size selects is the one that matters. No
-# container missed its readiness budget at any rung: the replacement log
-# stayed empty across all four runs. The figures follow the suite's size and
-# shape, so a growth worth noticing is worth measuring.
 [test-groups]
 stand-1 = { max-threads = 1 }
 stand-2 = { max-threads = 2 }
