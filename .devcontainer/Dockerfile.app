@@ -39,9 +39,6 @@ COPY --chmod=755 scripts/project-user-init.sh /usr/local/bin/project-user-init.s
 COPY --chown=vscode:vscode sandcat/tmux.conf /home/vscode/.tmux.conf
 COPY codex/config.toml /etc/codex/config.toml
 
-RUN groupadd -f docker \
-    && usermod -aG docker vscode
-
 # Outside the home volume, so a rebuild upgrades it. CODEX_HOME applies to the
 # installer only; at runtime Codex reads ~/.codex.
 RUN curl -fsSL https://chatgpt.com/codex/install.sh | \

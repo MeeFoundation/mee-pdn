@@ -75,8 +75,9 @@ jobs:
 
   stand:
     runs-on: ubuntu-26.04
-    # A release image build plus the container suite. Past this the job is
-    # stuck rather than slow, and the runner's own ceiling is six hours.
+    # A release image build plus the container suite and the demo. Past this
+    # the job is stuck rather than slow, and the runner's own ceiling is six
+    # hours.
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -102,6 +103,7 @@ jobs:
       # pays for the dependency stage once. Built here rather than through
       # `just test-docker`, which builds without that cache.
       - name: Build the stand's image
+        id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -122,3 +124,14 @@ jobs:
           [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
           export PDN_STAND_IMAGE
           cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all
+
+      # The demo from the same image, whatever the scenarios returned: it
+      # drives the whole debug surface in order, and nothing else notices when
+      # a route moves under it.
+      - name: Run the demo
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
+        run: |
+          PDN_STAND_IMAGE="$(just stand-image)"
+          [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
+          export PDN_STAND_IMAGE
+          just demo

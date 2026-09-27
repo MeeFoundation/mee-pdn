@@ -68,9 +68,7 @@ image := "pdn-node-http:dev"
 # Build the stand's image from the workspace.
 [doc("Build the stand's node image")]
 build-image:
-  #!/bin/sh
-  set -eux
-  DOCKER_BUILDKIT=1 docker build -f ops/Dockerfile -t {{ image }} .
+  @sh scripts/build-image.sh {{ image }}
 
 # What the build context actually carries, listed against the allowed set in
 # .dockerignore. The criterion is presence — anything outside that set is a
