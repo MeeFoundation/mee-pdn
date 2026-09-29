@@ -390,6 +390,18 @@ impl Runtime {
         self.state.lock().await.node.hosted_identities()
     }
 
+    /// The announcement public key in `identity`'s own directory on this
+    /// runtime; `None` until its payload has arrived.
+    #[cfg(feature = "test-util")]
+    pub async fn announcement_public_key_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let state = self.state.lock().await;
+        let key = state.hosted(identity)?.directory.announcement_key().await?;
+        Ok(key.map(|key| key.public_key()))
+    }
+
     /// Fail every pair arming from now on.
     #[cfg(feature = "test-util")]
     pub async fn fail_pair_arm_for_test(&self) {

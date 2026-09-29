@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, PrivateMetadataStore, ShareMode};
+use data_layer::{AddrInfoOptions, AnnouncementKeyPair, PrivateMetadataStore, ShareMode};
 use pdn_types::PdnId;
 
 use crate::{
@@ -119,8 +119,9 @@ async fn undo_create(
 /// Creating and linking identities on a runtime.
 #[allow(async_fn_in_trait)]
 pub trait IdentityService {
-    /// Create an identity on its first device: a placeholder [`PdnId`] (a
-    /// random identifier, no key material) with its store set provisioned.
+    /// Create an identity on its first device: its announcement key pair,
+    /// the [`PdnId`] that pair's public key derives, and its store set
+    /// provisioned, the pair kept in its directory.
     async fn create(&self) -> Result<PdnId>;
 
     /// Mint a linking invite for hosted `identity`; `lifetime` overrides
@@ -156,7 +157,8 @@ impl<'rt> RuntimeIdentityService<'rt> {
 
 impl IdentityService for RuntimeIdentityService<'_> {
     async fn create(&self) -> Result<PdnId> {
-        let identity = PdnId::from_bytes(rand::random());
+        let announcement_key = AnnouncementKeyPair::generate();
+        let identity = announcement_key.pdn_id();
         // Provisioning needs no coarse lock, and holding it across the
         // store work would put every other caller behind one ceremony.
         let (node, cleanup_tasks, injected_failure) = {
@@ -196,6 +198,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
             // device holds a ticket to this fresh directory, so nothing
             // written here can reach anyone.
             directory.add_device(node.node_id()).await?;
+            directory.put_announcement_key(&announcement_key).await?;
             node.create_namespace(identity, identity).await?;
             let data_ticket = node
                 .share_ticket(

@@ -35,7 +35,7 @@ pub struct Connection {
     pub claim_ids: Vec<ClaimId>,
 }
 
-pdn_types::define_byte_id! {
+pdn_types::define_byte_id_32! {
     pub struct ConnectionId;
 }
 

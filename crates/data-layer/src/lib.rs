@@ -16,6 +16,8 @@
 //! are opaque payloads at this level. Errors are `anyhow`.
 
 mod access;
+mod announcement;
+mod cell;
 pub mod connection_metadata;
 pub mod grant;
 pub mod layer;
@@ -25,6 +27,8 @@ mod registry;
 mod retraction;
 
 pub use access::identity_of;
+pub use announcement::{cell_id_of, pdn_id_of, AnnouncementKeyPair};
+pub use cell::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };

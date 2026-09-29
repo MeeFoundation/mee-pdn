@@ -43,7 +43,7 @@ pub struct UwillCapability {
     pub nonce: [u8; 12],
 }
 
-pdn_types::define_byte_id! {
+pdn_types::define_byte_id_32! {
     /// CID of a `UWill` delegation — used for revocation references.
     pub struct CapabilityCid;
 }

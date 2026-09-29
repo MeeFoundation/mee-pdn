@@ -1,9 +1,10 @@
 //! The private metadata store: the one device-replicated directory of an
 //! identity's own state, device-internal by ticket alone (Invariant 1).
 //! Five record families under disjoint prefixes: `devices/`,
-//! `pending-devices/`, `tickets/`, `connections/`, `retractions/`. Device
-//! and connection records are record-level; ticket and marker payloads are
-//! blobs, so their reads wait for content.
+//! `pending-devices/`, `tickets/`, `connections/`, `retractions/`, and the
+//! announcement key pair at `announcement-key`. Device and connection
+//! records are record-level; ticket, marker and key payloads are blobs, so
+//! their reads wait for content.
 
 use std::{
     collections::HashSet,
@@ -27,7 +28,10 @@ use pdn_store::{
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 
-use crate::node::{read_payload, SyncNode};
+use crate::{
+    announcement::AnnouncementKeyPair,
+    node::{read_payload, SyncNode},
+};
 
 /// The wait of [`CatchUpWatch::wait`] elapsed. Downcast
 /// from its `anyhow::Error` to tell "did not catch up in time" from this
@@ -94,6 +98,7 @@ pub const PENDING_DEVICE_TTL: Duration = Duration::from_hours(24);
 const TICKETS_PREFIX: &str = "tickets/";
 const CONNECTIONS_PREFIX: &str = "connections/";
 const RETRACTIONS_PREFIX: &str = "retractions/";
+const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
 
 pub(crate) fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
@@ -595,6 +600,34 @@ impl PrivateMetadataStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// Written once, by the identity's creation; the payload is the 32
+    /// secret bytes, from which the pair follows.
+    pub async fn put_announcement_key(&self, key: &AnnouncementKeyPair) -> Result<()> {
+        self.doc
+            .set_bytes(
+                self.author,
+                ANNOUNCEMENT_KEY_PATH.as_bytes().to_vec(),
+                key.secret_bytes().to_vec(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `Ok(None)` while the payload is still syncing. A payload that does
+    /// not decode is an error, as for [`Self::get_ticket`].
+    pub async fn announcement_key(&self) -> Result<Option<AnnouncementKeyPair>> {
+        let Some(bytes) =
+            read_payload(&self.doc, &self.blobs, ANNOUNCEMENT_KEY_PATH.as_bytes()).await?
+        else {
+            return Ok(None);
+        };
+        let secret: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .context("an announcement key payload is not 32 bytes")?;
+        Ok(Some(AnnouncementKeyPair::from_secret_bytes(&secret)))
     }
 
     /// Crate-private: the fork's event type stays behind this layer.
