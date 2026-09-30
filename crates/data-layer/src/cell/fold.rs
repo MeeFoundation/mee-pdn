@@ -25,13 +25,14 @@ pub struct HeldEntry {
     pub payload: Option<Vec<u8>>,
 }
 
-/// What one held entry counts for, over everything the device holds.
+/// What one held entry counts for, over everything the device holds: in the
+/// membership store by the fold, in the record store by the record view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Counted,
     CountedForNothing(ForNothing),
     NotYet(Awaiting),
-    /// The key fits no membership layout: kept, and read by nothing.
+    /// The key fits no layout of its store: kept, and read by nothing.
     OutsideLayout,
 }
 
@@ -51,9 +52,12 @@ pub enum ForNothing {
     /// A join, kick or demotion whose actor is its subject; a leave whose
     /// actor is not.
     WrongActor,
-    /// Its author is no device of the actor its key names.
+    /// Its author is no device of the actor, or the writer, its key names.
     AuthorNotActorDevice,
-    /// The actor lacks, at the point it names, the state the act needs.
+    /// An operation whose author is not the one its key names.
+    AuthorNotNamed,
+    /// The actor, or the writer, lacks at the point its key names the state
+    /// the entry needs.
     ActorLacksState,
     /// The subject's state before its sequence allows no such transition.
     TransitionNotAllowed,
@@ -66,7 +70,8 @@ pub enum ForNothing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Awaiting {
     Payload,
-    /// The actor's chain is not held up to the point the event names.
+    /// The actor's or the writer's chain is not held up to the point its
+    /// key names.
     ActorChain,
     /// The subject's chain is not held up to the sequence before the
     /// event's.

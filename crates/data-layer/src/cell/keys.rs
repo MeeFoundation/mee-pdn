@@ -152,7 +152,7 @@ impl fmt::Display for MembershipKey {
 /// writer the operation reads as, the author that signs it, the writer's
 /// membership sequence and the author's own count of its operations on the
 /// record, from 1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpId {
     pub writer: PdnId,
     pub author: AuthorId,

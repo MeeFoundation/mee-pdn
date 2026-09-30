@@ -20,7 +20,7 @@ crate::define_byte_id_16! {
 
 /// The kind a record is placed as, chosen once; its name is the kind's
 /// segment in the record's key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecordKind {
     Claim,
@@ -65,7 +65,7 @@ impl FromStr for RecordKind {
 
 /// A record's identity, whatever its kind: the member under whose name it
 /// sits, its kind and its id — its key without the last segment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RecordRef {
     pub member: PdnId,
     pub kind: RecordKind,

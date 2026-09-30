@@ -33,7 +33,7 @@ pub use cell::CellVerdicts;
 pub use cell::{
     record_prefix, Awaiting, CellStore, CellTickets, DevicesPayload, EventKind, ForNothing,
     FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice, MemberState, Membership,
-    MembershipKey, OpId, RecordKey, Seq, UnknownCell, Verdict,
+    MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView, Seq, UnknownCell, Verdict,
 };
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,

@@ -33,12 +33,15 @@ use pdn_store::{
     store::Query,
     AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
 };
-use pdn_types::{CellId, EntryInfo, EntryPath, NodeId, PdnId};
+use pdn_types::{CellId, EntryInfo, EntryPath, NodeId, PdnId, RecordRef};
 use tokio::sync::oneshot;
 
 use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
-    cell::{CellStore, CellTickets, Membership, UnknownCell},
+    cell::{
+        record_entries, record_prefix, CellStore, CellTickets, Membership, Operation, RecordView,
+        UnknownCell,
+    },
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
     registry::{CellBinding, Registry, ServingPosture},
@@ -1509,6 +1512,66 @@ impl SyncNode {
             return Err(UnknownCell { cell }.into());
         }
         stack.access.fold_cell(cell, &held.membership).await
+    }
+
+    /// The record view over `identity`'s replica of `cell`'s record store,
+    /// judged by the membership its membership store folds into; payloads
+    /// are checked for arrival, not read. [`UnknownCell`] for a tombstone
+    /// too.
+    pub async fn cell_record_view(&self, identity: PdnId, cell: CellId) -> Result<RecordView> {
+        self.record_view(identity, cell, Query::all()).await
+    }
+
+    /// A claim's or an immutable-document's payload: of the record's
+    /// entries that read, the newest; `None` when none does.
+    pub async fn read_cell_record(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: &RecordRef,
+    ) -> Result<Option<Vec<u8>>> {
+        let view = self
+            .record_view(identity, cell, Query::key_prefix(record_prefix(record)))
+            .await?;
+        let Some(hash) = view.placed(record).and_then(|entry| entry.payload) else {
+            return Ok(None);
+        };
+        Ok(Some(self.blobs.get_bytes(hash).await?.to_vec()))
+    }
+
+    /// A mergeable-document's operations that read, in the order of their
+    /// ids.
+    pub async fn read_cell_operations(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: &RecordRef,
+    ) -> Result<Vec<Operation>> {
+        let view = self
+            .record_view(identity, cell, Query::key_prefix(record_prefix(record)))
+            .await?;
+        let mut operations = Vec::new();
+        for (id, entry) in view.operations(record) {
+            if let Some(hash) = entry.payload {
+                let payload = self.blobs.get_bytes(hash).await?.to_vec();
+                operations.push(Operation { id, payload });
+            }
+        }
+        Ok(operations)
+    }
+
+    async fn record_view(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        query: impl Into<Query>,
+    ) -> Result<RecordView> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        let records = held.records.ok_or(UnknownCell { cell })?;
+        let membership = stack.access.fold_cell(cell, &held.membership).await?;
+        let entries = record_entries(&records, &self.blobs, query).await?;
+        Ok(RecordView::new(&membership, entries))
     }
 
     /// Write `payload` at `key` into one of `cell`'s stores with
