@@ -197,6 +197,10 @@ impl AccessBook {
         peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
+        // A cell's store: nothing here resolves a caller to a member.
+        if registry.cell_of(namespace)?.is_some() {
+            return Ok(SessionAccess::Deny);
+        }
         // The directory and the connection metadata stores are ticket-gated
         // (Invariants 1 and 3). Classifying them against their own, possibly
         // not yet converged, device records would deadlock the bootstrap

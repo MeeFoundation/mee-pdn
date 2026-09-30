@@ -33,14 +33,15 @@ use pdn_store::{
     store::Query,
     AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
 };
-use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
+use pdn_types::{CellId, EntryInfo, EntryPath, NodeId, PdnId};
 use tokio::sync::oneshot;
 
 use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
+    cell::{CellTickets, UnknownCell},
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
-    registry::{Registry, ServingPosture},
+    registry::{CellBinding, Registry, ServingPosture},
     retraction::{RetractionTracker, RetractionVerdict},
 };
 
@@ -243,6 +244,10 @@ pub struct SyncNode {
     /// assert that a pass over a quiet pair opens none.
     #[cfg(feature = "test-util")]
     co_located_sessions: CoLocatedPassSessions,
+    /// Fails the record store's creation in the next `create_cell`, after
+    /// its membership store exists.
+    #[cfg(feature = "test-util")]
+    fail_next_cell_records_create: std::sync::atomic::AtomicBool,
     storage: StorageConfig,
     retraction: Arc<RetractionTracker>,
     /// Taken once, by the runtime's consumer.
@@ -399,6 +404,19 @@ impl HostedStack {
         Ok(())
     }
 
+    /// Keeps the tracked store's contacts and default identity.
+    fn set_strategy(&self, namespace: NamespaceId, strategy: SyncStrategy) -> Result<()> {
+        if let Some(entry) = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?
+            .get_mut(&namespace)
+        {
+            entry.strategy = strategy;
+        }
+        Ok(())
+    }
+
     fn tracked(&self, namespace: NamespaceId) -> Result<Option<TrackedDoc>> {
         Ok(self
             .tracked_docs
@@ -533,6 +551,8 @@ impl SyncNode {
             cache_budget_bytes: options.replica_cache_budget_bytes,
             #[cfg(feature = "test-util")]
             co_located_sessions: Arc::clone(&co_located_sessions),
+            #[cfg(feature = "test-util")]
+            fail_next_cell_records_create: std::sync::atomic::AtomicBool::new(false),
             storage: options.storage,
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
@@ -1001,6 +1021,22 @@ impl SyncNode {
         Ok(stack.tracked_snapshot().len())
     }
 
+    /// The replicas `identity`'s store holds, tracked or not — the only
+    /// anchor a scenario has for a replica no ticket ever named.
+    #[cfg(feature = "test-util")]
+    pub async fn held_replica_count(&self, identity: PdnId) -> Result<usize> {
+        let Some(stack) = self.stack(identity)? else {
+            return Ok(0);
+        };
+        let mut listed = stack.api.list().await?;
+        let mut held = 0;
+        while let Some(entry) = listed.next().await {
+            let _replica = entry?;
+            held += 1;
+        }
+        Ok(held)
+    }
+
     /// Live records at `path` across authors — what every latest-wins read
     /// collapses, so this is the only way to assert one author per
     /// identity.
@@ -1156,6 +1192,8 @@ impl SyncNode {
     fn guard_shared_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
         let role = if stack.registry.binding_of(namespace)?.is_some() {
             "a data replica of this identity"
+        } else if stack.registry.cell_of(namespace)?.is_some() {
+            "a store of a cell this identity holds"
         } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
             role
         } else {
@@ -1174,23 +1212,23 @@ impl SyncNode {
     /// registry's own refusal of a second issuer comes after that write
     /// and restores nothing.
     fn guard_data_import(stack: &HostedStack, issuer: PdnId, namespace: NamespaceId) -> Result<()> {
-        match stack.registry.binding_of(namespace)? {
-            Some((bound, _posture)) => {
-                if bound != issuer {
-                    return Err(anyhow::anyhow!(
-                        "namespace {namespace} is already bound to issuer {bound}; \
-                         one namespace binds one issuer"
-                    ));
-                }
+        if let Some((bound, _posture)) = stack.registry.binding_of(namespace)? {
+            if bound != issuer {
+                return Err(anyhow::anyhow!(
+                    "namespace {namespace} is already bound to issuer {bound}; \
+                     one namespace binds one issuer"
+                ));
             }
-            None => {
-                if stack.tracked(namespace)?.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "namespace {namespace} is a device-shared replica of this identity; \
-                         a data import must not repurpose it"
-                    ));
-                }
-            }
+        } else if let Some((cell, _store)) = stack.registry.cell_of(namespace)? {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a store of cell {cell}; \
+                 a data import must not repurpose it"
+            ));
+        } else if stack.tracked(namespace)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a device-shared replica of this identity; \
+                 a data import must not repurpose it"
+            ));
         }
         Ok(())
     }
@@ -1249,6 +1287,210 @@ impl SyncNode {
             return Ok(None);
         };
         Ok(stack.registry.data_doc(issuer)?.map(|doc| doc.id()))
+    }
+
+    /// Create both stores of `cell` for `identity`, both or neither: they
+    /// join the registry and the reconcile pass together, once both exist.
+    pub async fn create_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
+        let stack = self.require(identity)?;
+        if stack.registry.cell(cell)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "identity {identity} already holds cell {cell}"
+            ));
+        }
+        let membership = stack.api.create().await?;
+        let records = match self.create_cell_records(&stack).await {
+            Ok(records) => records,
+            Err(err) => {
+                // Fresh and never shared: dropping it loses nothing.
+                if let Err(drop_err) = stack.api.drop_doc(membership.id()).await {
+                    tracing::warn!(%cell, "a membership store whose cell failed to create stayed in the store: {drop_err:#}");
+                }
+                return Err(err);
+            }
+        };
+        let registered = stack.registry.register_cell(
+            cell,
+            CellBinding {
+                membership: membership.clone(),
+                records: Some(records.clone()),
+            },
+        );
+        if let Err(err) = registered {
+            for doc in [&membership, &records] {
+                if let Err(drop_err) = stack.api.drop_doc(doc.id()).await {
+                    tracing::warn!(%cell, "a store whose cell failed to register stayed in the store: {drop_err:#}");
+                }
+            }
+            return Err(err);
+        }
+        stack.track(
+            &membership,
+            Vec::new(),
+            SyncStrategy::Swarm,
+            stack.identity(),
+        )?;
+        stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())
+    }
+
+    async fn create_cell_records(&self, stack: &HostedStack) -> Result<Doc> {
+        #[cfg(feature = "test-util")]
+        if self
+            .fail_next_cell_records_create
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow::anyhow!("record store creation failed for test"));
+        }
+        stack.api.create().await
+    }
+
+    #[cfg(feature = "test-util")]
+    pub fn fail_next_cell_records_create_for_test(&self) {
+        self.fail_next_cell_records_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Import both stores of `cell` from their write tickets: nothing new for
+    /// a cell held on these stores, the cell again for its tombstone. A failed
+    /// import drops nothing — a replica may predate it — and a retry lands on it.
+    pub async fn import_cell(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        tickets: CellTickets,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let (membership_namespace, records_namespace) = (
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        );
+        if membership_namespace == records_namespace {
+            return Err(anyhow::anyhow!(
+                "namespace {membership_namespace} cannot be both stores of cell {cell}"
+            ));
+        }
+        if let Some(held) = stack.registry.cell(cell)? {
+            if held.membership.id() != membership_namespace {
+                return Err(anyhow::anyhow!(
+                    "cell {cell} is held on membership store {}, not {membership_namespace}",
+                    held.membership.id()
+                ));
+            }
+            return match held.records {
+                Some(records) if records.id() == records_namespace => Ok(()),
+                Some(records) => Err(anyhow::anyhow!(
+                    "cell {cell} is held on record store {}, not {records_namespace}",
+                    records.id()
+                )),
+                None => {
+                    Self::guard_cell_import(&stack, records_namespace)?;
+                    let contacts = tickets.records.contacts();
+                    let minted_by = tickets.records.identity;
+                    let records = stack
+                        .api
+                        .import_namespace(tickets.records.capability)
+                        .await?;
+                    stack
+                        .registry
+                        .set_cell_records(cell, Some(records.clone()))?;
+                    stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
+                    stack.set_strategy(membership_namespace, SyncStrategy::Swarm)
+                }
+            };
+        }
+        Self::guard_cell_import(&stack, membership_namespace)?;
+        Self::guard_cell_import(&stack, records_namespace)?;
+        let (membership_contacts, records_contacts) =
+            (tickets.membership.contacts(), tickets.records.contacts());
+        let (membership_minted_by, records_minted_by) =
+            (tickets.membership.identity, tickets.records.identity);
+        let membership = stack
+            .api
+            .import_namespace(tickets.membership.capability)
+            .await?;
+        let records = stack
+            .api
+            .import_namespace(tickets.records.capability)
+            .await?;
+        stack.registry.register_cell(
+            cell,
+            CellBinding {
+                membership: membership.clone(),
+                records: Some(records.clone()),
+            },
+        )?;
+        stack.track(
+            &membership,
+            membership_contacts,
+            SyncStrategy::Swarm,
+            membership_minted_by,
+        )?;
+        stack.track(
+            &records,
+            records_contacts,
+            SyncStrategy::Swarm,
+            records_minted_by,
+        )
+    }
+
+    /// Refuses a ticket naming a namespace this identity already holds in
+    /// any role: whatever bounded that replica's sessions before would stop
+    /// bounding them once a ticket's word made it a cell's store.
+    fn guard_cell_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
+        let role = if stack.registry.binding_of(namespace)?.is_some() {
+            "a data replica of this identity".to_owned()
+        } else if let Some((other, _store)) = stack.registry.cell_of(namespace)? {
+            format!("a store of cell {other}")
+        } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
+            role.to_owned()
+        } else if stack.tracked(namespace)?.is_some() {
+            "a store this identity's devices share".to_owned()
+        } else {
+            return Ok(());
+        };
+        Err(anyhow::anyhow!(
+            "namespace {namespace} is {role}; a cell import must not repurpose it"
+        ))
+    }
+
+    /// At a departure: drop `cell`'s record store and keep its membership
+    /// store, out of its swarm, as the tombstone. Finishes what an earlier
+    /// forget left; [`UnknownCell`] for a cell `identity` never held.
+    pub async fn forget_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        if let Some(records) = held.records {
+            // Drop first, as `forget_namespace` does: a failed drop leaves
+            // the cell held, and a retry still finds it.
+            self.forget_doc(identity, records.id()).await?;
+            stack.registry.set_cell_records(cell, None)?;
+        }
+        // Before the leave, so the pass does not join the swarm again.
+        stack.set_strategy(held.membership.id(), SyncStrategy::ContactsOnly)?;
+        held.membership.leave_gossip().await
+    }
+
+    /// Minting starts both stores' sync, as the store's share does for every
+    /// replica. [`UnknownCell`] for a tombstone too.
+    pub async fn share_cell_tickets(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        addr_options: AddrInfoOptions,
+    ) -> Result<CellTickets> {
+        let held = self
+            .require(identity)?
+            .registry
+            .cell(cell)?
+            .ok_or(UnknownCell { cell })?;
+        let records = held.records.ok_or(UnknownCell { cell })?;
+        Ok(CellTickets {
+            membership: held
+                .membership
+                .share(ShareMode::Write, addr_options)
+                .await?,
+            records: records.share(ShareMode::Write, addr_options).await?,
+        })
     }
 
     /// Set exactly `devices` as the issuer's device set for retraction
@@ -1434,6 +1676,12 @@ impl SyncNode {
                  it cannot be opened as a device-shared store"
             ));
         }
+        if let Some((cell, _store)) = stack.registry.cell_of(namespace)? {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a store of cell {cell}; \
+                 it cannot be opened as a device-shared store"
+            ));
+        }
         if !holds_namespace(&stack.api, namespace).await? {
             return Ok(None);
         }
@@ -1486,7 +1734,8 @@ impl SyncNode {
 
     /// Untrack and drop a device-shared store's doc. Data namespaces go
     /// through [`forget_namespace`](Self::forget_namespace), which also
-    /// unregisters the issuer.
+    /// unregisters the issuer, and a cell's stores through
+    /// [`forget_cell`](Self::forget_cell).
     pub async fn forget_doc(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
         let Some(stack) = self.stack(identity)? else {
             return Ok(());
