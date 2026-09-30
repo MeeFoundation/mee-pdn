@@ -38,7 +38,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
-    cell::{CellTickets, UnknownCell},
+    cell::{CellStore, CellTickets, Membership, UnknownCell},
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
     registry::{CellBinding, Registry, ServingPosture},
@@ -248,6 +248,10 @@ pub struct SyncNode {
     /// its membership store exists.
     #[cfg(feature = "test-util")]
     fail_next_cell_records_create: std::sync::atomic::AtomicBool,
+    /// Handed to every hosted identity's book; empty until a scenario takes
+    /// the channel, so nothing accumulates unread.
+    #[cfg(feature = "test-util")]
+    cell_verdicts: crate::access::CellVerdictSink,
     storage: StorageConfig,
     retraction: Arc<RetractionTracker>,
     /// Taken once, by the runtime's consumer.
@@ -553,6 +557,8 @@ impl SyncNode {
             co_located_sessions: Arc::clone(&co_located_sessions),
             #[cfg(feature = "test-util")]
             fail_next_cell_records_create: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            cell_verdicts: Arc::default(),
             storage: options.storage,
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
@@ -577,6 +583,8 @@ impl SyncNode {
         let registry = Arc::new(Registry::default());
         let access = Arc::new(AccessBook::new(identity));
         access.set_blobs(self.blobs.clone());
+        #[cfg(feature = "test-util")]
+        access.set_cell_verdicts(Arc::clone(&self.cell_verdicts));
         let observer_tracker = Arc::clone(&self.retraction);
         let docs = self
             .docs_builder(identity, &access, &registry)?
@@ -1290,7 +1298,9 @@ impl SyncNode {
     }
 
     /// Create both stores of `cell` for `identity`, both or neither: they
-    /// join the registry and the reconcile pass together, once both exist.
+    /// join the registry and the reconcile pass together, once both exist,
+    /// and their sync starts once they are registered, so their first
+    /// sessions are ones the book can judge.
     pub async fn create_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
         let stack = self.require(identity)?;
         if stack.registry.cell(cell)?.is_some() {
@@ -1330,7 +1340,9 @@ impl SyncNode {
             SyncStrategy::Swarm,
             stack.identity(),
         )?;
-        stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())
+        stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
+        membership.start_sync(Vec::new(), stack.identity()).await?;
+        records.start_sync(Vec::new(), stack.identity()).await
     }
 
     async fn create_cell_records(&self, stack: &HostedStack) -> Result<Doc> {
@@ -1351,8 +1363,9 @@ impl SyncNode {
     }
 
     /// Import both stores of `cell` from their write tickets: nothing new for
-    /// a cell held on these stores, the cell again for its tombstone. A failed
-    /// import drops nothing — a replica may predate it — and a retry lands on it.
+    /// a cell held on these stores, the cell again for its tombstone. Both
+    /// stores' sync starts once they are registered, as at `create_cell`. A failed import drops nothing — a replica may predate
+    /// it — and a retry lands on it.
     pub async fn import_cell(
         &self,
         identity: PdnId,
@@ -1394,7 +1407,9 @@ impl SyncNode {
                         .registry
                         .set_cell_records(cell, Some(records.clone()))?;
                     stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
-                    stack.set_strategy(membership_namespace, SyncStrategy::Swarm)
+                    stack.set_strategy(membership_namespace, SyncStrategy::Swarm)?;
+                    Self::start_tracked(&stack, membership_namespace).await?;
+                    Self::start_tracked(&stack, records_namespace).await
                 }
             };
         }
@@ -1430,7 +1445,21 @@ impl SyncNode {
             records_contacts,
             SyncStrategy::Swarm,
             records_minted_by,
-        )
+        )?;
+        Self::start_tracked(&stack, membership_namespace).await?;
+        Self::start_tracked(&stack, records_namespace).await
+    }
+
+    /// Start a tracked store's sync with the contacts and the default
+    /// identity it is tracked with.
+    async fn start_tracked(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
+        let Some(tracked) = stack.tracked(namespace)? else {
+            return Ok(());
+        };
+        tracked
+            .doc
+            .start_sync(tracked.contacts, tracked.default_identity)
+            .await
     }
 
     /// Refuses a ticket naming a namespace this identity already holds in
@@ -1468,6 +1497,75 @@ impl SyncNode {
         // Before the leave, so the pass does not join the swarm again.
         stack.set_strategy(held.membership.id(), SyncStrategy::ContactsOnly)?;
         held.membership.leave_gossip().await
+    }
+
+    /// The membership `identity`'s replica of `cell`'s membership store
+    /// folds into, payloads read as far as they have arrived.
+    /// [`UnknownCell`] for a tombstone too.
+    pub async fn cell_membership(&self, identity: PdnId, cell: CellId) -> Result<Membership> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        if held.records.is_none() {
+            return Err(UnknownCell { cell }.into());
+        }
+        stack.access.fold_cell(cell, &held.membership).await
+    }
+
+    /// Write `payload` at `key` into one of `cell`'s stores with
+    /// `identity`'s author, checking nothing the key or the payload says:
+    /// what the entry counts for is the fold's and the record view's.
+    /// [`UnknownCell`] for a tombstone too.
+    pub async fn write_cell_entry(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        doc.set_bytes(stack.author, key.to_vec(), payload.to_vec())
+            .await?;
+        Ok(())
+    }
+
+    /// Taken before whatever starts the store's sessions, as
+    /// [`PrivateMetadataStore::watch_catch_up`] is.
+    pub async fn watch_cell_catch_up(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+    ) -> Result<crate::private_metadata::CatchUpWatch> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        crate::private_metadata::watch_doc(&doc).await
+    }
+
+    fn cell_doc(stack: &HostedStack, cell: CellId, store: CellStore) -> Result<Doc> {
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        let records = held.records.ok_or(UnknownCell { cell })?;
+        Ok(match store {
+            CellStore::Membership => held.membership,
+            CellStore::Records => records,
+        })
+    }
+
+    /// Once; a second take yields `None`. From the take on, every fold of a
+    /// cell's membership store on this node — at a session's setup and at
+    /// [`cell_membership`](Self::cell_membership) — reports its verdicts.
+    #[cfg(feature = "test-util")]
+    pub fn take_cell_verdicts(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::cell::CellVerdicts>> {
+        let mut sender = self.cell_verdicts.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
     }
 
     /// Minting starts both stores' sync, as the store's share does for every

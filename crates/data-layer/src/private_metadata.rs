@@ -57,6 +57,16 @@ impl std::fmt::Debug for CatchUpWatch {
     }
 }
 
+/// The watch of [`PrivateMetadataStore::watch_catch_up`] over any replica.
+pub(crate) async fn watch_doc(doc: &Doc) -> Result<CatchUpWatch> {
+    let since = SystemTime::now();
+    let events = doc.subscribe().await?;
+    Ok(CatchUpWatch {
+        events: Box::pin(events),
+        since,
+    })
+}
+
 impl CatchUpWatch {
     /// Wait for the first successful sync session started since the watch
     /// was taken, or fail with [`CatchUpTimeout`]. A completed session, not
@@ -664,12 +674,7 @@ impl PrivateMetadataStore {
     /// `host_identity` arms a directory — or a session finished before the
     /// subscription goes unseen and the wait holds out for the next one.
     pub async fn watch_catch_up(&self) -> Result<CatchUpWatch> {
-        let since = SystemTime::now();
-        let events = self.events().await?;
-        Ok(CatchUpWatch {
-            events: Box::pin(events),
-            since,
-        })
+        watch_doc(&self.doc).await
     }
 
     /// The kinds under which tickets are published, record-level.

@@ -28,10 +28,12 @@ mod retraction;
 
 pub use access::identity_of;
 pub use announcement::{cell_id_of, pdn_id_of, AnnouncementKeyPair};
+#[cfg(feature = "test-util")]
+pub use cell::CellVerdicts;
 pub use cell::{
-    record_prefix, Awaiting, CellTickets, DevicesPayload, EventKind, ForNothing, FoundedPayload,
-    HeldEntry, JoinedPayload, Member, MemberDevice, MemberState, Membership, MembershipKey, OpId,
-    RecordKey, Seq, UnknownCell, Verdict,
+    record_prefix, Awaiting, CellStore, CellTickets, DevicesPayload, EventKind, ForNothing,
+    FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice, MemberState, Membership,
+    MembershipKey, OpId, RecordKey, Seq, UnknownCell, Verdict,
 };
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,

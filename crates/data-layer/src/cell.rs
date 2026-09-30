@@ -5,7 +5,9 @@ mod fold;
 mod keys;
 mod payloads;
 
-use pdn_store::DocTicket;
+use anyhow::Result;
+use futures_lite::StreamExt;
+use pdn_store::{api::Doc, store::Query, DocTicket};
 use pdn_types::CellId;
 
 pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership, Verdict};
@@ -19,6 +21,48 @@ pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice};
 #[error("cell not held on this node: {cell}")]
 pub struct UnknownCell {
     pub cell: CellId,
+}
+
+/// Which of a cell's two stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CellStore {
+    Membership,
+    Records,
+}
+
+/// The fold's verdicts on one run over one identity's replica of a cell's
+/// membership store: each entry by its key and author.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone)]
+pub struct CellVerdicts {
+    pub identity: pdn_types::PdnId,
+    pub cell: CellId,
+    pub verdicts: Vec<(Vec<u8>, pdn_store::AuthorId, Verdict)>,
+}
+
+/// Every entry of `doc`, one per author and key as the store keeps them,
+/// each with its payload once the bytes have arrived.
+pub(crate) async fn held_entries(
+    doc: &Doc,
+    blobs: &iroh_blobs::api::Store,
+) -> Result<Vec<HeldEntry>> {
+    let mut held = Vec::new();
+    let mut stream = std::pin::pin!(doc.get_many(Query::all()).await?);
+    while let Some(entry) = stream.next().await {
+        let entry = entry?;
+        let hash = entry.content_hash();
+        let payload = if blobs.has(hash).await? {
+            Some(blobs.get_bytes(hash).await?.to_vec())
+        } else {
+            None
+        };
+        held.push(HeldEntry {
+            key: entry.key().to_vec(),
+            author: entry.author(),
+            payload,
+        });
+    }
+    Ok(held)
 }
 
 /// The write tickets to a cell's two stores.

@@ -8,6 +8,8 @@ use anyhow::{anyhow, Result};
 use pdn_store::{api::Doc, NamespaceId};
 use pdn_types::{CellId, PdnId};
 
+use crate::cell::CellStore;
+
 /// How an identity serves a data replica it holds. Independent of the sync
 /// strategy (swarm vs contacts-only), which lives on the tracked doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +29,6 @@ pub(crate) enum ServingPosture {
 pub(crate) struct DataBinding {
     pub(crate) doc: Doc,
     pub(crate) posture: ServingPosture,
-}
-
-/// Which of a cell's two stores a namespace is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CellStore {
-    Membership,
-    Records,
 }
 
 /// One cell as one identity holds it. `records` is `None` once the identity

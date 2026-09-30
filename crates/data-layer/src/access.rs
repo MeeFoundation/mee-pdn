@@ -17,9 +17,10 @@ use pdn_store::{
     api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, SessionAccess,
     SessionIngest, SessionRole, ValidateOutcome,
 };
-use pdn_types::{ClaimId, NodeId, PdnId};
+use pdn_types::{CellId, ClaimId, NodeId, PdnId};
 
 use crate::{
+    cell::{held_entries, CellStore, Membership},
     connection_metadata::GrantRecord,
     grant::{claim_id_of_key, GrantedClaim, ReadGrant},
     registry::{Registry, ServingPosture},
@@ -110,7 +111,14 @@ pub(crate) struct AccessBook {
     /// marker can name. Shared, because a session's ingest verdict reads
     /// it per entry and must see what a marker recorded meanwhile.
     retractions: Arc<RwLock<HashMap<NamespaceId, ArmedRetractions>>>,
+    #[cfg(feature = "test-util")]
+    cell_verdicts: OnceLock<CellVerdictSink>,
 }
+
+/// Where each fold's verdicts go once a scenario takes the channel.
+#[cfg(feature = "test-util")]
+pub(crate) type CellVerdictSink =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::cell::CellVerdicts>>>>;
 
 impl AccessBook {
     pub(crate) fn new(identity: PdnId) -> Self {
@@ -121,6 +129,8 @@ impl AccessBook {
             blobs: OnceLock::new(),
             grant_cache: RwLock::new(HashMap::new()),
             retractions: Arc::default(),
+            #[cfg(feature = "test-util")]
+            cell_verdicts: OnceLock::new(),
         }
     }
 
@@ -197,9 +207,10 @@ impl AccessBook {
         peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
-        // A cell's store: nothing here resolves a caller to a member.
-        if registry.cell_of(namespace)?.is_some() {
-            return Ok(SessionAccess::Deny);
+        if let Some((cell, store)) = registry.cell_of(namespace)? {
+            return self
+                .classify_cell(&registry, cell, store, remote, peer, role)
+                .await;
         }
         // The directory and the connection metadata stores are ticket-gated
         // (Invariants 1 and 3). Classifying them against their own, possibly
@@ -355,6 +366,98 @@ impl AccessBook {
             egress: Some(egress_filter(issuer, rights.read)),
             ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
         })
+    }
+
+    /// A cell's membership store, served whole to a device of the member
+    /// the caller names — a sibling by this identity's own directory,
+    /// another member by the device statements this identity's replica
+    /// folds — and to nobody else, by the cell stores spec. The record
+    /// store serves no session.
+    async fn classify_cell(
+        &self,
+        registry: &Arc<Registry>,
+        cell: CellId,
+        store: CellStore,
+        remote: Identity,
+        peer: NodeId,
+        role: SessionRole,
+    ) -> Result<SessionAccess> {
+        if store == CellStore::Records {
+            return Ok(SessionAccess::Deny);
+        }
+        let refused = match role {
+            // A dial toward a callee not yet resolved to a member pulls
+            // and serves nothing: a device holding nothing of the store
+            // takes its first entries this way.
+            SessionRole::Dial => SessionAccess::Allow {
+                egress: Some(closed_egress()),
+                ingest: Some(self.ingest(registry, WriteAdmission::Nothing)),
+            },
+            SessionRole::Accept => SessionAccess::Deny,
+        };
+        let whole = SessionAccess::Allow {
+            egress: None,
+            ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+        };
+        if remote == identity_of(self.identity) {
+            let peer_key = crate::private_metadata::device_key(&peer);
+            let sibling = self.peer_is_own_device(peer_key.as_bytes()).await?;
+            return Ok(if sibling { whole } else { refused });
+        }
+        let Some(held) = registry.cell(cell)? else {
+            return Ok(refused);
+        };
+        let membership = self.fold_cell(cell, &held.membership).await?;
+        let caller = PdnId::from_bytes(*remote.as_bytes());
+        let listed = membership.member(&caller).is_some_and(|member| {
+            member.state.member && member.devices.iter().any(|device| device.node == peer)
+        });
+        Ok(if listed { whole } else { refused })
+    }
+
+    /// The membership this identity's replica of `cell`'s membership store
+    /// folds into, payloads read as far as they have arrived.
+    pub(crate) async fn fold_cell(&self, cell: CellId, membership: &Doc) -> Result<Membership> {
+        let entries = match self.blobs.get() {
+            Some(blobs) => held_entries(membership, blobs).await?,
+            None => Vec::new(),
+        };
+        let folded = Membership::fold(&cell, &entries);
+        #[cfg(feature = "test-util")]
+        self.report_cell_verdicts(cell, &entries, &folded);
+        Ok(folded)
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_cell_verdicts(&self, sink: CellVerdictSink) {
+        let _ = self.cell_verdicts.set(sink);
+    }
+
+    #[cfg(feature = "test-util")]
+    fn report_cell_verdicts(
+        &self,
+        cell: CellId,
+        entries: &[crate::cell::HeldEntry],
+        folded: &Membership,
+    ) {
+        let Some(sink) = self.cell_verdicts.get() else {
+            return;
+        };
+        let Ok(sender) = sink.lock() else {
+            return;
+        };
+        if let Some(sender) = sender.as_ref() {
+            let verdicts = entries
+                .iter()
+                .zip(folded.verdicts())
+                .map(|(entry, verdict)| (entry.key.clone(), entry.author, *verdict))
+                .collect();
+            let _ = sender.send(crate::cell::CellVerdicts {
+                identity: self.identity,
+                cell,
+                verdicts,
+            });
+        }
     }
 
     /// Whether the peer is a device of this book's own identity.
