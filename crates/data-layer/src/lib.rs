@@ -29,7 +29,9 @@ mod retraction;
 pub use access::identity_of;
 pub use announcement::{cell_id_of, pdn_id_of, AnnouncementKeyPair};
 pub use cell::{
-    record_prefix, CellTickets, EventKind, MembershipKey, OpId, RecordKey, Seq, UnknownCell,
+    record_prefix, Awaiting, CellTickets, DevicesPayload, EventKind, ForNothing, FoundedPayload,
+    HeldEntry, JoinedPayload, Member, MemberDevice, MemberState, Membership, MembershipKey, OpId,
+    RecordKey, Seq, UnknownCell, Verdict,
 };
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,

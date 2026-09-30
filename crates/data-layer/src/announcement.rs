@@ -2,11 +2,18 @@
 //! signed by it, each under a context string of its own, all of them here;
 //! the steps are the cell stores spec's.
 
-use iroh::SecretKey;
+use iroh::{PublicKey, SecretKey, Signature};
 use pdn_types::{CellId, PdnId};
+
+use crate::cell::{
+    encode_devices, DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, Seq,
+};
 
 const PDN_ID_CONTEXT: &str = "pdn/pdn-id/v1";
 const CELL_ID_CONTEXT: &str = "pdn/cell-id/v1";
+const CELL_FOUNDING_CONTEXT: &[u8] = b"pdn/cell-founding/v1";
+const CELL_JOIN_CONTEXT: &[u8] = b"pdn/cell-join/v1";
+const CELL_DEVICES_CONTEXT: &[u8] = b"pdn/cell-devices/v1";
 
 /// An identity's device-announcement key pair: one per identity, minted with
 /// it, its public key deriving the identity's `PdnId`.
@@ -34,6 +41,110 @@ impl AnnouncementKeyPair {
     pub(crate) fn secret_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
     }
+
+    /// The founding event of the cell `cell_id_of(self.pdn_id(), key, nonce)`.
+    pub fn founding(&self, nonce: [u8; 16]) -> FoundedPayload {
+        let announcement_key = self.public_key();
+        let message = founding_message(&self.pdn_id(), &announcement_key, &nonce);
+        FoundedPayload {
+            nonce,
+            announcement_key,
+            signature: self.0.sign(&message).to_bytes(),
+        }
+    }
+
+    /// The join statement over `subject_seq`, the sequence the inviting
+    /// device names for this identity's joined event.
+    pub fn join_statement(&self, cell: &CellId, subject_seq: Seq) -> JoinedPayload {
+        let announcement_key = self.public_key();
+        let message = join_message(&self.pdn_id(), &announcement_key, cell, subject_seq);
+        JoinedPayload {
+            announcement_key,
+            signature: self.0.sign(&message).to_bytes(),
+        }
+    }
+
+    /// The device-list statement at `version`, the version its key names.
+    pub fn device_statement(&self, version: u64, devices: Vec<MemberDevice>) -> DevicesPayload {
+        let message = devices_message(version, &devices);
+        DevicesPayload {
+            devices,
+            signature: self.0.sign(&message).to_bytes(),
+        }
+    }
+}
+
+/// Whether `payload`'s signature verifies for a founding event in
+/// `creator`'s chain; what its fields derive is the fold's to check.
+pub(crate) fn founding_verifies(creator: &PdnId, payload: &FoundedPayload) -> bool {
+    let message = founding_message(creator, &payload.announcement_key, &payload.nonce);
+    verifies(&payload.announcement_key, &message, &payload.signature)
+}
+
+/// Whether `payload`'s signature verifies for a joined event at
+/// `subject_seq` of `subject`'s chain in `cell`.
+pub(crate) fn join_verifies(
+    subject: &PdnId,
+    cell: &CellId,
+    subject_seq: Seq,
+    payload: &JoinedPayload,
+) -> bool {
+    let message = join_message(subject, &payload.announcement_key, cell, subject_seq);
+    verifies(&payload.announcement_key, &message, &payload.signature)
+}
+
+/// Whether `payload`'s signature verifies under `announcement_key` for the
+/// statement at `version`.
+pub(crate) fn devices_verify(
+    announcement_key: &[u8; 32],
+    version: u64,
+    payload: &DevicesPayload,
+) -> bool {
+    let message = devices_message(version, &payload.devices);
+    verifies(announcement_key, &message, &payload.signature)
+}
+
+fn founding_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
+    [
+        CELL_FOUNDING_CONTEXT,
+        creator.as_bytes(),
+        announcement_key,
+        nonce,
+    ]
+    .concat()
+}
+
+fn join_message(
+    subject: &PdnId,
+    announcement_key: &[u8; 32],
+    cell: &CellId,
+    subject_seq: Seq,
+) -> Vec<u8> {
+    [
+        CELL_JOIN_CONTEXT,
+        subject.as_bytes(),
+        announcement_key,
+        cell.as_bytes(),
+        &subject_seq.get().to_be_bytes(),
+    ]
+    .concat()
+}
+
+fn devices_message(version: u64, devices: &[MemberDevice]) -> Vec<u8> {
+    [
+        CELL_DEVICES_CONTEXT,
+        &version.to_be_bytes(),
+        &encode_devices(devices),
+    ]
+    .concat()
+}
+
+/// Strict verification: a key that is no curve point verifies nothing.
+fn verifies(announcement_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    PublicKey::from_bytes(announcement_key).is_ok_and(|key| {
+        key.verify(message, &Signature::from_bytes(signature))
+            .is_ok()
+    })
 }
 
 /// The `PdnId` an announcement public key derives.
@@ -76,6 +187,74 @@ mod tests {
             pair.pdn_id().to_string(),
             "65bcff20d2b149925daa94e3750937044e8ef27385d24cb6cb7bf4182b408ba5"
         );
+    }
+
+    /// Alice's founding event for "Family" carries the signature the cell
+    /// stores spec prints, and its fields derive the cell's id.
+    #[test]
+    fn the_specs_founding_event_signs_and_derives_family() {
+        let alice = AnnouncementKeyPair::from_secret_bytes(&[0x33; 32]);
+        let founding = alice.founding([0x5a; 16]);
+        let head: [u8; 8] = pdn_types::parse_hex("00ec508b9ba4af7b").unwrap();
+        let tail: [u8; 5] = pdn_types::parse_hex("34fb0cb808").unwrap();
+        assert!(founding.signature.starts_with(&head));
+        assert!(founding.signature.ends_with(&tail));
+        assert!(founding_verifies(&alice.pdn_id(), &founding));
+        assert_eq!(
+            cell_id_of(&alice.pdn_id(), &founding.announcement_key, &founding.nonce).to_string(),
+            "9cbcbe4da7cc35a44360d64e45621957"
+        );
+        // Denied: the same event claimed for another creator's chain.
+        let other = pdn_id_of(&key(OTHER_KEY));
+        assert!(!founding_verifies(&other, &founding));
+    }
+
+    /// A join statement verifies at the sequence it signs and in its cell
+    /// alone: one copied from an earlier join verifies at no later sequence.
+    #[test]
+    fn a_join_statement_verifies_at_its_own_sequence_only() {
+        let carol = AnnouncementKeyPair::generate();
+        let family = CellId::from_bytes([0x9c; 16]);
+        let statement = carol.join_statement(&family, Seq::new(1));
+        assert!(join_verifies(
+            &carol.pdn_id(),
+            &family,
+            Seq::new(1),
+            &statement
+        ));
+        // Denied: the copy at a later sequence, in another cell, for another member.
+        assert!(!join_verifies(
+            &carol.pdn_id(),
+            &family,
+            Seq::new(3),
+            &statement
+        ));
+        let wedding = CellId::from_bytes([0xf9; 16]);
+        assert!(!join_verifies(
+            &carol.pdn_id(),
+            &wedding,
+            Seq::new(1),
+            &statement
+        ));
+        let dave = AnnouncementKeyPair::generate().pdn_id();
+        assert!(!join_verifies(&dave, &family, Seq::new(1), &statement));
+    }
+
+    /// A device statement verifies under its member's key at its own version;
+    /// moved to another version, or checked under another key, it does not.
+    #[test]
+    fn a_device_statement_verifies_under_its_key_at_its_version_only() {
+        let bob = AnnouncementKeyPair::generate();
+        let devices = vec![MemberDevice {
+            node: pdn_types::NodeId::from_bytes([0xb1; 32]),
+            author: pdn_store::AuthorId::from(&[0xa1; 32]),
+        }];
+        let statement = bob.device_statement(2, devices);
+        assert!(devices_verify(&bob.public_key(), 2, &statement));
+        // Denied: the statement at another version, and under another key.
+        assert!(!devices_verify(&bob.public_key(), 3, &statement));
+        let dave = AnnouncementKeyPair::generate();
+        assert!(!devices_verify(&dave.public_key(), 2, &statement));
     }
 
     /// Alice's key and her `PdnId` derive the ids the specs print for "Family"
