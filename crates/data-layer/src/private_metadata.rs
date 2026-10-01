@@ -126,6 +126,19 @@ fn connection_key(peer: &PdnId) -> String {
     format!("{CONNECTIONS_PREFIX}{peer}")
 }
 
+/// The confirmed devices a directory replica lists, record-level.
+pub(crate) async fn listed_devices(doc: &Doc) -> Result<Vec<NodeId>> {
+    let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
+    let mut stream = std::pin::pin!(doc.get_many(query).await?);
+    let mut devices = HashSet::new();
+    while let Some(entry) = stream.next().await {
+        if let Some(device) = device_of(entry?.key()) {
+            devices.insert(device);
+        }
+    }
+    Ok(devices.into_iter().collect())
+}
+
 pub(crate) fn device_of(key: &[u8]) -> Option<NodeId> {
     std::str::from_utf8(key)
         .ok()?
@@ -427,15 +440,7 @@ impl PrivateMetadataStore {
 
     /// The confirmed devices, record-level.
     pub async fn list_devices(&self) -> Result<Vec<NodeId>> {
-        let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
-        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        let mut devices = HashSet::new();
-        while let Some(entry) = stream.next().await {
-            if let Some(device) = device_of(entry?.key()) {
-                devices.insert(device);
-            }
-        }
-        Ok(devices.into_iter().collect())
+        listed_devices(&self.doc).await
     }
 
     /// The devices that began linking and have not confirmed, after a

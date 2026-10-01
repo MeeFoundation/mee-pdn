@@ -202,6 +202,10 @@ pub struct StartSyncRequest {
     /// without ever joining the swarm.
     #[serde(default = "default_join_gossip")]
     pub join_gossip: bool,
+    /// The recorded peers dialed beside `peers`: every peer the engine
+    /// recorded for the replica when `None`, these alone when `Some`.
+    #[serde(default)]
+    pub recorded: Option<Vec<PeerIdBytes>>,
 }
 
 fn default_join_gossip() -> bool {

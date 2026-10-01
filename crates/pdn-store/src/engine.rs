@@ -235,18 +235,8 @@ impl Engine {
         peers: Vec<Contact>,
         default_identity: Identity,
     ) -> Result<()> {
-        let (reply, reply_rx) = oneshot::channel();
-        self.to_live_actor
-            .send(ToLiveActor::StartSync {
-                namespace,
-                peers,
-                default_identity,
-                join_gossip: true,
-                reply,
-            })
-            .await?;
-        reply_rx.await??;
-        Ok(())
+        self.sync_with(namespace, peers, None, default_identity, true)
+            .await
     }
 
     /// Start to sync a document without ever joining its gossip swarm.
@@ -261,13 +251,89 @@ impl Engine {
         peers: Vec<Contact>,
         default_identity: Identity,
     ) -> Result<()> {
+        self.sync_with(namespace, peers, None, default_identity, false)
+            .await
+    }
+
+    /// Sync a document with `peers` and the recorded peers in `recorded`
+    /// alone, none of the others this engine recorded for it; `join_gossip`
+    /// as in [`Self::start_sync`] and [`Self::start_sync_scoped`].
+    pub async fn sync_with_peers(
+        &self,
+        namespace: NamespaceId,
+        peers: Vec<Contact>,
+        recorded: Vec<PublicKey>,
+        default_identity: Identity,
+        join_gossip: bool,
+    ) -> Result<()> {
+        self.sync_with(
+            namespace,
+            peers,
+            Some(recorded),
+            default_identity,
+            join_gossip,
+        )
+        .await
+    }
+
+    /// Whom each peer of `namespace` is dialed as, replacing what contacts
+    /// stated for it before: for a consumer that derives the whole list
+    /// again whenever it changes. Dials nothing and joins no swarm.
+    pub async fn state_contacts(
+        &self,
+        namespace: NamespaceId,
+        contacts: Vec<Contact>,
+    ) -> Result<()> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::StateContacts {
+                namespace,
+                contacts,
+                reply,
+            })
+            .await?;
+        reply_rx.await?;
+        Ok(())
+    }
+
+    /// Make every later dial of `namespace` follow an exchange of `first`
+    /// with the same counterpart — the one this dial starts, or the one
+    /// running — so a store that `first` governs is reconciled after it.
+    /// `None` lifts the order. An in-process dial waits for the exchange
+    /// its consumer opened first rather than opening one.
+    pub async fn order_after(
+        &self,
+        namespace: NamespaceId,
+        first: Option<NamespaceId>,
+    ) -> Result<()> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::OrderAfter {
+                namespace,
+                first,
+                reply,
+            })
+            .await?;
+        reply_rx.await?;
+        Ok(())
+    }
+
+    async fn sync_with(
+        &self,
+        namespace: NamespaceId,
+        peers: Vec<Contact>,
+        recorded: Option<Vec<PublicKey>>,
+        default_identity: Identity,
+        join_gossip: bool,
+    ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
+                recorded,
                 default_identity,
-                join_gossip: false,
+                join_gossip,
                 reply,
             })
             .await?;

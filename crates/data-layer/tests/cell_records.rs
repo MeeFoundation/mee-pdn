@@ -1,17 +1,47 @@
-//! The record view over one device's replica of a cell's record store: what
+//! The record view over a device's replica of a cell's record store — what
 //! the entries it holds read as, by the membership its replica of the
-//! membership store folds into at each read. Every entry arrives by the
-//! store-level writes the cells service performs, on the one device: no
-//! session serves the record store, so the view's verdict on a relayed
-//! entry is not asserted here.
+//! membership store folds into at each read — and the entries of either
+//! store outside the key layout, held, read by nothing and listed with
+//! their authors. Every entry arrives by the store-level writes the cells
+//! service performs, and the tickets by hand.
+
+use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
     AnnouncementKeyPair, CellStore, EventKind, ForNothing, MemberDevice, MembershipKey, OpId,
-    RecordKey, Seq, SyncNode, UnknownCell, Verdict,
+    RecordKey, Seq, SpawnOptions, SyncNode, UnknownCell, UnknownEntry, Verdict,
 };
 use pdn_types::{CellId, PdnId, RecordId};
-use test_utils::{host_identity, memory_node};
+use test_utils::{cell as c, eventually, host_identity, memory_node};
+
+/// Out of every scenario's reach: no pass opens a session a scenario did
+/// not name.
+const QUIET: Duration = Duration::from_secs(3600);
+
+const PLAIN: data_layer::MemberState = data_layer::MemberState {
+    member: true,
+    owner: false,
+};
+
+async fn quiet_node() -> Result<SyncNode> {
+    SyncNode::spawn(SpawnOptions {
+        reconcile_interval: QUIET,
+        cell_reconcile_interval: QUIET,
+        ..SpawnOptions::memory()
+    })
+    .await
+}
+
+/// Whether `holder`'s replicas come to list `entry` outside the key layout.
+async fn lists_unknown(
+    node: &SyncNode,
+    holder: PdnId,
+    cell: CellId,
+    entry: &UnknownEntry,
+) -> Result<bool> {
+    eventually(|| async { Ok(node.list_cell_unknown(holder, cell).await?.contains(entry)) }).await
+}
 
 /// An identity whose `PdnId` derives from the announcement key pair beside it.
 struct Identity {
@@ -205,5 +235,223 @@ async fn a_members_records_read_on_its_device_and_its_forgery_under_another_name
     );
 
     phone.shutdown().await?;
+    Ok(())
+}
+
+/// A claim a member relays reads on another member's device as its
+/// author's, while its author's device is offline. Denied: the relaying
+/// member's own entry at the claim's key, newer though it is, is held and
+/// read by nothing, and a holder of the relay's tickets that is no member
+/// takes nothing.
+#[allow(clippy::too_many_lines)] // one scenario: the relay, the forgery and the denial
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_claim_reads_as_its_authors_and_the_relays_entry_at_its_key_by_nothing(
+) -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone, dave_phone) = (
+        quiet_node().await?,
+        quiet_node().await?,
+        quiet_node().await?,
+        quiet_node().await?,
+    );
+    let (alice, _) = c::host(&alice_phone).await?;
+    let (bob, _) = c::host(&bob_phone).await?;
+    let (carol, _) = c::host(&carol_phone).await?;
+    let (dave, _) = c::host(&dave_phone).await?;
+    let cell = c::found(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        c::invite(
+            &alice_phone,
+            &alice,
+            cell,
+            member,
+            vec![c::device_of(phone, member)?],
+        )
+        .await?;
+    }
+    bob_phone
+        .import_cell(bob.id, cell, c::tickets(&alice_phone, &alice, cell).await?)
+        .await?;
+    let claim = c::place_claim(&alice_phone, &alice, cell, 1).await?;
+    assert!(c::reads(&bob_phone, bob.id, cell, claim).await?);
+    let at_its_key = RecordKey::Claim {
+        member: alice.id,
+        id: claim.id,
+        mseq: Seq::FIRST,
+    };
+    bob_phone
+        .write_cell_entry(
+            bob.id,
+            cell,
+            CellStore::Records,
+            &at_its_key.to_bytes(),
+            b"forged",
+        )
+        .await?;
+    // Everything Carol's phone needs, payloads included, is on Bob's phone
+    // before Alice's goes.
+    assert!(c::lists(&bob_phone, bob.id, cell, carol.id, PLAIN).await?);
+    alice_phone.shutdown().await?;
+
+    let from_bob = c::tickets(&bob_phone, &bob, cell).await?;
+    carol_phone
+        .import_cell(carol.id, cell, from_bob.clone())
+        .await?;
+    dave_phone.import_cell(dave.id, cell, from_bob).await?;
+    assert!(c::reads(&carol_phone, carol.id, cell, claim).await?);
+    assert_eq!(
+        carol_phone
+            .read_cell_record(carol.id, cell, &claim)
+            .await?
+            .as_deref(),
+        Some(&b"claim"[..]),
+        "the relay's entry at the claim's key read"
+    );
+    let bobs_author = bob_phone.default_author(bob.id)?;
+    let held = carol_phone.cell_record_view(carol.id, cell).await?;
+    let forged = held
+        .verdicts()
+        .find(|(entry, _verdict)| entry.author == bobs_author)
+        .map(|(_entry, verdict)| verdict);
+    assert_eq!(
+        forged,
+        Some(Verdict::CountedForNothing(ForNothing::AuthorNotActorDevice)),
+        "the relay's entry is not held as read by nothing"
+    );
+    // Denied: the holder of the relay's tickets that is no member.
+    assert!(c::holds_no_record(&dave_phone, dave.id, cell).await?);
+
+    for node in [bob_phone, carol_phone, dave_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// An entry a member writes outside the key layout of either store reaches
+/// every member device and is listed there with its author, every record
+/// and every member reading as before. Denied: a holder of both tickets
+/// that is no member lists nothing.
+#[allow(clippy::too_many_lines)] // one scenario: both stores' unknown entries beside the denial
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_entry_from_a_member_converges_and_changes_nothing() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone, dave_phone) = (
+        quiet_node().await?,
+        quiet_node().await?,
+        quiet_node().await?,
+        quiet_node().await?,
+    );
+    let (alice, _) = c::host(&alice_phone).await?;
+    let (bob, _) = c::host(&bob_phone).await?;
+    let (carol, _) = c::host(&carol_phone).await?;
+    let (dave, _) = c::host(&dave_phone).await?;
+    let cell = c::found(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        c::invite(
+            &alice_phone,
+            &alice,
+            cell,
+            member,
+            vec![c::device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = c::tickets(&alice_phone, &alice, cell).await?;
+    for (phone, holder) in [
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+    ] {
+        phone.import_cell(holder.id, cell, tickets.clone()).await?;
+    }
+    let claim = c::place_claim(&alice_phone, &alice, cell, 1).await?;
+    assert!(c::reads(&carol_phone, carol.id, cell, claim).await?);
+
+    let bobs_author = bob_phone.default_author(bob.id)?;
+    let outside = UnknownEntry {
+        store: CellStore::Records,
+        key: b"ext/anything".to_vec(),
+        author: bobs_author,
+    };
+    let record_key_in_membership = UnknownEntry {
+        store: CellStore::Membership,
+        key: RecordKey::Claim {
+            member: bob.id,
+            id: RecordId::from_bytes([7; 16]),
+            mseq: Seq::FIRST,
+        }
+        .to_bytes(),
+        author: bobs_author,
+    };
+    for entry in [&outside, &record_key_in_membership] {
+        bob_phone
+            .write_cell_entry(bob.id, cell, entry.store, &entry.key, b"unknown")
+            .await?;
+    }
+    for (phone, holder) in [(&alice_phone, &alice), (&carol_phone, &carol)] {
+        for entry in [&outside, &record_key_in_membership] {
+            assert!(
+                lists_unknown(phone, holder.id, cell, entry).await?,
+                "an entry outside the key layout did not reach a member's device"
+            );
+        }
+        assert!(c::reads(phone, holder.id, cell, claim).await?);
+        assert_eq!(c::state_on(phone, holder.id, cell, bob.id).await, PLAIN);
+    }
+    // Denied: the ticket holder that is no member.
+    assert!(dave_phone
+        .list_cell_unknown(dave.id, cell)
+        .await?
+        .is_empty());
+
+    for node in [alice_phone, bob_phone, carol_phone, dave_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// An entry outside the key layout that a member relays, authored by a key
+/// no member's statement lists, is held on every member device and listed
+/// with that author, and changes no record and no member.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_entry_is_held_whoever_authored_it() -> Result<()> {
+    let (alice_phone, dave_phone) = (quiet_node().await?, quiet_node().await?);
+    let (alice, _) = c::host(&alice_phone).await?;
+    let (dave, _) = c::host(&dave_phone).await?;
+    let cell = c::found(&alice_phone, &alice).await?;
+    c::invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &dave,
+        vec![c::device_of(&dave_phone, &dave)?],
+    )
+    .await?;
+    dave_phone
+        .import_cell(dave.id, cell, c::tickets(&alice_phone, &alice, cell).await?)
+        .await?;
+    let claim = c::place_claim(&alice_phone, &alice, cell, 1).await?;
+    assert!(c::reads(&dave_phone, dave.id, cell, claim).await?);
+
+    let stranger = dave_phone.create_author(dave.id).await?;
+    let relayed = UnknownEntry {
+        store: CellStore::Records,
+        key: b"ext/anything".to_vec(),
+        author: stranger,
+    };
+    dave_phone
+        .write_cell_entry_as_for_test(dave.id, cell, relayed.store, stranger, &relayed.key, b"x")
+        .await?;
+    assert!(
+        lists_unknown(&alice_phone, alice.id, cell, &relayed).await?,
+        "a member device did not hold an unknown entry of an unlisted author"
+    );
+    assert!(c::reads(&alice_phone, alice.id, cell, claim).await?);
+    assert_eq!(
+        c::state_on(&alice_phone, alice.id, cell, dave.id).await,
+        PLAIN
+    );
+
+    for node in [alice_phone, dave_phone] {
+        node.shutdown().await?;
+    }
     Ok(())
 }

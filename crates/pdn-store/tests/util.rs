@@ -58,6 +58,7 @@ pub async fn endpoint(
 pub struct Node {
     router: iroh::protocol::Router,
     client: Client,
+    engine: std::sync::Arc<pdn_store::engine::Engine>,
 }
 
 impl Deref for Node {
@@ -144,7 +145,12 @@ impl Builder {
         let router = router.spawn();
 
         let client = Client::new(blobs.clone(), docs.api().clone());
-        Ok(Node { router, client })
+        let engine = docs.engine().clone();
+        Ok(Node {
+            router,
+            client,
+            engine,
+        })
     }
 
     pub fn gc_interval(mut self, value: Option<n0_future::time::Duration>) -> Self {
@@ -218,6 +224,12 @@ impl Builder {
 }
 
 impl Node {
+    /// The engine under the node's docs, for what its API does not carry.
+    #[allow(dead_code)]
+    pub fn engine(&self) -> &pdn_store::engine::Engine {
+        &self.engine
+    }
+
     /// Returns the node id
     pub fn id(&self) -> EndpointId {
         self.router.endpoint().id()

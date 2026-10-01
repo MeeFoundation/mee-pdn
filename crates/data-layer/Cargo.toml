@@ -26,6 +26,8 @@ iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
 pdn-store = { workspace = true }
 pdn-types = { path = "../pdn-types" }
+# The cell stores' pass draws the peers each run reaches.
+rand = "0.10"
 # The same major the fork's replica store uses, for one downcast: telling
 # "the directory is held by another running node" apart from corruption
 # when a spawn's store open fails (`DirectoryHeld`).

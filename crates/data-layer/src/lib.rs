@@ -33,12 +33,15 @@ pub use cell::CellVerdicts;
 pub use cell::{
     record_prefix, Awaiting, CellStore, CellTickets, DevicesPayload, EventKind, ForNothing,
     FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice, MemberState, Membership,
-    MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView, Seq, UnknownCell, Verdict,
+    MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView, Seq, UnknownCell,
+    UnknownEntry, Verdict,
 };
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
+#[cfg(feature = "test-util")]
+pub use node::{CellSession, CellSessions};
 // The ceremony registration point (ADR-0011, ADR-0012), re-exported so
 // consumers need no direct iroh dependency. The raw `Endpoint` is
 // deliberately not re-exported — the dial handle wraps it.
@@ -49,9 +52,9 @@ pub use iroh::{
 };
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
-    AlpnTaken, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol, GranteeCannotShare,
-    IdentityNotProvisioned, NamespaceImport, RecordedHosting, SpawnOptions, StorageConfig,
-    SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
+    AlpnTaken, CellPassDraw, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol,
+    GranteeCannotShare, IdentityNotProvisioned, NamespaceImport, RecordedHosting, SpawnOptions,
+    StorageConfig, SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
     DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
 };
 // pdn-store vocabulary of the share/import/write flows, so downstream

@@ -208,6 +208,15 @@ impl Registry {
         Ok(self.read_cells()?.get(&cell).cloned())
     }
 
+    /// Every cell held, a tombstone included.
+    pub(crate) fn cells(&self) -> Result<Vec<(CellId, CellBinding)>> {
+        Ok(self
+            .read_cells()?
+            .iter()
+            .map(|(cell, binding)| (*cell, binding.clone()))
+            .collect())
+    }
+
     /// Reverse lookup: which cell `namespace` is a store of, and which store.
     pub(crate) fn cell_of(&self, namespace: NamespaceId) -> Result<Option<(CellId, CellStore)>> {
         Ok(cell_of(&*self.read_cells()?, namespace))

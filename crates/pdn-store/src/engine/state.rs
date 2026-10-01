@@ -71,6 +71,30 @@ impl NamespaceStates {
         self.0.contains_key(namespace)
     }
 
+    /// Whether an exchange of `namespace` with `counterpart` is running,
+    /// dialed or accepted.
+    pub fn is_running(&self, namespace: &NamespaceId, counterpart: Counterpart) -> bool {
+        self.0
+            .get(namespace)
+            .and_then(|state| state.nodes.get(&counterpart))
+            .is_some_and(|peer| matches!(peer.state, SyncState::Running { .. }))
+    }
+
+    /// Whether an exchange of `namespace` with `counterpart`, dialed or
+    /// accepted, finished well after `since`.
+    pub fn synced_since(
+        &self,
+        namespace: &NamespaceId,
+        counterpart: Counterpart,
+        since: Instant,
+    ) -> bool {
+        self.0
+            .get(namespace)
+            .and_then(|state| state.nodes.get(&counterpart))
+            .and_then(|peer| peer.last_sync.as_ref())
+            .is_some_and(|(finished, result)| *finished >= since && result.is_ok())
+    }
+
     /// Insert a namespace into the set of syncing namespaces.
     pub fn insert(&mut self, namespace: NamespaceId) {
         self.0.entry(namespace).or_default();

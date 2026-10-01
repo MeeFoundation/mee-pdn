@@ -3,6 +3,7 @@
 
 mod fold;
 mod keys;
+mod past;
 mod payloads;
 mod record_view;
 #[cfg(test)]
@@ -10,11 +11,12 @@ mod testing;
 
 use anyhow::Result;
 use futures_lite::StreamExt;
-use pdn_store::{api::Doc, store::Query, DocTicket};
+use pdn_store::{api::Doc, store::Query, AuthorId, DocTicket};
 use pdn_types::CellId;
 
 pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership, Verdict};
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
+pub(crate) use past::{departure_past, PastEntry};
 pub(crate) use payloads::encode_devices;
 pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice};
 pub use record_view::{Operation, RecordEntry, RecordView};
@@ -90,6 +92,37 @@ pub(crate) async fn record_entries(
         });
     }
     Ok(held)
+}
+
+/// An entry of either store whose key fits no layout of its store: kept,
+/// read by nothing, and listed with its author.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownEntry {
+    pub store: CellStore,
+    pub key: Vec<u8>,
+    pub author: AuthorId,
+}
+
+/// The entries of `doc`, one of `cell`'s stores, whose keys fit no layout of
+/// that store.
+pub(crate) async fn unknown_entries(doc: &Doc, store: CellStore) -> Result<Vec<UnknownEntry>> {
+    let fits = |key: &[u8]| match store {
+        CellStore::Membership => MembershipKey::parse(key).is_some(),
+        CellStore::Records => RecordKey::parse(key).is_some(),
+    };
+    let mut unknown = Vec::new();
+    let mut stream = std::pin::pin!(doc.get_many(Query::all()).await?);
+    while let Some(entry) = stream.next().await {
+        let entry = entry?;
+        if !fits(entry.key()) {
+            unknown.push(UnknownEntry {
+                store,
+                key: entry.key().to_vec(),
+                author: entry.author(),
+            });
+        }
+    }
+    Ok(unknown)
 }
 
 /// The write tickets to a cell's two stores.

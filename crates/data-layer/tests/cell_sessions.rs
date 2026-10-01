@@ -1,4 +1,4 @@
-//! Sessions on a cell's membership store, served by the member the caller
+//! Sessions on a cell's stores, served by the member the caller
 //! names: a sibling device by its identity's own directory, another member's
 //! device by that member's device statements, and every other caller refused
 //! as for an unhosted replica. The entries a cell's creation and its joins
@@ -174,9 +174,9 @@ async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnId) -
     }
 }
 
-/// A member's device is served the membership store whole and folds the
-/// cell from nothing. Denied: a holder of both tickets that is no member,
-/// the member itself once kicked, and every caller on the record store.
+/// A member's device is served both stores and folds the cell from nothing.
+/// Denied: a holder of both tickets that is no member, on either store, and
+/// the member itself once kicked, on the record store.
 #[allow(clippy::too_many_lines)] // one scenario: the served member beside each denial
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
@@ -285,11 +285,21 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         0,
         "the refused ticket holder took entries"
     );
-    // Denied: the record store, to the member too.
+    session(&bob_phone, bob.id, records, &alice_phone, alice.id, bob.id).await?;
+    // Denied: the ticket holder, on the record store.
     assert!(refused(
-        session(&bob_phone, bob.id, records, &alice_phone, alice.id, bob.id).await
+        session(
+            &dave_phone,
+            dave.id,
+            records,
+            &alice_phone,
+            alice.id,
+            dave.id
+        )
+        .await
     ));
-    // Denied: the member once kicked.
+    // Denied: the member once kicked, on the record store; the membership
+    // store is served to it over the kick's past.
     let kick = MembershipKey::Event {
         subject: bob.id,
         seq: Seq::new(3),
@@ -299,16 +309,17 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     };
     write(&alice_phone, &alice, cell, kick, vec![0]).await?;
     assert!(refused(
-        session(
-            &bob_phone,
-            bob.id,
-            membership,
-            &alice_phone,
-            alice.id,
-            bob.id
-        )
-        .await
+        session(&bob_phone, bob.id, records, &alice_phone, alice.id, bob.id).await
     ));
+    session(
+        &bob_phone,
+        bob.id,
+        membership,
+        &alice_phone,
+        alice.id,
+        bob.id,
+    )
+    .await?;
 
     for node in [alice_phone, bob_phone, dave_phone] {
         node.shutdown().await?;
