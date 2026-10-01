@@ -149,6 +149,27 @@ pub async fn lists(
     eventually(|| async { Ok(state_on(node, holder, cell, member).await == want) }).await
 }
 
+/// Whether `holder`'s replica comes to fold `device` among `member`'s.
+pub async fn lists_device(
+    node: &SyncNode,
+    holder: PdnId,
+    cell: CellId,
+    member: PdnId,
+    device: MemberDevice,
+) -> Result<bool> {
+    eventually(|| async {
+        Ok(node
+            .cell_membership(holder, cell)
+            .await
+            .is_ok_and(|membership| {
+                membership
+                    .member(&member)
+                    .is_some_and(|folded| folded.devices.contains(&device))
+            }))
+    })
+    .await
+}
+
 pub async fn folds_nobody(node: &SyncNode, holder: PdnId, cell: CellId) -> Result<bool> {
     Ok(node
         .cell_membership(holder, cell)

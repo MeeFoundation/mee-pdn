@@ -4,8 +4,9 @@
 //! as for an unhosted replica. The entries a cell's creation and its joins
 //! write arrive by the store-level writes the cells service performs, and
 //! the tickets by hand. The reconcile pass is set out of reach and the
-//! sessions a scenario asserts on are opened by name; the ones the swarm
-//! opens between member devices carry nothing a refusal below depends on.
+//! sessions a scenario asserts on are opened by name; where a refusal
+//! depends on what a device has not received, the devices it had sessions
+//! with are settled first, since out of a swarm it is still dialed by them.
 
 use std::time::Duration;
 
@@ -162,6 +163,30 @@ async fn session(
 /// The uniform refusal, the one an unhosted replica answers with.
 fn refused(result: Result<()>) -> bool {
     result.is_err_and(|err| format!("{err:#}").contains("NotFound"))
+}
+
+/// Whether `cell`'s stores come to have nothing in flight on every one of
+/// `nodes` — no exchange running, held or due to redial — in two reads in
+/// a row: a dial one node still makes lands on another between two reads.
+async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut quiet_reads = 0_u8;
+    while std::time::Instant::now() < deadline {
+        let mut in_flight = 0_usize;
+        for node in nodes {
+            in_flight = in_flight.saturating_add(node.cell_syncs_in_flight_for_test(cell).await?);
+        }
+        quiet_reads = if in_flight == 0 {
+            quiet_reads.saturating_add(1)
+        } else {
+            0
+        };
+        if quiet_reads == 2 {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
 }
 
 async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnId) -> MemberState {
@@ -510,9 +535,10 @@ async fn a_newcomer_is_served_once_its_joined_event_arrives() -> Result<()> {
         eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, bob.id).await == PLAIN) })
             .await?
     );
-    // Out of the swarm, so Carol's joined event reaches Alice's phone only
-    // by the session named below.
+    // Out of the swarm and settled, so Carol's joined event reaches Alice's
+    // phone only by the session named below.
     bob_phone.leave_swarm_for_test(bob.id, membership).await?;
+    assert!(settle(&[&alice_phone, &bob_phone], cell).await?);
     invite(
         &bob_phone,
         &bob,

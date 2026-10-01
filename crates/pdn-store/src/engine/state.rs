@@ -4,7 +4,7 @@ use anyhow::Result;
 use iroh::EndpointId;
 use n0_future::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     net::{AbortReason, AcceptOutcome, SyncFinished},
@@ -78,6 +78,17 @@ impl NamespaceStates {
             .get(namespace)
             .and_then(|state| state.nodes.get(&counterpart))
             .is_some_and(|peer| matches!(peer.state, SyncState::Running { .. }))
+    }
+
+    /// The exchanges of `namespace` running, dialed or accepted.
+    pub fn running(&self, namespace: &NamespaceId) -> usize {
+        self.0.get(namespace).map_or(0, |state| {
+            state
+                .nodes
+                .values()
+                .filter(|peer| matches!(peer.state, SyncState::Running { .. }))
+                .count()
+        })
     }
 
     /// Whether an exchange of `namespace` with `counterpart`, dialed or
@@ -237,10 +248,14 @@ impl PeerState {
         let start = match &self.state {
             SyncState::Running {
                 start,
-                origin: origin2,
+                origin: running,
             } => {
-                if origin2 != origin {
-                    warn!(actual = ?origin, expected = ?origin2, "finished sync origin does not match state")
+                // Another exchange holds the slot: an accept this side refused
+                // never took it, and a dial the tie-break superseded leaves
+                // the accept that took it over to finish it.
+                if matches!(running, Origin::Accept) != matches!(origin, Origin::Accept) {
+                    debug!(finished = ?origin, ?running, "finish of an exchange not running");
+                    return None;
                 }
                 Some(*start)
             }
@@ -432,6 +447,39 @@ mod tests {
             matches!(refused, AcceptOutcome::Reject(AbortReason::AlreadySyncing)),
             "both sides accepted, so both exchanges ran"
         );
+    }
+
+    /// An accept refused while a dial toward the same counterpart runs leaves
+    /// the dial to finish the pair, and the dial's finish is the one reported:
+    /// a caller waiting for the dial's session would otherwise never hear of
+    /// it.
+    #[test]
+    fn a_refused_accept_leaves_the_running_dial_to_finish_the_pair() {
+        let namespace = namespace();
+        let (peer, _) = node_pair();
+        let mut states = NamespaceStates::default();
+        states.insert(namespace);
+        assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
+
+        let refused = states.finish(
+            &namespace,
+            peer,
+            counterpart(),
+            &Origin::Accept,
+            Err(anyhow::anyhow!("refused")),
+        );
+        assert!(refused.is_none(), "the refused accept finished the dial");
+        assert!(states.is_running(&namespace, (peer, counterpart())));
+
+        let dialed = states.finish(
+            &namespace,
+            peer,
+            counterpart(),
+            &Origin::Connect(SyncReason::DirectJoin),
+            Err(anyhow::anyhow!("the dial's own outcome")),
+        );
+        assert!(dialed.is_some(), "the dial's finish went unreported");
+        assert!(!states.is_running(&namespace, (peer, counterpart())));
     }
 
     /// A dial the remote rejected as already-syncing leaves nothing running that could

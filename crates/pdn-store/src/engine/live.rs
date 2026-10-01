@@ -159,6 +159,13 @@ pub enum ToLiveActor {
         reason: SyncReason,
         aborted: Instant,
     },
+    /// The exchanges of `namespaces` running, held behind another's, or
+    /// waiting to redial.
+    SyncsInFlight {
+        namespaces: Vec<NamespaceId>,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<usize>,
+    },
     /// Whom each peer of `namespace` is dialed as, replacing what contacts
     /// stated before; dials nothing.
     StateContacts {
@@ -400,6 +407,8 @@ pub struct LiveActor {
     /// Dials held until the prerequisite's exchange with the same
     /// counterpart finishes, keyed by that exchange.
     held_dials: HashMap<(NamespaceId, PublicKey, Identity), Vec<HeldDial>>,
+    /// Redials waiting out [`REDIAL_AFTER_ABORT`], by namespace.
+    redials_due: HashMap<NamespaceId, usize>,
     /// In-process sessions opened, so a pass over a quiet pair can be
     /// shown to open none.
     in_process_sessions: Arc<AtomicU64>,
@@ -456,6 +465,7 @@ impl LiveActor {
             default_identities: Default::default(),
             prerequisites: Default::default(),
             held_dials: Default::default(),
+            redials_due: Default::default(),
             in_process_sessions,
             co_located,
             metrics,
@@ -611,9 +621,15 @@ impl LiveActor {
                 reason,
                 aborted,
             } => {
+                if let Some(due) = self.redials_due.get_mut(&namespace) {
+                    *due = due.saturating_sub(1);
+                }
                 if !self.state.synced_since(&namespace, (peer, callee), aborted) {
                     self.sync_with_identity(namespace, peer, callee, reason);
                 }
+            }
+            ToLiveActor::SyncsInFlight { namespaces, reply } => {
+                reply.send(self.syncs_in_flight(&namespaces)).ok();
             }
             ToLiveActor::StateContacts {
                 namespace,
@@ -991,6 +1007,32 @@ impl LiveActor {
 
     /// The stated identities of `namespace`'s peers become `contacts`'
     /// alone; the ones a running session named stay until it ends.
+    fn syncs_in_flight(&self, namespaces: &[NamespaceId]) -> usize {
+        let running: usize = namespaces
+            .iter()
+            .map(|namespace| self.state.running(namespace))
+            .sum();
+        let held =
+            self.held_dials
+                .iter()
+                .flat_map(|((first, _peer, _counterpart), dials)| {
+                    dials.iter().map(move |dial| (first, dial))
+                })
+                .filter(|(first, dial)| {
+                    let namespace = match dial {
+                        HeldDial::Network { namespace, .. }
+                        | HeldDial::InProcess { namespace, .. } => namespace,
+                    };
+                    namespaces.contains(first) || namespaces.contains(namespace)
+                })
+                .count();
+        let due: usize = namespaces
+            .iter()
+            .filter_map(|namespace| self.redials_due.get(namespace))
+            .sum();
+        running.saturating_add(held).saturating_add(due)
+    }
+
     fn state_contacts(&mut self, namespace: NamespaceId, contacts: Vec<Contact>) {
         for ((tracked, _peer), identities) in &mut self.peer_identities {
             if *tracked == namespace {
@@ -1127,6 +1169,8 @@ impl LiveActor {
                     reason,
                     aborted: Instant::now(),
                 };
+                let due = self.redials_due.entry(namespace).or_default();
+                *due = due.saturating_add(1);
                 let to_self = self.sync_actor_tx.clone();
                 n0_future::task::spawn(async move {
                     n0_future::time::sleep(REDIAL_AFTER_ABORT).await;
@@ -1163,8 +1207,9 @@ impl LiveActor {
                 )
                 .await
             }
-            Err(AcceptError::Abort { reason, .. }) if reason == AbortReason::AlreadySyncing => {
-                // In case we aborted the sync: do nothing (our outgoing sync is in progress)
+            // Refused by us before the exchange took the pair's slot, which
+            // an exchange of ours with the same counterpart may hold.
+            Err(AcceptError::Abort { reason, .. }) => {
                 debug!(?reason, "aborted by us");
             }
             Err(err) => {

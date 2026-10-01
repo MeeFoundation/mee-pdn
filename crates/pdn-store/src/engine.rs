@@ -296,6 +296,17 @@ impl Engine {
         Ok(())
     }
 
+    /// The exchanges of `namespaces` running, held behind another's, or
+    /// waiting to redial: `0` once nothing this engine started on them can
+    /// still dial.
+    pub async fn syncs_in_flight(&self, namespaces: Vec<NamespaceId>) -> Result<usize> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::SyncsInFlight { namespaces, reply })
+            .await?;
+        Ok(reply_rx.await?)
+    }
+
     /// Make every later dial of `namespace` follow an exchange of `first`
     /// with the same counterpart — the one this dial starts, or the one
     /// running — so a store that `first` governs is reconciled after it.

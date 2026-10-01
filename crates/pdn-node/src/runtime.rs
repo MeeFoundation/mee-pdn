@@ -142,6 +142,7 @@ pub(crate) struct HostedIdentity {
 /// lock per phase and release it across every network round-trip and wait
 /// — otherwise two runtimes running a ceremony toward each other deadlock,
 /// each holding its own lock while the peer's accept side blocks on it.
+#[cfg_attr(feature = "test-util", allow(clippy::struct_excessive_bools))] // one-shot fault switches, each independent
 pub(crate) struct State {
     pub(crate) node: Arc<SyncNode>,
     /// Exactly the identities created or linked here.
@@ -218,6 +219,54 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn new(
+        node: SyncNode,
+        identities: HashMap<PdnId, HostedIdentity>,
+        serving_halves: ServingHalves,
+        sweep_interval: std::time::Duration,
+    ) -> Self {
+        let (retraction_events, _no_subscribers_yet) =
+            tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
+        let (linking_failures, _no_failure_subscribers_yet) =
+            tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
+        Self {
+            node: Arc::new(node),
+            identities,
+            pending_invites: PendingInvites::default(),
+            pending_linking_invites: PendingInvites::default(),
+            pending_cell_invites: PendingInvites::default(),
+            joining_in_flight: HashSet::new(),
+            metadata_pairs: HashMap::new(),
+            grant_binders: HashSet::new(),
+            bound_grants: HashMap::new(),
+            linking_in_flight: HashSet::new(),
+            establishing_in_flight: HashSet::new(),
+            cleanup_tasks: CleanupSupervisor::new(),
+            linking_failures,
+            serving_halves,
+            #[cfg(feature = "test-util")]
+            link_after_import_pause: None,
+            #[cfg(feature = "test-util")]
+            pairing_serve_pause: None,
+            #[cfg(feature = "test-util")]
+            link_before_commit_pause: None,
+            #[cfg(feature = "test-util")]
+            link_after_commit_pause: None,
+            #[cfg(feature = "test-util")]
+            fail_next_pending_device_write: false,
+            #[cfg(feature = "test-util")]
+            drop_next_join_reply: false,
+            #[cfg(feature = "test-util")]
+            fail_next_directory_create: false,
+            #[cfg(feature = "test-util")]
+            fail_next_hosting_record: false,
+            #[cfg(feature = "test-util")]
+            pair_arm_failures: None,
+            retraction_events,
+            sweep_interval,
+        }
+    }
+
     pub(crate) fn hosted(&self, identity: PdnId) -> Result<&HostedIdentity, UnknownIdentity> {
         self.identities
             .get(&identity)
@@ -297,46 +346,12 @@ impl Runtime {
             }
         };
 
-        let (retraction_events, _no_subscribers_yet) =
-            tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
-        let (linking_failures, _no_failure_subscribers_yet) =
-            tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
-        let state = Arc::new(Mutex::new(State {
-            node: Arc::new(node),
+        let state = Arc::new(Mutex::new(State::new(
+            node,
             identities,
-            pending_invites: PendingInvites::default(),
-            pending_linking_invites: PendingInvites::default(),
-            pending_cell_invites: PendingInvites::default(),
-            joining_in_flight: HashSet::new(),
-            metadata_pairs: HashMap::new(),
-            grant_binders: HashSet::new(),
-            bound_grants: HashMap::new(),
-            linking_in_flight: HashSet::new(),
-            establishing_in_flight: HashSet::new(),
-            cleanup_tasks: CleanupSupervisor::new(),
-            linking_failures,
             serving_halves,
-            #[cfg(feature = "test-util")]
-            link_after_import_pause: None,
-            #[cfg(feature = "test-util")]
-            pairing_serve_pause: None,
-            #[cfg(feature = "test-util")]
-            link_before_commit_pause: None,
-            #[cfg(feature = "test-util")]
-            link_after_commit_pause: None,
-            #[cfg(feature = "test-util")]
-            fail_next_pending_device_write: false,
-            #[cfg(feature = "test-util")]
-            drop_next_join_reply: false,
-            #[cfg(feature = "test-util")]
-            fail_next_directory_create: false,
-            #[cfg(feature = "test-util")]
-            fail_next_hosting_record: false,
-            #[cfg(feature = "test-util")]
-            pair_arm_failures: None,
-            retraction_events,
             sweep_interval,
-        }));
+        )));
         for (identity, changes) in armers {
             crate::connections::spawn_connection_armer(Arc::downgrade(&state), identity, changes);
         }

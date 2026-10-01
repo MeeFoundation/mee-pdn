@@ -364,6 +364,11 @@ async fn an_unknown_entry_from_a_member_converges_and_changes_nothing() -> Resul
     }
     let claim = c::place_claim(&alice_phone, &alice, cell, 1).await?;
     assert!(c::reads(&carol_phone, carol.id, cell, claim).await?);
+    // Bob's phone serves the pulls of its writes once it knows the readers.
+    for (phone, reader) in [(&alice_phone, &alice), (&carol_phone, &carol)] {
+        let device = c::device_of(phone, reader)?;
+        assert!(c::lists_device(&bob_phone, bob.id, cell, reader.id, device).await?);
+    }
 
     let bobs_author = bob_phone.default_author(bob.id)?;
     let outside = UnknownEntry {

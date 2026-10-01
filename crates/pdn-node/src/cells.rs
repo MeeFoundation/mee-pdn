@@ -172,7 +172,8 @@ pub trait CellsService {
     ) -> Result<CellInvite>;
 
     /// Join through the invite's dialogue, returning once both stores
-    /// caught up; the identity joins as a plain member. A catch-up cut short
+    /// caught up and the identity's replica folds it as a member; the
+    /// identity joins as a plain member. A catch-up cut short
     /// fails with [`data_layer::CatchUpTimeout`] and leaves both tickets and
     /// the directory's entry recorded.
     async fn join(&self, identity: PdnId, invite: CellInvite) -> Result<CellId>;
@@ -360,6 +361,7 @@ impl CellsService for RuntimeCellsService<'_> {
 
 /// The joiner's half: dial, run the dialogue, then record both tickets and
 /// the directory's entry before the catch-up the join waits for.
+#[allow(clippy::too_many_lines)] // one dialogue, both transports and each record in one place
 async fn join_via_dialogue(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
@@ -455,7 +457,15 @@ async fn join_via_dialogue(
         let directory = &state.hosted(identity)?.directory;
         record_cell(&node, directory, identity, cell, Seq::new(offer.seq)).await?;
     }
+    let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
     caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
+    // A member from here on: the caller's next act checks the fold.
+    node.await_cell_member(
+        identity,
+        cell,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .await?;
     Ok(cell)
 }
 
@@ -521,6 +531,7 @@ async fn join_in_process(
 /// sequence, write its joined event and device statement into the replica
 /// of the identity the secret was minted for, then hand over both tickets.
 /// `None` is a refusal, any reason at all.
+#[allow(clippy::too_many_lines)] // one dialogue, each refusal beside the step it guards
 pub(crate) async fn serve_join<R, W>(
     state: &Arc<Mutex<State>>,
     send: &mut W,

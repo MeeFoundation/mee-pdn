@@ -17,8 +17,8 @@ use data_layer::{
 use pdn_types::{CellId, NodeId};
 use test_utils::{
     cell::{
-        device_of, folds_nobody, found, holds_no_record, host, invite, lists, place_claim, reads,
-        state_on, tickets, write, Person,
+        device_of, folds_nobody, found, holds_no_record, host, invite, lists, lists_device,
+        place_claim, reads, state_on, tickets, write, Person,
     },
     eventually, TIMEOUT,
 };
@@ -70,6 +70,32 @@ async fn dial(
     let contact = Contact::new(to.dial_handle().addr(), identity_of(callee.id));
     from.sync_cell_with_for_test(holder.id, cell, store, contact)
         .await
+}
+
+/// Whether `cell`'s stores come to have nothing in flight on every one of
+/// `nodes` — no exchange running, held or due to redial — in two reads in
+/// a row: a dial one node still makes lands on another between two reads.
+/// Out of a swarm, a store is still dialed by every node it had a session
+/// with until then.
+async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut quiet_reads = 0_u8;
+    while std::time::Instant::now() < deadline {
+        let mut in_flight = 0_usize;
+        for node in nodes {
+            in_flight = in_flight.saturating_add(node.cell_syncs_in_flight_for_test(cell).await?);
+        }
+        quiet_reads = if in_flight == 0 {
+            quiet_reads.saturating_add(1)
+        } else {
+            0
+        };
+        if quiet_reads == 2 {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
 }
 
 /// A write reaches every subscribed member device through the store's swarm
@@ -409,6 +435,8 @@ async fn a_cell_store_keeps_its_own_interval() -> Result<()> {
     bob_phone.import_cell(bob.id, cell, tickets).await?;
     assert!(lists(&bob_phone, bob.id, cell, alice.id, OWNER).await?);
     bob_phone.leave_swarm_for_test(bob.id, membership).await?;
+    // Settled, so no dial the import left behind carries the write.
+    assert!(settle(&[&alice_phone, &bob_phone], cell).await?);
 
     let erin = Person::generate();
     invite(&alice_phone, &alice, cell, &erin, vec![nowhere(0xe0)]).await?;
@@ -469,8 +497,8 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
     for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         assert!(lists(phone, holder.id, cell, alice.id, OWNER).await?);
     }
-    // Out of both swarms, so Dave's entries reach Carol's phone only by the
-    // sessions she dials.
+    // Out of both swarms and settled, so Dave's entries reach Carol's phone
+    // only by the sessions she dials.
     for namespace in [
         tickets.membership.capability.id(),
         tickets.records.capability.id(),
@@ -479,6 +507,7 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
             .leave_swarm_for_test(carol.id, namespace)
             .await?;
     }
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone, &erin_phone], cell).await?);
 
     invite(
         &alice_phone,
@@ -489,7 +518,9 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
     )
     .await?;
     dave_phone.import_cell(dave.id, cell, tickets).await?;
-    assert!(lists(&dave_phone, dave.id, cell, alice.id, OWNER).await?);
+    // Bob's pull of the claim is served once Dave's phone knows his device.
+    let bobs = device_of(&bob_phone, &bob)?;
+    assert!(lists_device(&dave_phone, dave.id, cell, bob.id, bobs).await?);
     let claim = place_claim(&dave_phone, &dave, cell, 4).await?;
     assert!(reads(&bob_phone, bob.id, cell, claim).await?);
 
@@ -532,11 +563,6 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
 /// A newcomer is served the record store by a member device in the session
 /// after the one that brings the device its joined event. Denied: the
 /// newcomer's own dial to that device while the device does not know it.
-///
-/// The device's dial joins it to the newcomer's swarm, whose new neighbour
-/// sets off a dial of the newcomer's own at once, and either of the two can
-/// be the one that runs, so the session asserted on is the first served
-/// either way.
 #[allow(clippy::too_many_lines)] // one scenario: the refusal and the pair of sessions that ends it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that_brings_its_joined_event(
@@ -561,14 +587,15 @@ async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that
     let tickets = tickets(&alice_phone, &alice, cell).await?;
     bob_phone.import_cell(bob.id, cell, tickets.clone()).await?;
     assert!(lists(&bob_phone, bob.id, cell, alice.id, OWNER).await?);
-    // Out of both swarms, so Nina's joined event and Bob's claim cross only
-    // in the sessions dialed below.
+    // Out of both swarms and settled, so Nina's joined event and Bob's claim
+    // cross only in the sessions dialed below.
     for namespace in [
         tickets.membership.capability.id(),
         tickets.records.capability.id(),
     ] {
         bob_phone.leave_swarm_for_test(bob.id, namespace).await?;
     }
+    assert!(settle(&[&alice_phone, &bob_phone], cell).await?);
     let claim = place_claim(&bob_phone, &bob, cell, 2).await?;
 
     invite(
@@ -580,7 +607,8 @@ async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that
     )
     .await?;
     nina_phone.import_cell(nina.id, cell, tickets).await?;
-    assert!(lists(&nina_phone, nina.id, cell, bob.id, PLAIN).await?);
+    let bobs = device_of(&bob_phone, &bob)?;
+    assert!(lists_device(&nina_phone, nina.id, cell, bob.id, bobs).await?);
     let mut sessions = nina_phone
         .watch_cell_sessions(nina.id, cell, CellStore::Records)
         .await?;
@@ -660,7 +688,11 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
         phone.import_cell(holder.id, cell, tickets.clone()).await?;
         assert!(lists(phone, holder.id, cell, alice.id, OWNER).await?);
     }
-    assert!(lists(&bob_phone, bob.id, cell, carol.id, PLAIN).await?);
+    let carols = device_of(&carol_phone, &carol)?;
+    assert!(lists_device(&bob_phone, bob.id, cell, carol.id, carols).await?);
+    let phones = [&alice_phone, &bob_phone, &carol_phone];
+    // Settled, so the session read below is the one Carol's phone dials.
+    assert!(settle(&phones, cell).await?);
     let mut sessions = carol_phone
         .watch_cell_sessions(carol.id, cell, CellStore::Records)
         .await?;
@@ -676,12 +708,18 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
     let served = sessions
         .next_with(bob_phone.node_id(), true, TIMEOUT)
         .await?;
-    assert!(served.is_some_and(|session| session.exchanged.is_ok()));
-    // Out of the membership store's swarm, so the kick reaches Bob's phone
-    // only in the session Carol's phone dials.
+    assert!(
+        served
+            .as_ref()
+            .is_some_and(|session| session.exchanged.is_ok()),
+        "a member device refused a member: {served:?}"
+    );
+    // Out of the membership store's swarm and settled, so the kick reaches
+    // Bob's phone only in the session Carol's phone dials.
     bob_phone
         .leave_swarm_for_test(bob.id, tickets.membership.capability.id())
         .await?;
+    assert!(settle(&phones, cell).await?);
 
     let kick = MembershipKey::Event {
         subject: carol.id,
@@ -703,6 +741,9 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
     );
     assert_eq!(state_on(&bob_phone, bob.id, cell, carol.id).await, PLAIN);
 
+    let mut sessions = carol_phone
+        .watch_cell_sessions(carol.id, cell, CellStore::Records)
+        .await?;
     dial(
         &carol_phone,
         &carol,
@@ -758,8 +799,9 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
     let tickets = tickets(&mia_phone, &mia, cell).await?;
     tablet.import_cell(bob.id, cell, tickets.clone()).await?;
     assert!(lists(&tablet, bob.id, cell, mia.id, OWNER).await?);
-    // Both out of both swarms: Mia's node then dials nobody on its own, so
-    // Dave's joined event reaches Bob's replica through no session.
+    // Both out of both swarms and settled: Mia's node then dials nobody on
+    // its own, so Dave's joined event reaches Bob's replica through no
+    // session.
     for namespace in [
         tickets.membership.capability.id(),
         tickets.records.capability.id(),
@@ -767,6 +809,7 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
         tablet.leave_swarm_for_test(bob.id, namespace).await?;
         mia_phone.leave_swarm_for_test(mia.id, namespace).await?;
     }
+    assert!(settle(&[&mia_phone, &tablet], cell).await?);
     invite(
         &mia_phone,
         &mia,
@@ -802,11 +845,10 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
 /// them on the next pass, and the other member reads a newcomer's record it
 /// held and read nothing of.
 ///
-/// Both members are out of every swarm, the founder's node is gone once the
-/// newcomer has caught up, and the newcomer's node is dialed only by the
-/// sessions named below, so what moves between the two is the pass's: out
-/// of a swarm a node is still dialed by others, and the founder's would
-/// otherwise carry the newcomer's joined event to either at any time.
+/// Both members are out of every swarm and settled with the founder's node
+/// before the newcomer's joined event is written, the founder's node is gone
+/// once the newcomer has caught up, and the newcomer's node is dialed only
+/// by the sessions named below, so what moves between the two is the pass's.
 #[allow(clippy::too_many_lines)] // one scenario: the quiet pair, the membership event and both sessions
 #[tokio::test(flavor = "multi_thread")]
 async fn a_membership_event_with_no_record_written_opens_both_of_a_cells_sessions() -> Result<()> {
@@ -839,6 +881,7 @@ async fn a_membership_event_with_no_record_written_opens_both_of_a_cells_session
             tablet.leave_swarm_for_test(member.id, namespace).await?;
         }
     }
+    assert!(settle(&[&mia_phone, &tablet], cell).await?);
     invite(
         &mia_phone,
         &mia,
@@ -849,6 +892,11 @@ async fn a_membership_event_with_no_record_written_opens_both_of_a_cells_session
     .await?;
     erin_phone.import_cell(erin.id, cell, tickets).await?;
     assert!(lists(&erin_phone, erin.id, cell, erin.id, PLAIN).await?);
+    // Erin's phone serves both members once it knows their devices.
+    for member in [&bob, &dave] {
+        let device = device_of(&tablet, member)?;
+        assert!(lists_device(&erin_phone, erin.id, cell, member.id, device).await?);
+    }
     mia_phone.shutdown().await?;
     let claim = place_claim(&erin_phone, &erin, cell, 6).await?;
     // Dave's phone takes Erin's claim, and reads nothing of it.

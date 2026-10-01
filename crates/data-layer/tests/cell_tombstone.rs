@@ -16,8 +16,8 @@ use data_layer::{
 use pdn_types::CellId;
 use test_utils::{
     cell::{
-        device_of, found, holds_no_record, host, invite, lists, place_claim, reads, tickets, write,
-        Person,
+        device_of, found, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
+        tickets, write, Person,
     },
     join_identity, wait_devices, TIMEOUT,
 };
@@ -104,6 +104,32 @@ async fn dial(
     let contact = Contact::new(to.dial_handle().addr(), identity_of(callee.id));
     from.sync_cell_with_for_test(holder.id, cell, store, contact)
         .await
+}
+
+/// Whether `cell`'s stores come to have nothing in flight on every one of
+/// `nodes` — no exchange running, held or due to redial — in two reads in
+/// a row: a dial one node still makes lands on another between two reads.
+/// Out of a swarm, a store is still dialed by every node it had a session
+/// with until then.
+async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut quiet_reads = 0_u8;
+    while std::time::Instant::now() < deadline {
+        let mut in_flight = 0_usize;
+        for node in nodes {
+            in_flight = in_flight.saturating_add(node.cell_syncs_in_flight_for_test(cell).await?);
+        }
+        quiet_reads = if in_flight == 0 {
+            quiet_reads.saturating_add(1)
+        } else {
+            0
+        };
+        if quiet_reads == 2 {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
 }
 
 /// A device offline while its member is kicked learns of the kick at its
@@ -221,7 +247,8 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
         device.import_cell(holder.id, cell, tickets.clone()).await?;
         assert!(lists(device, holder.id, cell, bob.id, PLAIN).await?);
     }
-    // Out of both swarms, so the leave goes out in the sessions dialed below.
+    // Out of both swarms and settled, so the leave goes out in the sessions
+    // dialed below.
     for namespace in [
         tickets.membership.capability.id(),
         tickets.records.capability.id(),
@@ -233,6 +260,8 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
             .leave_swarm_for_test(carol.id, namespace)
             .await?;
     }
+    let phones = [&alice_phone, &bob_phone, &carol_phone, &carol_laptop];
+    assert!(settle(&phones, cell).await?);
 
     depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
     let dave = Person::generate();
@@ -409,7 +438,9 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
             .import_cell(holder.id, cell, from_alice.clone())
             .await?;
     }
-    assert!(lists(&carol_phone, carol.id, cell, bob.id, PLAIN).await?);
+    // Bob's pull of the claim is served once Carol's phone knows his device.
+    let bobs = device_of(&bob_phone, &bob)?;
+    assert!(lists_device(&carol_phone, carol.id, cell, bob.id, bobs).await?);
     let earlier = place_claim(&carol_phone, &carol, cell, 1).await?;
     assert!(reads(&bob_phone, bob.id, cell, earlier).await?);
 

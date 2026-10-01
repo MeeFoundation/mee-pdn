@@ -1632,6 +1632,38 @@ impl SyncNode {
         stack.access.fold_cell(cell, &held.membership).await
     }
 
+    /// Wait, at most `timeout`, until `identity`'s replica of `cell` folds
+    /// `identity` itself into a member: a session brings its own entries
+    /// ahead of their payloads. [`CatchUpTimeout`] when it does not.
+    pub async fn await_cell_member(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        timeout: Duration,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        // Subscribed before the first fold, so no change lands unseen.
+        let mut changes = held.membership.subscribe().await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let folded = stack.access.fold_cell(cell, &held.membership).await?;
+            if folded
+                .member(&identity)
+                .is_some_and(|member| member.state.member)
+            {
+                return Ok(());
+            }
+            match tokio::time::timeout_at(deadline, changes.next()).await {
+                Ok(Some(_change)) => {}
+                Ok(None) => anyhow::bail!("the membership store's change stream ended"),
+                Err(_elapsed) => return Err(crate::CatchUpTimeout.into()),
+            }
+            // A burst — a session's entries, their payloads — folds once.
+            while let Some(Some(_change)) = futures_lite::future::poll_once(changes.next()).await {}
+        }
+    }
+
     /// The record view over `identity`'s replica of `cell`'s record store,
     /// judged by the membership its membership store folds into; payloads
     /// are checked for arrival, not read. [`UnknownCell`] for a tombstone
@@ -1788,7 +1820,8 @@ impl SyncNode {
 
     /// Reconcile one of `cell`'s stores with `contact` as a drawn contact
     /// is: through the engine, the record store after the membership
-    /// store. Returns once the dial is asked for, not once it ends.
+    /// store. Returns once the dial is asked for, not once it ends, and
+    /// joins no swarm, so a store taken out of one stays out.
     #[cfg(feature = "test-util")]
     pub async fn sync_cell_with_for_test(
         &self,
@@ -1802,13 +1835,34 @@ impl SyncNode {
         let tracked = stack
             .tracked(doc.id())?
             .context("the identity tracks no replica of that store")?;
-        doc.sync_with_peers(
-            vec![contact],
-            Vec::new(),
-            tracked.default_identity,
-            tracked.strategy == SyncStrategy::Swarm,
-        )
-        .await
+        doc.sync_with_peers(vec![contact], Vec::new(), tracked.default_identity, false)
+            .await
+    }
+
+    /// The exchanges of `cell`'s stores this node's identities have
+    /// running, held behind another's, or waiting to redial; `0` once none
+    /// of them can still dial on their own.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_syncs_in_flight_for_test(&self, cell: CellId) -> Result<usize> {
+        let stacks: Vec<Arc<HostedStack>> = self
+            .identities
+            .read()
+            .map_err(|_poisoned| anyhow::anyhow!("identities lock poisoned"))?
+            .values()
+            .cloned()
+            .collect();
+        let mut in_flight = 0_usize;
+        for stack in stacks {
+            let Some(held) = stack.registry.cell(cell)? else {
+                continue;
+            };
+            let namespaces = std::iter::once(held.membership.id())
+                .chain(held.records.as_ref().map(Doc::id))
+                .collect();
+            let running = stack.docs.engine().syncs_in_flight(namespaces).await?;
+            in_flight = in_flight.saturating_add(running);
+        }
+        Ok(in_flight)
     }
 
     /// Every session one of `cell`'s stores finishes from now on, dialed or
@@ -3173,9 +3227,11 @@ fn watch_cell_membership(
     let stack = Arc::downgrade(stack);
     let membership = membership.clone();
     let _detached = tokio::spawn(async move {
-        let Ok(mut events) = membership.subscribe().await else {
+        let Ok(events) = membership.subscribe().await else {
             return;
         };
+        // A burst can end with the stream, which panics when polled again.
+        let mut events = events.fuse();
         while let Some(event) = events.next().await {
             // A burst — a session's entries, their payloads — derives once,
             // and a store that never goes quiet still derives.

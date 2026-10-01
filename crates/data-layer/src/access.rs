@@ -430,7 +430,8 @@ impl AccessBook {
         }
         // A newcomer's join statement and device statement arrive as
         // payloads after the session that brought their entries, so the
-        // session after it would refuse the newcomer for their absence.
+        // session after it would refuse the newcomer for their absence, so
+        // the newcomer is judged again once they are here.
         if self.await_payloads_of(&held.membership, &caller).await? {
             if let Some(access) = self
                 .serve_cell(registry, cell, store, &held.membership, caller, peer)
@@ -504,23 +505,25 @@ impl AccessBook {
     }
 
     /// Wait, at most [`CALLER_PAYLOADS_WAIT`], for the payloads the entries
-    /// of `member`'s own chain and statements still lack; whether any were
-    /// lacking.
+    /// of `member`'s own chain and statements still lack; whether the store
+    /// holds any such entry, so the caller is judged again even when the
+    /// last payload landed before the wait began.
     async fn await_payloads_of(&self, membership: &Doc, member: &PdnId) -> Result<bool> {
         let Some(blobs) = self.blobs.get() else {
             return Ok(false);
         };
         let prefix = format!("member/{member}/");
-        let mut lacking = Vec::new();
+        let (mut held, mut lacking) = (false, Vec::new());
         let mut entries = std::pin::pin!(membership.get_many(Query::key_prefix(prefix)).await?);
         while let Some(entry) = futures_lite::StreamExt::next(&mut entries).await {
+            held = true;
             let hash = entry?.content_hash();
             if !blobs.has(hash).await? {
                 lacking.push(hash);
             }
         }
         if lacking.is_empty() {
-            return Ok(false);
+            return Ok(held);
         }
         let deadline = tokio::time::Instant::now() + CALLER_PAYLOADS_WAIT;
         while tokio::time::Instant::now() < deadline {
