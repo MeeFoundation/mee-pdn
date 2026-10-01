@@ -31,10 +31,10 @@ pub use announcement::{cell_id_of, devices_verify, join_verifies, pdn_id_of, Ann
 #[cfg(feature = "test-util")]
 pub use cell::CellVerdicts;
 pub use cell::{
-    record_prefix, Awaiting, CellCatchUp, CellStore, CellTickets, DevicesPayload, EventKind,
-    ForNothing, FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice, MemberState,
-    Membership, MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView, Seq,
-    UnknownCell, UnknownEntry, Verdict,
+    record_prefix, Awaiting, CellCatchUp, CellDeparture, CellStore, CellTickets, DevicesPayload,
+    EventKind, ForNothing, FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice,
+    MemberState, Membership, MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView,
+    Seq, UnknownCell, UnknownEntry, Verdict, ACT_PAYLOAD,
 };
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
@@ -52,7 +52,7 @@ pub use iroh::{
 };
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
-    AlpnTaken, CellPassDraw, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol,
+    AlpnTaken, CellFlush, CellPassDraw, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol,
     GranteeCannotShare, IdentityNotProvisioned, NamespaceImport, RecordedHosting, SpawnOptions,
     StorageConfig, SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
     DEFAULT_REPLICA_CACHE_BUDGET_BYTES,

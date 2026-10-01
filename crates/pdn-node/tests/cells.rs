@@ -1,14 +1,15 @@
 //! The cells service end to end: creating a cell, listing cells and their
 //! members, the invite and join dialogue between in-process runtimes — the
 //! invite passed as a value — with the refusals of its verify-and-burn each
-//! probed for no observable state beside its allowed counterpart, and the
-//! records members place, edit and read.
+//! probed for no observable state beside its allowed counterpart, the
+//! membership acts each beside the same act refused, and the records
+//! members place, edit and read.
 
 use anyhow::Result;
 use pdn_node::{
-    CellInvite, CellMember, CellsService as _, IdentityService as _, JoinRefused, RecordPlacedOnce,
-    Runtime, UnknownCell, UnknownIdentity, UnknownRecord, UnsupportedCellInviteVersion,
-    WrongRecordKind,
+    ActRefusal, ActRefused, CellAct, CellInvite, CellMember, CellsService as _,
+    IdentityService as _, JoinRefused, RecordPlacedOnce, Runtime, UnknownCell, UnknownIdentity,
+    UnknownRecord, UnsupportedCellInviteVersion, WrongRecordKind,
 };
 use pdn_types::{CellId, PdnId, RecordId, RecordKind, RecordRef};
 use test_utils::{eventually, ids};
@@ -455,6 +456,349 @@ async fn any_member_edits_another_members_mergeable_document() -> Result<()> {
     assert_eq!(alice_phone.cells().list_records(alice, cell).await?, [note]);
 
     for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A cell `alice` created on `alice_phone`, `bob` and `carol` invited by her.
+async fn cell_of_three(
+    (alice_phone, alice): (&Runtime, PdnId),
+    (bob_phone, bob): (&Runtime, PdnId),
+    (carol_phone, carol): (&Runtime, PdnId),
+) -> Result<CellId> {
+    let cell = cell_of_two(alice_phone, alice, bob_phone, bob).await?;
+    let invite = alice_phone.cells().invite(alice, cell, None).await?;
+    carol_phone.cells().join(carol, invite).await?;
+    Ok(cell)
+}
+
+fn refused(acted: Result<()>, reason: ActRefusal) -> bool {
+    acted.is_err_and(|err| {
+        err.downcast_ref::<ActRefused>()
+            .is_some_and(|refusal| refusal.reason == reason)
+    })
+}
+
+/// Whether `holder` on `runtime` comes to list `cell` among its cells, or
+/// to list it no longer.
+async fn lists_cell(runtime: &Runtime, holder: PdnId, cell: CellId, held: bool) -> Result<bool> {
+    eventually(|| async {
+        let listed = runtime.cells().list(holder).await?;
+        Ok(listed.iter().any(|info| info.id == cell) == held)
+    })
+    .await
+}
+
+/// An owner's promotion of a plain member reaches the third member, who
+/// lists both owners. Denied: that third member's promotion of itself and
+/// demotion of the owner, both refused before the promotion, leave every
+/// member listing the roles the promotion alone gives.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_promotes_a_member_and_a_plain_member_promotes_nobody() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let cell = cell_of_three(
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    )
+    .await?;
+
+    // Denied (a plain member).
+    let cells = carol_phone.cells();
+    let promoted = cells.act(carol, cell, CellAct::Promote(carol)).await;
+    assert!(refused(promoted, ActRefusal::NotAnOwner));
+    let demoted = cells.act(carol, cell, CellAct::Demote(alice)).await;
+    assert!(refused(demoted, ActRefusal::NotAnOwner));
+
+    alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Promote(bob))
+        .await?;
+    let roles = vec![member(alice, true), member(bob, true), member(carol, false)];
+    for (runtime, holder) in [
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    ] {
+        assert!(lists_members(runtime, holder, cell, roles.clone()).await?);
+    }
+
+    for runtime in [alice_phone, bob_phone, carol_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// An owner demotes another owner, who stays a member. Denied: an owner's
+/// demotion of itself, the demoted owner's demotion of the other, and a
+/// demotion of a plain member, each refused with nothing written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_demotes_another_owner_and_not_itself() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let cell = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Promote(bob))
+        .await?;
+    let owners = vec![member(alice, true), member(bob, true)];
+    assert!(lists_members(&bob_phone, bob, cell, owners.clone()).await?);
+
+    // Denied: on itself.
+    let demoted = alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Demote(alice))
+        .await;
+    assert!(refused(demoted, ActRefusal::OnItself));
+    assert_eq!(alice_phone.cells().members(alice, cell).await?, {
+        let mut owners = owners;
+        owners.sort();
+        owners
+    });
+
+    bob_phone
+        .cells()
+        .act(bob, cell, CellAct::Demote(alice))
+        .await?;
+    let demoted = vec![member(alice, false), member(bob, true)];
+    for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
+        assert!(lists_members(runtime, holder, cell, demoted.clone()).await?);
+    }
+    // Denied: a demoted owner, and a demotion of a plain member.
+    let acted = alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Demote(bob))
+        .await;
+    assert!(refused(acted, ActRefusal::NotAnOwner));
+    let acted = bob_phone
+        .cells()
+        .act(bob, cell, CellAct::Demote(alice))
+        .await;
+    assert!(refused(acted, ActRefusal::SubjectNotOwner));
+    assert!(lists_members(&bob_phone, bob, cell, demoted).await?);
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// An owner kicked by another owner learns of the kick and stops listing
+/// the cell; invited again it joins as a plain member, and every member
+/// lists it so. Denied: its promotion of the owner after the rejoin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_former_owner_kicked_and_invited_again_is_a_plain_member() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let cell = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Promote(bob))
+        .await?;
+    let owners = vec![member(alice, true), member(bob, true)];
+    assert!(lists_members(&bob_phone, bob, cell, owners).await?);
+
+    alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Kick(bob))
+        .await?;
+    assert_eq!(
+        alice_phone.cells().members(alice, cell).await?,
+        [member(alice, true)]
+    );
+    assert!(
+        lists_cell(&bob_phone, bob, cell, false).await?,
+        "the kicked owner's device did not learn of its kick"
+    );
+    let asked = bob_phone.cells().members(bob, cell).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+
+    let invite = alice_phone.cells().invite(alice, cell, None).await?;
+    bob_phone.cells().join(bob, invite).await?;
+    let rejoined = vec![member(alice, true), member(bob, false)];
+    for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
+        assert!(lists_members(runtime, holder, cell, rejoined.clone()).await?);
+    }
+    assert!(lists_cell(&bob_phone, bob, cell, true).await?);
+    // Denied: an owner's act before an owner promotes it anew.
+    let promoted = bob_phone
+        .cells()
+        .act(bob, cell, CellAct::Promote(alice))
+        .await;
+    assert!(refused(promoted, ActRefusal::NotAnOwner));
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// An owner's kick of a plain member reaches the remaining member, the two
+/// still syncing, and the kicked member's device stops listing the cell.
+/// Denied: the kicked member's kick of the remaining one, refused while it
+/// was a plain member, and the owner's kick of itself, the remaining member
+/// still listed and served.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_kicks_a_member_and_a_plain_member_kicks_nobody() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let cell = cell_of_three(
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    )
+    .await?;
+
+    // Denied (a plain member, and on itself).
+    let kicked = carol_phone
+        .cells()
+        .act(carol, cell, CellAct::Kick(bob))
+        .await;
+    assert!(refused(kicked, ActRefusal::NotAnOwner));
+    let kicked = alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Kick(alice))
+        .await;
+    assert!(refused(kicked, ActRefusal::OnItself));
+
+    alice_phone
+        .cells()
+        .act(alice, cell, CellAct::Kick(carol))
+        .await?;
+    let remaining = vec![member(alice, true), member(bob, false)];
+    assert!(lists_members(&bob_phone, bob, cell, remaining).await?);
+    assert!(
+        lists_cell(&carol_phone, carol, cell, false).await?,
+        "the kicked member's device did not learn of its kick"
+    );
+    let claim = alice_phone
+        .cells()
+        .put_record(alice, cell, RecordKind::Claim, b"after the kick")
+        .await?;
+    assert!(reads(&bob_phone, bob, cell, claim, b"after the kick").await?);
+    let asked = carol_phone.cells().read(carol, cell, claim).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+
+    for runtime in [alice_phone, bob_phone, carol_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// The one owner leaves only once another member is an owner, the promotion
+/// written just before the leave making that member the one owner on every
+/// remaining device; the one member of a cell leaves as any member does.
+/// Denied: the one owner's leave while the cell has other members.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_one_owner_leaves_once_another_member_is_an_owner() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let cell = cell_of_three(
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    )
+    .await?;
+    let alone = alice_phone.cells().create(alice).await?;
+
+    // Denied: the one owner.
+    let left = alice_phone.cells().act(alice, cell, CellAct::Leave).await;
+    assert!(refused(left, ActRefusal::SoleOwner));
+    let mut all = vec![
+        member(alice, true),
+        member(bob, false),
+        member(carol, false),
+    ];
+    all.sort();
+    assert_eq!(alice_phone.cells().members(alice, cell).await?, all);
+
+    let cells = alice_phone.cells();
+    cells.act(alice, cell, CellAct::Promote(bob)).await?;
+    cells.act(alice, cell, CellAct::Leave).await?;
+    cells.act(alice, alone, CellAct::Leave).await?;
+    assert!(cells.list(alice).await?.is_empty());
+    let asked = cells.members(alice, cell).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+    let left = vec![member(bob, true), member(carol, false)];
+    for (runtime, holder) in [(&bob_phone, bob), (&carol_phone, carol)] {
+        assert!(lists_members(runtime, holder, cell, left.clone()).await?);
+    }
+
+    for runtime in [alice_phone, bob_phone, carol_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A member that leaves right after writing stops listing the cell, and
+/// the claim and the operation it wrote reach the remaining members; a
+/// co-located member's leave then spares the member beside it. Denied: a
+/// departed member reads nothing of the cell.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
+    let (tablet, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let leisure = tablet.identity().create().await?;
+    let work = tablet.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let cell = cell_of_two(&tablet, leisure, &bob_phone, bob).await?;
+    let invite = tablet.cells().invite(leisure, cell, None).await?;
+    tablet.cells().join(work, invite).await?;
+    let note = tablet
+        .cells()
+        .put_record(leisure, cell, RecordKind::MergeableDocument, b"milk")
+        .await?;
+    let first = vec![(leisure, 1, b"milk".to_vec())];
+    assert!(reads_ops(&bob_phone, bob, cell, note, first).await?);
+
+    let cells = bob_phone.cells();
+    let claim = cells
+        .put_record(bob, cell, RecordKind::Claim, b"bob's claim")
+        .await?;
+    cells.append_op(bob, cell, note, b"eggs").await?;
+    cells.act(bob, cell, CellAct::Leave).await?;
+    assert!(cells.list(bob).await?.is_empty());
+    // Denied: the departed member.
+    let asked = cells.read(bob, cell, claim).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+    let edited = vec![(leisure, 1, b"milk".to_vec()), (bob, 1, b"eggs".to_vec())];
+    let remaining = vec![member(leisure, true), member(work, false)];
+    for holder in [leisure, work] {
+        assert!(lists_members(&tablet, holder, cell, remaining.clone()).await?);
+        assert!(reads(&tablet, holder, cell, claim, b"bob's claim").await?);
+        assert!(reads_ops(&tablet, holder, cell, note, edited.clone()).await?);
+    }
+
+    tablet.cells().act(work, cell, CellAct::Leave).await?;
+    assert!(tablet.cells().list(work).await?.is_empty());
+    let asked = tablet.cells().read(work, cell, claim).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+    assert!(lists_members(&tablet, leisure, cell, vec![member(leisure, true)]).await?);
+    assert!(lists_cell(&tablet, leisure, cell, true).await?);
+    assert!(reads(&tablet, leisure, cell, claim, b"bob's claim").await?);
+
+    for runtime in [tablet, bob_phone] {
         runtime.shutdown().await?;
     }
     Ok(())

@@ -41,7 +41,7 @@ use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
     cell::{
         departure_past, record_entries, record_prefix, unknown_entries, CellCatchUp, CellStore,
-        CellTickets, Membership, Operation, RecordView, UnknownCell, UnknownEntry,
+        CellTickets, Membership, Operation, RecordView, Seq, UnknownCell, UnknownEntry,
     },
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
@@ -294,6 +294,9 @@ pub struct SyncNode {
     retraction: Arc<RetractionTracker>,
     /// Taken once, by the runtime's consumer.
     retraction_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>>>,
+    /// Handed to every hosted identity's half; filled once, by the
+    /// runtime's take.
+    cell_departures: crate::cell::CellDepartureSink,
     /// Taken once, so a repeated `shutdown` is a no-op under a shared
     /// reference; both passes watch it.
     reconciler_stop: Mutex<Option<watch::Sender<()>>>,
@@ -383,9 +386,22 @@ struct HostedStack {
     /// member's device, and is reconciled with the identity's own devices
     /// alone from then on.
     converged_tombstones: Mutex<HashSet<CellId>>,
+    departures: crate::cell::CellDepartureSink,
 }
 
 impl HostedStack {
+    fn report_departure(&self, cell: CellId, seq: Seq) {
+        if let Ok(sender) = self.departures.lock() {
+            if let Some(sender) = sender.as_ref() {
+                let _ = sender.send(crate::cell::CellDeparture {
+                    identity: self.identity,
+                    cell,
+                    seq,
+                });
+            }
+        }
+    }
+
     fn identity(&self) -> pdn_store::Identity {
         crate::access::identity_of(self.identity)
     }
@@ -644,6 +660,7 @@ impl SyncNode {
             storage: options.storage,
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
+            cell_departures: Arc::default(),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
             co_located_requests,
             directory_lock,
@@ -696,6 +713,7 @@ impl SyncNode {
             nudges_in_flight: Mutex::new(HashSet::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
             converged_tombstones: Mutex::new(HashSet::new()),
+            departures: Arc::clone(&self.cell_departures),
         });
         let mut hosted = self
             .identities
@@ -1620,6 +1638,53 @@ impl SyncNode {
         held.membership.leave_gossip().await
     }
 
+    /// Reconcile the stores `identity` holds of `cell` — both, or the
+    /// tombstone alone — with at most [`CELL_RECONCILE_PEERS`] devices of its
+    /// other members, drawn afresh, the membership store's exchange first.
+    /// Returns once the dials are asked for; [`CellFlush::wait`] waits for
+    /// their sessions. [`UnknownCell`] for a cell `identity` never held.
+    pub async fn flush_cell(&self, identity: PdnId, cell: CellId) -> Result<CellFlush> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        let node = self.router.endpoint().id();
+        let (contacts, _departed) =
+            cell_contacts(&stack, node, cell, &held.membership, &[]).await?;
+        let own = stack.identity();
+        let others: Vec<Contact> = contacts
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|contact| contact.identity != own)
+            .collect();
+        let (drawn, _recorded) = draw(others, Vec::new());
+        let mut flush = CellFlush {
+            peers: drawn
+                .iter()
+                .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
+                .collect(),
+            sessions: Vec::new(),
+        };
+        if drawn.is_empty() {
+            return Ok(flush);
+        }
+        for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+            let Some(tracked) = stack.tracked(doc.id())? else {
+                continue;
+            };
+            // Subscribed before the dial, so no session ends unseen.
+            flush.sessions.push(Box::pin(doc.subscribe().await?));
+            tracked
+                .doc
+                .sync_with_peers(
+                    drawn.clone(),
+                    Vec::new(),
+                    tracked.default_identity,
+                    tracked.strategy == SyncStrategy::Swarm,
+                )
+                .await?;
+        }
+        Ok(flush)
+    }
+
     /// The membership `identity`'s replica of `cell`'s membership store
     /// folds into, payloads read as far as they have arrived.
     /// [`UnknownCell`] for a tombstone too.
@@ -1967,6 +2032,22 @@ impl SyncNode {
         self.retraction
             .track_namespace(identity, doc.id(), devices.into_iter().collect());
         Ok(())
+    }
+
+    /// Once; a second take yields `None`. From the take on, every
+    /// derivation of a cell's contacts — at each change to its membership
+    /// store and each run of the cell stores' pass — reports a departure it
+    /// folds, until the record store is forgotten.
+    pub fn take_cell_departures(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::cell::CellDeparture>> {
+        let mut sender = self.cell_departures.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
     }
 
     /// Once; a second take yields `None`.
@@ -3209,7 +3290,14 @@ async fn derive_cell_contacts(
     held: &CellBinding,
     met: &[NodeId],
 ) {
-    let Ok(Some(contacts)) = cell_contacts(stack, node, cell, &held.membership, met).await else {
+    let Ok((contacts, departed)) = cell_contacts(stack, node, cell, &held.membership, met).await
+    else {
+        return;
+    };
+    if let (Some(seq), Some(_records)) = (departed, &held.records) {
+        stack.report_departure(cell, seq);
+    }
+    let Some(contacts) = contacts else {
         return;
     };
     for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
@@ -3275,18 +3363,21 @@ fn note_session(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeI
 /// this identity. `None` while the membership store folds into nobody: a
 /// replica that holds nothing yet keeps the contacts its ticket gave it.
 /// A tombstone drops the members' devices once a session with one of them
-/// — any device of another than itself among `met` — went through.
+/// — any device of another than itself among `met` — went through. Beside
+/// them, the sequence of the identity's own departure the fold reads.
 async fn cell_contacts(
     stack: &HostedStack,
     node: EndpointId,
     cell: CellId,
     membership: &Doc,
     met: &[NodeId],
-) -> Result<Option<Vec<Contact>>> {
+) -> Result<(Option<Vec<Contact>>, Option<Seq>)> {
     let (folded, entries) = stack.access.fold_cell_entries(cell, membership).await?;
     if folded.identities().next().is_none() {
-        return Ok(None);
+        return Ok((None, None));
     }
+    let departed =
+        departure_past(&folded, &entries, &stack.identity).map(|past| Seq::new(past.seq));
     let own = stack.identity();
     let own_devices = stack.access.own_devices().await?;
     let this_device = NodeId::from_bytes(*node.as_bytes());
@@ -3295,7 +3386,7 @@ async fn cell_contacts(
             .converged_tombstones
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("tombstone lock poisoned"))?;
-        if departure_past(&folded, &entries, &stack.identity).is_some() {
+        if departed.is_some() {
             if met
                 .iter()
                 .any(|peer| *peer != this_device && !own_devices.contains(peer))
@@ -3330,7 +3421,7 @@ async fn cell_contacts(
         }
         contacts.push(Contact::new(EndpointAddr::new(id), identity));
     }
-    Ok(Some(contacts))
+    Ok((Some(contacts), departed))
 }
 
 /// At most [`CELL_RECONCILE_PEERS`] of a store's contacts and recorded
@@ -3360,6 +3451,53 @@ fn draw(contacts: Vec<Contact>, recorded: Vec<PeerIdBytes>) -> (Vec<Contact>, Ve
         }
     }
     (contacts, recorded)
+}
+
+/// The sessions a [`SyncNode::flush_cell`] dialed, as each store finishes
+/// them.
+pub struct CellFlush {
+    peers: HashSet<NodeId>,
+    sessions: Vec<
+        std::pin::Pin<
+            Box<dyn futures_core::Stream<Item = Result<pdn_store::engine::LiveEvent>> + Send>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for CellFlush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellFlush")
+            .field("peers", &self.peers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CellFlush {
+    /// Whether a session with one of the dialed devices went through on
+    /// each store within `timeout`; `false` at once when none was dialed.
+    pub async fn wait(self, timeout: Duration) -> bool {
+        if self.peers.is_empty() {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        for mut events in self.sessions {
+            loop {
+                match tokio::time::timeout_at(deadline, events.next()).await {
+                    Ok(Some(Ok(pdn_store::engine::LiveEvent::SyncFinished(sync))))
+                        if sync.result.is_ok()
+                            && self
+                                .peers
+                                .contains(&NodeId::from_bytes(*sync.peer.as_bytes())) =>
+                    {
+                        break;
+                    }
+                    Ok(Some(_other)) => {}
+                    Ok(None) | Err(_) => return false,
+                }
+            }
+        }
+        true
+    }
 }
 
 /// The sessions one replica of a cell's store finishes, from

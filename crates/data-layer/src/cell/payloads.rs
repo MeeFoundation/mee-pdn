@@ -5,6 +5,10 @@
 use pdn_store::AuthorId;
 use pdn_types::NodeId;
 
+/// A left, kicked, promoted or demoted event's payload: its key carries
+/// all of the event, and an empty entry is a tombstone.
+pub const ACT_PAYLOAD: [u8; 1] = [0];
+
 /// A device of a member: the node sessions are classified and contacts
 /// dialed by, and the author the member writes with there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

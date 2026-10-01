@@ -12,13 +12,13 @@ mod testing;
 use anyhow::Result;
 use futures_lite::StreamExt;
 use pdn_store::{api::Doc, store::Query, AuthorId, DocTicket};
-use pdn_types::CellId;
+use pdn_types::{CellId, PdnId};
 
 pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership, Verdict};
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
 pub(crate) use past::{departure_past, PastEntry};
 pub(crate) use payloads::encode_devices;
-pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice};
+pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
 pub use record_view::{Operation, RecordEntry, RecordView};
 
 /// `identity` holds no cell `cell` here, or holds only its tombstone.
@@ -124,6 +124,20 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: CellStore) -> Result<Vec<U
     }
     Ok(unknown)
 }
+
+/// `identity`'s chain in `cell` ends in a counted left or kicked event at
+/// `seq` while its device still holds the cell's record store, from
+/// [`SyncNode::take_cell_departures`](crate::SyncNode::take_cell_departures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellDeparture {
+    pub identity: PdnId,
+    pub cell: CellId,
+    pub seq: Seq,
+}
+
+/// Empty until the channel is taken, so nothing accumulates unread.
+pub(crate) type CellDepartureSink =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CellDeparture>>>>;
 
 /// A wait for each of a cell's stores' first successful session started
 /// since an import, from [`SyncNode::import_cell`](crate::SyncNode::import_cell).

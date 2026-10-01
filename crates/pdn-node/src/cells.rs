@@ -3,8 +3,9 @@
 //! the cell-join ALPN — the inviter verifies and burns the secret before any
 //! state change, names the newcomer's sequence, writes its joined event and
 //! device statement, and only then hands over both stores' write tickets —
-//! and placing, editing and reading records. Refusals are uniform, as
-//! pairing's are. The stores underneath are the data layer's cell stores.
+//! the membership acts, and placing, editing and reading records. The join's
+//! refusals are uniform, as pairing's are. The stores underneath are the
+//! data layer's cell stores.
 
 use std::{
     sync::{Arc, OnceLock, Weak},
@@ -14,16 +15,17 @@ use std::{
 use anyhow::{Context, Result};
 use data_layer::{
     cell_id_of, cell_ticket_kind, devices_verify, join_verifies, pdn_id_of, AcceptError,
-    AddrInfoOptions, AuthorId, CellStore, CellTickets, Connection, DevicesPayload, DocTicket,
-    EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice, Membership, MembershipKey, OpId,
-    Operation, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownCell, UnknownEntry,
+    AddrInfoOptions, AuthorId, CellDeparture, CellStore, CellTickets, Connection, DevicesPayload,
+    DocTicket, EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice, Membership,
+    MembershipKey, OpId, Operation, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownCell,
+    UnknownEntry, ACT_PAYLOAD,
 };
 use pdn_types::{CellId, NodeId, PdnId, RecordId, RecordKind, RecordRef};
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
 };
 
 use crate::{
@@ -43,6 +45,11 @@ pub const CELL_INVITE_FORMAT_VERSION: u8 = 0;
 /// A constant because `join` names no budget; without it a hung inviter
 /// holds the caller for the transport's idle timeout.
 pub const JOIN_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What a leave waits, before its left event, for a session with another
+/// member's device on each store: one with a reachable device goes through
+/// in about a second, and past it the device is taken as offline.
+pub const LEAVE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `join` waits, once both tickets are recorded, for each store's first
 /// session; the catch-up a timeout cuts short is the armer's to finish.
@@ -109,6 +116,43 @@ pub struct JoinInProgress {
 #[error("the announcement key of {identity} has not reached this device yet")]
 pub struct AnnouncementKeyPending {
     pub identity: PdnId,
+}
+
+/// A membership act through [`CellsService::act`]. The founding act is
+/// written by `create`, the invite act inside the join dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellAct {
+    Promote(PdnId),
+    /// Of another owner.
+    Demote(PdnId),
+    /// Of another member, an owner or a plain member alike.
+    Kick(PdnId),
+    Leave,
+}
+
+/// Why [`ActRefused`] refused an act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActRefusal {
+    /// A promotion, a demotion or a kick by a member that is no owner.
+    NotAnOwner,
+    /// A demotion or a kick of the acting identity: its way out is leaving.
+    OnItself,
+    SubjectNotMember,
+    /// A demotion of a plain member.
+    SubjectNotOwner,
+    /// A leave by the cell's one owner while it has other members, until
+    /// another member is an owner (cells D11).
+    SoleOwner,
+}
+
+/// A membership act the identity's role or the cell's membership does not
+/// allow, as the identity's replica folds it; refused before anything is
+/// written. Downcast from the `anyhow::Error` of `act`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("{act:?} refused: {reason:?}")]
+pub struct ActRefused {
+    pub act: CellAct,
+    pub reason: ActRefusal,
 }
 
 /// A claim and an immutable-document are placed once: no operation is
@@ -204,6 +248,13 @@ pub trait CellsService {
     /// fails with [`data_layer::CatchUpTimeout`] and leaves both tickets and
     /// the directory's entry recorded.
     async fn join(&self, identity: PdnId, invite: CellInvite) -> Result<CellId>;
+
+    /// Write a membership act once the identity's role allows it, both
+    /// sequences picked from what the replica holds (cells D23);
+    /// [`ActRefused`] writes nothing. A leave also tombstones the cell in the
+    /// identity's directory at the left event's sequence and forgets the
+    /// record store, the membership store kept as the cell's tombstone.
+    async fn act(&self, identity: PdnId, cell: CellId, act: CellAct) -> Result<()>;
 
     /// Place a record under the identity's own name at a fresh id: a
     /// claim's or an immutable-document's one entry, or a
@@ -431,6 +482,50 @@ impl CellsService for RuntimeCellsService<'_> {
         joined
     }
 
+    async fn act(&self, identity: PdnId, cell: CellId, act: CellAct) -> Result<()> {
+        if act == CellAct::Leave {
+            // Checked before the flush too, so a refused leave dials nobody.
+            let node = {
+                let state = self.runtime.state.lock().await;
+                act_key(&state, identity, cell, act).await?;
+                Arc::clone(&state.node)
+            };
+            // What no member's device holds by the departure never leaves
+            // this one: the tombstone serves the departure's past alone
+            // (cells D36). A round trip, so outside the lock.
+            let _flushed = node
+                .flush_cell(identity, cell)
+                .await?
+                .wait(LEAVE_FLUSH_TIMEOUT)
+                .await;
+        }
+        // Local writes alone: no round trip runs under the lock.
+        let state = self.runtime.state.lock().await;
+        let key = act_key(&state, identity, cell, act).await?;
+        state
+            .node
+            .write_cell_entry(
+                identity,
+                cell,
+                CellStore::Membership,
+                &key.to_bytes(),
+                &ACT_PAYLOAD,
+            )
+            .await?;
+        if let MembershipKey::Event {
+            kind: EventKind::Left,
+            seq,
+            ..
+        } = key
+        {
+            depart(&state, identity, cell, seq).await?;
+            // Without it the left event reaches the members at the cell
+            // pass's next run, should its announcement have been lost.
+            let _dialed = state.node.flush_cell(identity, cell).await;
+        }
+        Ok(())
+    }
+
     async fn put_record(
         &self,
         identity: PdnId,
@@ -561,6 +656,130 @@ fn require_member(membership: &Membership, identity: PdnId, cell: CellId) -> Res
         .member(&identity)
         .filter(|member| member.state.member)
         .ok_or_else(|| UnknownCell { cell }.into())
+}
+
+/// The key of the event `act` writes as `identity` in `cell`, at the first
+/// sequence of its subject's chain the replica holds no entry at, naming
+/// the actor's last (cells D23); [`ActRefused`] by the checks of
+/// [`act_event`].
+async fn act_key(
+    state: &State,
+    identity: PdnId,
+    cell: CellId,
+    act: CellAct,
+) -> Result<MembershipKey> {
+    state.hosted(identity)?;
+    let membership = state.node.cell_membership(identity, cell).await?;
+    let actor = require_member(&membership, identity, cell)?;
+    let (subject, kind) = act_event(&membership, identity, actor, act)
+        .map_err(|reason| ActRefused { act, reason })?;
+    let seq = membership
+        .member(&subject)
+        .map_or(0, Member::run)
+        .checked_add(1)
+        .map(Seq::new)
+        .context("membership sequence exhausted")?;
+    Ok(MembershipKey::Event {
+        subject,
+        seq,
+        kind,
+        actor: identity,
+        actor_seq: Seq::new(actor.run()),
+    })
+}
+
+/// The event `act` writes as `identity`, by the checks the fold applies to
+/// it (cells D23) and the guard on the one owner's leave (cells D11).
+fn act_event(
+    membership: &Membership,
+    identity: PdnId,
+    actor: &Member,
+    act: CellAct,
+) -> Result<(PdnId, EventKind), ActRefusal> {
+    let (subject, kind) = match act {
+        CellAct::Leave => {
+            let current = || {
+                membership
+                    .identities()
+                    .filter(|(_id, member)| member.state.member)
+            };
+            let owners = current().filter(|(_id, member)| member.state.owner).count();
+            if actor.state.owner && owners == 1 && current().count() > 1 {
+                return Err(ActRefusal::SoleOwner);
+            }
+            return Ok((identity, EventKind::Left));
+        }
+        CellAct::Promote(subject) => (subject, EventKind::Promoted),
+        CellAct::Demote(subject) => (subject, EventKind::Demoted),
+        CellAct::Kick(subject) => (subject, EventKind::Kicked),
+    };
+    if !actor.state.owner {
+        return Err(ActRefusal::NotAnOwner);
+    }
+    if subject == identity && kind != EventKind::Promoted {
+        return Err(ActRefusal::OnItself);
+    }
+    let target = membership
+        .member(&subject)
+        .filter(|member| member.state.member)
+        .ok_or(ActRefusal::SubjectNotMember)?;
+    if kind == EventKind::Demoted && !target.state.owner {
+        return Err(ActRefusal::SubjectNotOwner);
+    }
+    Ok((subject, kind))
+}
+
+/// `identity`'s departure from `cell` at `seq` of its chain: the
+/// directory's tombstone at that sequence, then the record store forgotten,
+/// the membership store kept as the cell's tombstone (cells D35, D36).
+async fn depart(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Result<()> {
+    state
+        .hosted(identity)?
+        .directory
+        .tombstone_cell(cell, seq)
+        .await?;
+    state.node.forget_cell(identity, cell).await
+}
+
+/// Departs every cell the data layer reports a hosted identity's chain
+/// ends in a departure in, which is how a kicked member's device learns of
+/// its kick. A failure is reported again at the next change to the
+/// membership store or the next run of the cell stores' pass.
+pub(crate) fn spawn_departure_consumer(
+    state: Weak<Mutex<State>>,
+    mut departures: mpsc::UnboundedReceiver<CellDeparture>,
+) {
+    let _detached = tokio::spawn(async move {
+        while let Some(departure) = departures.recv().await {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let guard = state.lock().await;
+            let _ = settle_departure(&guard, departure).await;
+        }
+    });
+}
+
+async fn settle_departure(state: &State, departure: CellDeparture) -> Result<()> {
+    let CellDeparture {
+        identity,
+        cell,
+        seq,
+    } = departure;
+    // A join imports onto the tombstone before its joined event arrives.
+    if state.joining_in_flight.contains(&(identity, cell)) {
+        return Ok(());
+    }
+    let directory = &state.hosted(identity)?.directory;
+    // A later join recorded: the departure ends an earlier membership.
+    if directory
+        .cell_record(cell)
+        .await?
+        .is_some_and(|(recorded, held)| held && recorded > seq)
+    {
+        return Ok(());
+    }
+    depart(state, identity, cell, seq).await
 }
 
 /// The author `identity` writes with here and the point of its chain its

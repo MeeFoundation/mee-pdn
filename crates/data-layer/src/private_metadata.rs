@@ -532,34 +532,60 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
+    /// Record that the identity's left event at `seq`, or a kicked event at
+    /// `seq` its device learned of, ends its holding of `cell`: a tombstone
+    /// at that sequence.
+    pub async fn tombstone_cell(&self, cell: CellId, seq: Seq) -> Result<()> {
+        self.doc
+            .del(self.author, cell_record_key(&cell, seq).into_bytes())
+            .await?;
+        Ok(())
+    }
+
     /// The cells the identity holds, record-level: those whose entry at
     /// the highest sequence, across all authors, is not a tombstone. Entry
     /// timestamps are never read.
     pub async fn held_cells(&self) -> Result<Vec<CellId>> {
-        let query = Query::all()
-            .key_prefix(CELLS_PREFIX.as_bytes())
-            .include_empty();
+        Ok(self
+            .cell_records(CELLS_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_cell, (_seq, held))| *held)
+            .map(|(cell, _record)| cell)
+            .collect())
+    }
+
+    /// `cell`'s highest recorded sequence and whether the identity holds
+    /// the cell from it; `None` for a cell never recorded.
+    pub async fn cell_record(&self, cell: CellId) -> Result<Option<(Seq, bool)>> {
+        let prefix = format!("{CELLS_PREFIX}{cell}/");
+        Ok(self
+            .cell_records(&prefix)
+            .await?
+            .remove(&cell)
+            .map(|(seq, held)| (Seq::new(seq), held)))
+    }
+
+    /// Per cell under `prefix`: its highest sequence, and whether no
+    /// tombstone sits there, a tombstone outweighing a non-empty entry.
+    async fn cell_records(&self, prefix: &str) -> Result<HashMap<CellId, (u64, bool)>> {
+        let query = Query::all().key_prefix(prefix.as_bytes()).include_empty();
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        // Per cell: its highest sequence, and whether a tombstone sits there.
         let mut highest: HashMap<CellId, (u64, bool)> = HashMap::new();
         while let Some(entry) = stream.next().await {
             let entry = entry?;
             let Some((cell, seq)) = cell_record_of(entry.key()) else {
                 continue;
             };
-            let tombstone = entry.content_len() == 0;
-            let slot = highest.entry(cell).or_insert((seq, tombstone));
+            let held = entry.content_len() != 0;
+            let slot = highest.entry(cell).or_insert((seq, held));
             if seq > slot.0 {
-                *slot = (seq, tombstone);
+                *slot = (seq, held);
             } else if seq == slot.0 {
-                slot.1 |= tombstone;
+                slot.1 &= held;
             }
         }
-        Ok(highest
-            .into_iter()
-            .filter(|(_cell, (_seq, tombstone))| !tombstone)
-            .map(|(cell, _held)| cell)
-            .collect())
+        Ok(highest)
     }
 
     /// Record a write-retraction verdict, replacing any previous marker for

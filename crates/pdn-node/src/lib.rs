@@ -16,10 +16,10 @@ pub mod runtime;
 pub mod sync;
 
 pub use cells::{
-    AnnouncementKeyPending, CellInfo, CellInvite, CellMember, CellsService, JoinInProgress,
-    JoinRefused, JoinTimeout, RecordPlacedOnce, RuntimeCellsService, UnknownRecord,
-    UnsupportedCellInviteVersion, WrongRecordKind, CELL_INVITE_FORMAT_VERSION,
-    JOIN_CATCH_UP_TIMEOUT, JOIN_DIALOGUE_TIMEOUT,
+    ActRefusal, ActRefused, AnnouncementKeyPending, CellAct, CellInfo, CellInvite, CellMember,
+    CellsService, JoinInProgress, JoinRefused, JoinTimeout, RecordPlacedOnce, RuntimeCellsService,
+    UnknownRecord, UnsupportedCellInviteVersion, WrongRecordKind, CELL_INVITE_FORMAT_VERSION,
+    JOIN_CATCH_UP_TIMEOUT, JOIN_DIALOGUE_TIMEOUT, LEAVE_FLUSH_TIMEOUT,
 };
 pub use connections::{
     ConnectionsService, DelegationUnsupported, PeerGrant, PeerNotConnected,
