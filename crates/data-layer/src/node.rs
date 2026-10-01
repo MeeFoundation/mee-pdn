@@ -1672,6 +1672,18 @@ impl SyncNode {
         self.record_view(identity, cell, Query::all()).await
     }
 
+    /// [`cell_record_view`](Self::cell_record_view) over `record`'s own
+    /// entries alone.
+    pub async fn cell_record_view_of(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: &RecordRef,
+    ) -> Result<RecordView> {
+        self.record_view(identity, cell, Query::key_prefix(record_prefix(record)))
+            .await
+    }
+
     /// A claim's or an immutable-document's payload: of the record's
     /// entries that read, the newest; `None` when none does.
     pub async fn read_cell_record(
@@ -1680,9 +1692,7 @@ impl SyncNode {
         cell: CellId,
         record: &RecordRef,
     ) -> Result<Option<Vec<u8>>> {
-        let view = self
-            .record_view(identity, cell, Query::key_prefix(record_prefix(record)))
-            .await?;
+        let view = self.cell_record_view_of(identity, cell, record).await?;
         let Some(hash) = view.placed(record).and_then(|entry| entry.payload) else {
             return Ok(None);
         };
@@ -1697,9 +1707,7 @@ impl SyncNode {
         cell: CellId,
         record: &RecordRef,
     ) -> Result<Vec<Operation>> {
-        let view = self
-            .record_view(identity, cell, Query::key_prefix(record_prefix(record)))
-            .await?;
+        let view = self.cell_record_view_of(identity, cell, record).await?;
         let mut operations = Vec::new();
         for (id, entry) in view.operations(record) {
             if let Some(hash) = entry.payload {

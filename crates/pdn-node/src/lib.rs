@@ -17,8 +17,9 @@ pub mod sync;
 
 pub use cells::{
     AnnouncementKeyPending, CellInfo, CellInvite, CellMember, CellsService, JoinInProgress,
-    JoinRefused, JoinTimeout, RuntimeCellsService, UnsupportedCellInviteVersion,
-    CELL_INVITE_FORMAT_VERSION, JOIN_CATCH_UP_TIMEOUT, JOIN_DIALOGUE_TIMEOUT,
+    JoinRefused, JoinTimeout, RecordPlacedOnce, RuntimeCellsService, UnknownRecord,
+    UnsupportedCellInviteVersion, WrongRecordKind, CELL_INVITE_FORMAT_VERSION,
+    JOIN_CATCH_UP_TIMEOUT, JOIN_DIALOGUE_TIMEOUT,
 };
 pub use connections::{
     ConnectionsService, DelegationUnsupported, PeerGrant, PeerNotConnected,
@@ -27,8 +28,9 @@ pub use connections::{
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use data_layer::{
-    claim_id_of, CatchUpTimeout, DirectoryHeld, DocTicket, GrantedClaim, GranteeCannotShare,
-    ReadGrant, ShareMode, SpawnOptions, StorageConfig, UnknownCell, UnknownIssuer,
+    claim_id_of, CatchUpTimeout, CellStore, DirectoryHeld, DocTicket, GrantedClaim,
+    GranteeCannotShare, OpId, Operation, ReadGrant, ShareMode, SpawnOptions, StorageConfig,
+    UnknownCell, UnknownEntry, UnknownIssuer,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
@@ -39,7 +41,9 @@ pub use pairing::{
     EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, InvitePayload,
     InviterUnreachable, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
-pub use pdn_types::{CellId, ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
+pub use pdn_types::{
+    CellId, ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId, RecordId, RecordKind, RecordRef,
+};
 pub use retraction::RetractionEvent;
 pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};

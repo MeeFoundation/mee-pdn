@@ -1,10 +1,10 @@
 //! The cells service: creating a cell for a hosted identity, listing its
-//! cells and their members, and the invite and join dialogue (cells D26) on
+//! cells and their members, the invite and join dialogue (cells D26) on
 //! the cell-join ALPN — the inviter verifies and burns the secret before any
 //! state change, names the newcomer's sequence, writes its joined event and
-//! device statement, and only then hands over both stores' write tickets.
-//! Refusals are uniform, as pairing's are. The stores underneath are the
-//! data layer's cell stores.
+//! device statement, and only then hands over both stores' write tickets —
+//! and placing, editing and reading records. Refusals are uniform, as
+//! pairing's are. The stores underneath are the data layer's cell stores.
 
 use std::{
     sync::{Arc, OnceLock, Weak},
@@ -15,10 +15,10 @@ use anyhow::{Context, Result};
 use data_layer::{
     cell_id_of, cell_ticket_kind, devices_verify, join_verifies, pdn_id_of, AcceptError,
     AddrInfoOptions, AuthorId, CellStore, CellTickets, Connection, DevicesPayload, DocTicket,
-    EndpointAddr, EventKind, JoinedPayload, MemberDevice, MembershipKey, ProtocolHandler, Seq,
-    UnknownCell,
+    EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice, Membership, MembershipKey, OpId,
+    Operation, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownCell, UnknownEntry,
 };
-use pdn_types::{CellId, NodeId, PdnId};
+use pdn_types::{CellId, NodeId, PdnId, RecordId, RecordKind, RecordRef};
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -111,6 +111,33 @@ pub struct AnnouncementKeyPending {
     pub identity: PdnId,
 }
 
+/// A claim and an immutable-document are placed once: no operation is
+/// appended to either, by its member included (cells D5, D17). Refused
+/// before anything is written. Downcast from the `anyhow::Error` of
+/// `append_op`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("{} {} under {} is placed once", .record.kind, .record.id, .record.member)]
+pub struct RecordPlacedOnce {
+    pub record: RecordRef,
+}
+
+/// No entry of the record reads on the identity's replica: the cell holds
+/// none, or none has arrived yet. Downcast from the `anyhow::Error` of
+/// `append_op` and `read_ops`.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("{} {} under {} reads on no entry here", .record.kind, .record.id, .record.member)]
+pub struct UnknownRecord {
+    pub record: RecordRef,
+}
+
+/// `read` takes a claim or an immutable-document, `read_ops` a
+/// mergeable-document. Downcast from the `anyhow::Error` of either.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("{} {} under {} is not read by this call", .record.kind, .record.id, .record.member)]
+pub struct WrongRecordKind {
+    pub record: RecordRef,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct JoinRequest {
     version: u8,
@@ -146,9 +173,9 @@ struct JoinTickets {
     records: DocTicket,
 }
 
-/// Creating, listing and joining cells on a runtime. `identity` is the
-/// hosted identity acting; a call on a cell the identity is no member of
-/// fails with [`UnknownCell`].
+/// Creating, listing and joining cells on a runtime, and the records in
+/// them. `identity` is the hosted identity acting; a call on a cell the
+/// identity is no member of fails with [`UnknownCell`].
 #[allow(async_fn_in_trait)]
 pub trait CellsService {
     /// Derive the cell id, create both stores and write the signed founding
@@ -177,6 +204,57 @@ pub trait CellsService {
     /// fails with [`data_layer::CatchUpTimeout`] and leaves both tickets and
     /// the directory's entry recorded.
     async fn join(&self, identity: PdnId, invite: CellInvite) -> Result<CellId>;
+
+    /// Place a record under the identity's own name at a fresh id: a
+    /// claim's or an immutable-document's one entry, or a
+    /// mergeable-document's first operation.
+    async fn put_record(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> Result<RecordRef>;
+
+    /// Append an operation to a mergeable-document, whoever's name it sits
+    /// under. [`RecordPlacedOnce`] for a claim or an immutable-document and
+    /// [`UnknownRecord`] for a record that reads on no entry here, both
+    /// before anything is written.
+    async fn append_op(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+        op: &[u8],
+    ) -> Result<()>;
+
+    /// A claim's or an immutable-document's payload, the newest where
+    /// several entries read; `None` for a record that reads on no entry
+    /// here, [`WrongRecordKind`] for a mergeable-document.
+    async fn read(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+    ) -> Result<Option<Vec<u8>>>;
+
+    /// A mergeable-document's operations that read here, each with its
+    /// writer, in the order of their ids and merged into no document state;
+    /// [`UnknownRecord`] when none reads, [`WrongRecordKind`] for another
+    /// kind.
+    async fn read_ops(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+    ) -> Result<Vec<Operation>>;
+
+    /// Every record an entry of which reads here.
+    async fn list_records(&self, identity: PdnId, cell: CellId) -> Result<Vec<RecordRef>>;
+
+    /// The entries of both stores outside the key layout, each with its
+    /// author (cells D27).
+    async fn list_unknown(&self, identity: PdnId, cell: CellId) -> Result<Vec<UnknownEntry>>;
 }
 
 /// The production [`CellsService`].
@@ -188,6 +266,23 @@ pub struct RuntimeCellsService<'rt> {
 impl<'rt> RuntimeCellsService<'rt> {
     pub(crate) fn new(runtime: &'rt Runtime) -> Self {
         Self { runtime }
+    }
+
+    /// The node, and the membership `identity`'s replica of `cell` folds
+    /// into, once `identity` is a member there.
+    async fn as_member(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+    ) -> Result<(Arc<SyncNode>, Membership)> {
+        let node = {
+            let state = self.runtime.state.lock().await;
+            state.hosted(identity)?;
+            Arc::clone(&state.node)
+        };
+        let membership = node.cell_membership(identity, cell).await?;
+        require_member(&membership, identity, cell)?;
+        Ok((node, membership))
     }
 }
 
@@ -270,18 +365,7 @@ impl CellsService for RuntimeCellsService<'_> {
     }
 
     async fn members(&self, identity: PdnId, cell: CellId) -> Result<Vec<CellMember>> {
-        let node = {
-            let state = self.runtime.state.lock().await;
-            state.hosted(identity)?;
-            Arc::clone(&state.node)
-        };
-        let membership = node.cell_membership(identity, cell).await?;
-        if !membership
-            .member(&identity)
-            .is_some_and(|member| member.state.member)
-        {
-            return Err(UnknownCell { cell }.into());
-        }
+        let (_node, membership) = self.as_member(identity, cell).await?;
         let mut members: Vec<CellMember> = membership
             .identities()
             .filter(|(_id, member)| member.state.member)
@@ -300,18 +384,7 @@ impl CellsService for RuntimeCellsService<'_> {
         cell: CellId,
         lifetime: Option<Duration>,
     ) -> Result<CellInvite> {
-        let node = {
-            let state = self.runtime.state.lock().await;
-            state.hosted(identity)?;
-            Arc::clone(&state.node)
-        };
-        let membership = node.cell_membership(identity, cell).await?;
-        if !membership
-            .member(&identity)
-            .is_some_and(|member| member.state.member)
-        {
-            return Err(UnknownCell { cell }.into());
-        }
+        self.as_member(identity, cell).await?;
         let mut state = self.runtime.state.lock().await;
         let secret = state.pending_cell_invites.mint(
             (identity, cell),
@@ -357,6 +430,146 @@ impl CellsService for RuntimeCellsService<'_> {
         reservation.release().await;
         joined
     }
+
+    async fn put_record(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> Result<RecordRef> {
+        // Local writes alone: no round trip runs under the lock.
+        let state = self.runtime.state.lock().await;
+        let (author, mseq) = writer(&state, identity, cell).await?;
+        let mut id = [0u8; 16];
+        SysRng
+            .try_fill_bytes(&mut id)
+            .context("operating-system randomness unavailable")?;
+        let (member, id) = (identity, RecordId::from_bytes(id));
+        let key = match kind {
+            RecordKind::Claim => RecordKey::Claim { member, id, mseq },
+            RecordKind::ImmutableDocument => RecordKey::ImmutableDocument { member, id, mseq },
+            RecordKind::MergeableDocument => RecordKey::Operation {
+                member,
+                id,
+                op: OpId {
+                    writer: identity,
+                    author,
+                    mseq,
+                    op_seq: 1,
+                },
+            },
+        };
+        state
+            .node
+            .write_cell_entry(identity, cell, CellStore::Records, &key.to_bytes(), payload)
+            .await?;
+        Ok(key.record())
+    }
+
+    async fn append_op(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+        op: &[u8],
+    ) -> Result<()> {
+        // Held from the read of the operation sequence to the write that
+        // takes it: two appends taking one sequence would share a key, the
+        // later replacing the earlier.
+        let state = self.runtime.state.lock().await;
+        let (author, mseq) = writer(&state, identity, cell).await?;
+        if record.kind != RecordKind::MergeableDocument {
+            return Err(RecordPlacedOnce { record }.into());
+        }
+        let view = state
+            .node
+            .cell_record_view_of(identity, cell, &record)
+            .await?;
+        // Unread, `record` would be created under another member's name.
+        if !view.records().any(|read| *read == record) {
+            return Err(UnknownRecord { record }.into());
+        }
+        let op_seq = view
+            .next_op_seq(&record, author)
+            .context("operation sequence exhausted")?;
+        let key = RecordKey::Operation {
+            member: record.member,
+            id: record.id,
+            op: OpId {
+                writer: identity,
+                author,
+                mseq,
+                op_seq,
+            },
+        };
+        state
+            .node
+            .write_cell_entry(identity, cell, CellStore::Records, &key.to_bytes(), op)
+            .await
+    }
+
+    async fn read(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+    ) -> Result<Option<Vec<u8>>> {
+        let (node, _membership) = self.as_member(identity, cell).await?;
+        if record.kind == RecordKind::MergeableDocument {
+            return Err(WrongRecordKind { record }.into());
+        }
+        node.read_cell_record(identity, cell, &record).await
+    }
+
+    async fn read_ops(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+    ) -> Result<Vec<Operation>> {
+        let (node, _membership) = self.as_member(identity, cell).await?;
+        if record.kind != RecordKind::MergeableDocument {
+            return Err(WrongRecordKind { record }.into());
+        }
+        let operations = node.read_cell_operations(identity, cell, &record).await?;
+        if operations.is_empty() {
+            return Err(UnknownRecord { record }.into());
+        }
+        Ok(operations)
+    }
+
+    async fn list_records(&self, identity: PdnId, cell: CellId) -> Result<Vec<RecordRef>> {
+        let (node, _membership) = self.as_member(identity, cell).await?;
+        Ok(node
+            .cell_record_view(identity, cell)
+            .await?
+            .records()
+            .copied()
+            .collect())
+    }
+
+    async fn list_unknown(&self, identity: PdnId, cell: CellId) -> Result<Vec<UnknownEntry>> {
+        let (node, _membership) = self.as_member(identity, cell).await?;
+        node.list_cell_unknown(identity, cell).await
+    }
+}
+
+/// `identity` as `membership` folds it; [`UnknownCell`] for no member.
+fn require_member(membership: &Membership, identity: PdnId, cell: CellId) -> Result<&Member> {
+    membership
+        .member(&identity)
+        .filter(|member| member.state.member)
+        .ok_or_else(|| UnknownCell { cell }.into())
+}
+
+/// The author `identity` writes with here and the point of its chain its
+/// records name (cells D22), once it is a member of `cell`.
+async fn writer(state: &State, identity: PdnId, cell: CellId) -> Result<(AuthorId, Seq)> {
+    let author = state.hosted(identity)?.author;
+    let membership = state.node.cell_membership(identity, cell).await?;
+    let seq = require_member(&membership, identity, cell)?.run();
+    Ok((author, Seq::new(seq)))
 }
 
 /// The joiner's half: dial, run the dialogue, then record both tickets and

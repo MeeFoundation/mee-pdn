@@ -348,3 +348,45 @@ fn entries_in_any_order_read_the_same() {
     assert_eq!(writers(&forward, &note), writers(&backward, &note));
     assert_eq!(writers(&forward, &note), by_id(vec![bob.id(), carol.id()]));
 }
+
+/// An author's next operation on a mergeable-document takes the one above
+/// the highest it holds there, an operation that reads nothing yet included;
+/// another author's operations and its own on another record move nothing.
+#[test]
+fn the_next_operation_sequence_is_one_above_the_authors_highest_held() {
+    let cast = Cast::new();
+    let (alice, bob) = (&cast.alice, &cast.bob);
+    let mut store = Store::founded_by(alice);
+    store.invite(alice, 1, bob);
+    let numbered = |writer: &Person, id: u8, mseq: u64, op_seq: u64| RecordKey::Operation {
+        member: bob.id(),
+        id: RecordId::from_bytes([id; 16]),
+        op: OpId {
+            writer: writer.id(),
+            author: writer.author(),
+            mseq: Seq::new(mseq),
+            op_seq,
+        },
+    };
+    let note = numbered(bob, 1, 1, 1).record();
+    let mut records = Records::default();
+    assert_eq!(
+        records.view(&store).next_op_seq(&note, bob.author()),
+        Some(1)
+    );
+    records.put(numbered(bob, 1, 1, 1), bob.author());
+    records.put(numbered(bob, 1, 1, 3), bob.author());
+    let waiting = records.put(numbered(bob, 1, 5, 7), bob.author());
+    records.put(numbered(alice, 1, 1, 20), alice.author());
+    records.put(numbered(bob, 2, 1, 30), bob.author());
+    let view = records.view(&store);
+    assert_eq!(
+        verdict(&view, waiting),
+        Verdict::NotYet(Awaiting::ActorChain)
+    );
+    assert_eq!(view.next_op_seq(&note, bob.author()), Some(8));
+    assert_eq!(view.next_op_seq(&note, alice.author()), Some(21));
+
+    records.put(numbered(bob, 1, 1, u64::MAX), bob.author());
+    assert_eq!(records.view(&store).next_op_seq(&note, bob.author()), None);
+}

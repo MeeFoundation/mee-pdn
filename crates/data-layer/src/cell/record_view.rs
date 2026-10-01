@@ -92,6 +92,24 @@ impl RecordView {
         operations
     }
 
+    /// The operation sequence `author`'s next operation on `record` takes:
+    /// one above the highest held under it, whatever the entries count for,
+    /// so the count continues across a restart. `None` past `u64::MAX`.
+    pub fn next_op_seq(&self, record: &RecordRef, author: AuthorId) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.author == author)
+            .filter_map(|entry| match RecordKey::parse(&entry.key) {
+                Some(key @ RecordKey::Operation { op, .. }) if key.record() == *record => {
+                    Some(op.op_seq)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+    }
+
     /// Every held entry beside its verdict, in the order given.
     pub fn verdicts(&self) -> impl Iterator<Item = (&RecordEntry, Verdict)> {
         self.entries.iter().zip(self.verdicts.iter().copied())

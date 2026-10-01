@@ -1,14 +1,16 @@
 //! The cells service end to end: creating a cell, listing cells and their
-//! members, and the invite and join dialogue between in-process runtimes —
-//! the invite passed as a value — with the refusals of its verify-and-burn
-//! each probed for no observable state beside its allowed counterpart.
+//! members, the invite and join dialogue between in-process runtimes — the
+//! invite passed as a value — with the refusals of its verify-and-burn each
+//! probed for no observable state beside its allowed counterpart, and the
+//! records members place, edit and read.
 
 use anyhow::Result;
 use pdn_node::{
-    CellInvite, CellMember, CellsService as _, IdentityService as _, JoinRefused, Runtime,
-    UnknownCell, UnknownIdentity, UnsupportedCellInviteVersion,
+    CellInvite, CellMember, CellsService as _, IdentityService as _, JoinRefused, RecordPlacedOnce,
+    Runtime, UnknownCell, UnknownIdentity, UnknownRecord, UnsupportedCellInviteVersion,
+    WrongRecordKind,
 };
-use pdn_types::{CellId, PdnId};
+use pdn_types::{CellId, PdnId, RecordId, RecordKind, RecordRef};
 use test_utils::{eventually, ids};
 
 mod common;
@@ -266,6 +268,191 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
             "the second invite wrote a second joined event"
         );
     }
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A cell with `owner` its creator on `owner_runtime` and `member` joined
+/// from `member_runtime`.
+async fn cell_of_two(
+    owner_runtime: &Runtime,
+    owner: PdnId,
+    member_runtime: &Runtime,
+    member: PdnId,
+) -> Result<CellId> {
+    let cell = owner_runtime.cells().create(owner).await?;
+    let invite = owner_runtime.cells().invite(owner, cell, None).await?;
+    member_runtime.cells().join(member, invite).await?;
+    Ok(cell)
+}
+
+/// Whether `holder` on `runtime` comes to read `want` at `record`.
+async fn reads(
+    runtime: &Runtime,
+    holder: PdnId,
+    cell: CellId,
+    record: RecordRef,
+    want: &[u8],
+) -> Result<bool> {
+    eventually(|| async {
+        Ok(runtime
+            .cells()
+            .read(holder, cell, record)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(want))
+    })
+    .await
+}
+
+/// The writer, operation sequence and payload of each of `record`'s
+/// operations `holder` reads, sorted.
+async fn operations(
+    runtime: &Runtime,
+    holder: PdnId,
+    cell: CellId,
+    record: RecordRef,
+) -> Result<Vec<(PdnId, u64, Vec<u8>)>> {
+    let mut read: Vec<_> = runtime
+        .cells()
+        .read_ops(holder, cell, record)
+        .await?
+        .into_iter()
+        .map(|op| (op.id.writer, op.id.op_seq, op.payload))
+        .collect();
+    read.sort();
+    Ok(read)
+}
+
+/// Whether `holder` on `runtime` comes to read exactly `want`, sorted, as
+/// `record`'s operations.
+async fn reads_ops(
+    runtime: &Runtime,
+    holder: PdnId,
+    cell: CellId,
+    record: RecordRef,
+    mut want: Vec<(PdnId, u64, Vec<u8>)>,
+) -> Result<bool> {
+    want.sort();
+    eventually(|| async {
+        Ok(operations(runtime, holder, cell, record)
+            .await
+            .ok()
+            .as_ref()
+            == Some(&want))
+    })
+    .await
+}
+
+/// A claim and an immutable-document round-trip unchanged under the name of
+/// the member that placed them, and a write addressed at either is refused,
+/// by that member and by the owner alike, every member reading the bytes
+/// placed first and listing no record beside the two. Denied: a co-located
+/// identity that is no member reads nothing of the cell.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_and_an_immutable_document_are_placed_once() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let erin = alice_phone.identity().create().await?;
+    let cell = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+
+    let mut placed = Vec::new();
+    for kind in [RecordKind::Claim, RecordKind::ImmutableDocument] {
+        let record = bob_phone
+            .cells()
+            .put_record(bob, cell, kind, b"placed first")
+            .await?;
+        assert_eq!((record.member, record.kind), (bob, kind));
+        assert!(reads(&alice_phone, alice, cell, record, b"placed first").await?);
+        for (runtime, writer) in [(&bob_phone, bob), (&alice_phone, alice)] {
+            let refused = runtime
+                .cells()
+                .append_op(writer, cell, record, b"placed again")
+                .await;
+            assert!(refused.is_err_and(|err| is::<RecordPlacedOnce>(&err)));
+            assert_eq!(
+                runtime.cells().read(writer, cell, record).await?.as_deref(),
+                Some(&b"placed first"[..])
+            );
+        }
+        let refused = alice_phone.cells().read_ops(alice, cell, record).await;
+        assert!(refused.is_err_and(|err| is::<WrongRecordKind>(&err)));
+        // Denied (outsider).
+        let refused = alice_phone.cells().read(erin, cell, record).await;
+        assert!(refused.is_err_and(|err| is::<UnknownCell>(&err)));
+        placed.push(record);
+    }
+    placed.sort();
+    for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
+        assert_eq!(runtime.cells().list_records(holder, cell).await?, placed);
+    }
+    let refused = alice_phone.cells().list_records(erin, cell).await;
+    assert!(refused.is_err_and(|err| is::<UnknownCell>(&err)));
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A plain member's operations on the owner's mergeable-document, three of
+/// them appended at once, read on the owner's device as that member's, each
+/// under an operation sequence of its own. Denied: a co-located identity that
+/// is no member edits and reads nothing, and an operation addressed at a
+/// mergeable-document the cell does not hold is refused, so none is created
+/// under another member's name.
+#[tokio::test(flavor = "multi_thread")]
+async fn any_member_edits_another_members_mergeable_document() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let erin = bob_phone.identity().create().await?;
+    let cell = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    let note = alice_phone
+        .cells()
+        .put_record(alice, cell, RecordKind::MergeableDocument, b"milk")
+        .await?;
+    let first = vec![(alice, 1, b"milk".to_vec())];
+    assert!(reads_ops(&bob_phone, bob, cell, note, first.clone()).await?);
+
+    let cells = bob_phone.cells();
+    let (one, two, three) = tokio::join!(
+        cells.append_op(bob, cell, note, b"eggs"),
+        cells.append_op(bob, cell, note, b"eggs"),
+        cells.append_op(bob, cell, note, b"eggs"),
+    );
+    for appended in [one, two, three] {
+        appended?;
+    }
+    let mut edited = first;
+    edited.extend((1..=3).map(|op_seq| (bob, op_seq, b"eggs".to_vec())));
+    assert!(reads_ops(&alice_phone, alice, cell, note, edited.clone()).await?);
+
+    // Denied (outsider).
+    let refused = cells.append_op(erin, cell, note, b"cake").await;
+    assert!(refused.is_err_and(|err| is::<UnknownCell>(&err)));
+    let refused = cells.read_ops(erin, cell, note).await;
+    assert!(refused.is_err_and(|err| is::<UnknownCell>(&err)));
+    // Denied: a record the cell does not hold.
+    let absent = RecordRef {
+        id: RecordId::from_bytes([0x77; 16]),
+        ..note
+    };
+    let refused = cells.append_op(bob, cell, absent, b"cake").await;
+    assert!(refused.is_err_and(|err| is::<UnknownRecord>(&err)));
+    let refused = cells.read_ops(bob, cell, absent).await;
+    assert!(refused.is_err_and(|err| is::<UnknownRecord>(&err)));
+    // Sentinel: an operation appended after the refusals reaches the owner.
+    cells.append_op(bob, cell, note, b"bread").await?;
+    edited.push((bob, 4, b"bread".to_vec()));
+    assert!(reads_ops(&alice_phone, alice, cell, note, edited).await?);
+    assert_eq!(alice_phone.cells().list_records(alice, cell).await?, [note]);
 
     for runtime in [alice_phone, bob_phone] {
         runtime.shutdown().await?;
