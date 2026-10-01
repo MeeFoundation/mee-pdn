@@ -334,14 +334,14 @@ impl Runtime {
             let verdicts = node
                 .take_retraction_verdicts()
                 .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
-            let departures = node
-                .take_cell_departures()
-                .ok_or_else(|| anyhow::anyhow!("cell departure stream taken twice"))?;
+            let notices = node
+                .take_cell_notices()
+                .ok_or_else(|| anyhow::anyhow!("cell notice stream taken twice"))?;
             let (identities, armers) = recover_hosted_identities(&node).await?;
-            anyhow::Ok((verdicts, departures, identities, armers))
+            anyhow::Ok((verdicts, notices, identities, armers))
         }
         .await;
-        let (verdicts, departures, identities, armers) = match prepared {
+        let (verdicts, notices, identities, armers) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = node.shutdown().await;
@@ -361,7 +361,7 @@ impl Runtime {
         // Every identity the directory records is hosted again by now.
         state.lock().await.node.start_blob_collection();
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
-        crate::cells::spawn_departure_consumer(Arc::downgrade(&state), departures);
+        crate::cells::spawn_cell_notice_consumer(Arc::downgrade(&state), notices);
         pairing_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("pairing state slot filled twice"))?;

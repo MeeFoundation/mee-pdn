@@ -125,19 +125,26 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: CellStore) -> Result<Vec<U
     Ok(unknown)
 }
 
-/// `identity`'s chain in `cell` ends in a counted left or kicked event at
-/// `seq` while its device still holds the cell's record store, from
-/// [`SyncNode::take_cell_departures`](crate::SyncNode::take_cell_departures).
+/// What a derivation of a cell's contacts finds for the runtime to act on
+/// while the identity's device still holds the cell's record store, from
+/// [`SyncNode::take_cell_notices`](crate::SyncNode::take_cell_notices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellDeparture {
-    pub identity: PdnId,
-    pub cell: CellId,
-    pub seq: Seq,
+pub enum CellNotice {
+    /// `identity`'s chain in `cell` ends in a counted left or kicked event
+    /// at `seq`.
+    Departed {
+        identity: PdnId,
+        cell: CellId,
+        seq: Seq,
+    },
+    /// `identity` is a member of `cell`, and none of its counted device
+    /// statements lists this device with the author it writes with here.
+    Unlisted { identity: PdnId, cell: CellId },
 }
 
 /// Empty until the channel is taken, so nothing accumulates unread.
-pub(crate) type CellDepartureSink =
-    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CellDeparture>>>>;
+pub(crate) type CellNoticeSink =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CellNotice>>>>;
 
 /// A wait for each of a cell's stores' first successful session started
 /// since an import, from [`SyncNode::import_cell`](crate::SyncNode::import_cell).

@@ -15,7 +15,7 @@ use pdn_types::{CellId, PdnId, RecordId, RecordKind, RecordRef};
 use test_utils::{eventually, ids};
 
 mod common;
-use common::memory_runtime;
+use common::{link_patiently, memory_runtime};
 
 fn member(id: PdnId, owner: bool) -> CellMember {
     CellMember { id, owner }
@@ -799,6 +799,121 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
     assert!(reads(&tablet, leisure, cell, claim, b"bob's claim").await?);
 
     for runtime in [tablet, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Devices linked into a member before and after its join reach the cell
+/// from the identity's directory, read it, and register themselves, so the
+/// owner's device reads what they write and serves one of them with every
+/// other device of the member gone. Denied: a co-located identity that is
+/// no member lists no such cell and reads nothing of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn devices_linked_before_and_after_the_join_reach_the_cell() -> Result<()> {
+    let (alice_phone, bob_phone, bob_laptop, bob_tablet) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let dave = bob_laptop.identity().create().await?;
+    let cell = alice_phone.cells().create(alice).await?;
+    let before = alice_phone
+        .cells()
+        .put_record(alice, cell, RecordKind::Claim, b"before")
+        .await?;
+    link_patiently(&bob_laptop, &bob_phone, bob).await?;
+    let invite = alice_phone.cells().invite(alice, cell, None).await?;
+    bob_phone.cells().join(bob, invite).await?;
+    link_patiently(&bob_tablet, &bob_phone, bob).await?;
+
+    for (device, said) in [(&bob_laptop, &b"laptop"[..]), (&bob_tablet, &b"tablet"[..])] {
+        assert!(lists_cell(device, bob, cell, true).await?);
+        assert!(reads(device, bob, cell, before, b"before").await?);
+        let placed = device
+            .cells()
+            .put_record(bob, cell, RecordKind::Claim, said)
+            .await?;
+        assert!(
+            reads(&alice_phone, alice, cell, placed, said).await?,
+            "the owner's device did not read what a linked device wrote"
+        );
+    }
+    // Denied (a co-located non-member).
+    assert!(bob_laptop.cells().list(dave).await?.is_empty());
+    let asked = bob_laptop.cells().read(dave, cell, before).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+
+    bob_phone.shutdown().await?;
+    bob_tablet.shutdown().await?;
+    let after = alice_phone
+        .cells()
+        .put_record(alice, cell, RecordKind::Claim, b"after")
+        .await?;
+    assert!(
+        reads(&bob_laptop, bob, cell, after, b"after").await?,
+        "the owner's device did not serve the linked device"
+    );
+
+    for runtime in [alice_phone, bob_laptop] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A leave on one of a member's devices, and an owner's kick of the member,
+/// each reach the member's other device, which stops listing the cell and
+/// reads nothing of it, while the owner goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_departure_reaches_the_members_other_devices() -> Result<()> {
+    let (alice_phone, bob_phone, bob_laptop) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    link_patiently(&bob_laptop, &bob_phone, bob).await?;
+    let family = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    let wedding = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    let claims = [
+        alice_phone
+            .cells()
+            .put_record(alice, family, RecordKind::Claim, b"family")
+            .await?,
+        alice_phone
+            .cells()
+            .put_record(alice, wedding, RecordKind::Claim, b"wedding")
+            .await?,
+    ];
+    for (cell, claim, said) in [
+        (family, claims[0], &b"family"[..]),
+        (wedding, claims[1], &b"wedding"[..]),
+    ] {
+        assert!(reads(&bob_laptop, bob, cell, claim, said).await?);
+    }
+
+    bob_phone.cells().act(bob, family, CellAct::Leave).await?;
+    alice_phone
+        .cells()
+        .act(alice, wedding, CellAct::Kick(bob))
+        .await?;
+    for (cell, claim) in [(family, claims[0]), (wedding, claims[1])] {
+        for device in [&bob_phone, &bob_laptop] {
+            assert!(
+                lists_cell(device, bob, cell, false).await?,
+                "a device of the departed member still lists the cell"
+            );
+            let asked = device.cells().read(bob, cell, claim).await;
+            assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+        }
+        assert!(lists_members(&alice_phone, alice, cell, vec![member(alice, true)]).await?);
+    }
+
+    for runtime in [alice_phone, bob_phone, bob_laptop] {
         runtime.shutdown().await?;
     }
     Ok(())

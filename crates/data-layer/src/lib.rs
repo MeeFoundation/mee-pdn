@@ -31,7 +31,7 @@ pub use announcement::{cell_id_of, devices_verify, join_verifies, pdn_id_of, Ann
 #[cfg(feature = "test-util")]
 pub use cell::CellVerdicts;
 pub use cell::{
-    record_prefix, Awaiting, CellCatchUp, CellDeparture, CellStore, CellTickets, DevicesPayload,
+    record_prefix, Awaiting, CellCatchUp, CellNotice, CellStore, CellTickets, DevicesPayload,
     EventKind, ForNothing, FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice,
     MemberState, Membership, MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView,
     Seq, UnknownCell, UnknownEntry, Verdict, ACT_PAYLOAD,

@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use data_layer::{
     cell_id_of, cell_ticket_kind, devices_verify, join_verifies, pdn_id_of, AcceptError,
-    AddrInfoOptions, AuthorId, CellDeparture, CellStore, CellTickets, Connection, DevicesPayload,
+    AddrInfoOptions, AuthorId, CellNotice, CellStore, CellTickets, Connection, DevicesPayload,
     DocTicket, EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice, Membership,
     MembershipKey, OpId, Operation, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownCell,
     UnknownEntry, ACT_PAYLOAD,
@@ -741,31 +741,37 @@ async fn depart(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Resul
     state.node.forget_cell(identity, cell).await
 }
 
-/// Departs every cell the data layer reports a hosted identity's chain
-/// ends in a departure in, which is how a kicked member's device learns of
-/// its kick. A failure is reported again at the next change to the
-/// membership store or the next run of the cell stores' pass.
-pub(crate) fn spawn_departure_consumer(
+/// Acts on every notice the data layer reports of a hosted identity's
+/// cells: a departure is settled — how a kicked member's device, or a
+/// departed member's other device, learns of it — and a device its
+/// member's statements do not list registers itself (cells D16). A failure
+/// is reported again at the next change to the membership store or the
+/// next run of the cell stores' pass.
+pub(crate) fn spawn_cell_notice_consumer(
     state: Weak<Mutex<State>>,
-    mut departures: mpsc::UnboundedReceiver<CellDeparture>,
+    mut notices: mpsc::UnboundedReceiver<CellNotice>,
 ) {
     let _detached = tokio::spawn(async move {
-        while let Some(departure) = departures.recv().await {
+        while let Some(notice) = notices.recv().await {
             let Some(state) = state.upgrade() else {
                 return;
             };
             let guard = state.lock().await;
-            let _ = settle_departure(&guard, departure).await;
+            let _ = match notice {
+                CellNotice::Departed {
+                    identity,
+                    cell,
+                    seq,
+                } => settle_departure(&guard, identity, cell, seq).await,
+                CellNotice::Unlisted { identity, cell } => {
+                    register_device(&guard, identity, cell).await
+                }
+            };
         }
     });
 }
 
-async fn settle_departure(state: &State, departure: CellDeparture) -> Result<()> {
-    let CellDeparture {
-        identity,
-        cell,
-        seq,
-    } = departure;
+async fn settle_departure(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Result<()> {
     // A join imports onto the tombstone before its joined event arrives.
     if state.joining_in_flight.contains(&(identity, cell)) {
         return Ok(());
@@ -780,6 +786,119 @@ async fn settle_departure(state: &State, departure: CellDeparture) -> Result<()>
         return Ok(());
     }
     depart(state, identity, cell, seq).await
+}
+
+/// Write `identity`'s next device statement in `cell` — its counted list
+/// with this device added — when that list does not name this device with
+/// the author `identity` writes with here (cells D16). Nothing while the
+/// announcement key has not reached this device, or while a join of the
+/// cell is in flight here, its dialogue carrying a statement of its own.
+async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
+    if state.joining_in_flight.contains(&(identity, cell)) {
+        return Ok(());
+    }
+    let hosted = state.hosted(identity)?;
+    let Some(keys) = hosted.directory.announcement_key().await? else {
+        return Ok(());
+    };
+    let membership = state.node.cell_membership(identity, cell).await?;
+    let member = require_member(&membership, identity, cell)?;
+    let device = MemberDevice {
+        node: state.node.node_id(),
+        author: hosted.author,
+    };
+    if member.devices.contains(&device) {
+        return Ok(());
+    }
+    let version = member
+        .statement_version
+        .checked_add(1)
+        .context("device statement version exhausted")?;
+    let mut devices: Vec<MemberDevice> = member.devices.iter().copied().collect();
+    devices.push(device);
+    let key = MembershipKey::Devices {
+        member: identity,
+        version,
+    };
+    state
+        .node
+        .write_cell_entry(
+            identity,
+            cell,
+            CellStore::Membership,
+            &key.to_bytes(),
+            &keys.device_statement(version, devices).encode(),
+        )
+        .await
+}
+
+/// Open every cell `identity`'s directory holds that this device does not,
+/// from the tickets beside its record, and forget the record store of every
+/// one whose record the directory's tombstone ends (cells D16, D35). A cell
+/// whose join is in flight here is the join's; one whose tickets have not
+/// arrived waits for the next sweep.
+pub(crate) async fn arm_cells(state: &State, identity: PdnId) {
+    let Ok(hosted) = state.hosted(identity) else {
+        return;
+    };
+    let (Ok(held), Ok(holdings)) = (
+        hosted.directory.held_cells().await,
+        state.node.cell_holdings(identity),
+    ) else {
+        return;
+    };
+    let joining = |cell: &CellId| state.joining_in_flight.contains(&(identity, *cell));
+    for cell in &held {
+        let records_held = holdings
+            .iter()
+            .any(|(holding, records)| holding == cell && *records);
+        if records_held || joining(cell) {
+            continue;
+        }
+        if let Err(err) = open_cell(state, identity, *cell).await {
+            tracing::warn!(%identity, %cell, "opening the cell from the directory failed: {err:#}");
+        }
+    }
+    for (cell, records) in holdings {
+        if !records || held.contains(&cell) || joining(&cell) {
+            continue;
+        }
+        // No record at all: a create or a join that failed before writing it.
+        if !matches!(
+            hosted.directory.cell_record(cell).await,
+            Ok(Some((_seq, false)))
+        ) {
+            continue;
+        }
+        if let Err(err) = state.node.forget_cell(identity, cell).await {
+            tracing::warn!(%identity, %cell, "forgetting the departed cell failed: {err:#}");
+        }
+    }
+}
+
+async fn open_cell(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
+    let directory = &state.hosted(identity)?.directory;
+    let membership = directory
+        .get_ticket(&cell_ticket_kind(&cell, CellStore::Membership))
+        .await?;
+    let records = directory
+        .get_ticket(&cell_ticket_kind(&cell, CellStore::Records))
+        .await?;
+    let (Some(membership), Some(records)) = (membership, records) else {
+        return Ok(());
+    };
+    let _caught_up = state
+        .node
+        .import_cell(
+            identity,
+            cell,
+            CellTickets {
+                membership,
+                records,
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// The author `identity` writes with here and the point of its chain its
