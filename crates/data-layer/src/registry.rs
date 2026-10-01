@@ -204,6 +204,14 @@ impl Registry {
         Ok(true)
     }
 
+    pub(crate) fn unregister_cell(&self, cell: CellId) -> Result<Option<CellBinding>> {
+        Ok(self
+            .cells
+            .write()
+            .map_err(|_poisoned| anyhow!("cell registry lock poisoned"))?
+            .remove(&cell))
+    }
+
     pub(crate) fn cell(&self, cell: CellId) -> Result<Option<CellBinding>> {
         Ok(self.read_cells()?.get(&cell).cloned())
     }

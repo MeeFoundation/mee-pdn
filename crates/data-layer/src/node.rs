@@ -40,8 +40,8 @@ use tokio::sync::watch;
 use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
     cell::{
-        departure_past, record_entries, record_prefix, unknown_entries, CellStore, CellTickets,
-        Membership, Operation, RecordView, UnknownCell, UnknownEntry,
+        departure_past, record_entries, record_prefix, unknown_entries, CellCatchUp, CellStore,
+        CellTickets, Membership, Operation, RecordView, UnknownCell, UnknownEntry,
     },
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
@@ -282,6 +282,10 @@ pub struct SyncNode {
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
     cell_verdicts: crate::access::CellVerdictSink,
+    /// Blob collection runs once set: at spawn on memory, at the host's
+    /// [`start_blob_collection`](Self::start_blob_collection) on a
+    /// directory.
+    collecting: Arc<std::sync::atomic::AtomicBool>,
     /// What the passes report, so a scenario can order its absence
     /// assertions after runs that happened.
     #[cfg(feature = "test-util")]
@@ -571,7 +575,12 @@ impl SyncNode {
 
         let endpoint = bind_endpoint(secret_key, options.connectivity).await?;
         let identities: Identities = Arc::default();
-        let blobs_store = open_blob_store(&options, &identities).await?;
+        // A memory node holds nothing an identity could come back for.
+        let collecting = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
+            options.storage,
+            StorageConfig::Memory
+        )));
+        let blobs_store = open_blob_store(&options, &identities, &collecting).await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let (retraction, retraction_verdicts) = RetractionTracker::new();
@@ -631,6 +640,7 @@ impl SyncNode {
             cell_verdicts: Arc::default(),
             #[cfg(feature = "test-util")]
             pass_probes,
+            collecting,
             storage: options.storage,
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
@@ -1448,7 +1458,7 @@ impl SyncNode {
         identity: PdnId,
         cell: CellId,
         tickets: CellTickets,
-    ) -> Result<()> {
+    ) -> Result<CellCatchUp> {
         let stack = self.require(identity)?;
         let (membership_namespace, records_namespace) = (
             tickets.membership.capability.id(),
@@ -1467,7 +1477,9 @@ impl SyncNode {
                 ));
             }
             return match held.records {
-                Some(records) if records.id() == records_namespace => Ok(()),
+                Some(records) if records.id() == records_namespace => {
+                    Self::start_cell(&stack, &held.membership, &records).await
+                }
                 Some(records) => Err(anyhow::anyhow!(
                     "cell {cell} is held on record store {}, not {records_namespace}",
                     records.id()
@@ -1528,11 +1540,35 @@ impl SyncNode {
     }
 
     /// Start both tracked stores' sync, the record store's every dial
-    /// ordered after the membership store's.
-    async fn start_cell(stack: &HostedStack, membership: &Doc, records: &Doc) -> Result<()> {
+    /// ordered after the membership store's, behind a wait for the first
+    /// session of each that this start brings.
+    async fn start_cell(
+        stack: &HostedStack,
+        membership: &Doc,
+        records: &Doc,
+    ) -> Result<CellCatchUp> {
+        let caught_up = CellCatchUp {
+            membership: crate::private_metadata::watch_doc(membership).await?,
+            records: crate::private_metadata::watch_doc(records).await?,
+        };
         Self::order_cell_stores(stack, membership, records).await?;
         Self::start_tracked(stack, membership.id()).await?;
-        Self::start_tracked(stack, records.id()).await
+        Self::start_tracked(stack, records.id()).await?;
+        Ok(caught_up)
+    }
+
+    /// Drop both of `cell`'s stores and its registration, as if the cell
+    /// had never been held here: the undo of a create or a join before
+    /// anything of the cell left this device. Nothing for a cell not held.
+    pub async fn discard_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
+        let stack = self.require(identity)?;
+        let Some(held) = stack.registry.unregister_cell(cell)? else {
+            return Ok(());
+        };
+        for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+            self.forget_doc(identity, doc.id()).await?;
+        }
+        Ok(())
     }
 
     /// Start a tracked store's sync with the contacts and the default
@@ -1811,6 +1847,14 @@ impl SyncNode {
     #[cfg(feature = "test-util")]
     pub async fn holds_payload(&self, hash: Hash) -> Result<bool> {
         Ok(self.blobs.has(hash).await?)
+    }
+
+    /// Put `bytes` into the node's blob store referenced by no replica: the
+    /// payload the next collection run removes.
+    #[cfg(feature = "test-util")]
+    pub async fn add_stray_payload_for_test(&self, bytes: &[u8]) -> Result<Hash> {
+        let tag = self.blobs.add_bytes(bytes.to_vec()).temp_tag().await?;
+        Ok(tag.hash())
     }
 
     /// The runs of the pass over every tracked store but a cell's finished
@@ -2300,6 +2344,15 @@ impl SyncNode {
             .collect())
     }
 
+    /// Let blob collection run on a directory-configured node, once the
+    /// host has hosted again every identity it means to: a run before that
+    /// would remove the payloads of an identity recovery has yet to reach.
+    /// A memory node collects from its spawn.
+    pub fn start_blob_collection(&self) {
+        self.collecting
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Idempotent under a shared reference.
     pub async fn shutdown(&self) -> Result<()> {
         // First, so it does not race the docs engines' shutdown with fresh
@@ -2590,16 +2643,18 @@ fn governing_store(stack: &HostedStack, namespace: NamespaceId) -> Option<Namesp
     Some(stack.registry.cell(cell).ok()??.membership.id())
 }
 
-/// The node's one blob store, collected at the interval `options` sets.
+/// The node's one blob store, collected at the interval `options` sets
+/// once `collecting` is set.
 async fn open_blob_store(
     options: &SpawnOptions,
     identities: &Identities,
+    collecting: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<iroh_blobs::api::Store> {
     let collection = GcConfig {
         interval: options.blob_collection_interval,
         add_protected: Some(protect_hosted(
             Arc::downgrade(identities),
-            options.storage.clone(),
+            Arc::clone(collecting),
         )),
     };
     Ok(match &options.storage {
@@ -2621,17 +2676,18 @@ async fn open_blob_store(
 
 /// Blob collection's protect callback: every payload a replica of an
 /// identity the node hosts references, the node's one blob store being
-/// every identity's. A run while an identity the storage directory records
-/// is not hosted yet — a start before recovery reached it — is skipped, or
-/// it would remove that identity's payloads.
+/// every identity's. Every run before `collecting` is set is skipped.
 fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
-    storage: StorageConfig,
+    collecting: Arc<std::sync::atomic::AtomicBool>,
 ) -> ProtectCb {
     Arc::new(move |live: &mut HashSet<Hash>| {
         let identities = identities.clone();
-        let storage = storage.clone();
+        let collecting = Arc::clone(&collecting);
         Box::pin(async move {
+            if !collecting.load(std::sync::atomic::Ordering::Acquire) {
+                return ProtectOutcome::Abort;
+            }
             let Some(identities) = identities.upgrade() else {
                 return ProtectOutcome::Abort;
             };
@@ -2639,16 +2695,6 @@ fn protect_hosted(
                 Ok(hosted) => hosted.values().cloned().collect(),
                 Err(_poisoned) => return ProtectOutcome::Abort,
             };
-            if let StorageConfig::Directory(directory) = &storage {
-                let Ok(recorded) = read_hosting_records(directory) else {
-                    return ProtectOutcome::Abort;
-                };
-                let hosted =
-                    |identity: &PdnId| stacks.iter().any(|stack| stack.identity == *identity);
-                if !recorded.iter().all(|record| hosted(&record.identity)) {
-                    return ProtectOutcome::Abort;
-                }
-            }
             for stack in stacks {
                 let Ok(referenced) = referenced_payloads(&stack).await else {
                     return ProtectOutcome::Abort;

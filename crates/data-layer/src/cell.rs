@@ -125,6 +125,26 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: CellStore) -> Result<Vec<U
     Ok(unknown)
 }
 
+/// A wait for each of a cell's stores' first successful session started
+/// since an import, from [`SyncNode::import_cell`](crate::SyncNode::import_cell).
+#[derive(Debug)]
+pub struct CellCatchUp {
+    pub(crate) membership: crate::private_metadata::CatchUpWatch,
+    pub(crate) records: crate::private_metadata::CatchUpWatch,
+}
+
+impl CellCatchUp {
+    /// Fails with [`CatchUpTimeout`](crate::CatchUpTimeout) when either store
+    /// has had none within `timeout`.
+    pub async fn wait(self, timeout: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        self.membership.wait(timeout).await?;
+        self.records
+            .wait(deadline.saturating_duration_since(std::time::Instant::now()))
+            .await
+    }
+}
+
 /// The write tickets to a cell's two stores.
 #[derive(Debug, Clone)]
 pub struct CellTickets {

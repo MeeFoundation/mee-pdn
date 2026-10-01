@@ -104,6 +104,7 @@ impl CeremonyPause {
 
 use crate::linking::LinkingLocalFailure;
 use crate::{
+    cells::{JoinHandler, RuntimeCellsService, CELL_JOIN_ALPN},
     connections::RuntimeConnectionsService,
     data::RuntimeDataService,
     identity::RuntimeIdentityService,
@@ -150,6 +151,11 @@ pub(crate) struct State {
     /// Separate from pairing's: a secret minted for one ceremony must never
     /// verify in the other.
     pub(crate) pending_linking_invites: PendingInvites,
+    /// The cell join dialogue's, each secret minted for an identity and a
+    /// cell.
+    pub(crate) pending_cell_invites: PendingInvites<(PdnId, pdn_types::CellId)>,
+    /// Keyed by `(joining identity, cell)`.
+    pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::CellId)>,
     /// A cache keyed by `(hosted identity, counterparty)`; the directory is
     /// the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
@@ -187,6 +193,10 @@ pub(crate) struct State {
     pub(crate) link_after_commit_pause: Option<Arc<CeremonyPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
+    /// Ends the next join dialogue's serving half once the joined event and
+    /// the statement are written, before the tickets go out: a reply lost.
+    #[cfg(feature = "test-util")]
+    pub(crate) drop_next_join_reply: bool,
     /// Fails the next `create` where its directory would be made — a step
     /// between provisioning an identity and hosting it, which a full disk is
     /// the product's reason to reach.
@@ -256,10 +266,13 @@ impl Runtime {
         let pairing_slot = pairing.slot();
         let linking = LinkingHandler::new(serving_halves.clone());
         let linking_slot = linking.slot();
+        let join = JoinHandler::new(serving_halves.clone());
+        let join_slot = join.slot();
         let node = SyncNode::spawn_with(
             vec![
                 (PAIRING_ALPN.to_vec(), Box::new(pairing)),
                 (LINKING_ALPN.to_vec(), Box::new(linking)),
+                (CELL_JOIN_ALPN.to_vec(), Box::new(join)),
             ],
             options,
         )
@@ -293,6 +306,8 @@ impl Runtime {
             identities,
             pending_invites: PendingInvites::default(),
             pending_linking_invites: PendingInvites::default(),
+            pending_cell_invites: PendingInvites::default(),
+            joining_in_flight: HashSet::new(),
             metadata_pairs: HashMap::new(),
             grant_binders: HashSet::new(),
             bound_grants: HashMap::new(),
@@ -312,6 +327,8 @@ impl Runtime {
             #[cfg(feature = "test-util")]
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
+            drop_next_join_reply: false,
+            #[cfg(feature = "test-util")]
             fail_next_directory_create: false,
             #[cfg(feature = "test-util")]
             fail_next_hosting_record: false,
@@ -323,6 +340,8 @@ impl Runtime {
         for (identity, changes) in armers {
             crate::connections::spawn_connection_armer(Arc::downgrade(&state), identity, changes);
         }
+        // Every identity the directory records is hosted again by now.
+        state.lock().await.node.start_blob_collection();
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
         pairing_slot
             .set(Arc::downgrade(&state))
@@ -330,6 +349,9 @@ impl Runtime {
         linking_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("linking state slot filled twice"))?;
+        join_slot
+            .set(Arc::downgrade(&state))
+            .map_err(|_already_filled| anyhow::anyhow!("join state slot filled twice"))?;
         Ok(Self { node_id, state })
     }
 
@@ -353,6 +375,10 @@ impl Runtime {
         RuntimeSyncService::new(self)
     }
 
+    pub fn cells(&self) -> RuntimeCellsService<'_> {
+        RuntimeCellsService::new(self)
+    }
+
     /// One event per retracted entry — the host's hook for user-facing
     /// surfacing. A lagging subscriber loses the oldest events, never
     /// blocks the runtime.
@@ -369,6 +395,22 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn fail_next_pending_device_write_for_test(&self) {
         self.state.lock().await.fail_next_pending_device_write = true;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn drop_next_join_reply_for_test(&self) {
+        self.state.lock().await.drop_next_join_reply = true;
+    }
+
+    /// The membership `identity`'s replica of `cell` folds into.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_membership_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        cell: pdn_types::CellId,
+    ) -> anyhow::Result<data_layer::Membership> {
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.cell_membership(identity, cell).await
     }
 
     #[cfg(feature = "test-util")]

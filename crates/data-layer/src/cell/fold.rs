@@ -94,11 +94,32 @@ pub struct Member {
     pub announcement_key: Option<[u8; 32]>,
     /// The union of its counted device statements.
     pub devices: BTreeSet<MemberDevice>,
+    /// The highest version among its counted device statements; `0` for
+    /// none. The next statement takes the version after it.
+    pub statement_version: u64,
     /// The state after each sequence of that run, from 1.
     chain: BTreeMap<u64, MemberState>,
 }
 
 impl Member {
+    /// The last sequence of the member's chain before the first one the
+    /// device holds no entry at; `0` for no chain. The next event of the
+    /// chain goes at the sequence after it.
+    pub fn run(&self) -> u64 {
+        self.chain.keys().next_back().copied().unwrap_or(0)
+    }
+
+    /// The sequence at which the member last became one — its founding or
+    /// its latest joined event — while it is a member.
+    pub fn joined_at(&self) -> Option<u64> {
+        if !self.state.member {
+            return None;
+        }
+        (1..=self.run())
+            .rev()
+            .find(|seq| !self.state_at(seq - 1).is_some_and(|before| before.member))
+    }
+
     /// `None` past the run of sequences the device holds.
     pub fn state_at(&self, seq: u64) -> Option<MemberState> {
         if seq == 0 {
@@ -245,6 +266,7 @@ struct Pass<'a> {
     set_aside: &'a BTreeSet<usize>,
     keys: HashMap<PdnId, [u8; 32]>,
     devices: HashMap<PdnId, BTreeSet<MemberDevice>>,
+    statement_versions: HashMap<PdnId, u64>,
     authors: HashMap<PdnId, HashSet<AuthorId>>,
     verdicts: Vec<Verdict>,
     winners: HashMap<PdnId, BTreeMap<u64, Winner>>,
@@ -266,6 +288,7 @@ impl<'a> Pass<'a> {
             set_aside,
             keys: HashMap::new(),
             devices: HashMap::new(),
+            statement_versions: HashMap::new(),
             authors: HashMap::new(),
             verdicts: vec![Verdict::OutsideLayout; entries.len()],
             winners: HashMap::new(),
@@ -326,6 +349,8 @@ impl<'a> Pass<'a> {
                         .entry(statement.member)
                         .or_default()
                         .extend(payload.devices);
+                    let version = self.statement_versions.entry(statement.member).or_default();
+                    *version = (*version).max(statement.version);
                 }
             }
             self.set(statement.entry, verdict);
@@ -734,6 +759,7 @@ impl<'a> Pass<'a> {
                     state: self.state(&id, run),
                     announcement_key: self.keys.get(&id).copied(),
                     devices: self.devices.get(&id).cloned().unwrap_or_default(),
+                    statement_version: self.statement_versions.get(&id).copied().unwrap_or(0),
                     chain,
                 };
                 (id, member)

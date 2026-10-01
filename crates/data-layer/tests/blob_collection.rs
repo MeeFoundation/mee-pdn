@@ -145,14 +145,14 @@ async fn a_payload_a_co_located_identity_references_stays() -> Result<()> {
     Ok(())
 }
 
-/// After a restart, the payloads of an identity the storage directory
-/// records stay through the runs before that identity is hosted again, and
-/// after.
+/// After a restart, a node on a storage directory removes nothing until its
+/// host has hosted its identities again and lets collection start, and
+/// collects from then on.
 ///
-/// Nothing is collected while the identity waits, so no removal can order
-/// the absence of one; the wait spans several runs at their interval.
+/// Nothing is collected before the start, so no removal can order the
+/// absence of one; the wait spans several runs at their interval.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_payload_survives_a_restart_until_its_identity_is_hosted_again() -> Result<()> {
+async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let on_dir = || {
         SyncNode::spawn(SpawnOptions {
@@ -186,18 +186,18 @@ async fn a_payload_survives_a_restart_until_its_identity_is_hosted_again() -> Re
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
         second.holds_payload(Hash::new(b"photo")).await?,
-        "a payload of an identity not yet hosted again was removed"
+        "a payload was removed before the host let collection start"
     );
     second.provision_identity(carol.id).await?;
     let reopened = data_layer::PrivateMetadataStore::open(&second, carol.id, directory.namespace())
         .await?
         .expect("the directory survives the restart");
     second.host_identity(carol.id, &reopened)?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(
-        second.holds_payload(Hash::new(b"photo")).await?,
-        "a payload a hosted identity's replica references was removed"
-    );
+    second.start_blob_collection();
+    // Collection runs from the start on: a payload nothing references goes.
+    let stray = second.add_stray_payload_for_test(b"stray").await?;
+    assert!(eventually(|| async { Ok(!second.holds_payload(stray).await?) }).await?);
+    assert!(second.holds_payload(Hash::new(b"photo")).await?);
     second.shutdown().await?;
     Ok(())
 }

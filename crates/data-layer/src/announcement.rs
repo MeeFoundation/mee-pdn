@@ -83,7 +83,7 @@ pub(crate) fn founding_verifies(creator: &PdnId, payload: &FoundedPayload) -> bo
 
 /// Whether `payload`'s signature verifies for a joined event at
 /// `subject_seq` of `subject`'s chain in `cell`.
-pub(crate) fn join_verifies(
+pub fn join_verifies(
     subject: &PdnId,
     cell: &CellId,
     subject_seq: Seq,
@@ -95,11 +95,7 @@ pub(crate) fn join_verifies(
 
 /// Whether `payload`'s signature verifies under `announcement_key` for the
 /// statement at `version`.
-pub(crate) fn devices_verify(
-    announcement_key: &[u8; 32],
-    version: u64,
-    payload: &DevicesPayload,
-) -> bool {
+pub fn devices_verify(announcement_key: &[u8; 32], version: u64, payload: &DevicesPayload) -> bool {
     let message = devices_message(version, &payload.devices);
     verifies(announcement_key, &message, &payload.signature)
 }

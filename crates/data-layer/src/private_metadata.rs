@@ -7,7 +7,7 @@
 //! their reads wait for content.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,11 +25,12 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket, NamespaceId,
 };
-use pdn_types::{NodeId, PdnId};
+use pdn_types::{CellId, NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     announcement::AnnouncementKeyPair,
+    cell::{CellStore, Seq},
     node::{read_payload, SyncNode},
 };
 
@@ -109,6 +110,30 @@ const TICKETS_PREFIX: &str = "tickets/";
 const CONNECTIONS_PREFIX: &str = "connections/";
 const RETRACTIONS_PREFIX: &str = "retractions/";
 const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
+const CELLS_PREFIX: &str = "cells/";
+
+/// The directory kind of one of a cell's stores' write tickets.
+pub fn cell_ticket_kind(cell: &CellId, store: CellStore) -> String {
+    let store = match store {
+        CellStore::Membership => "membership",
+        CellStore::Records => "records",
+    };
+    format!("cell/{cell}/{store}")
+}
+
+fn cell_record_key(cell: &CellId, seq: Seq) -> String {
+    format!("{CELLS_PREFIX}{cell}/{seq}")
+}
+
+fn cell_record_of(key: &[u8]) -> Option<(CellId, u64)> {
+    let rest = std::str::from_utf8(key).ok()?.strip_prefix(CELLS_PREFIX)?;
+    let (cell, seq) = rest.split_once('/')?;
+    let canonical = seq == "0" || (!seq.starts_with('0') && !seq.is_empty());
+    if !canonical || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((cell.parse().ok()?, seq.parse().ok()?))
+}
 
 pub(crate) fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
@@ -492,6 +517,49 @@ impl PrivateMetadataStore {
             }
         }
         Ok(peers)
+    }
+
+    /// Record that the identity's membership event at `seq` of its chain in
+    /// `cell` — its founding or joined event — holds the cell.
+    pub async fn record_cell(&self, cell: CellId, seq: Seq) -> Result<()> {
+        self.doc
+            .set_bytes(
+                self.author,
+                cell_record_key(&cell, seq).into_bytes(),
+                vec![1u8],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The cells the identity holds, record-level: those whose entry at
+    /// the highest sequence, across all authors, is not a tombstone. Entry
+    /// timestamps are never read.
+    pub async fn held_cells(&self) -> Result<Vec<CellId>> {
+        let query = Query::all()
+            .key_prefix(CELLS_PREFIX.as_bytes())
+            .include_empty();
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        // Per cell: its highest sequence, and whether a tombstone sits there.
+        let mut highest: HashMap<CellId, (u64, bool)> = HashMap::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            let Some((cell, seq)) = cell_record_of(entry.key()) else {
+                continue;
+            };
+            let tombstone = entry.content_len() == 0;
+            let slot = highest.entry(cell).or_insert((seq, tombstone));
+            if seq > slot.0 {
+                *slot = (seq, tombstone);
+            } else if seq == slot.0 {
+                slot.1 |= tombstone;
+            }
+        }
+        Ok(highest
+            .into_iter()
+            .filter(|(_cell, (_seq, tombstone))| !tombstone)
+            .map(|(cell, _held)| cell)
+            .collect())
     }
 
     /// Record a write-retraction verdict, replacing any previous marker for

@@ -8,7 +8,7 @@ An identity's announcement key pair and everything derived from it or signed by 
 
 The `DataLayer` trait in `layer.rs` is declared and implemented by nothing; the runtime drives `SyncNode` directly.
 
-Blob collection runs over the node's one blob store at `SpawnOptions::blob_collection_interval`, its single protect callback answering with the payloads every hosted identity's replica store references, and skipping a run while an identity the storage directory records is not hosted yet, so a start removes nothing of an identity recovery has yet to reach. The collection's task holds the store until it stops, so a node dropped without `shutdown` stops its blob store in its drop.
+Blob collection runs over the node's one blob store at `SpawnOptions::blob_collection_interval`, its single protect callback answering with the payloads every hosted identity's replica store references, and on a storage directory starting only at the host's `start_blob_collection` — pdn-node calls it once recovery has hosted its identities again — so a start removes nothing of an identity recovery has yet to reach. The collection's task holds the store until it stops, so a node dropped without `shutdown` stops its blob store in its drop.
 
 Storage is a required choice of every spawn (`SpawnOptions::storage`): memory by name — the workspace's suites, via their spawn helpers — or a directory by name, with no default. A configured directory holds everything a node needs to be itself:
 

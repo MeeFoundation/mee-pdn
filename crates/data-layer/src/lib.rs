@@ -27,14 +27,14 @@ mod registry;
 mod retraction;
 
 pub use access::identity_of;
-pub use announcement::{cell_id_of, pdn_id_of, AnnouncementKeyPair};
+pub use announcement::{cell_id_of, devices_verify, join_verifies, pdn_id_of, AnnouncementKeyPair};
 #[cfg(feature = "test-util")]
 pub use cell::CellVerdicts;
 pub use cell::{
-    record_prefix, Awaiting, CellStore, CellTickets, DevicesPayload, EventKind, ForNothing,
-    FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice, MemberState, Membership,
-    MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView, Seq, UnknownCell,
-    UnknownEntry, Verdict,
+    record_prefix, Awaiting, CellCatchUp, CellStore, CellTickets, DevicesPayload, EventKind,
+    ForNothing, FoundedPayload, HeldEntry, JoinedPayload, Member, MemberDevice, MemberState,
+    Membership, MembershipKey, OpId, Operation, RecordEntry, RecordKey, RecordView, Seq,
+    UnknownCell, UnknownEntry, Verdict,
 };
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
@@ -64,6 +64,7 @@ pub use pdn_store::{
     AuthorId, Contact, DocTicket, Identity, NamespaceId,
 };
 pub use private_metadata::{
-    CatchUpTimeout, CatchUpWatch, PrivateMetadataStore, RetractionHead, RetractionMarker,
+    cell_ticket_kind, CatchUpTimeout, CatchUpWatch, PrivateMetadataStore, RetractionHead,
+    RetractionMarker,
 };
 pub use retraction::RetractionVerdict;
