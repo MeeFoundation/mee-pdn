@@ -5,6 +5,7 @@
 //! assembly slot. The runtime adds no sync or authorization mechanics of
 //! its own: it registers what it hosts with data-layer's access book.
 
+pub mod cells;
 pub mod connections;
 pub mod data;
 pub mod identity;
@@ -14,6 +15,12 @@ pub mod retraction;
 pub mod runtime;
 pub mod sync;
 
+pub use cells::{
+    ActRefusal, ActRefused, AnnouncementKeyPending, CellAct, CellInfo, CellInvite, CellMember,
+    CellsService, JoinInProgress, JoinRefused, JoinTimeout, RecordPlacedOnce, RuntimeCellsService,
+    UnknownRecord, UnsupportedCellInviteVersion, WrongRecordKind, CELL_INVITE_FORMAT_VERSION,
+    JOIN_CATCH_UP_TIMEOUT, JOIN_DIALOGUE_TIMEOUT, LEAVE_FLUSH_TIMEOUT,
+};
 pub use connections::{
     ConnectionsService, DelegationUnsupported, PeerGrant, PeerNotConnected,
     RuntimeConnectionsService,
@@ -21,8 +28,9 @@ pub use connections::{
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use data_layer::{
-    claim_id_of, CatchUpTimeout, DirectoryHeld, DocTicket, GrantedClaim, GranteeCannotShare,
-    ReadGrant, ShareMode, SpawnOptions, StorageConfig, UnknownIssuer,
+    claim_id_of, CatchUpTimeout, CellStore, DirectoryHeld, DocTicket, GrantedClaim,
+    GranteeCannotShare, OpId, Operation, ReadGrant, ShareMode, SpawnOptions, StorageConfig,
+    UnknownCell, UnknownEntry, UnknownIssuer,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
@@ -33,7 +41,9 @@ pub use pairing::{
     EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, InvitePayload,
     InviterUnreachable, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
-pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
+pub use pdn_types::{
+    CellId, ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId, RecordId, RecordKind, RecordRef,
+};
 pub use retraction::RetractionEvent;
 pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};

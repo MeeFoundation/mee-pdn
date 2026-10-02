@@ -478,6 +478,7 @@ impl Doc {
                 peers,
                 default_identity,
                 join_gossip: true,
+                recorded: None,
             })
             .await??;
         Ok(())
@@ -500,6 +501,32 @@ impl Doc {
                 peers,
                 default_identity,
                 join_gossip: false,
+                recorded: None,
+            })
+            .await??;
+        Ok(())
+    }
+
+    /// Syncs this document with `peers` and the recorded peers in
+    /// `recorded` alone, none of the others the engine recorded: for a
+    /// caller that draws whom each run reaches. `join_gossip` joins the
+    /// swarm as [`Self::start_sync`] does; without it the document stays
+    /// outside, as under [`Self::start_sync_scoped`].
+    pub async fn sync_with_peers(
+        &self,
+        peers: Vec<Contact>,
+        recorded: Vec<PeerIdBytes>,
+        default_identity: Identity,
+        join_gossip: bool,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        self.inner
+            .rpc(StartSyncRequest {
+                doc_id: self.namespace_id,
+                peers,
+                default_identity,
+                join_gossip,
+                recorded: Some(recorded),
             })
             .await??;
         Ok(())

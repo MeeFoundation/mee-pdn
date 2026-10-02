@@ -20,8 +20,8 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
-    store::{fs::FsStore, mem::MemStore},
-    BlobsProtocol, ALPN as BLOBS_ALPN,
+    store::{fs::FsStore, mem::MemStore, GcConfig, ProtectCb, ProtectOutcome},
+    BlobsProtocol, Hash, ALPN as BLOBS_ALPN,
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
@@ -31,16 +31,22 @@ use pdn_store::{
     },
     protocol::{Docs, DocsDispatch},
     store::Query,
-    AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
+    AuthorId, Contact, DocTicket, Identity, NamespaceId, PeerIdBytes, ALPN as DOCS_ALPN,
 };
-use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId};
-use tokio::sync::oneshot;
+use pdn_types::{CellId, EntryInfo, EntryPath, NodeId, PdnId, RecordRef};
+use rand::seq::SliceRandom as _;
+use tokio::sync::watch;
 
 use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
+    cell::{
+        departure_past, record_entries, record_prefix, unknown_entries, CellCatchUp, CellNotice,
+        CellStore, CellTickets, MemberDevice, Membership, Operation, RecordView, Seq, UnknownCell,
+        UnknownEntry,
+    },
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
-    registry::{Registry, ServingPosture},
+    registry::{CellBinding, Registry, ServingPosture},
     retraction::{RetractionTracker, RetractionVerdict},
 };
 
@@ -130,6 +136,21 @@ impl ProtocolHandler for PanicGuarded {
 /// permanently.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Default of [`SpawnOptions::cell_reconcile_interval`]: a cell store's
+/// writes arrive over its swarm, and its pass catches up what gossip lost.
+const CELL_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The peers one run of the cell stores' pass reaches per store, so a
+/// cell's sessions stay bounded whatever its size.
+const CELL_RECONCILE_PEERS: usize = 5;
+
+/// Default of [`SpawnOptions::blob_collection_interval`].
+const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How long after a change to a cell's membership store its contacts are
+/// derived again, the changes meanwhile taken in the same derivation.
+const CELL_CHANGE_SETTLE: Duration = Duration::from_millis(50);
+
 /// Chosen by name at spawn, with no default. Not read from the process
 /// environment: several nodes spawn in one process, and a directory belongs
 /// to one node.
@@ -173,6 +194,13 @@ pub struct SpawnOptions {
     /// expressible.
     pub storage: StorageConfig,
     pub reconcile_interval: Duration,
+    /// The pass over each cell store, whose every run reaches at most 5
+    /// peers per store; every other tracked store keeps
+    /// `reconcile_interval` and every contact.
+    pub cell_reconcile_interval: Duration,
+    /// How often the node removes the payloads no replica of any identity
+    /// it hosts references.
+    pub blob_collection_interval: Duration,
     /// [`Connectivity::Direct`] in every constructor but
     /// [`SpawnOptions::for_product`].
     pub connectivity: Connectivity,
@@ -196,6 +224,8 @@ impl SpawnOptions {
         Self {
             storage: StorageConfig::Memory,
             reconcile_interval: RECONCILE_INTERVAL,
+            cell_reconcile_interval: CELL_RECONCILE_INTERVAL,
+            blob_collection_interval: BLOB_COLLECTION_INTERVAL,
             connectivity: Connectivity::Direct,
             replica_cache_budget_bytes: DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
         }
@@ -206,6 +236,8 @@ impl SpawnOptions {
         Self {
             storage: StorageConfig::Directory(directory.into()),
             reconcile_interval: RECONCILE_INTERVAL,
+            cell_reconcile_interval: CELL_RECONCILE_INTERVAL,
+            blob_collection_interval: BLOB_COLLECTION_INTERVAL,
             connectivity: Connectivity::Direct,
             replica_cache_budget_bytes: DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
         }
@@ -243,13 +275,32 @@ pub struct SyncNode {
     /// assert that a pass over a quiet pair opens none.
     #[cfg(feature = "test-util")]
     co_located_sessions: CoLocatedPassSessions,
+    /// Fails the record store's creation in the next `create_cell`, after
+    /// its membership store exists.
+    #[cfg(feature = "test-util")]
+    fail_next_cell_records_create: std::sync::atomic::AtomicBool,
+    /// Handed to every hosted identity's book; empty until a scenario takes
+    /// the channel, so nothing accumulates unread.
+    #[cfg(feature = "test-util")]
+    cell_verdicts: crate::access::CellVerdictSink,
+    /// Blob collection runs once set: at spawn on memory, at the host's
+    /// [`start_blob_collection`](Self::start_blob_collection) on a
+    /// directory.
+    collecting: Arc<std::sync::atomic::AtomicBool>,
+    /// What the passes report, so a scenario can order its absence
+    /// assertions after runs that happened.
+    #[cfg(feature = "test-util")]
+    pass_probes: Arc<PassProbes>,
     storage: StorageConfig,
     retraction: Arc<RetractionTracker>,
     /// Taken once, by the runtime's consumer.
     retraction_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>>>,
+    /// Handed to every hosted identity's half; filled once, by the
+    /// runtime's take.
+    cell_notices: crate::cell::CellNoticeSink,
     /// Taken once, so a repeated `shutdown` is a no-op under a shared
-    /// reference.
-    reconciler_stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// reference; both passes watch it.
+    reconciler_stop: Mutex<Option<watch::Sender<()>>>,
     /// Cloned into every hosted identity's engine; the task at the other
     /// end holds the identity map weakly (`serve_co_located`).
     co_located_requests: pdn_store::engine::CoLocatedRequests,
@@ -332,9 +383,22 @@ struct HostedStack {
     /// dropped, not replayed to it: a later announcement or pass carries
     /// what it would have.
     announcements_in_flight: Mutex<HashSet<(NamespaceId, Identity)>>,
+    /// Cells this identity departed whose tombstone has converged with a
+    /// member's device, and is reconciled with the identity's own devices
+    /// alone from then on.
+    converged_tombstones: Mutex<HashSet<CellId>>,
+    notices: crate::cell::CellNoticeSink,
 }
 
 impl HostedStack {
+    fn report(&self, notice: CellNotice) {
+        if let Ok(sender) = self.notices.lock() {
+            if let Some(sender) = sender.as_ref() {
+                let _ = sender.send(notice);
+            }
+        }
+    }
+
     fn identity(&self) -> pdn_store::Identity {
         crate::access::identity_of(self.identity)
     }
@@ -399,6 +463,33 @@ impl HostedStack {
         Ok(())
     }
 
+    /// Replace a tracked store's contacts wholesale; an untracked store is
+    /// refused rather than its set dropped silently.
+    fn set_contacts(&self, namespace: NamespaceId, contacts: Vec<Contact>) -> Result<()> {
+        let mut docs = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
+        let entry = docs
+            .get_mut(&namespace)
+            .ok_or(UntrackedNamespace { namespace })?;
+        entry.contacts = contacts;
+        Ok(())
+    }
+
+    /// Keeps the tracked store's contacts and default identity.
+    fn set_strategy(&self, namespace: NamespaceId, strategy: SyncStrategy) -> Result<()> {
+        if let Some(entry) = self
+            .tracked_docs
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?
+            .get_mut(&namespace)
+        {
+            entry.strategy = strategy;
+        }
+        Ok(())
+    }
+
     fn tracked(&self, namespace: NamespaceId) -> Result<Option<TrackedDoc>> {
         Ok(self
             .tracked_docs
@@ -427,6 +518,21 @@ impl HostedStack {
         self.registry
             .data_doc(issuer)?
             .ok_or_else(|| UnknownIssuer { issuer }.into())
+    }
+}
+
+/// A node dropped without [`shutdown`](SyncNode::shutdown) still lets go of
+/// its blob store: blob collection's task holds the store, and ends only once
+/// the store has stopped.
+impl Drop for SyncNode {
+    fn drop(&mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let blobs = self.blobs.clone();
+        let _detached = runtime.spawn(async move {
+            let _ = blobs.shutdown().await;
+        });
     }
 }
 
@@ -481,19 +587,18 @@ impl SyncNode {
         let (secret_key, directory_lock) = prepare_storage(&options.storage).await?;
 
         let endpoint = bind_endpoint(secret_key, options.connectivity).await?;
-        let blobs_store: iroh_blobs::api::Store = match &options.storage {
-            StorageConfig::Memory => MemStore::default().into(),
-            StorageConfig::Directory(directory) => FsStore::load(directory.join(BLOBS_DIR))
-                .await
-                .with_context(|| format!("cannot open the blob store in {}", directory.display()))?
-                .into(),
-        };
+        let identities: Identities = Arc::default();
+        // A memory node holds nothing an identity could come back for.
+        let collecting = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
+            options.storage,
+            StorageConfig::Memory
+        )));
+        let blobs_store = open_blob_store(&options, &identities, &collecting).await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let (retraction, retraction_verdicts) = RetractionTracker::new();
         let retraction = Arc::new(retraction);
 
-        let identities: Identities = Arc::default();
         let resolver: pdn_store::protocol::IdentityResolver = {
             let identities = Arc::clone(&identities);
             Arc::new(move |identity: pdn_store::Identity| {
@@ -517,12 +622,21 @@ impl SyncNode {
         let (co_located_requests, requests) =
             tokio::sync::mpsc::channel(CO_LOCATED_REQUESTS_CAPACITY);
         let _detached = tokio::spawn(serve_co_located(Arc::downgrade(&identities), requests));
-        let (reconciler_stop, stop) = oneshot::channel();
+        let (reconciler_stop, stop) = watch::channel(());
         let co_located_sessions: CoLocatedPassSessions = Arc::default();
+        let pass_probes: Arc<PassProbes> = Arc::default();
         let _detached = tokio::spawn(reconcile_pass(
             options.reconcile_interval,
             Arc::clone(&identities),
             Arc::clone(&co_located_sessions),
+            Arc::clone(&pass_probes),
+            stop.clone(),
+        ));
+        let _detached = tokio::spawn(cell_reconcile_pass(
+            options.cell_reconcile_interval,
+            router.endpoint().id(),
+            Arc::clone(&identities),
+            Arc::clone(&pass_probes),
             stop,
         ));
         Ok(Self {
@@ -533,9 +647,17 @@ impl SyncNode {
             cache_budget_bytes: options.replica_cache_budget_bytes,
             #[cfg(feature = "test-util")]
             co_located_sessions: Arc::clone(&co_located_sessions),
+            #[cfg(feature = "test-util")]
+            fail_next_cell_records_create: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            cell_verdicts: Arc::default(),
+            #[cfg(feature = "test-util")]
+            pass_probes,
+            collecting,
             storage: options.storage,
             retraction,
             retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
+            cell_notices: Arc::default(),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
             co_located_requests,
             directory_lock,
@@ -557,6 +679,8 @@ impl SyncNode {
         let registry = Arc::new(Registry::default());
         let access = Arc::new(AccessBook::new(identity));
         access.set_blobs(self.blobs.clone());
+        #[cfg(feature = "test-util")]
+        access.set_cell_verdicts(Arc::clone(&self.cell_verdicts));
         let observer_tracker = Arc::clone(&self.retraction);
         let docs = self
             .docs_builder(identity, &access, &registry)?
@@ -585,6 +709,8 @@ impl SyncNode {
             tracked_docs: Mutex::new(HashMap::new()),
             nudges_in_flight: Mutex::new(HashSet::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
+            converged_tombstones: Mutex::new(HashSet::new()),
+            notices: Arc::clone(&self.cell_notices),
         });
         let mut hosted = self
             .identities
@@ -962,16 +1088,7 @@ impl SyncNode {
         namespace: NamespaceId,
         contacts: Vec<Contact>,
     ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let mut docs = stack
-            .tracked_docs
-            .lock()
-            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
-        let entry = docs
-            .get_mut(&namespace)
-            .ok_or(UntrackedNamespace { namespace })?;
-        entry.contacts = contacts;
-        Ok(())
+        self.require(identity)?.set_contacts(namespace, contacts)
     }
 
     /// The observation side of
@@ -999,6 +1116,22 @@ impl SyncNode {
             return Ok(0);
         };
         Ok(stack.tracked_snapshot().len())
+    }
+
+    /// The replicas `identity`'s store holds, tracked or not — the only
+    /// anchor a scenario has for a replica no ticket ever named.
+    #[cfg(feature = "test-util")]
+    pub async fn held_replica_count(&self, identity: PdnId) -> Result<usize> {
+        let Some(stack) = self.stack(identity)? else {
+            return Ok(0);
+        };
+        let mut listed = stack.api.list().await?;
+        let mut held = 0;
+        while let Some(entry) = listed.next().await {
+            let _replica = entry?;
+            held += 1;
+        }
+        Ok(held)
     }
 
     /// Live records at `path` across authors — what every latest-wins read
@@ -1156,6 +1289,8 @@ impl SyncNode {
     fn guard_shared_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
         let role = if stack.registry.binding_of(namespace)?.is_some() {
             "a data replica of this identity"
+        } else if stack.registry.cell_of(namespace)?.is_some() {
+            "a store of a cell this identity holds"
         } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
             role
         } else {
@@ -1174,23 +1309,23 @@ impl SyncNode {
     /// registry's own refusal of a second issuer comes after that write
     /// and restores nothing.
     fn guard_data_import(stack: &HostedStack, issuer: PdnId, namespace: NamespaceId) -> Result<()> {
-        match stack.registry.binding_of(namespace)? {
-            Some((bound, _posture)) => {
-                if bound != issuer {
-                    return Err(anyhow::anyhow!(
-                        "namespace {namespace} is already bound to issuer {bound}; \
-                         one namespace binds one issuer"
-                    ));
-                }
+        if let Some((bound, _posture)) = stack.registry.binding_of(namespace)? {
+            if bound != issuer {
+                return Err(anyhow::anyhow!(
+                    "namespace {namespace} is already bound to issuer {bound}; \
+                     one namespace binds one issuer"
+                ));
             }
-            None => {
-                if stack.tracked(namespace)?.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "namespace {namespace} is a device-shared replica of this identity; \
-                         a data import must not repurpose it"
-                    ));
-                }
-            }
+        } else if let Some((cell, _store)) = stack.registry.cell_of(namespace)? {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a store of cell {cell}; \
+                 a data import must not repurpose it"
+            ));
+        } else if stack.tracked(namespace)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a device-shared replica of this identity; \
+                 a data import must not repurpose it"
+            ));
         }
         Ok(())
     }
@@ -1251,6 +1386,706 @@ impl SyncNode {
         Ok(stack.registry.data_doc(issuer)?.map(|doc| doc.id()))
     }
 
+    /// Create both stores of `cell` for `identity`, both or neither: they
+    /// join the registry and the reconcile pass together, once both exist,
+    /// and their sync starts once they are registered, so their first
+    /// sessions are ones the book can judge.
+    pub async fn create_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
+        let stack = self.require(identity)?;
+        if stack.registry.cell(cell)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "identity {identity} already holds cell {cell}"
+            ));
+        }
+        let membership = stack.api.create().await?;
+        let records = match self.create_cell_records(&stack).await {
+            Ok(records) => records,
+            Err(err) => {
+                // Fresh and never shared: dropping it loses nothing.
+                if let Err(drop_err) = stack.api.drop_doc(membership.id()).await {
+                    tracing::warn!(%cell, "a membership store whose cell failed to create stayed in the store: {drop_err:#}");
+                }
+                return Err(err);
+            }
+        };
+        let registered = stack.registry.register_cell(
+            cell,
+            CellBinding {
+                membership: membership.clone(),
+                records: Some(records.clone()),
+            },
+        );
+        if let Err(err) = registered {
+            for doc in [&membership, &records] {
+                if let Err(drop_err) = stack.api.drop_doc(doc.id()).await {
+                    tracing::warn!(%cell, "a store whose cell failed to register stayed in the store: {drop_err:#}");
+                }
+            }
+            return Err(err);
+        }
+        stack.track(
+            &membership,
+            Vec::new(),
+            SyncStrategy::Swarm,
+            stack.identity(),
+        )?;
+        stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
+        Self::order_cell_stores(&stack, &membership, &records).await?;
+        watch_cell_membership(&stack, self.router.endpoint().id(), cell, &membership);
+        membership.start_sync(Vec::new(), stack.identity()).await?;
+        records.start_sync(Vec::new(), stack.identity()).await
+    }
+
+    /// Every dial of the record store follows an exchange of the membership
+    /// store with the same counterpart, so the session that serves it folds
+    /// the membership that exchange brought.
+    async fn order_cell_stores(stack: &HostedStack, membership: &Doc, records: &Doc) -> Result<()> {
+        stack
+            .docs
+            .engine()
+            .order_after(records.id(), Some(membership.id()))
+            .await
+    }
+
+    async fn create_cell_records(&self, stack: &HostedStack) -> Result<Doc> {
+        #[cfg(feature = "test-util")]
+        if self
+            .fail_next_cell_records_create
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow::anyhow!("record store creation failed for test"));
+        }
+        stack.api.create().await
+    }
+
+    #[cfg(feature = "test-util")]
+    pub fn fail_next_cell_records_create_for_test(&self) {
+        self.fail_next_cell_records_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Import both stores of `cell` from their write tickets: nothing new for
+    /// a cell held on these stores, the cell again for its tombstone. Both
+    /// stores' sync starts once they are registered, as at `create_cell`. A failed import drops nothing — a replica may predate
+    /// it — and a retry lands on it.
+    pub async fn import_cell(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        tickets: CellTickets,
+    ) -> Result<CellCatchUp> {
+        let stack = self.require(identity)?;
+        let (membership_namespace, records_namespace) = (
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        );
+        if membership_namespace == records_namespace {
+            return Err(anyhow::anyhow!(
+                "namespace {membership_namespace} cannot be both stores of cell {cell}"
+            ));
+        }
+        if let Some(held) = stack.registry.cell(cell)? {
+            if held.membership.id() != membership_namespace {
+                return Err(anyhow::anyhow!(
+                    "cell {cell} is held on membership store {}, not {membership_namespace}",
+                    held.membership.id()
+                ));
+            }
+            return match held.records {
+                Some(records) if records.id() == records_namespace => {
+                    self.start_cell(&stack, cell, &held.membership, &records)
+                        .await
+                }
+                Some(records) => Err(anyhow::anyhow!(
+                    "cell {cell} is held on record store {}, not {records_namespace}",
+                    records.id()
+                )),
+                None => {
+                    self.import_records_onto_tombstone(
+                        &stack,
+                        cell,
+                        &held.membership,
+                        tickets.records,
+                    )
+                    .await
+                }
+            };
+        }
+        Self::guard_cell_import(&stack, membership_namespace)?;
+        Self::guard_cell_import(&stack, records_namespace)?;
+        let (membership_contacts, records_contacts) =
+            (tickets.membership.contacts(), tickets.records.contacts());
+        let (membership_minted_by, records_minted_by) =
+            (tickets.membership.identity, tickets.records.identity);
+        let membership = stack
+            .api
+            .import_namespace(tickets.membership.capability)
+            .await?;
+        let records = stack
+            .api
+            .import_namespace(tickets.records.capability)
+            .await?;
+        stack.registry.register_cell(
+            cell,
+            CellBinding {
+                membership: membership.clone(),
+                records: Some(records.clone()),
+            },
+        )?;
+        stack.track(
+            &membership,
+            membership_contacts,
+            SyncStrategy::Swarm,
+            membership_minted_by,
+        )?;
+        stack.track(
+            &records,
+            records_contacts,
+            SyncStrategy::Swarm,
+            records_minted_by,
+        )?;
+        watch_cell_membership(&stack, self.router.endpoint().id(), cell, &membership);
+        self.start_cell(&stack, cell, &membership, &records).await
+    }
+
+    /// A join after a departure: the record store imported again beside the
+    /// tombstone, which goes back into its swarm and kept its watch.
+    async fn import_records_onto_tombstone(
+        &self,
+        stack: &HostedStack,
+        cell: CellId,
+        membership: &Doc,
+        ticket: DocTicket,
+    ) -> Result<CellCatchUp> {
+        Self::guard_cell_import(stack, ticket.capability.id())?;
+        let (contacts, minted_by) = (ticket.contacts(), ticket.identity);
+        let records = stack.api.import_namespace(ticket.capability).await?;
+        stack
+            .registry
+            .set_cell_records(cell, Some(records.clone()))?;
+        stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
+        stack.set_strategy(membership.id(), SyncStrategy::Swarm)?;
+        self.start_cell(stack, cell, membership, &records).await
+    }
+
+    /// Start both tracked stores' sync, the record store's every dial
+    /// ordered after the membership store's, behind a wait for the first
+    /// session of each that this start brings.
+    async fn start_cell(
+        &self,
+        stack: &HostedStack,
+        cell: CellId,
+        membership: &Doc,
+        records: &Doc,
+    ) -> Result<CellCatchUp> {
+        let held = CellBinding {
+            membership: membership.clone(),
+            records: Some(records.clone()),
+        };
+        derive_before_start(stack, self.router.endpoint().id(), cell, &held).await?;
+        let caught_up = CellCatchUp {
+            membership: crate::private_metadata::watch_doc(membership).await?,
+            records: crate::private_metadata::watch_doc(records).await?,
+        };
+        Self::order_cell_stores(stack, membership, records).await?;
+        Self::start_tracked(stack, membership.id()).await?;
+        Self::start_tracked(stack, records.id()).await?;
+        Ok(caught_up)
+    }
+
+    /// Drop both of `cell`'s stores and its registration, as if the cell
+    /// had never been held here: the undo of a create or a join before
+    /// anything of the cell left this device. Nothing for a cell not held.
+    pub async fn discard_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
+        let stack = self.require(identity)?;
+        let Some(held) = stack.registry.unregister_cell(cell)? else {
+            return Ok(());
+        };
+        for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+            self.forget_doc(identity, doc.id()).await?;
+        }
+        Ok(())
+    }
+
+    /// Start a tracked store's sync with the contacts and the default
+    /// identity it is tracked with.
+    async fn start_tracked(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
+        let Some(tracked) = stack.tracked(namespace)? else {
+            return Ok(());
+        };
+        tracked
+            .doc
+            .start_sync(tracked.contacts, tracked.default_identity)
+            .await
+    }
+
+    /// Refuses a ticket naming a namespace this identity already holds in
+    /// any role: whatever bounded that replica's sessions before would stop
+    /// bounding them once a ticket's word made it a cell's store.
+    fn guard_cell_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
+        let role = if stack.registry.binding_of(namespace)?.is_some() {
+            "a data replica of this identity".to_owned()
+        } else if let Some((other, _store)) = stack.registry.cell_of(namespace)? {
+            format!("a store of cell {other}")
+        } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
+            role.to_owned()
+        } else if stack.tracked(namespace)?.is_some() {
+            "a store this identity's devices share".to_owned()
+        } else {
+            return Ok(());
+        };
+        Err(anyhow::anyhow!(
+            "namespace {namespace} is {role}; a cell import must not repurpose it"
+        ))
+    }
+
+    /// Open `cell`'s tombstone from its membership store's write ticket, as
+    /// a departure leaves it: no record store, and the membership store out
+    /// of its swarm, reconciled with the contacts its membership derives.
+    /// Nothing for a cell `identity` holds already, a tombstone included.
+    pub async fn open_cell_tombstone(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        membership: DocTicket,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        if stack.registry.cell(cell)?.is_some() {
+            return Ok(());
+        }
+        Self::guard_cell_import(&stack, membership.capability.id())?;
+        let (contacts, minted_by) = (membership.contacts(), membership.identity);
+        let doc = stack.api.import_namespace(membership.capability).await?;
+        stack.registry.register_cell(
+            cell,
+            CellBinding {
+                membership: doc.clone(),
+                records: None,
+            },
+        )?;
+        stack.track(&doc, contacts, SyncStrategy::ContactsOnly, minted_by)?;
+        let node = self.router.endpoint().id();
+        let held = CellBinding {
+            membership: doc.clone(),
+            records: None,
+        };
+        derive_before_start(&stack, node, cell, &held).await?;
+        watch_cell_membership(&stack, node, cell, &doc);
+        let contacts = stack
+            .tracked(doc.id())?
+            .map(|tracked| tracked.contacts)
+            .unwrap_or_default();
+        doc.start_sync_scoped(contacts, minted_by).await
+    }
+
+    /// The cells `identity` holds here, each with whether its record store
+    /// is held: `false` for a tombstone.
+    pub fn cell_holdings(&self, identity: PdnId) -> Result<Vec<(CellId, bool)>> {
+        let stack = self.require(identity)?;
+        Ok(stack
+            .registry
+            .cells()?
+            .into_iter()
+            .map(|(cell, held)| (cell, held.records.is_some()))
+            .collect())
+    }
+
+    /// At a departure: drop `cell`'s record store and keep its membership
+    /// store, out of its swarm, as the tombstone. Finishes what an earlier
+    /// forget left; [`UnknownCell`] for a cell `identity` never held.
+    pub async fn forget_cell(&self, identity: PdnId, cell: CellId) -> Result<()> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        if let Some(records) = held.records {
+            // Drop first, as `forget_namespace` does: a failed drop leaves
+            // the cell held, and a retry still finds it.
+            self.forget_doc(identity, records.id()).await?;
+            stack.registry.set_cell_records(cell, None)?;
+        }
+        // Before the leave, so the pass does not join the swarm again.
+        stack.set_strategy(held.membership.id(), SyncStrategy::ContactsOnly)?;
+        held.membership.leave_gossip().await
+    }
+
+    /// Reconcile the stores `identity` holds of `cell` — both, or the
+    /// tombstone alone — with at most [`CELL_RECONCILE_PEERS`] devices of its
+    /// other members, drawn afresh, the membership store's exchange first.
+    /// Returns once the dials are asked for; [`CellFlush::wait`] waits for
+    /// their sessions. [`UnknownCell`] for a cell `identity` never held.
+    pub async fn flush_cell(&self, identity: PdnId, cell: CellId) -> Result<CellFlush> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        let node = self.router.endpoint().id();
+        let derived = cell_contacts(&stack, node, cell, &held.membership, &[]).await?;
+        let own = stack.identity();
+        let others: Vec<Contact> = derived
+            .contacts
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|contact| contact.identity != own)
+            .collect();
+        let (drawn, _recorded) = draw(others, Vec::new());
+        let mut flush = CellFlush {
+            since: std::time::SystemTime::now(),
+            peers: drawn
+                .iter()
+                .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
+                .collect(),
+            sessions: Vec::new(),
+        };
+        if drawn.is_empty() {
+            return Ok(flush);
+        }
+        for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+            let Some(tracked) = stack.tracked(doc.id())? else {
+                continue;
+            };
+            // Subscribed before the dial, so no session ends unseen.
+            flush.sessions.push(Box::pin(doc.subscribe().await?));
+            tracked
+                .doc
+                .sync_with_peers(
+                    drawn.clone(),
+                    Vec::new(),
+                    tracked.default_identity,
+                    tracked.strategy == SyncStrategy::Swarm,
+                )
+                .await?;
+        }
+        Ok(flush)
+    }
+
+    /// The membership `identity`'s replica of `cell`'s membership store
+    /// folds into, payloads read as far as they have arrived.
+    /// [`UnknownCell`] for a tombstone too.
+    pub async fn cell_membership(&self, identity: PdnId, cell: CellId) -> Result<Membership> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        if held.records.is_none() {
+            return Err(UnknownCell { cell }.into());
+        }
+        stack.access.fold_cell(cell, &held.membership).await
+    }
+
+    /// Wait, at most `timeout`, until `identity`'s replica of `cell` folds
+    /// `identity` itself into a member: a session brings its own entries
+    /// ahead of their payloads. [`CatchUpTimeout`] when it does not.
+    pub async fn await_cell_member(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        timeout: Duration,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        // Subscribed before the first fold, so no change lands unseen.
+        let mut changes = held.membership.subscribe().await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let folded = stack.access.fold_cell(cell, &held.membership).await?;
+            if folded
+                .member(&identity)
+                .is_some_and(|member| member.state.member)
+            {
+                return Ok(());
+            }
+            match tokio::time::timeout_at(deadline, changes.next()).await {
+                Ok(Some(_change)) => {}
+                Ok(None) => anyhow::bail!("the membership store's change stream ended"),
+                Err(_elapsed) => return Err(crate::CatchUpTimeout.into()),
+            }
+            // A burst — a session's entries, their payloads — folds once.
+            while let Some(Some(_change)) = futures_lite::future::poll_once(changes.next()).await {}
+        }
+    }
+
+    /// The record view over `identity`'s replica of `cell`'s record store,
+    /// judged by the membership its membership store folds into; payloads
+    /// are checked for arrival, not read. [`UnknownCell`] for a tombstone
+    /// too.
+    pub async fn cell_record_view(&self, identity: PdnId, cell: CellId) -> Result<RecordView> {
+        self.record_view(identity, cell, Query::all()).await
+    }
+
+    /// [`cell_record_view`](Self::cell_record_view) over `record`'s own
+    /// entries alone.
+    pub async fn cell_record_view_of(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: &RecordRef,
+    ) -> Result<RecordView> {
+        self.record_view(identity, cell, Query::key_prefix(record_prefix(record)))
+            .await
+    }
+
+    /// A claim's or an immutable-document's payload: of the record's
+    /// entries that read, the newest; `None` when none does.
+    pub async fn read_cell_record(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: &RecordRef,
+    ) -> Result<Option<Vec<u8>>> {
+        let view = self.cell_record_view_of(identity, cell, record).await?;
+        let Some(hash) = view.placed(record).and_then(|entry| entry.payload) else {
+            return Ok(None);
+        };
+        Ok(Some(self.blobs.get_bytes(hash).await?.to_vec()))
+    }
+
+    /// A mergeable-document's operations that read, in the order of their
+    /// ids.
+    pub async fn read_cell_operations(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: &RecordRef,
+    ) -> Result<Vec<Operation>> {
+        let view = self.cell_record_view_of(identity, cell, record).await?;
+        let mut operations = Vec::new();
+        for (id, entry) in view.operations(record) {
+            if let Some(hash) = entry.payload {
+                let payload = self.blobs.get_bytes(hash).await?.to_vec();
+                operations.push(Operation { id, payload });
+            }
+        }
+        Ok(operations)
+    }
+
+    /// The entries of both of `cell`'s stores whose keys fit no layout of
+    /// their store, each with its author. [`UnknownCell`] for a tombstone
+    /// too.
+    pub async fn list_cell_unknown(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+    ) -> Result<Vec<UnknownEntry>> {
+        let stack = self.require(identity)?;
+        let mut unknown = Vec::new();
+        for store in [CellStore::Membership, CellStore::Records] {
+            let doc = Self::cell_doc(&stack, cell, store)?;
+            unknown.extend(unknown_entries(&doc, store).await?);
+        }
+        Ok(unknown)
+    }
+
+    async fn record_view(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        query: impl Into<Query>,
+    ) -> Result<RecordView> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        let records = held.records.ok_or(UnknownCell { cell })?;
+        let membership = stack.access.fold_cell(cell, &held.membership).await?;
+        let entries = record_entries(&records, &self.blobs, query).await?;
+        Ok(RecordView::new(&membership, entries))
+    }
+
+    /// Write `payload` at `key` into one of `cell`'s stores with
+    /// `identity`'s author, checking nothing the key or the payload says:
+    /// what the entry counts for is the fold's and the record view's.
+    /// [`UnknownCell`] for a tombstone too.
+    pub async fn write_cell_entry(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        doc.set_bytes(stack.author, key.to_vec(), payload.to_vec())
+            .await?;
+        Ok(())
+    }
+
+    /// [`write_cell_entry`](Self::write_cell_entry) under `author`, an
+    /// author `identity`'s replica store holds besides its own: an entry of
+    /// a device no statement lists.
+    #[cfg(feature = "test-util")]
+    pub async fn write_cell_entry_as_for_test(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+        author: AuthorId,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        doc.set_bytes(author, key.to_vec(), payload.to_vec())
+            .await?;
+        Ok(())
+    }
+
+    /// Taken before whatever starts the store's sessions, as
+    /// [`PrivateMetadataStore::watch_catch_up`] is.
+    pub async fn watch_cell_catch_up(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+    ) -> Result<crate::private_metadata::CatchUpWatch> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        crate::private_metadata::watch_doc(&doc).await
+    }
+
+    fn cell_doc(stack: &HostedStack, cell: CellId, store: CellStore) -> Result<Doc> {
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        let records = held.records.ok_or(UnknownCell { cell })?;
+        Ok(match store {
+            CellStore::Membership => held.membership,
+            CellStore::Records => records,
+        })
+    }
+
+    /// Once; a second take yields `None`. From the take on, every fold of a
+    /// cell's membership store on this node — at a session's setup, at a
+    /// read and at a run of the cell stores' pass — reports its verdicts.
+    #[cfg(feature = "test-util")]
+    pub fn take_cell_verdicts(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::cell::CellVerdicts>> {
+        let mut sender = self.cell_verdicts.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
+    }
+
+    /// Reconcile one of `cell`'s stores with `contact` as a drawn contact
+    /// is: through the engine, the record store after the membership
+    /// store. Returns once the dial is asked for, not once it ends, and
+    /// joins no swarm, so a store taken out of one stays out.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_cell_with_for_test(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+        contact: Contact,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        let tracked = stack
+            .tracked(doc.id())?
+            .context("the identity tracks no replica of that store")?;
+        doc.sync_with_peers(vec![contact], Vec::new(), tracked.default_identity, false)
+            .await
+    }
+
+    /// The exchanges of `cell`'s stores this node's identities have
+    /// running, held behind another's, or waiting to redial; `0` once none
+    /// of them can still dial on their own.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_syncs_in_flight_for_test(&self, cell: CellId) -> Result<usize> {
+        let stacks: Vec<Arc<HostedStack>> = self
+            .identities
+            .read()
+            .map_err(|_poisoned| anyhow::anyhow!("identities lock poisoned"))?
+            .values()
+            .cloned()
+            .collect();
+        let mut in_flight = 0_usize;
+        for stack in stacks {
+            let Some(held) = stack.registry.cell(cell)? else {
+                continue;
+            };
+            let namespaces = std::iter::once(held.membership.id())
+                .chain(held.records.as_ref().map(Doc::id))
+                .collect();
+            let running = stack.docs.engine().syncs_in_flight(namespaces).await?;
+            in_flight = in_flight.saturating_add(running);
+        }
+        Ok(in_flight)
+    }
+
+    /// Every session one of `cell`'s stores finishes from now on, dialed or
+    /// accepted, with what it exchanged. [`UnknownCell`] for a tombstone
+    /// too.
+    #[cfg(feature = "test-util")]
+    pub async fn watch_cell_sessions(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+    ) -> Result<CellSessions> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        Ok(CellSessions {
+            events: Box::pin(doc.subscribe().await?),
+        })
+    }
+
+    /// Once; a second take yields `None`. From the take on, every run of the
+    /// cell stores' pass reports whom it reached for each store.
+    #[cfg(feature = "test-util")]
+    pub fn take_cell_pass_draws(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<CellPassDraw>> {
+        let mut sender = self.pass_probes.draws.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
+    }
+
+    /// Whether the node's blob store holds the payload `hash` names.
+    #[cfg(feature = "test-util")]
+    pub async fn holds_payload(&self, hash: Hash) -> Result<bool> {
+        Ok(self.blobs.has(hash).await?)
+    }
+
+    /// Put `bytes` into the node's blob store referenced by no replica: the
+    /// payload the next collection run removes.
+    #[cfg(feature = "test-util")]
+    pub async fn add_stray_payload_for_test(&self, bytes: &[u8]) -> Result<Hash> {
+        let tag = self.blobs.add_bytes(bytes.to_vec()).temp_tag().await?;
+        Ok(tag.hash())
+    }
+
+    /// The runs of the pass over every tracked store but a cell's finished
+    /// since spawn.
+    #[cfg(feature = "test-util")]
+    pub fn reconcile_passes(&self) -> u64 {
+        self.pass_probes
+            .passes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Minting starts both stores' sync, as the store's share does for every
+    /// replica. [`UnknownCell`] for a tombstone too.
+    pub async fn share_cell_tickets(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        addr_options: AddrInfoOptions,
+    ) -> Result<CellTickets> {
+        let held = self
+            .require(identity)?
+            .registry
+            .cell(cell)?
+            .ok_or(UnknownCell { cell })?;
+        let records = held.records.ok_or(UnknownCell { cell })?;
+        Ok(CellTickets {
+            membership: held
+                .membership
+                .share(ShareMode::Write, addr_options)
+                .await?,
+            records: records.share(ShareMode::Write, addr_options).await?,
+        })
+    }
+
     /// Set exactly `devices` as the issuer's device set for retraction
     /// verdicts on `issuer`'s granted namespace.
     pub fn track_retraction_peers(
@@ -1267,6 +2102,20 @@ impl SyncNode {
         self.retraction
             .track_namespace(identity, doc.id(), devices.into_iter().collect());
         Ok(())
+    }
+
+    /// Once; a second take yields `None`. From the take on, every
+    /// derivation of a cell's contacts — at each change to its membership
+    /// store and each run of the cell stores' pass, ahead of its dials —
+    /// reports what it finds, until the record store is forgotten.
+    pub fn take_cell_notices(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<CellNotice>> {
+        let mut sender = self.cell_notices.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
     }
 
     /// Once; a second take yields `None`.
@@ -1434,6 +2283,12 @@ impl SyncNode {
                  it cannot be opened as a device-shared store"
             ));
         }
+        if let Some((cell, _store)) = stack.registry.cell_of(namespace)? {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is a store of cell {cell}; \
+                 it cannot be opened as a device-shared store"
+            ));
+        }
         if !holds_namespace(&stack.api, namespace).await? {
             return Ok(None);
         }
@@ -1486,7 +2341,8 @@ impl SyncNode {
 
     /// Untrack and drop a device-shared store's doc. Data namespaces go
     /// through [`forget_namespace`](Self::forget_namespace), which also
-    /// unregisters the issuer.
+    /// unregisters the issuer, and a cell's stores through
+    /// [`forget_cell`](Self::forget_cell).
     pub async fn forget_doc(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
         let Some(stack) = self.stack(identity)? else {
             return Ok(());
@@ -1697,6 +2553,15 @@ impl SyncNode {
             .keys()
             .copied()
             .collect())
+    }
+
+    /// Let blob collection run on a directory-configured node, once the
+    /// host has hosted again every identity it means to: a run before that
+    /// would remove the payloads of an identity recovery has yet to reach.
+    /// A memory node collects from its spawn.
+    pub fn start_blob_collection(&self) {
+        self.collecting
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Idempotent under a shared reference.
@@ -1938,6 +2803,7 @@ fn reconcile_with_co_located(
         return;
     };
     let from = Arc::clone(from);
+    let first = governing_store(&from, namespace);
     let targets: Vec<Arc<HostedStack>> = hosted
         .values()
         .filter(|stack| stack.identity() != source)
@@ -1958,6 +2824,15 @@ fn reconcile_with_co_located(
         }
         let from = Arc::clone(&from);
         let _detached = tokio::spawn(async move {
+            // The engine holds the record store's dial until this exchange
+            // of the membership store finishes.
+            if let Some(first) = first {
+                let _ = from
+                    .docs
+                    .engine()
+                    .sync_in_process(target.docs.engine(), first, identity)
+                    .await;
+            }
             let _ = from
                 .docs
                 .engine()
@@ -1968,6 +2843,83 @@ fn reconcile_with_co_located(
             }
         });
     }
+}
+
+/// The membership store of the cell whose record store `namespace` is,
+/// which its every reconciliation follows.
+fn governing_store(stack: &HostedStack, namespace: NamespaceId) -> Option<NamespaceId> {
+    let Ok(Some((cell, CellStore::Records))) = stack.registry.cell_of(namespace) else {
+        return None;
+    };
+    Some(stack.registry.cell(cell).ok()??.membership.id())
+}
+
+/// The node's one blob store, collected at the interval `options` sets
+/// once `collecting` is set.
+async fn open_blob_store(
+    options: &SpawnOptions,
+    identities: &Identities,
+    collecting: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<iroh_blobs::api::Store> {
+    let collection = GcConfig {
+        interval: options.blob_collection_interval,
+        add_protected: Some(protect_hosted(
+            Arc::downgrade(identities),
+            Arc::clone(collecting),
+        )),
+    };
+    Ok(match &options.storage {
+        StorageConfig::Memory => MemStore::new_with_opts(iroh_blobs::store::mem::Options {
+            gc_config: Some(collection),
+        })
+        .into(),
+        StorageConfig::Directory(directory) => {
+            let root = directory.join(BLOBS_DIR);
+            let mut store_options = iroh_blobs::store::fs::options::Options::new(&root);
+            store_options.gc = Some(collection);
+            FsStore::load_with_opts(root.join("blobs.db"), store_options)
+                .await
+                .with_context(|| format!("cannot open the blob store in {}", directory.display()))?
+                .into()
+        }
+    })
+}
+
+/// Blob collection's protect callback: every payload a replica of an
+/// identity the node hosts references, the node's one blob store being
+/// every identity's. Every run before `collecting` is set is skipped.
+fn protect_hosted(
+    identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
+    collecting: Arc<std::sync::atomic::AtomicBool>,
+) -> ProtectCb {
+    Arc::new(move |live: &mut HashSet<Hash>| {
+        let identities = identities.clone();
+        let collecting = Arc::clone(&collecting);
+        Box::pin(async move {
+            if !collecting.load(std::sync::atomic::Ordering::Acquire) {
+                return ProtectOutcome::Abort;
+            }
+            let Some(identities) = identities.upgrade() else {
+                return ProtectOutcome::Abort;
+            };
+            let stacks: Vec<Arc<HostedStack>> = match identities.read() {
+                Ok(hosted) => hosted.values().cloned().collect(),
+                Err(_poisoned) => return ProtectOutcome::Abort,
+            };
+            for stack in stacks {
+                let Ok(referenced) = referenced_payloads(&stack).await else {
+                    return ProtectOutcome::Abort;
+                };
+                live.extend(referenced);
+            }
+            ProtectOutcome::Continue
+        })
+    })
+}
+
+/// Every payload hash the replicas of one identity's store reference.
+async fn referenced_payloads(stack: &HostedStack) -> Result<Vec<Hash>> {
+    stack.docs.engine().sync.content_hashes().await?.collect()
 }
 
 /// One subdirectory per identity, each holding that identity's replica
@@ -2263,25 +3215,33 @@ pub(crate) async fn read_payload(
 }
 
 /// Every `interval`, re-request a sync for each hosted identity's tracked
-/// docs with their contacts (the engine unions in the peers it recorded),
-/// and reconcile each co-located pair unless its write counts
-/// ([`PairReading`]) stand where its last successful pass session found
-/// them. A failed request is retried by the next pass. Ends when `stop` is
-/// sent or its sender is dropped with the node.
+/// docs but a cell's stores, which [`cell_reconcile_pass`] runs, with their
+/// contacts (the engine unions in the peers it recorded), and reconcile
+/// each co-located pair unless its write counts ([`PairReading`]) stand
+/// where its last successful pass session found them. A failed request is
+/// retried by the next pass. Ends when `stop` is sent or its sender is
+/// dropped with the node.
 async fn reconcile_pass(
     interval: Duration,
     identities: Identities,
     co_located_sessions: CoLocatedPassSessions,
-    mut stop: oneshot::Receiver<()>,
+    probes: Arc<PassProbes>,
+    mut stop: watch::Receiver<()>,
 ) {
     let mut reconciled: HashMap<(PdnId, PdnId, NamespaceId), PairReading> = HashMap::new();
-    while tokio::time::timeout(interval, &mut stop).await.is_err() {
+    while tokio::time::timeout(interval, stop.changed())
+        .await
+        .is_err()
+    {
         let stacks: Vec<Arc<HostedStack>> = match identities.read() {
             Ok(guard) => guard.values().cloned().collect(),
             Err(_poisoned) => continue,
         };
         for stack in &stacks {
             for tracked in stack.tracked_snapshot() {
+                if matches!(stack.registry.cell_of(tracked.doc.id()), Ok(Some(_))) {
+                    continue;
+                }
                 let _ = match tracked.strategy {
                     SyncStrategy::ContactsOnly => {
                         tracked
@@ -2299,6 +3259,531 @@ async fn reconcile_pass(
             }
         }
         reconcile_co_located(&stacks, &co_located_sessions, &mut reconciled).await;
+        probes
+            .passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Every `interval`, reconcile each store of every cell a hosted identity
+/// holds with at most [`CELL_RECONCILE_PEERS`] peers, drawn afresh from its
+/// contacts — derived first from the cell's membership — and the peers the
+/// engine recorded. A failed run is retried by the next. Ends as
+/// [`reconcile_pass`] does.
+async fn cell_reconcile_pass(
+    interval: Duration,
+    node: EndpointId,
+    identities: Identities,
+    probes: Arc<PassProbes>,
+    mut stop: watch::Receiver<()>,
+) {
+    while tokio::time::timeout(interval, stop.changed())
+        .await
+        .is_err()
+    {
+        let stacks: Vec<Arc<HostedStack>> = match identities.read() {
+            Ok(guard) => guard.values().cloned().collect(),
+            Err(_poisoned) => continue,
+        };
+        for stack in &stacks {
+            let Ok(cells) = stack.registry.cells() else {
+                continue;
+            };
+            for (cell, held) in cells {
+                reconcile_cell(stack, node, cell, &held, &probes).await;
+            }
+        }
+    }
+}
+
+async fn reconcile_cell(
+    stack: &HostedStack,
+    node: EndpointId,
+    cell: CellId,
+    held: &CellBinding,
+    probes: &PassProbes,
+) {
+    derive_cell_contacts(stack, node, cell, held, &[]).await;
+    let stores = std::iter::once((CellStore::Membership, &held.membership)).chain(
+        held.records
+            .as_ref()
+            .map(|records| (CellStore::Records, records)),
+    );
+    for (store, doc) in stores {
+        let namespace = doc.id();
+        let Ok(Some(tracked)) = stack.tracked(namespace) else {
+            continue;
+        };
+        let recorded = stack
+            .docs
+            .engine()
+            .sync
+            .get_sync_peers(namespace)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let (contacts, recorded) = draw(tracked.contacts.clone(), recorded);
+        probes.report(|| CellPassDraw {
+            identity: stack.identity,
+            cell,
+            store,
+            contacts: tracked.contacts.clone(),
+            drawn: contacts.clone(),
+            recorded: recorded
+                .iter()
+                .map(|peer| NodeId::from_bytes(*peer))
+                .collect(),
+        });
+        let _ = tracked
+            .doc
+            .sync_with_peers(
+                contacts,
+                recorded,
+                tracked.default_identity,
+                tracked.strategy == SyncStrategy::Swarm,
+            )
+            .await;
+    }
+}
+
+/// Derive both of a cell's stores' contacts from its membership and set
+/// them whole: as the stores are tracked, and as the engine dials each
+/// peer, since a peer a gossip message or a recorded session names is
+/// dialed as what contacts stated for it.
+async fn derive_cell_contacts(
+    stack: &HostedStack,
+    node: EndpointId,
+    cell: CellId,
+    held: &CellBinding,
+    met: &[NodeId],
+) {
+    let Ok(derived) = cell_contacts(stack, node, cell, &held.membership, met).await else {
+        return;
+    };
+    if held.records.is_some() {
+        let identity = stack.identity;
+        if let Some(seq) = derived.departed {
+            stack.report(CellNotice::Departed {
+                identity,
+                cell,
+                seq,
+            });
+        }
+        if derived.unlisted {
+            stack.report(CellNotice::Unlisted { identity, cell });
+        }
+    }
+    let Some(contacts) = derived.contacts else {
+        return;
+    };
+    for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+        let _ = stack.set_contacts(doc.id(), contacts.clone());
+        let _ = stack
+            .docs
+            .engine()
+            .state_contacts(doc.id(), contacts.clone())
+            .await;
+    }
+}
+
+/// Derive `held`'s contacts before its sync starts, so a reopened replica
+/// dials each member's devices as that member — a ticket names every node
+/// as the identity that minted it — and keep beside them each ticket
+/// contact whose node they leave out: a replica that folds nobody yet, or a
+/// tombstone past its convergence, has no other.
+async fn derive_before_start(
+    stack: &HostedStack,
+    node: EndpointId,
+    cell: CellId,
+    held: &CellBinding,
+) -> Result<()> {
+    let docs: Vec<&Doc> = std::iter::once(&held.membership)
+        .chain(held.records.as_ref())
+        .collect();
+    let mut ticketed = Vec::new();
+    for doc in &docs {
+        ticketed.push(
+            stack
+                .tracked(doc.id())?
+                .map(|tracked| tracked.contacts)
+                .unwrap_or_default(),
+        );
+    }
+    derive_cell_contacts(stack, node, cell, held, &[]).await;
+    for (doc, ticketed) in docs.into_iter().zip(ticketed) {
+        let Some(tracked) = stack.tracked(doc.id())? else {
+            continue;
+        };
+        let mut contacts = tracked.contacts;
+        for contact in ticketed {
+            if !contacts.iter().any(|kept| kept.addr.id == contact.addr.id) {
+                contacts.push(contact);
+            }
+        }
+        stack.set_contacts(doc.id(), contacts.clone())?;
+        stack
+            .docs
+            .engine()
+            .state_contacts(doc.id(), contacts)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Derive `cell`'s contacts again whenever its membership store changes —
+/// an entry or a payload arriving, a local write — so a newcomer is dialed
+/// as the member it is from its first announcement on. Ends with the
+/// store's subscription or the identity's half of the node.
+fn watch_cell_membership(
+    stack: &Arc<HostedStack>,
+    node: EndpointId,
+    cell: CellId,
+    membership: &Doc,
+) {
+    let stack = Arc::downgrade(stack);
+    let membership = membership.clone();
+    let _detached = tokio::spawn(async move {
+        let Ok(events) = membership.subscribe().await else {
+            return;
+        };
+        // A burst can end with the stream, which panics when polled again.
+        let mut events = events.fuse();
+        while let Some(event) = events.next().await {
+            // A burst — a session's entries, their payloads — derives once,
+            // and a store that never goes quiet still derives.
+            let mut met = Vec::new();
+            note_session(event, &mut met);
+            let settled = tokio::time::Instant::now() + CELL_CHANGE_SETTLE;
+            while let Ok(Some(event)) = tokio::time::timeout_at(settled, events.next()).await {
+                note_session(event, &mut met);
+            }
+            let Some(stack) = stack.upgrade() else {
+                return;
+            };
+            let Ok(Some(held)) = stack.registry.cell(cell) else {
+                continue;
+            };
+            derive_cell_contacts(&stack, node, cell, &held, &met).await;
+        }
+    });
+}
+
+/// The peer of a session that went through.
+fn note_session(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>) {
+    if let Ok(pdn_store::engine::LiveEvent::SyncFinished(sync)) = event {
+        if sync.result.is_ok() {
+            met.push(NodeId::from_bytes(*sync.peer.as_bytes()));
+        }
+    }
+}
+
+/// A cell store's contacts: every device the statements of the cell's
+/// current members list, each dialed as its member, and the identity's own
+/// devices by its directory, dialed as the identity; never this device as
+/// this identity. `None` while the membership store folds into nobody: a
+/// replica that holds nothing yet keeps the contacts its ticket gave it.
+/// A tombstone drops the members' devices once a session with one of them
+/// — any device of another than itself among `met` — went through.
+async fn cell_contacts(
+    stack: &HostedStack,
+    node: EndpointId,
+    cell: CellId,
+    membership: &Doc,
+    met: &[NodeId],
+) -> Result<DerivedContacts> {
+    let (folded, entries) = stack.access.fold_cell_entries(cell, membership).await?;
+    if folded.identities().next().is_none() {
+        return Ok(DerivedContacts {
+            contacts: None,
+            departed: None,
+            unlisted: false,
+        });
+    }
+    let departed =
+        departure_past(&folded, &entries, &stack.identity).map(|past| Seq::new(past.seq));
+    let own = stack.identity();
+    let own_devices = stack.access.own_devices().await?;
+    let this_device = NodeId::from_bytes(*node.as_bytes());
+    let device = MemberDevice {
+        node: this_device,
+        author: stack.author,
+    };
+    let unlisted = folded
+        .member(&stack.identity)
+        .is_some_and(|member| member.state.member && !member.devices.contains(&device));
+    let converged = {
+        let mut converged = stack
+            .converged_tombstones
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("tombstone lock poisoned"))?;
+        if departed.is_some() {
+            if met
+                .iter()
+                .any(|peer| *peer != this_device && !own_devices.contains(peer))
+            {
+                converged.insert(cell);
+            }
+        } else {
+            converged.remove(&cell);
+        }
+        converged.contains(&cell)
+    };
+    let mut devices: Vec<(NodeId, Identity)> = folded
+        .identities()
+        .filter(|(_id, member)| member.state.member && !converged)
+        .flat_map(|(id, member)| {
+            let identity = crate::access::identity_of(*id);
+            member
+                .devices
+                .iter()
+                .map(move |device| (device.node, identity))
+        })
+        .collect();
+    devices.extend(own_devices.into_iter().map(|device| (device, own)));
+    let known = known_addresses(stack, membership)?;
+    let mut seen = HashSet::new();
+    let mut contacts = Vec::new();
+    for (device, identity) in devices {
+        let Ok(id) = EndpointId::from_bytes(device.as_bytes()) else {
+            continue;
+        };
+        if (id == node && identity == own) || !seen.insert((id, identity)) {
+            continue;
+        }
+        let addr = known
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(id));
+        contacts.push(Contact::new(addr, identity));
+    }
+    Ok(DerivedContacts {
+        contacts: Some(contacts),
+        departed,
+        unlisted,
+    })
+}
+
+/// The addresses a store's contacts carry, a ticket's among them: without
+/// address lookup a node id alone is undialable to a device that never met
+/// it, a restarted one included.
+fn known_addresses(stack: &HostedStack, store: &Doc) -> Result<HashMap<EndpointId, EndpointAddr>> {
+    Ok(stack
+        .tracked(store.id())?
+        .map(|tracked| {
+            tracked
+                .contacts
+                .into_iter()
+                .map(|contact| (contact.addr.id, contact.addr))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// What [`cell_contacts`] derives from one fold.
+struct DerivedContacts {
+    /// `None` while the membership store folds into nobody.
+    contacts: Option<Vec<Contact>>,
+    /// The sequence of the identity's own departure.
+    departed: Option<Seq>,
+    /// The identity is a member, and no statement of its own lists this
+    /// device with the author it writes with here.
+    unlisted: bool,
+}
+
+/// At most [`CELL_RECONCILE_PEERS`] of a store's contacts and recorded
+/// peers, drawn afresh; a recorded peer a contact names counts once, as the
+/// contact, which names the identity it is dialed as.
+fn draw(contacts: Vec<Contact>, recorded: Vec<PeerIdBytes>) -> (Vec<Contact>, Vec<PeerIdBytes>) {
+    enum Peer {
+        Contact(Contact),
+        Recorded(PeerIdBytes),
+    }
+    let mut peers: Vec<Peer> = recorded
+        .into_iter()
+        .filter(|peer| {
+            !contacts
+                .iter()
+                .any(|contact| contact.addr.id.as_bytes() == peer)
+        })
+        .map(Peer::Recorded)
+        .collect();
+    peers.extend(contacts.into_iter().map(Peer::Contact));
+    peers.shuffle(&mut rand::rng());
+    let (mut contacts, mut recorded) = (Vec::new(), Vec::new());
+    for peer in peers.into_iter().take(CELL_RECONCILE_PEERS) {
+        match peer {
+            Peer::Contact(contact) => contacts.push(contact),
+            Peer::Recorded(peer) => recorded.push(peer),
+        }
+    }
+    (contacts, recorded)
+}
+
+/// The sessions a [`SyncNode::flush_cell`] dialed, as each store finishes
+/// them.
+pub struct CellFlush {
+    /// A session started before it may have missed the latest writes. A
+    /// clock stepping back past it leaves the wait to its bound.
+    since: std::time::SystemTime,
+    peers: HashSet<NodeId>,
+    sessions: Vec<
+        std::pin::Pin<
+            Box<dyn futures_core::Stream<Item = Result<pdn_store::engine::LiveEvent>> + Send>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for CellFlush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellFlush")
+            .field("peers", &self.peers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CellFlush {
+    /// Whether a session with one of the dialed devices went through on
+    /// each store within `timeout`; `false` at once when none was dialed.
+    pub async fn wait(self, timeout: Duration) -> bool {
+        if self.peers.is_empty() {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        for mut events in self.sessions {
+            loop {
+                match tokio::time::timeout_at(deadline, events.next()).await {
+                    Ok(Some(Ok(pdn_store::engine::LiveEvent::SyncFinished(sync))))
+                        if sync.result.is_ok()
+                            && sync.started >= self.since
+                            && self
+                                .peers
+                                .contains(&NodeId::from_bytes(*sync.peer.as_bytes())) =>
+                    {
+                        break;
+                    }
+                    Ok(Some(_other)) => {}
+                    Ok(None) | Err(_) => return false,
+                }
+            }
+        }
+        true
+    }
+}
+
+/// The sessions one replica of a cell's store finishes, from
+/// [`SyncNode::watch_cell_sessions`]. Unread past its buffer it drops
+/// events.
+#[cfg(feature = "test-util")]
+pub struct CellSessions {
+    events: std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<pdn_store::engine::LiveEvent>> + Send>,
+    >,
+}
+
+#[cfg(feature = "test-util")]
+impl std::fmt::Debug for CellSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellSessions").finish_non_exhaustive()
+    }
+}
+
+/// One session a cell store's replica finished.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone)]
+pub struct CellSession {
+    pub peer: NodeId,
+    pub dialed: bool,
+    /// The session's entries received and sent, or why it failed or was
+    /// refused.
+    pub exchanged: std::result::Result<(usize, usize), String>,
+}
+
+#[cfg(feature = "test-util")]
+impl CellSessions {
+    /// The next session with `peer` that went through, whichever side
+    /// dialed, or `None` once `timeout` passes first.
+    pub async fn next_served_with(
+        &mut self,
+        peer: NodeId,
+        timeout: Duration,
+    ) -> Result<Option<CellSession>> {
+        self.next_matching(timeout, |session| {
+            session.peer == peer && session.exchanged.is_ok()
+        })
+        .await
+    }
+
+    /// The next session finished with `peer` that this replica `dialed`,
+    /// or accepted, or `None` once `timeout` passes first.
+    pub async fn next_with(
+        &mut self,
+        peer: NodeId,
+        dialed: bool,
+        timeout: Duration,
+    ) -> Result<Option<CellSession>> {
+        self.next_matching(timeout, |session| {
+            session.peer == peer && session.dialed == dialed
+        })
+        .await
+    }
+
+    async fn next_matching(
+        &mut self,
+        timeout: Duration,
+        wanted: impl Fn(&CellSession) -> bool,
+    ) -> Result<Option<CellSession>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let Ok(event) = tokio::time::timeout_at(deadline, self.events.next()).await else {
+                return Ok(None);
+            };
+            let event = event.context("the replica's event stream ended")??;
+            let pdn_store::engine::LiveEvent::SyncFinished(sync) = event else {
+                continue;
+            };
+            let session = CellSession {
+                peer: NodeId::from_bytes(*sync.peer.as_bytes()),
+                dialed: matches!(sync.origin, pdn_store::engine::Origin::Connect(_)),
+                exchanged: sync
+                    .result
+                    .map(|details| (details.entries_received, details.entries_sent)),
+            };
+            if wanted(&session) {
+                return Ok(Some(session));
+            }
+        }
+    }
+}
+
+/// Whom one run of the cell stores' pass reached for one store.
+#[derive(Debug, Clone)]
+pub struct CellPassDraw {
+    pub identity: PdnId,
+    pub cell: CellId,
+    pub store: CellStore,
+    /// The contacts the store was tracked with when the run drew.
+    pub contacts: Vec<Contact>,
+    pub drawn: Vec<Contact>,
+    pub recorded: Vec<NodeId>,
+}
+
+/// What the passes report: how many runs of [`reconcile_pass`] finished,
+/// and, once a scenario takes the channel, every draw of
+/// [`cell_reconcile_pass`].
+#[derive(Debug, Default)]
+struct PassProbes {
+    passes: std::sync::atomic::AtomicU64,
+    draws: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CellPassDraw>>>,
+}
+
+impl PassProbes {
+    fn report(&self, draw: impl FnOnce() -> CellPassDraw) {
+        if let Ok(sender) = self.draws.lock() {
+            if let Some(sender) = sender.as_ref() {
+                let _ = sender.send(draw());
+            }
+        }
     }
 }
 
@@ -2321,6 +3806,10 @@ struct PairReading {
     target_writes: u64,
     source_rights: u64,
     target_rights: u64,
+    /// A cell's record store beside its membership store, the two read as
+    /// one pair.
+    source_records: u64,
+    target_records: u64,
 }
 
 /// The writes taken by the connection stores this identity holds toward
@@ -2373,12 +3862,29 @@ async fn pair_reading(
     } else {
         (0, 0)
     };
+    let (source_records, target_records) = match cell_records(first, namespace) {
+        Some(records) => (
+            first.docs.engine().sync.writes(records).await.ok()?,
+            second.docs.engine().sync.writes(records).await.ok()?,
+        ),
+        None => (0, 0),
+    };
     Some(PairReading {
         source_writes: first.docs.engine().sync.writes(namespace).await.ok()?,
         target_writes: second.docs.engine().sync.writes(namespace).await.ok()?,
         source_rights,
         target_rights,
+        source_records,
+        target_records,
     })
+}
+
+/// The record store of the cell whose membership store `namespace` is.
+fn cell_records(stack: &HostedStack, namespace: NamespaceId) -> Option<NamespaceId> {
+    let Ok(Some((cell, CellStore::Membership))) = stack.registry.cell_of(namespace) else {
+        return None;
+    };
+    Some(stack.registry.cell(cell).ok()??.records?.id())
 }
 
 /// Reconcile each pair of hosted identities holding one namespace, and
@@ -2397,6 +3903,10 @@ async fn reconcile_co_located(
                 if target.tracked(namespace).ok().flatten().is_none() {
                     continue;
                 }
+                // Reconciled after its membership store, the two one pair.
+                if governing_store(source, namespace).is_some() {
+                    continue;
+                }
                 let (first, second) = ordered(source, target);
                 let pair = (first.identity, second.identity, namespace);
                 let Some(reading) = pair_reading(source, target, namespace).await else {
@@ -2405,14 +3915,25 @@ async fn reconcile_co_located(
                 if reconciled.get(&pair) == Some(&reading) {
                     continue;
                 }
+                let records = cell_records(source, namespace)
+                    .filter(|records| matches!(target.tracked(*records), Ok(Some(_))));
                 if let Ok(mut opened) = opened.lock() {
-                    *opened.entry(namespace).or_default() += 1;
+                    for reconciled in std::iter::once(namespace).chain(records) {
+                        *opened.entry(reconciled).or_default() += 1;
+                    }
                 }
-                let reconciliation = source
+                let mut reconciliation = source
                     .docs
                     .engine()
                     .sync_in_process(target.docs.engine(), namespace, target.identity())
                     .await;
+                if let (Ok(()), Some(records)) = (&reconciliation, records) {
+                    reconciliation = source
+                        .docs
+                        .engine()
+                        .sync_in_process(target.docs.engine(), records, target.identity())
+                        .await;
+                }
                 // The reading taken before the session is what is kept, and
                 // only if the session went through. Reading again after it
                 // would race the ingest — the receiving side applies what
@@ -2452,6 +3973,37 @@ fn starts_with_components(path: &EntryPath, prefix: &EntryPath) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each draw reaches at most five of a store's contacts and recorded
+    /// peers, a recorded peer a contact names counting once, as the
+    /// contact, and draws differ from run to run until every peer has been
+    /// reached.
+    #[test]
+    fn a_draw_reaches_at_most_five_peers_afresh_each_run() {
+        let key = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public();
+        let contacts: Vec<Contact> = (1..=6)
+            .map(|seed| {
+                Contact::new(
+                    EndpointAddr::new(key(seed)),
+                    Identity::from_bytes([seed; 32]),
+                )
+            })
+            .collect();
+        let named = *key(1).as_bytes();
+        let recorded = vec![named, *key(7).as_bytes(), *key(8).as_bytes()];
+        let mut reached = HashSet::new();
+        for _run in 0..200 {
+            let (drawn, drawn_recorded) = draw(contacts.clone(), recorded.clone());
+            assert_eq!(drawn.len() + drawn_recorded.len(), CELL_RECONCILE_PEERS);
+            assert!(
+                !drawn_recorded.contains(&named),
+                "a recorded peer a contact names was drawn as recorded"
+            );
+            reached.extend(drawn.iter().map(|contact| *contact.addr.id.as_bytes()));
+            reached.extend(drawn_recorded);
+        }
+        assert_eq!(reached.len(), 8, "a peer went undrawn for 200 runs");
+    }
 
     /// Tested directly: the directory's advisory lock refuses a second node
     /// before any store opens, so no scenario reaches this backstop, and a

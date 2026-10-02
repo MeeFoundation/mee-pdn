@@ -1623,6 +1623,123 @@ async fn next_event_matching(
         .expect("timeout waiting for matching event")
 }
 
+/// A dial of a namespace ordered after another starts only once an
+/// exchange of the other with the same peer has finished, and a dial the
+/// order makes of the other runs though nothing asked for it.
+#[tokio::test]
+#[traced_test]
+async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result<()> {
+    let mut rng = test_rng(b"a_dial_ordered_after_another_namespace_follows_its_exchange");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let id1 = nodes[1].id();
+    let (first0, then0) = (
+        nodes[0].docs().create().await?,
+        nodes[0].docs().create().await?,
+    );
+    let mut first_events = first0.subscribe().await?;
+    let mut then_events = then0.subscribe().await?;
+    let mut contacts = Vec::new();
+    let mut imported = Vec::new();
+    for doc in [&first0, &then0] {
+        doc.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+        let ticket = doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        contacts = ticket.contacts();
+        imported.push(nodes[1].docs().import_namespace(ticket.capability).await?);
+    }
+    let (first1, then1) = (&imported[0], &imported[1]);
+    nodes[1]
+        .engine()
+        .order_after(then1.id(), Some(first1.id()))
+        .await?;
+    // In the sync set, with no peer of its own to dial.
+    first1.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    then1.start_sync_scoped(contacts, util::TEST_HOLDER).await?;
+
+    let first = next_event_matching(&mut first_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id1)
+    })
+    .await;
+    let then = next_event_matching(&mut then_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id1)
+    })
+    .await;
+    let (LiveEvent::SyncFinished(first), LiveEvent::SyncFinished(then)) = (first, then) else {
+        unreachable!("matched as finished syncs");
+    };
+    assert!(
+        then.started >= first.finished,
+        "the ordered dial started before the exchange it follows finished"
+    );
+    Ok(())
+}
+
+/// A sync handed its peers dials those alone, none of the other peers the
+/// replica recorded; the recorded peer left out is dialed once it is handed.
+///
+/// Every replica stays outside the swarm and nothing is written, so a
+/// session reaches the peer left out only through a dial of that sync. The
+/// peer left out sees its own first session end before the window opens:
+/// its end of that session can come after node 0's.
+#[tokio::test]
+#[traced_test]
+async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
+    let mut rng = test_rng(b"a_sync_with_handed_peers_dials_no_other_recorded_peer");
+    let nodes = spawn_nodes(3, &mut rng).await?;
+    let (id0, id1, id2) = (nodes[0].id(), nodes[1].id(), nodes[2].id());
+    let doc0 = nodes[0].docs().create().await?;
+    doc0.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let mut events0 = doc0.subscribe().await?;
+    let mut events = Vec::new();
+    for node in &nodes[1..] {
+        let doc = node
+            .docs()
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        events.push(doc.subscribe().await?);
+        doc.start_sync_scoped(ticket.contacts(), util::TEST_HOLDER)
+            .await?;
+    }
+    // Both first sessions finished, so node 0 recorded both peers.
+    assert_events_matching(
+        &mut events0,
+        TIMEOUT,
+        vec![
+            Box::new(move |e| match_sync_finished(e, id1)),
+            Box::new(move |e| match_sync_finished(e, id2)),
+        ],
+    )
+    .await;
+    let mut events2 = events.pop().context("node 2 subscribed")?;
+    next_event_matching(&mut events2, TIMEOUT, move |e| match_sync_finished(e, id0)).await;
+
+    doc0.sync_with_peers(vec![], vec![*id1.as_bytes()], util::TEST_HOLDER, false)
+        .await?;
+    next_event_matching(&mut events0, TIMEOUT, move |e| match_sync_finished(e, id1)).await;
+    let reached_two = n0_future::time::timeout(
+        Duration::from_secs(1),
+        next_event_matching(
+            &mut events2,
+            TIMEOUT,
+            move |e| matches!(e, LiveEvent::SyncFinished(sync) if sync.peer == id0),
+        ),
+    )
+    .await;
+    assert!(
+        reached_two.is_err(),
+        "a recorded peer not handed was dialed"
+    );
+
+    doc0.sync_with_peers(vec![], vec![*id2.as_bytes()], util::TEST_HOLDER, false)
+        .await?;
+    next_event_matching(&mut events2, TIMEOUT, move |e| match_sync_finished(e, id0)).await;
+    Ok(())
+}
+
 /// A record can arrive from a peer that does not have the record's content:
 /// the sender is a relay that received the record but never fetched the
 /// bytes. The receiver then has no provider to download from, and the

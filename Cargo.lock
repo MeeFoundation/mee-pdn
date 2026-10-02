@@ -1023,6 +1023,7 @@ dependencies = [
  "iroh-gossip",
  "pdn-store",
  "pdn-types",
+ "rand 0.10.2",
  "redb 4.2.0",
  "serde",
  "serde_json",

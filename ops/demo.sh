@@ -93,6 +93,8 @@ reads() { # url reader issuer path expected label
     case "$code" in
       200) if [ "$body" = "$5" ]; then shown "$6 sees " "$5"; return 0; fi ;;
       404) ;;
+      # Unbound until the grant record reaches the reader and its binder runs.
+      409) ;;
       000) echo "  $6's read: no answer" >&2; exit 1 ;;
       *) echo "  $6's read answered $code: $body" >&2; exit 1 ;;
     esac

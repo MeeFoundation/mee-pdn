@@ -7,11 +7,11 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, DirectoryHeld, PrivateMetadataStore, RecordedHosting, ShareMode, SpawnOptions,
-    SyncNode,
+    AddrInfoOptions, AuthorId, CellStore, DirectoryHeld, OpId, PrivateMetadataStore, RecordKey,
+    RecordedHosting, Seq, ShareMode, SpawnOptions, SyncNode,
 };
-use pdn_types::EntryPath;
-use test_utils::{host_identity, ids};
+use pdn_types::{CellId, EntryPath, PdnId, RecordId, RecordKind, RecordRef};
+use test_utils::{cell as c, host_identity, ids};
 
 /// Spawn a node on `dir` — the directory-configured counterpart of the
 /// suites' `memory_node`.
@@ -503,6 +503,117 @@ async fn a_start_finds_the_identities_whose_hosting_was_recorded() -> Result<()>
             store_present: true,
         }],
         "a start must find the recorded identity and nothing else"
+    );
+    second.shutdown().await?;
+    Ok(())
+}
+
+/// A cell's stores import from their tickets onto the replicas a respawned
+/// node's store already holds, the import restart recovery performs, and the
+/// cell is held again on the same stores.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_imports_onto_its_replicas_after_a_respawn() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let family = CellId::from_bytes([
+        0x9c, 0xbc, 0xbe, 0x4d, 0xa7, 0xcc, 0x35, 0xa4, 0x43, 0x60, 0xd6, 0x4e, 0x45, 0x62, 0x19,
+        0x57,
+    ]);
+
+    let first = node_on(dir.path()).await?;
+    let _directory = host_identity(&first, ids::ALICE).await?;
+    first.create_cell(ids::ALICE, family).await?;
+    let tickets = first
+        .share_cell_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
+        .await?;
+    let stores = [
+        tickets.membership.capability.id(),
+        tickets.records.capability.id(),
+    ];
+    first.shutdown().await?;
+    drop(first);
+
+    let second = node_on(dir.path()).await?;
+    second.provision_identity(ids::ALICE).await?;
+    for namespace in stores {
+        assert!(
+            second.holds_replica(ids::ALICE, namespace).await?,
+            "a cell's replica did not survive the respawn"
+        );
+    }
+    second.import_cell(ids::ALICE, family, tickets).await?;
+    let held = second
+        .share_cell_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
+        .await?;
+    assert_eq!(
+        [
+            held.membership.capability.id(),
+            held.records.capability.id()
+        ],
+        stores,
+        "the respawned node holds the cell on other stores"
+    );
+    second.shutdown().await?;
+    Ok(())
+}
+
+/// An operation on `note` by `writer` at its sequence 1, numbered as the
+/// cells service numbers it: one above the highest its author holds there.
+async fn append(on: &SyncNode, writer: PdnId, cell: CellId, note: &RecordRef) -> Result<()> {
+    let author = on.default_author(writer)?;
+    let view = on.cell_record_view_of(writer, cell, note).await?;
+    let op_seq = view
+        .next_op_seq(note, author)
+        .ok_or_else(|| anyhow::anyhow!("exhausted"))?;
+    let key = RecordKey::Operation {
+        member: note.member,
+        id: note.id,
+        op: OpId {
+            writer,
+            author,
+            mseq: Seq::FIRST,
+            op_seq,
+        },
+    };
+    on.write_cell_entry(writer, cell, CellStore::Records, &key.to_bytes(), b"op")
+        .await
+}
+
+/// A device's operation sequence on a mergeable-document continues after a
+/// respawn: its fourth operation takes sequence 4 under the same author.
+/// The cell is imported from its tickets onto the replicas the store holds,
+/// as restart recovery imports it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operation_sequence_continues_after_a_respawn() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let (bob, _directory) = c::host(&first).await?;
+    let cell = c::found(&first, &bob).await?;
+    let note = RecordRef {
+        member: bob.id,
+        kind: RecordKind::MergeableDocument,
+        id: RecordId::from_bytes([0x11; 16]),
+    };
+    for _ in 0..3 {
+        append(&first, bob.id, cell, &note).await?;
+    }
+    let author = first.default_author(bob.id)?;
+    let tickets = c::tickets(&first, &bob, cell).await?;
+    first.shutdown().await?;
+    drop(first);
+
+    let second = node_on(dir.path()).await?;
+    second.provision_identity(bob.id).await?;
+    second.import_cell(bob.id, cell, tickets).await?;
+    append(&second, bob.id, cell, &note).await?;
+    let numbered: Vec<(AuthorId, u64)> = second
+        .read_cell_operations(bob.id, cell, &note)
+        .await?
+        .into_iter()
+        .map(|op| (op.id.author, op.id.op_seq))
+        .collect();
+    assert_eq!(
+        numbered,
+        (1..=4).map(|op_seq| (author, op_seq)).collect::<Vec<_>>()
     );
     second.shutdown().await?;
     Ok(())

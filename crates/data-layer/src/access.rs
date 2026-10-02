@@ -9,6 +9,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, OnceLock, RwLock},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -17,13 +18,21 @@ use pdn_store::{
     api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, SessionAccess,
     SessionIngest, SessionRole, ValidateOutcome,
 };
-use pdn_types::{ClaimId, NodeId, PdnId};
+use pdn_types::{CellId, ClaimId, NodeId, PdnId};
 
 use crate::{
+    cell::{
+        departure_past, held_entries, CellStore, HeldEntry, Membership, MembershipKey, PastEntry,
+    },
     connection_metadata::GrantRecord,
     grant::{claim_id_of_key, GrantedClaim, ReadGrant},
     registry::{Registry, ServingPosture},
 };
+
+/// How long a cell store's session waits for the payloads its caller's own
+/// entries lack before it is refused; the payloads are small and follow
+/// their entries at once.
+const CALLER_PAYLOADS_WAIT: Duration = Duration::from_secs(5);
 
 /// A hosted identity as the store names it on the wire: the 32 bytes of
 /// its `PdnId`, which the store compares and never interprets.
@@ -76,6 +85,14 @@ enum WriteAdmission {
     Claims(HashSet<ClaimId>),
     /// Nothing: no session vouched for the writer.
     Nothing,
+    /// Exactly these entries of a cell's membership store, by key and
+    /// author — a departure's past — and, where `rejoin` names the departed
+    /// member and its departure's sequence, every event of that member's
+    /// chain after it, so a device holding its tombstone takes its new join.
+    Past {
+        entries: Arc<HashSet<PastEntry>>,
+        rejoin: Option<(PdnId, u64)>,
+    },
 }
 
 /// Timestamp bound per retracted `(author, key)` of one granted namespace.
@@ -110,7 +127,14 @@ pub(crate) struct AccessBook {
     /// marker can name. Shared, because a session's ingest verdict reads
     /// it per entry and must see what a marker recorded meanwhile.
     retractions: Arc<RwLock<HashMap<NamespaceId, ArmedRetractions>>>,
+    #[cfg(feature = "test-util")]
+    cell_verdicts: OnceLock<CellVerdictSink>,
 }
+
+/// Where each fold's verdicts go once a scenario takes the channel.
+#[cfg(feature = "test-util")]
+pub(crate) type CellVerdictSink =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::cell::CellVerdicts>>>>;
 
 impl AccessBook {
     pub(crate) fn new(identity: PdnId) -> Self {
@@ -121,6 +145,8 @@ impl AccessBook {
             blobs: OnceLock::new(),
             grant_cache: RwLock::new(HashMap::new()),
             retractions: Arc::default(),
+            #[cfg(feature = "test-util")]
+            cell_verdicts: OnceLock::new(),
         }
     }
 
@@ -197,6 +223,11 @@ impl AccessBook {
         peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
+        if let Some((cell, store)) = registry.cell_of(namespace)? {
+            return self
+                .classify_cell(&registry, cell, store, remote, peer, role)
+                .await;
+        }
         // The directory and the connection metadata stores are ticket-gated
         // (Invariants 1 and 3). Classifying them against their own, possibly
         // not yet converged, device records would deadlock the bootstrap
@@ -353,7 +384,225 @@ impl AccessBook {
         })
     }
 
+    /// A cell's membership store, served whole to a device of the member
+    /// the caller names — a sibling by this identity's own directory,
+    /// another member by the device statements this identity's replica
+    /// folds — and to nobody else, by the cell stores spec. The record
+    /// store serves no session.
+    async fn classify_cell(
+        &self,
+        registry: &Arc<Registry>,
+        cell: CellId,
+        store: CellStore,
+        remote: Identity,
+        peer: NodeId,
+        role: SessionRole,
+    ) -> Result<SessionAccess> {
+        let refused = match role {
+            // A dial toward a callee not yet resolved to a member pulls
+            // and serves nothing: a device holding nothing of the store
+            // takes its first entries this way.
+            SessionRole::Dial => SessionAccess::Allow {
+                egress: Some(closed_egress()),
+                ingest: Some(self.ingest(registry, WriteAdmission::Nothing)),
+            },
+            SessionRole::Accept => SessionAccess::Deny,
+        };
+        if remote == identity_of(self.identity) {
+            // A sibling is served the store whole, a tombstone included.
+            let peer_key = crate::private_metadata::device_key(&peer);
+            let sibling = self.peer_is_own_device(peer_key.as_bytes()).await?;
+            return Ok(if sibling {
+                self.whole(registry)
+            } else {
+                refused
+            });
+        }
+        let Some(held) = registry.cell(cell)? else {
+            return Ok(refused);
+        };
+        let caller = PdnId::from_bytes(*remote.as_bytes());
+        if let Some(access) = self
+            .serve_cell(registry, cell, store, &held.membership, caller, peer)
+            .await?
+        {
+            return Ok(access);
+        }
+        // A newcomer's join statement and device statement arrive as
+        // payloads after the session that brought their entries, so the
+        // session after it would refuse the newcomer for their absence, so
+        // the newcomer is judged again once they are here.
+        if self.await_payloads_of(&held.membership, &caller).await? {
+            if let Some(access) = self
+                .serve_cell(registry, cell, store, &held.membership, caller, peer)
+                .await?
+            {
+                return Ok(access);
+            }
+        }
+        Ok(refused)
+    }
+
+    /// How a session naming `caller` from `peer` is served, if it is: a
+    /// current member's device whole, and a former member's device on the
+    /// membership store over its departure's past alone, both ways; a
+    /// replica whose own identity departed serves any member over its own
+    /// departure's past alone.
+    async fn serve_cell(
+        &self,
+        registry: &Arc<Registry>,
+        cell: CellId,
+        store: CellStore,
+        membership: &Doc,
+        caller: PdnId,
+        peer: NodeId,
+    ) -> Result<Option<SessionAccess>> {
+        let (folded, entries) = self.fold_cell_entries(cell, membership).await?;
+        let Some(member) = folded.member(&caller) else {
+            return Ok(None);
+        };
+        if !member.devices.iter().any(|device| device.node == peer) {
+            return Ok(None);
+        }
+        let (departure, rejoin) = if member.state.member {
+            match departure_past(&folded, &entries, &self.identity) {
+                None => return Ok(Some(self.whole(registry))),
+                Some(own) => {
+                    let rejoin = Some((self.identity, own.seq));
+                    (own, rejoin)
+                }
+            }
+        } else {
+            match departure_past(&folded, &entries, &caller) {
+                None => return Ok(None),
+                Some(theirs) => (theirs, None),
+            }
+        };
+        if store == CellStore::Records {
+            return Ok(None);
+        }
+        let past = Arc::new(departure.past);
+        let served = Arc::clone(&past);
+        Ok(Some(SessionAccess::Allow {
+            egress: Some(Arc::new(move |entry: &pdn_store::SignedEntry| {
+                served.contains(&(entry.key().to_vec(), entry.author()))
+            })),
+            ingest: Some(self.ingest(
+                registry,
+                WriteAdmission::Past {
+                    entries: past,
+                    rejoin,
+                },
+            )),
+        }))
+    }
+
+    fn whole(&self, registry: &Arc<Registry>) -> SessionAccess {
+        SessionAccess::Allow {
+            egress: None,
+            ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+        }
+    }
+
+    /// Wait, at most [`CALLER_PAYLOADS_WAIT`], for the payloads the entries
+    /// of `member`'s own chain and statements still lack; whether the store
+    /// holds any such entry, so the caller is judged again even when the
+    /// last payload landed before the wait began.
+    async fn await_payloads_of(&self, membership: &Doc, member: &PdnId) -> Result<bool> {
+        let Some(blobs) = self.blobs.get() else {
+            return Ok(false);
+        };
+        let prefix = format!("member/{member}/");
+        let (mut held, mut lacking) = (false, Vec::new());
+        let mut entries = std::pin::pin!(membership.get_many(Query::key_prefix(prefix)).await?);
+        while let Some(entry) = futures_lite::StreamExt::next(&mut entries).await {
+            held = true;
+            let hash = entry?.content_hash();
+            if !blobs.has(hash).await? {
+                lacking.push(hash);
+            }
+        }
+        if lacking.is_empty() {
+            return Ok(held);
+        }
+        let deadline = tokio::time::Instant::now() + CALLER_PAYLOADS_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            let mut arrived = true;
+            for hash in &lacking {
+                arrived &= blobs.has(*hash).await?;
+            }
+            if arrived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(true)
+    }
+
+    /// The membership this identity's replica of `cell`'s membership store
+    /// folds into, payloads read as far as they have arrived.
+    pub(crate) async fn fold_cell(&self, cell: CellId, membership: &Doc) -> Result<Membership> {
+        Ok(self.fold_cell_entries(cell, membership).await?.0)
+    }
+
+    /// [`fold_cell`](Self::fold_cell) beside the entries it folded.
+    pub(crate) async fn fold_cell_entries(
+        &self,
+        cell: CellId,
+        membership: &Doc,
+    ) -> Result<(Membership, Vec<HeldEntry>)> {
+        let entries = match self.blobs.get() {
+            Some(blobs) => held_entries(membership, blobs).await?,
+            None => Vec::new(),
+        };
+        let folded = Membership::fold(&cell, &entries);
+        #[cfg(feature = "test-util")]
+        self.report_cell_verdicts(cell, &entries, &folded);
+        Ok((folded, entries))
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_cell_verdicts(&self, sink: CellVerdictSink) {
+        let _ = self.cell_verdicts.set(sink);
+    }
+
+    #[cfg(feature = "test-util")]
+    fn report_cell_verdicts(
+        &self,
+        cell: CellId,
+        entries: &[crate::cell::HeldEntry],
+        folded: &Membership,
+    ) {
+        let Some(sink) = self.cell_verdicts.get() else {
+            return;
+        };
+        let Ok(sender) = sink.lock() else {
+            return;
+        };
+        if let Some(sender) = sender.as_ref() {
+            let verdicts = entries
+                .iter()
+                .zip(folded.verdicts())
+                .map(|(entry, verdict)| (entry.key.clone(), entry.author, *verdict))
+                .collect();
+            let _ = sender.send(crate::cell::CellVerdicts {
+                identity: self.identity,
+                cell,
+                verdicts,
+            });
+        }
+    }
+
     /// Whether the peer is a device of this book's own identity.
+    /// The devices the identity's own directory lists; none before it is
+    /// armed.
+    pub(crate) async fn own_devices(&self) -> Result<Vec<NodeId>> {
+        let Some(directory) = self.own_directory()? else {
+            return Ok(Vec::new());
+        };
+        crate::private_metadata::listed_devices(&directory).await
+    }
+
     async fn peer_is_own_device(&self, peer_key: &[u8]) -> Result<bool> {
         let Some(directory) = self.own_directory()? else {
             return Ok(false);
@@ -455,6 +704,23 @@ impl AccessBook {
         let book = Arc::clone(&self.retractions);
         let identity = self.identity;
         Arc::new(move |entry: &pdn_store::SignedEntry| {
+            if let WriteAdmission::Past { entries, rejoin } = &admission {
+                let id = entry.id();
+                let later_in_own_chain = rejoin.is_some_and(|(member, departed)| {
+                    matches!(
+                        MembershipKey::parse(id.key()),
+                        Some(MembershipKey::Event { subject, seq, .. })
+                            if subject == member && seq.get() > departed
+                    )
+                });
+                return if later_in_own_chain
+                    || entries.contains(&(id.key().to_vec(), entry.author()))
+                {
+                    ValidateOutcome::Accept
+                } else {
+                    ValidateOutcome::Drop
+                };
+            }
             let id = entry.id();
             let namespace = id.namespace();
             let issuer = match registry.binding_of(namespace) {
@@ -485,8 +751,9 @@ impl AccessBook {
                     }
                 }
                 // No session vouched for the writer: not a verdict on its
-                // authority, so the sender re-offers and self-heals.
-                WriteAdmission::Nothing => ValidateOutcome::Drop,
+                // authority, so the sender re-offers and self-heals. A past
+                // bounds only a cell's store, which returned above.
+                WriteAdmission::Nothing | WriteAdmission::Past { .. } => ValidateOutcome::Drop,
             }
         })
     }

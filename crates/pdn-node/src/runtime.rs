@@ -104,6 +104,7 @@ impl CeremonyPause {
 
 use crate::linking::LinkingLocalFailure;
 use crate::{
+    cells::{JoinHandler, RuntimeCellsService, CELL_JOIN_ALPN},
     connections::RuntimeConnectionsService,
     data::RuntimeDataService,
     identity::RuntimeIdentityService,
@@ -141,6 +142,7 @@ pub(crate) struct HostedIdentity {
 /// lock per phase and release it across every network round-trip and wait
 /// — otherwise two runtimes running a ceremony toward each other deadlock,
 /// each holding its own lock while the peer's accept side blocks on it.
+#[cfg_attr(feature = "test-util", allow(clippy::struct_excessive_bools))] // one-shot fault switches, each independent
 pub(crate) struct State {
     pub(crate) node: Arc<SyncNode>,
     /// Exactly the identities created or linked here.
@@ -150,6 +152,11 @@ pub(crate) struct State {
     /// Separate from pairing's: a secret minted for one ceremony must never
     /// verify in the other.
     pub(crate) pending_linking_invites: PendingInvites,
+    /// The cell join dialogue's, each secret minted for an identity and a
+    /// cell.
+    pub(crate) pending_cell_invites: PendingInvites<(PdnId, pdn_types::CellId)>,
+    /// Keyed by `(joining identity, cell)`.
+    pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::CellId)>,
     /// A cache keyed by `(hosted identity, counterparty)`; the directory is
     /// the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
@@ -187,6 +194,10 @@ pub(crate) struct State {
     pub(crate) link_after_commit_pause: Option<Arc<CeremonyPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
+    /// Ends the next join dialogue's serving half once the joined event and
+    /// the statement are written, before the tickets go out: a reply lost.
+    #[cfg(feature = "test-util")]
+    pub(crate) drop_next_join_reply: bool,
     /// Fails the next `create` where its directory would be made — a step
     /// between provisioning an identity and hosting it, which a full disk is
     /// the product's reason to reach.
@@ -208,6 +219,54 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn new(
+        node: SyncNode,
+        identities: HashMap<PdnId, HostedIdentity>,
+        serving_halves: ServingHalves,
+        sweep_interval: std::time::Duration,
+    ) -> Self {
+        let (retraction_events, _no_subscribers_yet) =
+            tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
+        let (linking_failures, _no_failure_subscribers_yet) =
+            tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
+        Self {
+            node: Arc::new(node),
+            identities,
+            pending_invites: PendingInvites::default(),
+            pending_linking_invites: PendingInvites::default(),
+            pending_cell_invites: PendingInvites::default(),
+            joining_in_flight: HashSet::new(),
+            metadata_pairs: HashMap::new(),
+            grant_binders: HashSet::new(),
+            bound_grants: HashMap::new(),
+            linking_in_flight: HashSet::new(),
+            establishing_in_flight: HashSet::new(),
+            cleanup_tasks: CleanupSupervisor::new(),
+            linking_failures,
+            serving_halves,
+            #[cfg(feature = "test-util")]
+            link_after_import_pause: None,
+            #[cfg(feature = "test-util")]
+            pairing_serve_pause: None,
+            #[cfg(feature = "test-util")]
+            link_before_commit_pause: None,
+            #[cfg(feature = "test-util")]
+            link_after_commit_pause: None,
+            #[cfg(feature = "test-util")]
+            fail_next_pending_device_write: false,
+            #[cfg(feature = "test-util")]
+            drop_next_join_reply: false,
+            #[cfg(feature = "test-util")]
+            fail_next_directory_create: false,
+            #[cfg(feature = "test-util")]
+            fail_next_hosting_record: false,
+            #[cfg(feature = "test-util")]
+            pair_arm_failures: None,
+            retraction_events,
+            sweep_interval,
+        }
+    }
+
     pub(crate) fn hosted(&self, identity: PdnId) -> Result<&HostedIdentity, UnknownIdentity> {
         self.identities
             .get(&identity)
@@ -256,10 +315,13 @@ impl Runtime {
         let pairing_slot = pairing.slot();
         let linking = LinkingHandler::new(serving_halves.clone());
         let linking_slot = linking.slot();
+        let join = JoinHandler::new(serving_halves.clone());
+        let join_slot = join.slot();
         let node = SyncNode::spawn_with(
             vec![
                 (PAIRING_ALPN.to_vec(), Box::new(pairing)),
                 (LINKING_ALPN.to_vec(), Box::new(linking)),
+                (CELL_JOIN_ALPN.to_vec(), Box::new(join)),
             ],
             options,
         )
@@ -272,11 +334,14 @@ impl Runtime {
             let verdicts = node
                 .take_retraction_verdicts()
                 .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
+            let notices = node
+                .take_cell_notices()
+                .ok_or_else(|| anyhow::anyhow!("cell notice stream taken twice"))?;
             let (identities, armers) = recover_hosted_identities(&node).await?;
-            anyhow::Ok((verdicts, identities, armers))
+            anyhow::Ok((verdicts, notices, identities, armers))
         }
         .await;
-        let (verdicts, identities, armers) = match prepared {
+        let (verdicts, notices, identities, armers) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = node.shutdown().await;
@@ -284,52 +349,28 @@ impl Runtime {
             }
         };
 
-        let (retraction_events, _no_subscribers_yet) =
-            tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
-        let (linking_failures, _no_failure_subscribers_yet) =
-            tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
-        let state = Arc::new(Mutex::new(State {
-            node: Arc::new(node),
+        let state = Arc::new(Mutex::new(State::new(
+            node,
             identities,
-            pending_invites: PendingInvites::default(),
-            pending_linking_invites: PendingInvites::default(),
-            metadata_pairs: HashMap::new(),
-            grant_binders: HashSet::new(),
-            bound_grants: HashMap::new(),
-            linking_in_flight: HashSet::new(),
-            establishing_in_flight: HashSet::new(),
-            cleanup_tasks: CleanupSupervisor::new(),
-            linking_failures,
             serving_halves,
-            #[cfg(feature = "test-util")]
-            link_after_import_pause: None,
-            #[cfg(feature = "test-util")]
-            pairing_serve_pause: None,
-            #[cfg(feature = "test-util")]
-            link_before_commit_pause: None,
-            #[cfg(feature = "test-util")]
-            link_after_commit_pause: None,
-            #[cfg(feature = "test-util")]
-            fail_next_pending_device_write: false,
-            #[cfg(feature = "test-util")]
-            fail_next_directory_create: false,
-            #[cfg(feature = "test-util")]
-            fail_next_hosting_record: false,
-            #[cfg(feature = "test-util")]
-            pair_arm_failures: None,
-            retraction_events,
             sweep_interval,
-        }));
+        )));
         for (identity, changes) in armers {
             crate::connections::spawn_connection_armer(Arc::downgrade(&state), identity, changes);
         }
+        // Every identity the directory records is hosted again by now.
+        state.lock().await.node.start_blob_collection();
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
+        crate::cells::spawn_cell_notice_consumer(Arc::downgrade(&state), notices);
         pairing_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("pairing state slot filled twice"))?;
         linking_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("linking state slot filled twice"))?;
+        join_slot
+            .set(Arc::downgrade(&state))
+            .map_err(|_already_filled| anyhow::anyhow!("join state slot filled twice"))?;
         Ok(Self { node_id, state })
     }
 
@@ -353,6 +394,10 @@ impl Runtime {
         RuntimeSyncService::new(self)
     }
 
+    pub fn cells(&self) -> RuntimeCellsService<'_> {
+        RuntimeCellsService::new(self)
+    }
+
     /// One event per retracted entry — the host's hook for user-facing
     /// surfacing. A lagging subscriber loses the oldest events, never
     /// blocks the runtime.
@@ -372,6 +417,32 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
+    pub async fn drop_next_join_reply_for_test(&self) {
+        self.state.lock().await.drop_next_join_reply = true;
+    }
+
+    /// The membership `identity`'s replica of `cell` folds into.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_membership_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        cell: pdn_types::CellId,
+    ) -> anyhow::Result<data_layer::Membership> {
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.cell_membership(identity, cell).await
+    }
+
+    /// The cells `identity` holds on this node, each with whether its
+    /// record store is held: `false` for a tombstone.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_holdings_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<Vec<(pdn_types::CellId, bool)>> {
+        self.state.lock().await.node.cell_holdings(identity)
+    }
+
+    #[cfg(feature = "test-util")]
     pub async fn fail_next_directory_create_for_test(&self) {
         self.state.lock().await.fail_next_directory_create = true;
     }
@@ -388,6 +459,18 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn provisioned_identities_for_test(&self) -> anyhow::Result<Vec<pdn_types::PdnId>> {
         self.state.lock().await.node.hosted_identities()
+    }
+
+    /// The announcement public key in `identity`'s own directory on this
+    /// runtime; `None` until its payload has arrived.
+    #[cfg(feature = "test-util")]
+    pub async fn announcement_public_key_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let state = self.state.lock().await;
+        let key = state.hosted(identity)?.directory.announcement_key().await?;
+        Ok(key.map(|key| key.public_key()))
     }
 
     /// Fail every pair arming from now on.
