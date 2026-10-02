@@ -1679,7 +1679,9 @@ async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result
 /// replica recorded; the recorded peer left out is dialed once it is handed.
 ///
 /// Every replica stays outside the swarm and nothing is written, so a
-/// session reaches the peer left out only through a dial of that sync.
+/// session reaches the peer left out only through a dial of that sync. The
+/// peer left out sees its own first session end before the window opens:
+/// its end of that session can come after node 0's.
 #[tokio::test]
 #[traced_test]
 async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
@@ -1692,15 +1694,15 @@ async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
         .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     let mut events0 = doc0.subscribe().await?;
-    let mut imported = Vec::new();
+    let mut events = Vec::new();
     for node in &nodes[1..] {
         let doc = node
             .docs()
             .import_namespace(ticket.capability.clone())
             .await?;
+        events.push(doc.subscribe().await?);
         doc.start_sync_scoped(ticket.contacts(), util::TEST_HOLDER)
             .await?;
-        imported.push(doc);
     }
     // Both first sessions finished, so node 0 recorded both peers.
     assert_events_matching(
@@ -1712,7 +1714,8 @@ async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
         ],
     )
     .await;
-    let mut events2 = imported[1].subscribe().await?;
+    let mut events2 = events.pop().context("node 2 subscribed")?;
+    next_event_matching(&mut events2, TIMEOUT, move |e| match_sync_finished(e, id0)).await;
 
     doc0.sync_with_peers(vec![], vec![*id1.as_bytes()], util::TEST_HOLDER, false)
         .await?;
