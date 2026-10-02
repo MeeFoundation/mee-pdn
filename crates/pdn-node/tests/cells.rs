@@ -8,8 +8,8 @@
 use anyhow::Result;
 use pdn_node::{
     ActRefusal, ActRefused, CellAct, CellInvite, CellMember, CellsService as _,
-    IdentityService as _, JoinRefused, RecordPlacedOnce, Runtime, UnknownCell, UnknownIdentity,
-    UnknownRecord, UnsupportedCellInviteVersion, WrongRecordKind,
+    IdentityService as _, JoinRefused, RecordPlacedOnce, Runtime, SpawnOptions, UnknownCell,
+    UnknownIdentity, UnknownRecord, UnsupportedCellInviteVersion, WrongRecordKind,
 };
 use pdn_types::{CellId, PdnId, RecordId, RecordKind, RecordRef};
 use test_utils::{eventually, ids};
@@ -755,10 +755,17 @@ async fn the_one_owner_leaves_once_another_member_is_an_owner() -> Result<()> {
 /// A member that leaves right after writing stops listing the cell, and
 /// the claim and the operation it wrote reach the remaining members; a
 /// co-located member's leave then spares the member beside it. Denied: a
-/// departed member reads nothing of the cell.
+/// departed member reads nothing of the cell. The leave flushes to one of
+/// the two members on the tablet, and the other takes what it wrote at the
+/// tablet's cell pass, run every half second here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
-    let (tablet, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let tablet = Runtime::spawn(SpawnOptions {
+        cell_reconcile_interval: std::time::Duration::from_millis(500),
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let bob_phone = memory_runtime().await?;
     let leisure = tablet.identity().create().await?;
     let work = tablet.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
@@ -916,5 +923,130 @@ async fn a_departure_reaches_the_members_other_devices() -> Result<()> {
     for runtime in [alice_phone, bob_phone, bob_laptop] {
         runtime.shutdown().await?;
     }
+    Ok(())
+}
+
+/// A runtime on `dir`, which a scenario stops and starts again.
+async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
+    Runtime::spawn(SpawnOptions::on_directory(dir)).await
+}
+
+/// A member's runtime on a storage directory hosts its cell again after a
+/// restart, from its directory alone: the claim another member placed
+/// meanwhile arrives, the member's next operation continues its author's
+/// count, and its hosting record is the one its create wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_is_hosted_again_after_a_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let alice_phone = memory_runtime().await?;
+    let bob_tablet = runtime_on(dir.path()).await?;
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_tablet.identity().create().await?;
+    let cell = cell_of_two(&alice_phone, alice, &bob_tablet, bob).await?;
+    let note = alice_phone
+        .cells()
+        .put_record(alice, cell, RecordKind::MergeableDocument, b"milk")
+        .await?;
+    let mut edited = vec![(alice, 1, b"milk".to_vec())];
+    assert!(reads_ops(&bob_tablet, bob, cell, note, edited.clone()).await?);
+    for _ in 0..3 {
+        bob_tablet
+            .cells()
+            .append_op(bob, cell, note, b"eggs")
+            .await?;
+    }
+    edited.extend((1..=3).map(|op_seq| (bob, op_seq, b"eggs".to_vec())));
+    assert!(reads_ops(&alice_phone, alice, cell, note, edited.clone()).await?);
+    let record = dir
+        .path()
+        .join("identities")
+        .join(bob.to_string())
+        .join("directory");
+    let recorded = std::fs::read(&record)?;
+    bob_tablet.shutdown().await?;
+    drop(bob_tablet);
+
+    let meanwhile = alice_phone
+        .cells()
+        .put_record(alice, cell, RecordKind::Claim, b"meanwhile")
+        .await?;
+    let bob_tablet = runtime_on(dir.path()).await?;
+    assert!(lists_cell(&bob_tablet, bob, cell, true).await?);
+    assert!(reads(&bob_tablet, bob, cell, meanwhile, b"meanwhile").await?);
+    bob_tablet
+        .cells()
+        .append_op(bob, cell, note, b"bread")
+        .await?;
+    edited.push((bob, 4, b"bread".to_vec()));
+    assert!(reads_ops(&alice_phone, alice, cell, note, edited).await?);
+    assert_eq!(
+        std::fs::read(&record)?,
+        recorded,
+        "the restart rewrote the hosting record"
+    );
+
+    for runtime in [alice_phone, bob_tablet] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Two members hosted on one node come back from a restart each with its
+/// own copy of their cell, and a record one places reaches the other with no
+/// other node reachable; a cell the second left before the restart stays
+/// left, its membership store alone kept as the tombstone. Denied: the left
+/// cell's records, to the member that left it.
+#[tokio::test(flavor = "multi_thread")]
+async fn co_located_members_come_back_and_a_left_cell_stays_left() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tablet = runtime_on(dir.path()).await?;
+    let leisure = tablet.identity().create().await?;
+    let work = tablet.identity().create().await?;
+    let wedding = tablet.cells().create(leisure).await?;
+    let invite = tablet.cells().invite(leisure, wedding, None).await?;
+    tablet.cells().join(work, invite).await?;
+    let left = tablet.cells().create(work).await?;
+    let before = tablet
+        .cells()
+        .put_record(work, left, RecordKind::Claim, b"before the leave")
+        .await?;
+    tablet.cells().act(work, left, CellAct::Leave).await?;
+    tablet.shutdown().await?;
+    drop(tablet);
+
+    let tablet = runtime_on(dir.path()).await?;
+    let both = vec![member(leisure, true), member(work, false)];
+    for holder in [leisure, work] {
+        assert!(lists_cell(&tablet, holder, wedding, true).await?);
+        assert!(lists_members(&tablet, holder, wedding, both.clone()).await?);
+    }
+    let mut kept = vec![(wedding, true), (left, false)];
+    kept.sort();
+    assert!(
+        eventually(|| async {
+            let mut holdings = tablet.cell_holdings_for_test(work).await?;
+            holdings.sort();
+            Ok(holdings == kept)
+        })
+        .await?,
+        "the left cell came back as more or less than its tombstone"
+    );
+    assert!(!tablet
+        .cells()
+        .list(work)
+        .await?
+        .iter()
+        .any(|info| info.id == left));
+    // Denied: the left cell.
+    let asked = tablet.cells().read(work, left, before).await;
+    assert!(asked.is_err_and(|err| is::<UnknownCell>(&err)));
+
+    let claim = tablet
+        .cells()
+        .put_record(leisure, wedding, RecordKind::Claim, b"after the restart")
+        .await?;
+    assert!(reads(&tablet, work, wedding, claim, b"after the restart").await?);
+
+    tablet.shutdown().await?;
     Ok(())
 }

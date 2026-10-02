@@ -1493,27 +1493,21 @@ impl SyncNode {
             }
             return match held.records {
                 Some(records) if records.id() == records_namespace => {
-                    Self::start_cell(&stack, &held.membership, &records).await
+                    self.start_cell(&stack, cell, &held.membership, &records)
+                        .await
                 }
                 Some(records) => Err(anyhow::anyhow!(
                     "cell {cell} is held on record store {}, not {records_namespace}",
                     records.id()
                 )),
                 None => {
-                    Self::guard_cell_import(&stack, records_namespace)?;
-                    let contacts = tickets.records.contacts();
-                    let minted_by = tickets.records.identity;
-                    let records = stack
-                        .api
-                        .import_namespace(tickets.records.capability)
-                        .await?;
-                    stack
-                        .registry
-                        .set_cell_records(cell, Some(records.clone()))?;
-                    stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
-                    stack.set_strategy(membership_namespace, SyncStrategy::Swarm)?;
-                    // The tombstone's membership store kept its watch.
-                    Self::start_cell(&stack, &held.membership, &records).await
+                    self.import_records_onto_tombstone(
+                        &stack,
+                        cell,
+                        &held.membership,
+                        tickets.records,
+                    )
+                    .await
                 }
             };
         }
@@ -1551,17 +1545,44 @@ impl SyncNode {
             records_minted_by,
         )?;
         watch_cell_membership(&stack, self.router.endpoint().id(), cell, &membership);
-        Self::start_cell(&stack, &membership, &records).await
+        self.start_cell(&stack, cell, &membership, &records).await
+    }
+
+    /// A join after a departure: the record store imported again beside the
+    /// tombstone, which goes back into its swarm and kept its watch.
+    async fn import_records_onto_tombstone(
+        &self,
+        stack: &HostedStack,
+        cell: CellId,
+        membership: &Doc,
+        ticket: DocTicket,
+    ) -> Result<CellCatchUp> {
+        Self::guard_cell_import(stack, ticket.capability.id())?;
+        let (contacts, minted_by) = (ticket.contacts(), ticket.identity);
+        let records = stack.api.import_namespace(ticket.capability).await?;
+        stack
+            .registry
+            .set_cell_records(cell, Some(records.clone()))?;
+        stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
+        stack.set_strategy(membership.id(), SyncStrategy::Swarm)?;
+        self.start_cell(stack, cell, membership, &records).await
     }
 
     /// Start both tracked stores' sync, the record store's every dial
     /// ordered after the membership store's, behind a wait for the first
     /// session of each that this start brings.
     async fn start_cell(
+        &self,
         stack: &HostedStack,
+        cell: CellId,
         membership: &Doc,
         records: &Doc,
     ) -> Result<CellCatchUp> {
+        let held = CellBinding {
+            membership: membership.clone(),
+            records: Some(records.clone()),
+        };
+        derive_before_start(stack, self.router.endpoint().id(), cell, &held).await?;
         let caught_up = CellCatchUp {
             membership: crate::private_metadata::watch_doc(membership).await?,
             records: crate::private_metadata::watch_doc(records).await?,
@@ -1618,6 +1639,45 @@ impl SyncNode {
         ))
     }
 
+    /// Open `cell`'s tombstone from its membership store's write ticket, as
+    /// a departure leaves it: no record store, and the membership store out
+    /// of its swarm, reconciled with the contacts its membership derives.
+    /// Nothing for a cell `identity` holds already, a tombstone included.
+    pub async fn open_cell_tombstone(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        membership: DocTicket,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        if stack.registry.cell(cell)?.is_some() {
+            return Ok(());
+        }
+        Self::guard_cell_import(&stack, membership.capability.id())?;
+        let (contacts, minted_by) = (membership.contacts(), membership.identity);
+        let doc = stack.api.import_namespace(membership.capability).await?;
+        stack.registry.register_cell(
+            cell,
+            CellBinding {
+                membership: doc.clone(),
+                records: None,
+            },
+        )?;
+        stack.track(&doc, contacts, SyncStrategy::ContactsOnly, minted_by)?;
+        let node = self.router.endpoint().id();
+        let held = CellBinding {
+            membership: doc.clone(),
+            records: None,
+        };
+        derive_before_start(&stack, node, cell, &held).await?;
+        watch_cell_membership(&stack, node, cell, &doc);
+        let contacts = stack
+            .tracked(doc.id())?
+            .map(|tracked| tracked.contacts)
+            .unwrap_or_default();
+        doc.start_sync_scoped(contacts, minted_by).await
+    }
+
     /// The cells `identity` holds here, each with whether its record store
     /// is held: `false` for a tombstone.
     pub fn cell_holdings(&self, identity: PdnId) -> Result<Vec<(CellId, bool)>> {
@@ -1666,6 +1726,7 @@ impl SyncNode {
             .collect();
         let (drawn, _recorded) = draw(others, Vec::new());
         let mut flush = CellFlush {
+            since: std::time::SystemTime::now(),
             peers: drawn
                 .iter()
                 .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
@@ -3326,6 +3387,50 @@ async fn derive_cell_contacts(
     }
 }
 
+/// Derive `held`'s contacts before its sync starts, so a reopened replica
+/// dials each member's devices as that member — a ticket names every node
+/// as the identity that minted it — and keep beside them each ticket
+/// contact whose node they leave out: a replica that folds nobody yet, or a
+/// tombstone past its convergence, has no other.
+async fn derive_before_start(
+    stack: &HostedStack,
+    node: EndpointId,
+    cell: CellId,
+    held: &CellBinding,
+) -> Result<()> {
+    let docs: Vec<&Doc> = std::iter::once(&held.membership)
+        .chain(held.records.as_ref())
+        .collect();
+    let mut ticketed = Vec::new();
+    for doc in &docs {
+        ticketed.push(
+            stack
+                .tracked(doc.id())?
+                .map(|tracked| tracked.contacts)
+                .unwrap_or_default(),
+        );
+    }
+    derive_cell_contacts(stack, node, cell, held, &[]).await;
+    for (doc, ticketed) in docs.into_iter().zip(ticketed) {
+        let Some(tracked) = stack.tracked(doc.id())? else {
+            continue;
+        };
+        let mut contacts = tracked.contacts;
+        for contact in ticketed {
+            if !contacts.iter().any(|kept| kept.addr.id == contact.addr.id) {
+                contacts.push(contact);
+            }
+        }
+        stack.set_contacts(doc.id(), contacts.clone())?;
+        stack
+            .docs
+            .engine()
+            .state_contacts(doc.id(), contacts)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Derive `cell`'s contacts again whenever its membership store changes —
 /// an entry or a payload arriving, a local write — so a newcomer is dialed
 /// as the member it is from its first announcement on. Ends with the
@@ -3436,6 +3541,7 @@ async fn cell_contacts(
         })
         .collect();
     devices.extend(own_devices.into_iter().map(|device| (device, own)));
+    let known = known_addresses(stack, membership)?;
     let mut seen = HashSet::new();
     let mut contacts = Vec::new();
     for (device, identity) in devices {
@@ -3445,13 +3551,33 @@ async fn cell_contacts(
         if (id == node && identity == own) || !seen.insert((id, identity)) {
             continue;
         }
-        contacts.push(Contact::new(EndpointAddr::new(id), identity));
+        let addr = known
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(id));
+        contacts.push(Contact::new(addr, identity));
     }
     Ok(DerivedContacts {
         contacts: Some(contacts),
         departed,
         unlisted,
     })
+}
+
+/// The addresses a store's contacts carry, a ticket's among them: without
+/// address lookup a node id alone is undialable to a device that never met
+/// it, a restarted one included.
+fn known_addresses(stack: &HostedStack, store: &Doc) -> Result<HashMap<EndpointId, EndpointAddr>> {
+    Ok(stack
+        .tracked(store.id())?
+        .map(|tracked| {
+            tracked
+                .contacts
+                .into_iter()
+                .map(|contact| (contact.addr.id, contact.addr))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// What [`cell_contacts`] derives from one fold.
@@ -3497,6 +3623,9 @@ fn draw(contacts: Vec<Contact>, recorded: Vec<PeerIdBytes>) -> (Vec<Contact>, Ve
 /// The sessions a [`SyncNode::flush_cell`] dialed, as each store finishes
 /// them.
 pub struct CellFlush {
+    /// A session started before it may have missed the latest writes. A
+    /// clock stepping back past it leaves the wait to its bound.
+    since: std::time::SystemTime,
     peers: HashSet<NodeId>,
     sessions: Vec<
         std::pin::Pin<
@@ -3526,6 +3655,7 @@ impl CellFlush {
                 match tokio::time::timeout_at(deadline, events.next()).await {
                     Ok(Some(Ok(pdn_store::engine::LiveEvent::SyncFinished(sync))))
                         if sync.result.is_ok()
+                            && sync.started >= self.since
                             && self
                                 .peers
                                 .contains(&NodeId::from_bytes(*sync.peer.as_bytes())) =>

@@ -555,6 +555,18 @@ impl PrivateMetadataStore {
             .collect())
     }
 
+    /// The cells the identity departed, record-level: those whose entry at
+    /// the highest sequence, across all authors, is a tombstone.
+    pub async fn departed_cells(&self) -> Result<Vec<CellId>> {
+        Ok(self
+            .cell_records(CELLS_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_cell, (_seq, held))| !*held)
+            .map(|(cell, _record)| cell)
+            .collect())
+    }
+
     /// `cell`'s highest recorded sequence and whether the identity holds
     /// the cell from it; `None` for a cell never recorded.
     pub async fn cell_record(&self, cell: CellId) -> Result<Option<(Seq, bool)>> {

@@ -386,7 +386,7 @@ impl CellsService for RuntimeCellsService<'_> {
                 &keys.device_statement(1, vec![device]).encode(),
             )
             .await?;
-            record_cell(&node, &hosted.directory, identity, cell, Seq::FIRST).await
+            record_cell(&node, &hosted.directory, identity, cell, Seq::FIRST, &[]).await
         }
         .await;
         match written {
@@ -833,47 +833,66 @@ async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result
 }
 
 /// Open every cell `identity`'s directory holds that this device does not,
-/// from the tickets beside its record, and forget the record store of every
-/// one whose record the directory's tombstone ends (cells D16, D35). A cell
-/// whose join is in flight here is the join's; one whose tickets have not
-/// arrived waits for the next sweep.
+/// from the tickets beside its record; open the tombstone of every cell it
+/// departed that this device holds nothing of, and forget the record store
+/// of every one this device still holds (cells D16, D35, D36). The sweep
+/// after a restart re-derives the hosted cells so. A cell whose join is in
+/// flight here is the join's; one whose tickets have not arrived waits for
+/// the next sweep.
 pub(crate) async fn arm_cells(state: &State, identity: PdnId) {
     let Ok(hosted) = state.hosted(identity) else {
         return;
     };
-    let (Ok(held), Ok(holdings)) = (
+    let (Ok(held), Ok(departed), Ok(holdings)) = (
         hosted.directory.held_cells().await,
+        hosted.directory.departed_cells().await,
         state.node.cell_holdings(identity),
     ) else {
         return;
     };
-    let joining = |cell: &CellId| state.joining_in_flight.contains(&(identity, *cell));
-    for cell in &held {
-        let records_held = holdings
+    // `Some(false)` for a tombstone.
+    let records_held = |cell: &CellId| {
+        holdings
             .iter()
-            .any(|(holding, records)| holding == cell && *records);
-        if records_held || joining(cell) {
+            .find(|(holding, _records)| holding == cell)
+            .map(|(_holding, records)| *records)
+    };
+    let joining = |cell: &CellId| state.joining_in_flight.contains(&(identity, *cell));
+    for cell in held {
+        if records_held(&cell) == Some(true) || joining(&cell) {
             continue;
         }
-        if let Err(err) = open_cell(state, identity, *cell).await {
+        if let Err(err) = open_cell(state, identity, cell).await {
             tracing::warn!(%identity, %cell, "opening the cell from the directory failed: {err:#}");
         }
     }
-    for (cell, records) in holdings {
-        if !records || held.contains(&cell) || joining(&cell) {
+    for cell in departed {
+        if joining(&cell) {
             continue;
         }
-        // No record at all: a create or a join that failed before writing it.
-        if !matches!(
-            hosted.directory.cell_record(cell).await,
-            Ok(Some((_seq, false)))
-        ) {
-            continue;
-        }
-        if let Err(err) = state.node.forget_cell(identity, cell).await {
-            tracing::warn!(%identity, %cell, "forgetting the departed cell failed: {err:#}");
+        let armed = match records_held(&cell) {
+            Some(true) => state.node.forget_cell(identity, cell).await,
+            Some(false) => Ok(()),
+            None => open_tombstone(state, identity, cell).await,
+        };
+        if let Err(err) = armed {
+            tracing::warn!(%identity, %cell, "keeping the departed cell's tombstone failed: {err:#}");
         }
     }
+}
+
+async fn open_tombstone(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
+    let directory = &state.hosted(identity)?.directory;
+    let Some(membership) = directory
+        .get_ticket(&cell_ticket_kind(&cell, CellStore::Membership))
+        .await?
+    else {
+        return Ok(());
+    };
+    state
+        .node
+        .open_cell_tombstone(identity, cell, membership)
+        .await
 }
 
 async fn open_cell(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
@@ -993,6 +1012,7 @@ async fn join_via_dialogue(
     }
 
     let cell = invite.cell;
+    let inviter = tickets.membership.nodes.clone();
     let caught_up = node
         .import_cell(
             identity,
@@ -1006,7 +1026,15 @@ async fn join_via_dialogue(
     {
         let state = state.lock().await;
         let directory = &state.hosted(identity)?.directory;
-        record_cell(&node, directory, identity, cell, Seq::new(offer.seq)).await?;
+        record_cell(
+            &node,
+            directory,
+            identity,
+            cell,
+            Seq::new(offer.seq),
+            &inviter,
+        )
+        .await?;
     }
     let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
     caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
@@ -1207,17 +1235,27 @@ where
 
 /// The identity holds `cell` from `seq` of its chain on: both stores' write
 /// tickets and the cell's entry in its directory (cells D35), which reach
-/// its other devices.
+/// its other devices. The tickets carry `reached` beside this device's own
+/// address — the inviter's, at a join — so a sibling, or this device after a
+/// restart, has a member's device to dial without address lookup.
 async fn record_cell(
     node: &data_layer::SyncNode,
     directory: &data_layer::PrivateMetadataStore,
     identity: PdnId,
     cell: CellId,
     seq: Seq,
+    reached: &[EndpointAddr],
 ) -> Result<()> {
-    let tickets = node
+    let mut tickets = node
         .share_cell_tickets(identity, cell, AddrInfoOptions::RelayAndAddresses)
         .await?;
+    for ticket in [&mut tickets.membership, &mut tickets.records] {
+        for addr in reached {
+            if !ticket.nodes.iter().any(|known| known.id == addr.id) {
+                ticket.nodes.push(addr.clone());
+            }
+        }
+    }
     directory
         .put_ticket(
             &cell_ticket_kind(&cell, CellStore::Membership),

@@ -432,6 +432,16 @@ impl Runtime {
         node.cell_membership(identity, cell).await
     }
 
+    /// The cells `identity` holds on this node, each with whether its
+    /// record store is held: `false` for a tombstone.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_holdings_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<Vec<(pdn_types::CellId, bool)>> {
+        self.state.lock().await.node.cell_holdings(identity)
+    }
+
     #[cfg(feature = "test-util")]
     pub async fn fail_next_directory_create_for_test(&self) {
         self.state.lock().await.fail_next_directory_create = true;
