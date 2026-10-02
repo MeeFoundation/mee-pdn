@@ -125,17 +125,28 @@ fn a_member_leaves_for_itself_alone() {
     assert_eq!(state(&store.fold(), &cast.bob), OUT);
 }
 
-/// Nobody kicks, demotes or invites itself: each such event counts for
+/// An owner's kick of a member and demotion of another owner apply.
+/// Denied: the same acts on itself, and an invite of itself, count for
 /// nothing, and the owner stays one.
 #[test]
 fn nobody_kicks_demotes_or_invites_itself() {
     let cast = Cast::new();
     let mut store = Store::founded_by(&cast.alice);
-    let alice = &cast.alice;
+    let (alice, bob, carol) = (&cast.alice, &cast.bob, &cast.carol);
+    store.invite(alice, 1, bob);
+    store.invite(alice, 1, carol);
+    store.act(EventKind::Promoted, carol, 2, alice, 1);
+    let kicked = store.act(EventKind::Kicked, bob, 2, alice, 1);
+    let demoted = store.act(EventKind::Demoted, carol, 3, alice, 1);
     let kick = store.act(EventKind::Kicked, alice, 2, alice, 1);
     let demotion = store.act(EventKind::Demoted, alice, 2, alice, 1);
     let invite = store.join(alice, 1, alice, 2);
     let membership = store.fold();
+    for entry in [kicked, demoted] {
+        assert_eq!(verdict(&membership, entry), Verdict::Counted);
+    }
+    assert_eq!(state(&membership, bob), OUT);
+    assert_eq!(state(&membership, carol), PLAIN);
     for entry in [kick, demotion, invite] {
         assert_eq!(verdict(&membership, entry), nothing(ForNothing::WrongActor));
     }
@@ -240,15 +251,28 @@ fn a_device_statement_counts_whoever_writes_it() {
 }
 
 /// Two statements at one version under two authors both count into the
-/// device list. Denied: a statement moved to another version's key.
+/// device list. Denied: a third at that version under a wrong key, and a
+/// statement moved to another version's key, add nothing.
 #[test]
 fn two_statements_at_one_version_both_count() {
     let cast = Cast::new();
     let mut store = Store::founded_by(&cast.alice);
     store.invite(&cast.alice, 1, &cast.bob);
+    store.invite(&cast.alice, 1, &cast.carol);
     let (b2, b3) = (device(0xb2), device(0xb3));
     store.statement(&cast.bob, 2, &[cast.bob.device, b2], b2.author);
     store.statement(&cast.bob, 2, &[cast.bob.device, b3], b3.author);
+    let wrong_key = store.write(
+        MembershipKey::Devices {
+            member: cast.bob.id(),
+            version: 2,
+        },
+        cast.carol.author(),
+        cast.carol
+            .keys
+            .device_statement(2, vec![cast.bob.device, device(0xb4)])
+            .encode(),
+    );
     let moved = store.write(
         MembershipKey::Devices {
             member: cast.bob.id(),
@@ -261,10 +285,12 @@ fn two_statements_at_one_version_both_count() {
             .encode(),
     );
     let membership = store.fold();
-    assert_eq!(
-        verdict(&membership, moved),
-        nothing(ForNothing::BadSignature)
-    );
+    for entry in [wrong_key, moved] {
+        assert_eq!(
+            verdict(&membership, entry),
+            nothing(ForNothing::BadSignature)
+        );
+    }
     let bob = membership.member(&cast.bob.id()).unwrap();
     assert_eq!(bob.devices, BTreeSet::from([cast.bob.device, b2, b3]));
 }
