@@ -17,7 +17,7 @@ use pdn_types::CellId;
 use test_utils::{
     cell::{
         device_of, found, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
-        tickets, write, Person,
+        state_on, tickets, write, Person,
     },
     join_identity, wait_devices, TIMEOUT,
 };
@@ -375,6 +375,7 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     .await?;
 
     depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_cell(carol.id, cell).await?;
     assert!(lists(&bob_phone, bob.id, cell, carol.id, OUT).await?);
     tokio::time::timeout(TIMEOUT, async {
         loop {
@@ -387,6 +388,74 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     .await?;
 
     for node in [alice_phone, bob_phone, carol_phone, carol_laptop] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Whether a run of the cell pass `draws` reports comes to draw from
+/// membership-store contacts that list `contact` as `want` says.
+async fn draws_contact(
+    draws: &mut tokio::sync::mpsc::UnboundedReceiver<data_layer::CellPassDraw>,
+    contact: (data_layer::EndpointId, data_layer::Identity),
+    want: bool,
+) -> Result<bool> {
+    let found = tokio::time::timeout(TIMEOUT, async {
+        while let Some(draw) = draws.recv().await {
+            let listed = draw
+                .contacts
+                .iter()
+                .any(|drawn| (drawn.addr.id, drawn.identity) == contact);
+            if draw.store == CellStore::Membership && listed == want {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    Ok(found.unwrap_or(false))
+}
+
+/// A departed member's device that takes its record store back on a rejoin
+/// dials its inviter as the inviter while its fold still shows the
+/// departure. Paired: the converged tombstone, before the rejoin, leaves the
+/// inviter out. The inviter writes no joined event, which stands in for one
+/// still on its way: any session would otherwise bring it and move the fold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_shows_the_join(
+) -> Result<()> {
+    let (alice_phone, carol_phone) = (node(QUIET).await?, node(CELL_RUN).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let cell = found(&alice_phone, &alice).await?;
+    let carols = vec![device_of(&carol_phone, &carol)?];
+    invite(&alice_phone, &alice, cell, &carol, carols).await?;
+    let from_alice = tickets(&alice_phone, &alice, cell).await?;
+    carol_phone
+        .import_cell(carol.id, cell, from_alice.clone())
+        .await?;
+    assert!(lists(&carol_phone, carol.id, cell, carol.id, PLAIN).await?);
+    let inviter = (
+        data_layer::EndpointId::from_bytes(alice_phone.node_id().as_bytes())?,
+        identity_of(alice.id),
+    );
+    let mut draws = carol_phone
+        .take_cell_pass_draws()
+        .expect("the draw channel is taken once");
+    depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_cell(carol.id, cell).await?;
+    assert!(lists(&alice_phone, alice.id, cell, carol.id, OUT).await?);
+    // Paired: the tombstone, once a session with the inviter went through.
+    assert!(draws_contact(&mut draws, inviter, false).await?);
+
+    carol_phone.import_cell(carol.id, cell, from_alice).await?;
+    assert!(
+        draws_contact(&mut draws, inviter, true).await?,
+        "the rejoining device dropped its inviter from its contacts"
+    );
+    assert_eq!(state_on(&carol_phone, carol.id, cell, carol.id).await, OUT);
+
+    for node in [alice_phone, carol_phone] {
         node.shutdown().await?;
     }
     Ok(())

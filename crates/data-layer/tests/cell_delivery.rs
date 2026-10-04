@@ -364,6 +364,49 @@ async fn a_cell_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membersh
     Ok(())
 }
 
+/// The device an invite's statement lists is the inviter's contact on both
+/// stores, as the newcomer, once the writes return, before any newcomer can
+/// write. Paired: before the invite it is no contact.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_device_is_a_contact_once_the_invite_is_written() -> Result<()> {
+    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let cell = found(&alice_phone, &alice).await?;
+    let as_bob = Contact::new(bob_phone.dial_handle().addr(), identity_of(bob.id));
+    let lists_bob = |contacts: Vec<Contact>| {
+        contacts
+            .iter()
+            .any(|contact| contact.addr.id == as_bob.addr.id && contact.identity == as_bob.identity)
+    };
+    for store in [CellStore::Membership, CellStore::Records] {
+        // Paired: before the invite.
+        let before = alice_phone.cell_contacts_for_test(alice.id, cell, store)?;
+        assert!(!lists_bob(before));
+    }
+
+    invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    for store in [CellStore::Membership, CellStore::Records] {
+        let after = alice_phone.cell_contacts_for_test(alice.id, cell, store)?;
+        assert!(
+            lists_bob(after),
+            "{store:?}: the invited device is no contact yet"
+        );
+    }
+
+    for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A write whose announcement a member device missed reaches it at the next
 /// run of its cell pass. Denied: a holder of both tickets that is no member,
 /// running the same pass, takes nothing.

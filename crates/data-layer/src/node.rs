@@ -1738,7 +1738,7 @@ impl SyncNode {
         let stack = self.require(identity)?;
         let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
         let node = self.router.endpoint().id();
-        let derived = cell_contacts(&stack, node, cell, &held.membership, &[]).await?;
+        let derived = cell_contacts(&stack, node, cell, &held, &[]).await?;
         let own = stack.identity();
         let others: Vec<Contact> = derived
             .contacts
@@ -1922,6 +1922,14 @@ impl SyncNode {
         let doc = Self::cell_doc(&stack, cell, store)?;
         doc.set_bytes(stack.author, key.to_vec(), payload.to_vec())
             .await?;
+        if store == CellStore::Membership {
+            // Stated before the write returns, not once the change watch's
+            // burst settles: an inviter pulls a newcomer's first write from a
+            // device this write lists, and an unstated one is dialed as us.
+            if let Some(held) = stack.registry.cell(cell)? {
+                derive_cell_contacts(&stack, self.router.endpoint().id(), cell, &held, &[]).await;
+            }
+        }
         Ok(())
     }
 
@@ -1943,6 +1951,23 @@ impl SyncNode {
         doc.set_bytes(author, key.to_vec(), payload.to_vec())
             .await?;
         Ok(())
+    }
+
+    /// The contacts `identity`'s replica of one of `cell`'s stores is
+    /// tracked with, as the last derivation left them; reading derives none.
+    #[cfg(feature = "test-util")]
+    pub fn cell_contacts_for_test(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        store: CellStore,
+    ) -> Result<Vec<Contact>> {
+        let stack = self.require(identity)?;
+        let doc = Self::cell_doc(&stack, cell, store)?;
+        Ok(stack
+            .tracked(doc.id())?
+            .map(|tracked| tracked.contacts)
+            .unwrap_or_default())
     }
 
     /// Taken before whatever starts the store's sessions, as
@@ -3401,7 +3426,7 @@ async fn derive_cell_contacts(
     held: &CellBinding,
     met: &[NodeId],
 ) {
-    let Ok(derived) = cell_contacts(stack, node, cell, &held.membership, met).await else {
+    let Ok(derived) = cell_contacts(stack, node, cell, held, met).await else {
         return;
     };
     if held.records.is_some() {
@@ -3527,14 +3552,17 @@ fn note_session(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeI
 /// this identity. `None` while the membership store folds into nobody: a
 /// replica that holds nothing yet keeps the contacts its ticket gave it.
 /// A tombstone drops the members' devices once a session with one of them
-/// — any device of another than itself among `met` — went through.
+/// — any device of another than itself among `met` — went through. A
+/// replica holding its record store again keeps them while its fold still
+/// shows the departure: they are how a rejoin dials its inviter.
 async fn cell_contacts(
     stack: &HostedStack,
     node: EndpointId,
     cell: CellId,
-    membership: &Doc,
+    held: &CellBinding,
     met: &[NodeId],
 ) -> Result<DerivedContacts> {
+    let membership = &held.membership;
     let (folded, entries) = stack.access.fold_cell_entries(cell, membership).await?;
     if folded.identities().next().is_none() {
         return Ok(DerivedContacts {
@@ -3560,7 +3588,7 @@ async fn cell_contacts(
             .converged_tombstones
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("tombstone lock poisoned"))?;
-        if departed.is_some() {
+        if departed.is_some() && held.records.is_none() {
             if met
                 .iter()
                 .any(|peer| *peer != this_device && !own_devices.contains(peer))
