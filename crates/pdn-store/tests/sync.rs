@@ -1865,6 +1865,121 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
     Ok(())
 }
 
+/// Content a record arrived without before its node restarted is fetched
+/// from the first peer a session goes through with after the restart. The
+/// engine parks such content in memory, and a session after the restart
+/// exchanges no record, so nothing else asks for it again.
+///
+/// The record reaches the receiver through a relay whose download policy
+/// keeps it content-less, as in the test above, and the writer is away
+/// until the receiver has restarted.
+#[tokio::test]
+#[traced_test]
+#[cfg(feature = "fs-store")]
+async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() -> Result<()> {
+    let mut rng = test_rng(b"content_a_restart_left_missing_is_fetched_from_the_first_sync_peer");
+    let loopback = |secret_key: SecretKey| async move {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let writer = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
+        .spawn()
+        .await?;
+    let relay = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
+        .spawn()
+        .await?;
+    let receiver_dir = tempdir()?;
+    let receiver_key = SecretKey::from_bytes(&rng.random());
+    let receiver = Node::persistent(&receiver_dir, loopback(receiver_key.clone()).await?)
+        .spawn()
+        .await?;
+    let (writer_id, relay_id) = (writer.id(), relay.id());
+
+    let author = writer.docs().author_create().await?;
+    let doc_writer = writer.docs().create().await?;
+    let hash = doc_writer
+        .set_bytes(author, b"k".to_vec(), b"v".to_vec())
+        .await?;
+    let ticket_writer = doc_writer
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc_relay = relay
+        .docs()
+        .import_namespace(ticket_writer.capability.clone())
+        .await?;
+    doc_relay
+        .set_download_policy(DownloadPolicy::NothingExcept(vec![]))
+        .await?;
+    let mut events_relay = doc_relay.subscribe().await?;
+    doc_relay
+        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .await?;
+    next_event_matching(
+        &mut events_relay,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == writer_id),
+    )
+    .await;
+    doc_writer.leave().await?;
+
+    let ticket_relay = doc_relay
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let (doc_receiver, mut events_receiver) =
+        receiver.docs().import_and_subscribe(ticket_relay).await?;
+    next_event_matching(&mut events_receiver, TIMEOUT, |e| {
+        matches!(
+            e,
+            LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing, .. }
+                if *from == relay_id
+        )
+    })
+    .await;
+    let namespace = doc_receiver.id();
+    drop((doc_receiver, events_receiver));
+    receiver.shutdown().await?;
+
+    let receiver = Node::persistent(&receiver_dir, loopback(receiver_key).await?)
+        .spawn()
+        .await?;
+    assert!(
+        !receiver.blobs().has(hash).await?,
+        "the receiver held the content before the restart"
+    );
+    let doc_receiver = receiver
+        .docs()
+        .open(namespace)
+        .await?
+        .context("the receiver lost the replica in the restart")?;
+    let mut events_receiver = doc_receiver.subscribe().await?;
+    doc_writer.start_sync(vec![], util::TEST_HOLDER).await?;
+    doc_receiver
+        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .await?;
+    next_event_matching(&mut events_receiver, TIMEOUT, |e| {
+        match_sync_finished(e, writer_id)
+    })
+    .await;
+    let deadline = Instant::now() + TIMEOUT;
+    while !receiver.blobs().has(hash).await? {
+        assert!(
+            Instant::now() < deadline,
+            "content the restart left missing did not arrive from the writer"
+        );
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_latest(receiver.blobs(), &doc_receiver, b"k", b"v").await;
+
+    for node in [writer, relay, receiver] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A subscriber that stops reading holds up neither the replica nor the
 /// live engine: the importing node takes in more entries and their content
 /// than its unread subscription buffers, and every one becomes readable.

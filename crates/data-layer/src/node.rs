@@ -1474,7 +1474,27 @@ impl SyncNode {
         cell: CellId,
         tickets: CellTickets,
     ) -> Result<CellCatchUp> {
+        self.import_cell_with(identity, cell, tickets, &[]).await
+    }
+
+    /// [`import_cell`](Self::import_cell) with the nodes of `others` —
+    /// tickets to the same two stores that other identities minted — among
+    /// the contacts as well, each dialed as the identity whose ticket names
+    /// it: a ticket names all its nodes as the one identity that minted it.
+    pub async fn import_cell_with(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        tickets: CellTickets,
+        others: &[CellTickets],
+    ) -> Result<CellCatchUp> {
         let stack = self.require(identity)?;
+        let membership_contacts = contacts_of(
+            &tickets.membership,
+            others.iter().map(|other| &other.membership),
+        )?;
+        let records_contacts =
+            contacts_of(&tickets.records, others.iter().map(|other| &other.records))?;
         let (membership_namespace, records_namespace) = (
             tickets.membership.capability.id(),
             tickets.records.capability.id(),
@@ -1506,6 +1526,7 @@ impl SyncNode {
                         cell,
                         &held.membership,
                         tickets.records,
+                        records_contacts,
                     )
                     .await
                 }
@@ -1513,8 +1534,6 @@ impl SyncNode {
         }
         Self::guard_cell_import(&stack, membership_namespace)?;
         Self::guard_cell_import(&stack, records_namespace)?;
-        let (membership_contacts, records_contacts) =
-            (tickets.membership.contacts(), tickets.records.contacts());
         let (membership_minted_by, records_minted_by) =
             (tickets.membership.identity, tickets.records.identity);
         let membership = stack
@@ -1556,9 +1575,10 @@ impl SyncNode {
         cell: CellId,
         membership: &Doc,
         ticket: DocTicket,
+        contacts: Vec<Contact>,
     ) -> Result<CellCatchUp> {
         Self::guard_cell_import(stack, ticket.capability.id())?;
-        let (contacts, minted_by) = (ticket.contacts(), ticket.identity);
+        let minted_by = ticket.identity;
         let records = stack.api.import_namespace(ticket.capability).await?;
         stack
             .registry
@@ -1648,13 +1668,15 @@ impl SyncNode {
         identity: PdnId,
         cell: CellId,
         membership: DocTicket,
+        others: &[DocTicket],
     ) -> Result<()> {
         let stack = self.require(identity)?;
         if stack.registry.cell(cell)?.is_some() {
             return Ok(());
         }
         Self::guard_cell_import(&stack, membership.capability.id())?;
-        let (contacts, minted_by) = (membership.contacts(), membership.identity);
+        let contacts = contacts_of(&membership, others.iter())?;
+        let minted_by = membership.identity;
         let doc = stack.api.import_namespace(membership.capability).await?;
         stack.registry.register_cell(
             cell,
@@ -2006,6 +2028,27 @@ impl SyncNode {
             in_flight = in_flight.saturating_add(running);
         }
         Ok(in_flight)
+    }
+
+    /// While `refuse`, every session on a cell's store that `identity` is
+    /// asked to serve is refused, as by a device out of reach; its own dials
+    /// go on.
+    #[cfg(feature = "test-util")]
+    pub fn refuse_cell_sessions_for_test(&self, identity: PdnId, refuse: bool) -> Result<()> {
+        self.require(identity)?.access.refuse_cell_sessions(refuse);
+        Ok(())
+    }
+
+    /// [`cell_membership`](Self::cell_membership) over a tombstone as well.
+    #[cfg(feature = "test-util")]
+    pub async fn held_cell_membership_for_test(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+    ) -> Result<Membership> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.cell(cell)?.ok_or(UnknownCell { cell })?;
+        stack.access.fold_cell(cell, &held.membership).await
     }
 
     /// Every session one of `cell`'s stores finishes from now on, dialed or
@@ -3562,6 +3605,32 @@ async fn cell_contacts(
         departed,
         unlisted,
     })
+}
+
+/// The contacts of `ticket` and of `others`, tickets to the same store,
+/// each node named as the identity whose ticket lists it.
+fn contacts_of<'a>(
+    ticket: &DocTicket,
+    others: impl Iterator<Item = &'a DocTicket>,
+) -> Result<Vec<Contact>> {
+    let namespace = ticket.capability.id();
+    let mut contacts = ticket.contacts();
+    for other in others {
+        anyhow::ensure!(
+            other.capability.id() == namespace,
+            "a ticket to {} is no ticket to {namespace}",
+            other.capability.id()
+        );
+        for contact in other.contacts() {
+            if !contacts
+                .iter()
+                .any(|known| known.addr.id == contact.addr.id && known.identity == contact.identity)
+            {
+                contacts.push(contact);
+            }
+        }
+    }
+    Ok(contacts)
 }
 
 /// The addresses a store's contacts carry, a ticket's among them: without

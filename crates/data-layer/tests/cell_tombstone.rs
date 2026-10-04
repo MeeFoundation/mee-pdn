@@ -545,3 +545,48 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
     }
     Ok(())
 }
+
+/// A leave dated before the join it ends, as a device whose clock runs
+/// behind the one that recorded the join dates it, still ends the
+/// identity's holding of the cell on each of its devices, and a join at a
+/// later sequence holds the cell again. The tombstone is written before the
+/// join's record, so its date is the earlier of the two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leave_dated_before_its_join_still_ends_holding_on_every_device() -> Result<()> {
+    let (carol_phone, carol_laptop) = (node(QUIET).await?, node(QUIET).await?);
+    let (carol, phone_directory) = host(&carol_phone).await?;
+    phone_directory.add_device(carol_laptop.node_id()).await?;
+    let ticket = phone_directory
+        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
+    let laptop_directory = join_identity(&carol_laptop, carol.id, ticket).await?;
+    let both = [carol_phone.node_id(), carol_laptop.node_id()];
+    assert!(wait_devices(&laptop_directory, &both).await?);
+    let cell = CellId::from_bytes([0x9c; 16]);
+
+    laptop_directory.tombstone_cell(cell, Seq::new(2)).await?;
+    phone_directory.record_cell(cell, Seq::FIRST).await?;
+    for directory in [&phone_directory, &laptop_directory] {
+        assert!(
+            test_utils::eventually(|| async {
+                Ok(directory.held_cells().await?.is_empty()
+                    && directory.departed_cells().await? == [cell])
+            })
+            .await?,
+            "the leave lost to a join dated after it"
+        );
+    }
+    phone_directory.record_cell(cell, Seq::new(3)).await?;
+    for directory in [&phone_directory, &laptop_directory] {
+        assert!(
+            test_utils::eventually(|| async { Ok(directory.held_cells().await? == [cell]) })
+                .await?,
+            "the join after the leave did not hold the cell again"
+        );
+    }
+
+    for node in [carol_phone, carol_laptop] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

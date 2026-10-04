@@ -14,11 +14,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use data_layer::{
-    cell_id_of, cell_ticket_kind, devices_verify, join_verifies, pdn_id_of, AcceptError,
-    AddrInfoOptions, AuthorId, CellNotice, CellStore, CellTickets, Connection, DevicesPayload,
-    DocTicket, EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice, Membership,
-    MembershipKey, OpId, Operation, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownCell,
-    UnknownEntry, ACT_PAYLOAD,
+    cell_id_of, cell_inviter_ticket_kind, cell_ticket_kind, devices_verify, join_verifies,
+    pdn_id_of, AcceptError, AddrInfoOptions, AuthorId, CellNotice, CellStore, CellTickets,
+    Connection, DevicesPayload, DocTicket, EndpointAddr, EventKind, JoinedPayload, Member,
+    MemberDevice, Membership, MembershipKey, OpId, Operation, ProtocolHandler, RecordKey, Seq,
+    SyncNode, UnknownCell, UnknownEntry, ACT_PAYLOAD,
 };
 use pdn_types::{CellId, NodeId, PdnId, RecordId, RecordKind, RecordRef};
 use rand::{rngs::SysRng, TryRng as _};
@@ -386,7 +386,7 @@ impl CellsService for RuntimeCellsService<'_> {
                 &keys.device_statement(1, vec![device]).encode(),
             )
             .await?;
-            record_cell(&node, &hosted.directory, identity, cell, Seq::FIRST, &[]).await
+            record_cell(&node, &hosted.directory, identity, cell, Seq::FIRST, None).await
         }
         .await;
         match written {
@@ -820,6 +820,10 @@ async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result
         member: identity,
         version,
     };
+    #[cfg(feature = "test-util")]
+    if state.failing_device_statements.contains(&cell) {
+        anyhow::bail!("the device statement write failed for test");
+    }
     state
         .node
         .write_cell_entry(
@@ -889,35 +893,47 @@ async fn open_tombstone(state: &State, identity: PdnId, cell: CellId) -> Result<
     else {
         return Ok(());
     };
+    let inviter = directory
+        .get_ticket(&cell_inviter_ticket_kind(&cell, CellStore::Membership))
+        .await?;
     state
         .node
-        .open_cell_tombstone(identity, cell, membership)
+        .open_cell_tombstone(identity, cell, membership, inviter.as_slice())
         .await
 }
 
 async fn open_cell(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
     let directory = &state.hosted(identity)?.directory;
-    let membership = directory
-        .get_ticket(&cell_ticket_kind(&cell, CellStore::Membership))
-        .await?;
-    let records = directory
-        .get_ticket(&cell_ticket_kind(&cell, CellStore::Records))
-        .await?;
-    let (Some(membership), Some(records)) = (membership, records) else {
+    let Some(own) = cell_tickets(directory, cell, cell_ticket_kind).await? else {
         return Ok(());
     };
+    let inviter = cell_tickets(directory, cell, cell_inviter_ticket_kind).await?;
     let _caught_up = state
         .node
-        .import_cell(
-            identity,
-            cell,
-            CellTickets {
-                membership,
-                records,
-            },
-        )
+        .import_cell_with(identity, cell, own, inviter.as_slice())
         .await?;
     Ok(())
+}
+
+/// Both stores' tickets of `cell` the directory holds under the kinds
+/// `kind` names; `None` until both have arrived.
+async fn cell_tickets(
+    directory: &data_layer::PrivateMetadataStore,
+    cell: CellId,
+    kind: fn(&CellId, CellStore) -> String,
+) -> Result<Option<CellTickets>> {
+    let membership = directory
+        .get_ticket(&kind(&cell, CellStore::Membership))
+        .await?;
+    let records = directory
+        .get_ticket(&kind(&cell, CellStore::Records))
+        .await?;
+    Ok(membership
+        .zip(records)
+        .map(|(membership, records)| CellTickets {
+            membership,
+            records,
+        }))
 }
 
 /// The author `identity` writes with here and the point of its chain its
@@ -1012,17 +1028,11 @@ async fn join_via_dialogue(
     }
 
     let cell = invite.cell;
-    let inviter = tickets.membership.nodes.clone();
-    let caught_up = node
-        .import_cell(
-            identity,
-            cell,
-            CellTickets {
-                membership: tickets.membership,
-                records: tickets.records,
-            },
-        )
-        .await?;
+    let inviter = CellTickets {
+        membership: tickets.membership,
+        records: tickets.records,
+    };
+    let caught_up = node.import_cell(identity, cell, inviter.clone()).await?;
     {
         let state = state.lock().await;
         let directory = &state.hosted(identity)?.directory;
@@ -1032,9 +1042,17 @@ async fn join_via_dialogue(
             identity,
             cell,
             Seq::new(offer.seq),
-            &inviter,
+            Some(&inviter),
         )
         .await?;
+    }
+    #[cfg(feature = "test-util")]
+    {
+        let pause = state.lock().await.join_catch_up_pause.take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
     let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
     caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
@@ -1235,39 +1253,41 @@ where
 
 /// The identity holds `cell` from `seq` of its chain on: both stores' write
 /// tickets and the cell's entry in its directory (cells D35), which reach
-/// its other devices. The tickets carry `reached` beside this device's own
-/// address — the inviter's, at a join — so a sibling, or this device after a
-/// restart, has a member's device to dial without address lookup.
+/// its other devices. Beside its own tickets go the ones the inviter handed
+/// over at a join, so a sibling, or this device after a restart, has a
+/// member's device to dial, named as that member, before its replica folds
+/// anyone.
 async fn record_cell(
     node: &data_layer::SyncNode,
     directory: &data_layer::PrivateMetadataStore,
     identity: PdnId,
     cell: CellId,
     seq: Seq,
-    reached: &[EndpointAddr],
+    inviter: Option<&CellTickets>,
 ) -> Result<()> {
-    let mut tickets = node
+    let own = node
         .share_cell_tickets(identity, cell, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    for ticket in [&mut tickets.membership, &mut tickets.records] {
-        for addr in reached {
-            if !ticket.nodes.iter().any(|known| known.id == addr.id) {
-                ticket.nodes.push(addr.clone());
-            }
-        }
+    let mut kinds = vec![
+        (
+            cell_ticket_kind(&cell, CellStore::Membership),
+            &own.membership,
+        ),
+        (cell_ticket_kind(&cell, CellStore::Records), &own.records),
+    ];
+    if let Some(inviter) = inviter {
+        kinds.push((
+            cell_inviter_ticket_kind(&cell, CellStore::Membership),
+            &inviter.membership,
+        ));
+        kinds.push((
+            cell_inviter_ticket_kind(&cell, CellStore::Records),
+            &inviter.records,
+        ));
     }
-    directory
-        .put_ticket(
-            &cell_ticket_kind(&cell, CellStore::Membership),
-            &tickets.membership,
-        )
-        .await?;
-    directory
-        .put_ticket(
-            &cell_ticket_kind(&cell, CellStore::Records),
-            &tickets.records,
-        )
-        .await?;
+    for (kind, ticket) in kinds {
+        directory.put_ticket(&kind, ticket).await?;
+    }
     directory.record_cell(cell, seq).await
 }
 

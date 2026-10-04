@@ -129,6 +129,10 @@ pub(crate) struct AccessBook {
     retractions: Arc<RwLock<HashMap<NamespaceId, ArmedRetractions>>>,
     #[cfg(feature = "test-util")]
     cell_verdicts: OnceLock<CellVerdictSink>,
+    /// Refuses every cell session this identity is asked to serve, as a
+    /// device out of reach answers none.
+    #[cfg(feature = "test-util")]
+    refuse_cells: std::sync::atomic::AtomicBool,
 }
 
 /// Where each fold's verdicts go once a scenario takes the channel.
@@ -147,7 +151,15 @@ impl AccessBook {
             retractions: Arc::default(),
             #[cfg(feature = "test-util")]
             cell_verdicts: OnceLock::new(),
+            #[cfg(feature = "test-util")]
+            refuse_cells: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn refuse_cell_sessions(&self, refuse: bool) {
+        self.refuse_cells
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn set_blobs(&self, blobs: iroh_blobs::api::Store) {
@@ -408,6 +420,12 @@ impl AccessBook {
             },
             SessionRole::Accept => SessionAccess::Deny,
         };
+        #[cfg(feature = "test-util")]
+        if matches!(role, SessionRole::Accept)
+            && self.refuse_cells.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(SessionAccess::Deny);
+        }
         if remote == identity_of(self.identity) {
             // A sibling is served the store whole, a tombstone included.
             let peer_key = crate::private_metadata::device_key(&peer);

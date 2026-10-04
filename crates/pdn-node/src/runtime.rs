@@ -198,6 +198,14 @@ pub(crate) struct State {
     /// the statement are written, before the tickets go out: a reply lost.
     #[cfg(feature = "test-util")]
     pub(crate) drop_next_join_reply: bool,
+    /// A pause of the next join once both tickets and the directory's entry
+    /// are recorded, before its catch-up wait.
+    #[cfg(feature = "test-util")]
+    pub(crate) join_catch_up_pause: Option<Arc<CeremonyPause>>,
+    /// Cells whose device statement every write fails in, as a process
+    /// ended before it landed; a restart clears it.
+    #[cfg(feature = "test-util")]
+    pub(crate) failing_device_statements: HashSet<pdn_types::CellId>,
     /// Fails the next `create` where its directory would be made — a step
     /// between provisioning an identity and hosting it, which a full disk is
     /// the product's reason to reach.
@@ -256,6 +264,10 @@ impl State {
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
             drop_next_join_reply: false,
+            #[cfg(feature = "test-util")]
+            join_catch_up_pause: None,
+            #[cfg(feature = "test-util")]
+            failing_device_statements: HashSet::new(),
             #[cfg(feature = "test-util")]
             fail_next_directory_create: false,
             #[cfg(feature = "test-util")]
@@ -421,7 +433,8 @@ impl Runtime {
         self.state.lock().await.drop_next_join_reply = true;
     }
 
-    /// The membership `identity`'s replica of `cell` folds into.
+    /// The membership `identity`'s replica of `cell`'s membership store
+    /// folds into, a tombstone's included.
     #[cfg(feature = "test-util")]
     pub async fn cell_membership_for_test(
         &self,
@@ -429,7 +442,55 @@ impl Runtime {
         cell: pdn_types::CellId,
     ) -> anyhow::Result<data_layer::Membership> {
         let node = Arc::clone(&self.state.lock().await.node);
-        node.cell_membership(identity, cell).await
+        node.held_cell_membership_for_test(identity, cell).await
+    }
+
+    /// The record view over `identity`'s replica of `cell`'s record store,
+    /// every entry it holds beside its verdict.
+    #[cfg(feature = "test-util")]
+    pub async fn cell_record_view_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        cell: pdn_types::CellId,
+    ) -> anyhow::Result<data_layer::RecordView> {
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.cell_record_view(identity, cell).await
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn pause_next_join_catch_up(&self) -> Arc<CeremonyPause> {
+        let pause = Arc::new(CeremonyPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        self.state.lock().await.join_catch_up_pause = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// Every device statement this runtime writes into `cell` fails from
+    /// now on, until the runtime restarts.
+    #[cfg(feature = "test-util")]
+    pub async fn fail_device_statements_for_test(&self, cell: pdn_types::CellId) {
+        self.state
+            .lock()
+            .await
+            .failing_device_statements
+            .insert(cell);
+    }
+
+    /// While `refuse`, every session on a cell's store `identity` is asked
+    /// to serve here is refused, as by a device out of reach.
+    #[cfg(feature = "test-util")]
+    pub async fn refuse_cell_sessions_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        refuse: bool,
+    ) -> anyhow::Result<()> {
+        self.state
+            .lock()
+            .await
+            .node
+            .refuse_cell_sessions_for_test(identity, refuse)
     }
 
     /// The cells `identity` holds on this node, each with whether its

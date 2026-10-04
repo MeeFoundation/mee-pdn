@@ -64,7 +64,7 @@ pub use pdn_store::{
     AuthorId, Contact, DocTicket, Identity, NamespaceId,
 };
 pub use private_metadata::{
-    cell_ticket_kind, CatchUpTimeout, CatchUpWatch, PrivateMetadataStore, RetractionHead,
-    RetractionMarker,
+    cell_inviter_ticket_kind, cell_ticket_kind, CatchUpTimeout, CatchUpWatch, PrivateMetadataStore,
+    RetractionHead, RetractionMarker,
 };
 pub use retraction::RetractionVerdict;

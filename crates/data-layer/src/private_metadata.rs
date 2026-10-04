@@ -112,13 +112,24 @@ const RETRACTIONS_PREFIX: &str = "retractions/";
 const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
 const CELLS_PREFIX: &str = "cells/";
 
-/// The directory kind of one of a cell's stores' write tickets.
+/// The directory kind of one of a cell's stores' write tickets, minted by
+/// the identity itself: its own devices are the nodes it names.
 pub fn cell_ticket_kind(cell: &CellId, store: CellStore) -> String {
-    let store = match store {
+    format!("cell/{cell}/{}", cell_store_name(store))
+}
+
+/// The directory kind of the write ticket to one of a cell's stores that
+/// the device which invited the identity handed over, naming that device
+/// as the inviter: a ticket names all its nodes as one identity.
+pub fn cell_inviter_ticket_kind(cell: &CellId, store: CellStore) -> String {
+    format!("cell/{cell}/inviter/{}", cell_store_name(store))
+}
+
+fn cell_store_name(store: CellStore) -> &'static str {
+    match store {
         CellStore::Membership => "membership",
         CellStore::Records => "records",
-    };
-    format!("cell/{cell}/{store}")
+    }
 }
 
 fn cell_record_key(cell: &CellId, seq: Seq) -> String {

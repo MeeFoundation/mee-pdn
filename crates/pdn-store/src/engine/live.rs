@@ -932,6 +932,13 @@ impl LiveActor {
                 .subscribe(self.replica_events_tx.clone());
             self.sync.open(namespace, opts).await?;
             self.state.insert(namespace);
+            // Before the first dial, so the first finished session retries it.
+            if let Err(err) = self.park_missing_content(namespace).await {
+                warn!(
+                    ?namespace,
+                    "parking the content its entries lack failed: {err:#}"
+                );
+            }
         }
         if let Some(handed) = handed {
             self.join_peers(namespace, peers, handed, join_gossip)
@@ -967,6 +974,31 @@ impl LiveActor {
         }
         self.join_peers(namespace, peers, recorded, join_gossip)
             .await?;
+        Ok(())
+    }
+
+    /// Park the content of every entry of `namespace` the download policy
+    /// wants and the blob store does not hold whole, as a remote insert
+    /// parks it. The parked set lives in memory: without this, content whose
+    /// download a restart cut short is never asked for again, since a
+    /// session after the restart finds no entry to exchange.
+    async fn park_missing_content(&mut self, namespace: NamespaceId) -> Result<()> {
+        let policy = self.sync.get_download_policy(namespace).await?;
+        let (tx, mut rx) = irpc::channel::mpsc::channel(64);
+        self.sync
+            .get_many(namespace, crate::store::Query::all().into(), tx)
+            .await?;
+        while let Some(entry) = rx.recv().await? {
+            let entry = entry?;
+            if entry.content_len() == 0 || !policy.matches(entry.entry()) {
+                continue;
+            }
+            let hash = entry.content_hash();
+            let status = self.bao_store.blobs().status(hash).await;
+            if !matches!(status, Ok(BlobStatus::Complete { .. })) {
+                self.missing_hashes.insert((namespace, hash));
+            }
+        }
         Ok(())
     }
 
