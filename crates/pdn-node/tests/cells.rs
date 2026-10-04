@@ -14,8 +14,9 @@ use data_layer::{
 };
 use pdn_node::{
     ActRefusal, ActRefused, CellAct, CellInvite, CellMember, CellsService as _,
-    IdentityService as _, JoinRefused, RecordPlacedOnce, Runtime, SpawnOptions, UnknownCell,
-    UnknownIdentity, UnknownRecord, UnsupportedCellInviteVersion, WrongRecordKind,
+    ConnectionsService as _, IdentityService as _, JoinRefused, RecordPlacedOnce, Runtime,
+    SpawnOptions, UnknownCell, UnknownIdentity, UnknownRecord, UnsupportedCellInviteVersion,
+    WrongRecordKind,
 };
 use pdn_types::{CellId, PdnId, RecordId, RecordKind, RecordRef};
 use test_utils::{eventually, ids};
@@ -713,6 +714,99 @@ async fn any_member_edits_another_members_mergeable_document() -> Result<()> {
     Ok(())
 }
 
+/// Three identities with no connection to one another share through one
+/// cell: a claim one invited member places reads on the other's device, and
+/// none of the three lists a connection. Denied: an identity on that
+/// device's node holding a connection with the claim's author and no
+/// membership lists no such cell and reads nothing of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn three_identities_share_through_a_cell_with_no_connections() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let cell = cell_of_three(
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    )
+    .await?;
+    let claim = bob_phone
+        .cells()
+        .put_record(bob, cell, RecordKind::Claim, b"lease scan")
+        .await?;
+    assert!(reads(&carol_phone, carol, cell, claim, b"lease scan").await?);
+    for (runtime, holder) in [
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    ] {
+        assert!(runtime.connections().list(holder).await?.is_empty());
+    }
+
+    // Denied: a connection with the author, no membership.
+    let erin = carol_phone.identity().create().await?;
+    let invite = bob_phone.connections().invite(bob, None).await?;
+    carol_phone.connections().establish(erin, invite).await?;
+    assert_eq!(carol_phone.connections().list(erin).await?, [bob]);
+    assert!(carol_phone.cells().list(erin).await?.is_empty());
+    let refused = carol_phone.cells().read(erin, cell, claim).await;
+    assert!(refused.is_err_and(|err| is::<UnknownCell>(&err)));
+
+    for runtime in [alice_phone, bob_phone, carol_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Two cells with the same members keep their entries apart: a claim placed
+/// in each reads there on the other member's device, and neither cell's
+/// stores hold an entry of the other's claim. Denied: each claim addressed
+/// at the other cell, by either member, reads nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_cells_with_the_same_members_keep_their_entries_apart() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let household = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    let taxes = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    let lease = bob_phone
+        .cells()
+        .put_record(bob, taxes, RecordKind::Claim, b"lease scan")
+        .await?;
+    let shopping = bob_phone
+        .cells()
+        .put_record(bob, household, RecordKind::Claim, b"shopping list")
+        .await?;
+    assert!(reads(&alice_phone, alice, taxes, lease, b"lease scan").await?);
+    assert!(reads(&alice_phone, alice, household, shopping, b"shopping list").await?);
+
+    for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
+        for (cell, own) in [(taxes, lease), (household, shopping)] {
+            assert_eq!(runtime.cells().list_records(holder, cell).await?, [own]);
+            let view = runtime.cell_record_view_for_test(holder, cell).await?;
+            let held: Vec<_> = view
+                .verdicts()
+                .map(|(entry, _)| RecordKey::parse(&entry.key).map(|key| key.record()))
+                .collect();
+            assert_eq!(held, [Some(own)]);
+            assert!(runtime.cells().list_unknown(holder, cell).await?.is_empty());
+        }
+        // Denied: the other cell's claim.
+        assert_eq!(runtime.cells().read(holder, household, lease).await?, None);
+        assert_eq!(runtime.cells().read(holder, taxes, shopping).await?, None);
+    }
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A cell `alice` created on `alice_phone`, `bob` and `carol` invited by her.
 async fn cell_of_three(
     (alice_phone, alice): (&Runtime, PdnId),
@@ -1083,14 +1177,19 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
 /// from the identity's directory, read it, and register themselves, so the
 /// owner's device reads what they write and serves one of them with every
 /// other device of the member gone. Denied: a co-located identity that is
-/// no member lists no such cell and reads nothing of it.
+/// no member lists no such cell and reads nothing of it. A linked device's
+/// first session can reach its sibling before its confirmation does, and is
+/// refused; its cell pass, every half second here, opens the next one.
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_linked_before_and_after_the_join_reach_the_cell() -> Result<()> {
-    let (alice_phone, bob_phone, bob_laptop, bob_tablet) = (
-        memory_runtime().await?,
-        memory_runtime().await?,
-        memory_runtime().await?,
-        memory_runtime().await?,
+    let quick = || SpawnOptions {
+        cell_reconcile_interval: Duration::from_millis(500),
+        ..SpawnOptions::memory()
+    };
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let (bob_laptop, bob_tablet) = (
+        Runtime::spawn(quick()).await?,
+        Runtime::spawn(quick()).await?,
     );
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
