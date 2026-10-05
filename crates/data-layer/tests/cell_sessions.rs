@@ -501,10 +501,11 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
 }
 
 /// A newcomer is refused by a member device its joined event has not
-/// reached, and served once the event arrives there.
+/// reached, and served once the event arrives there: without an anchored
+/// log the serving device cannot tell it from a stranger.
 #[allow(clippy::too_many_lines)] // one scenario: the refusal and the arrival that ends it
 #[tokio::test(flavor = "multi_thread")]
-async fn a_newcomer_is_served_once_its_joined_event_arrives() -> Result<()> {
+async fn wrongly_refused_without_anchoring_d19() -> Result<()> {
     let (alice_phone, bob_phone, carol_phone) =
         (node(QUIET).await?, node(QUIET).await?, node(QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;

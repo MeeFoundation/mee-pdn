@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    AnnouncementKeyPair, CellStore, EventKind, ForNothing, MemberDevice, MembershipKey, OpId,
-    RecordKey, Seq, SpawnOptions, SyncNode, UnknownCell, UnknownEntry, Verdict,
+    identity_of, AnnouncementKeyPair, CellStore, Contact, EventKind, ForNothing, MemberDevice,
+    MembershipKey, OpId, RecordKey, Seq, SpawnOptions, SyncNode, UnknownCell, UnknownEntry,
+    Verdict,
 };
 use pdn_types::{CellId, PdnId, RecordId};
-use test_utils::{cell as c, eventually, host_identity, memory_node};
+use test_utils::{cell as c, eventually, host_identity, memory_node, TIMEOUT};
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
 /// not name.
@@ -41,6 +42,46 @@ async fn lists_unknown(
     entry: &UnknownEntry,
 ) -> Result<bool> {
     eventually(|| async { Ok(node.list_cell_unknown(holder, cell).await?.contains(entry)) }).await
+}
+
+/// Whether `cell`'s stores come to have nothing in flight on every one of
+/// `nodes` — no exchange running, held or due to redial — in two reads in
+/// a row: a dial one node still makes lands on another between two reads.
+async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut quiet_reads = 0_u8;
+    while std::time::Instant::now() < deadline {
+        let mut in_flight = 0_usize;
+        for node in nodes {
+            in_flight = in_flight.saturating_add(node.cell_syncs_in_flight_for_test(cell).await?);
+        }
+        quiet_reads = if in_flight == 0 {
+            quiet_reads.saturating_add(1)
+        } else {
+            0
+        };
+        if quiet_reads == 2 {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
+}
+
+/// The entries received and sent by the session `holder`'s replica of
+/// `cell`'s `store` on `from` dials next to `callee`'s on `to`.
+async fn next_session_exchanges(
+    (from, holder): (&SyncNode, &c::Person),
+    cell: CellId,
+    store: CellStore,
+    (to, callee): (&SyncNode, &c::Person),
+) -> Result<Option<(usize, usize)>> {
+    let mut sessions = from.watch_cell_sessions(holder.id, cell, store).await?;
+    let contact = Contact::new(to.dial_handle().addr(), identity_of(callee.id));
+    from.sync_cell_with_for_test(holder.id, cell, store, contact)
+        .await?;
+    let session = sessions.next_with(to.node_id(), true, TIMEOUT).await?;
+    Ok(session.and_then(|session| session.exchanged.ok()))
 }
 
 /// An identity whose `PdnId` derives from the announcement key pair beside it.
@@ -328,7 +369,8 @@ async fn a_relayed_claim_reads_as_its_authors_and_the_relays_entry_at_its_key_by
 
 /// An entry a member writes outside the key layout of either store reaches
 /// every member device and is listed there with its author, every record
-/// and every member reading as before. Denied: a holder of both tickets
+/// and every member reading as before, and a later session between two
+/// member devices finds no difference. Denied: a holder of both tickets
 /// that is no member lists nothing.
 #[allow(clippy::too_many_lines)] // one scenario: both stores' unknown entries beside the denial
 #[tokio::test(flavor = "multi_thread")]
@@ -401,6 +443,17 @@ async fn an_unknown_entry_from_a_member_converges_and_changes_nothing() -> Resul
         assert!(c::reads(phone, holder.id, cell, claim).await?);
         assert_eq!(c::state_on(phone, holder.id, cell, bob.id).await, PLAIN);
     }
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], cell).await?);
+    for store in [CellStore::Membership, CellStore::Records] {
+        for other in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+            let found = next_session_exchanges((&alice_phone, &alice), cell, store, other).await?;
+            assert_eq!(
+                found,
+                Some((0, 0)),
+                "{store:?}: a later session found a difference"
+            );
+        }
+    }
     // Denied: the ticket holder that is no member.
     assert!(dave_phone
         .list_cell_unknown(dave.id, cell)
@@ -415,26 +468,40 @@ async fn an_unknown_entry_from_a_member_converges_and_changes_nothing() -> Resul
 
 /// An entry outside the key layout that a member relays, authored by a key
 /// no member's statement lists, is held on every member device and listed
-/// with that author, and changes no record and no member.
+/// with that author, changes no record and no member, and a later session
+/// between two member devices finds no difference.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_entry_is_held_whoever_authored_it() -> Result<()> {
-    let (alice_phone, dave_phone) = (quiet_node().await?, quiet_node().await?);
+    let (alice_phone, bob_phone, dave_phone) = (
+        quiet_node().await?,
+        quiet_node().await?,
+        quiet_node().await?,
+    );
     let (alice, _) = c::host(&alice_phone).await?;
+    let (bob, _) = c::host(&bob_phone).await?;
     let (dave, _) = c::host(&dave_phone).await?;
     let cell = c::found(&alice_phone, &alice).await?;
-    c::invite(
-        &alice_phone,
-        &alice,
-        cell,
-        &dave,
-        vec![c::device_of(&dave_phone, &dave)?],
-    )
-    .await?;
-    dave_phone
-        .import_cell(dave.id, cell, c::tickets(&alice_phone, &alice, cell).await?)
+    for (phone, member) in [(&bob_phone, &bob), (&dave_phone, &dave)] {
+        c::invite(
+            &alice_phone,
+            &alice,
+            cell,
+            member,
+            vec![c::device_of(phone, member)?],
+        )
         .await?;
+    }
+    let tickets = c::tickets(&alice_phone, &alice, cell).await?;
+    for (phone, holder) in [(&bob_phone, &bob), (&dave_phone, &dave)] {
+        phone.import_cell(holder.id, cell, tickets.clone()).await?;
+    }
     let claim = c::place_claim(&alice_phone, &alice, cell, 1).await?;
     assert!(c::reads(&dave_phone, dave.id, cell, claim).await?);
+    // Dave's phone serves the pulls of its writes once it knows the readers.
+    for (phone, reader) in [(&alice_phone, &alice), (&bob_phone, &bob)] {
+        let device = c::device_of(phone, reader)?;
+        assert!(c::lists_device(&dave_phone, dave.id, cell, reader.id, device).await?);
+    }
 
     let stranger = dave_phone.create_author(dave.id).await?;
     let relayed = UnknownEntry {
@@ -445,17 +512,27 @@ async fn an_unknown_entry_is_held_whoever_authored_it() -> Result<()> {
     dave_phone
         .write_cell_entry_as_for_test(dave.id, cell, relayed.store, stranger, &relayed.key, b"x")
         .await?;
-    assert!(
-        lists_unknown(&alice_phone, alice.id, cell, &relayed).await?,
-        "a member device did not hold an unknown entry of an unlisted author"
-    );
-    assert!(c::reads(&alice_phone, alice.id, cell, claim).await?);
-    assert_eq!(
-        c::state_on(&alice_phone, alice.id, cell, dave.id).await,
-        PLAIN
-    );
+    for (phone, holder) in [(&alice_phone, &alice), (&bob_phone, &bob)] {
+        assert!(
+            lists_unknown(phone, holder.id, cell, &relayed).await?,
+            "a member device did not hold an unknown entry of an unlisted author"
+        );
+        assert!(c::reads(phone, holder.id, cell, claim).await?);
+        assert_eq!(c::state_on(phone, holder.id, cell, dave.id).await, PLAIN);
+    }
+    assert!(settle(&[&alice_phone, &bob_phone, &dave_phone], cell).await?);
+    for store in [CellStore::Membership, CellStore::Records] {
+        for other in [(&bob_phone, &bob), (&dave_phone, &dave)] {
+            let found = next_session_exchanges((&alice_phone, &alice), cell, store, other).await?;
+            assert_eq!(
+                found,
+                Some((0, 0)),
+                "{store:?}: a later session found a difference"
+            );
+        }
+    }
 
-    for node in [alice_phone, dave_phone] {
+    for node in [alice_phone, bob_phone, dave_phone] {
         node.shutdown().await?;
     }
     Ok(())

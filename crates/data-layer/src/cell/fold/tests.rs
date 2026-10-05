@@ -695,3 +695,378 @@ fn an_entry_outside_the_layout_changes_no_member() {
     assert_eq!(membership.verdicts().last(), Some(&Verdict::OutsideLayout));
     assert_eq!(state(&membership, &cast.alice), OWNER);
 }
+
+/// A row of a verdict class's table: what the case is, and its check.
+type Case = (&'static str, fn(&Cast, &str));
+
+/// What the fold counts on honest devices, one case per row over the
+/// entries one device holds. The session that brings a newcomer's device
+/// the store from nothing is `a_member_device_is_served_and_a_ticket_holder_is_not`
+/// in `tests/cell_sessions.rs`. Paired: `rightly_counted_for_nothing`.
+#[allow(clippy::too_many_lines)] // one table: every case of the class
+#[test]
+fn rightly_counted() {
+    let cases: [Case; 9] = [
+        ("the founding event deriving the cell id", |cast, case| {
+            let membership = Store::founded_by(&cast.alice).fold();
+            assert_eq!(verdict(&membership, 0), Verdict::Counted, "{case}");
+            assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
+        }),
+        ("a join by a plain member", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            let joined = store.invite(&cast.bob, 1, &cast.carol);
+            let membership = store.fold();
+            assert_eq!(verdict(&membership, joined), Verdict::Counted, "{case}");
+            assert_eq!(state(&membership, &cast.carol), PLAIN, "{case}");
+        }),
+        (
+            "a promotion by an owner naming its own point",
+            |cast, case| {
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                let promoted = store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
+                let membership = store.fold();
+                assert_eq!(verdict(&membership, promoted), Verdict::Counted, "{case}");
+                assert_eq!(state(&membership, &cast.bob), OWNER, "{case}");
+            },
+        ),
+        (
+            "a promotion by an owner demoted later, on a device linked after the demotion",
+            |cast, case| {
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                store.invite(&cast.alice, 1, &cast.carol);
+                store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
+                let promoted = store.act(EventKind::Promoted, &cast.carol, 2, &cast.bob, 2);
+                store.act(EventKind::Demoted, &cast.bob, 3, &cast.alice, 1);
+                let membership = store.fold();
+                assert_eq!(verdict(&membership, promoted), Verdict::Counted, "{case}");
+                assert_eq!(state(&membership, &cast.carol), OWNER, "{case}");
+                assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
+            },
+        ),
+        ("a leave by the member itself", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            let left = store.act(EventKind::Left, &cast.bob, 2, &cast.bob, 1);
+            let membership = store.fold();
+            assert_eq!(verdict(&membership, left), Verdict::Counted, "{case}");
+            assert_eq!(state(&membership, &cast.bob), OUT, "{case}");
+        }),
+        (
+            "a former owner invited again by a plain member, as a plain member",
+            |cast, case| {
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                store.invite(&cast.alice, 1, &cast.carol);
+                store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
+                store.act(EventKind::Left, &cast.bob, 3, &cast.bob, 2);
+                let back = store.join(&cast.carol, 1, &cast.bob, 4);
+                let membership = store.fold();
+                assert_eq!(verdict(&membership, back), Verdict::Counted, "{case}");
+                assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
+            },
+        ),
+        (
+            "a newcomer's device folding from nothing, each statement before its join",
+            |cast, case| {
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                store.invite(&cast.bob, 1, &cast.carol);
+                let b2 = device(0xb2);
+                store.statement(&cast.bob, 2, &[cast.bob.device, b2], b2.author);
+                let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
+                let membership = Membership::fold(&store.cell, &backwards);
+                assert!(
+                    membership.verdicts().iter().all(|v| *v == Verdict::Counted),
+                    "{case}"
+                );
+                assert_eq!(state(&membership, &cast.carol), PLAIN, "{case}");
+                let bob = membership.member(&cast.bob.id()).unwrap();
+                assert_eq!(bob.devices, BTreeSet::from([cast.bob.device, b2]), "{case}");
+            },
+        ),
+        ("a device statement whoever relays it", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            let b2 = device(0xb2);
+            let relayed =
+                store.statement(&cast.bob, 2, &[cast.bob.device, b2], cast.alice.author());
+            let membership = store.fold();
+            assert_eq!(verdict(&membership, relayed), Verdict::Counted, "{case}");
+            let bob = membership.member(&cast.bob.id()).unwrap();
+            assert!(bob.devices.contains(&b2), "{case}");
+        }),
+        (
+            "two owners' events at one point, both held and resolved alike on every device",
+            |cast, case| {
+                let mut store = two_owners(cast);
+                let promotion = store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
+                let kick = store.act(EventKind::Kicked, &cast.bob, 2, &cast.carol, 2);
+                let forward = store.fold();
+                let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
+                let other_device = Membership::fold(&store.cell, &backwards);
+                for membership in [&forward, &other_device] {
+                    assert_eq!(state(membership, &cast.bob), OUT, "{case}");
+                }
+                for entry in [promotion, kick] {
+                    assert_eq!(verdict(&forward, entry), Verdict::Counted, "{case}");
+                    let mirrored = store.entries.len() - 1 - entry;
+                    assert_eq!(verdict(&other_device, mirrored), Verdict::Counted, "{case}");
+                }
+            },
+        ),
+    ];
+    let cast = Cast::new();
+    for (case, check) in cases {
+        check(&cast, case);
+    }
+}
+
+/// What the fold holds and counts for nothing on honest devices, one case
+/// per row over the entries one device holds. A kicked member's device
+/// asking for a session is refused in
+/// `a_member_device_is_served_and_a_ticket_holder_is_not` in
+/// `tests/cell_sessions.rs`. Paired: `rightly_counted`.
+#[allow(clippy::too_many_lines)] // one table: every case of the class
+#[test]
+fn rightly_counted_for_nothing() {
+    let cases: [Case; 8] = [
+        ("a promotion or a kick by a plain member", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            store.invite(&cast.alice, 1, &cast.carol);
+            let promoted = store.act(EventKind::Promoted, &cast.bob, 2, &cast.carol, 1);
+            let kicked = store.act(EventKind::Kicked, &cast.bob, 2, &cast.carol, 1);
+            let membership = store.fold();
+            for entry in [promoted, kicked] {
+                assert_eq!(
+                    verdict(&membership, entry),
+                    nothing(ForNothing::ActorLacksState),
+                    "{case}"
+                );
+            }
+            assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
+        }),
+        ("a leave by anyone but its subject", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            let left = store.act(EventKind::Left, &cast.bob, 2, &cast.alice, 1);
+            let membership = store.fold();
+            assert_eq!(
+                verdict(&membership, left),
+                nothing(ForNothing::WrongActor),
+                "{case}"
+            );
+            assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
+        }),
+        ("a join, a kick or a demotion by its subject itself", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            let joined = store.join(&cast.alice, 1, &cast.alice, 2);
+            let kicked = store.act(EventKind::Kicked, &cast.alice, 2, &cast.alice, 1);
+            let demoted = store.act(EventKind::Demoted, &cast.alice, 2, &cast.alice, 1);
+            let membership = store.fold();
+            for entry in [joined, kicked, demoted] {
+                assert_eq!(
+                    verdict(&membership, entry),
+                    nothing(ForNothing::WrongActor),
+                    "{case}"
+                );
+            }
+            assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
+        }),
+        (
+            "a founding event that does not derive the cell id, in any order, served first to a device holding nothing",
+            |cast, case| {
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                store.write(
+                    MembershipKey::founded(cast.bob.id()),
+                    cast.bob.author(),
+                    cast.bob.keys.founding([0x5a; 16]).encode(),
+                );
+                let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
+                let membership = Membership::fold(&store.cell, &backwards);
+                assert_eq!(
+                    membership.verdicts()[0],
+                    nothing(ForNothing::OtherCell),
+                    "{case}"
+                );
+                assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
+
+                let mut invented = Store {
+                    cell: store.cell,
+                    entries: Vec::new(),
+                };
+                let founding = invented.write(
+                    MembershipKey::founded(cast.bob.id()),
+                    cast.bob.author(),
+                    cast.bob.keys.founding([0x5a; 16]).encode(),
+                );
+                let membership = invented.fold();
+                assert_eq!(
+                    verdict(&membership, founding),
+                    nothing(ForNothing::OtherCell),
+                    "{case}"
+                );
+                assert_eq!(state(&membership, &cast.bob), OUT, "{case}");
+            },
+        ),
+        ("an event by a key no member's statement lists", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            let forged = store.write(
+                event(cast.bob.id(), 2, EventKind::Promoted, cast.alice.id(), 1),
+                cast.dave.author(),
+                vec![0],
+            );
+            let membership = store.fold();
+            assert_eq!(
+                verdict(&membership, forged),
+                nothing(ForNothing::AuthorNotActorDevice),
+                "{case}"
+            );
+            assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
+        }),
+        ("a device statement under a wrong announcement key", |cast, case| {
+            let mut store = Store::founded_by(&cast.alice);
+            store.invite(&cast.alice, 1, &cast.bob);
+            let forged = store.write(
+                MembershipKey::Devices {
+                    member: cast.bob.id(),
+                    version: 2,
+                },
+                cast.dave.author(),
+                cast.dave
+                    .keys
+                    .device_statement(2, vec![cast.dave.device])
+                    .encode(),
+            );
+            let membership = store.fold();
+            assert_eq!(
+                verdict(&membership, forged),
+                nothing(ForNothing::BadSignature),
+                "{case}"
+            );
+            let bob = membership.member(&cast.bob.id()).unwrap();
+            assert_eq!(bob.devices, BTreeSet::from([cast.bob.device]), "{case}");
+        }),
+        (
+            "a join under a key that does not derive its member's PdnId, or with a copied join statement",
+            |cast, case| {
+                let mallory = Person::new(0x66);
+                let erin = Person::new(0xe0);
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                store.invite(&cast.alice, 1, &cast.carol);
+                store.act(EventKind::Left, &cast.carol, 2, &cast.carol, 1);
+                let minted = |seq| {
+                    mallory
+                        .keys
+                        .join_statement(&store.cell, Seq::new(seq))
+                        .encode()
+                };
+                let (at_three, at_one) = (minted(3), minted(1));
+                let copied = cast
+                    .carol
+                    .keys
+                    .join_statement(&store.cell, Seq::new(1))
+                    .encode();
+                let next_sequence = store.write(
+                    event(cast.carol.id(), 3, EventKind::Joined, cast.bob.id(), 1),
+                    cast.bob.author(),
+                    at_three,
+                );
+                let first_sequence = store.write(
+                    event(cast.carol.id(), 1, EventKind::Joined, cast.bob.id(), 1),
+                    cast.bob.author(),
+                    at_one.clone(),
+                );
+                let never_member = store.write(
+                    event(erin.id(), 1, EventKind::Joined, cast.bob.id(), 1),
+                    cast.bob.author(),
+                    at_one,
+                );
+                let copy = store.write(
+                    event(cast.carol.id(), 3, EventKind::Joined, cast.alice.id(), 1),
+                    cast.alice.author(),
+                    copied,
+                );
+                let membership = store.fold();
+                for entry in [next_sequence, first_sequence, never_member] {
+                    assert_eq!(
+                        verdict(&membership, entry),
+                        nothing(ForNothing::KeyOfAnother),
+                        "{case}"
+                    );
+                }
+                assert_eq!(
+                    verdict(&membership, copy),
+                    nothing(ForNothing::BadSignature),
+                    "{case}"
+                );
+                assert_eq!(state(&membership, &cast.carol), OUT, "{case}");
+                assert_eq!(state(&membership, &erin), OUT, "{case}");
+            },
+        ),
+        (
+            "an event naming an actor point the device does not hold, until the point arrives",
+            |cast, case| {
+                let mut store = Store::founded_by(&cast.alice);
+                store.invite(&cast.alice, 1, &cast.bob);
+                store.invite(&cast.alice, 1, &cast.carol);
+                let ahead = store.act(EventKind::Promoted, &cast.carol, 2, &cast.bob, 2);
+                let membership = store.fold();
+                assert_eq!(
+                    verdict(&membership, ahead),
+                    Verdict::NotYet(Awaiting::ActorChain),
+                    "{case}"
+                );
+                assert_eq!(state(&membership, &cast.carol), PLAIN, "{case}");
+
+                store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
+                let membership = store.fold();
+                assert_eq!(verdict(&membership, ahead), Verdict::Counted, "{case}");
+                assert_eq!(state(&membership, &cast.carol), OWNER, "{case}");
+            },
+        ),
+    ];
+    let cast = Cast::new();
+    for (case, check) in cases {
+        check(&cast, case);
+    }
+}
+
+/// An event whose actor point no live device holds — the owner that wrote
+/// that point died before spreading it — is never counted, and its subject
+/// becomes an owner only through a promotion a current owner issues anew at
+/// a point every device holds. Paired: that promotion counts.
+#[test]
+fn wrongly_left_uncounted_without_anchoring_d23() {
+    let cast = Cast::new();
+    let (alice, bob, carol, dave) = (&cast.alice, &cast.bob, &cast.carol, &cast.dave);
+    let mut store = Store::founded_by(alice);
+    for newcomer in [bob, carol, dave] {
+        store.invite(alice, 1, newcomer);
+    }
+    store.act(EventKind::Promoted, bob, 2, alice, 1);
+    // Bob's promotion of Carol at Carol's sequence 2 reached Carol's device
+    // alone, and both devices died: no device here holds that point.
+    let stranded = store.act(EventKind::Promoted, dave, 2, carol, 2);
+    let membership = store.fold();
+    assert_eq!(
+        verdict(&membership, stranded),
+        Verdict::NotYet(Awaiting::ActorChain)
+    );
+    assert_eq!(state(&membership, dave), PLAIN);
+
+    let anew = store.act(EventKind::Promoted, dave, 3, alice, 1);
+    let membership = store.fold();
+    assert_eq!(verdict(&membership, anew), Verdict::Counted);
+    assert_eq!(
+        verdict(&membership, stranded),
+        Verdict::NotYet(Awaiting::ActorChain)
+    );
+    assert_eq!(state(&membership, dave), OWNER);
+}
