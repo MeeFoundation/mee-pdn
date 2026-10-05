@@ -28,7 +28,7 @@ pub(crate) async fn invite(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<InvitePayload>, HostError> {
     let lifetime: Lifetime = parse::query(raw_query.as_deref(), "invite query")?;
-    let identity = parse::id(&identity, "identity")?;
+    let identity = parse::segment(&identity, "identity")?;
     let payload = runtime
         .connections()
         .invite(identity, lifetime.as_duration()?)
@@ -43,7 +43,7 @@ pub(crate) async fn establish(
     Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
-    let identity = parse::id(&identity, "identity")?;
+    let identity = parse::segment(&identity, "identity")?;
     let invite: InvitePayload = parse::json(&body, "invite payload")?;
     runtime.connections().establish(identity, invite).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -55,7 +55,7 @@ pub(crate) async fn list(
     Path(identity): Path<String>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<Connections>, HostError> {
-    let identity = parse::id(&identity, "identity")?;
+    let identity = parse::segment(&identity, "identity")?;
     let connections = runtime.connections().list(identity).await?;
     Ok(Json(Connections { connections }))
 }
@@ -67,8 +67,8 @@ pub(crate) async fn publish_grant(
     Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let peer = parse::id(&peer, "peer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let peer = parse::segment(&peer, "peer")?;
     let publication: GrantPublication = parse::json(&body, "grant publication")?;
     let named = publication
         .claims
@@ -97,8 +97,8 @@ pub(crate) async fn read_grants(
     Path((identity, peer)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<PeerGrants>, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let peer = parse::id(&peer, "peer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let peer = parse::segment(&peer, "peer")?;
     let grants = runtime
         .connections()
         .read_grants(identity, peer)
@@ -116,8 +116,8 @@ pub(crate) async fn read_own_grants(
     Path((identity, peer)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<OwnGrant>, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let peer = parse::id(&peer, "peer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let peer = parse::segment(&peer, "peer")?;
     let grant = runtime
         .connections()
         .read_own_grants(identity, peer)
@@ -132,9 +132,9 @@ pub(crate) async fn withdraw_grant(
     Path((identity, peer, issuer)): Path<(String, String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<StatusCode, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let peer = parse::id(&peer, "peer")?;
-    let issuer = parse::id(&issuer, "issuer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let peer = parse::segment(&peer, "peer")?;
+    let issuer = parse::segment(&issuer, "issuer")?;
     runtime
         .connections()
         .withdraw_grant(identity, peer, issuer)

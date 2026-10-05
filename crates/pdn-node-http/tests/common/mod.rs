@@ -17,8 +17,10 @@ use std::{
 
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node::PdnId;
-use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath, OwnGrant};
+use pdn_node::{CellId, PdnId};
+use pdn_node_http::shapes::{
+    CreatedIdentity, GrantPublication, GrantedPath, HeldCell, Member, Members, OwnGrant,
+};
 use serde::de::DeserializeOwned;
 use testcontainers::{
     core::{logs::LogFrame, ContainerPort, ExecCommand, Mount, WaitFor},
@@ -269,6 +271,24 @@ impl Host {
         let created: CreatedIdentity =
             self.post("/debug/identities", Bytes::new()).await?.json()?;
         Ok(created.identity)
+    }
+
+    pub async fn create_cell(&self, identity: PdnId) -> Result<CellId> {
+        let created: HeldCell = self
+            .post(&format!("/debug/identities/{identity}/cells"), Bytes::new())
+            .await?
+            .json()?;
+        Ok(created.cell)
+    }
+
+    pub async fn cell_members(&self, identity: PdnId, cell: CellId) -> Result<Vec<Member>> {
+        let members: Members = self
+            .get(&format!(
+                "/debug/identities/{identity}/cells/{cell}/members"
+            ))
+            .await?
+            .json()?;
+        Ok(members.members)
     }
 
     pub async fn publish_grant(

@@ -6,7 +6,10 @@
 
 use std::time::Duration;
 
-use pdn_node::{EntryInfo, GrantedClaim, PdnId, ReadGrant};
+use pdn_node::{
+    CellAct, CellId, CellMember, CellStore, EntryInfo, GrantedClaim, Operation, PdnId, ReadGrant,
+    RecordKind, RecordRef, UnknownEntry,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::HostError;
@@ -152,6 +155,130 @@ pub struct ListingPrefix {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoQuery {}
+
+/// The cell a `create` or a `join` answers with.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeldCell {
+    pub cell: CellId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeldCells {
+    pub cells: Vec<CellId>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Members {
+    pub members: Vec<Member>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    pub id: PdnId,
+    pub owner: bool,
+}
+
+impl From<CellMember> for Member {
+    fn from(member: CellMember) -> Self {
+        Self {
+            id: member.id,
+            owner: member.owner,
+        }
+    }
+}
+
+/// A membership act, `{"kick": "<pdn-id>"}` or `"leave"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Act {
+    Promote(PdnId),
+    Demote(PdnId),
+    Kick(PdnId),
+    Leave,
+}
+
+impl From<Act> for CellAct {
+    fn from(act: Act) -> Self {
+        match act {
+            Act::Promote(subject) => Self::Promote(subject),
+            Act::Demote(subject) => Self::Demote(subject),
+            Act::Kick(subject) => Self::Kick(subject),
+            Act::Leave => Self::Leave,
+        }
+    }
+}
+
+/// `kind` has no default. See [`Lifetime`] for `deny_unknown_fields`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Placement {
+    pub kind: RecordKind,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Records {
+    pub records: Vec<RecordRef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Operations {
+    pub operations: Vec<CellOperation>,
+}
+
+/// An operation that reads, payload included: a listing carries several, so
+/// they cannot travel as the raw body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellOperation {
+    pub writer: PdnId,
+    /// `<writer>.<author>.<mseq>.<op_seq>`, the operation's key segment.
+    pub id: String,
+    pub payload: Vec<u8>,
+}
+
+impl From<Operation> for CellOperation {
+    fn from(operation: Operation) -> Self {
+        Self {
+            writer: operation.id.writer,
+            id: operation.id.to_string(),
+            payload: operation.payload,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UnknownEntries {
+    pub entries: Vec<CellUnknownEntry>,
+}
+
+/// An entry outside the key layout. The key travels as bytes: it need not
+/// be text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellUnknownEntry {
+    pub store: CellStoreName,
+    pub key: Vec<u8>,
+    /// Lowercase hex.
+    pub author: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellStoreName {
+    Membership,
+    Records,
+}
+
+impl From<UnknownEntry> for CellUnknownEntry {
+    fn from(entry: UnknownEntry) -> Self {
+        Self {
+            store: match entry.store {
+                CellStore::Membership => CellStoreName::Membership,
+                CellStore::Records => CellStoreName::Records,
+            },
+            key: entry.key,
+            author: entry.author.to_string(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

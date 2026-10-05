@@ -10,9 +10,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pdn_node::{
-    DelegationUnsupported, EstablishmentInProgress, EstablishmentRefused, IdentityAlreadyHosted,
-    LinkingInProgress, LinkingRefused, PeerNotConnected, UnknownIdentity, UnknownIssuer,
-    UnsupportedInviteVersion, UnsupportedLinkingVersion, WriteNotGranted,
+    ActRefused, AnnouncementKeyPending, DelegationUnsupported, EstablishmentInProgress,
+    EstablishmentRefused, IdentityAlreadyHosted, JoinInProgress, JoinRefused, LinkingInProgress,
+    LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownCell, UnknownIdentity,
+    UnknownIssuer, UnknownRecord, UnsupportedCellInviteVersion, UnsupportedInviteVersion,
+    UnsupportedLinkingVersion, WriteNotGranted, WrongRecordKind,
 };
 
 #[derive(Debug)]
@@ -30,9 +32,9 @@ impl HostError {
         }
     }
 
-    /// An absent entry alone. An identity or issuer the runtime does not
-    /// know is 409, never this: route names are unpinned, so a deny test
-    /// asserting 404 would keep passing after a rename.
+    /// An absent entry or record alone. An identity, issuer or cell the
+    /// runtime does not know is 409, never this: route names are unpinned, so
+    /// a deny test asserting 404 would keep passing after a rename.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -71,27 +73,39 @@ impl IntoResponse for HostError {
 fn status_of(err: &anyhow::Error) -> StatusCode {
     if err.downcast_ref::<EstablishmentRefused>().is_some()
         || err.downcast_ref::<LinkingRefused>().is_some()
+        || err.downcast_ref::<JoinRefused>().is_some()
         || err.downcast_ref::<WriteNotGranted>().is_some()
         || err.downcast_ref::<DelegationUnsupported>().is_some()
+        || err.downcast_ref::<ActRefused>().is_some()
+        || err.downcast_ref::<RecordPlacedOnce>().is_some()
     {
         // The runtime's rules said no, or a ceremony reached its inviter and
         // no answer came back.
         StatusCode::FORBIDDEN
     } else if err.downcast_ref::<UnknownIdentity>().is_some()
         || err.downcast_ref::<UnknownIssuer>().is_some()
+        || err.downcast_ref::<UnknownCell>().is_some()
         || err.downcast_ref::<PeerNotConnected>().is_some()
+        || err.downcast_ref::<AnnouncementKeyPending>().is_some()
         || err.downcast_ref::<IdentityAlreadyHosted>().is_some()
         || err.downcast_ref::<LinkingInProgress>().is_some()
         || err.downcast_ref::<EstablishmentInProgress>().is_some()
+        || err.downcast_ref::<JoinInProgress>().is_some()
     {
         // The runtime does not host what the request addressed, or already
         // has a conflicting act of its own committed or in flight against
-        // it.
+        // it. A cell the identity is no member of is here, not with the
+        // refusals: a test expecting a refusal by role would otherwise pass
+        // when the service does not take the caller for a member at all.
         StatusCode::CONFLICT
     } else if err.downcast_ref::<UnsupportedInviteVersion>().is_some()
         || err.downcast_ref::<UnsupportedLinkingVersion>().is_some()
+        || err.downcast_ref::<UnsupportedCellInviteVersion>().is_some()
+        || err.downcast_ref::<WrongRecordKind>().is_some()
     {
         StatusCode::BAD_REQUEST
+    } else if err.downcast_ref::<UnknownRecord>().is_some() {
+        StatusCode::NOT_FOUND
     } else {
         // An unreachable peer included: 500 against 403 is the distinction.
         StatusCode::INTERNAL_SERVER_ERROR
@@ -101,12 +115,23 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context as _};
-    use pdn_node::{EntryPath, PdnId};
+    use pdn_node::{
+        ActRefusal, CellAct, CellId, EntryPath, PdnId, RecordId, RecordKind, RecordRef,
+    };
 
     use super::*;
 
     const ISSUER: PdnId = PdnId::from_bytes([0x11; 32]);
     const PEER: PdnId = PdnId::from_bytes([0x22; 32]);
+    const CELL: CellId = CellId::from_bytes([0x33; 16]);
+
+    fn record(kind: RecordKind) -> RecordRef {
+        RecordRef {
+            member: PEER,
+            kind,
+            id: RecordId::from_bytes([0x44; 16]),
+        }
+    }
 
     fn status(err: impl Into<anyhow::Error>) -> StatusCode {
         HostError::from(err.into()).status()
@@ -127,6 +152,20 @@ mod tests {
             status(DelegationUnsupported {
                 identity: PEER,
                 issuer: ISSUER,
+            }),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(status(JoinRefused), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(ActRefused {
+                act: CellAct::Kick(PEER),
+                reason: ActRefusal::NotAnOwner,
+            }),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(RecordPlacedOnce {
+                record: record(RecordKind::Claim),
             }),
             StatusCode::FORBIDDEN
         );
@@ -164,6 +203,18 @@ mod tests {
             }),
             StatusCode::CONFLICT
         );
+        assert_eq!(status(UnknownCell { cell: CELL }), StatusCode::CONFLICT);
+        assert_eq!(
+            status(AnnouncementKeyPending { identity: ISSUER }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(JoinInProgress {
+                identity: ISSUER,
+                cell: CELL,
+            }),
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]
@@ -175,6 +226,32 @@ mod tests {
         assert_eq!(
             status(UnsupportedLinkingVersion { version: 9 }),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(UnsupportedCellInviteVersion { version: 9 }),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The kind in the path names a call that does not read it.
+    #[test]
+    fn a_record_read_by_the_wrong_call_is_400() {
+        assert_eq!(
+            status(WrongRecordKind {
+                record: record(RecordKind::MergeableDocument),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// A record that reads on no entry here is absent, as an entry is.
+    #[test]
+    fn an_absent_record_is_404() {
+        assert_eq!(
+            status(UnknownRecord {
+                record: record(RecordKind::MergeableDocument),
+            }),
+            StatusCode::NOT_FOUND
         );
     }
 

@@ -3,14 +3,21 @@
 //! well-formed body of the wrong shape is 422 — a distinction no caller
 //! asked for.
 
+use std::{fmt::Display, str::FromStr};
+
 use axum::body::Bytes;
-use pdn_node::{EntryPath, PdnId};
+use pdn_node::EntryPath;
 use serde::de::DeserializeOwned;
 
 use crate::error::HostError;
 
-/// `what` names the segment in the refusal.
-pub fn id(raw: &str, what: &str) -> Result<PdnId, HostError> {
+/// A path segment by its text form — an identity, a cell, a record id or
+/// kind; `what` names the segment in the refusal.
+pub fn segment<T>(raw: &str, what: &str) -> Result<T, HostError>
+where
+    T: FromStr,
+    T::Err: Display,
+{
     let preview: String = raw.chars().take(64).collect();
     raw.parse()
         .map_err(|err| HostError::bad_request(format!("malformed {what} {preview:?}: {err}")))
@@ -35,12 +42,27 @@ pub fn json<T: DeserializeOwned>(body: &Bytes, what: &str) -> Result<T, HostErro
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
+    use pdn_node::{CellId, PdnId, RecordKind};
 
     use super::*;
 
     #[test]
     fn a_malformed_identity_is_400() {
-        let err = id("not-hex", "identity").unwrap_err();
+        let err = segment::<PdnId>("not-hex", "identity").unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An identity's 64 hex chars are no cell id.
+    #[test]
+    fn a_malformed_cell_is_400() {
+        let identity = PdnId::from_bytes([0x11; 32]).to_string();
+        let err = segment::<CellId>(&identity, "cell").unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_unknown_record_kind_is_400() {
+        let err = segment::<RecordKind>("Claim", "record kind").unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 

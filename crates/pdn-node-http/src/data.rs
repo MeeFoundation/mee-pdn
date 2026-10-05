@@ -28,8 +28,8 @@ pub(crate) async fn write(
     Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let issuer = parse::id(&issuer, "issuer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let issuer = parse::segment(&issuer, "issuer")?;
     let path = parse::entry_path(&path)?;
     // The engine rejects a zero-length entry: the request being wrong, not
     // the 500 an unnamed engine error would land on.
@@ -50,8 +50,8 @@ pub(crate) async fn read(
     Path((identity, issuer, path)): Path<(String, String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Bytes, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let issuer = parse::id(&issuer, "issuer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let issuer = parse::segment(&issuer, "issuer")?;
     let path = parse::entry_path(&path)?;
     runtime
         .data()
@@ -68,8 +68,8 @@ pub(crate) async fn list(
     Path((identity, issuer)): Path<(String, String)>,
     Query(prefix): Query<ListingPrefix>,
 ) -> Result<Json<Entries>, HostError> {
-    let identity = parse::id(&identity, "identity")?;
-    let issuer = parse::id(&issuer, "issuer")?;
+    let identity = parse::segment(&identity, "identity")?;
+    let issuer = parse::segment(&issuer, "issuer")?;
     let prefix = prefix
         .prefix
         .as_deref()

@@ -5,8 +5,10 @@
 
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node::PdnId;
-use pdn_node_http::shapes::{Connections, GrantPublication, HostedIdentities, OwnGrant};
+use pdn_node::{PdnId, RecordId, RecordRef};
+use pdn_node_http::shapes::{
+    Act, Connections, GrantPublication, HeldCell, HostedIdentities, Member, OwnGrant,
+};
 
 mod common;
 use common::{body, claims_on, entry_reads, grant_on, own_grant_reads, Stand};
@@ -412,6 +414,134 @@ async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Resu
             .count(),
         1,
         "the concurrent loser must not leave duplicate or missing hosted state: {hosted:?}"
+    );
+
+    Ok(())
+}
+
+/// Each refusal of the cells routes arrives with a status of its own, beside
+/// the accepted act it denies, on one node hosting a cell's owner and a
+/// second identity: that identity while no member (409), its promotion of
+/// itself as a plain member (403), and a read of a record the cell does not
+/// hold (404). The non-member shares the owner's node, so the node holds the
+/// cell and the refusal rests on the identity named alone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+#[allow(clippy::too_many_lines)] // the denials of one surface, kept beside their positives
+async fn cell_refusals_arrive_as_refusals() -> Result<()> {
+    let stand = Stand::new();
+    let tablet = stand.spawn("tablet").await?;
+    let leisure = tablet.create_identity().await?;
+    let work = tablet.create_identity().await?;
+    let family = tablet.create_cell(leisure).await?;
+
+    // Denied (a co-located identity that is no member). Beside it, the same
+    // route answers for the owner.
+    let outsider = tablet
+        .get(&format!("/debug/identities/{work}/cells/{family}/members"))
+        .await?;
+    assert_eq!(
+        outsider.status,
+        StatusCode::CONFLICT,
+        "a cell the identity is no member of must be refused, got {}: {}",
+        outsider.status,
+        outsider.text()
+    );
+    assert!(
+        outsider.text().contains(&family.to_string()),
+        "the refusal must name the cell: {}",
+        outsider.text()
+    );
+    assert_eq!(
+        tablet.cell_members(leisure, family).await?,
+        vec![Member {
+            id: leisure,
+            owner: true,
+        }]
+    );
+
+    let invite = tablet
+        .post(
+            &format!("/debug/identities/{leisure}/cells/{family}/invites"),
+            Bytes::new(),
+        )
+        .await?
+        .ok()?;
+    let joined: HeldCell = tablet
+        .post(&format!("/debug/identities/{work}/cells/join"), invite)
+        .await?
+        .json()?;
+    assert_eq!(joined.cell, family);
+
+    // Denied (a refusal by role): a plain member promotes itself. Beside it,
+    // the owner's promotion of the same member goes through.
+    let promote_work = serde_json::to_vec(&Act::Promote(work))?;
+    let by_member = tablet
+        .post(
+            &format!("/debug/identities/{work}/cells/{family}/acts"),
+            promote_work.clone(),
+        )
+        .await?;
+    assert_eq!(
+        by_member.status,
+        StatusCode::FORBIDDEN,
+        "a plain member's promotion must be refused, got {}: {}",
+        by_member.status,
+        by_member.text()
+    );
+    let after_refusal = tablet.cell_members(leisure, family).await?;
+    assert!(
+        after_refusal.contains(&Member {
+            id: work,
+            owner: false,
+        }),
+        "the refused promotion must leave a plain member: {after_refusal:?}"
+    );
+    tablet
+        .post(
+            &format!("/debug/identities/{leisure}/cells/{family}/acts"),
+            promote_work,
+        )
+        .await?
+        .ok()?;
+    let after_promotion = tablet.cell_members(leisure, family).await?;
+    assert!(
+        after_promotion.contains(&Member {
+            id: work,
+            owner: true,
+        }),
+        "the owner's promotion must take effect: {after_promotion:?}"
+    );
+
+    // Denied (an absent record): 404, the status reserved for nothing being
+    // there. Beside it, a placed claim reads back.
+    let placed: RecordRef = tablet
+        .post(
+            &format!("/debug/identities/{leisure}/cells/{family}/records?kind=claim"),
+            body(b"alice@example.org"),
+        )
+        .await?
+        .json()?;
+    let record_route = |record: RecordRef| {
+        format!(
+            "/debug/identities/{leisure}/cells/{family}/records/{}/{}/{}",
+            record.member, record.kind, record.id
+        )
+    };
+    let read = tablet.get(&record_route(placed)).await?.ok()?;
+    assert_eq!(read, Bytes::from_static(b"alice@example.org"));
+    let absent = tablet
+        .get(&record_route(RecordRef {
+            id: RecordId::from_bytes([0x77; 16]),
+            ..placed
+        }))
+        .await?;
+    assert_eq!(
+        absent.status,
+        StatusCode::NOT_FOUND,
+        "an absent record is 404, got {}: {}",
+        absent.status,
+        absent.text()
     );
 
     Ok(())

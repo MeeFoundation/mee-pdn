@@ -29,6 +29,27 @@ const DEBUG_ROUTES: &[(Method, &str)] = &[
     (Method::Get, "/debug/data/aa/bb"),
     (Method::Put, "/debug/data/aa/bb/contact/email"),
     (Method::Get, "/debug/data/aa/bb/contact/email"),
+    (Method::Post, "/debug/identities/aa/cells"),
+    (Method::Get, "/debug/identities/aa/cells"),
+    (Method::Post, "/debug/identities/aa/cells/join"),
+    (Method::Get, "/debug/identities/aa/cells/bb/members"),
+    (Method::Post, "/debug/identities/aa/cells/bb/invites"),
+    (Method::Post, "/debug/identities/aa/cells/bb/acts"),
+    (Method::Post, "/debug/identities/aa/cells/bb/records"),
+    (Method::Get, "/debug/identities/aa/cells/bb/records"),
+    (
+        Method::Get,
+        "/debug/identities/aa/cells/bb/records/cc/claim/dd",
+    ),
+    (
+        Method::Post,
+        "/debug/identities/aa/cells/bb/records/cc/mergeable-document/dd/ops",
+    ),
+    (
+        Method::Get,
+        "/debug/identities/aa/cells/bb/records/cc/mergeable-document/dd/ops",
+    ),
+    (Method::Get, "/debug/identities/aa/cells/bb/unknown"),
 ];
 
 /// Without the flag the node answers liveness and readiness, and every

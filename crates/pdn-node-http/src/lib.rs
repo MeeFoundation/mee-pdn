@@ -12,6 +12,7 @@
 //! HTTP travels.
 
 mod bind;
+mod cells;
 mod connections;
 mod data;
 mod error;
@@ -102,9 +103,11 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, Host
 /// One route to one service call. Deliberately absent, and to stay absent:
 /// any namespace ticket handover (a harness that arranged a granted
 /// namespace by importing its ticket would keep passing after the grant
-/// binder broke), anything that forces a reconciliation (waiting is
-/// repeating the read), anything that resets state, and any handler
-/// addressing another host.
+/// binder broke), a cell store's ticket or a raw entry written into it (a
+/// path the runtime's own callers lack; forgeries are the data layer's
+/// tests), anything that forces a reconciliation (waiting is repeating the
+/// read), anything that resets state, and any handler addressing another
+/// host.
 fn debug_routes() -> Router<Arc<Runtime>> {
     Router::new()
         .route("/debug/status", get(debug_status))
@@ -145,6 +148,39 @@ fn debug_routes() -> Router<Arc<Runtime>> {
         .route(
             "/debug/data/{identity}/{issuer}/{*path}",
             put(data::write).get(data::read),
+        )
+        .route(
+            "/debug/identities/{identity}/cells",
+            post(cells::create).get(cells::list),
+        )
+        .route("/debug/identities/{identity}/cells/join", post(cells::join))
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/members",
+            get(cells::members),
+        )
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/invites",
+            post(cells::invite),
+        )
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/acts",
+            post(cells::act),
+        )
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/records",
+            post(cells::put_record).get(cells::list_records),
+        )
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/records/{member}/{kind}/{id}",
+            get(cells::read),
+        )
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/records/{member}/{kind}/{id}/ops",
+            post(cells::append_op).get(cells::read_ops),
+        )
+        .route(
+            "/debug/identities/{identity}/cells/{cell}/unknown",
+            get(cells::list_unknown),
         )
 }
 
