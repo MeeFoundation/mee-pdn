@@ -235,7 +235,14 @@ impl Engine {
         peers: Vec<Contact>,
         default_identity: Identity,
     ) -> Result<()> {
-        self.sync_with(namespace, peers, None, default_identity, true)
+        self.sync_with(namespace, peers, None, Some(default_identity), true)
+            .await
+    }
+
+    /// Start to sync a document with no peers of its own, keeping whom an
+    /// earlier start said its unnamed peers are dialed as.
+    pub(crate) async fn start_sync_keeping_default(&self, namespace: NamespaceId) -> Result<()> {
+        self.sync_with(namespace, Vec::new(), None, None, true)
             .await
     }
 
@@ -251,7 +258,7 @@ impl Engine {
         peers: Vec<Contact>,
         default_identity: Identity,
     ) -> Result<()> {
-        self.sync_with(namespace, peers, None, default_identity, false)
+        self.sync_with(namespace, peers, None, Some(default_identity), false)
             .await
     }
 
@@ -270,7 +277,7 @@ impl Engine {
             namespace,
             peers,
             Some(recorded),
-            default_identity,
+            Some(default_identity),
             join_gossip,
         )
         .await
@@ -334,7 +341,7 @@ impl Engine {
         namespace: NamespaceId,
         peers: Vec<Contact>,
         recorded: Option<Vec<PublicKey>>,
-        default_identity: Identity,
+        default_identity: Option<Identity>,
         join_gossip: bool,
     ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();

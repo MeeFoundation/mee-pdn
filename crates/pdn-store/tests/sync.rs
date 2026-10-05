@@ -104,9 +104,13 @@ async fn sync_simple() -> Result<()> {
 
     info!("node1: join");
     let peer1 = nodes[1].id();
-    let doc1 = clients[1].docs().import(ticket.clone()).await?;
+    // Subscribed before the sync starts: the neighbor can come up before a
+    // subscription made after the import.
+    let (doc1, mut events1) = clients[1]
+        .docs()
+        .import_and_subscribe(ticket.clone())
+        .await?;
     let blobs1 = clients[1].blobs();
-    let mut events1 = doc1.subscribe().await?;
     info!("node1: assert 5 events");
     assert_next_unordered(
         &mut events1,
@@ -397,11 +401,14 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     let peer1 = nodes[1].id();
     let author1 = clients[1].docs().author_create().await?;
     info!("peer1: join doc");
-    let doc1 = clients[1].docs().import(ticket.clone()).await?;
+    // Subscribed before the sync starts, as in `sync_simple`.
+    let (doc1, mut events1) = clients[1]
+        .docs()
+        .import_and_subscribe(ticket.clone())
+        .await?;
     let blobs1 = clients[1].blobs();
 
     info!("peer1: wait for 4 events (for sync and join with peer0)");
-    let mut events1 = doc1.subscribe().await?;
     assert_next_unordered(
         &mut events1,
         TIMEOUT,
@@ -467,10 +474,10 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     info!("peer2: spawn");
     nodes.push(spawn_node(nodes.len(), &mut rng).await?);
     clients.push(nodes.last().unwrap().client().clone());
-    let doc2 = clients[2].docs().import(ticket).await?;
+    // Subscribed before the sync starts, as in `sync_simple`.
+    let (doc2, mut events2) = clients[2].docs().import_and_subscribe(ticket).await?;
     let blobs2 = clients[2].blobs();
     let peer2 = nodes[2].id();
-    let mut events2 = doc2.subscribe().await?;
 
     // How many syncs peer2 runs is not fixed: it reconciles on the ticket's
     // peer, again on each `NeighborUp`, and once more for every author head
@@ -692,9 +699,9 @@ async fn test_sync_via_relay() -> Result<()> {
         .collect();
     ticket.nodes[0] = relay_ticket;
     // join
-    let doc2 = node2.docs().import(ticket).await?;
+    // Subscribed before the sync starts, as in `sync_simple`.
+    let (doc2, mut events) = node2.docs().import_and_subscribe(ticket).await?;
     let blobs2 = node2.blobs();
-    let mut events = doc2.subscribe().await?;
 
     // An `InsertRemote`'s `content_status` is a snapshot of the local blob
     // store taken as the event is produced, and `ContentReady` reaches this
@@ -1446,24 +1453,39 @@ fn apply_matchers<T>(item: &T, matchers: &mut Vec<Box<dyn Fn(&T) -> bool + Send>
     false
 }
 
+/// The bookkeeping of an exchange no scenario asserts: a sync trigger that
+/// meets a running exchange is run again after it, so a join can bring one
+/// more successful `SyncFinished`, and its `PendingContentReady`, than a
+/// scenario counts. The helpers below skip such an event when no matcher
+/// takes it.
+fn extra_exchange(event: &LiveEvent) -> bool {
+    matches!(event, LiveEvent::SyncFinished(sync) if sync.result.is_ok())
+        || matches!(event, LiveEvent::PendingContentReady)
+}
+
 /// Receive the next `matchers.len()` elements from a stream and matches them against the functions
 /// in `matchers`, in order.
 ///
 /// Returns all received events.
 #[allow(clippy::type_complexity)]
-async fn assert_next<T: std::fmt::Debug + Clone>(
-    mut stream: impl Stream<Item = Result<T>> + Unpin + Send,
+async fn assert_next(
+    mut stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
     timeout: Duration,
-    matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-) -> Vec<T> {
+    matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
     let fut = async {
         let mut items = vec![];
         for (i, f) in matchers.iter().enumerate() {
-            let item = stream
-                .try_next()
-                .await
-                .expect("event stream ended prematurely")
-                .expect("event stream errored");
+            let item = loop {
+                let item = stream
+                    .try_next()
+                    .await
+                    .expect("event stream ended prematurely")
+                    .expect("event stream errored");
+                if (f)(&item) || !extra_exchange(&item) {
+                    break item;
+                }
+            };
             if !(f)(&item) {
                 panic!("assertion failed for event {i} {item:?}");
             }
@@ -1482,11 +1504,11 @@ async fn assert_next<T: std::fmt::Debug + Clone>(
 ///
 /// Returns all received events.
 #[allow(clippy::type_complexity)]
-async fn assert_next_unordered<T: std::fmt::Debug + Clone>(
-    stream: impl Stream<Item = Result<T>> + Unpin + Send,
+async fn assert_next_unordered(
+    stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
     timeout: Duration,
-    matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-) -> Vec<T> {
+    matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
     assert_next_unordered_with_optionals(stream, timeout, matchers, vec![]).await
 }
 
@@ -1502,31 +1524,32 @@ async fn assert_next_unordered<T: std::fmt::Debug + Clone>(
 ///
 /// Returns all received events.
 #[allow(clippy::type_complexity)]
-async fn assert_next_unordered_with_optionals<T: std::fmt::Debug + Clone>(
-    mut stream: impl Stream<Item = Result<T>> + Unpin + Send,
+async fn assert_next_unordered_with_optionals(
+    mut stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
     timeout: Duration,
-    mut required_matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-    mut optional_matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-) -> Vec<T> {
+    mut required_matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+    mut optional_matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
     let max = required_matchers.len() + optional_matchers.len();
     let required = required_matchers.len();
     // we have to use a mutex because rustc is not intelligent enough to realize
     // that the mutable borrow terminates when the future completes
     let events = Arc::new(parking_lot::Mutex::new(vec![]));
     let fut = async {
+        let mut matched = 0;
         while let Ok(event) = stream.try_next().await {
             let event = event.context("failed to read from stream")?;
-            let len = {
-                let mut events = events.lock();
-                events.push(event.clone());
-                events.len()
-            };
+            events.lock().push(event.clone());
             if !apply_matchers(&event, &mut required_matchers)
                 && !apply_matchers(&event, &mut optional_matchers)
             {
+                if extra_exchange(&event) {
+                    continue;
+                }
                 bail!("Event didn't match any matcher: {event:?}");
             }
-            if required_matchers.is_empty() || len == max {
+            matched += 1;
+            if required_matchers.is_empty() || matched == max {
                 break;
             }
         }

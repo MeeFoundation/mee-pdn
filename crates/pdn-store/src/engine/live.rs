@@ -21,7 +21,7 @@ use iroh_blobs::{
 use iroh_gossip::net::Gossip;
 use n0_future::{
     task::JoinSet,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
     FutureExt,
 };
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,9 @@ pub enum ToLiveActor {
         /// The recorded peers dialed beside `peers`: every one the store
         /// holds for the replica when `None`.
         recorded: Option<Vec<PublicKey>>,
-        default_identity: Identity,
+        /// Whom a peer no contact or session named is dialed as; `None`
+        /// keeps what an earlier start stated, else this engine's identity.
+        default_identity: Option<Identity>,
         /// Whether to join the replica's gossip swarm. Scoped access syncs
         /// without ever joining the swarm.
         join_gossip: bool,
@@ -149,15 +151,12 @@ pub enum ToLiveActor {
         #[debug("SessionOpening")]
         opening: SessionOpening<InProcessRecv, InProcessSend>,
     },
-    /// The dialing half of the same session.
-    /// A dial the remote aborted as already syncing, asked for again unless
-    /// an exchange with that counterpart went through since.
+    /// A dial the remote aborted as already syncing, asked for again.
     Redial {
         namespace: NamespaceId,
         peer: PublicKey,
         callee: Identity,
         reason: SyncReason,
-        aborted: Instant,
     },
     /// The exchanges of `namespaces` running, held behind another's, or
     /// waiting to redial.
@@ -619,14 +618,11 @@ impl LiveActor {
                 peer,
                 callee,
                 reason,
-                aborted,
             } => {
                 if let Some(due) = self.redials_due.get_mut(&namespace) {
                     *due = due.saturating_sub(1);
                 }
-                if !self.state.synced_since(&namespace, (peer, callee), aborted) {
-                    self.sync_with_identity(namespace, peer, callee, reason);
-                }
+                self.sync_with_identity(namespace, peer, callee, reason);
             }
             ToLiveActor::SyncsInFlight { namespaces, reply } => {
                 reply.send(self.syncs_in_flight(&namespaces)).ok();
@@ -916,13 +912,22 @@ impl LiveActor {
         namespace: NamespaceId,
         peers: Vec<Contact>,
         handed: Option<Vec<PublicKey>>,
-        default_identity: Identity,
+        default_identity: Option<Identity>,
         join_gossip: bool,
     ) -> Result<()> {
         // A peer the engine recorded carries a node id and nothing else,
         // so the consumer states whom a peer of this replica is dialed as
         // when neither a contact nor a past session named one.
-        self.default_identities.insert(namespace, default_identity);
+        match default_identity {
+            Some(identity) => {
+                self.default_identities.insert(namespace, identity);
+            }
+            None => {
+                self.default_identities
+                    .entry(namespace)
+                    .or_insert(self.identity);
+            }
+        }
         let mut recorded: Vec<PublicKey> = Vec::new();
         debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
         // update state to allow sync
@@ -1193,13 +1198,14 @@ impl LiveActor {
                 }
                 // The remote's exchange may be one this side refuses — a
                 // replica holding nothing yet judges no caller — and then
-                // neither runs; dialing again once it is over settles that.
+                // neither runs; or one that froze the remote's view before
+                // the news this dial was for. Dialing again once it is over
+                // settles both, whatever finished in between.
                 let redial = ToLiveActor::Redial {
                     namespace,
                     peer,
                     callee,
                     reason,
-                    aborted: Instant::now(),
                 };
                 let due = self.redials_due.entry(namespace).or_default();
                 *due = due.saturating_add(1);
@@ -1355,9 +1361,7 @@ impl LiveActor {
             Err(err) => Err(err.to_string()),
         };
 
-        let finished = self
-            .state
-            .finish(&namespace, peer, counterpart, &origin, result);
+        let finished = self.state.finish(&namespace, peer, counterpart, &origin);
         self.release_held(namespace, peer, counterpart);
         let Some((started, resync)) = finished else {
             return;

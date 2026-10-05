@@ -231,7 +231,6 @@ async fn acts_at_one_point_resolve_by_precedence_on_every_member_device() -> Res
     dial(alice_phone, alice, cell, dave_phone, dave).await?;
     assert!(lists(alice_phone, alice.id, cell, dave.id, OUT).await?);
     dial(carol_phone, carol, cell, alice_phone, alice).await?;
-    dial(bob_phone, bob, cell, alice_phone, alice).await?;
 
     for (index, phone, holder) in [(0, alice_phone, alice), (2, carol_phone, carol)] {
         let reports = reports.get_mut(index).context("one channel per phone")?;
@@ -243,6 +242,9 @@ async fn acts_at_one_point_resolve_by_precedence_on_every_member_device() -> Res
             assert!(lists(phone, holder.id, cell, member.id, want).await?);
         }
     }
+    // Only once Alice's phone holds the kick: a dial returns when asked for,
+    // and its session serves what Alice's phone held as it opened.
+    dial(bob_phone, bob, cell, alice_phone, alice).await?;
     assert!(
         lists(bob_phone, bob.id, cell, bob.id, OUT).await?,
         "the kicked member's device did not take the kick that outranks its promotion"

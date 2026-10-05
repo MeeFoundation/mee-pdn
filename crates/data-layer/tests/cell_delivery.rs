@@ -11,14 +11,14 @@ use std::{collections::HashSet, time::Duration};
 
 use anyhow::Result;
 use data_layer::{
-    identity_of, AuthorId, CellStore, Contact, EventKind, MemberDevice, MemberState, MembershipKey,
-    Seq, SpawnOptions, SyncNode,
+    cell_id_of, identity_of, AuthorId, CellStore, Contact, EventKind, MemberDevice, MemberState,
+    MembershipKey, Seq, SpawnOptions, SyncNode,
 };
 use pdn_types::{CellId, NodeId};
 use test_utils::{
     cell::{
         device_of, folds_nobody, found, holds_no_record, host, invite, lists, lists_device,
-        place_claim, reads, state_on, tickets, write, Person,
+        place_claim, reads, state_on, statement, tickets, write, Person,
     },
     eventually, TIMEOUT,
 };
@@ -300,6 +300,9 @@ async fn a_cell_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membersh
     expected.insert((endpoint(&sibling)?, identity_of(alice.id)));
     let mut stores_drawn = HashSet::new();
     let mut reached = HashSet::new();
+    // A run whose derivation began before the last invite can report after
+    // the channel was taken, without it.
+    let mut derived = false;
     tokio::time::timeout(TIMEOUT, async {
         while stores_drawn.len() < 2 || reached.len() <= 5 {
             let draw = draws.recv().await.expect("the pass stopped drawing");
@@ -311,6 +314,10 @@ async fn a_cell_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membersh
                 .iter()
                 .map(|contact| (contact.addr.id, contact.identity))
                 .collect();
+            derived |= contacts == expected;
+            if !derived {
+                continue;
+            }
             assert_eq!(contacts, expected, "the contacts the membership derives");
             assert!(draw.drawn.len() + draw.recorded.len() <= 5);
             for contact in &draw.drawn {
@@ -472,6 +479,143 @@ async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> 
     );
 
     for node in [alice_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A newcomer's record store reaches the inviter by its ticket, and the
+/// inviter's claim reads, though the membership store's first session
+/// derives contacts that leave the inviter's device out. Alice's statement
+/// lists another node here, as a fold whose payloads are still on their way
+/// lists none; the start is held between the two stores until that
+/// derivation lands, which the stress pass meets only now and then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no_inviter_device(
+) -> Result<()> {
+    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let founding = alice.keys.founding([0xa0; 16]);
+    let cell = cell_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    alice_phone.create_cell(alice.id, cell).await?;
+    write(
+        &alice_phone,
+        &alice,
+        cell,
+        MembershipKey::founded(alice.id),
+        founding.encode(),
+    )
+    .await?;
+    let elsewhere = MemberDevice {
+        node: nowhere(0xa0).node,
+        author: alice_phone.default_author(alice.id)?,
+    };
+    statement(&alice_phone, &alice, cell, &alice, vec![elsewhere]).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    let claim = place_claim(&alice_phone, &alice, cell, 1).await?;
+    let tickets = tickets(&alice_phone, &alice, cell).await?;
+
+    let pause = bob_phone.pause_next_cell_start_for_test();
+    let only_elsewhere = |contacts: Vec<Contact>| {
+        contacts.len() == 1
+            && contacts
+                .iter()
+                .all(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes())
+    };
+    let (imported, derived) = tokio::join!(bob_phone.import_cell(bob.id, cell, tickets), async {
+        pause.reached.notified().await;
+        let derived = eventually(|| async {
+            let contacts = bob_phone.cell_contacts_for_test(bob.id, cell, CellStore::Records)?;
+            Ok(only_elsewhere(contacts))
+        })
+        .await;
+        pause.release.notify_one();
+        derived
+    });
+    imported?;
+    assert!(
+        derived?,
+        "the membership store's first session derived no contacts"
+    );
+    assert!(
+        reads(&bob_phone, bob.id, cell, claim).await?,
+        "the record store started with the contacts derived after its membership store's start"
+    );
+
+    for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// The inviter's write reaches a newcomer live after the newcomer shared its
+/// own tickets, while the contacts its membership derives still leave the
+/// inviter's device out: the pull its announcement triggers addresses the
+/// inviter, whose ticket the stores came from. Alice's statement lists
+/// another node here, as a fold whose payloads are still on their way lists
+/// none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newcomer_that_shared_its_tickets_pulls_from_an_inviter_its_contacts_leave_out(
+) -> Result<()> {
+    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let founding = alice.keys.founding([0xa1; 16]);
+    let cell = cell_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    alice_phone.create_cell(alice.id, cell).await?;
+    write(
+        &alice_phone,
+        &alice,
+        cell,
+        MembershipKey::founded(alice.id),
+        founding.encode(),
+    )
+    .await?;
+    let elsewhere = MemberDevice {
+        node: nowhere(0xa1).node,
+        author: alice_phone.default_author(alice.id)?,
+    };
+    statement(&alice_phone, &alice, cell, &alice, vec![elsewhere]).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    bob_phone
+        .import_cell(bob.id, cell, tickets(&alice_phone, &alice, cell).await?)
+        .await?;
+    assert!(lists(&bob_phone, bob.id, cell, bob.id, PLAIN).await?);
+    assert!(
+        eventually(|| async {
+            let contacts = bob_phone.cell_contacts_for_test(bob.id, cell, CellStore::Records)?;
+            Ok(contacts.len() == 1
+                && contacts
+                    .iter()
+                    .all(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes()))
+        })
+        .await?,
+        "the contacts the membership derives still name the inviter's device"
+    );
+    tickets(&bob_phone, &bob, cell).await?;
+
+    let claim = place_claim(&alice_phone, &alice, cell, 1).await?;
+    assert!(
+        reads(&bob_phone, bob.id, cell, claim).await?,
+        "the pull the announcement triggered addressed another identity than the inviter"
+    );
+
+    for node in [alice_phone, bob_phone] {
         node.shutdown().await?;
     }
     Ok(())

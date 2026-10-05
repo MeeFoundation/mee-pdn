@@ -368,6 +368,20 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             holds_every_forgery_unread(phone, reports, holder.id, cell, &forged).await?,
             "a member device does not hold every forgery, or counts one"
         );
+        // The wait above takes a forgery whose payload is still on its way,
+        // so the genuine records' payloads may be too.
+        for record in [claim, scan.record()] {
+            assert!(c::reads(phone, holder.id, cell, record).await?);
+        }
+        assert!(
+            test_utils::eventually(|| async {
+                Ok(!phone
+                    .read_cell_operations(holder.id, cell, &note.record())
+                    .await?
+                    .is_empty())
+            })
+            .await?
+        );
         assert_eq!(
             phone
                 .read_cell_record(holder.id, cell, &claim)

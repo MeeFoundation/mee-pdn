@@ -259,13 +259,24 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
         &bob,
     )
     .await?;
-    let session = sessions
-        .next_with(bob_laptop.node_id(), true, TIMEOUT)
-        .await?;
-    assert!(
-        session.is_some_and(|session| session.exchanged.is_ok_and(|(received, _)| received > 0)),
-        "the old version written again did not arrive"
-    );
+    // A session already running as the dial is asked for can finish first,
+    // with nothing new: a dial returns when asked for.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut arrived = false;
+    while let Some(session) = sessions
+        .next_with(
+            bob_laptop.node_id(),
+            true,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?
+    {
+        if session.exchanged.is_ok_and(|(received, _)| received > 0) {
+            arrived = true;
+            break;
+        }
+    }
+    assert!(arrived, "the old version written again did not arrive");
     // Denied: a statement for Bob under a key that is not his.
     let stranger = Person::generate();
     let b6 = nowhere(0xb6, AuthorId::from([0xb6; 32]));

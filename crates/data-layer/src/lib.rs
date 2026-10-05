@@ -41,7 +41,7 @@ pub use connection_metadata::{
 };
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
 #[cfg(feature = "test-util")]
-pub use node::{CellSession, CellSessions};
+pub use node::{CellSession, CellSessions, CellStartPause};
 // The ceremony registration point (ADR-0011, ADR-0012), re-exported so
 // consumers need no direct iroh dependency. The raw `Endpoint` is
 // deliberately not re-exported — the dial handle wraps it.

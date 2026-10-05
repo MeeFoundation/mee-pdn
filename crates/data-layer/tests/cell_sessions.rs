@@ -254,7 +254,13 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
             .await?,
         "the member's device did not fold the cell from its first session"
     );
-    assert_eq!(state_on(&bob_phone, bob.id, cell, bob.id).await, PLAIN);
+    // A joined event counts once its payload lands, which can trail the
+    // founding event's.
+    assert!(
+        eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, bob.id).await == PLAIN) })
+            .await?,
+        "the member's device did not count its own joined event"
+    );
     // A dialer serves a callee only once it resolves the callee's member,
     // so the promotion leaves Bob's phone in the second session.
     session(

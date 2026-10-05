@@ -146,7 +146,12 @@ async fn connect_and_sync_inner(
     }
 
     let outcome = res?;
-    closed?;
+    // A completed exchange stands: the peer can drop the connection before
+    // this side's teardown hears its last acknowledgement, and everything
+    // the peer sent has already arrived.
+    if let Err(error) = closed {
+        debug!(?error, "teardown failed after a completed exchange");
+    }
 
     let timings = Timings {
         connect: t_connect,
@@ -332,7 +337,11 @@ where
     }
     .await;
 
-    let namespace = res.and_then(|namespace| closed.map(|()| namespace))?;
+    let namespace = res?;
+    // A completed exchange stands, as on the dialing side.
+    if let Err(error) = closed {
+        debug!(?error, "teardown failed after a completed exchange");
+    }
     Ok(SyncFinished {
         namespace,
         outcome,

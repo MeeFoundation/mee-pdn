@@ -1,13 +1,12 @@
 use std::{cmp::Ordering, collections::BTreeMap};
 
-use anyhow::Result;
 use iroh::EndpointId;
-use n0_future::time::{Instant, SystemTime};
+use n0_future::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
-    net::{AbortReason, AcceptOutcome, SyncFinished},
+    net::{AbortReason, AcceptOutcome},
     Identity, NamespaceId,
 };
 
@@ -91,21 +90,6 @@ impl NamespaceStates {
         })
     }
 
-    /// Whether an exchange of `namespace` with `counterpart`, dialed or
-    /// accepted, finished well after `since`.
-    pub fn synced_since(
-        &self,
-        namespace: &NamespaceId,
-        counterpart: Counterpart,
-        since: Instant,
-    ) -> bool {
-        self.0
-            .get(namespace)
-            .and_then(|state| state.nodes.get(&counterpart))
-            .and_then(|peer| peer.last_sync.as_ref())
-            .is_some_and(|(finished, result)| *finished >= since && result.is_ok())
-    }
-
     /// Insert a namespace into the set of syncing namespaces.
     pub fn insert(&mut self, namespace: NamespaceId) {
         self.0.entry(namespace).or_default();
@@ -180,10 +164,9 @@ impl NamespaceStates {
         node: EndpointId,
         counterpart: Identity,
         origin: &Origin,
-        result: Result<SyncFinished>,
     ) -> Option<(SystemTime, bool)> {
         let state = self.entry(namespace, (node, counterpart))?;
-        state.finish(origin, result)
+        state.finish(origin)
     }
 
     /// Set whether a [`super::live::Event::PendingContentReady`] may be emitted once the pending queue
@@ -236,15 +219,10 @@ impl NamespaceStates {
 struct PeerState {
     state: SyncState,
     resync_requested: bool,
-    last_sync: Option<(Instant, Result<SyncFinished>)>,
 }
 
 impl PeerState {
-    fn finish(
-        &mut self,
-        origin: &Origin,
-        result: Result<SyncFinished>,
-    ) -> Option<(SystemTime, bool)> {
+    fn finish(&mut self, origin: &Origin) -> Option<(SystemTime, bool)> {
         let start = match &self.state {
             SyncState::Running {
                 start,
@@ -268,7 +246,6 @@ impl PeerState {
             }
         };
 
-        self.last_sync = Some((Instant::now(), result));
         self.state = SyncState::Idle;
         start.map(|s| (s, self.resync_requested))
     }
@@ -279,12 +256,16 @@ impl PeerState {
             // never run two syncs at the same time
             SyncState::Running { .. } => {
                 debug!("abort connect: sync already running");
-                // A dial the consumer asked for, or news prompted, is queued
-                // rather than dropped: the running exchange began before the
-                // ask and may carry nothing written since.
+                // A dial the consumer asked for, news prompted or a new
+                // neighbor prompted is queued rather than dropped: the
+                // running exchange began before the ask and may carry
+                // nothing written since.
                 if matches!(
                     reason,
-                    SyncReason::DirectJoin | SyncReason::SyncReport | SyncReason::Announced
+                    SyncReason::DirectJoin
+                        | SyncReason::SyncReport
+                        | SyncReason::Announced
+                        | SyncReason::NewNeighbor
                 ) {
                     debug!("resync queued");
                     self.resync_requested = true;
@@ -467,13 +448,7 @@ mod tests {
         states.insert(namespace);
         assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
 
-        let refused = states.finish(
-            &namespace,
-            peer,
-            counterpart(),
-            &Origin::Accept,
-            Err(anyhow::anyhow!("refused")),
-        );
+        let refused = states.finish(&namespace, peer, counterpart(), &Origin::Accept);
         assert!(refused.is_none(), "the refused accept finished the dial");
         assert!(states.is_running(&namespace, (peer, counterpart())));
 
@@ -482,16 +457,15 @@ mod tests {
             peer,
             counterpart(),
             &Origin::Connect(SyncReason::DirectJoin),
-            Err(anyhow::anyhow!("the dial's own outcome")),
         );
         assert!(dialed.is_some(), "the dial's finish went unreported");
         assert!(!states.is_running(&namespace, (peer, counterpart())));
     }
 
-    /// A dial the consumer asks for while an accepted exchange with its
-    /// counterpart runs is run again once that exchange ends, as one news
-    /// prompts is. Paired: a resync meeting a running exchange queues nothing
-    /// more.
+    /// A dial the consumer asks for, or a new neighbor prompts, while an
+    /// accepted exchange with its counterpart runs is run again once that
+    /// exchange ends, as one news prompts is. Paired: a resync meeting a
+    /// running exchange queues nothing more.
     #[test]
     fn a_dial_asked_for_during_a_running_exchange_is_run_after_it() {
         let namespace = namespace();
@@ -500,6 +474,7 @@ mod tests {
             (SyncReason::DirectJoin, true),
             (SyncReason::SyncReport, true),
             (SyncReason::Announced, true),
+            (SyncReason::NewNeighbor, true),
             (SyncReason::Resync, false),
         ] {
             let mut states = NamespaceStates::default();
@@ -509,13 +484,7 @@ mod tests {
             assert!(matches!(accepted, AcceptOutcome::Allow { .. }));
             assert!(!states.start_connect(&namespace, node, counterpart(), reason));
 
-            let finished = states.finish(
-                &namespace,
-                node,
-                counterpart(),
-                &Origin::Accept,
-                Err(anyhow::anyhow!("the accepted exchange's outcome")),
-            );
+            let finished = states.finish(&namespace, node, counterpart(), &Origin::Accept);
             let (_started, resync) = finished.expect("the accepted exchange went unreported");
             assert_eq!(resync, queued, "{reason:?} asked for during the exchange");
         }
@@ -545,13 +514,7 @@ mod tests {
                 states.accept_request(&me, own_identity(), &namespace, node, counterpart());
             assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
-            let finished = states.finish(
-                &namespace,
-                node,
-                counterpart(),
-                &Origin::Accept,
-                Err(anyhow::anyhow!("the takeover's outcome")),
-            );
+            let finished = states.finish(&namespace, node, counterpart(), &Origin::Accept);
             let (_started, resync) = finished.expect("the takeover went unreported");
             assert_eq!(resync, asked, "asked for during the dial: {asked}");
         }

@@ -188,6 +188,9 @@ struct JoinRequest {
     secret: [u8; 32],
     joiner: PdnId,
     announcement_key: [u8; 32],
+    /// The highest sequence of the joiner's own chain its replica holds, a
+    /// tombstone's included.
+    run: u64,
 }
 
 /// Sent only after the verify-and-burn: the sequence of the joiner's chain
@@ -980,6 +983,7 @@ async fn join_via_dialogue(
         secret: invite.secret,
         joiner: identity,
         announcement_key: keys.public_key(),
+        run: node.cell_chain_run(identity, invite.cell, identity).await?,
     };
     let device = MemberDevice {
         node: node.node_id(),
@@ -1064,6 +1068,19 @@ async fn join_via_dialogue(
     )
     .await?;
     Ok(cell)
+}
+
+/// The sequence the inviter offers the joiner and whether it writes a
+/// joined event there, from what the inviter's replica holds of the
+/// joiner's chain and the run the joiner reports of its own. A member the
+/// inviter knows keeps its point, unless its own chain runs past the
+/// inviter's view — a departure the inviter has not yet seen — and then the
+/// joined event goes past both runs.
+fn offered_seq(joined_at: Option<u64>, known_run: u64, joiner_run: u64) -> (u64, bool) {
+    match joined_at {
+        Some(joined) if joiner_run <= known_run => (joined, false),
+        _ => (known_run.max(joiner_run).saturating_add(1), true),
+    }
 }
 
 /// The joiner's messages over any pair of streams: the request, the
@@ -1159,13 +1176,11 @@ where
     }
     let actor_seq = inviter.run();
     let known = membership.member(&request.joiner);
-    let (seq, write_joined) = match known {
-        Some(member) => match member.joined_at() {
-            Some(joined) => (joined, false),
-            None => (member.run() + 1, true),
-        },
-        None => (1, true),
-    };
+    let (seq, write_joined) = offered_seq(
+        known.and_then(Member::joined_at),
+        known.map_or(0, Member::run),
+        request.run,
+    );
     let known_devices: Vec<MemberDevice> = known
         .map(|member| member.devices.iter().copied().collect())
         .unwrap_or_default();
@@ -1413,5 +1428,23 @@ impl Drop for CellRollback {
         self.cleanup_tasks.spawn(async move {
             let _ = node.discard_cell(identity, cell).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The inviter offers a sequence past a departure only the joiner's own
+    /// replica holds yet. Paired: a joiner whose reply was lost, holding
+    /// nothing of the cell, keeps the point it joined at, with no second
+    /// joined event.
+    #[test]
+    fn a_departure_the_inviter_has_not_seen_moves_the_offer_past_it() {
+        // Joined at 1, promoted at 2 on the inviter; left at 3 on the joiner.
+        assert_eq!(offered_seq(Some(1), 2, 3), (4, true));
+        assert_eq!(offered_seq(Some(1), 1, 0), (1, false));
+        assert_eq!(offered_seq(None, 3, 3), (4, true));
+        assert_eq!(offered_seq(None, 0, 0), (1, true));
     }
 }

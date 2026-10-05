@@ -41,8 +41,8 @@ use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
     cell::{
         departure_past, record_entries, record_prefix, unknown_entries, CellCatchUp, CellNotice,
-        CellStore, CellTickets, MemberDevice, Membership, Operation, RecordView, Seq, UnknownCell,
-        UnknownEntry,
+        CellStore, CellTickets, Member, MemberDevice, Membership, Operation, RecordView, Seq,
+        UnknownCell, UnknownEntry,
     },
     connection_metadata::ConnectionMetadataStore,
     private_metadata::PrivateMetadataStore,
@@ -285,6 +285,9 @@ pub struct SyncNode {
     /// its membership store exists.
     #[cfg(feature = "test-util")]
     fail_next_cell_records_create: std::sync::atomic::AtomicBool,
+    /// Holds the next cell start between its two stores' starts.
+    #[cfg(feature = "test-util")]
+    cell_start_pause: std::sync::Mutex<Option<Arc<CellStartPause>>>,
     /// Handed to every hosted identity's book; empty until a scenario takes
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
@@ -393,6 +396,10 @@ struct HostedStack {
     /// member's device, and is reconciled with the identity's own devices
     /// alone from then on.
     converged_tombstones: Mutex<HashSet<CellId>>,
+    /// Held through each derivation of a cell's contacts, from its fold to
+    /// its last write: one that folded before a change would otherwise set
+    /// its list after the one that folded after it.
+    cell_derivation: tokio::sync::Mutex<()>,
     notices: crate::cell::CellNoticeSink,
 }
 
@@ -658,6 +665,8 @@ impl SyncNode {
             #[cfg(feature = "test-util")]
             fail_next_cell_records_create: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
+            cell_start_pause: std::sync::Mutex::default(),
+            #[cfg(feature = "test-util")]
             cell_verdicts: Arc::default(),
             #[cfg(feature = "test-util")]
             pass_probes,
@@ -718,6 +727,7 @@ impl SyncNode {
             nudges_in_flight: Mutex::new(HashSet::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
             converged_tombstones: Mutex::new(HashSet::new()),
+            cell_derivation: tokio::sync::Mutex::new(()),
             notices: Arc::clone(&self.cell_notices),
         });
         let mut hosted = self
@@ -1472,6 +1482,17 @@ impl SyncNode {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Holds the next cell start once its membership store's sync has
+    /// started, before its record store's, until `release` is notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_cell_start_for_test(&self) -> Arc<CellStartPause> {
+        let pause = Arc::new(CellStartPause::default());
+        if let Ok(mut slot) = self.cell_start_pause.lock() {
+            *slot = Some(Arc::clone(&pause));
+        }
+        pause
+    }
+
     /// Import both stores of `cell` from their write tickets: nothing new for
     /// a cell held on these stores, the cell again for its tombstone. Both
     /// stores' sync starts once they are registered, as at `create_cell`. A failed import drops nothing — a replica may predate
@@ -1621,8 +1642,28 @@ impl SyncNode {
             records: crate::private_metadata::watch_doc(records).await?,
         };
         Self::order_cell_stores(stack, membership, records).await?;
-        Self::start_tracked(stack, membership.id()).await?;
-        Self::start_tracked(stack, records.id()).await?;
+        // Read before either starts: the membership store's first session
+        // derives both stores' contacts again, from a fold that can list no
+        // device of the inviter yet, and the record store would start with
+        // none.
+        let (membership, records) = (
+            stack.tracked(membership.id())?,
+            stack.tracked(records.id())?,
+        );
+        Self::start_tracked(membership).await?;
+        #[cfg(feature = "test-util")]
+        {
+            let pause = self
+                .cell_start_pause
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        Self::start_tracked(records).await?;
         Ok(caught_up)
     }
 
@@ -1642,8 +1683,8 @@ impl SyncNode {
 
     /// Start a tracked store's sync with the contacts and the default
     /// identity it is tracked with.
-    async fn start_tracked(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
-        let Some(tracked) = stack.tracked(namespace)? else {
+    async fn start_tracked(tracked: Option<TrackedDoc>) -> Result<()> {
+        let Some(tracked) = tracked else {
             return Ok(());
         };
         tracked
@@ -1800,6 +1841,22 @@ impl SyncNode {
             return Err(UnknownCell { cell }.into());
         }
         stack.access.fold_cell(cell, &held.membership).await
+    }
+
+    /// The highest sequence of `subject`'s chain that `identity`'s replica
+    /// of `cell` holds, a tombstone's included; `0` for a cell not held here.
+    pub async fn cell_chain_run(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        subject: PdnId,
+    ) -> Result<u64> {
+        let stack = self.require(identity)?;
+        let Some(held) = stack.registry.cell(cell)? else {
+            return Ok(0);
+        };
+        let membership = stack.access.fold_cell(cell, &held.membership).await?;
+        Ok(membership.member(&subject).map_or(0, Member::run))
     }
 
     /// Wait, at most `timeout`, until `identity`'s replica of `cell` folds
@@ -3439,6 +3496,18 @@ async fn derive_cell_contacts(
     held: &CellBinding,
     met: &[NodeId],
 ) {
+    let _derivation = stack.cell_derivation.lock().await;
+    derive_cell_contacts_locked(stack, node, cell, held, met).await;
+}
+
+/// [`derive_cell_contacts`] with the stack's `cell_derivation` held.
+async fn derive_cell_contacts_locked(
+    stack: &HostedStack,
+    node: EndpointId,
+    cell: CellId,
+    held: &CellBinding,
+    met: &[NodeId],
+) {
     let Ok(derived) = cell_contacts(stack, node, cell, held, met).await else {
         return;
     };
@@ -3479,6 +3548,7 @@ async fn derive_before_start(
     cell: CellId,
     held: &CellBinding,
 ) -> Result<()> {
+    let _derivation = stack.cell_derivation.lock().await;
     let docs: Vec<&Doc> = std::iter::once(&held.membership)
         .chain(held.records.as_ref())
         .collect();
@@ -3491,7 +3561,7 @@ async fn derive_before_start(
                 .unwrap_or_default(),
         );
     }
-    derive_cell_contacts(stack, node, cell, held, &[]).await;
+    derive_cell_contacts_locked(stack, node, cell, held, &[]).await;
     for (doc, ticketed) in docs.into_iter().zip(ticketed) {
         let Some(tracked) = stack.tracked(doc.id())? else {
             continue;
@@ -3804,6 +3874,15 @@ impl CellFlush {
         }
         true
     }
+}
+
+/// The hold [`SyncNode::pause_next_cell_start_for_test`] puts on a cell
+/// start: `reached` once its membership store's sync has started.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Default)]
+pub struct CellStartPause {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 /// The sessions one replica of a cell's store finishes, from

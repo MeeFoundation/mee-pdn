@@ -423,10 +423,9 @@ impl RpcActor {
                 crate::Capability::Write(secret)
             }
         };
-        // Restates this store's identity as whom recorded peers are dialed as:
-        // a document whose default names another identity — a grantee
-        // replica, a connection's peer store — must not be shared.
-        self.start_sync(doc_id, vec![], self.identity())
+        // Keeps whom unnamed peers are dialed as: a cell's store is shared
+        // while its default still names the member whose ticket it came from.
+        self.start_sync_keeping_default(doc_id)
             .await
             .map_err(|e| RpcError::new(&*e))?;
 
