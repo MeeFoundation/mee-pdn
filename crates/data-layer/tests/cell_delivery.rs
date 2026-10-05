@@ -11,8 +11,8 @@ use std::{collections::HashSet, time::Duration};
 
 use anyhow::Result;
 use data_layer::{
-    cell_id_of, identity_of, AuthorId, CellStore, Contact, EventKind, MemberDevice, MemberState,
-    MembershipKey, Seq, SpawnOptions, SyncNode,
+    cell_id_of, identity_of, AddrInfoOptions, AuthorId, CellStore, Contact, EventKind,
+    MemberDevice, MemberState, MembershipKey, Seq, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_types::{CellId, NodeId};
 use test_utils::{
@@ -20,7 +20,7 @@ use test_utils::{
         device_of, folds_nobody, found, holds_no_record, host, invite, lists, lists_device,
         place_claim, reads, state_on, statement, tickets, write, Person,
     },
-    eventually, TIMEOUT,
+    eventually, join_identity, wait_devices, TIMEOUT,
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -556,15 +556,17 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     Ok(())
 }
 
-/// The inviter's write reaches a newcomer live after the newcomer shared its
-/// own tickets, while the contacts its membership derives still leave the
-/// inviter's device out: the pull its announcement triggers addresses the
-/// inviter, whose ticket the stores came from. Alice's statement lists
-/// another node here, as a fold whose payloads are still on their way lists
-/// none.
+/// A newcomer sharing its own tickets reaches its inviter as the inviter,
+/// while the contacts its membership derives still leave the inviter's
+/// device out: the share restarts each store's sync, which dials the peers
+/// the store recorded as the identity whose ticket the store came from.
+/// Alice's statement lists another node here, as a fold whose payloads are
+/// still on their way lists none; the newcomer is out of the record store's
+/// swarm while Alice writes, so the share's dial is the only way the write
+/// reaches it.
+#[allow(clippy::too_many_lines)] // one scenario: the arrangement, the write and the share
 #[tokio::test(flavor = "multi_thread")]
-async fn a_newcomer_that_shared_its_tickets_pulls_from_an_inviter_its_contacts_leave_out(
-) -> Result<()> {
+async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
@@ -592,10 +594,13 @@ async fn a_newcomer_that_shared_its_tickets_pulls_from_an_inviter_its_contacts_l
         vec![device_of(&bob_phone, &bob)?],
     )
     .await?;
-    bob_phone
-        .import_cell(bob.id, cell, tickets(&alice_phone, &alice, cell).await?)
-        .await?;
-    assert!(lists(&bob_phone, bob.id, cell, bob.id, PLAIN).await?);
+    let first = place_claim(&alice_phone, &alice, cell, 1).await?;
+    let alices = tickets(&alice_phone, &alice, cell).await?;
+    let records = alices.records.capability.id();
+    bob_phone.import_cell(bob.id, cell, alices).await?;
+    // The record store's session with Alice's phone went through, so the
+    // store recorded it.
+    assert!(reads(&bob_phone, bob.id, cell, first).await?);
     assert!(
         eventually(|| async {
             let contacts = bob_phone.cell_contacts_for_test(bob.id, cell, CellStore::Records)?;
@@ -607,15 +612,95 @@ async fn a_newcomer_that_shared_its_tickets_pulls_from_an_inviter_its_contacts_l
         .await?,
         "the contacts the membership derives still name the inviter's device"
     );
-    tickets(&bob_phone, &bob, cell).await?;
+    bob_phone.leave_swarm_for_test(bob.id, records).await?;
+    assert!(settle(&[&alice_phone, &bob_phone], cell).await?);
 
-    let claim = place_claim(&alice_phone, &alice, cell, 1).await?;
+    let second = place_claim(&alice_phone, &alice, cell, 2).await?;
+    tickets(&bob_phone, &bob, cell).await?;
     assert!(
-        reads(&bob_phone, bob.id, cell, claim).await?,
-        "the pull the announcement triggered addressed another identity than the inviter"
+        reads(&bob_phone, bob.id, cell, second).await?,
+        "the share dialed the inviter's device as another identity than the inviter"
     );
 
     for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A member's write announced from a device of that member whose node no
+/// statement lists reaches another member: the pull the announcement
+/// triggers addresses the member the announcement names. Bob's statement
+/// lists his phone's author beside another node, as a fold whose payloads
+/// are still on their way lists none; the phone takes the membership from
+/// its sibling, which then leaves the record store's swarm so it relays
+/// nothing, and every store settles before the write, so the announcement
+/// is the only way out of the phone.
+#[allow(clippy::too_many_lines)] // one scenario: two devices of one member and the write
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_member() -> Result<()>
+{
+    let (alice_phone, bob_laptop, bob_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, bob_directory) = host(&bob_laptop).await?;
+    bob_directory.add_device(bob_phone.node_id()).await?;
+    let ticket = bob_directory
+        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
+    let phone_directory = join_identity(&bob_phone, bob.id, ticket).await?;
+    assert!(
+        wait_devices(
+            &phone_directory,
+            &[bob_laptop.node_id(), bob_phone.node_id()]
+        )
+        .await?
+    );
+    let cell = found(&alice_phone, &alice).await?;
+    let unlisted_node = MemberDevice {
+        node: nowhere(0xb2).node,
+        author: bob_phone.default_author(bob.id)?,
+    };
+    invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &bob,
+        vec![device_of(&bob_laptop, &bob)?, unlisted_node],
+    )
+    .await?;
+    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    for device in [&bob_laptop, &bob_phone] {
+        device.import_cell(bob.id, cell, tickets.clone()).await?;
+    }
+    // A dial returns when asked for, and its session serves what the laptop
+    // held as it opened.
+    assert!(lists(&bob_laptop, bob.id, cell, alice.id, OWNER).await?);
+    dial(
+        &bob_laptop,
+        &bob,
+        cell,
+        CellStore::Membership,
+        &bob_phone,
+        &bob,
+    )
+    .await?;
+    assert!(lists(&bob_phone, bob.id, cell, alice.id, OWNER).await?);
+    bob_laptop
+        .leave_swarm_for_test(bob.id, tickets.records.capability.id())
+        .await?;
+    assert!(settle(&[&alice_phone, &bob_laptop, &bob_phone], cell).await?);
+
+    let claim = place_claim(&bob_phone, &bob, cell, 1).await?;
+    assert!(
+        reads(&alice_phone, alice.id, cell, claim).await?,
+        "the pull the announcement triggered addressed another identity than its member"
+    );
+
+    for node in [alice_phone, bob_laptop, bob_phone] {
         node.shutdown().await?;
     }
     Ok(())

@@ -99,6 +99,8 @@ pub struct SyncReport {
     namespace: NamespaceId,
     /// Encoded [`AuthorHeads`]
     heads: Vec<u8>,
+    /// The identity the sender's replica answers as.
+    identity: Identity,
 }
 
 /// Messages to the sync actor
@@ -704,17 +706,37 @@ impl LiveActor {
     /// replica, else this engine's own identity — what a sibling device of
     /// the same identity is.
     fn identities_of_peer(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Identity> {
-        let learned: Vec<Identity> = self
-            .peer_identities
-            .get(&(namespace, peer))
-            .map(|identities| identities.all().collect())
-            .unwrap_or_default();
+        let learned = self.learned_identities(namespace, peer);
         if !learned.is_empty() {
             return learned;
         }
         match self.default_identities.get(&namespace) {
             Some(default) => vec![*default],
             None => vec![self.identity],
+        }
+    }
+
+    /// The identities contacts and running sessions name this peer as.
+    fn learned_identities(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Identity> {
+        self.peer_identities
+            .get(&(namespace, peer))
+            .map(|identities| identities.all().collect())
+            .unwrap_or_default()
+    }
+
+    /// A pull of the news `peer` reported, addressed as contacts and running
+    /// sessions name it, else as the identity the report names. That name
+    /// is the sender's word and picks only which replica of its own node the
+    /// pull addresses; the access provider judges the session on both sides.
+    fn sync_with_reporter(&mut self, namespace: NamespaceId, peer: PublicKey, reporter: Identity) {
+        let learned = self.learned_identities(namespace, peer);
+        let callees = if learned.is_empty() {
+            vec![reporter]
+        } else {
+            learned
+        };
+        for callee in callees {
+            self.sync_with_identity(namespace, peer, callee, SyncReason::SyncReport);
         }
     }
 
@@ -1347,7 +1369,11 @@ impl LiveActor {
                     {
                         Err(err) => warn!(?err, "Failed to encode author heads for sync report"),
                         Ok(heads) => {
-                            let report = SyncReport { namespace, heads };
+                            let report = SyncReport {
+                                namespace,
+                                heads,
+                                identity: self.identity,
+                            };
                             self.broadcast_neighbors(namespace, &Op::SyncReport(report))
                                 .await;
                         }
@@ -1436,7 +1462,11 @@ impl LiveActor {
                 return;
             }
         };
-        let report = SyncReport { namespace, heads };
+        let report = SyncReport {
+            namespace,
+            heads,
+            identity: self.identity,
+        };
         self.broadcast_neighbors(namespace, &Op::SyncReport(report))
             .await;
     }
@@ -1501,7 +1531,7 @@ impl LiveActor {
         match self.sync.has_news_for_us(report.namespace, heads).await {
             Ok(Some(updated_authors)) => {
                 info!(%updated_authors, "news reported: sync now");
-                self.sync_with_peer(report.namespace, from, SyncReason::SyncReport);
+                self.sync_with_reporter(report.namespace, from, report.identity);
             }
             Ok(None) => {
                 debug!("no news reported: nothing to do");
