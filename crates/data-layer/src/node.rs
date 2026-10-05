@@ -147,8 +147,7 @@ const CELL_RECONCILE_PEERS: usize = 5;
 /// Default of [`SpawnOptions::blob_collection_interval`].
 const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
-/// How long after a change to a cell's membership store its contacts are
-/// derived again, the changes meanwhile taken in the same derivation.
+/// Default of [`SpawnOptions::cell_change_settle`].
 const CELL_CHANGE_SETTLE: Duration = Duration::from_millis(50);
 
 /// Chosen by name at spawn, with no default. Not read from the process
@@ -198,6 +197,10 @@ pub struct SpawnOptions {
     /// peers per store; every other tracked store keeps
     /// `reconcile_interval` and every contact.
     pub cell_reconcile_interval: Duration,
+    /// How long a cell's change watch gathers events that list no new
+    /// device — a session's end, a neighbor — before deriving the cell's
+    /// contacts again; an entry or a payload arriving derives at once.
+    pub cell_change_settle: Duration,
     /// How often the node removes the payloads no replica of any identity
     /// it hosts references.
     pub blob_collection_interval: Duration,
@@ -225,6 +228,7 @@ impl SpawnOptions {
             storage: StorageConfig::Memory,
             reconcile_interval: RECONCILE_INTERVAL,
             cell_reconcile_interval: CELL_RECONCILE_INTERVAL,
+            cell_change_settle: CELL_CHANGE_SETTLE,
             blob_collection_interval: BLOB_COLLECTION_INTERVAL,
             connectivity: Connectivity::Direct,
             replica_cache_budget_bytes: DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
@@ -237,6 +241,7 @@ impl SpawnOptions {
             storage: StorageConfig::Directory(directory.into()),
             reconcile_interval: RECONCILE_INTERVAL,
             cell_reconcile_interval: CELL_RECONCILE_INTERVAL,
+            cell_change_settle: CELL_CHANGE_SETTLE,
             blob_collection_interval: BLOB_COLLECTION_INTERVAL,
             connectivity: Connectivity::Direct,
             replica_cache_budget_bytes: DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
@@ -271,6 +276,7 @@ pub struct SyncNode {
     /// What this node's replica stores may hold together; one store's
     /// share of it is cut as that store opens.
     cache_budget_bytes: usize,
+    cell_change_settle: Duration,
     /// Sessions [`reconcile_co_located`] has opened, so a scenario can
     /// assert that a pass over a quiet pair opens none.
     #[cfg(feature = "test-util")]
@@ -571,6 +577,7 @@ impl SyncNode {
     /// before anything binds. A handler's `accept` should return
     /// `Err(AcceptError)` rather than panic: a panic is contained per
     /// connection, but a `panic = "abort"` build still aborts the process.
+    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
     pub async fn spawn_with(
         extra_protocols: Vec<ExtraProtocol>,
         options: SpawnOptions,
@@ -645,6 +652,7 @@ impl SyncNode {
             gossip,
             identities,
             cache_budget_bytes: options.replica_cache_budget_bytes,
+            cell_change_settle: options.cell_change_settle,
             #[cfg(feature = "test-util")]
             co_located_sessions: Arc::clone(&co_located_sessions),
             #[cfg(feature = "test-util")]
@@ -1431,7 +1439,7 @@ impl SyncNode {
         )?;
         stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
         Self::order_cell_stores(&stack, &membership, &records).await?;
-        watch_cell_membership(&stack, self.router.endpoint().id(), cell, &membership);
+        self.watch_cell(&stack, cell, &membership);
         membership.start_sync(Vec::new(), stack.identity()).await?;
         records.start_sync(Vec::new(), stack.identity()).await
     }
@@ -1563,7 +1571,7 @@ impl SyncNode {
             SyncStrategy::Swarm,
             records_minted_by,
         )?;
-        watch_cell_membership(&stack, self.router.endpoint().id(), cell, &membership);
+        self.watch_cell(&stack, cell, &membership);
         self.start_cell(&stack, cell, &membership, &records).await
     }
 
@@ -1586,6 +1594,11 @@ impl SyncNode {
         stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
         stack.set_strategy(membership.id(), SyncStrategy::Swarm)?;
         self.start_cell(stack, cell, membership, &records).await
+    }
+
+    fn watch_cell(&self, stack: &Arc<HostedStack>, cell: CellId, membership: &Doc) {
+        let node = self.router.endpoint().id();
+        watch_cell_membership(stack, node, cell, membership, self.cell_change_settle);
     }
 
     /// Start both tracked stores' sync, the record store's every dial
@@ -1692,7 +1705,7 @@ impl SyncNode {
             records: None,
         };
         derive_before_start(&stack, node, cell, &held).await?;
-        watch_cell_membership(&stack, node, cell, &doc);
+        self.watch_cell(&stack, cell, &doc);
         let contacts = stack
             .tracked(doc.id())?
             .map(|tracked| tracked.contacts)
@@ -3500,14 +3513,17 @@ async fn derive_before_start(
 }
 
 /// Derive `cell`'s contacts again whenever its membership store changes —
-/// an entry or a payload arriving, a local write — so a newcomer is dialed
-/// as the member it is from its first announcement on. Ends with the
-/// store's subscription or the identity's half of the node.
+/// at once when an entry or a payload arrives, since either may list a
+/// device, and `settle` after anything else — so a newcomer is dialed as
+/// the member it is from its first announcement on; a local write derives
+/// in the write itself. Ends with the store's subscription or the
+/// identity's half of the node.
 fn watch_cell_membership(
     stack: &Arc<HostedStack>,
     node: EndpointId,
     cell: CellId,
     membership: &Doc,
+    settle: Duration,
 ) {
     let stack = Arc::downgrade(stack);
     let membership = membership.clone();
@@ -3518,13 +3534,21 @@ fn watch_cell_membership(
         // A burst can end with the stream, which panics when polled again.
         let mut events = events.fuse();
         while let Some(event) = events.next().await {
-            // A burst — a session's entries, their payloads — derives once,
-            // and a store that never goes quiet still derives.
+            // What is already queued joins this derivation; what arrives
+            // during it derives again after it, so a store that never goes
+            // quiet still derives.
             let mut met = Vec::new();
-            note_session(event, &mut met);
-            let settled = tokio::time::Instant::now() + CELL_CHANGE_SETTLE;
-            while let Ok(Some(event)) = tokio::time::timeout_at(settled, events.next()).await {
-                note_session(event, &mut met);
+            let mut listing = note_event(event, &mut met);
+            while let Some(Some(event)) = futures_lite::future::poll_once(events.next()).await {
+                listing |= note_event(event, &mut met);
+            }
+            if !listing {
+                let settled = tokio::time::Instant::now() + settle;
+                while let Ok(Some(event)) = tokio::time::timeout_at(settled, events.next()).await {
+                    if note_event(event, &mut met) {
+                        break;
+                    }
+                }
             }
             let Some(stack) = stack.upgrade() else {
                 return;
@@ -3537,12 +3561,26 @@ fn watch_cell_membership(
     });
 }
 
-/// The peer of a session that went through.
-fn note_session(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>) {
-    if let Ok(pdn_store::engine::LiveEvent::SyncFinished(sync)) = event {
-        if sync.result.is_ok() {
-            met.push(NodeId::from_bytes(*sync.peer.as_bytes()));
+/// Notes the peer of a session that went through; whether the event may
+/// list a device the contacts lack — an entry or a payload arriving, or
+/// events dropped unread.
+fn note_event(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>) -> bool {
+    use pdn_store::engine::LiveEvent;
+    match event {
+        Ok(LiveEvent::SyncFinished(sync)) => {
+            if sync.result.is_ok() {
+                met.push(NodeId::from_bytes(*sync.peer.as_bytes()));
+            }
+            false
         }
+        Ok(
+            LiveEvent::InsertLocal { .. }
+            | LiveEvent::PendingContentReady
+            | LiveEvent::NeighborUp(_)
+            | LiveEvent::NeighborDown(_),
+        ) => false,
+        Ok(LiveEvent::InsertRemote { .. } | LiveEvent::ContentReady { .. } | LiveEvent::Lagged)
+        | Err(_) => true,
     }
 }
 

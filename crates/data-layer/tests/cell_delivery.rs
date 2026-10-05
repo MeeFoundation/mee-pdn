@@ -407,6 +407,76 @@ async fn an_invited_device_is_a_contact_once_the_invite_is_written() -> Result<(
     Ok(())
 }
 
+/// A device another member's invite lists is a contact, as the newcomer,
+/// once the session that brings the invite ends, with no quiet wait before
+/// it: the newcomer's first announcement can come at once. Paired: before
+/// that session it is no contact. The change watch's quiet wait runs an hour
+/// here, so only the derivation an arriving entry starts can list it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> Result<()> {
+    let spawn = || {
+        SyncNode::spawn(SpawnOptions {
+            reconcile_interval: QUIET,
+            cell_reconcile_interval: QUIET,
+            cell_change_settle: QUIET,
+            ..SpawnOptions::memory()
+        })
+    };
+    let (alice_phone, carol_phone) = (spawn().await?, spawn().await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let cell = found(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &carol,
+        vec![device_of(&carol_phone, &carol)?],
+    )
+    .await?;
+    carol_phone
+        .import_cell(carol.id, cell, tickets(&alice_phone, &alice, cell).await?)
+        .await?;
+    assert!(lists(&carol_phone, carol.id, cell, carol.id, PLAIN).await?);
+    let dave = Person::generate();
+    let daves = nowhere(0xd0);
+    let lists_dave = |contacts: Vec<Contact>| {
+        contacts.iter().any(|contact| {
+            contact.addr.id.as_bytes() == daves.node.as_bytes()
+                && contact.identity == identity_of(dave.id)
+        })
+    };
+    // Paired: before the session that brings the invite.
+    let before = carol_phone.cell_contacts_for_test(carol.id, cell, CellStore::Membership)?;
+    assert!(!lists_dave(before));
+
+    invite(&alice_phone, &alice, cell, &dave, vec![daves]).await?;
+    dial(
+        &carol_phone,
+        &carol,
+        cell,
+        CellStore::Membership,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    assert!(lists_device(&carol_phone, carol.id, cell, dave.id, daves).await?);
+    assert!(
+        eventually(|| async {
+            let contacts =
+                carol_phone.cell_contacts_for_test(carol.id, cell, CellStore::Membership)?;
+            Ok(lists_dave(contacts))
+        })
+        .await?,
+        "the device an arriving invite lists waited for a quiet store"
+    );
+
+    for node in [alice_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A write whose announcement a member device missed reaches it at the next
 /// run of its cell pass. Denied: a holder of both tickets that is no member,
 /// running the same pass, takes nothing.
