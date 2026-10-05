@@ -17,9 +17,10 @@ use std::{
 
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node::{CellId, PdnId};
+use pdn_node::{CellId, PdnId, RecordKind, RecordRef};
 use pdn_node_http::shapes::{
-    CreatedIdentity, GrantPublication, GrantedPath, HeldCell, Member, Members, OwnGrant,
+    Act, CreatedIdentity, GrantPublication, GrantedPath, HeldCell, HeldCells, Member, Members,
+    Operations, OwnGrant,
 };
 use serde::de::DeserializeOwned;
 use testcontainers::{
@@ -283,12 +284,62 @@ impl Host {
 
     pub async fn cell_members(&self, identity: PdnId, cell: CellId) -> Result<Vec<Member>> {
         let members: Members = self
-            .get(&format!(
-                "/debug/identities/{identity}/cells/{cell}/members"
-            ))
+            .get(&format!("{}/members", cell_route(identity, cell)))
             .await?
             .json()?;
         Ok(members.members)
+    }
+
+    /// The payload carries a live one-time secret.
+    pub async fn invite_to_cell(&self, identity: PdnId, cell: CellId) -> Result<Bytes> {
+        self.post(
+            &format!("{}/invites", cell_route(identity, cell)),
+            Bytes::new(),
+        )
+        .await?
+        .ok()
+    }
+
+    pub async fn join_cell(&self, identity: PdnId, invite: Bytes) -> Result<Answer> {
+        self.post(&format!("/debug/identities/{identity}/cells/join"), invite)
+            .await
+    }
+
+    pub async fn cell_act(&self, identity: PdnId, cell: CellId, act: Act) -> Result<Answer> {
+        self.post(
+            &format!("{}/acts", cell_route(identity, cell)),
+            serde_json::to_vec(&act)?,
+        )
+        .await
+    }
+
+    pub async fn place_record(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> Result<RecordRef> {
+        self.post(
+            &format!("{}/records?kind={kind}", cell_route(identity, cell)),
+            body(payload),
+        )
+        .await?
+        .json()
+    }
+
+    pub async fn append_op(
+        &self,
+        identity: PdnId,
+        cell: CellId,
+        record: RecordRef,
+        op: &[u8],
+    ) -> Result<Answer> {
+        self.post(
+            &format!("{}/ops", record_route(identity, cell, record)),
+            body(op),
+        )
+        .await
     }
 
     pub async fn publish_grant(
@@ -744,8 +795,6 @@ pub async fn own_grant_reads(
     Ok(())
 }
 
-/// Repeat the read until `holds`, carrying the last answer into the error:
-/// "no answer at all" and "the wrong answer" are different diagnoses.
 async fn poll_read(
     host: &Host,
     acting: PdnId,
@@ -754,10 +803,109 @@ async fn poll_read(
     holds: impl Fn(&Answer) -> bool,
 ) -> Result<()> {
     let route = format!("/debug/data/{acting}/{issuer}/{}", encode_path(path));
+    poll_route(host, &route, holds).await
+}
+
+pub fn cell_route(identity: PdnId, cell: CellId) -> String {
+    format!("/debug/identities/{identity}/cells/{cell}")
+}
+
+pub fn record_route(identity: PdnId, cell: CellId, record: RecordRef) -> String {
+    format!(
+        "{}/records/{}/{}/{}",
+        cell_route(identity, cell),
+        record.member,
+        record.kind,
+        record.id
+    )
+}
+
+/// Poll until `identity`'s replica lists exactly `expected` as the cell's
+/// members, in any order.
+pub async fn members_read(
+    host: &Host,
+    identity: PdnId,
+    cell: CellId,
+    expected: &[Member],
+) -> Result<()> {
+    let mut expected = expected.to_vec();
+    expected.sort_by_key(|member| member.id);
+    let route = format!("{}/members", cell_route(identity, cell));
+    poll_route(host, &route, |answer| {
+        answer.status == StatusCode::OK
+            && serde_json::from_slice::<Members>(&answer.body).is_ok_and(|mut listed| {
+                listed.members.sort_by_key(|member| member.id);
+                listed.members == expected
+            })
+    })
+    .await
+    .with_context(|| format!("{cell} never listed {expected:?} as its members for {identity}"))
+}
+
+pub async fn record_reads(
+    host: &Host,
+    identity: PdnId,
+    cell: CellId,
+    record: RecordRef,
+    expected: &[u8],
+) -> Result<()> {
+    poll_route(host, &record_route(identity, cell, record), |answer| {
+        answer.status == StatusCode::OK && answer.body == expected
+    })
+    .await
+    .with_context(|| format!("{record:?} never read back as expected for {identity}"))
+}
+
+/// Poll until the document's operations are exactly `expected`, each a
+/// writer and its payload, in any order.
+pub async fn ops_read(
+    host: &Host,
+    identity: PdnId,
+    cell: CellId,
+    record: RecordRef,
+    expected: &[(PdnId, &[u8])],
+) -> Result<()> {
+    let mut expected: Vec<(PdnId, Vec<u8>)> = expected
+        .iter()
+        .map(|(writer, payload)| (*writer, payload.to_vec()))
+        .collect();
+    expected.sort();
+    let route = format!("{}/ops", record_route(identity, cell, record));
+    poll_route(host, &route, |answer| {
+        answer.status == StatusCode::OK
+            && serde_json::from_slice::<Operations>(&answer.body).is_ok_and(|read| {
+                let mut read: Vec<(PdnId, Vec<u8>)> = read
+                    .operations
+                    .into_iter()
+                    .map(|op| (op.writer, op.payload))
+                    .collect();
+                read.sort();
+                read == expected
+            })
+    })
+    .await
+    .with_context(|| format!("the operations of {record:?} never read as expected for {identity}"))
+}
+
+/// Poll until `identity` lists `cell` when `held`, or lists it no more.
+pub async fn cell_listed(host: &Host, identity: PdnId, cell: CellId, held: bool) -> Result<()> {
+    let route = format!("/debug/identities/{identity}/cells");
+    poll_route(host, &route, |answer| {
+        answer.status == StatusCode::OK
+            && serde_json::from_slice::<HeldCells>(&answer.body)
+                .is_ok_and(|listed| listed.cells.contains(&cell) == held)
+    })
+    .await
+    .with_context(|| format!("{identity} never listed {cell} as held: {held}"))
+}
+
+/// Repeat a read of `route` until `holds`, carrying the last answer into the
+/// error: "no answer at all" and "the wrong answer" are different diagnoses.
+async fn poll_route(host: &Host, route: &str, holds: impl Fn(&Answer) -> bool) -> Result<()> {
     let deadline = tokio::time::Instant::now() + CONVERGENCE_BUDGET;
     let mut last: Option<Answer> = None;
     loop {
-        let cut_mid_request = match tokio::time::timeout_at(deadline, host.get(&route)).await {
+        let cut_mid_request = match tokio::time::timeout_at(deadline, host.get(route)).await {
             Ok(answer) => {
                 let answer = answer?;
                 if holds(&answer) {
