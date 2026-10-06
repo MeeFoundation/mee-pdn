@@ -19,7 +19,7 @@ On running things. You ARE expected to run the one named test that settles a fin
 
 What nobody does: build, lint, or format the tree — no `cargo build` / `check` / `clippy` / `fmt`, no `just check` / `just fix`, no running the suite whole. That belongs to implementation and to CI, and cargo serializes every agent on one artifact lock, which turns this fan-out back into a queue. Never modify a file in the working tree, and run no state-changing git operation.
 
-Write every prose field of your answer in [LANGUAGE]. Identifiers, paths, and type names stay exactly as they are in the code. Never translate these domain terms: capability, connection metadata store / CMS, private metadata store / PMS, claim, lock, race, identity, audience, connection, binder, session, snapshot, ingress, egress.
+Write every prose field of your answer in [LANGUAGE]. Identifiers, paths, and type names stay exactly as they are in the code. Never translate the platform terms the root CLAUDE.md lists under "Platform terms keep their English names", inflected the way it says, nor ingress and egress.
 ```
 
 Omit the context block when the request carried none. Omit the language block when the review is in English.
