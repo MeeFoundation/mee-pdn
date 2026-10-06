@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,13 +24,15 @@ use pdn_store::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
-    engine::LiveEvent,
+    engine::{LiveEvent, Origin},
     store::{DownloadPolicy, FilterKind, Query},
-    AuthorId, ContentStatus, Entry,
+    AuthorId, ContentStatus, Entry, EntryFilter, NamespaceId, SessionAccess, SessionAccessProvider,
+    SessionRole,
 };
 use rand::{CryptoRng, RngExt, SeedableRng};
 #[cfg(feature = "fs-store")]
 use tempfile::tempdir;
+use tokio::sync::Notify;
 use tracing::{debug, error_span, info, Instrument};
 use tracing_test::traced_test;
 mod util;
@@ -1694,6 +1699,159 @@ async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result
     assert!(
         then.started >= first.finished,
         "the ordered dial started before the exchange it follows finished"
+    );
+    Ok(())
+}
+
+/// A dial held behind an exchange stays held when the dial of that exchange
+/// loses its slot to the counterpart's own and then ends refused: it starts
+/// only once the exchange that took the slot over has finished.
+///
+/// Node `x`, the greater id, wins the tie-break as the accepting side. Its
+/// own dial of `first` waits in its provider until the counterpart's dial
+/// has been accepted and reached `x`'s entries, then is refused; the
+/// counterpart reveals its entries of `first` slowly, so the accepted
+/// exchange outlasts that refusal by seconds.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Result<()> {
+    let mut rng = test_rng(b"a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held");
+    let (mut key_x, mut key_y) = (
+        SecretKey::from_bytes(&rng.random()),
+        SecretKey::from_bytes(&rng.random()),
+    );
+    if key_x.public() < key_y.public() {
+        std::mem::swap(&mut key_x, &mut key_y);
+    }
+    let first_id: Arc<std::sync::OnceLock<NamespaceId>> = Arc::default();
+    let dial_asked = Arc::new(Notify::new());
+    let accepted = Arc::new(Notify::new());
+    let gate = Arc::new(AtomicBool::new(true));
+    let x_access: SessionAccessProvider = {
+        let (first_id, dial_asked, accepted) =
+            (first_id.clone(), dial_asked.clone(), accepted.clone());
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let ours = first_id.get() == Some(&namespace);
+            let (dial_asked, accepted, gate) = (dial_asked.clone(), accepted.clone(), gate.clone());
+            Box::pin(async move {
+                match role {
+                    SessionRole::Dial if ours && gate.swap(false, Ordering::SeqCst) => {
+                        dial_asked.notify_one();
+                        accepted.notified().await;
+                        SessionAccess::Deny
+                    }
+                    SessionRole::Accept if ours => {
+                        let reached: EntryFilter = Arc::new(move |_entry| {
+                            accepted.notify_one();
+                            true
+                        });
+                        SessionAccess::Allow {
+                            egress: Some(reached),
+                            ingest: None,
+                        }
+                    }
+                    _ => SessionAccess::whole(),
+                }
+            })
+        })
+    };
+    let y_access: SessionAccessProvider = {
+        let first_id = first_id.clone();
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let slow = first_id.get() == Some(&namespace) && role == SessionRole::Dial;
+            let access = if slow {
+                let slow_egress: EntryFilter = Arc::new(|_entry| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    true
+                });
+                SessionAccess::Allow {
+                    egress: Some(slow_egress),
+                    ingest: None,
+                }
+            } else {
+                SessionAccess::whole()
+            };
+            Box::pin(std::future::ready(access))
+        })
+    };
+    let x = test_node(key_x).await?.access(x_access).spawn().await?;
+    let y = test_node(key_y).await?.access(y_access).spawn().await?;
+    let id_y = y.id();
+
+    let (first_x, then_x) = (x.docs().create().await?, x.docs().create().await?);
+    first_id
+        .set(first_x.id())
+        .map_err(|_| anyhow!("first set once"))?;
+    let author_x = x.docs().author_create().await?;
+    first_x
+        .set_bytes(author_x, b"x".to_vec(), b"x".to_vec())
+        .await?;
+    let mut x_contacts = Vec::new();
+    let mut imported = Vec::new();
+    for doc in [&first_x, &then_x] {
+        let ticket = doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        x_contacts = ticket.contacts();
+        imported.push(y.docs().import_namespace(ticket.capability).await?);
+    }
+    let (first_y, then_y) = (&imported[0], &imported[1]);
+    let author_y = y.docs().author_create().await?;
+    for i in 0..20u8 {
+        first_y.set_bytes(author_y, vec![b'y', i], vec![i]).await?;
+    }
+    let y_contacts = then_y
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?
+        .contacts();
+    let mut first_events = first_x.subscribe().await?;
+    let mut then_events = then_x.subscribe().await?;
+
+    x.engine()
+        .order_after(then_x.id(), Some(first_x.id()))
+        .await?;
+    first_x.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    then_x
+        .start_sync_scoped(y_contacts, util::TEST_HOLDER)
+        .await?;
+    n0_future::time::timeout(TIMEOUT, dial_asked.notified()).await?;
+    then_y.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    first_y
+        .start_sync_scoped(x_contacts, util::TEST_HOLDER)
+        .await?;
+
+    let first = next_event_matching(&mut first_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id_y)
+    })
+    .await;
+    // The counterpart dials `then` of its own accord once a neighbor; the
+    // order holds this node's dials alone.
+    let then = next_event_matching(&mut then_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id_y)
+            && matches!(e, LiveEvent::SyncFinished(sync) if matches!(sync.origin, Origin::Connect(_)))
+    })
+    .await;
+    let (LiveEvent::SyncFinished(first), LiveEvent::SyncFinished(then)) = (first, then) else {
+        unreachable!("matched as finished syncs");
+    };
+    assert!(
+        matches!(first.origin, Origin::Accept),
+        "the exchange of first was not the accepted one: {:?}",
+        first.origin
+    );
+    // The finished stamp is taken after the exchange releases its held
+    // dials; the slow egress keeps the exchange itself over a second long.
+    let released = first
+        .finished
+        .checked_sub(Duration::from_millis(100))
+        .context("a finished stamp after the epoch")?;
+    assert!(
+        then.started >= released,
+        "the held dial started {:?} before the exchange that took the slot over finished",
+        first
+            .finished
+            .duration_since(then.started)
+            .unwrap_or_default()
     );
     Ok(())
 }

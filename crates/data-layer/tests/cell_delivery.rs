@@ -1113,6 +1113,153 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
     Ok(())
 }
 
+/// A member's device dialing a member's device serves it the cell's records.
+/// Denied: a kicked member's device takes no record from the same dial, and
+/// a holder of both tickets that is no member no entry of either store.
+///
+/// Every device dialed serves whatever session it is asked to whole, as a
+/// modified node would, so the dialer's own closed egress is all that keeps
+/// the records in; every device is out of both swarms and settled, so the
+/// dials below are the only sessions.
+#[allow(clippy::too_many_lines)] // one scenario: the served member beside two denials
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_accepts() -> Result<()>
+{
+    let (alice_phone, bob_phone, carol_phone, dave_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let (dave, _) = host(&dave_phone).await?;
+    let cell = found(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        invite(
+            &alice_phone,
+            &alice,
+            cell,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    for (phone, holder) in [
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+    ] {
+        phone.import_cell(holder.id, cell, tickets.clone()).await?;
+    }
+    for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        assert!(lists(phone, holder.id, cell, alice.id, OWNER).await?);
+    }
+    let devices = [
+        (&alice_phone, &alice),
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+    ];
+    for (phone, holder) in devices {
+        for namespace in [
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        ] {
+            phone.leave_swarm_for_test(holder.id, namespace).await?;
+        }
+    }
+    let phones = [&alice_phone, &bob_phone, &carol_phone, &dave_phone];
+    assert!(settle(&phones, cell).await?);
+
+    let kick = MembershipKey::Event {
+        subject: carol.id,
+        seq: Seq::new(2),
+        kind: EventKind::Kicked,
+        actor: alice.id,
+        actor_seq: Seq::FIRST,
+    };
+    write(&alice_phone, &alice, cell, kick, vec![0]).await?;
+    let claim = place_claim(&alice_phone, &alice, cell, 1).await?;
+    for (phone, holder) in [
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+    ] {
+        phone.serve_cell_sessions_whole_for_test(holder.id, true)?;
+    }
+    let mut records = alice_phone
+        .watch_cell_sessions(alice.id, cell, CellStore::Records)
+        .await?;
+
+    dial(
+        &alice_phone,
+        &alice,
+        cell,
+        CellStore::Records,
+        &bob_phone,
+        &bob,
+    )
+    .await?;
+    assert!(
+        reads(&bob_phone, bob.id, cell, claim).await?,
+        "a member's device took no record from a member's dial"
+    );
+    // Denied: the kicked member's device, on the record store.
+    dial(
+        &alice_phone,
+        &alice,
+        cell,
+        CellStore::Records,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    assert!(
+        records
+            .next_served_with(carol_phone.node_id(), TIMEOUT)
+            .await?
+            .is_some(),
+        "the dial to the kicked member's device did not go through"
+    );
+    assert!(
+        holds_no_record(&carol_phone, carol.id, cell).await?,
+        "a member's dial served a kicked member's device a record"
+    );
+    // Denied: the ticket holder that is no member, on either store.
+    dial(
+        &alice_phone,
+        &alice,
+        cell,
+        CellStore::Records,
+        &dave_phone,
+        &dave,
+    )
+    .await?;
+    assert!(
+        records
+            .next_served_with(dave_phone.node_id(), TIMEOUT)
+            .await?
+            .is_some(),
+        "the dial to the ticket holder did not go through"
+    );
+    assert!(
+        folds_nobody(&dave_phone, dave.id, cell).await?,
+        "a member's dial served a ticket holder the membership store"
+    );
+    assert!(
+        holds_no_record(&dave_phone, dave.id, cell).await?,
+        "a member's dial served a ticket holder a record"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone, dave_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A member's write reaches a co-located newcomer it does not yet know
 /// through the announcement inside the process, which reconciles the
 /// membership store first. Denied: a co-located holder of both tickets

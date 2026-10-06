@@ -396,14 +396,24 @@ struct HostedStack {
     /// member's device, and is reconciled with the identity's own devices
     /// alone from then on.
     converged_tombstones: Mutex<HashSet<CellId>>,
-    /// Held through each derivation of a cell's contacts, from its fold to
-    /// its last write: one that folded before a change would otherwise set
-    /// its list after the one that folded after it.
-    cell_derivation: tokio::sync::Mutex<()>,
+    /// One per cell, held through each derivation of that cell's contacts,
+    /// from its fold to its last write: one that folded before a change
+    /// would otherwise set its list after the one that folded after it.
+    cell_derivations: Mutex<HashMap<CellId, Arc<tokio::sync::Mutex<()>>>>,
     notices: crate::cell::CellNoticeSink,
 }
 
 impl HostedStack {
+    /// `cell`'s derivation lock. A map of locks holds no state a panic
+    /// could leave half-written, so a poisoned one is used as it stands.
+    fn cell_derivation(&self, cell: CellId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .cell_derivations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(locks.entry(cell).or_default())
+    }
+
     fn report(&self, notice: CellNotice) {
         if let Ok(sender) = self.notices.lock() {
             if let Some(sender) = sender.as_ref() {
@@ -727,7 +737,7 @@ impl SyncNode {
             nudges_in_flight: Mutex::new(HashSet::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
             converged_tombstones: Mutex::new(HashSet::new()),
-            cell_derivation: tokio::sync::Mutex::new(()),
+            cell_derivations: Mutex::new(HashMap::new()),
             notices: Arc::clone(&self.cell_notices),
         });
         let mut hosted = self
@@ -1231,7 +1241,8 @@ impl SyncNode {
 
     /// [`sync_as_for_test`](Self::sync_as_for_test) for any replica
     /// `identity` holds, named by its namespace — a directory or a
-    /// connection metadata store as well as a data replica.
+    /// connection metadata store as well as a data replica. No session
+    /// access is asked on the dialing side, so it serves its replica whole.
     #[cfg(feature = "test-util")]
     pub async fn sync_namespace_as_for_test(
         &self,
@@ -1678,6 +1689,11 @@ impl SyncNode {
         for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
             self.forget_doc(identity, doc.id()).await?;
         }
+        stack
+            .cell_derivations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&cell);
         Ok(())
     }
 
@@ -1818,15 +1834,7 @@ impl SyncNode {
             };
             // Subscribed before the dial, so no session ends unseen.
             flush.sessions.push(Box::pin(doc.subscribe().await?));
-            tracked
-                .doc
-                .sync_with_peers(
-                    drawn.clone(),
-                    Vec::new(),
-                    tracked.default_identity,
-                    tracked.strategy == SyncStrategy::Swarm,
-                )
-                .await?;
+            sync_cell_store(&stack, &tracked, drawn.clone(), Vec::new()).await?;
         }
         Ok(flush)
     }
@@ -2131,6 +2139,17 @@ impl SyncNode {
     #[cfg(feature = "test-util")]
     pub fn refuse_cell_sessions_for_test(&self, identity: PdnId, refuse: bool) -> Result<()> {
         self.require(identity)?.access.refuse_cell_sessions(refuse);
+        Ok(())
+    }
+
+    /// While `serve`, every session on a cell's store that `identity` is
+    /// asked to serve is served whole, as by a modified node that judges no
+    /// caller; its own dials are judged as ever.
+    #[cfg(feature = "test-util")]
+    pub fn serve_cell_sessions_whole_for_test(&self, identity: PdnId, serve: bool) -> Result<()> {
+        self.require(identity)?
+            .access
+            .serve_cell_sessions_whole(serve);
         Ok(())
     }
 
@@ -3473,16 +3492,32 @@ async fn reconcile_cell(
                 .map(|peer| NodeId::from_bytes(*peer))
                 .collect(),
         });
-        let _ = tracked
-            .doc
-            .sync_with_peers(
-                contacts,
-                recorded,
-                tracked.default_identity,
-                tracked.strategy == SyncStrategy::Swarm,
-            )
-            .await;
+        let _ = sync_cell_store(stack, &tracked, contacts, recorded).await;
     }
+}
+
+/// Reconcile a cell store with `contacts` and `recorded`, in its swarm as
+/// `tracked` read. A store `forget_cell` turned out of its swarm after that
+/// read leaves the swarm again: the forget's own leave can run before this
+/// sync joins.
+async fn sync_cell_store(
+    stack: &HostedStack,
+    tracked: &TrackedDoc,
+    contacts: Vec<Contact>,
+    recorded: Vec<PeerIdBytes>,
+) -> Result<()> {
+    let swarm = tracked.strategy == SyncStrategy::Swarm;
+    tracked
+        .doc
+        .sync_with_peers(contacts, recorded, tracked.default_identity, swarm)
+        .await?;
+    let turned_out = stack
+        .tracked(tracked.doc.id())?
+        .is_some_and(|now| now.strategy == SyncStrategy::ContactsOnly);
+    if swarm && turned_out {
+        tracked.doc.leave_gossip().await?;
+    }
+    Ok(())
 }
 
 /// Derive both of a cell's stores' contacts from its membership and set
@@ -3496,11 +3531,12 @@ async fn derive_cell_contacts(
     held: &CellBinding,
     met: &[NodeId],
 ) {
-    let _derivation = stack.cell_derivation.lock().await;
+    let derivation = stack.cell_derivation(cell);
+    let _derivation = derivation.lock().await;
     derive_cell_contacts_locked(stack, node, cell, held, met).await;
 }
 
-/// [`derive_cell_contacts`] with the stack's `cell_derivation` held.
+/// [`derive_cell_contacts`] with the cell's derivation lock held.
 async fn derive_cell_contacts_locked(
     stack: &HostedStack,
     node: EndpointId,
@@ -3508,8 +3544,13 @@ async fn derive_cell_contacts_locked(
     held: &CellBinding,
     met: &[NodeId],
 ) {
-    let Ok(derived) = cell_contacts(stack, node, cell, held, met).await else {
-        return;
+    let derived = match cell_contacts(stack, node, cell, held, met).await {
+        Ok(derived) => derived,
+        Err(err) => {
+            let identity = stack.identity;
+            tracing::warn!(%identity, %cell, "deriving the cell's contacts failed: {err:#}");
+            return;
+        }
     };
     if held.records.is_some() {
         let identity = stack.identity;
@@ -3548,7 +3589,8 @@ async fn derive_before_start(
     cell: CellId,
     held: &CellBinding,
 ) -> Result<()> {
-    let _derivation = stack.cell_derivation.lock().await;
+    let derivation = stack.cell_derivation(cell);
+    let _derivation = derivation.lock().await;
     let docs: Vec<&Doc> = std::iter::once(&held.membership)
         .chain(held.records.as_ref())
         .collect();

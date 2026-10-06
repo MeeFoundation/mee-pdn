@@ -200,7 +200,8 @@ async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnId) -
 }
 
 /// A member's device is served both stores and folds the cell from nothing.
-/// Denied: a holder of both tickets that is no member, on either store, and
+/// Denied: the callee of its first dial, which it does not yet resolve to a
+/// member; a holder of both tickets that is no member, on either store; and
 /// the member itself once kicked, on the record store.
 #[allow(clippy::too_many_lines)] // one scenario: the served member beside each denial
 #[tokio::test(flavor = "multi_thread")]
@@ -227,11 +228,20 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     let mut verdicts = alice_phone
         .take_cell_verdicts()
         .expect("the verdict channel is taken once");
+    // Refused while both import, so the imports' own dials bring them
+    // nothing; Bob's phone out of both swarms and every device settled, so
+    // the dials below are its only sessions.
+    alice_phone.refuse_cell_sessions_for_test(alice.id, true)?;
     bob_phone.import_cell(bob.id, cell, tickets.clone()).await?;
     dave_phone.import_cell(dave.id, cell, tickets).await?;
+    for namespace in [membership, records] {
+        bob_phone.leave_swarm_for_test(bob.id, namespace).await?;
+    }
+    assert!(settle(&[&alice_phone, &bob_phone, &dave_phone], cell).await?);
+    alice_phone.refuse_cell_sessions_for_test(alice.id, false)?;
 
     // A plain member's promotion of itself, carried to Alice's phone by the
-    // session that follows.
+    // second of the dials that follow.
     let own_promotion = MembershipKey::Event {
         subject: bob.id,
         seq: Seq::new(2),
@@ -240,15 +250,20 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         actor_seq: Seq::new(1),
     };
     write(&bob_phone, &bob, cell, own_promotion, vec![0]).await?;
-    session(
-        &bob_phone,
-        bob.id,
-        membership,
-        &alice_phone,
-        alice.id,
-        bob.id,
-    )
-    .await?;
+    let to_alice = Contact::new(alice_phone.dial_handle().addr(), identity_of(alice.id));
+    let mut dials = bob_phone
+        .watch_cell_sessions(bob.id, cell, CellStore::Membership)
+        .await?;
+    bob_phone
+        .sync_cell_with_for_test(bob.id, cell, CellStore::Membership, to_alice.clone())
+        .await?;
+    assert!(
+        dials
+            .next_served_with(alice_phone.node_id(), TIMEOUT)
+            .await?
+            .is_some(),
+        "the member's first dial did not go through"
+    );
     assert!(
         eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, alice.id).await == OWNER) })
             .await?,
@@ -261,18 +276,24 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
             .await?,
         "the member's device did not count its own joined event"
     );
-    // A dialer serves a callee only once it resolves the callee's member,
-    // so the promotion leaves Bob's phone in the second session.
-    session(
-        &bob_phone,
-        bob.id,
-        membership,
-        &alice_phone,
-        alice.id,
-        bob.id,
-    )
-    .await?;
+    // Denied: the callee of a dial whose member the dialer has not resolved
+    // yet takes nothing from it.
     let promotion_key = own_promotion.to_bytes();
+    alice_phone.cell_membership(alice.id, cell).await?;
+    let mut held_early = false;
+    while let Ok(report) = verdicts.try_recv() {
+        held_early |= report
+            .verdicts
+            .iter()
+            .any(|(key, _author, _verdict)| *key == promotion_key);
+    }
+    assert!(
+        !held_early,
+        "the first dial served the callee before the dialer resolved its member"
+    );
+    bob_phone
+        .sync_cell_with_for_test(bob.id, cell, CellStore::Membership, to_alice)
+        .await?;
     let judged = tokio::time::timeout(TIMEOUT, async {
         loop {
             alice_phone.cell_membership(alice.id, cell).await?;

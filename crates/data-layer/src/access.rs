@@ -133,6 +133,10 @@ pub(crate) struct AccessBook {
     /// device out of reach answers none.
     #[cfg(feature = "test-util")]
     refuse_cells: std::sync::atomic::AtomicBool,
+    /// Serves every cell session this identity is asked to serve whole, as
+    /// a modified node judging no caller answers.
+    #[cfg(feature = "test-util")]
+    serve_cells_whole: std::sync::atomic::AtomicBool,
 }
 
 /// Where each fold's verdicts go once a scenario takes the channel.
@@ -153,6 +157,8 @@ impl AccessBook {
             cell_verdicts: OnceLock::new(),
             #[cfg(feature = "test-util")]
             refuse_cells: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            serve_cells_whole: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -160,6 +166,12 @@ impl AccessBook {
     pub(crate) fn refuse_cell_sessions(&self, refuse: bool) {
         self.refuse_cells
             .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn serve_cell_sessions_whole(&self, serve: bool) {
+        self.serve_cells_whole
+            .store(serve, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn set_blobs(&self, blobs: iroh_blobs::api::Store) {
@@ -425,6 +437,14 @@ impl AccessBook {
             && self.refuse_cells.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(SessionAccess::Deny);
+        }
+        #[cfg(feature = "test-util")]
+        if matches!(role, SessionRole::Accept)
+            && self
+                .serve_cells_whole
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(self.whole(registry));
         }
         if remote == identity_of(self.identity) {
             // A sibling is served the store whole, a tombstone included.

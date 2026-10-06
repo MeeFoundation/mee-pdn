@@ -1,5 +1,5 @@
 //! The cells service: creating a cell for a hosted identity, listing its
-//! cells and their members, the invite and join dialogue (cells D26) on
+//! cells and their members, the invite and join dialogue on
 //! the cell-join ALPN — the inviter verifies and burns the secret before any
 //! state change, names the newcomer's sequence, writes its joined event and
 //! device statement, and only then hands over both stores' write tickets —
@@ -141,7 +141,7 @@ pub enum ActRefusal {
     /// A demotion of a plain member.
     SubjectNotOwner,
     /// A leave by the cell's one owner while it has other members, until
-    /// another member is an owner (cells D11).
+    /// another member is an owner.
     SoleOwner,
 }
 
@@ -156,9 +156,8 @@ pub struct ActRefused {
 }
 
 /// A claim and an immutable-document are placed once: no operation is
-/// appended to either, by its member included (cells D5, D17). Refused
-/// before anything is written. Downcast from the `anyhow::Error` of
-/// `append_op`.
+/// appended to either, by its member included. Refused before anything is
+/// written. Downcast from the `anyhow::Error` of `append_op`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{} {} under {} is placed once", .record.kind, .record.id, .record.member)]
 pub struct RecordPlacedOnce {
@@ -253,7 +252,7 @@ pub trait CellsService {
     async fn join(&self, identity: PdnId, invite: CellInvite) -> Result<CellId>;
 
     /// Write a membership act once the identity's role allows it, both
-    /// sequences picked from what the replica holds (cells D23);
+    /// sequences picked from what the replica holds;
     /// [`ActRefused`] writes nothing. A leave also tombstones the cell in the
     /// identity's directory at the left event's sequence and forgets the
     /// record store, the membership store kept as the cell's tombstone.
@@ -307,7 +306,7 @@ pub trait CellsService {
     async fn list_records(&self, identity: PdnId, cell: CellId) -> Result<Vec<RecordRef>>;
 
     /// The entries of both stores outside the key layout, each with its
-    /// author (cells D27).
+    /// author.
     async fn list_unknown(&self, identity: PdnId, cell: CellId) -> Result<Vec<UnknownEntry>>;
 }
 
@@ -494,8 +493,8 @@ impl CellsService for RuntimeCellsService<'_> {
                 Arc::clone(&state.node)
             };
             // What no member's device holds by the departure never leaves
-            // this one: the tombstone serves the departure's past alone
-            // (cells D36). A round trip, so outside the lock.
+            // this one: the tombstone serves the departure's past alone.
+            // A round trip, so outside the lock.
             let _flushed = node
                 .flush_cell(identity, cell)
                 .await?
@@ -663,7 +662,7 @@ fn require_member(membership: &Membership, identity: PdnId, cell: CellId) -> Res
 
 /// The key of the event `act` writes as `identity` in `cell`, at the first
 /// sequence of its subject's chain the replica holds no entry at, naming
-/// the actor's last (cells D23); [`ActRefused`] by the checks of
+/// the actor's last; [`ActRefused`] by the checks of
 /// [`act_event`].
 async fn act_key(
     state: &State,
@@ -692,7 +691,7 @@ async fn act_key(
 }
 
 /// The event `act` writes as `identity`, by the checks the fold applies to
-/// it (cells D23) and the guard on the one owner's leave (cells D11).
+/// it and the guard on the one owner's leave.
 fn act_event(
     membership: &Membership,
     identity: PdnId,
@@ -734,7 +733,7 @@ fn act_event(
 
 /// `identity`'s departure from `cell` at `seq` of its chain: the
 /// directory's tombstone at that sequence, then the record store forgotten,
-/// the membership store kept as the cell's tombstone (cells D35, D36).
+/// the membership store kept as the cell's tombstone.
 async fn depart(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Result<()> {
     state
         .hosted(identity)?
@@ -747,8 +746,8 @@ async fn depart(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Resul
 /// Acts on every notice the data layer reports of a hosted identity's
 /// cells: a departure is settled — how a kicked member's device, or a
 /// departed member's other device, learns of it — and a device its
-/// member's statements do not list registers itself (cells D16). A failure
-/// is reported again at the next change to the membership store or the
+/// member's statements do not list registers itself. A failure is logged
+/// and reported again at the next change to the membership store or the
 /// next run of the cell stores' pass.
 pub(crate) fn spawn_cell_notice_consumer(
     state: Weak<Mutex<State>>,
@@ -760,16 +759,22 @@ pub(crate) fn spawn_cell_notice_consumer(
                 return;
             };
             let guard = state.lock().await;
-            let _ = match notice {
+            match notice {
                 CellNotice::Departed {
                     identity,
                     cell,
                     seq,
-                } => settle_departure(&guard, identity, cell, seq).await,
-                CellNotice::Unlisted { identity, cell } => {
-                    register_device(&guard, identity, cell).await
+                } => {
+                    if let Err(err) = settle_departure(&guard, identity, cell, seq).await {
+                        tracing::warn!(%identity, %cell, "settling the departure failed: {err:#}");
+                    }
                 }
-            };
+                CellNotice::Unlisted { identity, cell } => {
+                    if let Err(err) = register_device(&guard, identity, cell).await {
+                        tracing::warn!(%identity, %cell, "registering this device failed: {err:#}");
+                    }
+                }
+            }
         }
     });
 }
@@ -793,9 +798,9 @@ async fn settle_departure(state: &State, identity: PdnId, cell: CellId, seq: Seq
 
 /// Write `identity`'s next device statement in `cell` — its counted list
 /// with this device added — when that list does not name this device with
-/// the author `identity` writes with here (cells D16). Nothing while the
-/// announcement key has not reached this device, or while a join of the
-/// cell is in flight here, its dialogue carrying a statement of its own.
+/// the author `identity` writes with here. Nothing while the announcement
+/// key has not reached this device, or while a join of the cell is in
+/// flight here, its dialogue carrying a statement of its own.
 async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
     if state.joining_in_flight.contains(&(identity, cell)) {
         return Ok(());
@@ -842,10 +847,9 @@ async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result
 /// Open every cell `identity`'s directory holds that this device does not,
 /// from the tickets beside its record; open the tombstone of every cell it
 /// departed that this device holds nothing of, and forget the record store
-/// of every one this device still holds (cells D16, D35, D36). The sweep
-/// after a restart re-derives the hosted cells so. A cell whose join is in
-/// flight here is the join's; one whose tickets have not arrived waits for
-/// the next sweep.
+/// of every one this device still holds. The sweep after a restart
+/// re-derives the hosted cells so. A cell whose join is in flight here is
+/// the join's; one whose tickets have not arrived waits for the next sweep.
 pub(crate) async fn arm_cells(state: &State, identity: PdnId) {
     let Ok(hosted) = state.hosted(identity) else {
         return;
@@ -940,7 +944,7 @@ async fn cell_tickets(
 }
 
 /// The author `identity` writes with here and the point of its chain its
-/// records name (cells D22), once it is a member of `cell`.
+/// records name, once it is a member of `cell`.
 async fn writer(state: &State, identity: PdnId, cell: CellId) -> Result<(AuthorId, Seq)> {
     let author = state.hosted(identity)?.author;
     let membership = state.node.cell_membership(identity, cell).await?;
@@ -1267,7 +1271,7 @@ where
 }
 
 /// The identity holds `cell` from `seq` of its chain on: both stores' write
-/// tickets and the cell's entry in its directory (cells D35), which reach
+/// tickets and the cell's entry in its directory, which reach
 /// its other devices. Beside its own tickets go the ones the inviter handed
 /// over at a join, so a sibling, or this device after a restart, has a
 /// member's device to dial, named as that member, before its replica folds

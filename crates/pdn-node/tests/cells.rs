@@ -529,6 +529,75 @@ async fn a_join_whose_inviter_drops_out_during_its_catch_up_is_finished_later() 
     Ok(())
 }
 
+/// A former member invited by a device that has not seen its leave joins
+/// again: its joined event goes past the leave, at the run the joiner
+/// reports from its own replica.
+///
+/// Both devices refuse every cell session from the leave on, so the left
+/// event stays on the leaving device until the join's catch-up; the
+/// inviting device refuses until the join is paused before its catch-up,
+/// since a session served earlier would carry the left event to it before
+/// it offers the sequence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_former_member_invited_by_a_device_that_has_not_seen_its_leave_joins_again() -> Result<()>
+{
+    let alice_phone = memory_runtime().await?;
+    let bob_phone = Arc::new(
+        Runtime::spawn(SpawnOptions {
+            cell_reconcile_interval: Duration::from_millis(500),
+            ..SpawnOptions::memory()
+        })
+        .await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let cell = cell_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    let both = vec![member(alice, true), member(bob, false)];
+    assert!(lists_members(&alice_phone, alice, cell, both.clone()).await?);
+
+    alice_phone
+        .refuse_cell_sessions_for_test(alice, true)
+        .await?;
+    bob_phone.refuse_cell_sessions_for_test(bob, true).await?;
+    bob_phone.cells().act(bob, cell, CellAct::Leave).await?;
+    assert!(lists_cell(&bob_phone, bob, cell, false).await?);
+    let invite = alice_phone.cells().invite(alice, cell, None).await?;
+    let pause = bob_phone.pause_next_join_catch_up().await;
+    let joining = {
+        let (bob_phone, invite) = (Arc::clone(&bob_phone), invite);
+        tokio::spawn(async move { bob_phone.cells().join(bob, invite).await })
+    };
+    pause.wait_until_reached().await;
+    let offered_on = alice_phone.cell_membership_for_test(alice, cell).await?;
+    assert_eq!(
+        offered_on
+            .member(&bob)
+            .map(|folded| (folded.run(), folded.state.member)),
+        Some((1, true)),
+        "the inviting device saw the leave before it made its offer"
+    );
+    alice_phone
+        .refuse_cell_sessions_for_test(alice, false)
+        .await?;
+    pause.release();
+
+    joining.await??;
+    for (runtime, holder) in [(&alice_phone, alice), (&*bob_phone, bob)] {
+        assert!(lists_members(runtime, holder, cell, both.clone()).await?);
+    }
+    let rejoined = bob_phone.cell_membership_for_test(bob, cell).await?;
+    assert_eq!(
+        rejoined.member(&bob).map(data_layer::Member::run),
+        Some(3),
+        "the joined event did not go past the leave"
+    );
+    bob_phone.refuse_cell_sessions_for_test(bob, false).await?;
+
+    alice_phone.shutdown().await?;
+    bob_phone.shutdown().await?;
+    Ok(())
+}
+
 /// A cell with `owner` its creator on `owner_runtime` and `member` joined
 /// from `member_runtime`.
 async fn cell_of_two(

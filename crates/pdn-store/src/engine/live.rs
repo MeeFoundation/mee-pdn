@@ -1388,7 +1388,11 @@ impl LiveActor {
         };
 
         let finished = self.state.finish(&namespace, peer, counterpart, &origin);
-        self.release_held(namespace, peer, counterpart);
+        // A dial the tie-break superseded leaves the held dials to the
+        // exchange that took its slot over.
+        if !self.state.is_running(&namespace, (peer, counterpart)) {
+            self.release_held(namespace, peer, counterpart);
+        }
         let Some((started, resync)) = finished else {
             return;
         };

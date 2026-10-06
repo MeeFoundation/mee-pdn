@@ -15,7 +15,10 @@ use iroh_blobs::store::GcConfig;
 use iroh_gossip::net::Gossip;
 use n0_error::Result;
 use pdn_store::{
-    engine::ProtectCallbackHandler, filter::serve_whole, protocol::Docs, Contact, Identity,
+    engine::ProtectCallbackHandler,
+    filter::{serve_whole, SessionAccessProvider},
+    protocol::Docs,
+    Contact, Identity,
 };
 
 /// One identity per node: these suites reconcile between two bare nodes.
@@ -97,6 +100,8 @@ pub struct Builder {
     gc_interval: Option<n0_future::time::Duration>,
     #[debug(skip)]
     register_gc_done_cb: Option<Box<dyn Fn() + Send + 'static>>,
+    #[debug(skip)]
+    access: Option<SessionAccessProvider>,
 }
 
 impl Builder {
@@ -109,17 +114,16 @@ impl Builder {
         let mut router = iroh::protocol::Router::builder(self.endpoint.clone());
         let gossip = Gossip::builder().spawn(self.endpoint.clone());
         // These suites reconcile between two bare nodes: one identity each,
-        // and a provider that judges nothing — what a consumer states when
-        // its scenario is the codec rather than the access model.
+        // and unless a scenario names one, a provider that judges nothing —
+        // what a consumer states when its scenario is the codec rather than
+        // the access model.
+        let access = self.access.clone().unwrap_or_else(serve_whole);
         let mut docs_builder = match self.storage {
-            Storage::Memory => Docs::memory(TEST_HOLDER, serve_whole()),
+            Storage::Memory => Docs::memory(TEST_HOLDER, access),
             #[cfg(feature = "fs-store")]
-            Storage::Persistent(ref path) => Docs::persistent(
-                path.to_path_buf(),
-                TEST_CACHE_BYTES,
-                TEST_HOLDER,
-                serve_whole(),
-            ),
+            Storage::Persistent(ref path) => {
+                Docs::persistent(path.to_path_buf(), TEST_CACHE_BYTES, TEST_HOLDER, access)
+            }
         };
         if let Some(protect_cb) = protect_cb {
             docs_builder = docs_builder.protect_handler(protect_cb);
@@ -163,12 +167,19 @@ impl Builder {
         self
     }
 
+    /// Judges sessions with `provider` in place of [`serve_whole`].
+    pub fn access(mut self, provider: SessionAccessProvider) -> Self {
+        self.access = Some(provider);
+        self
+    }
+
     fn new(storage: Storage, endpoint: Endpoint) -> Self {
         Self {
             endpoint,
             storage,
             gc_interval: None,
             register_gc_done_cb: None,
+            access: None,
         }
     }
 }

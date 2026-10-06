@@ -317,9 +317,8 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
     Ok(())
 }
 
-/// A tombstone is reconciled with member devices until one session with a
-/// member's device goes through, and from then on with the identity's own
-/// devices alone.
+/// A tombstone that has reached a member's device is reconciled with the
+/// identity's own devices alone.
 #[allow(clippy::too_many_lines)] // one scenario: the leave and the contacts before and after
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_member() -> Result<()>
@@ -386,6 +385,80 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
         }
     })
     .await?;
+
+    for node in [alice_phone, bob_phone, carol_phone, carol_laptop] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A tombstone that has reached no member's device yet is reconciled with
+/// member devices: the flush a leave runs after its departure carries the
+/// left event to every one of them.
+///
+/// Every pass is out of reach and the leaving devices are out of both swarms
+/// and settled, so the flush is the left event's one path. The record store
+/// is forgotten after the left event is written, as a leave does: a write
+/// reaches a cell's membership store only while its record store is held.
+#[allow(clippy::too_many_lines)] // one scenario: the leave, the forget and the flush
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() -> Result<()> {
+    let (alice_phone, bob_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let (carol_phone, carol_laptop) = (node(QUIET).await?, node(QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
+    let cell = found(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        cell,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    let carols = vec![
+        device_of(&carol_phone, &carol)?,
+        device_of(&carol_laptop, &carol)?,
+    ];
+    invite(&alice_phone, &alice, cell, &carol, carols).await?;
+    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    for (device, holder) in [
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&carol_laptop, &carol),
+    ] {
+        device.import_cell(holder.id, cell, tickets.clone()).await?;
+        assert!(lists(device, holder.id, cell, bob.id, PLAIN).await?);
+    }
+    for namespace in [
+        tickets.membership.capability.id(),
+        tickets.records.capability.id(),
+    ] {
+        carol_phone
+            .leave_swarm_for_test(carol.id, namespace)
+            .await?;
+        carol_laptop
+            .leave_swarm_for_test(carol.id, namespace)
+            .await?;
+    }
+    let phones = [&alice_phone, &bob_phone, &carol_phone, &carol_laptop];
+    assert!(settle(&phones, cell).await?);
+
+    depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_cell(carol.id, cell).await?;
+    let flushed = carol_phone
+        .flush_cell(carol.id, cell)
+        .await?
+        .wait(TIMEOUT)
+        .await;
+    assert!(flushed, "the tombstone's flush reached no member's device");
+    for (phone, holder) in [(&alice_phone, &alice), (&bob_phone, &bob)] {
+        assert!(
+            lists(phone, holder.id, cell, carol.id, OUT).await?,
+            "the leave did not reach a member's device"
+        );
+    }
 
     for node in [alice_phone, bob_phone, carol_phone, carol_laptop] {
         node.shutdown().await?;
