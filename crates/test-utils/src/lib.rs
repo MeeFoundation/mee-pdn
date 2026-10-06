@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use data_layer::{DocTicket, PrivateMetadataStore, SpawnOptions, SyncNode};
 
-pub mod cell;
+pub mod pod;
 use pdn_types::{EntryPath, NodeId, PdnId};
 
 /// A node on memory storage — what the in-process suites run on.

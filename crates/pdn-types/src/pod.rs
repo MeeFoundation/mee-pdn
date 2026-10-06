@@ -1,4 +1,4 @@
-//! The cell's vocabulary; the cell stores spec (`data-layer/cell-store`) holds its rules.
+//! The pod's vocabulary; the pod stores spec (`data-layer/pod-store`) holds its rules.
 
 use std::{fmt, str::FromStr};
 
@@ -8,9 +8,9 @@ use thiserror::Error;
 use crate::PdnId;
 
 crate::define_byte_id_16! {
-    /// A cell's one address, carrying no key material and never equal to
+    /// A pod's one address, carrying no key material and never equal to
     /// either of its stores' namespace ids (Invariant 3).
-    pub struct CellId;
+    pub struct PodId;
 }
 
 crate::define_byte_id_16! {
@@ -92,15 +92,15 @@ mod tests {
         assert!("Claim".parse::<RecordKind>().is_err());
     }
 
-    /// A cell id's text is 32 lowercase hex chars and parses back; a 64-char
+    /// A pod id's text is 32 lowercase hex chars and parses back; a 64-char
     /// string is refused.
     #[test]
-    fn cell_id_text_round_trips() {
-        let id: CellId = "9cbcbe4da7cc35a44360d64e45621957".parse().unwrap();
-        assert_eq!(id.to_string(), "9cbcbe4da7cc35a44360d64e45621957");
+    fn pod_id_text_round_trips() {
+        let id: PodId = "ad58a3faa04cdc5576c8dc5823a347c6".parse().unwrap();
+        assert_eq!(id.to_string(), "ad58a3faa04cdc5576c8dc5823a347c6");
         assert!(
-            "9cbcbe4da7cc35a44360d64e456219579cbcbe4da7cc35a44360d64e45621957"
-                .parse::<CellId>()
+            "ad58a3faa04cdc5576c8dc5823a347c6ad58a3faa04cdc5576c8dc5823a347c6"
+                .parse::<PodId>()
                 .is_err()
         );
     }

@@ -1,6 +1,6 @@
-//! The record view: what the entries a device holds in a cell's record
+//! The record view: what the entries a device holds in a pod's record
 //! store read as, each judged on its own against the membership — by the
-//! cell stores spec's requirements on the record store.
+//! pod stores spec's requirements on the record store.
 
 use std::collections::BTreeMap;
 

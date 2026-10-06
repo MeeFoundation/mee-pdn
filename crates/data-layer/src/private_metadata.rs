@@ -25,13 +25,13 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket, NamespaceId,
 };
-use pdn_types::{CellId, NodeId, PdnId};
+use pdn_types::{NodeId, PdnId, PodId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     announcement::AnnouncementKeyPair,
-    cell::{CellStore, Seq},
     node::{read_payload, SyncNode},
+    pod::{PodStore, Seq},
 };
 
 /// The wait of [`CatchUpWatch::wait`] elapsed. Downcast
@@ -110,40 +110,40 @@ const TICKETS_PREFIX: &str = "tickets/";
 const CONNECTIONS_PREFIX: &str = "connections/";
 const RETRACTIONS_PREFIX: &str = "retractions/";
 const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
-const CELLS_PREFIX: &str = "cells/";
+const PODS_PREFIX: &str = "pods/";
 
-/// The directory kind of one of a cell's stores' write tickets, minted by
+/// The directory kind of one of a pod's stores' write tickets, minted by
 /// the identity itself: its own devices are the nodes it names.
-pub fn cell_ticket_kind(cell: &CellId, store: CellStore) -> String {
-    format!("cell/{cell}/{}", cell_store_name(store))
+pub fn pod_ticket_kind(pod: &PodId, store: PodStore) -> String {
+    format!("pod/{pod}/{}", pod_store_name(store))
 }
 
-/// The directory kind of the write ticket to one of a cell's stores that
+/// The directory kind of the write ticket to one of a pod's stores that
 /// the device which invited the identity handed over, naming that device
 /// as the inviter: a ticket names all its nodes as one identity.
-pub fn cell_inviter_ticket_kind(cell: &CellId, store: CellStore) -> String {
-    format!("cell/{cell}/inviter/{}", cell_store_name(store))
+pub fn pod_inviter_ticket_kind(pod: &PodId, store: PodStore) -> String {
+    format!("pod/{pod}/inviter/{}", pod_store_name(store))
 }
 
-fn cell_store_name(store: CellStore) -> &'static str {
+fn pod_store_name(store: PodStore) -> &'static str {
     match store {
-        CellStore::Membership => "membership",
-        CellStore::Records => "records",
+        PodStore::Membership => "membership",
+        PodStore::Records => "records",
     }
 }
 
-fn cell_record_key(cell: &CellId, seq: Seq) -> String {
-    format!("{CELLS_PREFIX}{cell}/{seq}")
+fn pod_record_key(pod: &PodId, seq: Seq) -> String {
+    format!("{PODS_PREFIX}{pod}/{seq}")
 }
 
-fn cell_record_of(key: &[u8]) -> Option<(CellId, u64)> {
-    let rest = std::str::from_utf8(key).ok()?.strip_prefix(CELLS_PREFIX)?;
-    let (cell, seq) = rest.split_once('/')?;
+fn pod_record_of(key: &[u8]) -> Option<(PodId, u64)> {
+    let rest = std::str::from_utf8(key).ok()?.strip_prefix(PODS_PREFIX)?;
+    let (pod, seq) = rest.split_once('/')?;
     let canonical = seq == "0" || (!seq.starts_with('0') && !seq.is_empty());
     if !canonical || !seq.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((cell.parse().ok()?, seq.parse().ok()?))
+    Some((pod.parse().ok()?, seq.parse().ok()?))
 }
 
 pub(crate) fn device_key(device: &NodeId) -> String {
@@ -531,12 +531,12 @@ impl PrivateMetadataStore {
     }
 
     /// Record that the identity's membership event at `seq` of its chain in
-    /// `cell` — its founding or joined event — holds the cell.
-    pub async fn record_cell(&self, cell: CellId, seq: Seq) -> Result<()> {
+    /// `pod` — its founding or joined event — holds the pod.
+    pub async fn record_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
         self.doc
             .set_bytes(
                 self.author,
-                cell_record_key(&cell, seq).into_bytes(),
+                pod_record_key(&pod, seq).into_bytes(),
                 vec![1u8],
             )
             .await?;
@@ -544,64 +544,64 @@ impl PrivateMetadataStore {
     }
 
     /// Record that the identity's left event at `seq`, or a kicked event at
-    /// `seq` its device learned of, ends its holding of `cell`: a tombstone
+    /// `seq` its device learned of, ends its holding of `pod`: a tombstone
     /// at that sequence.
-    pub async fn tombstone_cell(&self, cell: CellId, seq: Seq) -> Result<()> {
+    pub async fn tombstone_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
         self.doc
-            .del(self.author, cell_record_key(&cell, seq).into_bytes())
+            .del(self.author, pod_record_key(&pod, seq).into_bytes())
             .await?;
         Ok(())
     }
 
-    /// The cells the identity holds, record-level: those whose entry at
+    /// The pods the identity holds, record-level: those whose entry at
     /// the highest sequence, across all authors, is not a tombstone. Entry
     /// timestamps are never read.
-    pub async fn held_cells(&self) -> Result<Vec<CellId>> {
+    pub async fn held_pods(&self) -> Result<Vec<PodId>> {
         Ok(self
-            .cell_records(CELLS_PREFIX)
+            .pod_records(PODS_PREFIX)
             .await?
             .into_iter()
-            .filter(|(_cell, (_seq, held))| *held)
-            .map(|(cell, _record)| cell)
+            .filter(|(_pod, (_seq, held))| *held)
+            .map(|(pod, _record)| pod)
             .collect())
     }
 
-    /// The cells the identity departed, record-level: those whose entry at
+    /// The pods the identity departed, record-level: those whose entry at
     /// the highest sequence, across all authors, is a tombstone.
-    pub async fn departed_cells(&self) -> Result<Vec<CellId>> {
+    pub async fn departed_pods(&self) -> Result<Vec<PodId>> {
         Ok(self
-            .cell_records(CELLS_PREFIX)
+            .pod_records(PODS_PREFIX)
             .await?
             .into_iter()
-            .filter(|(_cell, (_seq, held))| !*held)
-            .map(|(cell, _record)| cell)
+            .filter(|(_pod, (_seq, held))| !*held)
+            .map(|(pod, _record)| pod)
             .collect())
     }
 
-    /// `cell`'s highest recorded sequence and whether the identity holds
-    /// the cell from it; `None` for a cell never recorded.
-    pub async fn cell_record(&self, cell: CellId) -> Result<Option<(Seq, bool)>> {
-        let prefix = format!("{CELLS_PREFIX}{cell}/");
+    /// `pod`'s highest recorded sequence and whether the identity holds
+    /// the pod from it; `None` for a pod never recorded.
+    pub async fn pod_record(&self, pod: PodId) -> Result<Option<(Seq, bool)>> {
+        let prefix = format!("{PODS_PREFIX}{pod}/");
         Ok(self
-            .cell_records(&prefix)
+            .pod_records(&prefix)
             .await?
-            .remove(&cell)
+            .remove(&pod)
             .map(|(seq, held)| (Seq::new(seq), held)))
     }
 
-    /// Per cell under `prefix`: its highest sequence, and whether no
+    /// Per pod under `prefix`: its highest sequence, and whether no
     /// tombstone sits there, a tombstone outweighing a non-empty entry.
-    async fn cell_records(&self, prefix: &str) -> Result<HashMap<CellId, (u64, bool)>> {
+    async fn pod_records(&self, prefix: &str) -> Result<HashMap<PodId, (u64, bool)>> {
         let query = Query::all().key_prefix(prefix.as_bytes()).include_empty();
         let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        let mut highest: HashMap<CellId, (u64, bool)> = HashMap::new();
+        let mut highest: HashMap<PodId, (u64, bool)> = HashMap::new();
         while let Some(entry) = stream.next().await {
             let entry = entry?;
-            let Some((cell, seq)) = cell_record_of(entry.key()) else {
+            let Some((pod, seq)) = pod_record_of(entry.key()) else {
                 continue;
             };
             let held = entry.content_len() != 0;
-            let slot = highest.entry(cell).or_insert((seq, held));
+            let slot = highest.entry(pod).or_insert((seq, held));
             if seq > slot.0 {
                 *slot = (seq, held);
             } else if seq == slot.0 {

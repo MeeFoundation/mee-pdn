@@ -6,12 +6,12 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{CellStore, SpawnOptions, SyncNode};
+use data_layer::{PodStore, SpawnOptions, SyncNode};
 use iroh_blobs::Hash;
 use pdn_types::{EntryPath, RecordId, RecordRef};
 use test_utils::{
-    cell::{device_of, found, host, invite, place_claim, reads, tickets, Person},
     eventually,
+    pod::{device_of, found, host, invite, place_claim, reads, tickets, Person},
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -21,7 +21,7 @@ const QUIET: Duration = Duration::from_secs(3600);
 async fn node() -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions {
         reconcile_interval: QUIET,
-        cell_reconcile_interval: QUIET,
+        pod_reconcile_interval: QUIET,
         blob_collection_interval: Duration::from_millis(200),
         ..SpawnOptions::memory()
     })
@@ -32,7 +32,7 @@ async fn node() -> Result<SyncNode> {
 async fn claim(
     node: &SyncNode,
     member: &Person,
-    cell: pdn_types::CellId,
+    pod: pdn_types::PodId,
     seed: u8,
     payload: &[u8],
 ) -> Result<RecordRef> {
@@ -41,14 +41,8 @@ async fn claim(
         id: RecordId::from_bytes([seed; 16]),
         mseq: data_layer::Seq::FIRST,
     };
-    node.write_cell_entry(
-        member.id,
-        cell,
-        CellStore::Records,
-        &key.to_bytes(),
-        payload,
-    )
-    .await?;
+    node.write_pod_entry(member.id, pod, PodStore::Records, &key.to_bytes(), payload)
+        .await?;
     Ok(key.record())
 }
 
@@ -59,9 +53,9 @@ async fn claim(
 async fn a_payload_no_replica_references_is_removed() -> Result<()> {
     let phone = node().await?;
     let (carol, _) = host(&phone).await?;
-    let cell = found(&phone, &carol).await?;
-    claim(&phone, &carol, cell, 1, b"lease scan").await?;
-    claim(&phone, &carol, cell, 2, b"photo").await?;
+    let pod = found(&phone, &carol).await?;
+    claim(&phone, &carol, pod, 1, b"lease scan").await?;
+    claim(&phone, &carol, pod, 2, b"photo").await?;
     phone.create_namespace(carol.id, carol.id).await?;
     let photo = EntryPath::new("photos/beach")?;
     phone
@@ -78,7 +72,7 @@ async fn a_payload_no_replica_references_is_removed() -> Result<()> {
         assert!(phone.holds_payload(hash).await?);
     }
 
-    phone.forget_cell(carol.id, cell).await?;
+    phone.forget_pod(carol.id, pod).await?;
     assert!(
         eventually(|| async { Ok(!phone.holds_payload(scan).await?) }).await?,
         "the payload no replica references stayed"
@@ -98,27 +92,27 @@ async fn a_payload_no_replica_references_is_removed() -> Result<()> {
 /// the other identity forgets its replica, and that identity reads it.
 ///
 /// A payload only the forgetting identity's data namespace referenced,
-/// forgotten beside the cell, orders the assertion after a run that
+/// forgotten beside the pod, orders the assertion after a run that
 /// removed something.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payload_a_co_located_identity_references_stays() -> Result<()> {
     let tablet = node().await?;
     let (leisure, _) = host(&tablet).await?;
     let (work, _) = host(&tablet).await?;
-    let cell = found(&tablet, &leisure).await?;
+    let pod = found(&tablet, &leisure).await?;
     invite(
         &tablet,
         &leisure,
-        cell,
+        pod,
         &work,
         vec![device_of(&tablet, &work)?],
     )
     .await?;
     tablet
-        .import_cell(work.id, cell, tickets(&tablet, &leisure, cell).await?)
+        .import_pod(work.id, pod, tickets(&tablet, &leisure, pod).await?)
         .await?;
-    let shared = place_claim(&tablet, &leisure, cell, 1).await?;
-    assert!(reads(&tablet, work.id, cell, shared).await?);
+    let shared = place_claim(&tablet, &leisure, pod, 1).await?;
+    assert!(reads(&tablet, work.id, pod, shared).await?);
     tablet.create_namespace(work.id, work.id).await?;
     let notes = EntryPath::new("notes/today")?;
     tablet
@@ -132,14 +126,14 @@ async fn a_payload_a_co_located_identity_references_stays() -> Result<()> {
         .await?;
     let (sentinel, claim) = (Hash::new(b"only work's"), Hash::new(b"claim"));
 
-    tablet.forget_cell(work.id, cell).await?;
+    tablet.forget_pod(work.id, pod).await?;
     tablet.forget_namespace(work.id, work.id).await?;
     assert!(eventually(|| async { Ok(!tablet.holds_payload(sentinel).await?) }).await?);
     assert!(
         tablet.holds_payload(claim).await?,
         "a payload a co-located identity references was removed"
     );
-    assert!(reads(&tablet, leisure.id, cell, shared).await?);
+    assert!(reads(&tablet, leisure.id, pod, shared).await?);
 
     tablet.shutdown().await?;
     Ok(())
@@ -157,7 +151,7 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
     let on_dir = || {
         SyncNode::spawn(SpawnOptions {
             reconcile_interval: QUIET,
-            cell_reconcile_interval: QUIET,
+            pod_reconcile_interval: QUIET,
             blob_collection_interval: Duration::from_millis(200),
             ..SpawnOptions::on_directory(dir.path())
         })

@@ -1,12 +1,12 @@
-//! A cell's entries as the cells service writes them, by the store-level
+//! A pod's entries as the pods service writes them, by the store-level
 //! writes it performs, and the reads a scenario waits on.
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, AnnouncementKeyPair, CellStore, CellTickets, EventKind, MemberDevice,
-    MemberState, MembershipKey, PrivateMetadataStore, RecordKey, Seq, SyncNode,
+    AddrInfoOptions, AnnouncementKeyPair, EventKind, MemberDevice, MemberState, MembershipKey,
+    PodStore, PodTickets, PrivateMetadataStore, RecordKey, Seq, SyncNode,
 };
-use pdn_types::{CellId, PdnId, RecordId, RecordRef};
+use pdn_types::{PdnId, PodId, RecordId, RecordRef};
 
 use crate::{eventually, host_identity};
 
@@ -43,14 +43,14 @@ pub fn device_of(node: &SyncNode, person: &Person) -> Result<MemberDevice> {
 pub async fn write(
     node: &SyncNode,
     writer: &Person,
-    cell: CellId,
+    pod: PodId,
     key: MembershipKey,
     payload: Vec<u8>,
 ) -> Result<()> {
-    node.write_cell_entry(
+    node.write_pod_entry(
         writer.id,
-        cell,
-        CellStore::Membership,
+        pod,
+        PodStore::Membership,
         &key.to_bytes(),
         &payload,
     )
@@ -62,7 +62,7 @@ pub async fn write(
 pub async fn statement(
     node: &SyncNode,
     writer: &Person,
-    cell: CellId,
+    pod: PodId,
     member: &Person,
     devices: Vec<MemberDevice>,
 ) -> Result<()> {
@@ -71,36 +71,29 @@ pub async fn statement(
         version: 1,
     };
     let payload = member.keys.device_statement(1, devices).encode();
-    write(node, writer, cell, key, payload).await
+    write(node, writer, pod, key, payload).await
 }
 
-/// `creator`'s cell on `node`: both stores, the founding event and the
+/// `creator`'s pod on `node`: both stores, the founding event and the
 /// creator's first device statement.
-pub async fn found(node: &SyncNode, creator: &Person) -> Result<CellId> {
+pub async fn found(node: &SyncNode, creator: &Person) -> Result<PodId> {
     let founding = creator.keys.founding([0x5a; 16]);
-    let cell = data_layer::cell_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
-    node.create_cell(creator.id, cell).await?;
+    let pod = data_layer::pod_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
+    node.create_pod(creator.id, pod).await?;
     write(
         node,
         creator,
-        cell,
+        pod,
         MembershipKey::founded(creator.id),
         founding.encode(),
     )
     .await?;
-    statement(
-        node,
-        creator,
-        cell,
-        creator,
-        vec![device_of(node, creator)?],
-    )
-    .await?;
-    Ok(cell)
+    statement(node, creator, pod, creator, vec![device_of(node, creator)?]).await?;
+    Ok(pod)
 }
 
-pub async fn tickets(node: &SyncNode, holder: &Person, cell: CellId) -> Result<CellTickets> {
-    node.share_cell_tickets(holder.id, cell, AddrInfoOptions::Addresses)
+pub async fn tickets(node: &SyncNode, holder: &Person, pod: PodId) -> Result<PodTickets> {
+    node.share_pod_tickets(holder.id, pod, AddrInfoOptions::Addresses)
         .await
 }
 
@@ -110,7 +103,7 @@ pub async fn tickets(node: &SyncNode, holder: &Person, cell: CellId) -> Result<C
 pub async fn invite(
     node: &SyncNode,
     inviter: &Person,
-    cell: CellId,
+    pod: PodId,
     newcomer: &Person,
     devices: Vec<MemberDevice>,
 ) -> Result<()> {
@@ -121,15 +114,15 @@ pub async fn invite(
         actor: inviter.id,
         actor_seq: Seq::FIRST,
     };
-    let join_statement = newcomer.keys.join_statement(&cell, Seq::FIRST);
-    write(node, inviter, cell, key, join_statement.encode()).await?;
-    statement(node, inviter, cell, newcomer, devices).await
+    let join_statement = newcomer.keys.join_statement(&pod, Seq::FIRST);
+    write(node, inviter, pod, key, join_statement.encode()).await?;
+    statement(node, inviter, pod, newcomer, devices).await
 }
 
 /// `member`'s state as `holder`'s replica folds it; no member where the
 /// replica is not held.
-pub async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnId) -> MemberState {
-    match node.cell_membership(holder, cell).await {
+pub async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> MemberState {
+    match node.pod_membership(holder, pod).await {
         Ok(membership) => membership
             .member(&member)
             .map(|member| member.state)
@@ -142,24 +135,24 @@ pub async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnI
 pub async fn lists(
     node: &SyncNode,
     holder: PdnId,
-    cell: CellId,
+    pod: PodId,
     member: PdnId,
     want: MemberState,
 ) -> Result<bool> {
-    eventually(|| async { Ok(state_on(node, holder, cell, member).await == want) }).await
+    eventually(|| async { Ok(state_on(node, holder, pod, member).await == want) }).await
 }
 
 /// Whether `holder`'s replica comes to fold `device` among `member`'s.
 pub async fn lists_device(
     node: &SyncNode,
     holder: PdnId,
-    cell: CellId,
+    pod: PodId,
     member: PdnId,
     device: MemberDevice,
 ) -> Result<bool> {
     eventually(|| async {
         Ok(node
-            .cell_membership(holder, cell)
+            .pod_membership(holder, pod)
             .await
             .is_ok_and(|membership| {
                 membership
@@ -170,9 +163,9 @@ pub async fn lists_device(
     .await
 }
 
-pub async fn folds_nobody(node: &SyncNode, holder: PdnId, cell: CellId) -> Result<bool> {
+pub async fn folds_nobody(node: &SyncNode, holder: PdnId, pod: PodId) -> Result<bool> {
     Ok(node
-        .cell_membership(holder, cell)
+        .pod_membership(holder, pod)
         .await?
         .identities()
         .next()
@@ -184,7 +177,7 @@ pub async fn folds_nobody(node: &SyncNode, holder: PdnId, cell: CellId) -> Resul
 pub async fn place_claim(
     node: &SyncNode,
     member: &Person,
-    cell: CellId,
+    pod: PodId,
     seed: u8,
 ) -> Result<RecordRef> {
     let key = RecordKey::Claim {
@@ -192,36 +185,19 @@ pub async fn place_claim(
         id: RecordId::from_bytes([seed; 16]),
         mseq: Seq::FIRST,
     };
-    node.write_cell_entry(
-        member.id,
-        cell,
-        CellStore::Records,
-        &key.to_bytes(),
-        b"claim",
-    )
-    .await?;
+    node.write_pod_entry(member.id, pod, PodStore::Records, &key.to_bytes(), b"claim")
+        .await?;
     Ok(key.record())
 }
 
 /// Whether `holder`'s record view comes to read `record`.
-pub async fn reads(
-    node: &SyncNode,
-    holder: PdnId,
-    cell: CellId,
-    record: RecordRef,
-) -> Result<bool> {
-    eventually(|| async {
-        Ok(node
-            .read_cell_record(holder, cell, &record)
-            .await?
-            .is_some())
-    })
-    .await
+pub async fn reads(node: &SyncNode, holder: PdnId, pod: PodId, record: RecordRef) -> Result<bool> {
+    eventually(|| async { Ok(node.read_pod_record(holder, pod, &record).await?.is_some()) }).await
 }
 
-pub async fn holds_no_record(node: &SyncNode, holder: PdnId, cell: CellId) -> Result<bool> {
+pub async fn holds_no_record(node: &SyncNode, holder: PdnId, pod: PodId) -> Result<bool> {
     Ok(node
-        .cell_record_view(holder, cell)
+        .pod_record_view(holder, pod)
         .await?
         .verdicts()
         .next()

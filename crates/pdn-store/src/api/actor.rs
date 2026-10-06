@@ -423,7 +423,7 @@ impl RpcActor {
                 crate::Capability::Write(secret)
             }
         };
-        // Keeps whom unnamed peers are dialed as: a cell's store is shared
+        // Keeps whom unnamed peers are dialed as: a pod's store is shared
         // while its default still names the member whose ticket it came from.
         self.start_sync_keeping_default(doc_id)
             .await

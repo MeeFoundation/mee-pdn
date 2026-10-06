@@ -1,20 +1,18 @@
-//! The membership fold: what the entries a device holds in a cell's
+//! The membership fold: what the entries a device holds in a pod's
 //! membership store make of its members, and what each entry counts for,
-//! whatever order they arrived in — by the cell stores spec's requirements
+//! whatever order they arrived in — by the pod stores spec's requirements
 //! on the membership store and on device statements.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use pdn_store::AuthorId;
-use pdn_types::{CellId, PdnId};
+use pdn_types::{PdnId, PodId};
 
 use super::{
     keys::{EventKind, MembershipKey, Seq},
     payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice},
 };
-use crate::announcement::{
-    cell_id_of, devices_verify, founding_verifies, join_verifies, pdn_id_of,
-};
+use crate::announcement::{devices_verify, founding_verifies, join_verifies, pdn_id_of, pod_id_of};
 
 /// One entry of a membership store as a device holds it; `payload` is
 /// `None` until its bytes have arrived.
@@ -43,8 +41,8 @@ pub enum ForNothing {
     /// A founding event anywhere but the creator's sequence 1 naming its
     /// creator at 0, or an event at sequence 0.
     Misplaced,
-    /// The founding event's fields derive another cell id.
-    OtherCell,
+    /// The founding event's fields derive another pod id.
+    OtherPod,
     /// The announcement key it carries derives another `PdnId` than its
     /// subject's.
     KeyOfAnother,
@@ -63,7 +61,7 @@ pub enum ForNothing {
     TransitionNotAllowed,
     /// What it rests on leads back to itself.
     Cyclic,
-    /// A demotion set aside so the cell keeps an owner.
+    /// A demotion set aside so the pod keeps an owner.
     LastOwnerKept,
 }
 
@@ -138,11 +136,11 @@ pub struct Membership {
 }
 
 impl Membership {
-    pub fn fold(cell: &CellId, entries: &[HeldEntry]) -> Self {
+    pub fn fold(pod: &PodId, entries: &[HeldEntry]) -> Self {
         let parsed = Parsed::of(entries);
         let mut set_aside = BTreeSet::new();
         loop {
-            let pass = Pass::run(cell, entries, &parsed, &set_aside);
+            let pass = Pass::run(pod, entries, &parsed, &set_aside);
             let more = pass.demotions_to_set_aside();
             if more.is_subset(&set_aside) {
                 return pass.into_membership();
@@ -260,7 +258,7 @@ struct Winner {
 /// One evaluation of every entry, with `set_aside` the demotions the guard
 /// over the last owner ignores.
 struct Pass<'a> {
-    cell: &'a CellId,
+    pod: &'a PodId,
     entries: &'a [HeldEntry],
     parsed: &'a Parsed,
     set_aside: &'a BTreeSet<usize>,
@@ -276,13 +274,13 @@ struct Pass<'a> {
 
 impl<'a> Pass<'a> {
     fn run(
-        cell: &'a CellId,
+        pod: &'a PodId,
         entries: &'a [HeldEntry],
         parsed: &'a Parsed,
         set_aside: &'a BTreeSet<usize>,
     ) -> Self {
         let mut pass = Self {
-            cell,
+            pod,
             entries,
             parsed,
             set_aside,
@@ -431,8 +429,8 @@ impl<'a> Pass<'a> {
         let Some(founding) = FoundedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
-        if cell_id_of(&event.subject, &founding.announcement_key, &founding.nonce) != *self.cell {
-            return nothing(ForNothing::OtherCell);
+        if pod_id_of(&event.subject, &founding.announcement_key, &founding.nonce) != *self.pod {
+            return nothing(ForNothing::OtherPod);
         }
         if pdn_id_of(&founding.announcement_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
@@ -457,7 +455,7 @@ impl<'a> Pass<'a> {
         if pdn_id_of(&statement.announcement_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
         }
-        if !join_verifies(&event.subject, self.cell, Seq::new(event.seq), &statement) {
+        if !join_verifies(&event.subject, self.pod, Seq::new(event.seq), &statement) {
             return nothing(ForNothing::BadSignature);
         }
         Ok(())

@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-mod cell;
 mod data;
 mod non_empty;
-pub use cell::{CellId, RecordId, RecordKind, RecordRef, UnknownRecordKind};
+mod pod;
 pub use data::{EntryInfo, EntryPath, NamespaceRole, NodeAddr, PathValidationError};
 pub use non_empty::NonEmpty;
+pub use pod::{PodId, RecordId, RecordKind, RecordRef, UnknownRecordKind};
 
 // ---------------------------------------------------------------------------
 // Byte-backed ID infrastructure

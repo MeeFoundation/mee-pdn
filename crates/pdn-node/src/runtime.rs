@@ -104,12 +104,12 @@ impl CeremonyPause {
 
 use crate::linking::LinkingLocalFailure;
 use crate::{
-    cells::{JoinHandler, RuntimeCellsService, CELL_JOIN_ALPN},
     connections::RuntimeConnectionsService,
     data::RuntimeDataService,
     identity::RuntimeIdentityService,
     linking::{LinkingHandler, LINKING_ALPN},
     pairing::{PairingHandler, PendingInvites, PAIRING_ALPN},
+    pods::{JoinHandler, RuntimePodsService, POD_JOIN_ALPN},
     retraction::{spawn_retraction_consumer, RetractionEvent},
     sync::RuntimeSyncService,
 };
@@ -152,11 +152,11 @@ pub(crate) struct State {
     /// Separate from pairing's: a secret minted for one ceremony must never
     /// verify in the other.
     pub(crate) pending_linking_invites: PendingInvites,
-    /// The cell join dialogue's, each secret minted for an identity and a
-    /// cell.
-    pub(crate) pending_cell_invites: PendingInvites<(PdnId, pdn_types::CellId)>,
-    /// Keyed by `(joining identity, cell)`.
-    pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::CellId)>,
+    /// The pod join dialogue's, each secret minted for an identity and a
+    /// pod.
+    pub(crate) pending_pod_invites: PendingInvites<(PdnId, pdn_types::PodId)>,
+    /// Keyed by `(joining identity, pod)`.
+    pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::PodId)>,
     /// A cache keyed by `(hosted identity, counterparty)`; the directory is
     /// the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
@@ -202,10 +202,10 @@ pub(crate) struct State {
     /// are recorded, before its catch-up wait.
     #[cfg(feature = "test-util")]
     pub(crate) join_catch_up_pause: Option<Arc<CeremonyPause>>,
-    /// Cells whose device statement every write fails in, as a process
+    /// Pods whose device statement every write fails in, as a process
     /// ended before it landed; a restart clears it.
     #[cfg(feature = "test-util")]
-    pub(crate) failing_device_statements: HashSet<pdn_types::CellId>,
+    pub(crate) failing_device_statements: HashSet<pdn_types::PodId>,
     /// Fails the next `create` where its directory would be made — a step
     /// between provisioning an identity and hosting it, which a full disk is
     /// the product's reason to reach.
@@ -242,7 +242,7 @@ impl State {
             identities,
             pending_invites: PendingInvites::default(),
             pending_linking_invites: PendingInvites::default(),
-            pending_cell_invites: PendingInvites::default(),
+            pending_pod_invites: PendingInvites::default(),
             joining_in_flight: HashSet::new(),
             metadata_pairs: HashMap::new(),
             grant_binders: HashSet::new(),
@@ -333,7 +333,7 @@ impl Runtime {
             vec![
                 (PAIRING_ALPN.to_vec(), Box::new(pairing)),
                 (LINKING_ALPN.to_vec(), Box::new(linking)),
-                (CELL_JOIN_ALPN.to_vec(), Box::new(join)),
+                (POD_JOIN_ALPN.to_vec(), Box::new(join)),
             ],
             options,
         )
@@ -347,8 +347,8 @@ impl Runtime {
                 .take_retraction_verdicts()
                 .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
             let notices = node
-                .take_cell_notices()
-                .ok_or_else(|| anyhow::anyhow!("cell notice stream taken twice"))?;
+                .take_pod_notices()
+                .ok_or_else(|| anyhow::anyhow!("pod notice stream taken twice"))?;
             let (identities, armers) = recover_hosted_identities(&node).await?;
             anyhow::Ok((verdicts, notices, identities, armers))
         }
@@ -373,7 +373,7 @@ impl Runtime {
         // Every identity the directory records is hosted again by now.
         state.lock().await.node.start_blob_collection();
         spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
-        crate::cells::spawn_cell_notice_consumer(Arc::downgrade(&state), notices);
+        crate::pods::spawn_pod_notice_consumer(Arc::downgrade(&state), notices);
         pairing_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("pairing state slot filled twice"))?;
@@ -406,8 +406,8 @@ impl Runtime {
         RuntimeSyncService::new(self)
     }
 
-    pub fn cells(&self) -> RuntimeCellsService<'_> {
-        RuntimeCellsService::new(self)
+    pub fn pods(&self) -> RuntimePodsService<'_> {
+        RuntimePodsService::new(self)
     }
 
     /// One event per retracted entry — the host's hook for user-facing
@@ -433,28 +433,28 @@ impl Runtime {
         self.state.lock().await.drop_next_join_reply = true;
     }
 
-    /// The membership `identity`'s replica of `cell`'s membership store
+    /// The membership `identity`'s replica of `pod`'s membership store
     /// folds into, a tombstone's included.
     #[cfg(feature = "test-util")]
-    pub async fn cell_membership_for_test(
+    pub async fn pod_membership_for_test(
         &self,
         identity: pdn_types::PdnId,
-        cell: pdn_types::CellId,
+        pod: pdn_types::PodId,
     ) -> anyhow::Result<data_layer::Membership> {
         let node = Arc::clone(&self.state.lock().await.node);
-        node.held_cell_membership_for_test(identity, cell).await
+        node.held_pod_membership_for_test(identity, pod).await
     }
 
-    /// The record view over `identity`'s replica of `cell`'s record store,
+    /// The record view over `identity`'s replica of `pod`'s record store,
     /// every entry it holds beside its verdict.
     #[cfg(feature = "test-util")]
-    pub async fn cell_record_view_for_test(
+    pub async fn pod_record_view_for_test(
         &self,
         identity: pdn_types::PdnId,
-        cell: pdn_types::CellId,
+        pod: pdn_types::PodId,
     ) -> anyhow::Result<data_layer::RecordView> {
         let node = Arc::clone(&self.state.lock().await.node);
-        node.cell_record_view(identity, cell).await
+        node.pod_record_view(identity, pod).await
     }
 
     #[cfg(feature = "test-util")]
@@ -467,21 +467,21 @@ impl Runtime {
         pause
     }
 
-    /// Every device statement this runtime writes into `cell` fails from
+    /// Every device statement this runtime writes into `pod` fails from
     /// now on, until the runtime restarts.
     #[cfg(feature = "test-util")]
-    pub async fn fail_device_statements_for_test(&self, cell: pdn_types::CellId) {
+    pub async fn fail_device_statements_for_test(&self, pod: pdn_types::PodId) {
         self.state
             .lock()
             .await
             .failing_device_statements
-            .insert(cell);
+            .insert(pod);
     }
 
-    /// While `refuse`, every session on a cell's store `identity` is asked
+    /// While `refuse`, every session on a pod's store `identity` is asked
     /// to serve here is refused, as by a device out of reach.
     #[cfg(feature = "test-util")]
-    pub async fn refuse_cell_sessions_for_test(
+    pub async fn refuse_pod_sessions_for_test(
         &self,
         identity: pdn_types::PdnId,
         refuse: bool,
@@ -490,17 +490,17 @@ impl Runtime {
             .lock()
             .await
             .node
-            .refuse_cell_sessions_for_test(identity, refuse)
+            .refuse_pod_sessions_for_test(identity, refuse)
     }
 
-    /// The cells `identity` holds on this node, each with whether its
+    /// The pods `identity` holds on this node, each with whether its
     /// record store is held: `false` for a tombstone.
     #[cfg(feature = "test-util")]
-    pub async fn cell_holdings_for_test(
+    pub async fn pod_holdings_for_test(
         &self,
         identity: pdn_types::PdnId,
-    ) -> anyhow::Result<Vec<(pdn_types::CellId, bool)>> {
-        self.state.lock().await.node.cell_holdings(identity)
+    ) -> anyhow::Result<Vec<(pdn_types::PodId, bool)>> {
+        self.state.lock().await.node.pod_holdings(identity)
     }
 
     #[cfg(feature = "test-util")]

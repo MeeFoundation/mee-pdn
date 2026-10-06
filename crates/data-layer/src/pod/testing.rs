@@ -1,10 +1,10 @@
-//! The cast and the membership store the cell modules' unit tests write.
+//! The cast and the membership store the pod modules' unit tests write.
 
 use pdn_store::AuthorId;
-use pdn_types::{CellId, NodeId, PdnId};
+use pdn_types::{NodeId, PdnId, PodId};
 
 use super::{EventKind, HeldEntry, MemberDevice, Membership, MembershipKey, Seq};
-use crate::announcement::{cell_id_of, AnnouncementKeyPair};
+use crate::announcement::{pod_id_of, AnnouncementKeyPair};
 
 pub(super) struct Person {
     pub(super) keys: AnnouncementKeyPair,
@@ -35,7 +35,7 @@ pub(super) fn device(seed: u8) -> MemberDevice {
     }
 }
 
-/// Alice holds the secret of the specs' examples, so her cell is "Family".
+/// Alice holds the secret of the specs' examples, so her pod is "Family".
 pub(super) struct Cast {
     pub(super) alice: Person,
     pub(super) bob: Person,
@@ -54,10 +54,10 @@ impl Cast {
     }
 }
 
-/// A cell's membership store as one device holds it, written entry by entry.
+/// A pod's membership store as one device holds it, written entry by entry.
 #[derive(Clone)]
 pub(super) struct Store {
-    pub(super) cell: CellId,
+    pub(super) pod: PodId,
     pub(super) entries: Vec<HeldEntry>,
 }
 
@@ -66,9 +66,9 @@ impl Store {
     /// event.
     pub(super) fn founded_by(creator: &Person) -> Self {
         let founding = creator.keys.founding([0x5a; 16]);
-        let cell = cell_id_of(&creator.id(), &founding.announcement_key, &founding.nonce);
+        let pod = pod_id_of(&creator.id(), &founding.announcement_key, &founding.nonce);
         let mut store = Self {
-            cell,
+            pod,
             entries: Vec::new(),
         };
         store.write(
@@ -123,7 +123,7 @@ impl Store {
     ) -> usize {
         let statement = newcomer
             .keys
-            .join_statement(&self.cell, Seq::new(seq))
+            .join_statement(&self.pod, Seq::new(seq))
             .encode();
         let key = event(newcomer.id(), seq, EventKind::Joined, actor.id(), actor_seq);
         self.write(key, actor.author(), statement)
@@ -150,7 +150,7 @@ impl Store {
     }
 
     pub(super) fn fold(&self) -> Membership {
-        Membership::fold(&self.cell, &self.entries)
+        Membership::fold(&self.pod, &self.entries)
     }
 }
 

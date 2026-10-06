@@ -1,5 +1,5 @@
-//! A cell's two stores, the membership store and the record store, by the
-//! cell stores spec.
+//! A pod's two stores, the membership store and the record store, by the
+//! pod stores spec.
 
 mod fold;
 mod keys;
@@ -12,7 +12,7 @@ mod testing;
 use anyhow::Result;
 use futures_lite::StreamExt;
 use pdn_store::{api::Doc, store::Query, AuthorId, DocTicket};
-use pdn_types::{CellId, PdnId};
+use pdn_types::{PdnId, PodId};
 
 pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership, Verdict};
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
@@ -21,28 +21,28 @@ pub(crate) use payloads::encode_devices;
 pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
 pub use record_view::{Operation, RecordEntry, RecordView};
 
-/// `identity` holds no cell `cell` here, or holds only its tombstone.
-/// Downcast from the `anyhow::Error` of the cell-addressed operations.
+/// `identity` holds no pod `pod` here, or holds only its tombstone.
+/// Downcast from the `anyhow::Error` of the pod-addressed operations.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("cell not held on this node: {cell}")]
-pub struct UnknownCell {
-    pub cell: CellId,
+#[error("pod not held on this node: {pod}")]
+pub struct UnknownPod {
+    pub pod: PodId,
 }
 
-/// Which of a cell's two stores.
+/// Which of a pod's two stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CellStore {
+pub enum PodStore {
     Membership,
     Records,
 }
 
-/// The fold's verdicts on one run over one identity's replica of a cell's
+/// The fold's verdicts on one run over one identity's replica of a pod's
 /// membership store: each entry by its key and author.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Clone)]
-pub struct CellVerdicts {
+pub struct PodVerdicts {
     pub identity: pdn_types::PdnId,
-    pub cell: CellId,
+    pub pod: PodId,
     pub verdicts: Vec<(Vec<u8>, pdn_store::AuthorId, Verdict)>,
 }
 
@@ -98,17 +98,17 @@ pub(crate) async fn record_entries(
 /// read by nothing, and listed with its author.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownEntry {
-    pub store: CellStore,
+    pub store: PodStore,
     pub key: Vec<u8>,
     pub author: AuthorId,
 }
 
-/// The entries of `doc`, one of `cell`'s stores, whose keys fit no layout of
+/// The entries of `doc`, one of `pod`'s stores, whose keys fit no layout of
 /// that store.
-pub(crate) async fn unknown_entries(doc: &Doc, store: CellStore) -> Result<Vec<UnknownEntry>> {
+pub(crate) async fn unknown_entries(doc: &Doc, store: PodStore) -> Result<Vec<UnknownEntry>> {
     let fits = |key: &[u8]| match store {
-        CellStore::Membership => MembershipKey::parse(key).is_some(),
-        CellStore::Records => RecordKey::parse(key).is_some(),
+        PodStore::Membership => MembershipKey::parse(key).is_some(),
+        PodStore::Records => RecordKey::parse(key).is_some(),
     };
     let mut unknown = Vec::new();
     let mut stream = std::pin::pin!(doc.get_many(Query::all()).await?);
@@ -125,36 +125,36 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: CellStore) -> Result<Vec<U
     Ok(unknown)
 }
 
-/// What a derivation of a cell's contacts finds for the runtime to act on
-/// while the identity's device still holds the cell's record store, from
-/// [`SyncNode::take_cell_notices`](crate::SyncNode::take_cell_notices).
+/// What a derivation of a pod's contacts finds for the runtime to act on
+/// while the identity's device still holds the pod's record store, from
+/// [`SyncNode::take_pod_notices`](crate::SyncNode::take_pod_notices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CellNotice {
-    /// `identity`'s chain in `cell` ends in a counted left or kicked event
+pub enum PodNotice {
+    /// `identity`'s chain in `pod` ends in a counted left or kicked event
     /// at `seq`.
     Departed {
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         seq: Seq,
     },
-    /// `identity` is a member of `cell`, and none of its counted device
+    /// `identity` is a member of `pod`, and none of its counted device
     /// statements lists this device with the author it writes with here.
-    Unlisted { identity: PdnId, cell: CellId },
+    Unlisted { identity: PdnId, pod: PodId },
 }
 
 /// Empty until the channel is taken, so nothing accumulates unread.
-pub(crate) type CellNoticeSink =
-    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CellNotice>>>>;
+pub(crate) type PodNoticeSink =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<PodNotice>>>>;
 
-/// A wait for each of a cell's stores' first successful session started
-/// since an import, from [`SyncNode::import_cell`](crate::SyncNode::import_cell).
+/// A wait for each of a pod's stores' first successful session started
+/// since an import, from [`SyncNode::import_pod`](crate::SyncNode::import_pod).
 #[derive(Debug)]
-pub struct CellCatchUp {
+pub struct PodCatchUp {
     pub(crate) membership: crate::private_metadata::CatchUpWatch,
     pub(crate) records: crate::private_metadata::CatchUpWatch,
 }
 
-impl CellCatchUp {
+impl PodCatchUp {
     /// Fails with [`CatchUpTimeout`](crate::CatchUpTimeout) when either store
     /// has had none within `timeout`.
     pub async fn wait(self, timeout: std::time::Duration) -> Result<()> {
@@ -166,9 +166,9 @@ impl CellCatchUp {
     }
 }
 
-/// The write tickets to a cell's two stores.
+/// The write tickets to a pod's two stores.
 #[derive(Debug, Clone)]
-pub struct CellTickets {
+pub struct PodTickets {
     pub membership: DocTicket,
     pub records: DocTicket,
 }

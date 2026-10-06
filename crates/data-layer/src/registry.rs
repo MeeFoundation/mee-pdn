@@ -1,14 +1,14 @@
 //! Node-local addressing: the issuer-to-doc map data-namespace operations
-//! resolve through, and the cell-to-stores map cell operations resolve
+//! resolve through, and the pod-to-stores map pod operations resolve
 //! through.
 
 use std::{collections::HashMap, sync::RwLock};
 
 use anyhow::{anyhow, Result};
 use pdn_store::{api::Doc, NamespaceId};
-use pdn_types::{CellId, PdnId};
+use pdn_types::{PdnId, PodId};
 
-use crate::cell::CellStore;
+use crate::pod::PodStore;
 
 /// How an identity serves a data replica it holds. Independent of the sync
 /// strategy (swarm vs contacts-only), which lives on the tracked doc.
@@ -31,28 +31,28 @@ pub(crate) struct DataBinding {
     pub(crate) posture: ServingPosture,
 }
 
-/// One cell as one identity holds it. `records` is `None` once the identity
-/// departed: the membership store is then the cell's tombstone.
+/// One pod as one identity holds it. `records` is `None` once the identity
+/// departed: the membership store is then the pod's tombstone.
 #[derive(Debug, Clone)]
-pub(crate) struct CellBinding {
+pub(crate) struct PodBinding {
     pub(crate) membership: Doc,
     pub(crate) records: Option<Doc>,
 }
 
-impl CellBinding {
-    fn store_of(&self, namespace: NamespaceId) -> Option<CellStore> {
+impl PodBinding {
+    fn store_of(&self, namespace: NamespaceId) -> Option<PodStore> {
         if self.membership.id() == namespace {
-            return Some(CellStore::Membership);
+            return Some(PodStore::Membership);
         }
         self.records
             .as_ref()
             .filter(|records| records.id() == namespace)
-            .map(|_records| CellStore::Records)
+            .map(|_records| PodStore::Records)
     }
 }
 
 /// Node-local registry of data namespaces — issuer → backing doc — and of
-/// cells — cell id → its two stores. Lookups hand back cloned [`Doc`]s (cheap
+/// pods — pod id → its two stores. Lookups hand back cloned [`Doc`]s (cheap
 /// handles), so no read guard escapes. The metadata docs are not kept here —
 /// they live inside their store handles, and the access book registers the
 /// ones classification needs. Where both maps are locked, `data_docs` is
@@ -60,7 +60,7 @@ impl CellBinding {
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     data_docs: RwLock<HashMap<PdnId, DataBinding>>,
-    cells: RwLock<HashMap<CellId, CellBinding>>,
+    pods: RwLock<HashMap<PodId, PodBinding>>,
 }
 
 impl Registry {
@@ -96,9 +96,9 @@ impl Registry {
                  one namespace binds one issuer"
             ));
         }
-        if let Some((cell, _store)) = cell_of(&*self.read_cells()?, namespace) {
+        if let Some((pod, _store)) = pod_of(&*self.read_pods()?, namespace) {
             return Err(anyhow!(
-                "namespace {namespace} is a store of cell {cell}; it binds no issuer"
+                "namespace {namespace} is a store of pod {pod}; it binds no issuer"
             ));
         }
         Ok(docs.insert(issuer, binding))
@@ -148,20 +148,20 @@ impl Registry {
             .map(|(issuer, binding)| (*issuer, binding.posture)))
     }
 
-    /// Register `cell` as held on `binding`'s stores. Refused for a cell
+    /// Register `pod` as held on `binding`'s stores. Refused for a pod
     /// already registered, and for a store another role holds: a data
-    /// namespace, another cell's store, or the cell's other store.
-    pub(crate) fn register_cell(&self, cell: CellId, binding: CellBinding) -> Result<()> {
+    /// namespace, another pod's store, or the pod's other store.
+    pub(crate) fn register_pod(&self, pod: PodId, binding: PodBinding) -> Result<()> {
         let data = self
             .data_docs
             .read()
             .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?;
-        let mut cells = self
-            .cells
+        let mut pods = self
+            .pods
             .write()
-            .map_err(|_poisoned| anyhow!("cell registry lock poisoned"))?;
-        if cells.contains_key(&cell) {
-            return Err(anyhow!("cell {cell} is already registered"));
+            .map_err(|_poisoned| anyhow!("pod registry lock poisoned"))?;
+        if pods.contains_key(&pod) {
+            return Err(anyhow!("pod {pod} is already registered"));
         }
         let namespaces = std::iter::once(binding.membership.id())
             .chain(binding.records.as_ref().map(Doc::id))
@@ -169,79 +169,75 @@ impl Registry {
         if let [membership, records] = namespaces.as_slice() {
             if membership == records {
                 return Err(anyhow!(
-                    "namespace {membership} cannot be both stores of cell {cell}"
+                    "namespace {membership} cannot be both stores of pod {pod}"
                 ));
             }
         }
         for namespace in namespaces {
             if data.values().any(|bound| bound.doc.id() == namespace) {
                 return Err(anyhow!(
-                    "namespace {namespace} is a data namespace; it is no store of cell {cell}"
+                    "namespace {namespace} is a data namespace; it is no store of pod {pod}"
                 ));
             }
-            if let Some((other, _store)) = cell_of(&cells, namespace) {
+            if let Some((other, _store)) = pod_of(&pods, namespace) {
                 return Err(anyhow!(
-                    "namespace {namespace} is a store of cell {other}; it is no store of cell {cell}"
+                    "namespace {namespace} is a store of pod {other}; it is no store of pod {pod}"
                 ));
             }
         }
-        cells.insert(cell, binding);
+        pods.insert(pod, binding);
         Ok(())
     }
 
-    /// Replace `cell`'s record store: `None` turns the cell into its
-    /// tombstone, a doc turns the tombstone back into the cell. Answers
-    /// whether `cell` was registered.
-    pub(crate) fn set_cell_records(&self, cell: CellId, records: Option<Doc>) -> Result<bool> {
-        let mut cells = self
-            .cells
+    /// Replace `pod`'s record store: `None` turns the pod into its
+    /// tombstone, a doc turns the tombstone back into the pod. Answers
+    /// whether `pod` was registered.
+    pub(crate) fn set_pod_records(&self, pod: PodId, records: Option<Doc>) -> Result<bool> {
+        let mut pods = self
+            .pods
             .write()
-            .map_err(|_poisoned| anyhow!("cell registry lock poisoned"))?;
-        let Some(binding) = cells.get_mut(&cell) else {
+            .map_err(|_poisoned| anyhow!("pod registry lock poisoned"))?;
+        let Some(binding) = pods.get_mut(&pod) else {
             return Ok(false);
         };
         binding.records = records;
         Ok(true)
     }
 
-    pub(crate) fn unregister_cell(&self, cell: CellId) -> Result<Option<CellBinding>> {
+    pub(crate) fn unregister_pod(&self, pod: PodId) -> Result<Option<PodBinding>> {
         Ok(self
-            .cells
+            .pods
             .write()
-            .map_err(|_poisoned| anyhow!("cell registry lock poisoned"))?
-            .remove(&cell))
+            .map_err(|_poisoned| anyhow!("pod registry lock poisoned"))?
+            .remove(&pod))
     }
 
-    pub(crate) fn cell(&self, cell: CellId) -> Result<Option<CellBinding>> {
-        Ok(self.read_cells()?.get(&cell).cloned())
+    pub(crate) fn pod(&self, pod: PodId) -> Result<Option<PodBinding>> {
+        Ok(self.read_pods()?.get(&pod).cloned())
     }
 
-    /// Every cell held, a tombstone included.
-    pub(crate) fn cells(&self) -> Result<Vec<(CellId, CellBinding)>> {
+    /// Every pod held, a tombstone included.
+    pub(crate) fn pods(&self) -> Result<Vec<(PodId, PodBinding)>> {
         Ok(self
-            .read_cells()?
+            .read_pods()?
             .iter()
-            .map(|(cell, binding)| (*cell, binding.clone()))
+            .map(|(pod, binding)| (*pod, binding.clone()))
             .collect())
     }
 
-    /// Reverse lookup: which cell `namespace` is a store of, and which store.
-    pub(crate) fn cell_of(&self, namespace: NamespaceId) -> Result<Option<(CellId, CellStore)>> {
-        Ok(cell_of(&*self.read_cells()?, namespace))
+    /// Reverse lookup: which pod `namespace` is a store of, and which store.
+    pub(crate) fn pod_of(&self, namespace: NamespaceId) -> Result<Option<(PodId, PodStore)>> {
+        Ok(pod_of(&*self.read_pods()?, namespace))
     }
 
-    fn read_cells(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<CellId, CellBinding>>> {
-        self.cells
+    fn read_pods(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<PodId, PodBinding>>> {
+        self.pods
             .read()
-            .map_err(|_poisoned| anyhow!("cell registry lock poisoned"))
+            .map_err(|_poisoned| anyhow!("pod registry lock poisoned"))
     }
 }
 
-fn cell_of(
-    cells: &HashMap<CellId, CellBinding>,
-    namespace: NamespaceId,
-) -> Option<(CellId, CellStore)> {
-    cells
-        .iter()
-        .find_map(|(cell, binding)| binding.store_of(namespace).map(|store| (*cell, store)))
+fn pod_of(pods: &HashMap<PodId, PodBinding>, namespace: NamespaceId) -> Option<(PodId, PodStore)> {
+    pods.iter()
+        .find_map(|(pod, binding)| binding.store_of(namespace).map(|store| (*pod, store)))
 }

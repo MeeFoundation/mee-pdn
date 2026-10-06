@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::{PdnId, RecordId, RecordKind, RecordRef};
 use pdn_node_http::shapes::{
-    Act, Connections, GrantPublication, HeldCell, HostedIdentities, Member, OwnGrant,
+    Act, Connections, GrantPublication, HeldPod, HostedIdentities, Member, OwnGrant,
 };
 
 mod common;
@@ -419,54 +419,54 @@ async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Resu
     Ok(())
 }
 
-/// Each refusal of the cells routes arrives with a status of its own, beside
-/// the accepted act it denies, on one node hosting a cell's owner and a
+/// Each refusal of the pods routes arrives with a status of its own, beside
+/// the accepted act it denies, on one node hosting a pod's owner and a
 /// second identity: that identity while no member (409), its promotion of
-/// itself as a plain member (403), and a read of a record the cell does not
+/// itself as a plain member (403), and a read of a record the pod does not
 /// hold (404). The non-member shares the owner's node, so the node holds the
-/// cell and the refusal rests on the identity named alone.
+/// pod and the refusal rests on the identity named alone.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // the denials of one surface, kept beside their positives
-async fn cell_refusals_arrive_as_refusals() -> Result<()> {
+async fn pod_refusals_arrive_as_refusals() -> Result<()> {
     let stand = Stand::new();
     let tablet = stand.spawn("tablet").await?;
     let leisure = tablet.create_identity().await?;
     let work = tablet.create_identity().await?;
-    let family = tablet.create_cell(leisure).await?;
+    let family = tablet.create_pod(leisure).await?;
 
     // Denied (a co-located identity that is no member). Beside it, the same
     // route answers for the owner.
     let outsider = tablet
-        .get(&format!("/debug/identities/{work}/cells/{family}/members"))
+        .get(&format!("/debug/identities/{work}/pods/{family}/members"))
         .await?;
     assert_eq!(
         outsider.status,
         StatusCode::CONFLICT,
-        "a cell the identity is no member of must be refused, got {}: {}",
+        "a pod the identity is no member of must be refused, got {}: {}",
         outsider.status,
         outsider.text()
     );
     assert!(
         outsider.text().contains(&family.to_string()),
-        "the refusal must name the cell: {}",
+        "the refusal must name the pod: {}",
         outsider.text()
     );
     assert_eq!(
-        tablet.cell_members(leisure, family).await?,
+        tablet.pod_members(leisure, family).await?,
         vec![Member {
             id: leisure,
             owner: true,
         }]
     );
 
-    let invite = tablet.invite_to_cell(leisure, family).await?;
-    let joined: HeldCell = tablet.join_cell(work, invite).await?.json()?;
-    assert_eq!(joined.cell, family);
+    let invite = tablet.invite_to_pod(leisure, family).await?;
+    let joined: HeldPod = tablet.join_pod(work, invite).await?.json()?;
+    assert_eq!(joined.pod, family);
 
     // Denied (a refusal by role): a plain member promotes itself. Beside it,
     // the owner's promotion of the same member goes through.
-    let by_member = tablet.cell_act(work, family, Act::Promote(work)).await?;
+    let by_member = tablet.pod_act(work, family, Act::Promote(work)).await?;
     assert_eq!(
         by_member.status,
         StatusCode::FORBIDDEN,
@@ -474,7 +474,7 @@ async fn cell_refusals_arrive_as_refusals() -> Result<()> {
         by_member.status,
         by_member.text()
     );
-    let after_refusal = tablet.cell_members(leisure, family).await?;
+    let after_refusal = tablet.pod_members(leisure, family).await?;
     assert!(
         after_refusal.contains(&Member {
             id: work,
@@ -483,10 +483,10 @@ async fn cell_refusals_arrive_as_refusals() -> Result<()> {
         "the refused promotion must leave a plain member: {after_refusal:?}"
     );
     tablet
-        .cell_act(leisure, family, Act::Promote(work))
+        .pod_act(leisure, family, Act::Promote(work))
         .await?
         .ok()?;
-    let after_promotion = tablet.cell_members(leisure, family).await?;
+    let after_promotion = tablet.pod_members(leisure, family).await?;
     assert!(
         after_promotion.contains(&Member {
             id: work,

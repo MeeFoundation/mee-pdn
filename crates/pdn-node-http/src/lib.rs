@@ -12,12 +12,12 @@
 //! HTTP travels.
 
 mod bind;
-mod cells;
 mod connections;
 mod data;
 mod error;
 mod identity;
 mod parse;
+mod pods;
 pub mod shapes;
 
 use std::{future::Future, sync::Arc};
@@ -103,7 +103,7 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, Host
 /// One route to one service call. Deliberately absent, and to stay absent:
 /// any namespace ticket handover (a harness that arranged a granted
 /// namespace by importing its ticket would keep passing after the grant
-/// binder broke), a cell store's ticket or a raw entry written into it (a
+/// binder broke), a pod store's ticket or a raw entry written into it (a
 /// path the runtime's own callers lack; forgeries are the data layer's
 /// tests), anything that forces a reconciliation (waiting is repeating the
 /// read), anything that resets state, and any handler addressing another
@@ -150,37 +150,37 @@ fn debug_routes() -> Router<Arc<Runtime>> {
             put(data::write).get(data::read),
         )
         .route(
-            "/debug/identities/{identity}/cells",
-            post(cells::create).get(cells::list),
+            "/debug/identities/{identity}/pods",
+            post(pods::create).get(pods::list),
         )
-        .route("/debug/identities/{identity}/cells/join", post(cells::join))
+        .route("/debug/identities/{identity}/pods/join", post(pods::join))
         .route(
-            "/debug/identities/{identity}/cells/{cell}/members",
-            get(cells::members),
-        )
-        .route(
-            "/debug/identities/{identity}/cells/{cell}/invites",
-            post(cells::invite),
+            "/debug/identities/{identity}/pods/{pod}/members",
+            get(pods::members),
         )
         .route(
-            "/debug/identities/{identity}/cells/{cell}/acts",
-            post(cells::act),
+            "/debug/identities/{identity}/pods/{pod}/invites",
+            post(pods::invite),
         )
         .route(
-            "/debug/identities/{identity}/cells/{cell}/records",
-            post(cells::put_record).get(cells::list_records),
+            "/debug/identities/{identity}/pods/{pod}/acts",
+            post(pods::act),
         )
         .route(
-            "/debug/identities/{identity}/cells/{cell}/records/{member}/{kind}/{id}",
-            get(cells::read),
+            "/debug/identities/{identity}/pods/{pod}/records",
+            post(pods::put_record).get(pods::list_records),
         )
         .route(
-            "/debug/identities/{identity}/cells/{cell}/records/{member}/{kind}/{id}/ops",
-            post(cells::append_op).get(cells::read_ops),
+            "/debug/identities/{identity}/pods/{pod}/records/{member}/{kind}/{id}",
+            get(pods::read),
         )
         .route(
-            "/debug/identities/{identity}/cells/{cell}/unknown",
-            get(cells::list_unknown),
+            "/debug/identities/{identity}/pods/{pod}/records/{member}/{kind}/{id}/ops",
+            post(pods::append_op).get(pods::read_ops),
+        )
+        .route(
+            "/debug/identities/{identity}/pods/{pod}/unknown",
+            get(pods::list_unknown),
         )
 }
 

@@ -7,11 +7,11 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, AuthorId, CellStore, DirectoryHeld, OpId, PrivateMetadataStore, RecordKey,
+    AddrInfoOptions, AuthorId, DirectoryHeld, OpId, PodStore, PrivateMetadataStore, RecordKey,
     RecordedHosting, Seq, ShareMode, SpawnOptions, SyncNode,
 };
-use pdn_types::{CellId, EntryPath, PdnId, RecordId, RecordKind, RecordRef};
-use test_utils::{cell as c, host_identity, ids};
+use pdn_types::{EntryPath, PdnId, PodId, RecordId, RecordKind, RecordRef};
+use test_utils::{host_identity, ids, pod as c};
 
 /// Spawn a node on `dir` — the directory-configured counterpart of the
 /// suites' `memory_node`.
@@ -184,7 +184,7 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
 }
 
 /// Two identities of one node each keep their own author across a restart:
-/// what a counterparty or a cell binds to an identity on this device is
+/// what a counterparty or a pod binds to an identity on this device is
 /// that identity's author, not the node's.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
@@ -508,22 +508,22 @@ async fn a_start_finds_the_identities_whose_hosting_was_recorded() -> Result<()>
     Ok(())
 }
 
-/// A cell's stores import from their tickets onto the replicas a respawned
+/// A pod's stores import from their tickets onto the replicas a respawned
 /// node's store already holds, the import restart recovery performs, and the
-/// cell is held again on the same stores.
+/// pod is held again on the same stores.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cell_imports_onto_its_replicas_after_a_respawn() -> Result<()> {
+async fn a_pod_imports_onto_its_replicas_after_a_respawn() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let family = CellId::from_bytes([
+    let family = PodId::from_bytes([
         0x9c, 0xbc, 0xbe, 0x4d, 0xa7, 0xcc, 0x35, 0xa4, 0x43, 0x60, 0xd6, 0x4e, 0x45, 0x62, 0x19,
         0x57,
     ]);
 
     let first = node_on(dir.path()).await?;
     let _directory = host_identity(&first, ids::ALICE).await?;
-    first.create_cell(ids::ALICE, family).await?;
+    first.create_pod(ids::ALICE, family).await?;
     let tickets = first
-        .share_cell_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
+        .share_pod_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
         .await?;
     let stores = [
         tickets.membership.capability.id(),
@@ -537,12 +537,12 @@ async fn a_cell_imports_onto_its_replicas_after_a_respawn() -> Result<()> {
     for namespace in stores {
         assert!(
             second.holds_replica(ids::ALICE, namespace).await?,
-            "a cell's replica did not survive the respawn"
+            "a pod's replica did not survive the respawn"
         );
     }
-    second.import_cell(ids::ALICE, family, tickets).await?;
+    second.import_pod(ids::ALICE, family, tickets).await?;
     let held = second
-        .share_cell_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
+        .share_pod_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
         .await?;
     assert_eq!(
         [
@@ -550,17 +550,17 @@ async fn a_cell_imports_onto_its_replicas_after_a_respawn() -> Result<()> {
             held.records.capability.id()
         ],
         stores,
-        "the respawned node holds the cell on other stores"
+        "the respawned node holds the pod on other stores"
     );
     second.shutdown().await?;
     Ok(())
 }
 
 /// An operation on `note` by `writer` at its sequence 1, numbered as the
-/// cells service numbers it: one above the highest its author holds there.
-async fn append(on: &SyncNode, writer: PdnId, cell: CellId, note: &RecordRef) -> Result<()> {
+/// pods service numbers it: one above the highest its author holds there.
+async fn append(on: &SyncNode, writer: PdnId, pod: PodId, note: &RecordRef) -> Result<()> {
     let author = on.default_author(writer)?;
-    let view = on.cell_record_view_of(writer, cell, note).await?;
+    let view = on.pod_record_view_of(writer, pod, note).await?;
     let op_seq = view
         .next_op_seq(note, author)
         .ok_or_else(|| anyhow::anyhow!("exhausted"))?;
@@ -574,39 +574,39 @@ async fn append(on: &SyncNode, writer: PdnId, cell: CellId, note: &RecordRef) ->
             op_seq,
         },
     };
-    on.write_cell_entry(writer, cell, CellStore::Records, &key.to_bytes(), b"op")
+    on.write_pod_entry(writer, pod, PodStore::Records, &key.to_bytes(), b"op")
         .await
 }
 
 /// A device's operation sequence on a mergeable-document continues after a
 /// respawn: its fourth operation takes sequence 4 under the same author.
-/// The cell is imported from its tickets onto the replicas the store holds,
+/// The pod is imported from its tickets onto the replicas the store holds,
 /// as restart recovery imports it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operation_sequence_continues_after_a_respawn() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let first = node_on(dir.path()).await?;
     let (bob, _directory) = c::host(&first).await?;
-    let cell = c::found(&first, &bob).await?;
+    let pod = c::found(&first, &bob).await?;
     let note = RecordRef {
         member: bob.id,
         kind: RecordKind::MergeableDocument,
         id: RecordId::from_bytes([0x11; 16]),
     };
     for _ in 0..3 {
-        append(&first, bob.id, cell, &note).await?;
+        append(&first, bob.id, pod, &note).await?;
     }
     let author = first.default_author(bob.id)?;
-    let tickets = c::tickets(&first, &bob, cell).await?;
+    let tickets = c::tickets(&first, &bob, pod).await?;
     first.shutdown().await?;
     drop(first);
 
     let second = node_on(dir.path()).await?;
     second.provision_identity(bob.id).await?;
-    second.import_cell(bob.id, cell, tickets).await?;
-    append(&second, bob.id, cell, &note).await?;
+    second.import_pod(bob.id, pod, tickets).await?;
+    append(&second, bob.id, pod, &note).await?;
     let numbered: Vec<(AuthorId, u64)> = second
-        .read_cell_operations(bob.id, cell, &note)
+        .read_pod_operations(bob.id, pod, &note)
         .await?
         .into_iter()
         .map(|op| (op.id.author, op.id.op_seq))

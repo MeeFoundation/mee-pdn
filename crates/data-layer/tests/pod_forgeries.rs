@@ -1,4 +1,4 @@
-//! What a modified member device forges into a cell's stores: held on every
+//! What a modified member device forges into a pod's stores: held on every
 //! member device, read by nothing there, and leaving the member devices'
 //! replicas equal. The forgeries arrive by store-level writes, the tickets
 //! by hand.
@@ -7,11 +7,11 @@ use std::{collections::BTreeSet, time::Duration};
 
 use anyhow::{Context as _, Result};
 use data_layer::{
-    identity_of, AuthorId, CellStore, CellVerdicts, Contact, EventKind, MemberState, MembershipKey,
-    OpId, RecordKey, Seq, SpawnOptions, SyncNode, Verdict,
+    identity_of, AuthorId, Contact, EventKind, MemberState, MembershipKey, OpId, PodStore,
+    PodVerdicts, RecordKey, Seq, SpawnOptions, SyncNode, Verdict,
 };
-use pdn_types::{CellId, PdnId, RecordId};
-use test_utils::{cell as c, TIMEOUT};
+use pdn_types::{PdnId, PodId, RecordId};
+use test_utils::{pod as c, TIMEOUT};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -30,24 +30,24 @@ const PLAIN: MemberState = MemberState {
 async fn quiet_node() -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions {
         reconcile_interval: QUIET,
-        cell_reconcile_interval: QUIET,
+        pod_reconcile_interval: QUIET,
         ..SpawnOptions::memory()
     })
     .await
 }
 
-/// A dial of one of `cell`'s stores from `holder`'s replica on `from` to
+/// A dial of one of `pod`'s stores from `holder`'s replica on `from` to
 /// `callee`'s on `to`, as a drawn contact is dialed.
 async fn dial(
     from: &SyncNode,
     holder: PdnId,
-    cell: CellId,
-    store: CellStore,
+    pod: PodId,
+    store: PodStore,
     to: &SyncNode,
     callee: PdnId,
 ) -> Result<()> {
     let contact = Contact::new(to.dial_handle().addr(), identity_of(callee));
-    from.sync_cell_with_for_test(holder, cell, store, contact)
+    from.sync_pod_with_for_test(holder, pod, store, contact)
         .await
 }
 
@@ -56,27 +56,27 @@ async fn dial(
 /// fold a read reports on `reports`.
 async fn held(
     node: &SyncNode,
-    reports: &mut UnboundedReceiver<CellVerdicts>,
+    reports: &mut UnboundedReceiver<PodVerdicts>,
     holder: PdnId,
-    cell: CellId,
-) -> Result<Vec<(CellStore, Vec<u8>, AuthorId, Verdict)>> {
-    node.cell_membership(holder, cell).await?;
+    pod: PodId,
+) -> Result<Vec<(PodStore, Vec<u8>, AuthorId, Verdict)>> {
+    node.pod_membership(holder, pod).await?;
     let mut membership = None;
     while let Ok(report) = reports.try_recv() {
-        if report.identity == holder && report.cell == cell {
+        if report.identity == holder && report.pod == pod {
             membership = Some(report.verdicts);
         }
     }
     let mut held: Vec<_> = membership
         .context("the read reported no fold")?
         .into_iter()
-        .map(|(key, author, verdict)| (CellStore::Membership, key, author, verdict))
+        .map(|(key, author, verdict)| (PodStore::Membership, key, author, verdict))
         .collect();
     held.extend(
-        node.cell_record_view(holder, cell)
+        node.pod_record_view(holder, pod)
             .await?
             .verdicts()
-            .map(|(entry, verdict)| (CellStore::Records, entry.key.clone(), entry.author, verdict)),
+            .map(|(entry, verdict)| (PodStore::Records, entry.key.clone(), entry.author, verdict)),
     );
     Ok(held)
 }
@@ -87,7 +87,7 @@ struct Forgery<'a> {
     phone: &'a SyncNode,
     writer: PdnId,
     author: AuthorId,
-    store: CellStore,
+    store: PodStore,
     key: Vec<u8>,
     payload: Vec<u8>,
 }
@@ -96,14 +96,14 @@ struct Forgery<'a> {
 /// `forged`, counting none of them.
 async fn holds_every_forgery_unread(
     node: &SyncNode,
-    reports: &mut UnboundedReceiver<CellVerdicts>,
+    reports: &mut UnboundedReceiver<PodVerdicts>,
     holder: PdnId,
-    cell: CellId,
+    pod: PodId,
     forged: &[Forgery<'_>],
 ) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        let held = held(node, reports, holder, cell).await?;
+        let held = held(node, reports, holder, pod).await?;
         let all = forged.iter().all(|forgery| {
             held.iter().any(|(store, key, author, verdict)| {
                 *store == forgery.store
@@ -140,25 +140,25 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
     let [alice_phone, bob_phone, carol_phone] = &phones;
     let mut reports = Vec::new();
     for phone in &phones {
-        reports.push(phone.take_cell_verdicts().context("taken once")?);
+        reports.push(phone.take_pod_verdicts().context("taken once")?);
     }
     let (alice, _) = c::host(alice_phone).await?;
     let (bob, _) = c::host(bob_phone).await?;
     let (carol, _) = c::host(carol_phone).await?;
-    let cell = c::found(alice_phone, &alice).await?;
+    let pod = c::found(alice_phone, &alice).await?;
     for (phone, member) in [(bob_phone, &bob), (carol_phone, &carol)] {
         c::invite(
             alice_phone,
             &alice,
-            cell,
+            pod,
             member,
             vec![c::device_of(phone, member)?],
         )
         .await?;
     }
-    let tickets = c::tickets(alice_phone, &alice, cell).await?;
+    let tickets = c::tickets(alice_phone, &alice, pod).await?;
     for (phone, holder) in [(bob_phone, &bob), (carol_phone, &carol)] {
-        phone.import_cell(holder.id, cell, tickets.clone()).await?;
+        phone.import_pod(holder.id, pod, tickets.clone()).await?;
     }
     for (phone, holder) in [(bob_phone, &bob), (carol_phone, &carol)] {
         for (other, member) in [
@@ -167,7 +167,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             (bob_phone, &bob),
         ] {
             let device = c::device_of(other, member)?;
-            assert!(c::lists_device(phone, holder.id, cell, member.id, device).await?);
+            assert!(c::lists_device(phone, holder.id, pod, member.id, device).await?);
         }
     }
 
@@ -175,7 +175,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         alice_phone.default_author(alice.id)?,
         bob_phone.default_author(bob.id)?,
     );
-    let claim = c::place_claim(alice_phone, &alice, cell, 1).await?;
+    let claim = c::place_claim(alice_phone, &alice, pod, 1).await?;
     let scan = RecordKey::ImmutableDocument {
         member: bob.id,
         id: RecordId::from_bytes([2; 16]),
@@ -192,16 +192,10 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         },
     };
     bob_phone
-        .write_cell_entry(bob.id, cell, CellStore::Records, &scan.to_bytes(), b"scan")
+        .write_pod_entry(bob.id, pod, PodStore::Records, &scan.to_bytes(), b"scan")
         .await?;
     alice_phone
-        .write_cell_entry(
-            alice.id,
-            cell,
-            CellStore::Records,
-            &note.to_bytes(),
-            b"milk",
-        )
+        .write_pod_entry(alice.id, pod, PodStore::Records, &note.to_bytes(), b"milk")
         .await?;
 
     let stranger = bob_phone.create_author(bob.id).await?;
@@ -231,7 +225,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         key,
         payload,
     };
-    let (records, membership) = (CellStore::Records, CellStore::Membership);
+    let (records, membership) = (PodStore::Records, PodStore::Membership);
     let forged = vec![
         // Under another member's claim.
         forgery(
@@ -331,15 +325,15 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             bob_author,
             membership,
             event(erin.id, 1, EventKind::Joined, bob.id).to_bytes(),
-            mallory.keys.join_statement(&cell, Seq::FIRST).encode(),
+            mallory.keys.join_statement(&pod, Seq::FIRST).encode(),
         ),
     ];
     for forgery in &forged {
         forgery
             .phone
-            .write_cell_entry_as_for_test(
+            .write_pod_entry_as_for_test(
                 forgery.writer,
-                cell,
+                pod,
                 forgery.store,
                 forgery.author,
                 &forgery.key,
@@ -358,25 +352,25 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             if holder.id == callee.id {
                 continue;
             }
-            for store in [CellStore::Membership, CellStore::Records] {
-                dial(from, holder.id, cell, store, to, callee.id).await?;
+            for store in [PodStore::Membership, PodStore::Records] {
+                dial(from, holder.id, pod, store, to, callee.id).await?;
             }
         }
     }
     for ((phone, holder), reports) in members.into_iter().zip(&mut reports) {
         assert!(
-            holds_every_forgery_unread(phone, reports, holder.id, cell, &forged).await?,
+            holds_every_forgery_unread(phone, reports, holder.id, pod, &forged).await?,
             "a member device does not hold every forgery, or counts one"
         );
         // The wait above takes a forgery whose payload is still on its way,
         // so the genuine records' payloads may be too.
         for record in [claim, scan.record()] {
-            assert!(c::reads(phone, holder.id, cell, record).await?);
+            assert!(c::reads(phone, holder.id, pod, record).await?);
         }
         assert!(
             test_utils::eventually(|| async {
                 Ok(!phone
-                    .read_cell_operations(holder.id, cell, &note.record())
+                    .read_pod_operations(holder.id, pod, &note.record())
                     .await?
                     .is_empty())
             })
@@ -384,34 +378,34 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         );
         assert_eq!(
             phone
-                .read_cell_record(holder.id, cell, &claim)
+                .read_pod_record(holder.id, pod, &claim)
                 .await?
                 .as_deref(),
             Some(&b"claim"[..])
         );
         assert_eq!(
             phone
-                .read_cell_record(holder.id, cell, &scan.record())
+                .read_pod_record(holder.id, pod, &scan.record())
                 .await?
                 .as_deref(),
             Some(&b"scan"[..])
         );
         let writers: Vec<PdnId> = phone
-            .read_cell_operations(holder.id, cell, &note.record())
+            .read_pod_operations(holder.id, pod, &note.record())
             .await?
             .into_iter()
             .map(|op| op.id.writer)
             .collect();
         assert_eq!(writers, [alice.id]);
         for (member, want) in [(&alice, OWNER), (&bob, PLAIN), (&carol, PLAIN)] {
-            assert_eq!(c::state_on(phone, holder.id, cell, member.id).await, want);
+            assert_eq!(c::state_on(phone, holder.id, pod, member.id).await, want);
         }
         assert_eq!(
-            c::state_on(phone, holder.id, cell, erin.id).await,
+            c::state_on(phone, holder.id, pod, erin.id).await,
             MemberState::default()
         );
         let carols: BTreeSet<_> = phone
-            .cell_membership(holder.id, cell)
+            .pod_membership(holder.id, pod)
             .await?
             .member(&carol.id)
             .map(|member| member.devices.clone())
@@ -424,9 +418,9 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         (bob_phone, &bob, alice_phone, &alice),
         (alice_phone, &alice, carol_phone, &carol),
     ] {
-        for store in [CellStore::Membership, CellStore::Records] {
-            let mut sessions = from.watch_cell_sessions(holder.id, cell, store).await?;
-            dial(from, holder.id, cell, store, to, callee.id).await?;
+        for store in [PodStore::Membership, PodStore::Records] {
+            let mut sessions = from.watch_pod_sessions(holder.id, pod, store).await?;
+            dial(from, holder.id, pod, store, to, callee.id).await?;
             let session = sessions.next_with(to.node_id(), true, TIMEOUT).await?;
             assert!(
                 session.is_some_and(|session| session.exchanged == Ok((0, 0))),

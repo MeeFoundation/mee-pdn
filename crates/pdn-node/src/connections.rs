@@ -306,11 +306,11 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
     }
 }
 
-/// Keep hosted `identity`'s connections bound and its cells open: one sweep
+/// Keep hosted `identity`'s connections bound and its pods open: one sweep
 /// now, then one per directory change and one per sweep interval. Without
 /// it a linked device would refuse grants its identity issued until its
 /// first grant read, stay invisible to the counterparty, and reach none of
-/// its identity's cells. Holds the state weakly and upgrades
+/// its identity's pods. Holds the state weakly and upgrades
 /// per sweep, so the task ends with the runtime instead of keeping it alive.
 pub(crate) fn spawn_connection_armer(
     state: Weak<Mutex<State>>,
@@ -329,7 +329,7 @@ pub(crate) fn spawn_connection_armer(
                     return;
                 }
                 arm_connections(&mut guard, identity, &state).await;
-                crate::cells::arm_cells(&guard, identity).await;
+                crate::pods::arm_pods(&guard, identity).await;
                 guard.sweep_interval
             };
             // Two wake sources: a sweep can fail for a reason the directory

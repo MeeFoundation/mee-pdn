@@ -1,11 +1,11 @@
-//! The cells service: creating a cell for a hosted identity, listing its
-//! cells and their members, the invite and join dialogue on
-//! the cell-join ALPN — the inviter verifies and burns the secret before any
+//! The pods service: creating a pod for a hosted identity, listing its
+//! pods and their members, the invite and join dialogue on
+//! the pod-join ALPN — the inviter verifies and burns the secret before any
 //! state change, names the newcomer's sequence, writes its joined event and
 //! device statement, and only then hands over both stores' write tickets —
 //! the membership acts, and placing, editing and reading records. The join's
 //! refusals are uniform, as pairing's are. The stores underneath are the
-//! data layer's cell stores.
+//! data layer's pod stores.
 
 use std::{
     sync::{Arc, OnceLock, Weak},
@@ -14,13 +14,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use data_layer::{
-    cell_id_of, cell_inviter_ticket_kind, cell_ticket_kind, devices_verify, join_verifies,
-    pdn_id_of, AcceptError, AddrInfoOptions, AuthorId, CellNotice, CellStore, CellTickets,
-    Connection, DevicesPayload, DocTicket, EndpointAddr, EventKind, JoinedPayload, Member,
-    MemberDevice, Membership, MembershipKey, OpId, Operation, ProtocolHandler, RecordKey, Seq,
-    SyncNode, UnknownCell, UnknownEntry, ACT_PAYLOAD,
+    devices_verify, join_verifies, pdn_id_of, pod_id_of, pod_inviter_ticket_kind, pod_ticket_kind,
+    AcceptError, AddrInfoOptions, AuthorId, Connection, DevicesPayload, DocTicket, EndpointAddr,
+    EventKind, JoinedPayload, Member, MemberDevice, Membership, MembershipKey, OpId, Operation,
+    PodNotice, PodStore, PodTickets, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownEntry,
+    UnknownPod, ACT_PAYLOAD,
 };
-use pdn_types::{CellId, NodeId, PdnId, RecordId, RecordKind, RecordRef};
+use pdn_types::{NodeId, PdnId, PodId, RecordId, RecordKind, RecordRef};
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -36,11 +36,11 @@ use crate::{
     runtime::{CleanupSupervisor, Runtime, ServingHalves, State},
 };
 
-pub(crate) const CELL_JOIN_ALPN: &[u8] = b"/pdn/cell-join/0";
+pub(crate) const POD_JOIN_ALPN: &[u8] = b"/pdn/pod-join/0";
 
 /// Any other version is refused before dialing by the joiner, and
 /// uniformly by the inviter.
-pub const CELL_INVITE_FORMAT_VERSION: u8 = 0;
+pub const POD_INVITE_FORMAT_VERSION: u8 = 0;
 
 /// A constant because `join` names no budget; without it a hung inviter
 /// holds the caller for the transport's idle timeout.
@@ -59,31 +59,31 @@ pub const JOIN_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
 /// string or QR encoding is a host concern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CellInvite {
+pub struct PodInvite {
     pub version: u8,
     /// Where the joiner dials.
     pub inviter_addr: EndpointAddr,
     pub secret: [u8; 32],
-    pub cell: CellId,
+    pub pod: PodId,
 }
 
-/// A cell the identity holds.
+/// A pod the identity holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CellInfo {
-    pub id: CellId,
+pub struct PodInfo {
+    pub id: PodId,
 }
 
-/// A current member of a cell, with its role.
+/// A current member of a pod, with its role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CellMember {
+pub struct PodMember {
     pub id: PdnId,
     pub owner: bool,
 }
 
 /// Refused before dialing. Downcast from the `anyhow::Error` of `join`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("unsupported cell invite version: {version}")]
-pub struct UnsupportedCellInviteVersion {
+#[error("unsupported pod invite version: {version}")]
+pub struct UnsupportedPodInviteVersion {
     pub version: u8,
 }
 
@@ -100,13 +100,13 @@ pub struct JoinRefused;
 #[error("join dialogue did not complete in time")]
 pub struct JoinTimeout;
 
-/// Another `join` of the same cell by the same identity is in flight;
+/// Another `join` of the same pod by the same identity is in flight;
 /// refused before dialing. Downcast from the `anyhow::Error` of `join`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("a join of {cell} by {identity} is already in flight on this runtime")]
+#[error("a join of {pod} by {identity} is already in flight on this runtime")]
 pub struct JoinInProgress {
     pub identity: PdnId,
-    pub cell: CellId,
+    pub pod: PodId,
 }
 
 /// The identity's announcement key pair has not reached this device yet:
@@ -118,10 +118,10 @@ pub struct AnnouncementKeyPending {
     pub identity: PdnId,
 }
 
-/// A membership act through [`CellsService::act`]. The founding act is
+/// A membership act through [`PodsService::act`]. The founding act is
 /// written by `create`, the invite act inside the join dialogue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CellAct {
+pub enum PodAct {
     Promote(PdnId),
     /// Of another owner.
     Demote(PdnId),
@@ -140,18 +140,18 @@ pub enum ActRefusal {
     SubjectNotMember,
     /// A demotion of a plain member.
     SubjectNotOwner,
-    /// A leave by the cell's one owner while it has other members, until
+    /// A leave by the pod's one owner while it has other members, until
     /// another member is an owner.
     SoleOwner,
 }
 
-/// A membership act the identity's role or the cell's membership does not
+/// A membership act the identity's role or the pod's membership does not
 /// allow, as the identity's replica folds it; refused before anything is
 /// written. Downcast from the `anyhow::Error` of `act`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{act:?} refused: {reason:?}")]
 pub struct ActRefused {
-    pub act: CellAct,
+    pub act: PodAct,
     pub reason: ActRefusal,
 }
 
@@ -164,7 +164,7 @@ pub struct RecordPlacedOnce {
     pub record: RecordRef,
 }
 
-/// No entry of the record reads on the identity's replica: the cell holds
+/// No entry of the record reads on the identity's replica: the pod holds
 /// none, or none has arrived yet. Downcast from the `anyhow::Error` of
 /// `append_op` and `read_ops`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -219,44 +219,44 @@ struct JoinTickets {
     records: DocTicket,
 }
 
-/// Creating, listing and joining cells on a runtime, and the records in
-/// them. `identity` is the hosted identity acting; a call on a cell the
-/// identity is no member of fails with [`UnknownCell`].
+/// Creating, listing and joining pods on a runtime, and the records in
+/// them. `identity` is the hosted identity acting; a call on a pod the
+/// identity is no member of fails with [`UnknownPod`].
 #[allow(async_fn_in_trait)]
-pub trait CellsService {
-    /// Derive the cell id, create both stores and write the signed founding
+pub trait PodsService {
+    /// Derive the pod id, create both stores and write the signed founding
     /// event; the identity is the first owner.
-    async fn create(&self, identity: PdnId) -> Result<CellId>;
+    async fn create(&self, identity: PdnId) -> Result<PodId>;
 
-    /// The cells the identity holds, by its directory.
-    async fn list(&self, identity: PdnId) -> Result<Vec<CellInfo>>;
+    /// The pods the identity holds, by its directory.
+    async fn list(&self, identity: PdnId) -> Result<Vec<PodInfo>>;
 
     /// The current members, each with its role.
-    async fn members(&self, identity: PdnId, cell: CellId) -> Result<Vec<CellMember>>;
+    async fn members(&self, identity: PdnId, pod: PodId) -> Result<Vec<PodMember>>;
 
     /// Mint a one-time invite; `lifetime` overrides the short default.
-    /// Writes nothing to the cell: the joined event is written once a
+    /// Writes nothing to the pod: the joined event is written once a
     /// newcomer presents the secret.
     async fn invite(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         lifetime: Option<Duration>,
-    ) -> Result<CellInvite>;
+    ) -> Result<PodInvite>;
 
     /// Join through the invite's dialogue, returning once both stores
     /// caught up and the identity's replica folds it as a member; the
     /// identity joins as a plain member. A catch-up cut short
     /// fails with [`data_layer::CatchUpTimeout`] and leaves both tickets and
     /// the directory's entry recorded.
-    async fn join(&self, identity: PdnId, invite: CellInvite) -> Result<CellId>;
+    async fn join(&self, identity: PdnId, invite: PodInvite) -> Result<PodId>;
 
     /// Write a membership act once the identity's role allows it, both
     /// sequences picked from what the replica holds;
-    /// [`ActRefused`] writes nothing. A leave also tombstones the cell in the
+    /// [`ActRefused`] writes nothing. A leave also tombstones the pod in the
     /// identity's directory at the left event's sequence and forgets the
-    /// record store, the membership store kept as the cell's tombstone.
-    async fn act(&self, identity: PdnId, cell: CellId, act: CellAct) -> Result<()>;
+    /// record store, the membership store kept as the pod's tombstone.
+    async fn act(&self, identity: PdnId, pod: PodId, act: PodAct) -> Result<()>;
 
     /// Place a record under the identity's own name at a fresh id: a
     /// claim's or an immutable-document's one entry, or a
@@ -264,7 +264,7 @@ pub trait CellsService {
     async fn put_record(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         kind: RecordKind,
         payload: &[u8],
     ) -> Result<RecordRef>;
@@ -276,7 +276,7 @@ pub trait CellsService {
     async fn append_op(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         record: RecordRef,
         op: &[u8],
     ) -> Result<()>;
@@ -284,12 +284,8 @@ pub trait CellsService {
     /// A claim's or an immutable-document's payload, the newest where
     /// several entries read; `None` for a record that reads on no entry
     /// here, [`WrongRecordKind`] for a mergeable-document.
-    async fn read(
-        &self,
-        identity: PdnId,
-        cell: CellId,
-        record: RecordRef,
-    ) -> Result<Option<Vec<u8>>>;
+    async fn read(&self, identity: PdnId, pod: PodId, record: RecordRef)
+        -> Result<Option<Vec<u8>>>;
 
     /// A mergeable-document's operations that read here, each with its
     /// writer, in the order of their ids and merged into no document state;
@@ -298,49 +294,45 @@ pub trait CellsService {
     async fn read_ops(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         record: RecordRef,
     ) -> Result<Vec<Operation>>;
 
     /// Every record an entry of which reads here.
-    async fn list_records(&self, identity: PdnId, cell: CellId) -> Result<Vec<RecordRef>>;
+    async fn list_records(&self, identity: PdnId, pod: PodId) -> Result<Vec<RecordRef>>;
 
     /// The entries of both stores outside the key layout, each with its
     /// author.
-    async fn list_unknown(&self, identity: PdnId, cell: CellId) -> Result<Vec<UnknownEntry>>;
+    async fn list_unknown(&self, identity: PdnId, pod: PodId) -> Result<Vec<UnknownEntry>>;
 }
 
-/// The production [`CellsService`].
+/// The production [`PodsService`].
 #[derive(Clone, Copy)]
-pub struct RuntimeCellsService<'rt> {
+pub struct RuntimePodsService<'rt> {
     runtime: &'rt Runtime,
 }
 
-impl<'rt> RuntimeCellsService<'rt> {
+impl<'rt> RuntimePodsService<'rt> {
     pub(crate) fn new(runtime: &'rt Runtime) -> Self {
         Self { runtime }
     }
 
-    /// The node, and the membership `identity`'s replica of `cell` folds
+    /// The node, and the membership `identity`'s replica of `pod` folds
     /// into, once `identity` is a member there.
-    async fn as_member(
-        &self,
-        identity: PdnId,
-        cell: CellId,
-    ) -> Result<(Arc<SyncNode>, Membership)> {
+    async fn as_member(&self, identity: PdnId, pod: PodId) -> Result<(Arc<SyncNode>, Membership)> {
         let node = {
             let state = self.runtime.state.lock().await;
             state.hosted(identity)?;
             Arc::clone(&state.node)
         };
-        let membership = node.cell_membership(identity, cell).await?;
-        require_member(&membership, identity, cell)?;
+        let membership = node.pod_membership(identity, pod).await?;
+        require_member(&membership, identity, pod)?;
         Ok((node, membership))
     }
 }
 
-impl CellsService for RuntimeCellsService<'_> {
-    async fn create(&self, identity: PdnId) -> Result<CellId> {
+impl PodsService for RuntimePodsService<'_> {
+    async fn create(&self, identity: PdnId) -> Result<PodId> {
         // Local writes alone: no round trip runs under the lock.
         let state = self.runtime.state.lock().await;
         let hosted = state.hosted(identity)?;
@@ -354,13 +346,13 @@ impl CellsService for RuntimeCellsService<'_> {
             .try_fill_bytes(&mut nonce)
             .context("operating-system randomness unavailable")?;
         let founding = keys.founding(nonce);
-        let cell = cell_id_of(&identity, &founding.announcement_key, &founding.nonce);
+        let pod = pod_id_of(&identity, &founding.announcement_key, &founding.nonce);
         let node = Arc::clone(&state.node);
-        node.create_cell(identity, cell).await?;
-        let mut rollback = CellRollback::new(
+        node.create_pod(identity, pod).await?;
+        let mut rollback = PodRollback::new(
             Arc::clone(&node),
             identity,
-            cell,
+            pod,
             state.cleanup_tasks.clone(),
         );
         let device = MemberDevice {
@@ -368,10 +360,10 @@ impl CellsService for RuntimeCellsService<'_> {
             author: hosted.author,
         };
         let written = async {
-            node.write_cell_entry(
+            node.write_pod_entry(
                 identity,
-                cell,
-                CellStore::Membership,
+                pod,
+                PodStore::Membership,
                 &MembershipKey::founded(identity).to_bytes(),
                 &founding.encode(),
             )
@@ -380,21 +372,21 @@ impl CellsService for RuntimeCellsService<'_> {
                 member: identity,
                 version: 1,
             };
-            node.write_cell_entry(
+            node.write_pod_entry(
                 identity,
-                cell,
-                CellStore::Membership,
+                pod,
+                PodStore::Membership,
                 &statement.to_bytes(),
                 &keys.device_statement(1, vec![device]).encode(),
             )
             .await?;
-            record_cell(&node, &hosted.directory, identity, cell, Seq::FIRST, None).await
+            record_pod(&node, &hosted.directory, identity, pod, Seq::FIRST, None).await
         }
         .await;
         match written {
             Ok(()) => {
                 rollback.disarm();
-                Ok(cell)
+                Ok(pod)
             }
             Err(err) => {
                 rollback.roll_back().await;
@@ -403,26 +395,26 @@ impl CellsService for RuntimeCellsService<'_> {
         }
     }
 
-    async fn list(&self, identity: PdnId) -> Result<Vec<CellInfo>> {
+    async fn list(&self, identity: PdnId) -> Result<Vec<PodInfo>> {
         let state = self.runtime.state.lock().await;
-        let mut cells: Vec<CellInfo> = state
+        let mut pods: Vec<PodInfo> = state
             .hosted(identity)?
             .directory
-            .held_cells()
+            .held_pods()
             .await?
             .into_iter()
-            .map(|id| CellInfo { id })
+            .map(|id| PodInfo { id })
             .collect();
-        cells.sort();
-        Ok(cells)
+        pods.sort();
+        Ok(pods)
     }
 
-    async fn members(&self, identity: PdnId, cell: CellId) -> Result<Vec<CellMember>> {
-        let (_node, membership) = self.as_member(identity, cell).await?;
-        let mut members: Vec<CellMember> = membership
+    async fn members(&self, identity: PdnId, pod: PodId) -> Result<Vec<PodMember>> {
+        let (_node, membership) = self.as_member(identity, pod).await?;
+        let mut members: Vec<PodMember> = membership
             .identities()
             .filter(|(_id, member)| member.state.member)
-            .map(|(id, member)| CellMember {
+            .map(|(id, member)| PodMember {
                 id: *id,
                 owner: member.state.owner,
             })
@@ -434,27 +426,27 @@ impl CellsService for RuntimeCellsService<'_> {
     async fn invite(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         lifetime: Option<Duration>,
-    ) -> Result<CellInvite> {
-        self.as_member(identity, cell).await?;
+    ) -> Result<PodInvite> {
+        self.as_member(identity, pod).await?;
         let mut state = self.runtime.state.lock().await;
-        let secret = state.pending_cell_invites.mint(
-            (identity, cell),
+        let secret = state.pending_pod_invites.mint(
+            (identity, pod),
             lifetime.unwrap_or(DEFAULT_INVITE_LIFETIME),
             Instant::now(),
         )?;
-        Ok(CellInvite {
-            version: CELL_INVITE_FORMAT_VERSION,
+        Ok(PodInvite {
+            version: POD_INVITE_FORMAT_VERSION,
             inviter_addr: state.node.dial_handle().addr(),
             secret,
-            cell,
+            pod,
         })
     }
 
-    async fn join(&self, identity: PdnId, invite: CellInvite) -> Result<CellId> {
-        if invite.version != CELL_INVITE_FORMAT_VERSION {
-            return Err(UnsupportedCellInviteVersion {
+    async fn join(&self, identity: PdnId, invite: PodInvite) -> Result<PodId> {
+        if invite.version != POD_INVITE_FORMAT_VERSION {
+            return Err(UnsupportedPodInviteVersion {
                 version: invite.version,
             }
             .into());
@@ -462,10 +454,10 @@ impl CellsService for RuntimeCellsService<'_> {
         let cleanup_tasks = {
             let mut state = self.runtime.state.lock().await;
             state.hosted(identity)?;
-            if !state.joining_in_flight.insert((identity, invite.cell)) {
+            if !state.joining_in_flight.insert((identity, invite.pod)) {
                 return Err(JoinInProgress {
                     identity,
-                    cell: invite.cell,
+                    pod: invite.pod,
                 }
                 .into());
             }
@@ -475,7 +467,7 @@ impl CellsService for RuntimeCellsService<'_> {
         // covers a cancellation of this future alone.
         let reservation = JoinReservation {
             state: Arc::clone(&self.runtime.state),
-            key: (identity, invite.cell),
+            key: (identity, invite.pod),
             armed: true,
             cleanup_tasks,
         };
@@ -484,32 +476,32 @@ impl CellsService for RuntimeCellsService<'_> {
         joined
     }
 
-    async fn act(&self, identity: PdnId, cell: CellId, act: CellAct) -> Result<()> {
-        if act == CellAct::Leave {
+    async fn act(&self, identity: PdnId, pod: PodId, act: PodAct) -> Result<()> {
+        if act == PodAct::Leave {
             // Checked before the flush too, so a refused leave dials nobody.
             let node = {
                 let state = self.runtime.state.lock().await;
-                act_key(&state, identity, cell, act).await?;
+                act_key(&state, identity, pod, act).await?;
                 Arc::clone(&state.node)
             };
             // What no member's device holds by the departure never leaves
             // this one: the tombstone serves the departure's past alone.
             // A round trip, so outside the lock.
             let _flushed = node
-                .flush_cell(identity, cell)
+                .flush_pod(identity, pod)
                 .await?
                 .wait(LEAVE_FLUSH_TIMEOUT)
                 .await;
         }
         // Local writes alone: no round trip runs under the lock.
         let state = self.runtime.state.lock().await;
-        let key = act_key(&state, identity, cell, act).await?;
+        let key = act_key(&state, identity, pod, act).await?;
         state
             .node
-            .write_cell_entry(
+            .write_pod_entry(
                 identity,
-                cell,
-                CellStore::Membership,
+                pod,
+                PodStore::Membership,
                 &key.to_bytes(),
                 &ACT_PAYLOAD,
             )
@@ -520,10 +512,10 @@ impl CellsService for RuntimeCellsService<'_> {
             ..
         } = key
         {
-            depart(&state, identity, cell, seq).await?;
-            // Without it the left event reaches the members at the cell
+            depart(&state, identity, pod, seq).await?;
+            // Without it the left event reaches the members at the pod
             // pass's next run, should its announcement have been lost.
-            let _dialed = state.node.flush_cell(identity, cell).await;
+            let _dialed = state.node.flush_pod(identity, pod).await;
         }
         Ok(())
     }
@@ -531,13 +523,13 @@ impl CellsService for RuntimeCellsService<'_> {
     async fn put_record(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         kind: RecordKind,
         payload: &[u8],
     ) -> Result<RecordRef> {
         // Local writes alone: no round trip runs under the lock.
         let state = self.runtime.state.lock().await;
-        let (author, mseq) = writer(&state, identity, cell).await?;
+        let (author, mseq) = writer(&state, identity, pod).await?;
         let mut id = [0u8; 16];
         SysRng
             .try_fill_bytes(&mut id)
@@ -559,7 +551,7 @@ impl CellsService for RuntimeCellsService<'_> {
         };
         state
             .node
-            .write_cell_entry(identity, cell, CellStore::Records, &key.to_bytes(), payload)
+            .write_pod_entry(identity, pod, PodStore::Records, &key.to_bytes(), payload)
             .await?;
         Ok(key.record())
     }
@@ -567,7 +559,7 @@ impl CellsService for RuntimeCellsService<'_> {
     async fn append_op(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         record: RecordRef,
         op: &[u8],
     ) -> Result<()> {
@@ -575,13 +567,13 @@ impl CellsService for RuntimeCellsService<'_> {
         // takes it: two appends taking one sequence would share a key, the
         // later replacing the earlier.
         let state = self.runtime.state.lock().await;
-        let (author, mseq) = writer(&state, identity, cell).await?;
+        let (author, mseq) = writer(&state, identity, pod).await?;
         if record.kind != RecordKind::MergeableDocument {
             return Err(RecordPlacedOnce { record }.into());
         }
         let view = state
             .node
-            .cell_record_view_of(identity, cell, &record)
+            .pod_record_view_of(identity, pod, &record)
             .await?;
         // Unread, `record` would be created under another member's name.
         if !view.records().any(|read| *read == record) {
@@ -602,77 +594,72 @@ impl CellsService for RuntimeCellsService<'_> {
         };
         state
             .node
-            .write_cell_entry(identity, cell, CellStore::Records, &key.to_bytes(), op)
+            .write_pod_entry(identity, pod, PodStore::Records, &key.to_bytes(), op)
             .await
     }
 
     async fn read(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         record: RecordRef,
     ) -> Result<Option<Vec<u8>>> {
-        let (node, _membership) = self.as_member(identity, cell).await?;
+        let (node, _membership) = self.as_member(identity, pod).await?;
         if record.kind == RecordKind::MergeableDocument {
             return Err(WrongRecordKind { record }.into());
         }
-        node.read_cell_record(identity, cell, &record).await
+        node.read_pod_record(identity, pod, &record).await
     }
 
     async fn read_ops(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         record: RecordRef,
     ) -> Result<Vec<Operation>> {
-        let (node, _membership) = self.as_member(identity, cell).await?;
+        let (node, _membership) = self.as_member(identity, pod).await?;
         if record.kind != RecordKind::MergeableDocument {
             return Err(WrongRecordKind { record }.into());
         }
-        let operations = node.read_cell_operations(identity, cell, &record).await?;
+        let operations = node.read_pod_operations(identity, pod, &record).await?;
         if operations.is_empty() {
             return Err(UnknownRecord { record }.into());
         }
         Ok(operations)
     }
 
-    async fn list_records(&self, identity: PdnId, cell: CellId) -> Result<Vec<RecordRef>> {
-        let (node, _membership) = self.as_member(identity, cell).await?;
+    async fn list_records(&self, identity: PdnId, pod: PodId) -> Result<Vec<RecordRef>> {
+        let (node, _membership) = self.as_member(identity, pod).await?;
         Ok(node
-            .cell_record_view(identity, cell)
+            .pod_record_view(identity, pod)
             .await?
             .records()
             .copied()
             .collect())
     }
 
-    async fn list_unknown(&self, identity: PdnId, cell: CellId) -> Result<Vec<UnknownEntry>> {
-        let (node, _membership) = self.as_member(identity, cell).await?;
-        node.list_cell_unknown(identity, cell).await
+    async fn list_unknown(&self, identity: PdnId, pod: PodId) -> Result<Vec<UnknownEntry>> {
+        let (node, _membership) = self.as_member(identity, pod).await?;
+        node.list_pod_unknown(identity, pod).await
     }
 }
 
-/// `identity` as `membership` folds it; [`UnknownCell`] for no member.
-fn require_member(membership: &Membership, identity: PdnId, cell: CellId) -> Result<&Member> {
+/// `identity` as `membership` folds it; [`UnknownPod`] for no member.
+fn require_member(membership: &Membership, identity: PdnId, pod: PodId) -> Result<&Member> {
     membership
         .member(&identity)
         .filter(|member| member.state.member)
-        .ok_or_else(|| UnknownCell { cell }.into())
+        .ok_or_else(|| UnknownPod { pod }.into())
 }
 
-/// The key of the event `act` writes as `identity` in `cell`, at the first
+/// The key of the event `act` writes as `identity` in `pod`, at the first
 /// sequence of its subject's chain the replica holds no entry at, naming
 /// the actor's last; [`ActRefused`] by the checks of
 /// [`act_event`].
-async fn act_key(
-    state: &State,
-    identity: PdnId,
-    cell: CellId,
-    act: CellAct,
-) -> Result<MembershipKey> {
+async fn act_key(state: &State, identity: PdnId, pod: PodId, act: PodAct) -> Result<MembershipKey> {
     state.hosted(identity)?;
-    let membership = state.node.cell_membership(identity, cell).await?;
-    let actor = require_member(&membership, identity, cell)?;
+    let membership = state.node.pod_membership(identity, pod).await?;
+    let actor = require_member(&membership, identity, pod)?;
     let (subject, kind) = act_event(&membership, identity, actor, act)
         .map_err(|reason| ActRefused { act, reason })?;
     let seq = membership
@@ -696,10 +683,10 @@ fn act_event(
     membership: &Membership,
     identity: PdnId,
     actor: &Member,
-    act: CellAct,
+    act: PodAct,
 ) -> Result<(PdnId, EventKind), ActRefusal> {
     let (subject, kind) = match act {
-        CellAct::Leave => {
+        PodAct::Leave => {
             let current = || {
                 membership
                     .identities()
@@ -711,9 +698,9 @@ fn act_event(
             }
             return Ok((identity, EventKind::Left));
         }
-        CellAct::Promote(subject) => (subject, EventKind::Promoted),
-        CellAct::Demote(subject) => (subject, EventKind::Demoted),
-        CellAct::Kick(subject) => (subject, EventKind::Kicked),
+        PodAct::Promote(subject) => (subject, EventKind::Promoted),
+        PodAct::Demote(subject) => (subject, EventKind::Demoted),
+        PodAct::Kick(subject) => (subject, EventKind::Kicked),
     };
     if !actor.state.owner {
         return Err(ActRefusal::NotAnOwner);
@@ -731,27 +718,27 @@ fn act_event(
     Ok((subject, kind))
 }
 
-/// `identity`'s departure from `cell` at `seq` of its chain: the
+/// `identity`'s departure from `pod` at `seq` of its chain: the
 /// directory's tombstone at that sequence, then the record store forgotten,
-/// the membership store kept as the cell's tombstone.
-async fn depart(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Result<()> {
+/// the membership store kept as the pod's tombstone.
+async fn depart(state: &State, identity: PdnId, pod: PodId, seq: Seq) -> Result<()> {
     state
         .hosted(identity)?
         .directory
-        .tombstone_cell(cell, seq)
+        .tombstone_pod(pod, seq)
         .await?;
-    state.node.forget_cell(identity, cell).await
+    state.node.forget_pod(identity, pod).await
 }
 
 /// Acts on every notice the data layer reports of a hosted identity's
-/// cells: a departure is settled — how a kicked member's device, or a
+/// pods: a departure is settled — how a kicked member's device, or a
 /// departed member's other device, learns of it — and a device its
 /// member's statements do not list registers itself. A failure is logged
 /// and reported again at the next change to the membership store or the
-/// next run of the cell stores' pass.
-pub(crate) fn spawn_cell_notice_consumer(
+/// next run of the pod stores' pass.
+pub(crate) fn spawn_pod_notice_consumer(
     state: Weak<Mutex<State>>,
-    mut notices: mpsc::UnboundedReceiver<CellNotice>,
+    mut notices: mpsc::UnboundedReceiver<PodNotice>,
 ) {
     let _detached = tokio::spawn(async move {
         while let Some(notice) = notices.recv().await {
@@ -760,18 +747,14 @@ pub(crate) fn spawn_cell_notice_consumer(
             };
             let guard = state.lock().await;
             match notice {
-                CellNotice::Departed {
-                    identity,
-                    cell,
-                    seq,
-                } => {
-                    if let Err(err) = settle_departure(&guard, identity, cell, seq).await {
-                        tracing::warn!(%identity, %cell, "settling the departure failed: {err:#}");
+                PodNotice::Departed { identity, pod, seq } => {
+                    if let Err(err) = settle_departure(&guard, identity, pod, seq).await {
+                        tracing::warn!(%identity, %pod, "settling the departure failed: {err:#}");
                     }
                 }
-                CellNotice::Unlisted { identity, cell } => {
-                    if let Err(err) = register_device(&guard, identity, cell).await {
-                        tracing::warn!(%identity, %cell, "registering this device failed: {err:#}");
+                PodNotice::Unlisted { identity, pod } => {
+                    if let Err(err) = register_device(&guard, identity, pod).await {
+                        tracing::warn!(%identity, %pod, "registering this device failed: {err:#}");
                     }
                 }
             }
@@ -779,38 +762,38 @@ pub(crate) fn spawn_cell_notice_consumer(
     });
 }
 
-async fn settle_departure(state: &State, identity: PdnId, cell: CellId, seq: Seq) -> Result<()> {
+async fn settle_departure(state: &State, identity: PdnId, pod: PodId, seq: Seq) -> Result<()> {
     // A join imports onto the tombstone before its joined event arrives.
-    if state.joining_in_flight.contains(&(identity, cell)) {
+    if state.joining_in_flight.contains(&(identity, pod)) {
         return Ok(());
     }
     let directory = &state.hosted(identity)?.directory;
     // A later join recorded: the departure ends an earlier membership.
     if directory
-        .cell_record(cell)
+        .pod_record(pod)
         .await?
         .is_some_and(|(recorded, held)| held && recorded > seq)
     {
         return Ok(());
     }
-    depart(state, identity, cell, seq).await
+    depart(state, identity, pod, seq).await
 }
 
-/// Write `identity`'s next device statement in `cell` — its counted list
+/// Write `identity`'s next device statement in `pod` — its counted list
 /// with this device added — when that list does not name this device with
 /// the author `identity` writes with here. Nothing while the announcement
-/// key has not reached this device, or while a join of the cell is in
+/// key has not reached this device, or while a join of the pod is in
 /// flight here, its dialogue carrying a statement of its own.
-async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
-    if state.joining_in_flight.contains(&(identity, cell)) {
+async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
+    if state.joining_in_flight.contains(&(identity, pod)) {
         return Ok(());
     }
     let hosted = state.hosted(identity)?;
     let Some(keys) = hosted.directory.announcement_key().await? else {
         return Ok(());
     };
-    let membership = state.node.cell_membership(identity, cell).await?;
-    let member = require_member(&membership, identity, cell)?;
+    let membership = state.node.pod_membership(identity, pod).await?;
+    let member = require_member(&membership, identity, pod)?;
     let device = MemberDevice {
         node: state.node.node_id(),
         author: hosted.author,
@@ -829,126 +812,124 @@ async fn register_device(state: &State, identity: PdnId, cell: CellId) -> Result
         version,
     };
     #[cfg(feature = "test-util")]
-    if state.failing_device_statements.contains(&cell) {
+    if state.failing_device_statements.contains(&pod) {
         anyhow::bail!("the device statement write failed for test");
     }
     state
         .node
-        .write_cell_entry(
+        .write_pod_entry(
             identity,
-            cell,
-            CellStore::Membership,
+            pod,
+            PodStore::Membership,
             &key.to_bytes(),
             &keys.device_statement(version, devices).encode(),
         )
         .await
 }
 
-/// Open every cell `identity`'s directory holds that this device does not,
-/// from the tickets beside its record; open the tombstone of every cell it
+/// Open every pod `identity`'s directory holds that this device does not,
+/// from the tickets beside its record; open the tombstone of every pod it
 /// departed that this device holds nothing of, and forget the record store
 /// of every one this device still holds. The sweep after a restart
-/// re-derives the hosted cells so. A cell whose join is in flight here is
+/// re-derives the hosted pods so. A pod whose join is in flight here is
 /// the join's; one whose tickets have not arrived waits for the next sweep.
-pub(crate) async fn arm_cells(state: &State, identity: PdnId) {
+pub(crate) async fn arm_pods(state: &State, identity: PdnId) {
     let Ok(hosted) = state.hosted(identity) else {
         return;
     };
     let (Ok(held), Ok(departed), Ok(holdings)) = (
-        hosted.directory.held_cells().await,
-        hosted.directory.departed_cells().await,
-        state.node.cell_holdings(identity),
+        hosted.directory.held_pods().await,
+        hosted.directory.departed_pods().await,
+        state.node.pod_holdings(identity),
     ) else {
         return;
     };
     // `Some(false)` for a tombstone.
-    let records_held = |cell: &CellId| {
+    let records_held = |pod: &PodId| {
         holdings
             .iter()
-            .find(|(holding, _records)| holding == cell)
+            .find(|(holding, _records)| holding == pod)
             .map(|(_holding, records)| *records)
     };
-    let joining = |cell: &CellId| state.joining_in_flight.contains(&(identity, *cell));
-    for cell in held {
-        if records_held(&cell) == Some(true) || joining(&cell) {
+    let joining = |pod: &PodId| state.joining_in_flight.contains(&(identity, *pod));
+    for pod in held {
+        if records_held(&pod) == Some(true) || joining(&pod) {
             continue;
         }
-        if let Err(err) = open_cell(state, identity, cell).await {
-            tracing::warn!(%identity, %cell, "opening the cell from the directory failed: {err:#}");
+        if let Err(err) = open_pod(state, identity, pod).await {
+            tracing::warn!(%identity, %pod, "opening the pod from the directory failed: {err:#}");
         }
     }
-    for cell in departed {
-        if joining(&cell) {
+    for pod in departed {
+        if joining(&pod) {
             continue;
         }
-        let armed = match records_held(&cell) {
-            Some(true) => state.node.forget_cell(identity, cell).await,
+        let armed = match records_held(&pod) {
+            Some(true) => state.node.forget_pod(identity, pod).await,
             Some(false) => Ok(()),
-            None => open_tombstone(state, identity, cell).await,
+            None => open_tombstone(state, identity, pod).await,
         };
         if let Err(err) = armed {
-            tracing::warn!(%identity, %cell, "keeping the departed cell's tombstone failed: {err:#}");
+            tracing::warn!(%identity, %pod, "keeping the departed pod's tombstone failed: {err:#}");
         }
     }
 }
 
-async fn open_tombstone(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
+async fn open_tombstone(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
     let directory = &state.hosted(identity)?.directory;
     let Some(membership) = directory
-        .get_ticket(&cell_ticket_kind(&cell, CellStore::Membership))
+        .get_ticket(&pod_ticket_kind(&pod, PodStore::Membership))
         .await?
     else {
         return Ok(());
     };
     let inviter = directory
-        .get_ticket(&cell_inviter_ticket_kind(&cell, CellStore::Membership))
+        .get_ticket(&pod_inviter_ticket_kind(&pod, PodStore::Membership))
         .await?;
     state
         .node
-        .open_cell_tombstone(identity, cell, membership, inviter.as_slice())
+        .open_pod_tombstone(identity, pod, membership, inviter.as_slice())
         .await
 }
 
-async fn open_cell(state: &State, identity: PdnId, cell: CellId) -> Result<()> {
+async fn open_pod(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
     let directory = &state.hosted(identity)?.directory;
-    let Some(own) = cell_tickets(directory, cell, cell_ticket_kind).await? else {
+    let Some(own) = pod_tickets(directory, pod, pod_ticket_kind).await? else {
         return Ok(());
     };
-    let inviter = cell_tickets(directory, cell, cell_inviter_ticket_kind).await?;
+    let inviter = pod_tickets(directory, pod, pod_inviter_ticket_kind).await?;
     let _caught_up = state
         .node
-        .import_cell_with(identity, cell, own, inviter.as_slice())
+        .import_pod_with(identity, pod, own, inviter.as_slice())
         .await?;
     Ok(())
 }
 
-/// Both stores' tickets of `cell` the directory holds under the kinds
+/// Both stores' tickets of `pod` the directory holds under the kinds
 /// `kind` names; `None` until both have arrived.
-async fn cell_tickets(
+async fn pod_tickets(
     directory: &data_layer::PrivateMetadataStore,
-    cell: CellId,
-    kind: fn(&CellId, CellStore) -> String,
-) -> Result<Option<CellTickets>> {
+    pod: PodId,
+    kind: fn(&PodId, PodStore) -> String,
+) -> Result<Option<PodTickets>> {
     let membership = directory
-        .get_ticket(&kind(&cell, CellStore::Membership))
+        .get_ticket(&kind(&pod, PodStore::Membership))
         .await?;
-    let records = directory
-        .get_ticket(&kind(&cell, CellStore::Records))
-        .await?;
+    let records = directory.get_ticket(&kind(&pod, PodStore::Records)).await?;
     Ok(membership
         .zip(records)
-        .map(|(membership, records)| CellTickets {
+        .map(|(membership, records)| PodTickets {
             membership,
             records,
         }))
 }
 
 /// The author `identity` writes with here and the point of its chain its
-/// records name, once it is a member of `cell`.
-async fn writer(state: &State, identity: PdnId, cell: CellId) -> Result<(AuthorId, Seq)> {
+/// records name, once it is a member of `pod`.
+async fn writer(state: &State, identity: PdnId, pod: PodId) -> Result<(AuthorId, Seq)> {
     let author = state.hosted(identity)?.author;
-    let membership = state.node.cell_membership(identity, cell).await?;
-    let seq = require_member(&membership, identity, cell)?.run();
+    let membership = state.node.pod_membership(identity, pod).await?;
+    let seq = require_member(&membership, identity, pod)?.run();
     Ok((author, Seq::new(seq)))
 }
 
@@ -958,8 +939,8 @@ async fn writer(state: &State, identity: PdnId, cell: CellId) -> Result<(AuthorI
 async fn join_via_dialogue(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
-    invite: &CellInvite,
-) -> Result<CellId> {
+    invite: &PodInvite,
+) -> Result<PodId> {
     let (node, keys, author) = {
         let state = state.lock().await;
         let hosted = state.hosted(identity)?;
@@ -977,17 +958,17 @@ async fn join_via_dialogue(
         None
     } else {
         Some(
-            dial.connect(invite.inviter_addr.clone(), CELL_JOIN_ALPN)
+            dial.connect(invite.inviter_addr.clone(), POD_JOIN_ALPN)
                 .await
                 .context(InviterUnreachable)?,
         )
     };
     let request = JoinRequest {
-        version: CELL_INVITE_FORMAT_VERSION,
+        version: POD_INVITE_FORMAT_VERSION,
         secret: invite.secret,
         joiner: identity,
         announcement_key: keys.public_key(),
-        run: node.cell_chain_run(identity, invite.cell, identity).await?,
+        run: node.pod_chain_run(identity, invite.pod, identity).await?,
     };
     let device = MemberDevice {
         node: node.node_id(),
@@ -995,7 +976,7 @@ async fn join_via_dialogue(
     };
     let accept = |offer: &JoinOffer| {
         let join_statement = offer.write_joined.then(|| {
-            keys.join_statement(&invite.cell, Seq::new(offer.seq))
+            keys.join_statement(&invite.pod, Seq::new(offer.seq))
                 .encode()
         });
         let mut devices: Vec<MemberDevice> = offer
@@ -1035,20 +1016,20 @@ async fn join_via_dialogue(
         connection.close(0u32.into(), b"done");
     }
 
-    let cell = invite.cell;
-    let inviter = CellTickets {
+    let pod = invite.pod;
+    let inviter = PodTickets {
         membership: tickets.membership,
         records: tickets.records,
     };
-    let caught_up = node.import_cell(identity, cell, inviter.clone()).await?;
+    let caught_up = node.import_pod(identity, pod, inviter.clone()).await?;
     {
         let state = state.lock().await;
         let directory = &state.hosted(identity)?.directory;
-        record_cell(
+        record_pod(
             &node,
             directory,
             identity,
-            cell,
+            pod,
             Seq::new(offer.seq),
             Some(&inviter),
         )
@@ -1065,13 +1046,13 @@ async fn join_via_dialogue(
     let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
     caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
     // A member from here on: the caller's next act checks the fold.
-    node.await_cell_member(
+    node.await_pod_member(
         identity,
-        cell,
+        pod,
         deadline.saturating_duration_since(Instant::now()),
     )
     .await?;
-    Ok(cell)
+    Ok(pod)
 }
 
 /// The sequence the inviter offers the joiner and whether it writes a
@@ -1160,20 +1141,20 @@ where
     W: AsyncWrite + Unpin,
 {
     let request: JoinRequest = read_message(recv).await.ok()?;
-    if request.version != CELL_INVITE_FORMAT_VERSION
+    if request.version != POD_INVITE_FORMAT_VERSION
         || pdn_id_of(&request.announcement_key) != request.joiner
     {
         return None;
     }
-    let (node, identity, cell) = {
+    let (node, identity, pod) = {
         let mut state = state.lock().await;
         // Before any state change.
-        let (identity, cell) = state
-            .pending_cell_invites
+        let (identity, pod) = state
+            .pending_pod_invites
             .verify_and_burn(&request.secret, Instant::now())?;
-        (Arc::clone(&state.node), identity, cell)
+        (Arc::clone(&state.node), identity, pod)
     };
-    let membership = node.cell_membership(identity, cell).await.ok()?;
+    let membership = node.pod_membership(identity, pod).await.ok()?;
     let inviter = membership.member(&identity)?;
     if !inviter.state.member {
         return None;
@@ -1208,7 +1189,7 @@ where
     if write_joined {
         let joined = JoinedPayload::decode(acceptance.join_statement.as_deref()?)?;
         if joined.announcement_key != request.announcement_key
-            || !join_verifies(&request.joiner, &cell, Seq::new(seq), &joined)
+            || !join_verifies(&request.joiner, &pod, Seq::new(seq), &joined)
         {
             return None;
         }
@@ -1219,10 +1200,10 @@ where
             actor: identity,
             actor_seq: Seq::new(actor_seq),
         };
-        node.write_cell_entry(
+        node.write_pod_entry(
             identity,
-            cell,
-            CellStore::Membership,
+            pod,
+            PodStore::Membership,
             &key.to_bytes(),
             &joined.encode(),
         )
@@ -1238,10 +1219,10 @@ where
             member: request.joiner,
             version: statement_version,
         };
-        node.write_cell_entry(
+        node.write_pod_entry(
             identity,
-            cell,
-            CellStore::Membership,
+            pod,
+            PodStore::Membership,
             &key.to_bytes(),
             &statement.encode(),
         )
@@ -1255,7 +1236,7 @@ where
     // Written before the reply: a lost reply leaves the newcomer listed,
     // and a second invite hands the tickets over again.
     let tickets = node
-        .share_cell_tickets(identity, cell, AddrInfoOptions::RelayAndAddresses)
+        .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
         .await
         .ok()?;
     write_message(
@@ -1270,44 +1251,41 @@ where
     Some(())
 }
 
-/// The identity holds `cell` from `seq` of its chain on: both stores' write
-/// tickets and the cell's entry in its directory, which reach
+/// The identity holds `pod` from `seq` of its chain on: both stores' write
+/// tickets and the pod's entry in its directory, which reach
 /// its other devices. Beside its own tickets go the ones the inviter handed
 /// over at a join, so a sibling, or this device after a restart, has a
 /// member's device to dial, named as that member, before its replica folds
 /// anyone.
-async fn record_cell(
+async fn record_pod(
     node: &data_layer::SyncNode,
     directory: &data_layer::PrivateMetadataStore,
     identity: PdnId,
-    cell: CellId,
+    pod: PodId,
     seq: Seq,
-    inviter: Option<&CellTickets>,
+    inviter: Option<&PodTickets>,
 ) -> Result<()> {
     let own = node
-        .share_cell_tickets(identity, cell, AddrInfoOptions::RelayAndAddresses)
+        .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
         .await?;
     let mut kinds = vec![
-        (
-            cell_ticket_kind(&cell, CellStore::Membership),
-            &own.membership,
-        ),
-        (cell_ticket_kind(&cell, CellStore::Records), &own.records),
+        (pod_ticket_kind(&pod, PodStore::Membership), &own.membership),
+        (pod_ticket_kind(&pod, PodStore::Records), &own.records),
     ];
     if let Some(inviter) = inviter {
         kinds.push((
-            cell_inviter_ticket_kind(&cell, CellStore::Membership),
+            pod_inviter_ticket_kind(&pod, PodStore::Membership),
             &inviter.membership,
         ));
         kinds.push((
-            cell_inviter_ticket_kind(&cell, CellStore::Records),
+            pod_inviter_ticket_kind(&pod, PodStore::Records),
             &inviter.records,
         ));
     }
     for (kind, ticket) in kinds {
         directory.put_ticket(&kind, ticket).await?;
     }
-    directory.record_cell(cell, seq).await
+    directory.record_pod(pod, seq).await
 }
 
 /// Filled once, right after the node spawns, and held weakly, as pairing's
@@ -1358,10 +1336,10 @@ impl ProtocolHandler for JoinHandler {
     }
 }
 
-/// Reserves an `(identity, cell)` pair against a concurrent `join`.
+/// Reserves an `(identity, pod)` pair against a concurrent `join`.
 struct JoinReservation {
     state: Arc<Mutex<State>>,
-    key: (PdnId, CellId),
+    key: (PdnId, PodId),
     armed: bool,
     cleanup_tasks: CleanupSupervisor,
 }
@@ -1386,34 +1364,34 @@ impl Drop for JoinReservation {
     }
 }
 
-/// Discards a cell `create` brought up if it fails, or is dropped, before
-/// the cell is recorded.
-struct CellRollback {
+/// Discards a pod `create` brought up if it fails, or is dropped, before
+/// the pod is recorded.
+struct PodRollback {
     node: Arc<data_layer::SyncNode>,
     identity: PdnId,
-    cell: CellId,
+    pod: PodId,
     armed: bool,
     cleanup_tasks: CleanupSupervisor,
 }
 
-impl CellRollback {
+impl PodRollback {
     fn new(
         node: Arc<data_layer::SyncNode>,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         cleanup_tasks: CleanupSupervisor,
     ) -> Self {
         Self {
             node,
             identity,
-            cell,
+            pod,
             armed: true,
             cleanup_tasks,
         }
     }
 
     async fn roll_back(&mut self) {
-        let _ = self.node.discard_cell(self.identity, self.cell).await;
+        let _ = self.node.discard_pod(self.identity, self.pod).await;
         self.disarm();
     }
 
@@ -1422,15 +1400,15 @@ impl CellRollback {
     }
 }
 
-impl Drop for CellRollback {
+impl Drop for PodRollback {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         let node = Arc::clone(&self.node);
-        let (identity, cell) = (self.identity, self.cell);
+        let (identity, pod) = (self.identity, self.pod);
         self.cleanup_tasks.spawn(async move {
-            let _ = node.discard_cell(identity, cell).await;
+            let _ = node.discard_pod(identity, pod).await;
         });
     }
 }
@@ -1441,7 +1419,7 @@ mod tests {
 
     /// The inviter offers a sequence past a departure only the joiner's own
     /// replica holds yet. Paired: a joiner whose reply was lost, holding
-    /// nothing of the cell, keeps the point it joined at, with no second
+    /// nothing of the pod, keeps the point it joined at, with no second
     /// joined event.
     #[test]
     fn a_departure_the_inviter_has_not_seen_moves_the_offer_past_it() {

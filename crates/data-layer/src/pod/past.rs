@@ -1,6 +1,6 @@
 //! A departure's past: the entries of a membership store a former member's
 //! departure depends on, which is all a member device serves it and takes
-//! from it — by the cell stores spec's requirement on a departed member's
+//! from it — by the pod stores spec's requirement on a departed member's
 //! tombstone.
 
 use std::collections::{BTreeMap, HashMap, HashSet};

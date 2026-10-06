@@ -18,18 +18,18 @@ use pdn_store::{
     api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, SessionAccess,
     SessionIngest, SessionRole, ValidateOutcome,
 };
-use pdn_types::{CellId, ClaimId, NodeId, PdnId};
+use pdn_types::{ClaimId, NodeId, PdnId, PodId};
 
 use crate::{
-    cell::{
-        departure_past, held_entries, CellStore, HeldEntry, Membership, MembershipKey, PastEntry,
-    },
     connection_metadata::GrantRecord,
     grant::{claim_id_of_key, GrantedClaim, ReadGrant},
+    pod::{
+        departure_past, held_entries, HeldEntry, Membership, MembershipKey, PastEntry, PodStore,
+    },
     registry::{Registry, ServingPosture},
 };
 
-/// How long a cell store's session waits for the payloads its caller's own
+/// How long a pod store's session waits for the payloads its caller's own
 /// entries lack before it is refused; the payloads are small and follow
 /// their entries at once.
 const CALLER_PAYLOADS_WAIT: Duration = Duration::from_secs(5);
@@ -85,7 +85,7 @@ enum WriteAdmission {
     Claims(HashSet<ClaimId>),
     /// Nothing: no session vouched for the writer.
     Nothing,
-    /// Exactly these entries of a cell's membership store, by key and
+    /// Exactly these entries of a pod's membership store, by key and
     /// author — a departure's past — and, where `rejoin` names the departed
     /// member and its departure's sequence, every event of that member's
     /// chain after it, so a device holding its tombstone takes its new join.
@@ -128,21 +128,21 @@ pub(crate) struct AccessBook {
     /// it per entry and must see what a marker recorded meanwhile.
     retractions: Arc<RwLock<HashMap<NamespaceId, ArmedRetractions>>>,
     #[cfg(feature = "test-util")]
-    cell_verdicts: OnceLock<CellVerdictSink>,
-    /// Refuses every cell session this identity is asked to serve, as a
+    pod_verdicts: OnceLock<PodVerdictSink>,
+    /// Refuses every pod session this identity is asked to serve, as a
     /// device out of reach answers none.
     #[cfg(feature = "test-util")]
-    refuse_cells: std::sync::atomic::AtomicBool,
-    /// Serves every cell session this identity is asked to serve whole, as
+    refuse_pods: std::sync::atomic::AtomicBool,
+    /// Serves every pod session this identity is asked to serve whole, as
     /// a modified node judging no caller answers.
     #[cfg(feature = "test-util")]
-    serve_cells_whole: std::sync::atomic::AtomicBool,
+    serve_pods_whole: std::sync::atomic::AtomicBool,
 }
 
 /// Where each fold's verdicts go once a scenario takes the channel.
 #[cfg(feature = "test-util")]
-pub(crate) type CellVerdictSink =
-    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::cell::CellVerdicts>>>>;
+pub(crate) type PodVerdictSink =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::pod::PodVerdicts>>>>;
 
 impl AccessBook {
     pub(crate) fn new(identity: PdnId) -> Self {
@@ -154,23 +154,23 @@ impl AccessBook {
             grant_cache: RwLock::new(HashMap::new()),
             retractions: Arc::default(),
             #[cfg(feature = "test-util")]
-            cell_verdicts: OnceLock::new(),
+            pod_verdicts: OnceLock::new(),
             #[cfg(feature = "test-util")]
-            refuse_cells: std::sync::atomic::AtomicBool::new(false),
+            refuse_pods: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
-            serve_cells_whole: std::sync::atomic::AtomicBool::new(false),
+            serve_pods_whole: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     #[cfg(feature = "test-util")]
-    pub(crate) fn refuse_cell_sessions(&self, refuse: bool) {
-        self.refuse_cells
+    pub(crate) fn refuse_pod_sessions(&self, refuse: bool) {
+        self.refuse_pods
             .store(refuse, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(feature = "test-util")]
-    pub(crate) fn serve_cell_sessions_whole(&self, serve: bool) {
-        self.serve_cells_whole
+    pub(crate) fn serve_pod_sessions_whole(&self, serve: bool) {
+        self.serve_pods_whole
             .store(serve, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -247,9 +247,9 @@ impl AccessBook {
         peer: NodeId,
         role: SessionRole,
     ) -> Result<SessionAccess> {
-        if let Some((cell, store)) = registry.cell_of(namespace)? {
+        if let Some((pod, store)) = registry.pod_of(namespace)? {
             return self
-                .classify_cell(&registry, cell, store, remote, peer, role)
+                .classify_pod(&registry, pod, store, remote, peer, role)
                 .await;
         }
         // The directory and the connection metadata stores are ticket-gated
@@ -408,16 +408,16 @@ impl AccessBook {
         })
     }
 
-    /// A cell's membership store, served whole to a device of the member
+    /// A pod's membership store, served whole to a device of the member
     /// the caller names — a sibling by this identity's own directory,
     /// another member by the device statements this identity's replica
-    /// folds — and to nobody else, by the cell stores spec. The record
+    /// folds — and to nobody else, by the pod stores spec. The record
     /// store serves no session.
-    async fn classify_cell(
+    async fn classify_pod(
         &self,
         registry: &Arc<Registry>,
-        cell: CellId,
-        store: CellStore,
+        pod: PodId,
+        store: PodStore,
         remote: Identity,
         peer: NodeId,
         role: SessionRole,
@@ -434,14 +434,14 @@ impl AccessBook {
         };
         #[cfg(feature = "test-util")]
         if matches!(role, SessionRole::Accept)
-            && self.refuse_cells.load(std::sync::atomic::Ordering::SeqCst)
+            && self.refuse_pods.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(SessionAccess::Deny);
         }
         #[cfg(feature = "test-util")]
         if matches!(role, SessionRole::Accept)
             && self
-                .serve_cells_whole
+                .serve_pods_whole
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(self.whole(registry));
@@ -456,12 +456,12 @@ impl AccessBook {
                 refused
             });
         }
-        let Some(held) = registry.cell(cell)? else {
+        let Some(held) = registry.pod(pod)? else {
             return Ok(refused);
         };
         let caller = PdnId::from_bytes(*remote.as_bytes());
         if let Some(access) = self
-            .serve_cell(registry, cell, store, &held.membership, caller, peer)
+            .serve_pod(registry, pod, store, &held.membership, caller, peer)
             .await?
         {
             return Ok(access);
@@ -472,7 +472,7 @@ impl AccessBook {
         // the newcomer is judged again once they are here.
         if self.await_payloads_of(&held.membership, &caller).await? {
             if let Some(access) = self
-                .serve_cell(registry, cell, store, &held.membership, caller, peer)
+                .serve_pod(registry, pod, store, &held.membership, caller, peer)
                 .await?
             {
                 return Ok(access);
@@ -486,16 +486,16 @@ impl AccessBook {
     /// membership store over its departure's past alone, both ways; a
     /// replica whose own identity departed serves any member over its own
     /// departure's past alone.
-    async fn serve_cell(
+    async fn serve_pod(
         &self,
         registry: &Arc<Registry>,
-        cell: CellId,
-        store: CellStore,
+        pod: PodId,
+        store: PodStore,
         membership: &Doc,
         caller: PdnId,
         peer: NodeId,
     ) -> Result<Option<SessionAccess>> {
-        let (folded, entries) = self.fold_cell_entries(cell, membership).await?;
+        let (folded, entries) = self.fold_pod_entries(pod, membership).await?;
         let Some(member) = folded.member(&caller) else {
             return Ok(None);
         };
@@ -516,7 +516,7 @@ impl AccessBook {
                 Some(theirs) => (theirs, None),
             }
         };
-        if store == CellStore::Records {
+        if store == PodStore::Records {
             return Ok(None);
         }
         let past = Arc::new(departure.past);
@@ -577,41 +577,41 @@ impl AccessBook {
         Ok(true)
     }
 
-    /// The membership this identity's replica of `cell`'s membership store
+    /// The membership this identity's replica of `pod`'s membership store
     /// folds into, payloads read as far as they have arrived.
-    pub(crate) async fn fold_cell(&self, cell: CellId, membership: &Doc) -> Result<Membership> {
-        Ok(self.fold_cell_entries(cell, membership).await?.0)
+    pub(crate) async fn fold_pod(&self, pod: PodId, membership: &Doc) -> Result<Membership> {
+        Ok(self.fold_pod_entries(pod, membership).await?.0)
     }
 
-    /// [`fold_cell`](Self::fold_cell) beside the entries it folded.
-    pub(crate) async fn fold_cell_entries(
+    /// [`fold_pod`](Self::fold_pod) beside the entries it folded.
+    pub(crate) async fn fold_pod_entries(
         &self,
-        cell: CellId,
+        pod: PodId,
         membership: &Doc,
     ) -> Result<(Membership, Vec<HeldEntry>)> {
         let entries = match self.blobs.get() {
             Some(blobs) => held_entries(membership, blobs).await?,
             None => Vec::new(),
         };
-        let folded = Membership::fold(&cell, &entries);
+        let folded = Membership::fold(&pod, &entries);
         #[cfg(feature = "test-util")]
-        self.report_cell_verdicts(cell, &entries, &folded);
+        self.report_pod_verdicts(pod, &entries, &folded);
         Ok((folded, entries))
     }
 
     #[cfg(feature = "test-util")]
-    pub(crate) fn set_cell_verdicts(&self, sink: CellVerdictSink) {
-        let _ = self.cell_verdicts.set(sink);
+    pub(crate) fn set_pod_verdicts(&self, sink: PodVerdictSink) {
+        let _ = self.pod_verdicts.set(sink);
     }
 
     #[cfg(feature = "test-util")]
-    fn report_cell_verdicts(
+    fn report_pod_verdicts(
         &self,
-        cell: CellId,
-        entries: &[crate::cell::HeldEntry],
+        pod: PodId,
+        entries: &[crate::pod::HeldEntry],
         folded: &Membership,
     ) {
-        let Some(sink) = self.cell_verdicts.get() else {
+        let Some(sink) = self.pod_verdicts.get() else {
             return;
         };
         let Ok(sender) = sink.lock() else {
@@ -623,9 +623,9 @@ impl AccessBook {
                 .zip(folded.verdicts())
                 .map(|(entry, verdict)| (entry.key.clone(), entry.author, *verdict))
                 .collect();
-            let _ = sender.send(crate::cell::CellVerdicts {
+            let _ = sender.send(crate::pod::PodVerdicts {
                 identity: self.identity,
-                cell,
+                pod,
                 verdicts,
             });
         }
@@ -790,7 +790,7 @@ impl AccessBook {
                 }
                 // No session vouched for the writer: not a verdict on its
                 // authority, so the sender re-offers and self-heals. A past
-                // bounds only a cell's store, which returned above.
+                // bounds only a pod's store, which returned above.
                 WriteAdmission::Nothing | WriteAdmission::Past { .. } => ValidateOutcome::Drop,
             }
         })

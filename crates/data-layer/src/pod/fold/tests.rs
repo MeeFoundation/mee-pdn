@@ -1,5 +1,5 @@
 use super::*;
-use crate::cell::{
+use crate::pod::{
     keys::Seq,
     testing::{device, event, Cast, Person, Store},
 };
@@ -32,13 +32,13 @@ fn nothing(why: ForNothing) -> Verdict {
     Verdict::CountedForNothing(why)
 }
 
-/// The creator's founding event derives the cell's id and makes the creator
+/// The creator's founding event derives the pod's id and makes the creator
 /// its one member and owner.
 #[test]
-fn a_founded_cell_lists_its_creator_as_owner() {
+fn a_founded_pod_lists_its_creator_as_owner() {
     let cast = Cast::new();
     let store = Store::founded_by(&cast.alice);
-    assert_eq!(store.cell.to_string(), "9cbcbe4da7cc35a44360d64e45621957");
+    assert_eq!(store.pod.to_string(), "ad58a3faa04cdc5576c8dc5823a347c6");
     let membership = store.fold();
     assert_eq!(state(&membership, &cast.alice), OWNER);
     assert!(membership.verdicts().iter().all(|v| *v == Verdict::Counted));
@@ -206,7 +206,7 @@ fn entries_in_any_order_fold_the_same() {
     ];
     for order in orders {
         let entries: Vec<HeldEntry> = order.iter().map(|&i| store.entries[i].clone()).collect();
-        let shuffled = Membership::fold(&store.cell, &entries);
+        let shuffled = Membership::fold(&store.pod, &entries);
         for person in [&cast.alice, &cast.bob, &cast.carol, &cast.dave] {
             assert_eq!(state(&shuffled, person), state(&forward, person));
         }
@@ -295,11 +295,11 @@ fn two_statements_at_one_version_both_count() {
     assert_eq!(bob.devices, BTreeSet::from([cast.bob.device, b2, b3]));
 }
 
-/// A founding event counts only where it derives the cell id: another
+/// A founding event counts only where it derives the pod id: another
 /// member's, one in the creator's chain under another key, and a copy away
 /// from the creator's first sequence count for nothing.
 #[test]
-fn founding_events_that_do_not_derive_the_cell_count_for_nothing() {
+fn founding_events_that_do_not_derive_the_pod_count_for_nothing() {
     let cast = Cast::new();
     let mut store = Store::founded_by(&cast.alice);
     store.invite(&cast.alice, 1, &cast.bob);
@@ -319,10 +319,10 @@ fn founding_events_that_do_not_derive_the_cell_count_for_nothing() {
         cast.alice.keys.founding([0x5a; 16]).encode(),
     );
     let membership = store.fold();
-    assert_eq!(verdict(&membership, bobs), nothing(ForNothing::OtherCell));
+    assert_eq!(verdict(&membership, bobs), nothing(ForNothing::OtherPod));
     assert_eq!(
         verdict(&membership, other_key),
-        nothing(ForNothing::OtherCell)
+        nothing(ForNothing::OtherPod)
     );
     assert_eq!(verdict(&membership, moved), nothing(ForNothing::Misplaced));
     assert_eq!(state(&membership, &cast.alice), OWNER);
@@ -335,7 +335,7 @@ fn founding_events_that_do_not_derive_the_cell_count_for_nothing() {
 fn an_invented_founder_roots_nothing() {
     let cast = Cast::new();
     let mut invented = Store {
-        cell: Store::founded_by(&cast.alice).cell,
+        pod: Store::founded_by(&cast.alice).pod,
         entries: Vec::new(),
     };
     let founding = invented.write(
@@ -348,7 +348,7 @@ fn an_invented_founder_roots_nothing() {
     let membership = invented.fold();
     assert_eq!(
         verdict(&membership, founding),
-        nothing(ForNothing::OtherCell)
+        nothing(ForNothing::OtherPod)
     );
     assert_eq!(
         verdict(&membership, joined),
@@ -376,14 +376,14 @@ fn a_join_counts_only_under_its_members_own_statement() {
     let minted = |seq| {
         mallory
             .keys
-            .join_statement(&store.cell, Seq::new(seq))
+            .join_statement(&store.pod, Seq::new(seq))
             .encode()
     };
     let (at_three, at_one) = (minted(3), minted(1));
     let copied = cast
         .carol
         .keys
-        .join_statement(&store.cell, Seq::new(1))
+        .join_statement(&store.pod, Seq::new(1))
         .encode();
 
     let readmitted = store.write(
@@ -702,12 +702,12 @@ type Case = (&'static str, fn(&Cast, &str));
 /// What the fold counts on honest devices, one case per row over the
 /// entries one device holds. The session that brings a newcomer's device
 /// the store from nothing is `a_member_device_is_served_and_a_ticket_holder_is_not`
-/// in `tests/cell_sessions.rs`. Paired: `rightly_counted_for_nothing`.
+/// in `tests/pod_sessions.rs`. Paired: `rightly_counted_for_nothing`.
 #[allow(clippy::too_many_lines)] // one table: every case of the class
 #[test]
 fn rightly_counted() {
     let cases: [Case; 9] = [
-        ("the founding event deriving the cell id", |cast, case| {
+        ("the founding event deriving the pod id", |cast, case| {
             let membership = Store::founded_by(&cast.alice).fold();
             assert_eq!(verdict(&membership, 0), Verdict::Counted, "{case}");
             assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
@@ -777,7 +777,7 @@ fn rightly_counted() {
                 let b2 = device(0xb2);
                 store.statement(&cast.bob, 2, &[cast.bob.device, b2], b2.author);
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let membership = Membership::fold(&store.cell, &backwards);
+                let membership = Membership::fold(&store.pod, &backwards);
                 assert!(
                     membership.verdicts().iter().all(|v| *v == Verdict::Counted),
                     "{case}"
@@ -806,7 +806,7 @@ fn rightly_counted() {
                 let kick = store.act(EventKind::Kicked, &cast.bob, 2, &cast.carol, 2);
                 let forward = store.fold();
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let other_device = Membership::fold(&store.cell, &backwards);
+                let other_device = Membership::fold(&store.pod, &backwards);
                 for membership in [&forward, &other_device] {
                     assert_eq!(state(membership, &cast.bob), OUT, "{case}");
                 }
@@ -828,7 +828,7 @@ fn rightly_counted() {
 /// per row over the entries one device holds. A kicked member's device
 /// asking for a session is refused in
 /// `a_member_device_is_served_and_a_ticket_holder_is_not` in
-/// `tests/cell_sessions.rs`. Paired: `rightly_counted`.
+/// `tests/pod_sessions.rs`. Paired: `rightly_counted`.
 #[allow(clippy::too_many_lines)] // one table: every case of the class
 #[test]
 fn rightly_counted_for_nothing() {
@@ -877,7 +877,7 @@ fn rightly_counted_for_nothing() {
             assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
         }),
         (
-            "a founding event that does not derive the cell id, in any order, served first to a device holding nothing",
+            "a founding event that does not derive the pod id, in any order, served first to a device holding nothing",
             |cast, case| {
                 let mut store = Store::founded_by(&cast.alice);
                 store.invite(&cast.alice, 1, &cast.bob);
@@ -887,16 +887,16 @@ fn rightly_counted_for_nothing() {
                     cast.bob.keys.founding([0x5a; 16]).encode(),
                 );
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let membership = Membership::fold(&store.cell, &backwards);
+                let membership = Membership::fold(&store.pod, &backwards);
                 assert_eq!(
                     membership.verdicts()[0],
-                    nothing(ForNothing::OtherCell),
+                    nothing(ForNothing::OtherPod),
                     "{case}"
                 );
                 assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
 
                 let mut invented = Store {
-                    cell: store.cell,
+                    pod: store.pod,
                     entries: Vec::new(),
                 };
                 let founding = invented.write(
@@ -907,7 +907,7 @@ fn rightly_counted_for_nothing() {
                 let membership = invented.fold();
                 assert_eq!(
                     verdict(&membership, founding),
-                    nothing(ForNothing::OtherCell),
+                    nothing(ForNothing::OtherPod),
                     "{case}"
                 );
                 assert_eq!(state(&membership, &cast.bob), OUT, "{case}");
@@ -964,14 +964,14 @@ fn rightly_counted_for_nothing() {
                 let minted = |seq| {
                     mallory
                         .keys
-                        .join_statement(&store.cell, Seq::new(seq))
+                        .join_statement(&store.pod, Seq::new(seq))
                         .encode()
                 };
                 let (at_three, at_one) = (minted(3), minted(1));
                 let copied = cast
                     .carol
                     .keys
-                    .join_statement(&store.cell, Seq::new(1))
+                    .join_statement(&store.pod, Seq::new(1))
                     .encode();
                 let next_sequence = store.write(
                     event(cast.carol.id(), 3, EventKind::Joined, cast.bob.id(), 1),

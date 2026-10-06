@@ -1,19 +1,19 @@
 //! An identity's announcement key pair and everything derived from it or
 //! signed by it, each under a context string of its own, all of them here;
-//! the steps are the cell stores spec's.
+//! the steps are the pod stores spec's.
 
 use iroh::{PublicKey, SecretKey, Signature};
-use pdn_types::{CellId, PdnId};
+use pdn_types::{PdnId, PodId};
 
-use crate::cell::{
+use crate::pod::{
     encode_devices, DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, Seq,
 };
 
 const PDN_ID_CONTEXT: &str = "pdn/pdn-id/v1";
-const CELL_ID_CONTEXT: &str = "pdn/cell-id/v1";
-const CELL_FOUNDING_CONTEXT: &[u8] = b"pdn/cell-founding/v1";
-const CELL_JOIN_CONTEXT: &[u8] = b"pdn/cell-join/v1";
-const CELL_DEVICES_CONTEXT: &[u8] = b"pdn/cell-devices/v1";
+const POD_ID_CONTEXT: &str = "pdn/pod-id/v1";
+const POD_FOUNDING_CONTEXT: &[u8] = b"pdn/pod-founding/v1";
+const POD_JOIN_CONTEXT: &[u8] = b"pdn/pod-join/v1";
+const POD_DEVICES_CONTEXT: &[u8] = b"pdn/pod-devices/v1";
 
 /// An identity's device-announcement key pair: one per identity, minted with
 /// it, its public key deriving the identity's `PdnId`.
@@ -42,7 +42,7 @@ impl AnnouncementKeyPair {
         self.0.to_bytes()
     }
 
-    /// The founding event of the cell `cell_id_of(self.pdn_id(), key, nonce)`.
+    /// The founding event of the pod `pod_id_of(self.pdn_id(), key, nonce)`.
     pub fn founding(&self, nonce: [u8; 16]) -> FoundedPayload {
         let announcement_key = self.public_key();
         let message = founding_message(&self.pdn_id(), &announcement_key, &nonce);
@@ -55,9 +55,9 @@ impl AnnouncementKeyPair {
 
     /// The join statement over `subject_seq`, the sequence the inviting
     /// device names for this identity's joined event.
-    pub fn join_statement(&self, cell: &CellId, subject_seq: Seq) -> JoinedPayload {
+    pub fn join_statement(&self, pod: &PodId, subject_seq: Seq) -> JoinedPayload {
         let announcement_key = self.public_key();
-        let message = join_message(&self.pdn_id(), &announcement_key, cell, subject_seq);
+        let message = join_message(&self.pdn_id(), &announcement_key, pod, subject_seq);
         JoinedPayload {
             announcement_key,
             signature: self.0.sign(&message).to_bytes(),
@@ -82,14 +82,14 @@ pub(crate) fn founding_verifies(creator: &PdnId, payload: &FoundedPayload) -> bo
 }
 
 /// Whether `payload`'s signature verifies for a joined event at
-/// `subject_seq` of `subject`'s chain in `cell`.
+/// `subject_seq` of `subject`'s chain in `pod`.
 pub fn join_verifies(
     subject: &PdnId,
-    cell: &CellId,
+    pod: &PodId,
     subject_seq: Seq,
     payload: &JoinedPayload,
 ) -> bool {
-    let message = join_message(subject, &payload.announcement_key, cell, subject_seq);
+    let message = join_message(subject, &payload.announcement_key, pod, subject_seq);
     verifies(&payload.announcement_key, &message, &payload.signature)
 }
 
@@ -102,7 +102,7 @@ pub fn devices_verify(announcement_key: &[u8; 32], version: u64, payload: &Devic
 
 fn founding_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
     [
-        CELL_FOUNDING_CONTEXT,
+        POD_FOUNDING_CONTEXT,
         creator.as_bytes(),
         announcement_key,
         nonce,
@@ -113,14 +113,14 @@ fn founding_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 1
 fn join_message(
     subject: &PdnId,
     announcement_key: &[u8; 32],
-    cell: &CellId,
+    pod: &PodId,
     subject_seq: Seq,
 ) -> Vec<u8> {
     [
-        CELL_JOIN_CONTEXT,
+        POD_JOIN_CONTEXT,
         subject.as_bytes(),
         announcement_key,
-        cell.as_bytes(),
+        pod.as_bytes(),
         &subject_seq.get().to_be_bytes(),
     ]
     .concat()
@@ -128,7 +128,7 @@ fn join_message(
 
 fn devices_message(version: u64, devices: &[MemberDevice]) -> Vec<u8> {
     [
-        CELL_DEVICES_CONTEXT,
+        POD_DEVICES_CONTEXT,
         &version.to_be_bytes(),
         &encode_devices(devices),
     ]
@@ -148,16 +148,16 @@ pub fn pdn_id_of(announcement_key: &[u8; 32]) -> PdnId {
     PdnId::from_bytes(blake3::derive_key(PDN_ID_CONTEXT, announcement_key))
 }
 
-/// The cell id a founding event's fields derive.
-pub fn cell_id_of(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> CellId {
-    let mut hasher = blake3::Hasher::new_derive_key(CELL_ID_CONTEXT);
+/// The pod id a founding event's fields derive.
+pub fn pod_id_of(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> PodId {
+    let mut hasher = blake3::Hasher::new_derive_key(POD_ID_CONTEXT);
     hasher.update(creator.as_bytes());
     hasher.update(announcement_key);
     hasher.update(nonce);
     // The output stream's first 16 bytes are the hash's first 16.
     let mut id = [0u8; 16];
     hasher.finalize_xof().fill(&mut id);
-    CellId::from_bytes(id)
+    PodId::from_bytes(id)
 }
 
 #[cfg(test)]
@@ -185,32 +185,32 @@ mod tests {
         );
     }
 
-    /// Alice's founding event for "Family" carries the signature the cell
-    /// stores spec prints, and its fields derive the cell's id.
+    /// Alice's founding event for "Family" carries the signature the pod
+    /// stores spec prints, and its fields derive the pod's id.
     #[test]
     fn the_specs_founding_event_signs_and_derives_family() {
         let alice = AnnouncementKeyPair::from_secret_bytes(&[0x33; 32]);
         let founding = alice.founding([0x5a; 16]);
-        let head: [u8; 8] = pdn_types::parse_hex("00ec508b9ba4af7b").unwrap();
-        let tail: [u8; 5] = pdn_types::parse_hex("34fb0cb808").unwrap();
+        let head: [u8; 8] = pdn_types::parse_hex("6ad63c810f41d368").unwrap();
+        let tail: [u8; 5] = pdn_types::parse_hex("807d085d09").unwrap();
         assert!(founding.signature.starts_with(&head));
         assert!(founding.signature.ends_with(&tail));
         assert!(founding_verifies(&alice.pdn_id(), &founding));
         assert_eq!(
-            cell_id_of(&alice.pdn_id(), &founding.announcement_key, &founding.nonce).to_string(),
-            "9cbcbe4da7cc35a44360d64e45621957"
+            pod_id_of(&alice.pdn_id(), &founding.announcement_key, &founding.nonce).to_string(),
+            "ad58a3faa04cdc5576c8dc5823a347c6"
         );
         // Denied: the same event claimed for another creator's chain.
         let other = pdn_id_of(&key(OTHER_KEY));
         assert!(!founding_verifies(&other, &founding));
     }
 
-    /// A join statement verifies at the sequence it signs and in its cell
+    /// A join statement verifies at the sequence it signs and in its pod
     /// alone: one copied from an earlier join verifies at no later sequence.
     #[test]
     fn a_join_statement_verifies_at_its_own_sequence_only() {
         let carol = AnnouncementKeyPair::generate();
-        let family = CellId::from_bytes([0x9c; 16]);
+        let family = PodId::from_bytes([0x9c; 16]);
         let statement = carol.join_statement(&family, Seq::new(1));
         assert!(join_verifies(
             &carol.pdn_id(),
@@ -218,14 +218,14 @@ mod tests {
             Seq::new(1),
             &statement
         ));
-        // Denied: the copy at a later sequence, in another cell, for another member.
+        // Denied: the copy at a later sequence, in another pod, for another member.
         assert!(!join_verifies(
             &carol.pdn_id(),
             &family,
             Seq::new(3),
             &statement
         ));
-        let wedding = CellId::from_bytes([0xf9; 16]);
+        let wedding = PodId::from_bytes([0xf9; 16]);
         assert!(!join_verifies(
             &carol.pdn_id(),
             &wedding,
@@ -254,35 +254,35 @@ mod tests {
     }
 
     /// Alice's key and her `PdnId` derive the ids the specs print for "Family"
-    /// and her second cell, one per nonce.
+    /// and her second pod, one per nonce.
     #[test]
-    fn cell_id_derives_from_creator_key_and_nonce() {
+    fn pod_id_derives_from_creator_key_and_nonce() {
         let alice_key = key(ALICE_KEY);
         let alice = pdn_id_of(&alice_key);
         assert_eq!(
-            cell_id_of(&alice, &alice_key, &[0x5a; 16]).to_string(),
-            "9cbcbe4da7cc35a44360d64e45621957"
+            pod_id_of(&alice, &alice_key, &[0x5a; 16]).to_string(),
+            "ad58a3faa04cdc5576c8dc5823a347c6"
         );
         assert_eq!(
-            cell_id_of(&alice, &alice_key, &[0xa5; 16]).to_string(),
-            "b61cdcf20d79379e475d57d1c04db7a4"
+            pod_id_of(&alice, &alice_key, &[0xa5; 16]).to_string(),
+            "920657b318e1bb314e4cb2cf2174451a"
         );
     }
 
-    /// A founding event under another key derives another cell id, whether it
+    /// A founding event under another key derives another pod id, whether it
     /// names Alice's `PdnId` or the one that key derives.
     #[test]
-    fn another_key_derives_another_cell_id() {
+    fn another_key_derives_another_pod_id() {
         let alice = pdn_id_of(&key(ALICE_KEY));
         let other_key = key(OTHER_KEY);
         let other = pdn_id_of(&other_key);
         assert_eq!(
-            cell_id_of(&alice, &other_key, &[0x5a; 16]).to_string(),
-            "12849b66c608a62f31430f934efc083e"
+            pod_id_of(&alice, &other_key, &[0x5a; 16]).to_string(),
+            "0b1c51caa1cc711a3079f791899c43a7"
         );
         assert_eq!(
-            cell_id_of(&other, &other_key, &[0x5a; 16]).to_string(),
-            "211891a43656908e3d5804f5c25a38f4"
+            pod_id_of(&other, &other_key, &[0x5a; 16]).to_string(),
+            "4470d82a3f3ecc18d9e0889a23f98fed"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! The cell scenario across containers, reached only over the published
+//! The pod scenario across containers, reached only over the published
 //! HTTP port: an invite moves between nodes through the test, and waiting
 //! for convergence is repeating the read. Its restart arms are in
 //! `stand_restart.rs`. Ignored by default: `just test-docker` builds the
@@ -9,10 +9,10 @@ use std::time::Duration;
 use anyhow::Result;
 use axum::http::StatusCode;
 use pdn_node::{PdnId, RecordKind};
-use pdn_node_http::shapes::{Act, HeldCell, HeldCells, Member};
+use pdn_node_http::shapes::{Act, HeldPod, HeldPods, Member};
 
 mod common;
-use common::{cell_listed, cell_route, members_read, ops_read, record_reads, record_route, Stand};
+use common::{members_read, ops_read, pod_listed, pod_route, record_reads, record_route, Stand};
 
 /// Several times what an announced write takes to reach a member device,
 /// which the remaining member's read of the later record has just shown.
@@ -22,7 +22,7 @@ fn member(id: PdnId, owner: bool) -> Member {
     Member { id, owner }
 }
 
-/// A cell runs across three containers over HTTP alone: any member invites,
+/// A pod runs across three containers over HTTP alone: any member invites,
 /// a record and an edit reach every member, an owner's promotion and kick
 /// take effect, and the kicked member stops receiving. Paired denials: a
 /// consumed invite, a plain member's owner-only acts beside the owner's
@@ -32,7 +32,7 @@ fn member(id: PdnId, owner: bool) -> Member {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // one scenario, with its denials in the same place
-async fn a_cell_runs_across_three_containers() -> Result<()> {
+async fn a_pod_runs_across_three_containers() -> Result<()> {
     let stand = Stand::new();
     let alice_node = stand.spawn("alice").await?;
     let bob_node = stand.spawn("bob").await?;
@@ -43,13 +43,13 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
     let carol_work = carol_node.create_identity().await?;
 
     // The creator invites Bob, and Bob invites Carol.
-    let family = alice_node.create_cell(alice).await?;
-    let invite = alice_node.invite_to_cell(alice, family).await?;
-    let joined: HeldCell = bob_node.join_cell(bob, invite).await?.json()?;
-    assert_eq!(joined.cell, family);
-    let invite = bob_node.invite_to_cell(bob, family).await?;
-    let joined: HeldCell = carol_node.join_cell(carol, invite.clone()).await?.json()?;
-    assert_eq!(joined.cell, family);
+    let family = alice_node.create_pod(alice).await?;
+    let invite = alice_node.invite_to_pod(alice, family).await?;
+    let joined: HeldPod = bob_node.join_pod(bob, invite).await?.json()?;
+    assert_eq!(joined.pod, family);
+    let invite = bob_node.invite_to_pod(bob, family).await?;
+    let joined: HeldPod = carol_node.join_pod(carol, invite.clone()).await?.json()?;
+    assert_eq!(joined.pod, family);
     let nodes = [(&alice_node, alice), (&bob_node, bob), (&carol_node, carol)];
     let three = [
         member(alice, true),
@@ -61,7 +61,7 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
     }
 
     // Denied (a consumed invite).
-    let replayed = carol_node.join_cell(carol_work, invite).await?;
+    let replayed = carol_node.join_pod(carol_work, invite).await?;
     assert_eq!(
         replayed.status,
         StatusCode::FORBIDDEN,
@@ -69,13 +69,13 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
         replayed.status,
         replayed.text()
     );
-    let held: HeldCells = carol_node
-        .get(&format!("/debug/identities/{carol_work}/cells"))
+    let held: HeldPods = carol_node
+        .get(&format!("/debug/identities/{carol_work}/pods"))
         .await?
         .json()?;
     assert!(
-        held.cells.is_empty(),
-        "a refused join must leave no cell behind: {held:?}"
+        held.pods.is_empty(),
+        "a refused join must leave no pod behind: {held:?}"
     );
     members_read(&bob_node, bob, family, &three).await?;
 
@@ -101,7 +101,7 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
     // Denied (a plain member's owner-only acts). Beside them, the owner's
     // promotion of Bob takes effect on every node.
     for act in [Act::Promote(carol), Act::Kick(bob)] {
-        let refused = carol_node.cell_act(carol, family, act).await?;
+        let refused = carol_node.pod_act(carol, family, act).await?;
         assert_eq!(
             refused.status,
             StatusCode::FORBIDDEN,
@@ -111,7 +111,7 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
         );
     }
     alice_node
-        .cell_act(alice, family, Act::Promote(bob))
+        .pod_act(alice, family, Act::Promote(bob))
         .await?
         .ok()?;
     let promoted = [member(alice, true), member(bob, true), member(carol, false)];
@@ -120,7 +120,7 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
     }
 
     bob_node
-        .cell_act(bob, family, Act::Kick(carol))
+        .pod_act(bob, family, Act::Kick(carol))
         .await?
         .ok()?;
     // Placed before Alice's replica holds the kick, a record would rightly
@@ -156,14 +156,14 @@ async fn a_cell_runs_across_three_containers() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // Carol's device learns of its kick.
-    cell_listed(&carol_node, carol, family, false).await?;
+    pod_listed(&carol_node, carol, family, false).await?;
     let refused = carol_node
-        .get(&format!("{}/members", cell_route(carol, family)))
+        .get(&format!("{}/members", pod_route(carol, family)))
         .await?;
     assert_eq!(
         refused.status,
         StatusCode::CONFLICT,
-        "the kicked member's requests on the cell must be refused, got {}: {}",
+        "the kicked member's requests on the pod must be refused, got {}: {}",
         refused.status,
         refused.text()
     );

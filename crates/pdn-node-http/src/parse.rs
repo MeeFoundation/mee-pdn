@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::HostError;
 
-/// A path segment by its text form — an identity, a cell, a record id or
+/// A path segment by its text form — an identity, a pod, a record id or
 /// kind; `what` names the segment in the refusal.
 pub fn segment<T>(raw: &str, what: &str) -> Result<T, HostError>
 where
@@ -42,7 +42,7 @@ pub fn json<T: DeserializeOwned>(body: &Bytes, what: &str) -> Result<T, HostErro
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
-    use pdn_node::{CellId, PdnId, RecordKind};
+    use pdn_node::{PdnId, PodId, RecordKind};
 
     use super::*;
 
@@ -52,11 +52,11 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// An identity's 64 hex chars are no cell id.
+    /// An identity's 64 hex chars are no pod id.
     #[test]
-    fn a_malformed_cell_is_400() {
+    fn a_malformed_pod_is_400() {
         let identity = PdnId::from_bytes([0x11; 32]).to_string();
-        let err = segment::<CellId>(&identity, "cell").unwrap_err();
+        let err = segment::<PodId>(&identity, "pod").unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 

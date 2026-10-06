@@ -1,4 +1,4 @@
-//! The key layout of a cell's two stores, by the cell stores spec. Every
+//! The key layout of a pod's two stores, by the pod stores spec. Every
 //! segment is text; a key that parses to none of these types is outside the
 //! layout, kept and read by nothing.
 
@@ -321,7 +321,7 @@ mod tests {
         hex.parse().unwrap()
     }
 
-    /// Every layout the cell stores spec prints parses to what its segments
+    /// Every layout the pod stores spec prints parses to what its segments
     /// name and prints back byte for byte.
     #[test]
     fn every_layout_round_trips() {

@@ -1,5 +1,5 @@
-//! Cells handlers, addressed by the identity performing the operation and
-//! the cell. Record payloads and operations travel as raw bodies; a listing
+//! Pods handlers, addressed by the identity performing the operation and
+//! the pod. Record payloads and operations travel as raw bodies; a listing
 //! of operations carries them in JSON. No route writes a raw entry or hands
 //! over a store ticket: an invite carries a one-time secret, and the tickets
 //! cross only inside the join dialogue.
@@ -13,56 +13,56 @@ use axum::{
     Json,
 };
 use pdn_node::{
-    CellId, CellInvite, CellsService as _, PdnId, RecordId, RecordKind, RecordRef, Runtime,
+    PdnId, PodId, PodInvite, PodsService as _, RecordId, RecordKind, RecordRef, Runtime,
 };
 
 use crate::{
     error::HostError,
     parse,
     shapes::{
-        Act, HeldCell, HeldCells, Lifetime, Members, NoQuery, Operations, Placement, Records,
+        Act, HeldPod, HeldPods, Lifetime, Members, NoQuery, Operations, Placement, Records,
         UnknownEntries,
     },
 };
 
-/// `POST /debug/identities/{identity}/cells`.
+/// `POST /debug/identities/{identity}/pods`.
 pub(crate) async fn create(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
     Query(NoQuery {}): Query<NoQuery>,
-) -> Result<Json<HeldCell>, HostError> {
+) -> Result<Json<HeldPod>, HostError> {
     let identity = parse::segment(&identity, "identity")?;
-    let cell = runtime.cells().create(identity).await?;
-    Ok(Json(HeldCell { cell }))
+    let pod = runtime.pods().create(identity).await?;
+    Ok(Json(HeldPod { pod }))
 }
 
-/// `GET /debug/identities/{identity}/cells`.
+/// `GET /debug/identities/{identity}/pods`.
 pub(crate) async fn list(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
     Query(NoQuery {}): Query<NoQuery>,
-) -> Result<Json<HeldCells>, HostError> {
+) -> Result<Json<HeldPods>, HostError> {
     let identity = parse::segment(&identity, "identity")?;
-    let cells = runtime
-        .cells()
+    let pods = runtime
+        .pods()
         .list(identity)
         .await?
         .into_iter()
         .map(|info| info.id)
         .collect();
-    Ok(Json(HeldCells { cells }))
+    Ok(Json(HeldPods { pods }))
 }
 
-/// `GET /debug/identities/{identity}/cells/{cell}/members`.
+/// `GET /debug/identities/{identity}/pods/{pod}/members`.
 pub(crate) async fn members(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell)): Path<(String, String)>,
+    Path((identity, pod)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<Members>, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     let members = runtime
-        .cells()
-        .members(identity, cell)
+        .pods()
+        .members(identity, pod)
         .await?
         .into_iter()
         .map(Into::into)
@@ -70,91 +70,91 @@ pub(crate) async fn members(
     Ok(Json(Members { members }))
 }
 
-/// `POST /debug/identities/{identity}/cells/{cell}/invites` — the payload
+/// `POST /debug/identities/{identity}/pods/{pod}/invites` — the payload
 /// carries a live one-time secret.
 pub(crate) async fn invite(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell)): Path<(String, String)>,
+    Path((identity, pod)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<CellInvite>, HostError> {
-    let lifetime: Lifetime = parse::query(raw_query.as_deref(), "cell invite query")?;
-    let (identity, cell) = addressed(&identity, &cell)?;
+) -> Result<Json<PodInvite>, HostError> {
+    let lifetime: Lifetime = parse::query(raw_query.as_deref(), "pod invite query")?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     let invite = runtime
-        .cells()
-        .invite(identity, cell, lifetime.as_duration()?)
+        .pods()
+        .invite(identity, pod, lifetime.as_duration()?)
         .await?;
     Ok(Json(invite))
 }
 
-/// `POST /debug/identities/{identity}/cells/join` — awaited to its end, the
-/// catch-up included; the invite names the cell.
+/// `POST /debug/identities/{identity}/pods/join` — awaited to its end, the
+/// catch-up included; the invite names the pod.
 pub(crate) async fn join(
     State(runtime): State<Arc<Runtime>>,
     Path(identity): Path<String>,
     Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
-) -> Result<Json<HeldCell>, HostError> {
+) -> Result<Json<HeldPod>, HostError> {
     let identity = parse::segment(&identity, "identity")?;
-    let invite: CellInvite = parse::json(&body, "cell invite")?;
-    let cell = runtime.cells().join(identity, invite).await?;
-    Ok(Json(HeldCell { cell }))
+    let invite: PodInvite = parse::json(&body, "pod invite")?;
+    let pod = runtime.pods().join(identity, invite).await?;
+    Ok(Json(HeldPod { pod }))
 }
 
-/// `POST /debug/identities/{identity}/cells/{cell}/acts`.
+/// `POST /debug/identities/{identity}/pods/{pod}/acts`.
 pub(crate) async fn act(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell)): Path<(String, String)>,
+    Path((identity, pod)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
-    let act: Act = parse::json(&body, "cell act")?;
-    runtime.cells().act(identity, cell, act.into()).await?;
+    let (identity, pod) = addressed(&identity, &pod)?;
+    let act: Act = parse::json(&body, "pod act")?;
+    runtime.pods().act(identity, pod, act.into()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /debug/identities/{identity}/cells/{cell}/records?kind=<kind>` —
+/// `POST /debug/identities/{identity}/pods/{pod}/records?kind=<kind>` —
 /// placed under the identity's own name at a fresh id.
 pub(crate) async fn put_record(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell)): Path<(String, String)>,
+    Path((identity, pod)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Result<Json<RecordRef>, HostError> {
     let placement: Placement = parse::query(raw_query.as_deref(), "record placement")?;
-    let (identity, cell) = addressed(&identity, &cell)?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     nonempty(&body, "a record")?;
     let record = runtime
-        .cells()
-        .put_record(identity, cell, placement.kind, &body)
+        .pods()
+        .put_record(identity, pod, placement.kind, &body)
         .await?;
     Ok(Json(record))
 }
 
-/// `GET /debug/identities/{identity}/cells/{cell}/records`.
+/// `GET /debug/identities/{identity}/pods/{pod}/records`.
 pub(crate) async fn list_records(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell)): Path<(String, String)>,
+    Path((identity, pod)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<Records>, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
-    let records = runtime.cells().list_records(identity, cell).await?;
+    let (identity, pod) = addressed(&identity, &pod)?;
+    let records = runtime.pods().list_records(identity, pod).await?;
     Ok(Json(Records { records }))
 }
 
-/// `GET …/cells/{cell}/records/{member}/{kind}/{id}` — a claim or an
+/// `GET …/pods/{pod}/records/{member}/{kind}/{id}` — a claim or an
 /// immutable-document; 404 covers both "no such record" and "payload still
 /// arriving", as an entry read does.
 pub(crate) async fn read(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell, member, kind, id)): Path<(String, String, String, String, String)>,
+    Path((identity, pod, member, kind, id)): Path<(String, String, String, String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Bytes, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     let record = record(&member, &kind, &id)?;
     runtime
-        .cells()
-        .read(identity, cell, record)
+        .pods()
+        .read(identity, pod, record)
         .await?
         .map(Bytes::from)
         .ok_or_else(|| {
@@ -165,34 +165,34 @@ pub(crate) async fn read(
         })
 }
 
-/// `POST …/cells/{cell}/records/{member}/{kind}/{id}/ops`.
+/// `POST …/pods/{pod}/records/{member}/{kind}/{id}/ops`.
 pub(crate) async fn append_op(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell, member, kind, id)): Path<(String, String, String, String, String)>,
+    Path((identity, pod, member, kind, id)): Path<(String, String, String, String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
     body: Bytes,
 ) -> Result<StatusCode, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     let record = record(&member, &kind, &id)?;
     nonempty(&body, "an operation")?;
     runtime
-        .cells()
-        .append_op(identity, cell, record, &body)
+        .pods()
+        .append_op(identity, pod, record, &body)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET …/cells/{cell}/records/{member}/{kind}/{id}/ops`.
+/// `GET …/pods/{pod}/records/{member}/{kind}/{id}/ops`.
 pub(crate) async fn read_ops(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell, member, kind, id)): Path<(String, String, String, String, String)>,
+    Path((identity, pod, member, kind, id)): Path<(String, String, String, String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<Operations>, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     let record = record(&member, &kind, &id)?;
     let operations = runtime
-        .cells()
-        .read_ops(identity, cell, record)
+        .pods()
+        .read_ops(identity, pod, record)
         .await?
         .into_iter()
         .map(Into::into)
@@ -200,16 +200,16 @@ pub(crate) async fn read_ops(
     Ok(Json(Operations { operations }))
 }
 
-/// `GET /debug/identities/{identity}/cells/{cell}/unknown`.
+/// `GET /debug/identities/{identity}/pods/{pod}/unknown`.
 pub(crate) async fn list_unknown(
     State(runtime): State<Arc<Runtime>>,
-    Path((identity, cell)): Path<(String, String)>,
+    Path((identity, pod)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<Json<UnknownEntries>, HostError> {
-    let (identity, cell) = addressed(&identity, &cell)?;
+    let (identity, pod) = addressed(&identity, &pod)?;
     let entries = runtime
-        .cells()
-        .list_unknown(identity, cell)
+        .pods()
+        .list_unknown(identity, pod)
         .await?
         .into_iter()
         .map(Into::into)
@@ -217,10 +217,10 @@ pub(crate) async fn list_unknown(
     Ok(Json(UnknownEntries { entries }))
 }
 
-fn addressed(identity: &str, cell: &str) -> Result<(PdnId, CellId), HostError> {
+fn addressed(identity: &str, pod: &str) -> Result<(PdnId, PodId), HostError> {
     Ok((
         parse::segment(identity, "identity")?,
-        parse::segment(cell, "cell")?,
+        parse::segment(pod, "pod")?,
     ))
 }
 

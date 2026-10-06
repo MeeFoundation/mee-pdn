@@ -1,32 +1,33 @@
-//! A departed member's devices and the cell's membership store they keep as
+//! A departed member's devices and the pod's membership store they keep as
 //! its tombstone: served by member devices over the departure's past alone,
 //! both ways, refused the record store, served whole by a sibling, and
 //! reconciled with member devices until one session with them goes
 //! through, then with the identity's own devices alone. The entries a
-//! cell's creation, its joins and its departures write arrive by the
-//! store-level writes the cells service performs, and the tickets by hand.
+//! pod's creation, its joins and its departures write arrive by the
+//! store-level writes the pods service performs, and the tickets by hand.
 
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::Result;
 use data_layer::{
-    identity_of, AddrInfoOptions, AuthorId, CellStore, Contact, EventKind, MemberDevice,
-    MemberState, MembershipKey, PrivateMetadataStore, Seq, ShareMode, SpawnOptions, SyncNode,
+    identity_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice, MemberState,
+    MembershipKey, PodStore, PrivateMetadataStore, Seq, ShareMode, SpawnOptions, SyncNode,
 };
-use pdn_types::CellId;
+use pdn_types::PodId;
 use test_utils::{
-    cell::{
+    join_identity,
+    pod::{
         device_of, found, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
         state_on, tickets, write, Person,
     },
-    join_identity, wait_devices, TIMEOUT,
+    wait_devices, TIMEOUT,
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
 /// not name.
 const QUIET: Duration = Duration::from_secs(3600);
-/// A cell pass short enough that a scenario waits a few runs at most.
-const CELL_RUN: Duration = Duration::from_millis(300);
+/// A pod pass short enough that a scenario waits a few runs at most.
+const POD_RUN: Duration = Duration::from_millis(300);
 
 const PLAIN: MemberState = MemberState {
     member: true,
@@ -37,10 +38,10 @@ const OUT: MemberState = MemberState {
     owner: false,
 };
 
-async fn node(cell_reconcile_interval: Duration) -> Result<SyncNode> {
+async fn node(pod_reconcile_interval: Duration) -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions {
         reconcile_interval: QUIET,
-        cell_reconcile_interval,
+        pod_reconcile_interval,
         ..SpawnOptions::memory()
     })
     .await
@@ -49,7 +50,7 @@ async fn node(cell_reconcile_interval: Duration) -> Result<SyncNode> {
 async fn node_on(dir: &std::path::Path) -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions {
         reconcile_interval: QUIET,
-        cell_reconcile_interval: QUIET,
+        pod_reconcile_interval: QUIET,
         ..SpawnOptions::on_directory(dir)
     })
     .await
@@ -68,7 +69,7 @@ fn nowhere(seed: u8) -> MemberDevice {
 async fn depart(
     node: &SyncNode,
     member: &Person,
-    cell: CellId,
+    pod: PodId,
     kind: EventKind,
     by: &Person,
     seq: u64,
@@ -80,44 +81,44 @@ async fn depart(
         actor: by.id,
         actor_seq: Seq::FIRST,
     };
-    write(node, by, cell, key, vec![0]).await
+    write(node, by, pod, key, vec![0]).await
 }
 
-async fn knows(node: &SyncNode, holder: &Person, cell: CellId, member: &Person) -> Result<bool> {
+async fn knows(node: &SyncNode, holder: &Person, pod: PodId, member: &Person) -> Result<bool> {
     Ok(node
-        .cell_membership(holder.id, cell)
+        .pod_membership(holder.id, pod)
         .await?
         .member(&member.id)
         .is_some())
 }
 
-/// A dial of one of `cell`'s stores from `holder`'s replica on `from` to
+/// A dial of one of `pod`'s stores from `holder`'s replica on `from` to
 /// `callee`'s on `to`, as a drawn contact is dialed.
 async fn dial(
     from: &SyncNode,
     holder: &Person,
-    cell: CellId,
-    store: CellStore,
+    pod: PodId,
+    store: PodStore,
     to: &SyncNode,
     callee: &Person,
 ) -> Result<()> {
     let contact = Contact::new(to.dial_handle().addr(), identity_of(callee.id));
-    from.sync_cell_with_for_test(holder.id, cell, store, contact)
+    from.sync_pod_with_for_test(holder.id, pod, store, contact)
         .await
 }
 
-/// Whether `cell`'s stores come to have nothing in flight on every one of
+/// Whether `pod`'s stores come to have nothing in flight on every one of
 /// `nodes` — no exchange running, held or due to redial — in two reads in
 /// a row: a dial one node still makes lands on another between two reads.
 /// Out of a swarm, a store is still dialed by every node it had a session
 /// with until then.
-async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
+async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
     let deadline = std::time::Instant::now() + TIMEOUT;
     let mut quiet_reads = 0_u8;
     while std::time::Instant::now() < deadline {
         let mut in_flight = 0_usize;
         for node in nodes {
-            in_flight = in_flight.saturating_add(node.cell_syncs_in_flight_for_test(cell).await?);
+            in_flight = in_flight.saturating_add(node.pod_syncs_in_flight_for_test(pod).await?);
         }
         quiet_reads = if in_flight == 0 {
             quiet_reads.saturating_add(1)
@@ -147,49 +148,49 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let cell = found(&alice_phone, &alice).await?;
+    let pod = found(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
             &alice,
-            cell,
+            pod,
             member,
             vec![device_of(phone, member)?],
         )
         .await?;
     }
-    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
     for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
-        phone.import_cell(holder.id, cell, tickets.clone()).await?;
+        phone.import_pod(holder.id, pod, tickets.clone()).await?;
     }
-    assert!(lists(&carol_phone, carol.id, cell, bob.id, PLAIN).await?);
-    assert!(lists(&bob_phone, bob.id, cell, carol.id, PLAIN).await?);
+    assert!(lists(&carol_phone, carol.id, pod, bob.id, PLAIN).await?);
+    assert!(lists(&bob_phone, bob.id, pod, carol.id, PLAIN).await?);
     carol_phone.shutdown().await?;
     drop(carol_phone);
 
-    depart(&alice_phone, &carol, cell, EventKind::Kicked, &alice, 2).await?;
+    depart(&alice_phone, &carol, pod, EventKind::Kicked, &alice, 2).await?;
     let dave = Person::generate();
-    invite(&bob_phone, &bob, cell, &dave, vec![nowhere(0xd0)]).await?;
-    let claim = place_claim(&alice_phone, &alice, cell, 1).await?;
-    assert!(lists(&bob_phone, bob.id, cell, carol.id, OUT).await?);
-    assert!(lists(&alice_phone, alice.id, cell, dave.id, PLAIN).await?);
-    assert!(reads(&bob_phone, bob.id, cell, claim).await?);
+    invite(&bob_phone, &bob, pod, &dave, vec![nowhere(0xd0)]).await?;
+    let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
+    assert!(lists(&bob_phone, bob.id, pod, carol.id, OUT).await?);
+    assert!(lists(&alice_phone, alice.id, pod, dave.id, PLAIN).await?);
+    assert!(reads(&bob_phone, bob.id, pod, claim).await?);
 
     let carol_phone = node_on(dir.path()).await?;
     carol_phone.provision_identity(carol.id).await?;
-    carol_phone.import_cell(carol.id, cell, tickets).await?;
+    carol_phone.import_pod(carol.id, pod, tickets).await?;
     assert!(
-        lists(&carol_phone, carol.id, cell, carol.id, OUT).await?,
+        lists(&carol_phone, carol.id, pod, carol.id, OUT).await?,
         "the device did not learn of its member's kick"
     );
     let mut records = carol_phone
-        .watch_cell_sessions(carol.id, cell, CellStore::Records)
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
         .await?;
     dial(
         &carol_phone,
         &carol,
-        cell,
-        CellStore::Records,
+        pod,
+        PodStore::Records,
         &bob_phone,
         &bob,
     )
@@ -202,8 +203,8 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
         refused.is_some_and(|session| session.exchanged.is_err()),
         "a member device served the kicked member's record store"
     );
-    assert!(!knows(&carol_phone, &carol, cell, &dave).await?);
-    assert!(holds_no_record(&carol_phone, carol.id, cell).await?);
+    assert!(!knows(&carol_phone, &carol, pod, &dave).await?);
+    assert!(holds_no_record(&carol_phone, carol.id, pod).await?);
 
     for node in [alice_phone, bob_phone, carol_phone] {
         node.shutdown().await?;
@@ -224,11 +225,11 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let cell = found(&alice_phone, &alice).await?;
+    let pod = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
-        cell,
+        pod,
         &bob,
         vec![device_of(&bob_phone, &bob)?],
     )
@@ -237,15 +238,15 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
         device_of(&carol_phone, &carol)?,
         device_of(&carol_laptop, &carol)?,
     ];
-    invite(&alice_phone, &alice, cell, &carol, carols).await?;
-    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
     for (device, holder) in [
         (&bob_phone, &bob),
         (&carol_phone, &carol),
         (&carol_laptop, &carol),
     ] {
-        device.import_cell(holder.id, cell, tickets.clone()).await?;
-        assert!(lists(device, holder.id, cell, bob.id, PLAIN).await?);
+        device.import_pod(holder.id, pod, tickets.clone()).await?;
+        assert!(lists(device, holder.id, pod, bob.id, PLAIN).await?);
     }
     // Out of both swarms and settled, so the leave goes out in the sessions
     // dialed below.
@@ -261,46 +262,46 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
             .await?;
     }
     let phones = [&alice_phone, &bob_phone, &carol_phone, &carol_laptop];
-    assert!(settle(&phones, cell).await?);
+    assert!(settle(&phones, pod).await?);
 
-    depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
     let dave = Person::generate();
-    invite(&bob_phone, &bob, cell, &dave, vec![nowhere(0xd0)]).await?;
-    assert!(lists(&bob_phone, bob.id, cell, dave.id, PLAIN).await?);
+    invite(&bob_phone, &bob, pod, &dave, vec![nowhere(0xd0)]).await?;
+    assert!(lists(&bob_phone, bob.id, pod, dave.id, PLAIN).await?);
     dial(
         &carol_phone,
         &carol,
-        cell,
-        CellStore::Membership,
+        pod,
+        PodStore::Membership,
         &bob_phone,
         &bob,
     )
     .await?;
     assert!(
-        lists(&bob_phone, bob.id, cell, carol.id, OUT).await?,
+        lists(&bob_phone, bob.id, pod, carol.id, OUT).await?,
         "the leave did not reach a member's device"
     );
     dial(
         &carol_laptop,
         &carol,
-        cell,
-        CellStore::Membership,
+        pod,
+        PodStore::Membership,
         &carol_phone,
         &carol,
     )
     .await?;
-    assert!(lists(&carol_laptop, carol.id, cell, carol.id, OUT).await?);
+    assert!(lists(&carol_laptop, carol.id, pod, carol.id, OUT).await?);
 
     // Denied: the record store; and Dave's joined event, which Bob's phone
     // served whole, not knowing of the leave at that session's setup.
     let mut records = carol_phone
-        .watch_cell_sessions(carol.id, cell, CellStore::Records)
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
         .await?;
     dial(
         &carol_phone,
         &carol,
-        cell,
-        CellStore::Records,
+        pod,
+        PodStore::Records,
         &bob_phone,
         &bob,
     )
@@ -309,7 +310,7 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
         .next_with(bob_phone.node_id(), true, TIMEOUT)
         .await?;
     assert!(refused.is_some_and(|session| session.exchanged.is_err()));
-    assert!(!knows(&carol_phone, &carol, cell, &dave).await?);
+    assert!(!knows(&carol_phone, &carol, pod, &dave).await?);
 
     for node in [alice_phone, bob_phone, carol_phone, carol_laptop] {
         node.shutdown().await?;
@@ -324,15 +325,15 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
 async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_member() -> Result<()>
 {
     let (alice_phone, bob_phone) = (node(QUIET).await?, node(QUIET).await?);
-    let (carol_phone, carol_laptop) = (node(CELL_RUN).await?, node(QUIET).await?);
+    let (carol_phone, carol_laptop) = (node(POD_RUN).await?, node(QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let cell = found(&alice_phone, &alice).await?;
+    let pod = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
-        cell,
+        pod,
         &bob,
         vec![device_of(&bob_phone, &bob)?],
     )
@@ -341,22 +342,22 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
         device_of(&carol_phone, &carol)?,
         device_of(&carol_laptop, &carol)?,
     ];
-    invite(&alice_phone, &alice, cell, &carol, carols).await?;
-    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
     for (device, holder) in [
         (&bob_phone, &bob),
         (&carol_phone, &carol),
         (&carol_laptop, &carol),
     ] {
-        device.import_cell(holder.id, cell, tickets.clone()).await?;
-        assert!(lists(device, holder.id, cell, bob.id, PLAIN).await?);
+        device.import_pod(holder.id, pod, tickets.clone()).await?;
+        assert!(lists(device, holder.id, pod, bob.id, PLAIN).await?);
     }
     let laptop = data_layer::EndpointId::from_bytes(carol_laptop.node_id().as_bytes())?;
     let sibling_only = HashSet::from([(laptop, identity_of(carol.id))]);
     let mut draws = carol_phone
-        .take_cell_pass_draws()
+        .take_pod_pass_draws()
         .expect("the draw channel is taken once");
-    let contacts_of = |draw: &data_layer::CellPassDraw| -> HashSet<_> {
+    let contacts_of = |draw: &data_layer::PodPassDraw| -> HashSet<_> {
         draw.contacts
             .iter()
             .map(|contact| (contact.addr.id, contact.identity))
@@ -366,20 +367,20 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     tokio::time::timeout(TIMEOUT, async {
         loop {
             let draw = draws.recv().await.expect("the pass stopped drawing");
-            if draw.store == CellStore::Membership && contacts_of(&draw).len() > 1 {
+            if draw.store == PodStore::Membership && contacts_of(&draw).len() > 1 {
                 break;
             }
         }
     })
     .await?;
 
-    depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
-    carol_phone.forget_cell(carol.id, cell).await?;
-    assert!(lists(&bob_phone, bob.id, cell, carol.id, OUT).await?);
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_pod(carol.id, pod).await?;
+    assert!(lists(&bob_phone, bob.id, pod, carol.id, OUT).await?);
     tokio::time::timeout(TIMEOUT, async {
         loop {
             let draw = draws.recv().await.expect("the pass stopped drawing");
-            if draw.store == CellStore::Membership && contacts_of(&draw) == sibling_only {
+            if draw.store == PodStore::Membership && contacts_of(&draw) == sibling_only {
                 break;
             }
         }
@@ -399,7 +400,7 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
 /// Every pass is out of reach and the leaving devices are out of both swarms
 /// and settled, so the flush is the left event's one path. The record store
 /// is forgotten after the left event is written, as a leave does: a write
-/// reaches a cell's membership store only while its record store is held.
+/// reaches a pod's membership store only while its record store is held.
 #[allow(clippy::too_many_lines)] // one scenario: the leave, the forget and the flush
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() -> Result<()> {
@@ -408,11 +409,11 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let cell = found(&alice_phone, &alice).await?;
+    let pod = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
-        cell,
+        pod,
         &bob,
         vec![device_of(&bob_phone, &bob)?],
     )
@@ -421,15 +422,15 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
         device_of(&carol_phone, &carol)?,
         device_of(&carol_laptop, &carol)?,
     ];
-    invite(&alice_phone, &alice, cell, &carol, carols).await?;
-    let tickets = tickets(&alice_phone, &alice, cell).await?;
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
     for (device, holder) in [
         (&bob_phone, &bob),
         (&carol_phone, &carol),
         (&carol_laptop, &carol),
     ] {
-        device.import_cell(holder.id, cell, tickets.clone()).await?;
-        assert!(lists(device, holder.id, cell, bob.id, PLAIN).await?);
+        device.import_pod(holder.id, pod, tickets.clone()).await?;
+        assert!(lists(device, holder.id, pod, bob.id, PLAIN).await?);
     }
     for namespace in [
         tickets.membership.capability.id(),
@@ -443,19 +444,19 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
             .await?;
     }
     let phones = [&alice_phone, &bob_phone, &carol_phone, &carol_laptop];
-    assert!(settle(&phones, cell).await?);
+    assert!(settle(&phones, pod).await?);
 
-    depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
-    carol_phone.forget_cell(carol.id, cell).await?;
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_pod(carol.id, pod).await?;
     let flushed = carol_phone
-        .flush_cell(carol.id, cell)
+        .flush_pod(carol.id, pod)
         .await?
         .wait(TIMEOUT)
         .await;
     assert!(flushed, "the tombstone's flush reached no member's device");
     for (phone, holder) in [(&alice_phone, &alice), (&bob_phone, &bob)] {
         assert!(
-            lists(phone, holder.id, cell, carol.id, OUT).await?,
+            lists(phone, holder.id, pod, carol.id, OUT).await?,
             "the leave did not reach a member's device"
         );
     }
@@ -466,10 +467,10 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
     Ok(())
 }
 
-/// Whether a run of the cell pass `draws` reports comes to draw from
+/// Whether a run of the pod pass `draws` reports comes to draw from
 /// membership-store contacts that list `contact` as `want` says.
 async fn draws_contact(
-    draws: &mut tokio::sync::mpsc::UnboundedReceiver<data_layer::CellPassDraw>,
+    draws: &mut tokio::sync::mpsc::UnboundedReceiver<data_layer::PodPassDraw>,
     contact: (data_layer::EndpointId, data_layer::Identity),
     want: bool,
 ) -> Result<bool> {
@@ -479,7 +480,7 @@ async fn draws_contact(
                 .contacts
                 .iter()
                 .any(|drawn| (drawn.addr.id, drawn.identity) == contact);
-            if draw.store == CellStore::Membership && listed == want {
+            if draw.store == PodStore::Membership && listed == want {
                 return true;
             }
         }
@@ -497,36 +498,36 @@ async fn draws_contact(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_shows_the_join(
 ) -> Result<()> {
-    let (alice_phone, carol_phone) = (node(QUIET).await?, node(CELL_RUN).await?);
+    let (alice_phone, carol_phone) = (node(QUIET).await?, node(POD_RUN).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let cell = found(&alice_phone, &alice).await?;
+    let pod = found(&alice_phone, &alice).await?;
     let carols = vec![device_of(&carol_phone, &carol)?];
-    invite(&alice_phone, &alice, cell, &carol, carols).await?;
-    let from_alice = tickets(&alice_phone, &alice, cell).await?;
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let from_alice = tickets(&alice_phone, &alice, pod).await?;
     carol_phone
-        .import_cell(carol.id, cell, from_alice.clone())
+        .import_pod(carol.id, pod, from_alice.clone())
         .await?;
-    assert!(lists(&carol_phone, carol.id, cell, carol.id, PLAIN).await?);
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, PLAIN).await?);
     let inviter = (
         data_layer::EndpointId::from_bytes(alice_phone.node_id().as_bytes())?,
         identity_of(alice.id),
     );
     let mut draws = carol_phone
-        .take_cell_pass_draws()
+        .take_pod_pass_draws()
         .expect("the draw channel is taken once");
-    depart(&carol_phone, &carol, cell, EventKind::Left, &carol, 2).await?;
-    carol_phone.forget_cell(carol.id, cell).await?;
-    assert!(lists(&alice_phone, alice.id, cell, carol.id, OUT).await?);
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_pod(carol.id, pod).await?;
+    assert!(lists(&alice_phone, alice.id, pod, carol.id, OUT).await?);
     // Paired: the tombstone, once a session with the inviter went through.
     assert!(draws_contact(&mut draws, inviter, false).await?);
 
-    carol_phone.import_cell(carol.id, cell, from_alice).await?;
+    carol_phone.import_pod(carol.id, pod, from_alice).await?;
     assert!(
         draws_contact(&mut draws, inviter, true).await?,
         "the rejoining device dropped its inviter from its contacts"
     );
-    assert_eq!(state_on(&carol_phone, carol.id, cell, carol.id).await, OUT);
+    assert_eq!(state_on(&carol_phone, carol.id, pod, carol.id).await, OUT);
 
     for node in [alice_phone, carol_phone] {
         node.shutdown().await?;
@@ -563,41 +564,39 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_directory) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let cell = found(&alice_phone, &alice).await?;
+    let pod = found(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
             &alice,
-            cell,
+            pod,
             member,
             vec![device_of(phone, member)?],
         )
         .await?;
     }
-    let from_alice = tickets(&alice_phone, &alice, cell).await?;
+    let from_alice = tickets(&alice_phone, &alice, pod).await?;
     for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
-        phone
-            .import_cell(holder.id, cell, from_alice.clone())
-            .await?;
+        phone.import_pod(holder.id, pod, from_alice.clone()).await?;
     }
     // Bob's pull of the claim is served once Carol's phone knows his device.
     let bobs = device_of(&bob_phone, &bob)?;
-    assert!(lists_device(&carol_phone, carol.id, cell, bob.id, bobs).await?);
-    let earlier = place_claim(&carol_phone, &carol, cell, 1).await?;
-    assert!(reads(&bob_phone, bob.id, cell, earlier).await?);
+    assert!(lists_device(&carol_phone, carol.id, pod, bob.id, bobs).await?);
+    let earlier = place_claim(&carol_phone, &carol, pod, 1).await?;
+    assert!(reads(&bob_phone, bob.id, pod, earlier).await?);
 
-    depart(&alice_phone, &carol, cell, EventKind::Kicked, &alice, 2).await?;
-    assert!(lists(&bob_phone, bob.id, cell, carol.id, OUT).await?);
-    assert!(lists(&carol_phone, carol.id, cell, carol.id, OUT).await?);
+    depart(&alice_phone, &carol, pod, EventKind::Kicked, &alice, 2).await?;
+    assert!(lists(&bob_phone, bob.id, pod, carol.id, OUT).await?);
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, OUT).await?);
     // Denied: Carol's device, on the record store, while kicked.
     let mut carols = carol_phone
-        .watch_cell_sessions(carol.id, cell, CellStore::Records)
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
         .await?;
     dial(
         &carol_phone,
         &carol,
-        cell,
-        CellStore::Records,
+        pod,
+        PodStore::Records,
         &bob_phone,
         &bob,
     )
@@ -622,12 +621,12 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
             vec![device_of(&bob_phone, &bob)?, device_of(&bob_laptop, &bob)?],
         )
         .encode();
-    write(&bob_phone, &bob, cell, bobs, statement).await?;
+    write(&bob_phone, &bob, pod, bobs, statement).await?;
     bob_laptop
-        .import_cell(bob.id, cell, tickets(&bob_phone, &bob, cell).await?)
+        .import_pod(bob.id, pod, tickets(&bob_phone, &bob, pod).await?)
         .await?;
     assert!(
-        reads(&bob_laptop, bob.id, cell, earlier).await?,
+        reads(&bob_laptop, bob.id, pod, earlier).await?,
         "a departed member's earlier record did not read on a device linked after"
     );
 
@@ -639,47 +638,39 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    let join_statement = carol.keys.join_statement(&cell, Seq::new(3)).encode();
-    write(&alice_phone, &alice, cell, rejoined, join_statement).await?;
+    let join_statement = carol.keys.join_statement(&pod, Seq::new(3)).encode();
+    write(&alice_phone, &alice, pod, rejoined, join_statement).await?;
     dial(
         &carol_phone,
         &carol,
-        cell,
-        CellStore::Membership,
+        pod,
+        PodStore::Membership,
         &alice_phone,
         &alice,
     )
     .await?;
-    assert!(lists(&carol_phone, carol.id, cell, carol.id, PLAIN).await?);
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, PLAIN).await?);
     let later = data_layer::RecordKey::Claim {
         member: carol.id,
         id: pdn_types::RecordId::from_bytes([3; 16]),
         mseq: Seq::new(3),
     };
     carol_phone
-        .write_cell_entry(
+        .write_pod_entry(
             carol.id,
-            cell,
-            CellStore::Records,
+            pod,
+            PodStore::Records,
             &later.to_bytes(),
             b"claim",
         )
         .await?;
     for (device, holder) in [(&bob_phone, &bob), (&alice_phone, &alice)] {
-        dial(
-            &carol_phone,
-            &carol,
-            cell,
-            CellStore::Records,
-            device,
-            holder,
-        )
-        .await?;
+        dial(&carol_phone, &carol, pod, PodStore::Records, device, holder).await?;
         assert!(
-            reads(device, holder.id, cell, later.record()).await?,
+            reads(device, holder.id, pod, later.record()).await?,
             "the record written under the new sequence did not read"
         );
-        assert!(reads(device, holder.id, cell, earlier).await?);
+        assert!(reads(device, holder.id, pod, earlier).await?);
     }
 
     for node in [alice_phone, bob_phone, bob_laptop, carol_phone] {
@@ -690,8 +681,8 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
 
 /// A leave dated before the join it ends, as a device whose clock runs
 /// behind the one that recorded the join dates it, still ends the
-/// identity's holding of the cell on each of its devices, and a join at a
-/// later sequence holds the cell again. The tombstone is written before the
+/// identity's holding of the pod on each of its devices, and a join at a
+/// later sequence holds the pod again. The tombstone is written before the
 /// join's record, so its date is the earlier of the two.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leave_dated_before_its_join_still_ends_holding_on_every_device() -> Result<()> {
@@ -704,26 +695,25 @@ async fn a_leave_dated_before_its_join_still_ends_holding_on_every_device() -> R
     let laptop_directory = join_identity(&carol_laptop, carol.id, ticket).await?;
     let both = [carol_phone.node_id(), carol_laptop.node_id()];
     assert!(wait_devices(&laptop_directory, &both).await?);
-    let cell = CellId::from_bytes([0x9c; 16]);
+    let pod = PodId::from_bytes([0x9c; 16]);
 
-    laptop_directory.tombstone_cell(cell, Seq::new(2)).await?;
-    phone_directory.record_cell(cell, Seq::FIRST).await?;
+    laptop_directory.tombstone_pod(pod, Seq::new(2)).await?;
+    phone_directory.record_pod(pod, Seq::FIRST).await?;
     for directory in [&phone_directory, &laptop_directory] {
         assert!(
             test_utils::eventually(|| async {
-                Ok(directory.held_cells().await?.is_empty()
-                    && directory.departed_cells().await? == [cell])
+                Ok(directory.held_pods().await?.is_empty()
+                    && directory.departed_pods().await? == [pod])
             })
             .await?,
             "the leave lost to a join dated after it"
         );
     }
-    phone_directory.record_cell(cell, Seq::new(3)).await?;
+    phone_directory.record_pod(pod, Seq::new(3)).await?;
     for directory in [&phone_directory, &laptop_directory] {
         assert!(
-            test_utils::eventually(|| async { Ok(directory.held_cells().await? == [cell]) })
-                .await?,
-            "the join after the leave did not hold the cell again"
+            test_utils::eventually(|| async { Ok(directory.held_pods().await? == [pod]) }).await?,
+            "the join after the leave did not hold the pod again"
         );
     }
 

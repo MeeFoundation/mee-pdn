@@ -12,9 +12,9 @@ use axum::{
 use pdn_node::{
     ActRefused, AnnouncementKeyPending, DelegationUnsupported, EstablishmentInProgress,
     EstablishmentRefused, IdentityAlreadyHosted, JoinInProgress, JoinRefused, LinkingInProgress,
-    LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownCell, UnknownIdentity,
-    UnknownIssuer, UnknownRecord, UnsupportedCellInviteVersion, UnsupportedInviteVersion,
-    UnsupportedLinkingVersion, WriteNotGranted, WrongRecordKind,
+    LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownIdentity, UnknownIssuer, UnknownPod,
+    UnknownRecord, UnsupportedInviteVersion, UnsupportedLinkingVersion,
+    UnsupportedPodInviteVersion, WriteNotGranted, WrongRecordKind,
 };
 
 #[derive(Debug)]
@@ -32,7 +32,7 @@ impl HostError {
         }
     }
 
-    /// An absent entry or record alone. An identity, issuer or cell the
+    /// An absent entry or record alone. An identity, issuer or pod the
     /// runtime does not know is 409, never this: route names are unpinned, so
     /// a deny test asserting 404 would keep passing after a rename.
     pub fn not_found(message: impl Into<String>) -> Self {
@@ -84,7 +84,7 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
         StatusCode::FORBIDDEN
     } else if err.downcast_ref::<UnknownIdentity>().is_some()
         || err.downcast_ref::<UnknownIssuer>().is_some()
-        || err.downcast_ref::<UnknownCell>().is_some()
+        || err.downcast_ref::<UnknownPod>().is_some()
         || err.downcast_ref::<PeerNotConnected>().is_some()
         || err.downcast_ref::<AnnouncementKeyPending>().is_some()
         || err.downcast_ref::<IdentityAlreadyHosted>().is_some()
@@ -94,13 +94,13 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
     {
         // The runtime does not host what the request addressed, or already
         // has a conflicting act of its own committed or in flight against
-        // it. A cell the identity is no member of is here, not with the
+        // it. A pod the identity is no member of is here, not with the
         // refusals: a test expecting a refusal by role would otherwise pass
         // when the service does not take the caller for a member at all.
         StatusCode::CONFLICT
     } else if err.downcast_ref::<UnsupportedInviteVersion>().is_some()
         || err.downcast_ref::<UnsupportedLinkingVersion>().is_some()
-        || err.downcast_ref::<UnsupportedCellInviteVersion>().is_some()
+        || err.downcast_ref::<UnsupportedPodInviteVersion>().is_some()
         || err.downcast_ref::<WrongRecordKind>().is_some()
     {
         StatusCode::BAD_REQUEST
@@ -115,15 +115,13 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context as _};
-    use pdn_node::{
-        ActRefusal, CellAct, CellId, EntryPath, PdnId, RecordId, RecordKind, RecordRef,
-    };
+    use pdn_node::{ActRefusal, EntryPath, PdnId, PodAct, PodId, RecordId, RecordKind, RecordRef};
 
     use super::*;
 
     const ISSUER: PdnId = PdnId::from_bytes([0x11; 32]);
     const PEER: PdnId = PdnId::from_bytes([0x22; 32]);
-    const CELL: CellId = CellId::from_bytes([0x33; 16]);
+    const POD: PodId = PodId::from_bytes([0x33; 16]);
 
     fn record(kind: RecordKind) -> RecordRef {
         RecordRef {
@@ -158,7 +156,7 @@ mod tests {
         assert_eq!(status(JoinRefused), StatusCode::FORBIDDEN);
         assert_eq!(
             status(ActRefused {
-                act: CellAct::Kick(PEER),
+                act: PodAct::Kick(PEER),
                 reason: ActRefusal::NotAnOwner,
             }),
             StatusCode::FORBIDDEN
@@ -203,7 +201,7 @@ mod tests {
             }),
             StatusCode::CONFLICT
         );
-        assert_eq!(status(UnknownCell { cell: CELL }), StatusCode::CONFLICT);
+        assert_eq!(status(UnknownPod { pod: POD }), StatusCode::CONFLICT);
         assert_eq!(
             status(AnnouncementKeyPending { identity: ISSUER }),
             StatusCode::CONFLICT
@@ -211,7 +209,7 @@ mod tests {
         assert_eq!(
             status(JoinInProgress {
                 identity: ISSUER,
-                cell: CELL,
+                pod: POD,
             }),
             StatusCode::CONFLICT
         );
@@ -228,7 +226,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            status(UnsupportedCellInviteVersion { version: 9 }),
+            status(UnsupportedPodInviteVersion { version: 9 }),
             StatusCode::BAD_REQUEST
         );
     }

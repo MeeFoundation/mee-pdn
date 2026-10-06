@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use pdn_node::{
-    CellAct, CellId, CellMember, CellStore, EntryInfo, GrantedClaim, Operation, PdnId, ReadGrant,
+    EntryInfo, GrantedClaim, Operation, PdnId, PodAct, PodId, PodMember, PodStore, ReadGrant,
     RecordKind, RecordRef, UnknownEntry,
 };
 use serde::{Deserialize, Serialize};
@@ -156,15 +156,15 @@ pub struct ListingPrefix {
 #[serde(deny_unknown_fields)]
 pub struct NoQuery {}
 
-/// The cell a `create` or a `join` answers with.
+/// The pod a `create` or a `join` answers with.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HeldCell {
-    pub cell: CellId,
+pub struct HeldPod {
+    pub pod: PodId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HeldCells {
-    pub cells: Vec<CellId>,
+pub struct HeldPods {
+    pub pods: Vec<PodId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -178,8 +178,8 @@ pub struct Member {
     pub owner: bool,
 }
 
-impl From<CellMember> for Member {
-    fn from(member: CellMember) -> Self {
+impl From<PodMember> for Member {
+    fn from(member: PodMember) -> Self {
         Self {
             id: member.id,
             owner: member.owner,
@@ -197,7 +197,7 @@ pub enum Act {
     Leave,
 }
 
-impl From<Act> for CellAct {
+impl From<Act> for PodAct {
     fn from(act: Act) -> Self {
         match act {
             Act::Promote(subject) => Self::Promote(subject),
@@ -222,20 +222,20 @@ pub struct Records {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Operations {
-    pub operations: Vec<CellOperation>,
+    pub operations: Vec<PodOperation>,
 }
 
 /// An operation that reads, payload included: a listing carries several, so
 /// they cannot travel as the raw body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CellOperation {
+pub struct PodOperation {
     pub writer: PdnId,
     /// `<writer>.<author>.<mseq>.<op_seq>`, the operation's key segment.
     pub id: String,
     pub payload: Vec<u8>,
 }
 
-impl From<Operation> for CellOperation {
+impl From<Operation> for PodOperation {
     fn from(operation: Operation) -> Self {
         Self {
             writer: operation.id.writer,
@@ -247,14 +247,14 @@ impl From<Operation> for CellOperation {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UnknownEntries {
-    pub entries: Vec<CellUnknownEntry>,
+    pub entries: Vec<PodUnknownEntry>,
 }
 
 /// An entry outside the key layout. The key travels as bytes: it need not
 /// be text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CellUnknownEntry {
-    pub store: CellStoreName,
+pub struct PodUnknownEntry {
+    pub store: PodStoreName,
     pub key: Vec<u8>,
     /// Lowercase hex.
     pub author: String,
@@ -262,17 +262,17 @@ pub struct CellUnknownEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CellStoreName {
+pub enum PodStoreName {
     Membership,
     Records,
 }
 
-impl From<UnknownEntry> for CellUnknownEntry {
+impl From<UnknownEntry> for PodUnknownEntry {
     fn from(entry: UnknownEntry) -> Self {
         Self {
             store: match entry.store {
-                CellStore::Membership => CellStoreName::Membership,
-                CellStore::Records => CellStoreName::Records,
+                PodStore::Membership => PodStoreName::Membership,
+                PodStore::Records => PodStoreName::Records,
             },
             key: entry.key,
             author: entry.author.to_string(),

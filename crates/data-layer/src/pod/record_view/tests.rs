@@ -2,13 +2,13 @@ use iroh_blobs::Hash;
 use pdn_types::{PdnId, RecordId};
 
 use super::*;
-use crate::cell::{
+use crate::pod::{
     keys::Seq,
     testing::{device, Cast, Person, Store},
     EventKind,
 };
 
-/// A cell's record store as one device holds it, each entry newer than
+/// A pod's record store as one device holds it, each entry newer than
 /// the one before and its payload arrived.
 #[derive(Clone, Default)]
 struct Records {

@@ -7,7 +7,7 @@ description = "Data layer: capability-gated document sync over our iroh-docs var
 
 [features]
 # Extra observation surface for scenario tests, never the product: the read
-# side of the tracked contact set, the session and pass counters, a cell's
+# side of the tracked contact set, the session and pass counters, a pod's
 # exchanges in flight, and the session opened under a named holder, so a
 # scenario can assert what the
 # node derived instead of sleeping and guessing. Off in every product
@@ -27,7 +27,7 @@ iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
 pdn-store = { workspace = true }
 pdn-types = { path = "../pdn-types" }
-# The cell stores' pass draws the peers each run reaches.
+# The pod stores' pass draws the peers each run reaches.
 rand = "0.10"
 # The same major the fork's replica store uses, for one downcast: telling
 # "the directory is held by another running node" apart from corruption

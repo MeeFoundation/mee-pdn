@@ -121,7 +121,7 @@ struct PendingInvite<T> {
 /// runtime state so every operation is a map operation under the coarse
 /// lock. Expiry is lazy: checked at presentation, swept at the next invite.
 /// `T` is what a secret was minted for — an identity, or an identity and a
-/// cell.
+/// pod.
 #[derive(Debug)]
 pub(crate) struct PendingInvites<T = PdnId> {
     map: HashMap<[u8; 32], PendingInvite<T>>,

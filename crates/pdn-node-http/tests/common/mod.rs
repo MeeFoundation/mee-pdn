@@ -17,9 +17,9 @@ use std::{
 
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node::{CellId, PdnId, RecordKind, RecordRef};
+use pdn_node::{PdnId, PodId, RecordKind, RecordRef};
 use pdn_node_http::shapes::{
-    Act, CreatedIdentity, GrantPublication, GrantedPath, HeldCell, HeldCells, Member, Members,
+    Act, CreatedIdentity, GrantPublication, GrantedPath, HeldPod, HeldPods, Member, Members,
     Operations, OwnGrant,
 };
 use serde::de::DeserializeOwned;
@@ -274,40 +274,40 @@ impl Host {
         Ok(created.identity)
     }
 
-    pub async fn create_cell(&self, identity: PdnId) -> Result<CellId> {
-        let created: HeldCell = self
-            .post(&format!("/debug/identities/{identity}/cells"), Bytes::new())
+    pub async fn create_pod(&self, identity: PdnId) -> Result<PodId> {
+        let created: HeldPod = self
+            .post(&format!("/debug/identities/{identity}/pods"), Bytes::new())
             .await?
             .json()?;
-        Ok(created.cell)
+        Ok(created.pod)
     }
 
-    pub async fn cell_members(&self, identity: PdnId, cell: CellId) -> Result<Vec<Member>> {
+    pub async fn pod_members(&self, identity: PdnId, pod: PodId) -> Result<Vec<Member>> {
         let members: Members = self
-            .get(&format!("{}/members", cell_route(identity, cell)))
+            .get(&format!("{}/members", pod_route(identity, pod)))
             .await?
             .json()?;
         Ok(members.members)
     }
 
     /// The payload carries a live one-time secret.
-    pub async fn invite_to_cell(&self, identity: PdnId, cell: CellId) -> Result<Bytes> {
+    pub async fn invite_to_pod(&self, identity: PdnId, pod: PodId) -> Result<Bytes> {
         self.post(
-            &format!("{}/invites", cell_route(identity, cell)),
+            &format!("{}/invites", pod_route(identity, pod)),
             Bytes::new(),
         )
         .await?
         .ok()
     }
 
-    pub async fn join_cell(&self, identity: PdnId, invite: Bytes) -> Result<Answer> {
-        self.post(&format!("/debug/identities/{identity}/cells/join"), invite)
+    pub async fn join_pod(&self, identity: PdnId, invite: Bytes) -> Result<Answer> {
+        self.post(&format!("/debug/identities/{identity}/pods/join"), invite)
             .await
     }
 
-    pub async fn cell_act(&self, identity: PdnId, cell: CellId, act: Act) -> Result<Answer> {
+    pub async fn pod_act(&self, identity: PdnId, pod: PodId, act: Act) -> Result<Answer> {
         self.post(
-            &format!("{}/acts", cell_route(identity, cell)),
+            &format!("{}/acts", pod_route(identity, pod)),
             serde_json::to_vec(&act)?,
         )
         .await
@@ -316,12 +316,12 @@ impl Host {
     pub async fn place_record(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         kind: RecordKind,
         payload: &[u8],
     ) -> Result<RecordRef> {
         self.post(
-            &format!("{}/records?kind={kind}", cell_route(identity, cell)),
+            &format!("{}/records?kind={kind}", pod_route(identity, pod)),
             body(payload),
         )
         .await?
@@ -331,12 +331,12 @@ impl Host {
     pub async fn append_op(
         &self,
         identity: PdnId,
-        cell: CellId,
+        pod: PodId,
         record: RecordRef,
         op: &[u8],
     ) -> Result<Answer> {
         self.post(
-            &format!("{}/ops", record_route(identity, cell, record)),
+            &format!("{}/ops", record_route(identity, pod, record)),
             body(op),
         )
         .await
@@ -806,31 +806,31 @@ async fn poll_read(
     poll_route(host, &route, holds).await
 }
 
-pub fn cell_route(identity: PdnId, cell: CellId) -> String {
-    format!("/debug/identities/{identity}/cells/{cell}")
+pub fn pod_route(identity: PdnId, pod: PodId) -> String {
+    format!("/debug/identities/{identity}/pods/{pod}")
 }
 
-pub fn record_route(identity: PdnId, cell: CellId, record: RecordRef) -> String {
+pub fn record_route(identity: PdnId, pod: PodId, record: RecordRef) -> String {
     format!(
         "{}/records/{}/{}/{}",
-        cell_route(identity, cell),
+        pod_route(identity, pod),
         record.member,
         record.kind,
         record.id
     )
 }
 
-/// Poll until `identity`'s replica lists exactly `expected` as the cell's
+/// Poll until `identity`'s replica lists exactly `expected` as the pod's
 /// members, in any order.
 pub async fn members_read(
     host: &Host,
     identity: PdnId,
-    cell: CellId,
+    pod: PodId,
     expected: &[Member],
 ) -> Result<()> {
     let mut expected = expected.to_vec();
     expected.sort_by_key(|member| member.id);
-    let route = format!("{}/members", cell_route(identity, cell));
+    let route = format!("{}/members", pod_route(identity, pod));
     poll_route(host, &route, |answer| {
         answer.status == StatusCode::OK
             && serde_json::from_slice::<Members>(&answer.body).is_ok_and(|mut listed| {
@@ -839,17 +839,17 @@ pub async fn members_read(
             })
     })
     .await
-    .with_context(|| format!("{cell} never listed {expected:?} as its members for {identity}"))
+    .with_context(|| format!("{pod} never listed {expected:?} as its members for {identity}"))
 }
 
 pub async fn record_reads(
     host: &Host,
     identity: PdnId,
-    cell: CellId,
+    pod: PodId,
     record: RecordRef,
     expected: &[u8],
 ) -> Result<()> {
-    poll_route(host, &record_route(identity, cell, record), |answer| {
+    poll_route(host, &record_route(identity, pod, record), |answer| {
         answer.status == StatusCode::OK && answer.body == expected
     })
     .await
@@ -861,7 +861,7 @@ pub async fn record_reads(
 pub async fn ops_read(
     host: &Host,
     identity: PdnId,
-    cell: CellId,
+    pod: PodId,
     record: RecordRef,
     expected: &[(PdnId, &[u8])],
 ) -> Result<()> {
@@ -870,7 +870,7 @@ pub async fn ops_read(
         .map(|(writer, payload)| (*writer, payload.to_vec()))
         .collect();
     expected.sort();
-    let route = format!("{}/ops", record_route(identity, cell, record));
+    let route = format!("{}/ops", record_route(identity, pod, record));
     poll_route(host, &route, |answer| {
         answer.status == StatusCode::OK
             && serde_json::from_slice::<Operations>(&answer.body).is_ok_and(|read| {
@@ -887,16 +887,16 @@ pub async fn ops_read(
     .with_context(|| format!("the operations of {record:?} never read as expected for {identity}"))
 }
 
-/// Poll until `identity` lists `cell` when `held`, or lists it no more.
-pub async fn cell_listed(host: &Host, identity: PdnId, cell: CellId, held: bool) -> Result<()> {
-    let route = format!("/debug/identities/{identity}/cells");
+/// Poll until `identity` lists `pod` when `held`, or lists it no more.
+pub async fn pod_listed(host: &Host, identity: PdnId, pod: PodId, held: bool) -> Result<()> {
+    let route = format!("/debug/identities/{identity}/pods");
     poll_route(host, &route, |answer| {
         answer.status == StatusCode::OK
-            && serde_json::from_slice::<HeldCells>(&answer.body)
-                .is_ok_and(|listed| listed.cells.contains(&cell) == held)
+            && serde_json::from_slice::<HeldPods>(&answer.body)
+                .is_ok_and(|listed| listed.pods.contains(&pod) == held)
     })
     .await
-    .with_context(|| format!("{identity} never listed {cell} as held: {held}"))
+    .with_context(|| format!("{identity} never listed {pod} as held: {held}"))
 }
 
 /// Repeat a read of `route` until `holds`, carrying the last answer into the

@@ -1,8 +1,8 @@
-//! Sessions on a cell's stores, served by the member the caller
+//! Sessions on a pod's stores, served by the member the caller
 //! names: a sibling device by its identity's own directory, another member's
 //! device by that member's device statements, and every other caller refused
-//! as for an unhosted replica. The entries a cell's creation and its joins
-//! write arrive by the store-level writes the cells service performs, and
+//! as for an unhosted replica. The entries a pod's creation and its joins
+//! write arrive by the store-level writes the pods service performs, and
 //! the tickets by hand. The reconcile pass is set out of reach and the
 //! sessions a scenario asserts on are opened by name; where a refusal
 //! depends on what a device has not received, the devices it had sessions
@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    identity_of, AddrInfoOptions, AnnouncementKeyPair, CellStore, CellTickets, Contact, EventKind,
-    MemberDevice, MemberState, MembershipKey, NamespaceId, PrivateMetadataStore, Seq, SpawnOptions,
-    SyncNode, Verdict,
+    identity_of, AddrInfoOptions, AnnouncementKeyPair, Contact, EventKind, MemberDevice,
+    MemberState, MembershipKey, NamespaceId, PodStore, PodTickets, PrivateMetadataStore, Seq,
+    SpawnOptions, SyncNode, Verdict,
 };
-use pdn_types::{CellId, PdnId};
+use pdn_types::{PdnId, PodId};
 use test_utils::{eventually, host_identity, join_identity, wait_devices, TIMEOUT};
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -63,14 +63,14 @@ fn device_of(node: &SyncNode, identity: &Identity) -> Result<MemberDevice> {
 async fn write(
     node: &SyncNode,
     writer: &Identity,
-    cell: CellId,
+    pod: PodId,
     key: MembershipKey,
     payload: Vec<u8>,
 ) -> Result<()> {
-    node.write_cell_entry(
+    node.write_pod_entry(
         writer.id,
-        cell,
-        CellStore::Membership,
+        pod,
+        PodStore::Membership,
         &key.to_bytes(),
         &payload,
     )
@@ -80,7 +80,7 @@ async fn write(
 async fn statement(
     node: &SyncNode,
     writer: &Identity,
-    cell: CellId,
+    pod: PodId,
     member: &Identity,
     version: u64,
     devices: Vec<MemberDevice>,
@@ -90,19 +90,19 @@ async fn statement(
         version,
     };
     let payload = member.keys.device_statement(version, devices).encode();
-    write(node, writer, cell, key, payload).await
+    write(node, writer, pod, key, payload).await
 }
 
-/// `creator`'s cell on `node`: both stores, the founding event, the
+/// `creator`'s pod on `node`: both stores, the founding event, the
 /// creator's first device statement, and the tickets to both stores.
-async fn found(node: &SyncNode, creator: &Identity) -> Result<(CellId, CellTickets)> {
+async fn found(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
     let founding = creator.keys.founding([0x5a; 16]);
-    let cell = data_layer::cell_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
-    node.create_cell(creator.id, cell).await?;
+    let pod = data_layer::pod_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
+    node.create_pod(creator.id, pod).await?;
     write(
         node,
         creator,
-        cell,
+        pod,
         MembershipKey::founded(creator.id),
         founding.encode(),
     )
@@ -110,16 +110,16 @@ async fn found(node: &SyncNode, creator: &Identity) -> Result<(CellId, CellTicke
     statement(
         node,
         creator,
-        cell,
+        pod,
         creator,
         1,
         vec![device_of(node, creator)?],
     )
     .await?;
     let tickets = node
-        .share_cell_tickets(creator.id, cell, AddrInfoOptions::Addresses)
+        .share_pod_tickets(creator.id, pod, AddrInfoOptions::Addresses)
         .await?;
-    Ok((cell, tickets))
+    Ok((pod, tickets))
 }
 
 /// The invite act for `newcomer` at its sequence 1, naming `inviter`'s
@@ -129,7 +129,7 @@ async fn invite(
     node: &SyncNode,
     inviter: &Identity,
     inviter_seq: u64,
-    cell: CellId,
+    pod: PodId,
     newcomer: &Identity,
     newcomer_device: MemberDevice,
 ) -> Result<()> {
@@ -140,9 +140,9 @@ async fn invite(
         actor: inviter.id,
         actor_seq: Seq::new(inviter_seq),
     };
-    let join_statement = newcomer.keys.join_statement(&cell, Seq::new(1));
-    write(node, inviter, cell, key, join_statement.encode()).await?;
-    statement(node, inviter, cell, newcomer, 1, vec![newcomer_device]).await
+    let join_statement = newcomer.keys.join_statement(&pod, Seq::new(1));
+    write(node, inviter, pod, key, join_statement.encode()).await?;
+    statement(node, inviter, pod, newcomer, 1, vec![newcomer_device]).await
 }
 
 /// A session `from` opens with `to` on `namespace`, from the replica of
@@ -165,16 +165,16 @@ fn refused(result: Result<()>) -> bool {
     result.is_err_and(|err| format!("{err:#}").contains("NotFound"))
 }
 
-/// Whether `cell`'s stores come to have nothing in flight on every one of
+/// Whether `pod`'s stores come to have nothing in flight on every one of
 /// `nodes` — no exchange running, held or due to redial — in two reads in
 /// a row: a dial one node still makes lands on another between two reads.
-async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
+async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
     let deadline = std::time::Instant::now() + TIMEOUT;
     let mut quiet_reads = 0_u8;
     while std::time::Instant::now() < deadline {
         let mut in_flight = 0_usize;
         for node in nodes {
-            in_flight = in_flight.saturating_add(node.cell_syncs_in_flight_for_test(cell).await?);
+            in_flight = in_flight.saturating_add(node.pod_syncs_in_flight_for_test(pod).await?);
         }
         quiet_reads = if in_flight == 0 {
             quiet_reads.saturating_add(1)
@@ -189,8 +189,8 @@ async fn settle(nodes: &[&SyncNode], cell: CellId) -> Result<bool> {
     Ok(false)
 }
 
-async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnId) -> MemberState {
-    match node.cell_membership(holder, cell).await {
+async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> MemberState {
+    match node.pod_membership(holder, pod).await {
         Ok(membership) => membership
             .member(&member)
             .map(|member| member.state)
@@ -199,7 +199,7 @@ async fn state_on(node: &SyncNode, holder: PdnId, cell: CellId, member: PdnId) -
     }
 }
 
-/// A member's device is served both stores and folds the cell from nothing.
+/// A member's device is served both stores and folds the pod from nothing.
 /// Denied: the callee of its first dial, which it does not yet resolve to a
 /// member; a holder of both tickets that is no member, on either store; and
 /// the member itself once kicked, on the record store.
@@ -211,12 +211,12 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let (cell, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
         1,
-        cell,
+        pod,
         &bob,
         device_of(&bob_phone, &bob)?,
     )
@@ -226,19 +226,19 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         tickets.records.capability.id(),
     );
     let mut verdicts = alice_phone
-        .take_cell_verdicts()
+        .take_pod_verdicts()
         .expect("the verdict channel is taken once");
     // Refused while both import, so the imports' own dials bring them
     // nothing; Bob's phone out of both swarms and every device settled, so
     // the dials below are its only sessions.
-    alice_phone.refuse_cell_sessions_for_test(alice.id, true)?;
-    bob_phone.import_cell(bob.id, cell, tickets.clone()).await?;
-    dave_phone.import_cell(dave.id, cell, tickets).await?;
+    alice_phone.refuse_pod_sessions_for_test(alice.id, true)?;
+    bob_phone.import_pod(bob.id, pod, tickets.clone()).await?;
+    dave_phone.import_pod(dave.id, pod, tickets).await?;
     for namespace in [membership, records] {
         bob_phone.leave_swarm_for_test(bob.id, namespace).await?;
     }
-    assert!(settle(&[&alice_phone, &bob_phone, &dave_phone], cell).await?);
-    alice_phone.refuse_cell_sessions_for_test(alice.id, false)?;
+    assert!(settle(&[&alice_phone, &bob_phone, &dave_phone], pod).await?);
+    alice_phone.refuse_pod_sessions_for_test(alice.id, false)?;
 
     // A plain member's promotion of itself, carried to Alice's phone by the
     // second of the dials that follow.
@@ -249,13 +249,13 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         actor: bob.id,
         actor_seq: Seq::new(1),
     };
-    write(&bob_phone, &bob, cell, own_promotion, vec![0]).await?;
+    write(&bob_phone, &bob, pod, own_promotion, vec![0]).await?;
     let to_alice = Contact::new(alice_phone.dial_handle().addr(), identity_of(alice.id));
     let mut dials = bob_phone
-        .watch_cell_sessions(bob.id, cell, CellStore::Membership)
+        .watch_pod_sessions(bob.id, pod, PodStore::Membership)
         .await?;
     bob_phone
-        .sync_cell_with_for_test(bob.id, cell, CellStore::Membership, to_alice.clone())
+        .sync_pod_with_for_test(bob.id, pod, PodStore::Membership, to_alice.clone())
         .await?;
     assert!(
         dials
@@ -265,21 +265,21 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         "the member's first dial did not go through"
     );
     assert!(
-        eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, alice.id).await == OWNER) })
+        eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, alice.id).await == OWNER) })
             .await?,
-        "the member's device did not fold the cell from its first session"
+        "the member's device did not fold the pod from its first session"
     );
     // A joined event counts once its payload lands, which can trail the
     // founding event's.
     assert!(
-        eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, bob.id).await == PLAIN) })
+        eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, bob.id).await == PLAIN) })
             .await?,
         "the member's device did not count its own joined event"
     );
     // Denied: the callee of a dial whose member the dialer has not resolved
     // yet takes nothing from it.
     let promotion_key = own_promotion.to_bytes();
-    alice_phone.cell_membership(alice.id, cell).await?;
+    alice_phone.pod_membership(alice.id, pod).await?;
     let mut held_early = false;
     while let Ok(report) = verdicts.try_recv() {
         held_early |= report
@@ -292,11 +292,11 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         "the first dial served the callee before the dialer resolved its member"
     );
     bob_phone
-        .sync_cell_with_for_test(bob.id, cell, CellStore::Membership, to_alice)
+        .sync_pod_with_for_test(bob.id, pod, PodStore::Membership, to_alice)
         .await?;
     let judged = tokio::time::timeout(TIMEOUT, async {
         loop {
-            alice_phone.cell_membership(alice.id, cell).await?;
+            alice_phone.pod_membership(alice.id, pod).await?;
             while let Ok(report) = verdicts.try_recv() {
                 let found = report
                     .verdicts
@@ -314,7 +314,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         matches!(judged, Verdict::CountedForNothing(_)),
         "the plain member's promotion of itself counted: {judged:?}"
     );
-    assert_eq!(state_on(&alice_phone, alice.id, cell, bob.id).await, PLAIN);
+    assert_eq!(state_on(&alice_phone, alice.id, pod, bob.id).await, PLAIN);
 
     // Denied: the ticket holder that is no member.
     assert!(refused(
@@ -330,7 +330,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     ));
     assert_eq!(
         dave_phone
-            .cell_membership(dave.id, cell)
+            .pod_membership(dave.id, pod)
             .await?
             .identities()
             .count(),
@@ -359,7 +359,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         actor: alice.id,
         actor_seq: Seq::new(1),
     };
-    write(&alice_phone, &alice, cell, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
     assert!(refused(
         session(&bob_phone, bob.id, records, &alice_phone, alice.id, bob.id).await
     ));
@@ -388,18 +388,18 @@ async fn a_co_located_non_member_is_refused_where_its_node_mate_is_served() -> R
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let (cell, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
         1,
-        cell,
+        pod,
         &bob,
         device_of(&tablet, &bob)?,
     )
     .await?;
     let membership = tickets.membership.capability.id();
-    tablet.import_cell(bob.id, cell, tickets).await?;
+    tablet.import_pod(bob.id, pod, tickets).await?;
 
     // Denied: the co-located non-member, through the member's own replica.
     assert!(refused(
@@ -429,18 +429,18 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_directory) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let (cell, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
         1,
-        cell,
+        pod,
         &bob,
         device_of(&bob_phone, &bob)?,
     )
     .await?;
     let membership = tickets.membership.capability.id();
-    bob_phone.import_cell(bob.id, cell, tickets.clone()).await?;
+    bob_phone.import_pod(bob.id, pod, tickets.clone()).await?;
     session(
         &bob_phone,
         bob.id,
@@ -451,7 +451,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
     )
     .await?;
     assert!(
-        eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, alice.id).await == OWNER) })
+        eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, alice.id).await == OWNER) })
             .await?
     );
 
@@ -468,10 +468,8 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
         .await?,
         "the laptop's directory did not list both devices"
     );
-    bob_laptop
-        .import_cell(bob.id, cell, tickets.clone())
-        .await?;
-    dave_phone.import_cell(dave.id, cell, tickets).await?;
+    bob_laptop.import_pod(bob.id, pod, tickets.clone()).await?;
+    dave_phone.import_pod(dave.id, pod, tickets).await?;
 
     // Denied: the laptop, before any statement lists it.
     assert!(refused(
@@ -493,7 +491,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
 
     // The laptop's own statement: the phone and itself, under Bob's key.
     let devices = vec![device_of(&bob_phone, &bob)?, device_of(&bob_laptop, &bob)?];
-    statement(&bob_laptop, &bob, cell, &bob, 2, devices).await?;
+    statement(&bob_laptop, &bob, pod, &bob, 2, devices).await?;
     session(&bob_laptop, bob.id, membership, &bob_phone, bob.id, bob.id).await?;
     session(
         &bob_phone,
@@ -538,18 +536,18 @@ async fn wrongly_refused_without_anchoring_d19() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let (cell, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = found(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
         1,
-        cell,
+        pod,
         &bob,
         device_of(&bob_phone, &bob)?,
     )
     .await?;
     let membership = tickets.membership.capability.id();
-    bob_phone.import_cell(bob.id, cell, tickets.clone()).await?;
+    bob_phone.import_pod(bob.id, pod, tickets.clone()).await?;
     session(
         &bob_phone,
         bob.id,
@@ -560,23 +558,23 @@ async fn wrongly_refused_without_anchoring_d19() -> Result<()> {
     )
     .await?;
     assert!(
-        eventually(|| async { Ok(state_on(&bob_phone, bob.id, cell, bob.id).await == PLAIN) })
+        eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, bob.id).await == PLAIN) })
             .await?
     );
     // Out of the swarm and settled, so Carol's joined event reaches Alice's
     // phone only by the session named below.
     bob_phone.leave_swarm_for_test(bob.id, membership).await?;
-    assert!(settle(&[&alice_phone, &bob_phone], cell).await?);
+    assert!(settle(&[&alice_phone, &bob_phone], pod).await?);
     invite(
         &bob_phone,
         &bob,
         1,
-        cell,
+        pod,
         &carol,
         device_of(&carol_phone, &carol)?,
     )
     .await?;
-    carol_phone.import_cell(carol.id, cell, tickets).await?;
+    carol_phone.import_pod(carol.id, pod, tickets).await?;
 
     // Denied: Carol, before her joined event reaches Alice's phone.
     assert!(refused(
@@ -616,10 +614,8 @@ async fn wrongly_refused_without_anchoring_d19() -> Result<()> {
         "the newcomer was not served once its joined event arrived"
     );
     assert!(
-        eventually(|| async {
-            Ok(state_on(&carol_phone, carol.id, cell, carol.id).await == PLAIN)
-        })
-        .await?
+        eventually(|| async { Ok(state_on(&carol_phone, carol.id, pod, carol.id).await == PLAIN) })
+            .await?
     );
 
     for node in [alice_phone, bob_phone, carol_phone] {
@@ -637,15 +633,15 @@ async fn co_located_members_converge_and_a_co_located_ticket_holder_takes_nothin
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let (cell, tickets) = found(&tablet, &bob).await?;
-    invite(&tablet, &bob, 1, cell, &dave, device_of(&tablet, &dave)?).await?;
-    tablet.import_cell(dave.id, cell, tickets.clone()).await?;
-    tablet.import_cell(erin.id, cell, tickets).await?;
+    let (pod, tickets) = found(&tablet, &bob).await?;
+    invite(&tablet, &bob, 1, pod, &dave, device_of(&tablet, &dave)?).await?;
+    tablet.import_pod(dave.id, pod, tickets.clone()).await?;
+    tablet.import_pod(erin.id, pod, tickets).await?;
 
     assert!(
         eventually(|| async {
-            Ok(state_on(&tablet, dave.id, cell, bob.id).await == OWNER
-                && state_on(&tablet, dave.id, cell, dave.id).await == PLAIN)
+            Ok(state_on(&tablet, dave.id, pod, bob.id).await == OWNER
+                && state_on(&tablet, dave.id, pod, dave.id).await == PLAIN)
         })
         .await?,
         "the co-located member did not converge"
@@ -653,7 +649,7 @@ async fn co_located_members_converge_and_a_co_located_ticket_holder_takes_nothin
     // Sentinel: the passes that brought Dave the store reached Erin's pairs too.
     assert_eq!(
         tablet
-            .cell_membership(erin.id, cell)
+            .pod_membership(erin.id, pod)
             .await?
             .identities()
             .count(),

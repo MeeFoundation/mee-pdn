@@ -2,7 +2,7 @@
 //! by a kill with no grace — and started again on its own state directory,
 //! asserted to come back as the same node; a kill landing in the middle of
 //! a stream of acknowledged writes; a state directory that fills; and a
-//! member's node coming back with its cell, a cell it left staying left.
+//! member's node coming back with its pod, a pod it left staying left.
 //!
 //! A restart is asserted here and nowhere else: an in-process respawn
 //! proves nothing about a process that exits, and only a container carries
@@ -16,11 +16,11 @@ use std::sync::Arc;
 use anyhow::{ensure, Context as _, Result};
 use axum::http::StatusCode;
 use pdn_node::{PdnId, RecordKind};
-use pdn_node_http::shapes::{Act, Connections, HeldCells, HostedIdentities, Member, PeerGrants};
+use pdn_node_http::shapes::{Act, Connections, HeldPods, HostedIdentities, Member, PeerGrants};
 
 mod common;
 use common::{
-    body, cell_listed, cell_route, entry_reads, eventually, grant_on, members_read, record_reads,
+    body, entry_reads, eventually, grant_on, members_read, pod_listed, pod_route, record_reads,
     Host, Stand,
 };
 
@@ -452,39 +452,39 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
 }
 
 /// A member's node stopped and started again on its state directory hosts
-/// its cell again and reads a record placed while it was down, with no
-/// invite minted after the restart; a second cell it left before another
-/// restart stays left. Paired denial: a request addressing the left cell is
-/// refused beside the same request on the kept cell answering.
+/// its pod again and reads a record placed while it was down, with no
+/// invite minted after the restart; a second pod it left before another
+/// restart stays left. Paired denial: a request addressing the left pod is
+/// refused beside the same request on the kept pod answering.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-async fn a_member_node_comes_back_with_its_cell_and_a_left_cell_stays_left() -> Result<()> {
+async fn a_member_node_comes_back_with_its_pod_and_a_left_pod_stays_left() -> Result<()> {
     let stand = Stand::new();
     let alice_node = stand.spawn("alice").await?;
     let bob_node = stand.spawn("bob").await?;
     let alice = alice_node.create_identity().await?;
     let bob = bob_node.create_identity().await?;
-    let family = alice_node.create_cell(alice).await?;
-    let invite = alice_node.invite_to_cell(alice, family).await?;
-    bob_node.join_cell(bob, invite).await?.ok()?;
+    let family = alice_node.create_pod(alice).await?;
+    let invite = alice_node.invite_to_pod(alice, family).await?;
+    bob_node.join_pod(bob, invite).await?.ok()?;
 
     bob_node.stop().await?;
     let meanwhile = alice_node
         .place_record(alice, family, RecordKind::Claim, b"meanwhile")
         .await?;
     bob_node.start().await?;
-    cell_listed(&bob_node, bob, family, true).await?;
+    pod_listed(&bob_node, bob, family, true).await?;
     record_reads(&bob_node, bob, family, meanwhile, b"meanwhile")
         .await
         .context("the record placed while the member was down never reached it")?;
 
-    let wedding = alice_node.create_cell(alice).await?;
-    let invite = alice_node.invite_to_cell(alice, wedding).await?;
-    bob_node.join_cell(bob, invite).await?.ok()?;
-    bob_node.cell_act(bob, wedding, Act::Leave).await?.ok()?;
+    let wedding = alice_node.create_pod(alice).await?;
+    let invite = alice_node.invite_to_pod(alice, wedding).await?;
+    bob_node.join_pod(bob, invite).await?.ok()?;
+    bob_node.pod_act(bob, wedding, Act::Leave).await?.ok()?;
     bob_node.stop().await?;
     bob_node.start().await?;
-    // The kept cell served again first: the recovery that would bring the
+    // The kept pod served again first: the recovery that would bring the
     // left one back has run.
     let family_members = [
         Member {
@@ -497,21 +497,21 @@ async fn a_member_node_comes_back_with_its_cell_and_a_left_cell_stays_left() -> 
         },
     ];
     members_read(&bob_node, bob, family, &family_members).await?;
-    let held: HeldCells = bob_node
-        .get(&format!("/debug/identities/{bob}/cells"))
+    let held: HeldPods = bob_node
+        .get(&format!("/debug/identities/{bob}/pods"))
         .await?
         .json()?;
     ensure!(
-        !held.cells.contains(&wedding),
-        "the left cell came back with the restart: {held:?}"
+        !held.pods.contains(&wedding),
+        "the left pod came back with the restart: {held:?}"
     );
-    // Denied (the left cell).
+    // Denied (the left pod).
     let left = bob_node
-        .get(&format!("{}/members", cell_route(bob, wedding)))
+        .get(&format!("{}/members", pod_route(bob, wedding)))
         .await?;
     ensure!(
         left.status == StatusCode::CONFLICT,
-        "a cell left before the restart must be refused, got {}: {}",
+        "a pod left before the restart must be refused, got {}: {}",
         left.status,
         left.text()
     );
