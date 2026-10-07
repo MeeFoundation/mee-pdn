@@ -1435,7 +1435,7 @@ async fn a_pod_is_hosted_again_after_a_restart() -> Result<()> {
         .path()
         .join("identities")
         .join(bob.to_string())
-        .join("PMS");
+        .join("pms");
     let recorded = std::fs::read(&record)?;
     bob_tablet.shutdown().await?;
     drop(bob_tablet);
