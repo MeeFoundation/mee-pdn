@@ -96,13 +96,19 @@ run-image:
   BIND=${BIND:-127.0.0.1}
   docker run --rm -e PDN_DEBUG=1 -p "${BIND}:${PORT}:3011" {{ image }}
 
-# The live demo: several nodes on one network — Alice with two personas on a
-# phone plus a laptop, Bob and Carol with a phone and a laptop each — driven
-# through their debug surfaces while everything between them runs over the
-# runtimes' own protocols.
-[doc("Run the live demo across containers (needs docker)")]
-demo:
-  @sh scripts/run-demo.sh
+# The live demos: several nodes on one network, driven through their debug
+# surfaces while everything between them runs over the runtimes' own
+# protocols. Connections: Alice with two personas on a phone plus a laptop,
+# Bob and Carol with a phone and a laptop each, sharing through grants.
+[doc("Run the connections demo across containers (needs docker)")]
+demo-connections:
+  @sh scripts/run-demo.sh connections
+
+# Pods: Alice, Bob, Carol and Dave in one pod, which carries on while its
+# creator's devices are offline.
+[doc("Run the pods demo across containers (needs docker)")]
+demo-pods:
+  @sh scripts/run-demo.sh pods
 
 # The identity of the image a run tests: the content id the daemon gave the
 # build, rather than the tag that also names it. A tag is a name any build

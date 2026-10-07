@@ -12,8 +12,8 @@ use data_layer::{
 };
 use pdn_types::{NodeId, PodId, RecordId};
 use test_utils::{
-    join_identity,
-    pod::{device_of, found, host, invite, lists_device, reads, tickets, Person},
+    eventually, join_identity,
+    pod::{device_of, folds_nobody, found, host, invite, lists_device, reads, tickets, Person},
     wait_devices, TIMEOUT,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -110,6 +110,65 @@ async fn holds(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// A member's laptop whose first dials reached the member's phone before
+/// the phone's directory listed it is dialed by the phone once the listing
+/// arrives, and takes the pod. The phone joined on Alice's invite, so a
+/// dial a gossip neighbor prompts names Alice and is refused where only Bob
+/// is hosted; every pass is out of reach; and the listing is written only
+/// after the laptop's record store dial — which follows its membership
+/// store's — came back refused, so nothing but the listing reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -> Result<()> {
+    let (alice_phone, bob_phone, bob_laptop) = (node().await?, node().await?, node().await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, bob_directory) = host(&bob_phone).await?;
+    let pod = found(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    bob_phone
+        .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+        .await?;
+    assert!(eventually(|| async { Ok(!folds_nobody(&bob_phone, bob.id, pod).await?) }).await?);
+    let ticket = bob_directory
+        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
+    let laptop_directory = join_identity(&bob_laptop, bob.id, ticket).await?;
+    assert!(wait_devices(&laptop_directory, &[bob_phone.node_id()]).await?);
+    let tickets = tickets(&bob_phone, &bob, pod).await?;
+
+    let pause = bob_laptop.pause_next_pod_start_for_test();
+    let (imported, refused) = tokio::join!(bob_laptop.import_pod(bob.id, pod, tickets), async {
+        pause.reached.notified().await;
+        let sessions = bob_laptop
+            .watch_pod_sessions(bob.id, pod, PodStore::Records)
+            .await;
+        pause.release.notify_one();
+        let mut sessions = sessions?;
+        sessions.next_with(bob_phone.node_id(), true, TIMEOUT).await
+    });
+    imported?;
+    let refused = refused?.context("the laptop's record store never dialed the phone")?;
+    assert!(
+        refused.exchanged.is_err(),
+        "a phone that does not list the laptop served it"
+    );
+    assert!(folds_nobody(&bob_laptop, bob.id, pod).await?);
+
+    laptop_directory.add_device(bob_laptop.node_id()).await?;
+    assert!(wait_devices(&bob_directory, &[bob_laptop.node_id()]).await?);
+    assert!(
+        eventually(|| async { Ok(!folds_nobody(&bob_laptop, bob.id, pod).await?) }).await?,
+        "the phone did not dial the laptop its directory came to list"
+    );
+    Ok(())
 }
 
 /// Statements a member's devices write while out of reach of each other

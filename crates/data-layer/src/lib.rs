@@ -16,6 +16,7 @@
 //! are opaque payloads at this level. Errors are `anyhow`.
 
 mod access;
+mod address_book;
 mod announcement;
 pub mod connection_metadata;
 pub mod grant;

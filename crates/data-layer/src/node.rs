@@ -5,7 +5,7 @@
 //! point is protocol-agnostic: the ceremonies' semantics live in pdn-node.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     net::IpAddr,
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
@@ -39,6 +39,7 @@ use tokio::sync::watch;
 
 use crate::{
     access::{capability_ingest_validator, session_access_provider, AccessBook},
+    address_book::{AddressBook, ADDRESS_BOOK_INTERVAL},
     connection_metadata::ConnectionMetadataStore,
     pod::{
         departure_past, record_entries, record_prefix, unknown_entries, Member, MemberDevice,
@@ -316,6 +317,8 @@ pub struct SyncNode {
     /// Released by `shutdown` with the stores, or with the process. `None`
     /// on a memory node.
     directory_lock: Option<std::fs::File>,
+    /// `None` on a memory node, which comes back as nobody.
+    address_book: Option<Arc<AddressBook>>,
 }
 
 /// How a tracked doc re-syncs, independent of the binding's serving
@@ -608,9 +611,14 @@ impl SyncNode {
             }
         }
 
-        let (secret_key, directory_lock) = prepare_storage(&options.storage).await?;
+        let (secret_key, directory_lock, address_book) = prepare_storage(&options.storage).await?;
 
-        let endpoint = bind_endpoint(secret_key, options.connectivity).await?;
+        let endpoint = bind_endpoint(
+            secret_key,
+            options.connectivity,
+            address_book.as_ref().map(|book| book.lookup()),
+        )
+        .await?;
         let identities: Identities = Arc::default();
         // A memory node holds nothing an identity could come back for.
         let collecting = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
@@ -656,6 +664,14 @@ impl SyncNode {
             Arc::clone(&pass_probes),
             stop.clone(),
         ));
+        if let Some(book) = &address_book {
+            let _detached = tokio::spawn(keep_address_book(
+                Arc::clone(book),
+                router.endpoint().clone(),
+                Arc::clone(&identities),
+                stop.clone(),
+            ));
+        }
         let _detached = tokio::spawn(pod_reconcile_pass(
             options.pod_reconcile_interval,
             router.endpoint().id(),
@@ -688,6 +704,7 @@ impl SyncNode {
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
             co_located_requests,
             directory_lock,
+            address_book,
         })
     }
 
@@ -871,7 +888,9 @@ impl SyncNode {
     pub fn host_identity(&self, identity: PdnId, directory: &PrivateMetadataStore) -> Result<()> {
         let stack = self.require(identity)?;
         stack.access.arm_directory(directory.doc_handle())?;
-        stack.start_armed(directory.namespace())
+        stack.start_armed(directory.namespace())?;
+        watch_own_devices(&stack, self.router.endpoint().id(), directory.doc_handle());
+        Ok(())
     }
 
     /// The rollback counterpart of [`host_identity`](Self::host_identity):
@@ -2720,6 +2739,13 @@ impl SyncNode {
         {
             let _ = stop.send(());
         }
+        // While the endpoint still answers for its peers.
+        if let Some(book) = &self.address_book {
+            let peers = book_peers(&self.identities, self.router.endpoint().id()).await;
+            if let Err(err) = book.refresh(self.router.endpoint(), peers).await {
+                tracing::warn!("the address book was not saved at shutdown: {err:#}");
+            }
+        }
         // Everything below runs whatever the router answers: a stop that
         // returned early would leave every engine, the blob store and the
         // directory lock held for the rest of the process.
@@ -3282,20 +3308,25 @@ fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::
 /// lock, not the thread that opened it.
 async fn prepare_storage(
     storage: &StorageConfig,
-) -> Result<(Option<SecretKey>, Option<std::fs::File>)> {
+) -> Result<(
+    Option<SecretKey>,
+    Option<std::fs::File>,
+    Option<Arc<AddressBook>>,
+)> {
     let StorageConfig::Directory(directory) = storage else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
     let directory = directory.clone();
-    let (key, lock) = tokio::task::spawn_blocking(move || {
+    let (key, lock, book) = tokio::task::spawn_blocking(move || {
         provision_directory(&directory)?;
         let lock = lock_directory(&directory)?;
         let key = read_or_generate_node_key(&directory)?;
-        anyhow::Ok((key, lock))
+        let book = AddressBook::open(&directory);
+        anyhow::Ok((key, lock, book))
     })
     .await
     .context("the storage directory could not be provisioned")??;
-    Ok((Some(key), Some(lock)))
+    Ok((Some(key), Some(lock), Some(Arc::new(book))))
 }
 
 /// If `PDN_BIND_ADDR` holds an IP address the endpoint binds it with an
@@ -3306,6 +3337,7 @@ async fn prepare_storage(
 async fn bind_endpoint(
     secret_key: Option<SecretKey>,
     connectivity: Connectivity,
+    address_book: Option<iroh::address_lookup::MemoryLookup>,
 ) -> Result<Endpoint> {
     let builder = match connectivity {
         Connectivity::Direct => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
@@ -3316,6 +3348,10 @@ async fn bind_endpoint(
     };
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
+        None => builder,
+    };
+    let builder = match address_book {
+        Some(book) => builder.address_lookup(book),
         None => builder,
     };
     let builder = match std::env::var("PDN_BIND_ADDR") {
@@ -3330,6 +3366,49 @@ async fn bind_endpoint(
     let endpoint = builder.bind().await?;
     wait_until_dialable(&endpoint).await;
     Ok(endpoint)
+}
+
+/// Refresh the address book every [`ADDRESS_BOOK_INTERVAL`] until the
+/// node stops; `shutdown` takes the last refresh itself.
+async fn keep_address_book(
+    book: Arc<AddressBook>,
+    endpoint: Endpoint,
+    identities: Identities,
+    mut stop: watch::Receiver<()>,
+) {
+    while tokio::time::timeout(ADDRESS_BOOK_INTERVAL, stop.changed())
+        .await
+        .is_err()
+    {
+        let peers = book_peers(&identities, endpoint.id()).await;
+        if let Err(err) = book.refresh(&endpoint, peers).await {
+            tracing::warn!("the address book was not saved: {err:#}");
+        }
+    }
+}
+
+/// Every peer a hosted replica has synced with, as its store records them,
+/// or names as a contact; never this node.
+async fn book_peers(identities: &Identities, own: EndpointId) -> BTreeSet<EndpointId> {
+    let stacks: Vec<Arc<HostedStack>> = match identities.read() {
+        Ok(guard) => guard.values().cloned().collect(),
+        Err(_poisoned) => return BTreeSet::new(),
+    };
+    let mut peers = BTreeSet::new();
+    for stack in stacks {
+        for tracked in stack.tracked_snapshot() {
+            peers.extend(tracked.contacts.iter().map(|contact| contact.addr.id));
+            if let Ok(Some(synced)) = tracked.doc.get_sync_peers().await {
+                peers.extend(
+                    synced
+                        .iter()
+                        .filter_map(|peer| EndpointId::from_bytes(peer).ok()),
+                );
+            }
+        }
+    }
+    peers.remove(&own);
+    peers
 }
 
 /// No timeout: the local socket's address appears as soon as any transport
@@ -3605,6 +3684,72 @@ async fn derive_before_start(
             .await?;
     }
     Ok(())
+}
+
+/// Dial every store of the identity's pods toward each device its
+/// directory newly lists, as the identity: a sibling whose first dial came
+/// before its listing reached this device is refused, and nothing else
+/// dials it again before the pod stores' pass. Ends with the directory's
+/// subscription or the identity's half of the node.
+fn watch_own_devices(stack: &Arc<HostedStack>, node: EndpointId, directory: Doc) {
+    let stack = Arc::downgrade(stack);
+    let _detached = tokio::spawn(async move {
+        let Ok(events) = directory.subscribe().await else {
+            return;
+        };
+        // A burst can end with the stream, which panics when polled again.
+        let mut events = events.fuse();
+        let mut listed: HashSet<NodeId> = crate::private_metadata::listed_devices(&directory)
+            .await
+            .map(|devices| devices.into_iter().collect())
+            .unwrap_or_default();
+        while events.next().await.is_some() {
+            while let Some(Some(_queued)) = futures_lite::future::poll_once(events.next()).await {}
+            let Ok(now) = crate::private_metadata::listed_devices(&directory).await else {
+                continue;
+            };
+            let fresh: Vec<NodeId> = now
+                .iter()
+                .filter(|device| !listed.contains(*device))
+                .copied()
+                .collect();
+            listed.extend(now);
+            if fresh.is_empty() {
+                continue;
+            }
+            let Some(stack) = stack.upgrade() else {
+                return;
+            };
+            dial_own_devices(&stack, node, &fresh).await;
+        }
+    });
+}
+
+async fn dial_own_devices(stack: &HostedStack, node: EndpointId, devices: &[NodeId]) {
+    let own = stack.identity();
+    let contacts: Vec<Contact> = devices
+        .iter()
+        .filter_map(|device| EndpointId::from_bytes(device.as_bytes()).ok())
+        .filter(|device| *device != node)
+        .map(|device| Contact::new(EndpointAddr::new(device), own))
+        .collect();
+    if contacts.is_empty() {
+        return;
+    }
+    let Ok(pods) = stack.registry.pods() else {
+        return;
+    };
+    for (pod, held) in pods {
+        derive_pod_contacts(stack, node, pod, &held, &[]).await;
+        for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+            let Ok(Some(tracked)) = stack.tracked(doc.id()) else {
+                continue;
+            };
+            if let Err(err) = sync_pod_store(stack, &tracked, contacts.clone(), Vec::new()).await {
+                tracing::warn!(%pod, "dialing a newly listed device failed: {err:#}");
+            }
+        }
+    }
 }
 
 /// Derive `pod`'s contacts again whenever its membership store changes —

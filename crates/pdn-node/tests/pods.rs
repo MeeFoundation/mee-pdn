@@ -1471,6 +1471,42 @@ async fn a_pod_is_hosted_again_after_a_restart() -> Result<()> {
     Ok(())
 }
 
+/// A pod's creator restarted on its storage directory reads the claim a
+/// member placed while it was down: none of its tickets names the member's
+/// device, and its address book does. The wait is a sixth of the pod stores'
+/// pass, so the pass is not what delivers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_creator_reaches_its_member_again() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let alice_tablet = runtime_on(dir.path()).await?;
+    let bob_phone = memory_runtime().await?;
+    let alice = alice_tablet.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = pod_of_two(&alice_tablet, alice, &bob_phone, bob).await?;
+    let before = bob_phone
+        .pods()
+        .put_record(bob, pod, RecordKind::Claim, b"before")
+        .await?;
+    assert!(reads(&alice_tablet, alice, pod, before, b"before").await?);
+    alice_tablet.shutdown().await?;
+    drop(alice_tablet);
+
+    let meanwhile = bob_phone
+        .pods()
+        .put_record(bob, pod, RecordKind::Claim, b"meanwhile")
+        .await?;
+    let alice_tablet = runtime_on(dir.path()).await?;
+    assert!(
+        reads(&alice_tablet, alice, pod, meanwhile, b"meanwhile").await?,
+        "the restarted creator never reached its member"
+    );
+
+    for runtime in [alice_tablet, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// Two members hosted on one node come back from a restart each with its
 /// own copy of their pod, and a record one places reaches the other with no
 /// other node reachable; a pod the second left before the restart stays

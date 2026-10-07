@@ -184,7 +184,7 @@ fn debug_routes() -> Router<Arc<Runtime>> {
         )
 }
 
-/// The one human-readable probe; the demo script leans on it.
+/// The one human-readable probe; the demo scripts lean on it.
 async fn debug_status(
     State(runtime): State<Arc<Runtime>>,
     Query(shapes::NoQuery {}): Query<shapes::NoQuery>,

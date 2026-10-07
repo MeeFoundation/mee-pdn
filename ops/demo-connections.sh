@@ -1,9 +1,9 @@
 #!/bin/sh
-# The demo's narration: one person with two personas, two counterparties, a
-# phone and a laptop each. Every step says what it is doing before it does
-# it, and the nodes are driven over HTTP alone — what passes between them is
-# the runtimes' own traffic, and a ceremony payload travels through here the
-# way a code travels between two screens through a person.
+# The connections demo's narration: one person with two personas, two
+# counterparties, a phone and a laptop each. Every step says what it is doing
+# before it does it, and the nodes are driven over HTTP alone — what passes
+# between them is the runtimes' own traffic, and a ceremony payload travels
+# through here the way a code travels between two screens through a person.
 #
 # Reads the seven base URLs from the environment so the same narration can be
 # pointed at containers, at processes, or at anything else that serves the
@@ -13,7 +13,7 @@ set -eu
 # The restart step acts on one container through the compose project; a
 # narration pointed at something else — bare processes, say — sets
 # `DEMO_COMPOSE=none` and the step is skipped.
-DEMO_COMPOSE=${DEMO_COMPOSE:-docker compose -f ops/compose.yml}
+DEMO_COMPOSE=${DEMO_COMPOSE:-docker compose -f ops/compose-connections.yml}
 
 ALICE_PHONE=${ALICE_PHONE:-http://127.0.0.1:3011}
 ALICE_WORK_LAPTOP=${ALICE_WORK_LAPTOP:-http://127.0.0.1:3012}
@@ -23,66 +23,8 @@ BOB_LAPTOP=${BOB_LAPTOP:-http://127.0.0.1:3015}
 CAROL_PHONE=${CAROL_PHONE:-http://127.0.0.1:3016}
 CAROL_LAPTOP=${CAROL_LAPTOP:-http://127.0.0.1:3017}
 
-# Colour is for the room, so it follows the terminal rather than the script:
-# off when the output is a file or a pipeline, on when a person is watching.
-# `DEMO_COLOR=always` forces it for a recording, `never` for a transcript.
-case "${DEMO_COLOR:-auto}" in
-  always) tint=1 ;;
-  never) tint=0 ;;
-  *) [ -t 1 ] && tint=1 || tint=0 ;;
-esac
-if [ "$tint" = 1 ]; then
-  STEP=$(printf '\033[1;36m'); FACT=$(printf '\033[2m')
-  VALUE=$(printf '\033[32m'); OFF=$(printf '\033[0m')
-else
-  STEP=; FACT=; VALUE=; OFF=
-fi
-
-say() { printf '\n%s%s%s\n' "$STEP" "$*" "$OFF"; }
-
-# One observed fact under a step: the sentence dim, whatever was actually
-# read in colour, so a room can follow the values without reading the prose.
-fact() { printf '  %s%s%s\n' "$FACT" "$*" "$OFF"; }
-shown() { printf '  %s%s%s%s%s\n' "$FACT" "$1" "$OFF$VALUE" "$2" "$OFF"; }
-
-# One request with its status and body apart, in `code` and `body`: `-w`
-# appends the status to the body as its last three characters, `000` when
-# nothing answered.
-request() { # curl args...
-  out=$(curl -s -w '%{http_code}' "$@") || out=000
-  code=${out#"${out%???}"}
-  body=${out%???}
-}
-
-# Every call a step makes is checked: a refused one stops the show there,
-# with the node's own answer, instead of surfacing minutes later as a read
-# that never arrives. The answer goes to stdout, for the step to keep in a
-# variable of its own; inside `$(…)` the exit ends only the subshell, and the
-# failed assignment ends the script under `set -e`. The ceiling sits above
-# the longest call, a link bounded at 120 seconds.
-call() { # method url [curl args...]
-  method=$1 url=$2
-  shift 2
-  request -m 150 -X "$method" "$url" "$@"
-  case "$code" in
-    2??) printf '%s' "$body" ;;
-    000) echo "  $method $url: no answer" >&2; exit 1 ;;
-    *) echo "  $method $url answered $code: $body" >&2; exit 1 ;;
-  esac
-}
-
-# Every node answers liveness before the first step, so a slow start is not
-# mistaken for a broken one later.
-wait_live() {
-  for _ in $(seq 1 200); do
-    # A ceiling on one probe, without which an address nothing answers on
-    # holds each attempt open for minutes and the budget above means nothing.
-    curl -sf -m 2 "$1/live" >/dev/null 2>&1 && return 0
-    sleep 0.25
-  done
-  echo "no answer from $1" >&2
-  exit 1
-}
+# shellcheck source-path=SCRIPTDIR source=demo-common.sh
+. "$(dirname "$0")/demo-common.sh"
 
 # Poll a read until it carries the expected bytes. Repeating the read is the
 # only wait the surface offers — nothing here forces a reconciliation. An
@@ -102,11 +44,6 @@ reads() { # url reader issuer path expected label
   done
   echo "  $6 never saw \"$5\"" >&2
   exit 1
-}
-
-new_identity() { # url
-  CREATED=$(call POST "$1/debug/identities") || exit 1
-  printf '%s\n' "$CREATED" | sed -E 's/.*"identity":"([^"]+)".*/\1/'
 }
 
 printf '\n'
@@ -139,24 +76,12 @@ call POST "$CAROL_PHONE/debug/identities/$CAROL/establish" --data-raw "$LEISURE_
 fact "Carol is now a connection of Alice at leisure"
 
 say "Everyone adds a laptop. A device belongs to an identity, not to a person, so Alice adds one per persona."
-link_laptop() { # identity from to label
-  LINKING_INVITE=$(call POST "$2/debug/identities/$1/linking-invite") || exit 1
-  call POST "$3/debug/link?timeout_secs=120" --data-raw "$LINKING_INVITE" >/dev/null
-  fact "$4"
-}
-link_laptop "$AT_WORK" "$ALICE_PHONE" "$ALICE_WORK_LAPTOP" "Alice's work laptop joined Alice at work"
-link_laptop "$AT_LEISURE" "$ALICE_PHONE" "$ALICE_LEISURE_LAPTOP" "Alice's leisure laptop joined Alice at leisure"
-link_laptop "$BOB" "$BOB_PHONE" "$BOB_LAPTOP" "Bob's laptop joined"
-link_laptop "$CAROL" "$CAROL_PHONE" "$CAROL_LAPTOP" "Carol's laptop joined"
+link_device "$AT_WORK" "$ALICE_PHONE" "$ALICE_WORK_LAPTOP" "Alice's work laptop joined Alice at work"
+link_device "$AT_LEISURE" "$ALICE_PHONE" "$ALICE_LEISURE_LAPTOP" "Alice's leisure laptop joined Alice at leisure"
+link_device "$BOB" "$BOB_PHONE" "$BOB_LAPTOP" "Bob's laptop joined"
+link_device "$CAROL" "$CAROL_PHONE" "$CAROL_LAPTOP" "Carol's laptop joined"
 
 say "Each laptop hosts exactly the persona it joined — asked of the laptop itself."
-hosts() { # url identity label persona
-  HOSTED=$(call GET "$1/debug/identities") || exit 1
-  case "$HOSTED" in
-    *"$2"*) shown "$3 hosts " "$4" ;;
-    *) echo "  $3 does not host $4" >&2; exit 1 ;;
-  esac
-}
 hosts "$ALICE_WORK_LAPTOP" "$AT_WORK" "Alice's work laptop" "Alice at work"
 hosts "$ALICE_LEISURE_LAPTOP" "$AT_LEISURE" "Alice's leisure laptop" "Alice at leisure"
 
@@ -191,10 +116,6 @@ reads "$ALICE_LEISURE_LAPTOP" "$AT_LEISURE" "$AT_LEISURE" "contact/email" "alice
 
 if [ "$DEMO_COMPOSE" != "none" ]; then
   say "Bob's laptop is stopped — and started again. Its state is on disk, so what comes back is the same device."
-  node_id() { # url
-    STATUS=$(call GET "$1/debug/status") || exit 1
-    printf '%s\n' "$STATUS" | sed -n 's/^node //p'
-  }
   BEFORE=$(node_id "$BOB_LAPTOP")
   $DEMO_COMPOSE stop bob-laptop >/dev/null 2>&1
   $DEMO_COMPOSE start bob-laptop >/dev/null 2>&1

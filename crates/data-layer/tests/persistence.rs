@@ -376,6 +376,30 @@ async fn a_malformed_key_file_stops_the_start_and_is_not_replaced() -> Result<()
     Ok(())
 }
 
+/// An address book that does not parse starts the node anyway, as the
+/// same node, and the shutdown writes over it a book that reads back. The
+/// contrast with the key file above: the key is the node, the book a hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_address_book_starts_the_node_and_is_replaced() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let id = first.node_id();
+    first.shutdown().await?;
+    drop(first);
+
+    let book = dir.path().join("peers");
+    std::fs::write(&book, b"not a book")?;
+    let again = node_on(dir.path()).await?;
+    assert_eq!(again.node_id(), id, "the unreadable book changed the node");
+    again.shutdown().await?;
+    let written: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&book)?)?;
+    assert!(
+        written.is_empty(),
+        "a node with no peers wrote a book naming some: {written:?}"
+    );
+    Ok(())
+}
+
 /// A staging file left by a start that died while minting the key does not
 /// block the next one, and is gone afterwards. The staged name is fixed
 /// rather than derived from the process id, so on a container — always
