@@ -775,7 +775,6 @@ async fn test_sync_via_relay() -> Result<()> {
 
 #[tokio::test]
 #[traced_test]
-#[ignore = "flaky"]
 #[cfg(feature = "fs-store")]
 async fn sync_restart_node() -> Result<()> {
     use crate::util::endpoint;
@@ -1055,7 +1054,6 @@ async fn test_download_policies() -> Result<()> {
 /// Test sync between many nodes with propagation through sync reports.
 #[tokio::test(flavor = "multi_thread")]
 #[traced_test]
-#[ignore = "flaky"]
 async fn sync_big() -> Result<()> {
     let mut rng = test_rng(b"sync_big");
     let n_nodes = std::env::var("NODES")

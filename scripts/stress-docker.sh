@@ -31,24 +31,10 @@ mkdir -p target/tmp
 rm -rf "$logs"
 : > "$replaced_log"
 status=0
-# The runner's output is captured beside being shown: under
-# `--stress-count` with `--no-fail-fast` the runner has been seen exiting
-# zero while its own summary counted failed iterations, and a hunt that
-# trusted the exit code alone then threw away exactly the evidence it
-# exists to keep. The file is read back below; the `tail` is the live
-# view, ended once the run is.
+# Kept with the nodes' logs when the hunt catches something.
 run_log="target/tmp/stand-hunt-run.log"
-: > "$run_log"
-tail -f "$run_log" &
-tail_pid=$!
-cargo nextest run --profile "$(sh scripts/stand-profile.sh)" -p pdn-node-http -E 'binary(~stand)' \
-  --run-ignored all --stress-count "$count" --no-fail-fast "$@" >"$run_log" 2>&1 || status=$?
-kill "$tail_pid" 2>/dev/null || true
-wait "$tail_pid" 2>/dev/null || true
-if [ "$status" -eq 0 ] && grep -qE '[1-9][0-9]* failed' "$run_log"; then
-  echo "hunt: the runner exited clean while its summary counted failures — counting them"
-  status=1
-fi
+sh scripts/stress-run.sh "$run_log" --profile "$(sh scripts/stand-profile.sh)" -p pdn-node-http -E 'binary(~stand)' \
+  --run-ignored all --stress-count "$count" --no-fail-fast "$@" || status=$?
 replaced=$(grep -c 'never answered and was replaced' "$replaced_log" 2>/dev/null || true)
 echo
 echo "hunt: $count iterations requested, containers replaced: ${replaced:-0}"

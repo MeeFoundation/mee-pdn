@@ -24,7 +24,7 @@ A hash of this crate's own history dated before 2026-08-25 belongs to the former
 
 ## 2026-07-30 · `ad80e69` · Floris Bruynooghe · chore: run scheduled CI jobs earlier (#115)
 
-**Not applicable.** Upstream's own workflow files and lockfile. The crate carries no workflows in this workspace — the pipeline's `store` job runs its checks, and the nightly workflow runs its tests marked `#[ignore = "flaky"]`.
+**Not applicable.** Upstream's own workflow files and lockfile. The crate carries no workflows in this workspace — the pipeline's `store` job runs its checks, and the nightly workflow repeats its integration tests with the workspace's scenarios.
 
 ## 2026-07-15 · `b53c317` · Franz Heinzmann · fix: don't abort receive loop on invalid message (#110)
 
