@@ -238,9 +238,9 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     Ok(())
 }
 
-/// No device is the founder: the grant is published from the linked device,
-/// so the ticket names the laptop, and the audience converges from the
-/// founder through the published device set.
+/// A grant published from the linked device reaches past it: the ticket
+/// names the laptop, and the audience converges from the first device
+/// through the published device set.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -272,24 +272,24 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     );
     assert!(
         claim_arrives(&rt_phone, alice, alice, &email, b"v1").await?,
-        "the claim did not replicate to the founder"
+        "the claim did not replicate to the first device"
     );
     let phone_id = rt_phone.node_id();
     assert!(
         eventually(|| async { contact_present(&rt_bob, bob, alice, phone_id).await }).await?,
-        "the founder never entered the audience replica's contacts"
+        "the first device never entered the audience replica's contacts"
     );
     assert!(
         serving_ready(&rt_phone, alice, bob, alice).await?,
         "the grant record never reached the device that must serve by it"
     );
 
-    // The publishing device goes offline; the founder writes the update.
+    // The publishing device goes offline; the first device writes the update.
     rt_laptop.shutdown().await?;
     rt_phone.data().write(alice, alice, &email, b"v2").await?;
     assert!(
         claim_arrives(&rt_bob, bob, alice, &email, b"v2").await?,
-        "the audience did not converge from the founder past the publishing laptop"
+        "the audience did not converge from the first device past the publishing laptop"
     );
 
     rt_phone.shutdown().await?;

@@ -1,6 +1,6 @@
 //! Device linking end to end: the linking dialogue between in-process
 //! runtimes (the payload passed as a value), the full store set the reply
-//! bootstraps, the non-founder chain, the refusal pairs of the
+//! bootstraps, the chain through a linked device, the refusal pairs of the
 //! verify-and-burn requirement — each probed for no observable state on
 //! either side — lost-reply convergence, the rollback of a link that could
 //! not catch up, per-identity isolation across several linkings, the
@@ -103,9 +103,9 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     // Fixtures that predate the linking, authored on A.
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_peer, p, &rt_a, x, invite).await?;
-    let founder_path = EntryPath::new("contact/name")?;
+    let first_device_path = EntryPath::new("contact/name")?;
     rt_a.data()
-        .write(x, x, &founder_path, b"from-founder")
+        .write(x, x, &first_device_path, b"from-first-device")
         .await?;
 
     // Bearer-free: format version, the inviting device's address, the
@@ -144,11 +144,11 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     // The full store set.
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, x, &founder_path).await?.as_deref()
-                == Some(&b"from-founder"[..]))
+            Ok(rt_b.data().read(x, x, &first_device_path).await?.as_deref()
+                == Some(&b"from-first-device"[..]))
         })
         .await?,
-        "the founder's entry did not reach the newcomer's data namespace"
+        "the first device's entry did not reach the newcomer's data namespace"
     );
     let newcomer_path = EntryPath::new("contact/email")?;
     rt_b.data()
@@ -160,7 +160,7 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
                 == Some(&b"from-newcomer"[..]))
         })
         .await?,
-        "the newcomer's entry did not reach the founder"
+        "the newcomer's entry did not reach the first device"
     );
 
     probe_node.shutdown().await?;
@@ -210,7 +210,7 @@ async fn pdn_id_derives_from_the_announcement_key_on_every_device() -> Result<()
 /// mint a write ticket for the data namespace only because its own linking
 /// reply imported one.
 #[tokio::test(flavor = "multi_thread")]
-async fn linking_through_a_non_founder_device() -> Result<()> {
+async fn linking_through_a_linked_device() -> Result<()> {
     let rt_1 = memory_runtime().await?;
     let rt_2 = memory_runtime().await?;
     let rt_3 = memory_runtime().await?;
@@ -218,7 +218,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;
     rt_1.data().write(x, x, &path, b"Acme Engineering").await?;
 
-    // Device 2 links from the founder; device 3 from device 2.
+    // Device 2 links from the first device; device 3 from device 2.
     link_patiently(&rt_2, &rt_1, x).await?;
     link_patiently(&rt_3, &rt_2, x).await?;
 
@@ -228,7 +228,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
             Ok(rt_3.data().read(x, x, &path).await?.as_deref() == Some(&b"Acme Engineering"[..]))
         })
         .await?,
-        "data did not reach the third device through the non-founder chain"
+        "data did not reach the third device through the linked device"
     );
 
     // Probed from a raw linked node, itself a fourth device.
@@ -263,7 +263,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     let path = EntryPath::new("contact/name")?;
 
     // The no-state probe: X's directory from a raw linked node; baseline is
-    // the founder, the probe, and the data kind.
+    // the first device, the probe, and the data kind.
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     let baseline_kinds = vec!["data".to_owned()];
     assert!(
@@ -480,7 +480,7 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
     assert!(
         wait_devices(&probe_dir, &[rt_a.node_id()]).await?,
-        "the probe did not sync the founder's device record"
+        "the probe did not sync the first device's record"
     );
 
     // The vanishing dialer: presents a live secret, never reads the reply.
@@ -495,7 +495,7 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
         wait_pending_devices(&probe_dir, &[vanisher_id]).await?,
         "the registration must exist on the inviter although the reply was never read"
     );
-    // Pending is all it is: the device set holds the founder and the probe
+    // Pending is all it is: the device set holds the first device and the probe
     // alone.
     assert!(
         wait_devices_exactly(&probe_dir, &[rt_a.node_id(), probe_node.node_id()]).await?,

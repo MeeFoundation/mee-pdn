@@ -61,7 +61,7 @@ async fn import_data_from(from: &SyncNode, to: &mut SyncNode, issuer: PdnId) -> 
 }
 
 /// The tablet joins the work identity from tickets the laptop minted, not
-/// the founder: state authored on the phone reaches it transitively, a
+/// the first device: state authored on the phone reaches it transitively, a
 /// live update crosses the three-device swarm, the device sets end up
 /// asymmetric (work: three, leisure: two), and the tablet knows nothing of
 /// the leisure identity.
@@ -145,7 +145,7 @@ async fn three_devices_two_identities() -> Result<()> {
         "a live work update did not reach the tablet"
     );
 
-    // The work device set converges to all three — on the founder too.
+    // The work device set converges to all three — on the first device too.
     let all = [phone_id, laptop_id, tablet_id];
     assert!(
         wait_devices(&work_tablet_dir, &all).await?,
