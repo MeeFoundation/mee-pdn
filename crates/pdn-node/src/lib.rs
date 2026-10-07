@@ -10,6 +10,7 @@ pub mod data;
 pub mod identity;
 pub mod linking;
 pub mod pairing;
+pub mod pods;
 pub mod retraction;
 pub mod runtime;
 pub mod sync;
@@ -19,10 +20,17 @@ pub use connections::{
     RuntimeConnectionsService,
 };
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
+pub use pods::{
+    ActRefusal, ActRefused, AnnouncementKeyPending, JoinInProgress, JoinRefused, JoinTimeout,
+    PodAct, PodInfo, PodInvite, PodMember, PodsService, RecordPlacedOnce, RuntimePodsService,
+    UnknownRecord, UnsupportedPodInviteVersion, WrongRecordKind, JOIN_CATCH_UP_TIMEOUT,
+    JOIN_DIALOGUE_TIMEOUT, LEAVE_FLUSH_TIMEOUT, POD_INVITE_FORMAT_VERSION,
+};
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use data_layer::{
-    claim_id_of, CatchUpTimeout, DirectoryHeld, DocTicket, GrantedClaim, GranteeCannotShare,
-    ReadGrant, ShareMode, SpawnOptions, StorageConfig, UnknownIssuer,
+    claim_id_of, CatchUpTimeout, DirectoryHeld, DocTicket, GrantedClaim, GranteeCannotShare, OpId,
+    Operation, PodStore, ReadGrant, ShareMode, SpawnOptions, StorageConfig, UnknownEntry,
+    UnknownIssuer, UnknownPod,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
@@ -33,7 +41,9 @@ pub use pairing::{
     EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, InvitePayload,
     InviterUnreachable, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
 };
-pub use pdn_types::{ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId};
+pub use pdn_types::{
+    ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId, PodId, RecordId, RecordKind, RecordRef,
+};
 pub use retraction::RetractionEvent;
 pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};

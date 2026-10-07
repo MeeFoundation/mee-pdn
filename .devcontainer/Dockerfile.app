@@ -16,7 +16,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker CLI from the official repository: testcontainers drives the daemon
-# through it, and the demo brings its nodes up with the compose plugin.
+# through it, and the demos bring their nodes up with the compose plugin.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && install -m 0755 -d /etc/apt/keyrings \

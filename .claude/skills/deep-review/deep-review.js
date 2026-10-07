@@ -189,7 +189,7 @@ const PROPOSALS_SCHEMA = {
 }
 
 const LANG = A.language
-  ? `\n\nWrite every prose field of your answer in ${A.language}. Identifiers, paths, and type names stay exactly as they are in the code. Never translate these domain terms: capability, connection metadata store / CMS, private metadata store / PMS, claim, lock, race, identity, audience, connection, binder, session, snapshot, ingress, egress.`
+  ? `\n\nWrite every prose field of your answer in ${A.language}. Identifiers, paths, and type names stay exactly as they are in the code. Never translate the platform terms the root CLAUDE.md lists under "Platform terms keep their English names", inflected the way it says, nor ingress and egress.`
   : ''
 const CTX = A.context ? `\n\nContext from the user, to be honoured verbatim:\n${A.context}\n` : ''
 const NORUN = `\n\nOn running things. You ARE expected to run the one named test that settles a finding — \`just test -E 'test(<name>)'\`, or the scope-appropriate equivalent in a nested repository — whenever a verdict turns on whether a path is reachable or a test is vacuous. Read-only build queries are equally welcome and cost nothing: cargo tree -e features, cargo metadata, a grep over Cargo.toml. Runs like these are what separate a demonstrated finding from a plausible one, and the last three runs of this command executed nothing at all, which is the failure this paragraph exists to prevent. Never assert what a run or a feature lane WOULD produce without running it: either run it, or say in evidence that the claim was derived by reading.

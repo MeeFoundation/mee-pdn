@@ -75,7 +75,7 @@ jobs:
 
   stand:
     runs-on: ubuntu-26.04
-    # A release image build plus the container suite and the demo. Past this
+    # A release image build plus the container suite and the demos. Past this
     # the job is stuck rather than slow, and the runner's own ceiling is six
     # hours.
     timeout-minutes: 30
@@ -125,13 +125,21 @@ jobs:
           export PDN_STAND_IMAGE
           cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all
 
-      # The demo from the same image, whatever the scenarios returned: it
-      # drives the whole debug surface in order, and nothing else notices when
-      # a route moves under it.
-      - name: Run the demo
+      # The demos from the same image, whatever the scenarios returned: they
+      # drive the whole debug surface in order, and nothing else notices when
+      # a route moves under them. Each runs whatever the other returned.
+      - name: Run the connections demo
         if: ${{ !cancelled() && steps.image.outcome == 'success' }}
         run: |
           PDN_STAND_IMAGE="$(just stand-image)"
           [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
           export PDN_STAND_IMAGE
-          just demo
+          just demo-connections
+
+      - name: Run the pods demo
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
+        run: |
+          PDN_STAND_IMAGE="$(just stand-image)"
+          [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
+          export PDN_STAND_IMAGE
+          just demo-pods

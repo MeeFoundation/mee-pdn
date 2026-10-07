@@ -43,7 +43,7 @@ pub(crate) async fn linking_invite(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<LinkingPayload>, HostError> {
     let lifetime: Lifetime = parse::query(raw_query.as_deref(), "linking invite query")?;
-    let identity = parse::id(&identity, "identity")?;
+    let identity = parse::segment(&identity, "identity")?;
     let payload = runtime
         .identity()
         .linking_invite(identity, lifetime.as_duration()?)

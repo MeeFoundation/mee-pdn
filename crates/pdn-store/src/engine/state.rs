@@ -1,13 +1,12 @@
 use std::{cmp::Ordering, collections::BTreeMap};
 
-use anyhow::Result;
 use iroh::EndpointId;
-use n0_future::time::{Instant, SystemTime};
+use n0_future::time::SystemTime;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
-    net::{AbortReason, AcceptOutcome, SyncFinished},
+    net::{AbortReason, AcceptOutcome},
     Identity, NamespaceId,
 };
 
@@ -69,6 +68,26 @@ impl NamespaceStates {
     /// Are we syncing this namespace?
     pub fn is_syncing(&self, namespace: &NamespaceId) -> bool {
         self.0.contains_key(namespace)
+    }
+
+    /// Whether an exchange of `namespace` with `counterpart` is running,
+    /// dialed or accepted.
+    pub fn is_running(&self, namespace: &NamespaceId, counterpart: Counterpart) -> bool {
+        self.0
+            .get(namespace)
+            .and_then(|state| state.nodes.get(&counterpart))
+            .is_some_and(|peer| matches!(peer.state, SyncState::Running { .. }))
+    }
+
+    /// The exchanges of `namespace` running, dialed or accepted.
+    pub fn running(&self, namespace: &NamespaceId) -> usize {
+        self.0.get(namespace).map_or(0, |state| {
+            state
+                .nodes
+                .values()
+                .filter(|peer| matches!(peer.state, SyncState::Running { .. }))
+                .count()
+        })
     }
 
     /// Insert a namespace into the set of syncing namespaces.
@@ -145,10 +164,9 @@ impl NamespaceStates {
         node: EndpointId,
         counterpart: Identity,
         origin: &Origin,
-        result: Result<SyncFinished>,
     ) -> Option<(SystemTime, bool)> {
         let state = self.entry(namespace, (node, counterpart))?;
-        state.finish(origin, result)
+        state.finish(origin)
     }
 
     /// Set whether a [`super::live::Event::PendingContentReady`] may be emitted once the pending queue
@@ -201,22 +219,21 @@ impl NamespaceStates {
 struct PeerState {
     state: SyncState,
     resync_requested: bool,
-    last_sync: Option<(Instant, Result<SyncFinished>)>,
 }
 
 impl PeerState {
-    fn finish(
-        &mut self,
-        origin: &Origin,
-        result: Result<SyncFinished>,
-    ) -> Option<(SystemTime, bool)> {
+    fn finish(&mut self, origin: &Origin) -> Option<(SystemTime, bool)> {
         let start = match &self.state {
             SyncState::Running {
                 start,
-                origin: origin2,
+                origin: running,
             } => {
-                if origin2 != origin {
-                    warn!(actual = ?origin, expected = ?origin2, "finished sync origin does not match state")
+                // Another exchange holds the slot: an accept this side refused
+                // never took it, and a dial the tie-break superseded leaves
+                // the accept that took it over to finish it.
+                if matches!(running, Origin::Accept) != matches!(origin, Origin::Accept) {
+                    debug!(finished = ?origin, ?running, "finish of an exchange not running");
+                    return None;
                 }
                 Some(*start)
             }
@@ -229,7 +246,6 @@ impl PeerState {
             }
         };
 
-        self.last_sync = Some((Instant::now(), result));
         self.state = SyncState::Idle;
         start.map(|s| (s, self.resync_requested))
     }
@@ -240,11 +256,17 @@ impl PeerState {
             // never run two syncs at the same time
             SyncState::Running { .. } => {
                 debug!("abort connect: sync already running");
-                // A reason that says "there is news" is queued rather than
-                // dropped: the running exchange serves a view frozen before
-                // that news, so without the replay it travels no earlier
-                // than the next periodic trigger.
-                if matches!(reason, SyncReason::SyncReport | SyncReason::Announced) {
+                // A dial the consumer asked for, news prompted or a new
+                // neighbor prompted is queued rather than dropped: the
+                // running exchange began before the ask and may carry
+                // nothing written since.
+                if matches!(
+                    reason,
+                    SyncReason::DirectJoin
+                        | SyncReason::SyncReport
+                        | SyncReason::Announced
+                        | SyncReason::NewNeighbor
+                ) {
                     debug!("resync queued");
                     self.resync_requested = true;
                 }
@@ -301,7 +323,11 @@ impl PeerState {
             },
         };
         if let AcceptOutcome::Allow { .. } = outcome {
+            // A takeover keeps the resync queued on the dial it supersedes:
+            // the remote may have begun its exchange before that news.
+            let queued = matches!(self.state, SyncState::Running { .. }) && self.resync_requested;
             self.set_sync_running(Origin::Accept);
+            self.resync_requested = queued;
         }
         outcome
     }
@@ -410,6 +436,90 @@ mod tests {
         );
     }
 
+    /// An accept refused while a dial toward the same counterpart runs leaves
+    /// the dial to finish the pair, and the dial's finish is the one reported:
+    /// a caller waiting for the dial's session would otherwise never hear of
+    /// it.
+    #[test]
+    fn a_refused_accept_leaves_the_running_dial_to_finish_the_pair() {
+        let namespace = namespace();
+        let (peer, _) = node_pair();
+        let mut states = NamespaceStates::default();
+        states.insert(namespace);
+        assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
+
+        let refused = states.finish(&namespace, peer, counterpart(), &Origin::Accept);
+        assert!(refused.is_none(), "the refused accept finished the dial");
+        assert!(states.is_running(&namespace, (peer, counterpart())));
+
+        let dialed = states.finish(
+            &namespace,
+            peer,
+            counterpart(),
+            &Origin::Connect(SyncReason::DirectJoin),
+        );
+        assert!(dialed.is_some(), "the dial's finish went unreported");
+        assert!(!states.is_running(&namespace, (peer, counterpart())));
+    }
+
+    /// A dial the consumer asks for, or a new neighbor prompts, while an
+    /// accepted exchange with its counterpart runs is run again once that
+    /// exchange ends, as one news prompts is. Paired: a resync meeting a
+    /// running exchange queues nothing more.
+    #[test]
+    fn a_dial_asked_for_during_a_running_exchange_is_run_after_it() {
+        let namespace = namespace();
+        let (node, me) = node_pair();
+        for (reason, queued) in [
+            (SyncReason::DirectJoin, true),
+            (SyncReason::SyncReport, true),
+            (SyncReason::Announced, true),
+            (SyncReason::NewNeighbor, true),
+            (SyncReason::Resync, false),
+        ] {
+            let mut states = NamespaceStates::default();
+            states.insert(namespace);
+            let accepted =
+                states.accept_request(&me, own_identity(), &namespace, node, counterpart());
+            assert!(matches!(accepted, AcceptOutcome::Allow { .. }));
+            assert!(!states.start_connect(&namespace, node, counterpart(), reason));
+
+            let finished = states.finish(&namespace, node, counterpart(), &Origin::Accept);
+            let (_started, resync) = finished.expect("the accepted exchange went unreported");
+            assert_eq!(resync, queued, "{reason:?} asked for during the exchange");
+        }
+    }
+
+    /// A resync queued while our dial runs is run after the incoming exchange
+    /// that takes the slot over. Paired: a takeover with nothing queued
+    /// queues nothing.
+    #[test]
+    fn a_takeover_keeps_the_resync_queued_on_the_dial_it_supersedes() {
+        let namespace = namespace();
+        // `me` compares higher, so the incoming request from `node` wins the tie-break.
+        let (node, me) = node_pair();
+        for asked in [true, false] {
+            let mut states = NamespaceStates::default();
+            states.insert(namespace);
+            assert!(states.start_connect(&namespace, node, counterpart(), SyncReason::SyncReport));
+            if asked {
+                assert!(!states.start_connect(
+                    &namespace,
+                    node,
+                    counterpart(),
+                    SyncReason::SyncReport
+                ));
+            }
+            let outcome =
+                states.accept_request(&me, own_identity(), &namespace, node, counterpart());
+            assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
+
+            let finished = states.finish(&namespace, node, counterpart(), &Origin::Accept);
+            let (_started, resync) = finished.expect("the takeover went unreported");
+            assert_eq!(resync, asked, "asked for during the dial: {asked}");
+        }
+    }
+
     /// A dial the remote rejected as already-syncing leaves nothing running that could
     /// finish the exchange. `abort_connect` must return the pair to idle so the next
     /// trigger is not silently dropped — without it the pair stays `Running` forever
@@ -422,7 +532,7 @@ mod tests {
         states.insert(namespace);
 
         assert!(states.start_connect(&namespace, peer, counterpart(), SyncReason::DirectJoin));
-        // While the dial is in flight the pair is busy: triggers are dropped.
+        // While the dial is in flight the pair is busy: a trigger starts no second exchange.
         assert!(!states.start_connect(&namespace, peer, counterpart(), SyncReason::NewNeighbor));
 
         // Remote answered AlreadySyncing: the dial is dead, clear it.

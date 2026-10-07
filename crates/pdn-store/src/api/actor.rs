@@ -423,10 +423,9 @@ impl RpcActor {
                 crate::Capability::Write(secret)
             }
         };
-        // Restates this store's identity as whom recorded peers are dialed as:
-        // a document whose default names another identity — a grantee
-        // replica, a connection's peer store — must not be shared.
-        self.start_sync(doc_id, vec![], self.identity())
+        // Keeps whom unnamed peers are dialed as: a pod's store is shared
+        // while its default still names the member whose ticket it came from.
+        self.start_sync_keeping_default(doc_id)
             .await
             .map_err(|e| RpcError::new(&*e))?;
 
@@ -496,16 +495,26 @@ impl RpcActor {
             peers,
             default_identity,
             join_gossip,
+            recorded,
         } = req;
-        if join_gossip {
-            self.start_sync(doc_id, peers, default_identity)
-                .await
-                .map_err(|e| RpcError::new(&*e))?;
-        } else {
-            self.start_sync_scoped(doc_id, peers, default_identity)
-                .await
-                .map_err(|e| RpcError::new(&*e))?;
-        }
+        let started = match recorded {
+            // Bytes that decode to no key name no node to dial, as a
+            // corrupt entry in the recorded peers does.
+            Some(recorded) => {
+                let recorded = recorded
+                    .iter()
+                    .filter_map(|peer| iroh::PublicKey::from_bytes(peer).ok())
+                    .collect();
+                self.sync_with_peers(doc_id, peers, recorded, default_identity, join_gossip)
+                    .await
+            }
+            None if join_gossip => self.start_sync(doc_id, peers, default_identity).await,
+            None => {
+                self.start_sync_scoped(doc_id, peers, default_identity)
+                    .await
+            }
+        };
+        started.map_err(|e| RpcError::new(&*e))?;
         Ok(StartSyncResponse {})
     }
 

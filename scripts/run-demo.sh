@@ -1,18 +1,26 @@
 #!/bin/sh
-# The live demo's stage: the nodes brought up, reached over the ports they
-# publish on loopback, and torn down around the narration in ops/demo.sh.
-# The devcontainer's daemon publishes on the devcontainer's own loopback, so
-# a run there reaches the nodes as a run on the daemon's host does.
+# A live demo's stage: the nodes of ops/compose-<demo>.yml brought up,
+# reached over the ports they publish on loopback, and torn down around the
+# narration in ops/demo-<demo>.sh. The devcontainer's daemon publishes on the
+# devcontainer's own loopback, so a run there reaches the nodes as a run on
+# the daemon's host does.
 #
 # The nodes and their volumes are torn down on every exit, the failing one
 # included: each node keeps its state on a volume, so a demo that leaves
 # either behind has the next run meeting the last run's state, which is the
 # one thing a demo must never do.
+#
+# Usage: run-demo.sh connections|pods
 set -eu
 cd "$(dirname "$0")/.."
+demo=${1:-}
+case "$demo" in
+  connections|pods) ;;
+  *) echo "usage: run-demo.sh connections|pods" >&2; exit 2 ;;
+esac
 docker info >/dev/null 2>&1 || { echo "no container daemon — the demo needs one"; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "no compose plugin — the demo brings its nodes up with one"; exit 1; }
-compose="docker compose -f ops/compose.yml"
+compose="docker compose -f ops/compose-$demo.yml"
 export DEMO_COMPOSE="$compose"
 # The build and the bring-up are stagehands: their output is kept back so
 # the narration reads as one thing, and produced in full if either fails.
@@ -39,4 +47,4 @@ else
 fi
 export PDN_STAND_IMAGE
 $compose up -d --wait >"$log" 2>&1 || { cat "$log"; exit 1; }
-sh ops/demo.sh
+sh "ops/demo-$demo.sh"

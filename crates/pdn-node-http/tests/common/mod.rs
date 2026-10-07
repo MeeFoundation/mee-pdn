@@ -17,8 +17,11 @@ use std::{
 
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node::PdnId;
-use pdn_node_http::shapes::{CreatedIdentity, GrantPublication, GrantedPath, OwnGrant};
+use pdn_node::{PdnId, PodId, RecordKind, RecordRef};
+use pdn_node_http::shapes::{
+    Act, CreatedIdentity, GrantPublication, GrantedPath, HeldPod, HeldPods, Member, Members,
+    Operations, OwnGrant,
+};
 use serde::de::DeserializeOwned;
 use testcontainers::{
     core::{logs::LogFrame, ContainerPort, ExecCommand, Mount, WaitFor},
@@ -269,6 +272,74 @@ impl Host {
         let created: CreatedIdentity =
             self.post("/debug/identities", Bytes::new()).await?.json()?;
         Ok(created.identity)
+    }
+
+    pub async fn create_pod(&self, identity: PdnId) -> Result<PodId> {
+        let created: HeldPod = self
+            .post(&format!("/debug/identities/{identity}/pods"), Bytes::new())
+            .await?
+            .json()?;
+        Ok(created.pod)
+    }
+
+    pub async fn pod_members(&self, identity: PdnId, pod: PodId) -> Result<Vec<Member>> {
+        let members: Members = self
+            .get(&format!("{}/members", pod_route(identity, pod)))
+            .await?
+            .json()?;
+        Ok(members.members)
+    }
+
+    /// The payload carries a live one-time secret.
+    pub async fn invite_to_pod(&self, identity: PdnId, pod: PodId) -> Result<Bytes> {
+        self.post(
+            &format!("{}/invites", pod_route(identity, pod)),
+            Bytes::new(),
+        )
+        .await?
+        .ok()
+    }
+
+    pub async fn join_pod(&self, identity: PdnId, invite: Bytes) -> Result<Answer> {
+        self.post(&format!("/debug/identities/{identity}/pods/join"), invite)
+            .await
+    }
+
+    pub async fn pod_act(&self, identity: PdnId, pod: PodId, act: Act) -> Result<Answer> {
+        self.post(
+            &format!("{}/acts", pod_route(identity, pod)),
+            serde_json::to_vec(&act)?,
+        )
+        .await
+    }
+
+    pub async fn place_record(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> Result<RecordRef> {
+        self.post(
+            &format!("{}/records?kind={kind}", pod_route(identity, pod)),
+            body(payload),
+        )
+        .await?
+        .json()
+    }
+
+    pub async fn append_op(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        record: RecordRef,
+        op: &[u8],
+    ) -> Result<Answer> {
+        self.post(
+            &format!("{}/ops", record_route(identity, pod, record)),
+            body(op),
+        )
+        .await
     }
 
     pub async fn publish_grant(
@@ -724,8 +795,6 @@ pub async fn own_grant_reads(
     Ok(())
 }
 
-/// Repeat the read until `holds`, carrying the last answer into the error:
-/// "no answer at all" and "the wrong answer" are different diagnoses.
 async fn poll_read(
     host: &Host,
     acting: PdnId,
@@ -734,10 +803,109 @@ async fn poll_read(
     holds: impl Fn(&Answer) -> bool,
 ) -> Result<()> {
     let route = format!("/debug/data/{acting}/{issuer}/{}", encode_path(path));
+    poll_route(host, &route, holds).await
+}
+
+pub fn pod_route(identity: PdnId, pod: PodId) -> String {
+    format!("/debug/identities/{identity}/pods/{pod}")
+}
+
+pub fn record_route(identity: PdnId, pod: PodId, record: RecordRef) -> String {
+    format!(
+        "{}/records/{}/{}/{}",
+        pod_route(identity, pod),
+        record.member,
+        record.kind,
+        record.id
+    )
+}
+
+/// Poll until `identity`'s replica lists exactly `expected` as the pod's
+/// members, in any order.
+pub async fn members_read(
+    host: &Host,
+    identity: PdnId,
+    pod: PodId,
+    expected: &[Member],
+) -> Result<()> {
+    let mut expected = expected.to_vec();
+    expected.sort_by_key(|member| member.id);
+    let route = format!("{}/members", pod_route(identity, pod));
+    poll_route(host, &route, |answer| {
+        answer.status == StatusCode::OK
+            && serde_json::from_slice::<Members>(&answer.body).is_ok_and(|mut listed| {
+                listed.members.sort_by_key(|member| member.id);
+                listed.members == expected
+            })
+    })
+    .await
+    .with_context(|| format!("{pod} never listed {expected:?} as its members for {identity}"))
+}
+
+pub async fn record_reads(
+    host: &Host,
+    identity: PdnId,
+    pod: PodId,
+    record: RecordRef,
+    expected: &[u8],
+) -> Result<()> {
+    poll_route(host, &record_route(identity, pod, record), |answer| {
+        answer.status == StatusCode::OK && answer.body == expected
+    })
+    .await
+    .with_context(|| format!("{record:?} never read back as expected for {identity}"))
+}
+
+/// Poll until the document's operations are exactly `expected`, each a
+/// writer and its payload, in any order.
+pub async fn ops_read(
+    host: &Host,
+    identity: PdnId,
+    pod: PodId,
+    record: RecordRef,
+    expected: &[(PdnId, &[u8])],
+) -> Result<()> {
+    let mut expected: Vec<(PdnId, Vec<u8>)> = expected
+        .iter()
+        .map(|(writer, payload)| (*writer, payload.to_vec()))
+        .collect();
+    expected.sort();
+    let route = format!("{}/ops", record_route(identity, pod, record));
+    poll_route(host, &route, |answer| {
+        answer.status == StatusCode::OK
+            && serde_json::from_slice::<Operations>(&answer.body).is_ok_and(|read| {
+                let mut read: Vec<(PdnId, Vec<u8>)> = read
+                    .operations
+                    .into_iter()
+                    .map(|op| (op.writer, op.payload))
+                    .collect();
+                read.sort();
+                read == expected
+            })
+    })
+    .await
+    .with_context(|| format!("the operations of {record:?} never read as expected for {identity}"))
+}
+
+/// Poll until `identity` lists `pod` when `held`, or lists it no more.
+pub async fn pod_listed(host: &Host, identity: PdnId, pod: PodId, held: bool) -> Result<()> {
+    let route = format!("/debug/identities/{identity}/pods");
+    poll_route(host, &route, |answer| {
+        answer.status == StatusCode::OK
+            && serde_json::from_slice::<HeldPods>(&answer.body)
+                .is_ok_and(|listed| listed.pods.contains(&pod) == held)
+    })
+    .await
+    .with_context(|| format!("{identity} never listed {pod} as held: {held}"))
+}
+
+/// Repeat a read of `route` until `holds`, carrying the last answer into the
+/// error: "no answer at all" and "the wrong answer" are different diagnoses.
+async fn poll_route(host: &Host, route: &str, holds: impl Fn(&Answer) -> bool) -> Result<()> {
     let deadline = tokio::time::Instant::now() + CONVERGENCE_BUDGET;
     let mut last: Option<Answer> = None;
     loop {
-        let cut_mid_request = match tokio::time::timeout_at(deadline, host.get(&route)).await {
+        let cut_mid_request = match tokio::time::timeout_at(deadline, host.get(route)).await {
             Ok(answer) => {
                 let answer = answer?;
                 if holds(&answer) {

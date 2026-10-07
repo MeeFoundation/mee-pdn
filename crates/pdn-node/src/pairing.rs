@@ -112,24 +112,34 @@ struct PairingResponse {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingInvite {
-    identity: PdnId,
+struct PendingInvite<T> {
+    minted_for: T,
     expires_at: Instant,
 }
 
 /// One instance per ceremony that mints one-time secrets, inside the
 /// runtime state so every operation is a map operation under the coarse
 /// lock. Expiry is lazy: checked at presentation, swept at the next invite.
-#[derive(Debug, Default)]
-pub(crate) struct PendingInvites {
-    map: HashMap<[u8; 32], PendingInvite>,
+/// `T` is what a secret was minted for — an identity, or an identity and a
+/// pod.
+#[derive(Debug)]
+pub(crate) struct PendingInvites<T = PdnId> {
+    map: HashMap<[u8; 32], PendingInvite<T>>,
 }
 
-impl PendingInvites {
+impl<T> Default for PendingInvites<T> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+}
+
+impl<T: Copy> PendingInvites<T> {
     /// 32 bytes from the operating-system generator.
     pub(crate) fn mint(
         &mut self,
-        identity: PdnId,
+        minted_for: T,
         lifetime: Duration,
         now: Instant,
     ) -> Result<[u8; 32]> {
@@ -141,7 +151,7 @@ impl PendingInvites {
         self.map.insert(
             secret,
             PendingInvite {
-                identity,
+                minted_for,
                 expires_at: now + lifetime,
             },
         );
@@ -150,11 +160,11 @@ impl PendingInvites {
 
     /// Present and unexpired — burned and returned; expired — burned and
     /// refused; unknown — refused, burning nothing.
-    pub(crate) fn verify_and_burn(&mut self, secret: &[u8; 32], now: Instant) -> Option<PdnId> {
+    pub(crate) fn verify_and_burn(&mut self, secret: &[u8; 32], now: Instant) -> Option<T> {
         // Peek first: a miss must not disturb the map.
         let live = self.map.get(secret)?.expires_at > now;
         let pending = self.map.remove(secret)?;
-        live.then_some(pending.identity)
+        live.then_some(pending.minted_for)
     }
 }
 

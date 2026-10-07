@@ -1,12 +1,13 @@
 //! The private metadata store: the one device-replicated directory of an
 //! identity's own state, device-internal by ticket alone (Invariant 1).
 //! Five record families under disjoint prefixes: `devices/`,
-//! `pending-devices/`, `tickets/`, `connections/`, `retractions/`. Device
-//! and connection records are record-level; ticket and marker payloads are
-//! blobs, so their reads wait for content.
+//! `pending-devices/`, `tickets/`, `connections/`, `retractions/`, and the
+//! announcement key pair at `announcement-key`. Device and connection
+//! records are record-level; ticket, marker and key payloads are blobs, so
+//! their reads wait for content.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -24,10 +25,14 @@ use pdn_store::{
     store::Query,
     AuthorId, DocTicket, NamespaceId,
 };
-use pdn_types::{NodeId, PdnId};
+use pdn_types::{NodeId, PdnId, PodId};
 use serde::{Deserialize, Serialize};
 
-use crate::node::{read_payload, SyncNode};
+use crate::{
+    announcement::AnnouncementKeyPair,
+    node::{read_payload, SyncNode},
+    pod::{PodStore, Seq},
+};
 
 /// The wait of [`CatchUpWatch::wait`] elapsed. Downcast
 /// from its `anyhow::Error` to tell "did not catch up in time" from this
@@ -51,6 +56,16 @@ impl std::fmt::Debug for CatchUpWatch {
             .field("since", &self.since)
             .finish_non_exhaustive()
     }
+}
+
+/// The watch of [`PrivateMetadataStore::watch_catch_up`] over any replica.
+pub(crate) async fn watch_doc(doc: &Doc) -> Result<CatchUpWatch> {
+    let since = SystemTime::now();
+    let events = doc.subscribe().await?;
+    Ok(CatchUpWatch {
+        events: Box::pin(events),
+        since,
+    })
 }
 
 impl CatchUpWatch {
@@ -94,6 +109,42 @@ pub const PENDING_DEVICE_TTL: Duration = Duration::from_hours(24);
 const TICKETS_PREFIX: &str = "tickets/";
 const CONNECTIONS_PREFIX: &str = "connections/";
 const RETRACTIONS_PREFIX: &str = "retractions/";
+const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
+const PODS_PREFIX: &str = "pods/";
+
+/// The directory kind of one of a pod's stores' write tickets, minted by
+/// the identity itself: its own devices are the nodes it names.
+pub fn pod_ticket_kind(pod: &PodId, store: PodStore) -> String {
+    format!("pod/{pod}/{}", pod_store_name(store))
+}
+
+/// The directory kind of the write ticket to one of a pod's stores that
+/// the device which invited the identity handed over, naming that device
+/// as the inviter: a ticket names all its nodes as one identity.
+pub fn pod_inviter_ticket_kind(pod: &PodId, store: PodStore) -> String {
+    format!("pod/{pod}/inviter/{}", pod_store_name(store))
+}
+
+fn pod_store_name(store: PodStore) -> &'static str {
+    match store {
+        PodStore::Membership => "membership",
+        PodStore::Records => "records",
+    }
+}
+
+fn pod_record_key(pod: &PodId, seq: Seq) -> String {
+    format!("{PODS_PREFIX}{pod}/{seq}")
+}
+
+fn pod_record_of(key: &[u8]) -> Option<(PodId, u64)> {
+    let rest = std::str::from_utf8(key).ok()?.strip_prefix(PODS_PREFIX)?;
+    let (pod, seq) = rest.split_once('/')?;
+    let canonical = seq == "0" || (!seq.starts_with('0') && !seq.is_empty());
+    if !canonical || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((pod.parse().ok()?, seq.parse().ok()?))
+}
 
 pub(crate) fn device_key(device: &NodeId) -> String {
     format!("{DEVICES_PREFIX}{device}")
@@ -109,6 +160,19 @@ fn ticket_key(kind: &str) -> String {
 
 fn connection_key(peer: &PdnId) -> String {
     format!("{CONNECTIONS_PREFIX}{peer}")
+}
+
+/// The confirmed devices a directory replica lists, record-level.
+pub(crate) async fn listed_devices(doc: &Doc) -> Result<Vec<NodeId>> {
+    let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
+    let mut stream = std::pin::pin!(doc.get_many(query).await?);
+    let mut devices = HashSet::new();
+    while let Some(entry) = stream.next().await {
+        if let Some(device) = device_of(entry?.key()) {
+            devices.insert(device);
+        }
+    }
+    Ok(devices.into_iter().collect())
 }
 
 pub(crate) fn device_of(key: &[u8]) -> Option<NodeId> {
@@ -412,15 +476,7 @@ impl PrivateMetadataStore {
 
     /// The confirmed devices, record-level.
     pub async fn list_devices(&self) -> Result<Vec<NodeId>> {
-        let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
-        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        let mut devices = HashSet::new();
-        while let Some(entry) = stream.next().await {
-            if let Some(device) = device_of(entry?.key()) {
-                devices.insert(device);
-            }
-        }
-        Ok(devices.into_iter().collect())
+        listed_devices(&self.doc).await
     }
 
     /// The devices that began linking and have not confirmed, after a
@@ -472,6 +528,87 @@ impl PrivateMetadataStore {
             }
         }
         Ok(peers)
+    }
+
+    /// Record that the identity's membership event at `seq` of its chain in
+    /// `pod` — its founding or joined event — holds the pod.
+    pub async fn record_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
+        self.doc
+            .set_bytes(
+                self.author,
+                pod_record_key(&pod, seq).into_bytes(),
+                vec![1u8],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Record that the identity's left event at `seq`, or a kicked event at
+    /// `seq` its device learned of, ends its holding of `pod`: a tombstone
+    /// at that sequence.
+    pub async fn tombstone_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
+        self.doc
+            .del(self.author, pod_record_key(&pod, seq).into_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// The pods the identity holds, record-level: those whose entry at
+    /// the highest sequence, across all authors, is not a tombstone. Entry
+    /// timestamps are never read.
+    pub async fn held_pods(&self) -> Result<Vec<PodId>> {
+        Ok(self
+            .pod_records(PODS_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_pod, (_seq, held))| *held)
+            .map(|(pod, _record)| pod)
+            .collect())
+    }
+
+    /// The pods the identity departed, record-level: those whose entry at
+    /// the highest sequence, across all authors, is a tombstone.
+    pub async fn departed_pods(&self) -> Result<Vec<PodId>> {
+        Ok(self
+            .pod_records(PODS_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_pod, (_seq, held))| !*held)
+            .map(|(pod, _record)| pod)
+            .collect())
+    }
+
+    /// `pod`'s highest recorded sequence and whether the identity holds
+    /// the pod from it; `None` for a pod never recorded.
+    pub async fn pod_record(&self, pod: PodId) -> Result<Option<(Seq, bool)>> {
+        let prefix = format!("{PODS_PREFIX}{pod}/");
+        Ok(self
+            .pod_records(&prefix)
+            .await?
+            .remove(&pod)
+            .map(|(seq, held)| (Seq::new(seq), held)))
+    }
+
+    /// Per pod under `prefix`: its highest sequence, and whether no
+    /// tombstone sits there, a tombstone outweighing a non-empty entry.
+    async fn pod_records(&self, prefix: &str) -> Result<HashMap<PodId, (u64, bool)>> {
+        let query = Query::all().key_prefix(prefix.as_bytes()).include_empty();
+        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
+        let mut highest: HashMap<PodId, (u64, bool)> = HashMap::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            let Some((pod, seq)) = pod_record_of(entry.key()) else {
+                continue;
+            };
+            let held = entry.content_len() != 0;
+            let slot = highest.entry(pod).or_insert((seq, held));
+            if seq > slot.0 {
+                *slot = (seq, held);
+            } else if seq == slot.0 {
+                slot.1 &= held;
+            }
+        }
+        Ok(highest)
     }
 
     /// Record a write-retraction verdict, replacing any previous marker for
@@ -597,6 +734,34 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
+    /// Written once, by the identity's creation; the payload is the 32
+    /// secret bytes, from which the pair follows.
+    pub async fn put_announcement_key(&self, key: &AnnouncementKeyPair) -> Result<()> {
+        self.doc
+            .set_bytes(
+                self.author,
+                ANNOUNCEMENT_KEY_PATH.as_bytes().to_vec(),
+                key.secret_bytes().to_vec(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `Ok(None)` while the payload is still syncing. A payload that does
+    /// not decode is an error, as for [`Self::get_ticket`].
+    pub async fn announcement_key(&self) -> Result<Option<AnnouncementKeyPair>> {
+        let Some(bytes) =
+            read_payload(&self.doc, &self.blobs, ANNOUNCEMENT_KEY_PATH.as_bytes()).await?
+        else {
+            return Ok(None);
+        };
+        let secret: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .context("an announcement key payload is not 32 bytes")?;
+        Ok(Some(AnnouncementKeyPair::from_secret_bytes(&secret)))
+    }
+
     /// Crate-private: the fork's event type stays behind this layer.
     pub(crate) async fn events(
         &self,
@@ -631,12 +796,7 @@ impl PrivateMetadataStore {
     /// `host_identity` arms a directory — or a session finished before the
     /// subscription goes unseen and the wait holds out for the next one.
     pub async fn watch_catch_up(&self) -> Result<CatchUpWatch> {
-        let since = SystemTime::now();
-        let events = self.events().await?;
-        Ok(CatchUpWatch {
-            events: Box::pin(events),
-            since,
-        })
+        watch_doc(&self.doc).await
     }
 
     /// The kinds under which tickets are published, record-level.

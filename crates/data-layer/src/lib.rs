@@ -16,19 +16,33 @@
 //! are opaque payloads at this level. Errors are `anyhow`.
 
 mod access;
+mod address_book;
+mod announcement;
 pub mod connection_metadata;
 pub mod grant;
 pub mod layer;
 pub mod node;
+mod pod;
 pub mod private_metadata;
 mod registry;
 mod retraction;
 
 pub use access::identity_of;
+pub use announcement::{devices_verify, join_verifies, pdn_id_of, pod_id_of, AnnouncementKeyPair};
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
+#[cfg(feature = "test-util")]
+pub use node::{PodSession, PodSessions, PodStartPause};
+#[cfg(feature = "test-util")]
+pub use pod::PodVerdicts;
+pub use pod::{
+    record_prefix, Awaiting, DevicesPayload, EventKind, ForNothing, FoundedPayload, HeldEntry,
+    JoinedPayload, Member, MemberDevice, MemberState, Membership, MembershipKey, OpId, Operation,
+    PodCatchUp, PodNotice, PodStore, PodTickets, RecordEntry, RecordKey, RecordView, Seq,
+    UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,
+};
 // The ceremony registration point (ADR-0011, ADR-0012), re-exported so
 // consumers need no direct iroh dependency. The raw `Endpoint` is
 // deliberately not re-exported — the dial handle wraps it.
@@ -40,8 +54,8 @@ pub use iroh::{
 pub use layer::{DataLayer, DataLayerError};
 pub use node::{
     AlpnTaken, Connectivity, DialHandle, DirectoryHeld, ExtraProtocol, GranteeCannotShare,
-    IdentityNotProvisioned, NamespaceImport, RecordedHosting, SpawnOptions, StorageConfig,
-    SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
+    IdentityNotProvisioned, NamespaceImport, PodFlush, PodPassDraw, RecordedHosting, SpawnOptions,
+    StorageConfig, SyncNode, UnknownIssuer, UntrackedNamespace, BUILT_IN_ALPNS,
     DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
 };
 // pdn-store vocabulary of the share/import/write flows, so downstream
@@ -51,6 +65,7 @@ pub use pdn_store::{
     AuthorId, Contact, DocTicket, Identity, NamespaceId,
 };
 pub use private_metadata::{
-    CatchUpTimeout, CatchUpWatch, PrivateMetadataStore, RetractionHead, RetractionMarker,
+    pod_inviter_ticket_kind, pod_ticket_kind, CatchUpTimeout, CatchUpWatch, PrivateMetadataStore,
+    RetractionHead, RetractionMarker,
 };
 pub use retraction::RetractionVerdict;

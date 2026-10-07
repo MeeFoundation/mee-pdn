@@ -1,0 +1,56 @@
+# The pods demo's six nodes: four people, Alice and Bob with a phone and a
+# laptop each, Carol and Dave with a phone — enough for a pod to outlive its
+# creator's devices going offline while its other members carry on.
+#
+# One network, loopback-published HTTP and a named volume per node, for the
+# reasons `compose-connections.yml` gives. The ports sit apart from that
+# demo's, so the two shows can run side by side.
+
+name: pdn-demo-pods
+
+x-node: &node
+  # The image by the content id the recipe resolved after building it, so
+  # every node of one show comes from one artifact even if another build
+  # moves the tag meanwhile. Brought up by hand, this is the tag itself.
+  image: ${PDN_STAND_IMAGE:-pdn-node-http:dev}
+  environment:
+    PDN_DEBUG: "1"
+    RUST_LOG: "info,pdn_node=debug,data_layer=debug"
+  networks: [demo]
+
+services:
+  alice-phone:
+    <<: *node
+    ports: ["127.0.0.1:3021:3011"]
+    volumes: ["alice-phone-state:/var/lib/pdn"]
+  alice-laptop:
+    <<: *node
+    ports: ["127.0.0.1:3022:3011"]
+    volumes: ["alice-laptop-state:/var/lib/pdn"]
+  bob-phone:
+    <<: *node
+    ports: ["127.0.0.1:3023:3011"]
+    volumes: ["bob-phone-state:/var/lib/pdn"]
+  bob-laptop:
+    <<: *node
+    ports: ["127.0.0.1:3024:3011"]
+    volumes: ["bob-laptop-state:/var/lib/pdn"]
+  carol-phone:
+    <<: *node
+    ports: ["127.0.0.1:3025:3011"]
+    volumes: ["carol-phone-state:/var/lib/pdn"]
+  dave-phone:
+    <<: *node
+    ports: ["127.0.0.1:3026:3011"]
+    volumes: ["dave-phone-state:/var/lib/pdn"]
+
+networks:
+  demo:
+
+volumes:
+  alice-phone-state:
+  alice-laptop-state:
+  bob-phone-state:
+  bob-laptop-state:
+  carol-phone-state:
+  dave-phone-state:

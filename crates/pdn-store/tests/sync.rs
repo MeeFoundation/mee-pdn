@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,13 +24,15 @@ use pdn_store::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
-    engine::LiveEvent,
+    engine::{LiveEvent, Origin},
     store::{DownloadPolicy, FilterKind, Query},
-    AuthorId, ContentStatus, Entry,
+    AuthorId, ContentStatus, Entry, EntryFilter, NamespaceId, SessionAccess, SessionAccessProvider,
+    SessionRole,
 };
 use rand::{CryptoRng, RngExt, SeedableRng};
 #[cfg(feature = "fs-store")]
 use tempfile::tempdir;
+use tokio::sync::Notify;
 use tracing::{debug, error_span, info, Instrument};
 use tracing_test::traced_test;
 mod util;
@@ -104,9 +109,13 @@ async fn sync_simple() -> Result<()> {
 
     info!("node1: join");
     let peer1 = nodes[1].id();
-    let doc1 = clients[1].docs().import(ticket.clone()).await?;
+    // Subscribed before the sync starts: the neighbor can come up before a
+    // subscription made after the import.
+    let (doc1, mut events1) = clients[1]
+        .docs()
+        .import_and_subscribe(ticket.clone())
+        .await?;
     let blobs1 = clients[1].blobs();
-    let mut events1 = doc1.subscribe().await?;
     info!("node1: assert 5 events");
     assert_next_unordered(
         &mut events1,
@@ -397,11 +406,14 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     let peer1 = nodes[1].id();
     let author1 = clients[1].docs().author_create().await?;
     info!("peer1: join doc");
-    let doc1 = clients[1].docs().import(ticket.clone()).await?;
+    // Subscribed before the sync starts, as in `sync_simple`.
+    let (doc1, mut events1) = clients[1]
+        .docs()
+        .import_and_subscribe(ticket.clone())
+        .await?;
     let blobs1 = clients[1].blobs();
 
     info!("peer1: wait for 4 events (for sync and join with peer0)");
-    let mut events1 = doc1.subscribe().await?;
     assert_next_unordered(
         &mut events1,
         TIMEOUT,
@@ -467,10 +479,10 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     info!("peer2: spawn");
     nodes.push(spawn_node(nodes.len(), &mut rng).await?);
     clients.push(nodes.last().unwrap().client().clone());
-    let doc2 = clients[2].docs().import(ticket).await?;
+    // Subscribed before the sync starts, as in `sync_simple`.
+    let (doc2, mut events2) = clients[2].docs().import_and_subscribe(ticket).await?;
     let blobs2 = clients[2].blobs();
     let peer2 = nodes[2].id();
-    let mut events2 = doc2.subscribe().await?;
 
     // How many syncs peer2 runs is not fixed: it reconciles on the ticket's
     // peer, again on each `NeighborUp`, and once more for every author head
@@ -692,9 +704,9 @@ async fn test_sync_via_relay() -> Result<()> {
         .collect();
     ticket.nodes[0] = relay_ticket;
     // join
-    let doc2 = node2.docs().import(ticket).await?;
+    // Subscribed before the sync starts, as in `sync_simple`.
+    let (doc2, mut events) = node2.docs().import_and_subscribe(ticket).await?;
     let blobs2 = node2.blobs();
-    let mut events = doc2.subscribe().await?;
 
     // An `InsertRemote`'s `content_status` is a snapshot of the local blob
     // store taken as the event is produced, and `ContentReady` reaches this
@@ -1446,24 +1458,39 @@ fn apply_matchers<T>(item: &T, matchers: &mut Vec<Box<dyn Fn(&T) -> bool + Send>
     false
 }
 
+/// The bookkeeping of an exchange no scenario asserts: a sync trigger that
+/// meets a running exchange is run again after it, so a join can bring one
+/// more successful `SyncFinished`, and its `PendingContentReady`, than a
+/// scenario counts. The helpers below skip such an event when no matcher
+/// takes it.
+fn extra_exchange(event: &LiveEvent) -> bool {
+    matches!(event, LiveEvent::SyncFinished(sync) if sync.result.is_ok())
+        || matches!(event, LiveEvent::PendingContentReady)
+}
+
 /// Receive the next `matchers.len()` elements from a stream and matches them against the functions
 /// in `matchers`, in order.
 ///
 /// Returns all received events.
 #[allow(clippy::type_complexity)]
-async fn assert_next<T: std::fmt::Debug + Clone>(
-    mut stream: impl Stream<Item = Result<T>> + Unpin + Send,
+async fn assert_next(
+    mut stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
     timeout: Duration,
-    matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-) -> Vec<T> {
+    matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
     let fut = async {
         let mut items = vec![];
         for (i, f) in matchers.iter().enumerate() {
-            let item = stream
-                .try_next()
-                .await
-                .expect("event stream ended prematurely")
-                .expect("event stream errored");
+            let item = loop {
+                let item = stream
+                    .try_next()
+                    .await
+                    .expect("event stream ended prematurely")
+                    .expect("event stream errored");
+                if (f)(&item) || !extra_exchange(&item) {
+                    break item;
+                }
+            };
             if !(f)(&item) {
                 panic!("assertion failed for event {i} {item:?}");
             }
@@ -1482,11 +1509,11 @@ async fn assert_next<T: std::fmt::Debug + Clone>(
 ///
 /// Returns all received events.
 #[allow(clippy::type_complexity)]
-async fn assert_next_unordered<T: std::fmt::Debug + Clone>(
-    stream: impl Stream<Item = Result<T>> + Unpin + Send,
+async fn assert_next_unordered(
+    stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
     timeout: Duration,
-    matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-) -> Vec<T> {
+    matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
     assert_next_unordered_with_optionals(stream, timeout, matchers, vec![]).await
 }
 
@@ -1502,31 +1529,32 @@ async fn assert_next_unordered<T: std::fmt::Debug + Clone>(
 ///
 /// Returns all received events.
 #[allow(clippy::type_complexity)]
-async fn assert_next_unordered_with_optionals<T: std::fmt::Debug + Clone>(
-    mut stream: impl Stream<Item = Result<T>> + Unpin + Send,
+async fn assert_next_unordered_with_optionals(
+    mut stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
     timeout: Duration,
-    mut required_matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-    mut optional_matchers: Vec<Box<dyn Fn(&T) -> bool + Send>>,
-) -> Vec<T> {
+    mut required_matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+    mut optional_matchers: Vec<Box<dyn Fn(&LiveEvent) -> bool + Send>>,
+) -> Vec<LiveEvent> {
     let max = required_matchers.len() + optional_matchers.len();
     let required = required_matchers.len();
     // we have to use a mutex because rustc is not intelligent enough to realize
     // that the mutable borrow terminates when the future completes
     let events = Arc::new(parking_lot::Mutex::new(vec![]));
     let fut = async {
+        let mut matched = 0;
         while let Ok(event) = stream.try_next().await {
             let event = event.context("failed to read from stream")?;
-            let len = {
-                let mut events = events.lock();
-                events.push(event.clone());
-                events.len()
-            };
+            events.lock().push(event.clone());
             if !apply_matchers(&event, &mut required_matchers)
                 && !apply_matchers(&event, &mut optional_matchers)
             {
+                if extra_exchange(&event) {
+                    continue;
+                }
                 bail!("Event didn't match any matcher: {event:?}");
             }
-            if required_matchers.is_empty() || len == max {
+            matched += 1;
+            if required_matchers.is_empty() || matched == max {
                 break;
             }
         }
@@ -1621,6 +1649,276 @@ async fn next_event_matching(
     n0_future::time::timeout(timeout, fut)
         .await
         .expect("timeout waiting for matching event")
+}
+
+/// A dial of a namespace ordered after another starts only once an
+/// exchange of the other with the same peer has finished, and a dial the
+/// order makes of the other runs though nothing asked for it.
+#[tokio::test]
+#[traced_test]
+async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result<()> {
+    let mut rng = test_rng(b"a_dial_ordered_after_another_namespace_follows_its_exchange");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let id1 = nodes[1].id();
+    let (first0, then0) = (
+        nodes[0].docs().create().await?,
+        nodes[0].docs().create().await?,
+    );
+    let mut first_events = first0.subscribe().await?;
+    let mut then_events = then0.subscribe().await?;
+    let mut contacts = Vec::new();
+    let mut imported = Vec::new();
+    for doc in [&first0, &then0] {
+        doc.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+        let ticket = doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        contacts = ticket.contacts();
+        imported.push(nodes[1].docs().import_namespace(ticket.capability).await?);
+    }
+    let (first1, then1) = (&imported[0], &imported[1]);
+    nodes[1]
+        .engine()
+        .order_after(then1.id(), Some(first1.id()))
+        .await?;
+    // In the sync set, with no peer of its own to dial.
+    first1.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    then1.start_sync_scoped(contacts, util::TEST_HOLDER).await?;
+
+    let first = next_event_matching(&mut first_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id1)
+    })
+    .await;
+    let then = next_event_matching(&mut then_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id1)
+    })
+    .await;
+    let (LiveEvent::SyncFinished(first), LiveEvent::SyncFinished(then)) = (first, then) else {
+        unreachable!("matched as finished syncs");
+    };
+    assert!(
+        then.started >= first.finished,
+        "the ordered dial started before the exchange it follows finished"
+    );
+    Ok(())
+}
+
+/// A dial held behind an exchange stays held when the dial of that exchange
+/// loses its slot to the counterpart's own and then ends refused: it starts
+/// only once the exchange that took the slot over has finished.
+///
+/// Node `x`, the greater id, wins the tie-break as the accepting side. Its
+/// own dial of `first` waits in its provider until the counterpart's dial
+/// has been accepted and reached `x`'s entries, then is refused; the
+/// counterpart reveals its entries of `first` slowly, so the accepted
+/// exchange outlasts that refusal by seconds.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Result<()> {
+    let mut rng = test_rng(b"a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held");
+    let (mut key_x, mut key_y) = (
+        SecretKey::from_bytes(&rng.random()),
+        SecretKey::from_bytes(&rng.random()),
+    );
+    if key_x.public() < key_y.public() {
+        std::mem::swap(&mut key_x, &mut key_y);
+    }
+    let first_id: Arc<std::sync::OnceLock<NamespaceId>> = Arc::default();
+    let dial_asked = Arc::new(Notify::new());
+    let accepted = Arc::new(Notify::new());
+    let gate = Arc::new(AtomicBool::new(true));
+    let x_access: SessionAccessProvider = {
+        let (first_id, dial_asked, accepted) =
+            (first_id.clone(), dial_asked.clone(), accepted.clone());
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let ours = first_id.get() == Some(&namespace);
+            let (dial_asked, accepted, gate) = (dial_asked.clone(), accepted.clone(), gate.clone());
+            Box::pin(async move {
+                match role {
+                    SessionRole::Dial if ours && gate.swap(false, Ordering::SeqCst) => {
+                        dial_asked.notify_one();
+                        accepted.notified().await;
+                        SessionAccess::Deny
+                    }
+                    SessionRole::Accept if ours => {
+                        let reached: EntryFilter = Arc::new(move |_entry| {
+                            accepted.notify_one();
+                            true
+                        });
+                        SessionAccess::Allow {
+                            egress: Some(reached),
+                            ingest: None,
+                        }
+                    }
+                    _ => SessionAccess::whole(),
+                }
+            })
+        })
+    };
+    let y_access: SessionAccessProvider = {
+        let first_id = first_id.clone();
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let slow = first_id.get() == Some(&namespace) && role == SessionRole::Dial;
+            let access = if slow {
+                let slow_egress: EntryFilter = Arc::new(|_entry| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    true
+                });
+                SessionAccess::Allow {
+                    egress: Some(slow_egress),
+                    ingest: None,
+                }
+            } else {
+                SessionAccess::whole()
+            };
+            Box::pin(std::future::ready(access))
+        })
+    };
+    let x = test_node(key_x).await?.access(x_access).spawn().await?;
+    let y = test_node(key_y).await?.access(y_access).spawn().await?;
+    let id_y = y.id();
+
+    let (first_x, then_x) = (x.docs().create().await?, x.docs().create().await?);
+    first_id
+        .set(first_x.id())
+        .map_err(|_| anyhow!("first set once"))?;
+    let author_x = x.docs().author_create().await?;
+    first_x
+        .set_bytes(author_x, b"x".to_vec(), b"x".to_vec())
+        .await?;
+    let mut x_contacts = Vec::new();
+    let mut imported = Vec::new();
+    for doc in [&first_x, &then_x] {
+        let ticket = doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        x_contacts = ticket.contacts();
+        imported.push(y.docs().import_namespace(ticket.capability).await?);
+    }
+    let (first_y, then_y) = (&imported[0], &imported[1]);
+    let author_y = y.docs().author_create().await?;
+    for i in 0..20u8 {
+        first_y.set_bytes(author_y, vec![b'y', i], vec![i]).await?;
+    }
+    let y_contacts = then_y
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?
+        .contacts();
+    let mut first_events = first_x.subscribe().await?;
+    let mut then_events = then_x.subscribe().await?;
+
+    x.engine()
+        .order_after(then_x.id(), Some(first_x.id()))
+        .await?;
+    first_x.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    then_x
+        .start_sync_scoped(y_contacts, util::TEST_HOLDER)
+        .await?;
+    n0_future::time::timeout(TIMEOUT, dial_asked.notified()).await?;
+    then_y.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    first_y
+        .start_sync_scoped(x_contacts, util::TEST_HOLDER)
+        .await?;
+
+    let first = next_event_matching(&mut first_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id_y)
+    })
+    .await;
+    // The counterpart dials `then` of its own accord once a neighbor; the
+    // order holds this node's dials alone.
+    let then = next_event_matching(&mut then_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id_y)
+            && matches!(e, LiveEvent::SyncFinished(sync) if matches!(sync.origin, Origin::Connect(_)))
+    })
+    .await;
+    let (LiveEvent::SyncFinished(first), LiveEvent::SyncFinished(then)) = (first, then) else {
+        unreachable!("matched as finished syncs");
+    };
+    assert!(
+        matches!(first.origin, Origin::Accept),
+        "the exchange of first was not the accepted one: {:?}",
+        first.origin
+    );
+    // The finished stamp is taken after the exchange releases its held
+    // dials; the slow egress keeps the exchange itself over a second long.
+    let released = first
+        .finished
+        .checked_sub(Duration::from_millis(100))
+        .context("a finished stamp after the epoch")?;
+    assert!(
+        then.started >= released,
+        "the held dial started {:?} before the exchange that took the slot over finished",
+        first
+            .finished
+            .duration_since(then.started)
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// A sync handed its peers dials those alone, none of the other peers the
+/// replica recorded; the recorded peer left out is dialed once it is handed.
+///
+/// Every replica stays outside the swarm and nothing is written, so a
+/// session reaches the peer left out only through a dial of that sync. The
+/// peer left out sees its own first session end before the window opens:
+/// its end of that session can come after node 0's.
+#[tokio::test]
+#[traced_test]
+async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
+    let mut rng = test_rng(b"a_sync_with_handed_peers_dials_no_other_recorded_peer");
+    let nodes = spawn_nodes(3, &mut rng).await?;
+    let (id0, id1, id2) = (nodes[0].id(), nodes[1].id(), nodes[2].id());
+    let doc0 = nodes[0].docs().create().await?;
+    doc0.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let mut events0 = doc0.subscribe().await?;
+    let mut events = Vec::new();
+    for node in &nodes[1..] {
+        let doc = node
+            .docs()
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        events.push(doc.subscribe().await?);
+        doc.start_sync_scoped(ticket.contacts(), util::TEST_HOLDER)
+            .await?;
+    }
+    // Both first sessions finished, so node 0 recorded both peers.
+    assert_events_matching(
+        &mut events0,
+        TIMEOUT,
+        vec![
+            Box::new(move |e| match_sync_finished(e, id1)),
+            Box::new(move |e| match_sync_finished(e, id2)),
+        ],
+    )
+    .await;
+    let mut events2 = events.pop().context("node 2 subscribed")?;
+    next_event_matching(&mut events2, TIMEOUT, move |e| match_sync_finished(e, id0)).await;
+
+    doc0.sync_with_peers(vec![], vec![*id1.as_bytes()], util::TEST_HOLDER, false)
+        .await?;
+    next_event_matching(&mut events0, TIMEOUT, move |e| match_sync_finished(e, id1)).await;
+    let reached_two = n0_future::time::timeout(
+        Duration::from_secs(1),
+        next_event_matching(
+            &mut events2,
+            TIMEOUT,
+            move |e| matches!(e, LiveEvent::SyncFinished(sync) if sync.peer == id0),
+        ),
+    )
+    .await;
+    assert!(
+        reached_two.is_err(),
+        "a recorded peer not handed was dialed"
+    );
+
+    doc0.sync_with_peers(vec![], vec![*id2.as_bytes()], util::TEST_HOLDER, false)
+        .await?;
+    next_event_matching(&mut events2, TIMEOUT, move |e| match_sync_finished(e, id0)).await;
+    Ok(())
 }
 
 /// A record can arrive from a peer that does not have the record's content:
@@ -1743,6 +2041,121 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
     assert_latest(receiver.blobs(), &doc_receiver, b"k", b"v").await;
 
     for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Content a record arrived without before its node restarted is fetched
+/// from the first peer a session goes through with after the restart. The
+/// engine parks such content in memory, and a session after the restart
+/// exchanges no record, so nothing else asks for it again.
+///
+/// The record reaches the receiver through a relay whose download policy
+/// keeps it content-less, as in the test above, and the writer is away
+/// until the receiver has restarted.
+#[tokio::test]
+#[traced_test]
+#[cfg(feature = "fs-store")]
+async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() -> Result<()> {
+    let mut rng = test_rng(b"content_a_restart_left_missing_is_fetched_from_the_first_sync_peer");
+    let loopback = |secret_key: SecretKey| async move {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let writer = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
+        .spawn()
+        .await?;
+    let relay = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
+        .spawn()
+        .await?;
+    let receiver_dir = tempdir()?;
+    let receiver_key = SecretKey::from_bytes(&rng.random());
+    let receiver = Node::persistent(&receiver_dir, loopback(receiver_key.clone()).await?)
+        .spawn()
+        .await?;
+    let (writer_id, relay_id) = (writer.id(), relay.id());
+
+    let author = writer.docs().author_create().await?;
+    let doc_writer = writer.docs().create().await?;
+    let hash = doc_writer
+        .set_bytes(author, b"k".to_vec(), b"v".to_vec())
+        .await?;
+    let ticket_writer = doc_writer
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc_relay = relay
+        .docs()
+        .import_namespace(ticket_writer.capability.clone())
+        .await?;
+    doc_relay
+        .set_download_policy(DownloadPolicy::NothingExcept(vec![]))
+        .await?;
+    let mut events_relay = doc_relay.subscribe().await?;
+    doc_relay
+        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .await?;
+    next_event_matching(
+        &mut events_relay,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == writer_id),
+    )
+    .await;
+    doc_writer.leave().await?;
+
+    let ticket_relay = doc_relay
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let (doc_receiver, mut events_receiver) =
+        receiver.docs().import_and_subscribe(ticket_relay).await?;
+    next_event_matching(&mut events_receiver, TIMEOUT, |e| {
+        matches!(
+            e,
+            LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing, .. }
+                if *from == relay_id
+        )
+    })
+    .await;
+    let namespace = doc_receiver.id();
+    drop((doc_receiver, events_receiver));
+    receiver.shutdown().await?;
+
+    let receiver = Node::persistent(&receiver_dir, loopback(receiver_key).await?)
+        .spawn()
+        .await?;
+    assert!(
+        !receiver.blobs().has(hash).await?,
+        "the receiver held the content before the restart"
+    );
+    let doc_receiver = receiver
+        .docs()
+        .open(namespace)
+        .await?
+        .context("the receiver lost the replica in the restart")?;
+    let mut events_receiver = doc_receiver.subscribe().await?;
+    doc_writer.start_sync(vec![], util::TEST_HOLDER).await?;
+    doc_receiver
+        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .await?;
+    next_event_matching(&mut events_receiver, TIMEOUT, |e| {
+        match_sync_finished(e, writer_id)
+    })
+    .await;
+    let deadline = Instant::now() + TIMEOUT;
+    while !receiver.blobs().has(hash).await? {
+        assert!(
+            Instant::now() < deadline,
+            "content the restart left missing did not arrive from the writer"
+        );
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_latest(receiver.blobs(), &doc_receiver, b"k", b"v").await;
+
+    for node in [writer, relay, receiver] {
         node.shutdown().await?;
     }
     Ok(())

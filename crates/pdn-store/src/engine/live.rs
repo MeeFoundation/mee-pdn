@@ -19,7 +19,11 @@ use iroh_blobs::{
     Hash, HashAndFormat,
 };
 use iroh_gossip::net::Gossip;
-use n0_future::{task::JoinSet, time::SystemTime, FutureExt};
+use n0_future::{
+    task::JoinSet,
+    time::{Duration, SystemTime},
+    FutureExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
@@ -95,6 +99,8 @@ pub struct SyncReport {
     namespace: NamespaceId,
     /// Encoded [`AuthorHeads`]
     heads: Vec<u8>,
+    /// The identity the sender's replica answers as.
+    identity: Identity,
 }
 
 /// Messages to the sync actor
@@ -103,7 +109,12 @@ pub enum ToLiveActor {
     StartSync {
         namespace: NamespaceId,
         peers: Vec<Contact>,
-        default_identity: Identity,
+        /// The recorded peers dialed beside `peers`: every one the store
+        /// holds for the replica when `None`.
+        recorded: Option<Vec<PublicKey>>,
+        /// Whom a peer no contact or session named is dialed as; `None`
+        /// keeps what an earlier start stated, else this engine's identity.
+        default_identity: Option<Identity>,
         /// Whether to join the replica's gossip swarm. Scoped access syncs
         /// without ever joining the swarm.
         join_gossip: bool,
@@ -142,7 +153,36 @@ pub enum ToLiveActor {
         #[debug("SessionOpening")]
         opening: SessionOpening<InProcessRecv, InProcessSend>,
     },
-    /// The dialing half of the same session.
+    /// A dial the remote aborted as already syncing, asked for again.
+    Redial {
+        namespace: NamespaceId,
+        peer: PublicKey,
+        callee: Identity,
+        reason: SyncReason,
+    },
+    /// The exchanges of `namespaces` running, held behind another's, or
+    /// waiting to redial.
+    SyncsInFlight {
+        namespaces: Vec<NamespaceId>,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<usize>,
+    },
+    /// Whom each peer of `namespace` is dialed as, replacing what contacts
+    /// stated before; dials nothing.
+    StateContacts {
+        namespace: NamespaceId,
+        contacts: Vec<Contact>,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<()>,
+    },
+    /// Every later dial of `namespace` follows an exchange of `first` with
+    /// the same counterpart; `None` lifts it.
+    OrderAfter {
+        namespace: NamespaceId,
+        first: Option<NamespaceId>,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<()>,
+    },
     SyncInProcess {
         namespace: NamespaceId,
         callee: Identity,
@@ -279,6 +319,31 @@ impl PeerIdentities {
     }
 }
 
+/// How long after a remote aborted a dial as already syncing it is asked
+/// for again: enough for the remote's own exchange to have run.
+const REDIAL_AFTER_ABORT: Duration = Duration::from_millis(500);
+
+/// A dial held until the exchange it follows finishes.
+enum HeldDial {
+    Network {
+        namespace: NamespaceId,
+        reason: SyncReason,
+    },
+    InProcess {
+        namespace: NamespaceId,
+        send: InProcessSend,
+        recv: InProcessRecv,
+    },
+}
+
+impl HeldDial {
+    fn namespace(&self) -> NamespaceId {
+        match self {
+            Self::Network { namespace, .. } | Self::InProcess { namespace, .. } => *namespace,
+        }
+    }
+}
+
 // Currently peers might double-sync in both directions.
 pub struct LiveActor {
     /// Receiver for actor messages.
@@ -337,6 +402,14 @@ pub struct LiveActor {
     /// Whom a peer of a replica is dialed as when nothing named one — the
     /// consumer's statement, since only it knows whose replica this is.
     default_identities: HashMap<NamespaceId, Identity>,
+    /// The namespace whose exchange with a counterpart every dial of a
+    /// namespace follows.
+    prerequisites: HashMap<NamespaceId, NamespaceId>,
+    /// Dials held until the prerequisite's exchange with the same
+    /// counterpart finishes, keyed by that exchange.
+    held_dials: HashMap<(NamespaceId, PublicKey, Identity), Vec<HeldDial>>,
+    /// Redials waiting out [`REDIAL_AFTER_ABORT`], by namespace.
+    redials_due: HashMap<NamespaceId, usize>,
     /// In-process sessions opened, so a pass over a quiet pair can be
     /// shown to open none.
     in_process_sessions: Arc<AtomicU64>,
@@ -391,6 +464,9 @@ impl LiveActor {
             identity,
             peer_identities: Default::default(),
             default_identities: Default::default(),
+            prerequisites: Default::default(),
+            held_dials: Default::default(),
+            redials_due: Default::default(),
             in_process_sessions,
             co_located,
             metrics,
@@ -503,12 +579,13 @@ impl LiveActor {
             ToLiveActor::StartSync {
                 namespace,
                 peers,
+                recorded,
                 default_identity,
                 join_gossip,
                 reply,
             } => {
                 let res = self
-                    .start_sync(namespace, peers, default_identity, join_gossip)
+                    .start_sync(namespace, peers, recorded, default_identity, join_gossip)
                     .await;
                 reply.send(res).ok();
             }
@@ -537,6 +614,39 @@ impl LiveActor {
             }
             ToLiveActor::AcceptInProcess { opening } => {
                 self.accept_in_process(opening);
+            }
+            ToLiveActor::Redial {
+                namespace,
+                peer,
+                callee,
+                reason,
+            } => {
+                if let Some(due) = self.redials_due.get_mut(&namespace) {
+                    *due = due.saturating_sub(1);
+                }
+                self.sync_with_identity(namespace, peer, callee, reason);
+            }
+            ToLiveActor::SyncsInFlight { namespaces, reply } => {
+                reply.send(self.syncs_in_flight(&namespaces)).ok();
+            }
+            ToLiveActor::StateContacts {
+                namespace,
+                contacts,
+                reply,
+            } => {
+                self.state_contacts(namespace, contacts);
+                reply.send(()).ok();
+            }
+            ToLiveActor::OrderAfter {
+                namespace,
+                first,
+                reply,
+            } => {
+                match first {
+                    Some(first) => self.prerequisites.insert(namespace, first),
+                    None => self.prerequisites.remove(&namespace),
+                };
+                reply.send(()).ok();
             }
             ToLiveActor::SyncInProcess {
                 namespace,
@@ -596,17 +706,37 @@ impl LiveActor {
     /// replica, else this engine's own identity — what a sibling device of
     /// the same identity is.
     fn identities_of_peer(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Identity> {
-        let learned: Vec<Identity> = self
-            .peer_identities
-            .get(&(namespace, peer))
-            .map(|identities| identities.all().collect())
-            .unwrap_or_default();
+        let learned = self.learned_identities(namespace, peer);
         if !learned.is_empty() {
             return learned;
         }
         match self.default_identities.get(&namespace) {
             Some(default) => vec![*default],
             None => vec![self.identity],
+        }
+    }
+
+    /// The identities contacts and running sessions name this peer as.
+    fn learned_identities(&self, namespace: NamespaceId, peer: PublicKey) -> Vec<Identity> {
+        self.peer_identities
+            .get(&(namespace, peer))
+            .map(|identities| identities.all().collect())
+            .unwrap_or_default()
+    }
+
+    /// A pull of the news `peer` reported, addressed as contacts and running
+    /// sessions name it, else as the identity the report names. That name
+    /// is the sender's word and picks only which replica of its own node the
+    /// pull addresses; the access provider judges the session on both sides.
+    fn sync_with_reporter(&mut self, namespace: NamespaceId, peer: PublicKey, reporter: Identity) {
+        let learned = self.learned_identities(namespace, peer);
+        let callees = if learned.is_empty() {
+            vec![reporter]
+        } else {
+            learned
+        };
+        for callee in callees {
+            self.sync_with_identity(namespace, peer, callee, SyncReason::SyncReport);
         }
     }
 
@@ -638,6 +768,28 @@ impl LiveActor {
             });
             return;
         }
+        if let Some(first) = self.prerequisites.get(&namespace).copied() {
+            if !self.state.is_running(&first, (peer, callee)) {
+                self.dial(first, peer, callee, reason);
+            }
+            if self.state.is_running(&first, (peer, callee)) {
+                self.held_dials
+                    .entry((first, peer, callee))
+                    .or_default()
+                    .push(HeldDial::Network { namespace, reason });
+                return;
+            }
+        }
+        self.dial(namespace, peer, callee, reason);
+    }
+
+    fn dial(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        callee: Identity,
+        reason: SyncReason,
+    ) {
         if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
         }
@@ -697,6 +849,21 @@ impl LiveActor {
         mut send: InProcessSend,
         mut recv: InProcessRecv,
     ) {
+        // The consumer opens the prerequisite's in-process exchange first;
+        // one still running holds this dial until it finishes.
+        if let Some(first) = self.prerequisites.get(&namespace).copied() {
+            if self.state.is_running(&first, (peer, callee)) {
+                self.held_dials
+                    .entry((first, peer, callee))
+                    .or_default()
+                    .push(HeldDial::InProcess {
+                        namespace,
+                        send,
+                        recv,
+                    });
+                return;
+            }
+        }
         // Announced, so a pair found busy queues a resync. The replay dials
         // through `sync_with_peer`, which on this identity's own namespace
         // resolves to this identity itself and reaches no co-located one.
@@ -766,13 +933,23 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
-        default_identity: Identity,
+        handed: Option<Vec<PublicKey>>,
+        default_identity: Option<Identity>,
         join_gossip: bool,
     ) -> Result<()> {
         // A peer the engine recorded carries a node id and nothing else,
         // so the consumer states whom a peer of this replica is dialed as
         // when neither a contact nor a past session named one.
-        self.default_identities.insert(namespace, default_identity);
+        match default_identity {
+            Some(identity) => {
+                self.default_identities.insert(namespace, identity);
+            }
+            None => {
+                self.default_identities
+                    .entry(namespace)
+                    .or_insert(self.identity);
+            }
+        }
         let mut recorded: Vec<PublicKey> = Vec::new();
         debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
         // update state to allow sync
@@ -782,6 +959,18 @@ impl LiveActor {
                 .subscribe(self.replica_events_tx.clone());
             self.sync.open(namespace, opts).await?;
             self.state.insert(namespace);
+            // Before the first dial, so the first finished session retries it.
+            if let Err(err) = self.park_missing_content(namespace).await {
+                warn!(
+                    ?namespace,
+                    "parking the content its entries lack failed: {err:#}"
+                );
+            }
+        }
+        if let Some(handed) = handed {
+            self.join_peers(namespace, peers, handed, join_gossip)
+                .await?;
+            return Ok(());
         }
         // add the peers stored for this document
         match self.sync.get_sync_peers(namespace).await {
@@ -815,12 +1004,47 @@ impl LiveActor {
         Ok(())
     }
 
+    /// Park the content of every entry of `namespace` the download policy
+    /// wants and the blob store does not hold whole, as a remote insert
+    /// parks it. The parked set lives in memory: without this, content whose
+    /// download a restart cut short is never asked for again, since a
+    /// session after the restart finds no entry to exchange.
+    async fn park_missing_content(&mut self, namespace: NamespaceId) -> Result<()> {
+        let policy = self.sync.get_download_policy(namespace).await?;
+        let (tx, mut rx) = irpc::channel::mpsc::channel(64);
+        self.sync
+            .get_many(namespace, crate::store::Query::all().into(), tx)
+            .await?;
+        while let Some(entry) = rx.recv().await? {
+            let entry = entry?;
+            if entry.content_len() == 0 || !policy.matches(entry.entry()) {
+                continue;
+            }
+            let hash = entry.content_hash();
+            let status = self.bao_store.blobs().status(hash).await;
+            if !matches!(status, Ok(BlobStatus::Complete { .. })) {
+                self.missing_hashes.insert((namespace, hash));
+            }
+        }
+        Ok(())
+    }
+
     async fn leave(
         &mut self,
         namespace: NamespaceId,
         kill_subscribers: bool,
     ) -> anyhow::Result<()> {
         // self.subscribers.remove(&namespace);
+        self.prerequisites.remove(&namespace);
+        let held_on_it: Vec<(NamespaceId, PublicKey, Identity)> = self
+            .held_dials
+            .keys()
+            .filter(|(first, _peer, _counterpart)| *first == namespace)
+            .copied()
+            .collect();
+        for dials in self.held_dials.values_mut() {
+            dials.retain(|held| held.namespace() != namespace);
+        }
         if self.state.remove(&namespace) {
             self.peer_identities
                 .retain(|(tracked, _peer), _identities| *tracked != namespace);
@@ -834,7 +1058,79 @@ impl LiveActor {
         if kill_subscribers {
             self.subscribers.remove(&namespace);
         }
+        for (first, peer, counterpart) in held_on_it {
+            self.release_held(first, peer, counterpart);
+        }
         Ok(())
+    }
+
+    /// The stated identities of `namespace`'s peers become `contacts`'
+    /// alone; the ones a running session named stay until it ends.
+    fn syncs_in_flight(&self, namespaces: &[NamespaceId]) -> usize {
+        let running: usize = namespaces
+            .iter()
+            .map(|namespace| self.state.running(namespace))
+            .sum();
+        let held =
+            self.held_dials
+                .iter()
+                .flat_map(|((first, _peer, _counterpart), dials)| {
+                    dials.iter().map(move |dial| (first, dial))
+                })
+                .filter(|(first, dial)| {
+                    let namespace = match dial {
+                        HeldDial::Network { namespace, .. }
+                        | HeldDial::InProcess { namespace, .. } => namespace,
+                    };
+                    namespaces.contains(first) || namespaces.contains(namespace)
+                })
+                .count();
+        let due: usize = namespaces
+            .iter()
+            .filter_map(|namespace| self.redials_due.get(namespace))
+            .sum();
+        running.saturating_add(held).saturating_add(due)
+    }
+
+    fn state_contacts(&mut self, namespace: NamespaceId, contacts: Vec<Contact>) {
+        for ((tracked, _peer), identities) in &mut self.peer_identities {
+            if *tracked == namespace {
+                identities.stated.clear();
+            }
+        }
+        for Contact { addr, identity } in contacts {
+            self.peer_identities
+                .entry((namespace, addr.id))
+                .or_default()
+                .stated
+                .insert(identity);
+            if !addr.is_empty() {
+                self.memory_lookup.add_endpoint_info(addr);
+            }
+        }
+        self.peer_identities
+            .retain(|_key, identities| !identities.is_empty());
+    }
+
+    /// Run the dials held on the exchange of `first` with this
+    /// counterpart, which just ended.
+    fn release_held(&mut self, first: NamespaceId, peer: PublicKey, counterpart: Identity) {
+        for held in self
+            .held_dials
+            .remove(&(first, peer, counterpart))
+            .unwrap_or_default()
+        {
+            match held {
+                HeldDial::Network { namespace, reason } => {
+                    self.dial(namespace, peer, counterpart, reason);
+                }
+                HeldDial::InProcess {
+                    namespace,
+                    send,
+                    recv,
+                } => self.sync_in_process(namespace, counterpart, peer, send, recv),
+            }
+        }
     }
 
     /// Leave the replica's gossip swarm and touch nothing else — the
@@ -917,6 +1213,29 @@ impl LiveActor {
                 // it — otherwise this (namespace, peer) pair stays `Running` forever and every
                 // later sync trigger for it is silently dropped.
                 self.state.abort_connect(&namespace, peer, callee, reason);
+                // An incoming exchange that took the slot over releases the
+                // held dials when it finishes; with none, nothing else would.
+                if !self.state.is_running(&namespace, (peer, callee)) {
+                    self.release_held(namespace, peer, callee);
+                }
+                // The remote's exchange may be one this side refuses — a
+                // replica holding nothing yet judges no caller — and then
+                // neither runs; or one that froze the remote's view before
+                // the news this dial was for. Dialing again once it is over
+                // settles both, whatever finished in between.
+                let redial = ToLiveActor::Redial {
+                    namespace,
+                    peer,
+                    callee,
+                    reason,
+                };
+                let due = self.redials_due.entry(namespace).or_default();
+                *due = due.saturating_add(1);
+                let to_self = self.sync_actor_tx.clone();
+                n0_future::task::spawn(async move {
+                    n0_future::time::sleep(REDIAL_AFTER_ABORT).await;
+                    to_self.send(redial).await.ok();
+                });
             }
             res => {
                 self.on_sync_finished(
@@ -948,8 +1267,9 @@ impl LiveActor {
                 )
                 .await
             }
-            Err(AcceptError::Abort { reason, .. }) if reason == AbortReason::AlreadySyncing => {
-                // In case we aborted the sync: do nothing (our outgoing sync is in progress)
+            // Refused by us before the exchange took the pair's slot, which
+            // an exchange of ours with the same counterpart may hold.
+            Err(AcceptError::Abort { reason, .. }) => {
                 debug!(?reason, "aborted by us");
             }
             Err(err) => {
@@ -1049,7 +1369,11 @@ impl LiveActor {
                     {
                         Err(err) => warn!(?err, "Failed to encode author heads for sync report"),
                         Ok(heads) => {
-                            let report = SyncReport { namespace, heads };
+                            let report = SyncReport {
+                                namespace,
+                                heads,
+                                identity: self.identity,
+                            };
                             self.broadcast_neighbors(namespace, &Op::SyncReport(report))
                                 .await;
                         }
@@ -1063,10 +1387,13 @@ impl LiveActor {
             Err(err) => Err(err.to_string()),
         };
 
-        let Some((started, resync)) =
-            self.state
-                .finish(&namespace, peer, counterpart, &origin, result)
-        else {
+        let finished = self.state.finish(&namespace, peer, counterpart, &origin);
+        // A dial the tie-break superseded leaves the held dials to the
+        // exchange that took its slot over.
+        if !self.state.is_running(&namespace, (peer, counterpart)) {
+            self.release_held(namespace, peer, counterpart);
+        }
+        let Some((started, resync)) = finished else {
             return;
         };
 
@@ -1139,7 +1466,11 @@ impl LiveActor {
                 return;
             }
         };
-        let report = SyncReport { namespace, heads };
+        let report = SyncReport {
+            namespace,
+            heads,
+            identity: self.identity,
+        };
         self.broadcast_neighbors(namespace, &Op::SyncReport(report))
             .await;
     }
@@ -1204,7 +1535,7 @@ impl LiveActor {
         match self.sync.has_news_for_us(report.namespace, heads).await {
             Ok(Some(updated_authors)) => {
                 info!(%updated_authors, "news reported: sync now");
-                self.sync_with_peer(report.namespace, from, SyncReason::SyncReport);
+                self.sync_with_reporter(report.namespace, from, report.identity);
             }
             Ok(None) => {
                 debug!("no news reported: nothing to do");

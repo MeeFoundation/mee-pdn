@@ -3,34 +3,36 @@ use thiserror::Error;
 
 mod data;
 mod non_empty;
+mod pod;
 pub use data::{EntryInfo, EntryPath, NamespaceRole, NodeAddr, PathValidationError};
 pub use non_empty::NonEmpty;
+pub use pod::{PodId, RecordId, RecordKind, RecordRef, UnknownRecordKind};
 
 // ---------------------------------------------------------------------------
 // Byte-backed ID infrastructure
 // ---------------------------------------------------------------------------
 
-/// Error returned when parsing a hex string into a 32-byte ID.
+/// Error returned when parsing a hex string into a byte ID.
 #[derive(Debug, Clone, Error)]
 #[error("{message}")]
 pub struct ByteIdParseError {
     pub message: String,
 }
 
-/// Parse a lowercase hex string into `[u8; 32]`.
+/// Parse a lowercase hex string into `[u8; N]`.
 ///
 /// # Safety invariants (indexing)
-/// - Length is checked to be exactly 64 before iteration.
-/// - `chunks(2)` on a 64-byte slice yields exactly 32 chunks of 2 bytes each.
-/// - `enumerate()` yields `i` in `0..32`, matching `out`'s bounds.
+/// - Length is checked to be exactly `2 * N` before iteration.
+/// - `chunks(2)` on a `2 * N`-byte slice yields exactly `N` chunks of 2 bytes each.
+/// - `enumerate()` yields `i` in `0..N`, matching `out`'s bounds.
 #[allow(clippy::indexing_slicing)]
-pub fn parse_hex_32(s: &str) -> Result<[u8; 32], ByteIdParseError> {
-    if s.len() != 64 {
+pub fn parse_hex<const N: usize>(s: &str) -> Result<[u8; N], ByteIdParseError> {
+    if s.len() != 2 * N {
         return Err(ByteIdParseError {
-            message: format!("expected 64 hex chars, got {}", s.len()),
+            message: format!("expected {} hex chars, got {}", 2 * N, s.len()),
         });
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; N];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
         let hi = hex_digit(chunk[0])?;
         let lo = hex_digit(chunk[1])?;
@@ -54,8 +56,32 @@ fn hex_digit(b: u8) -> Result<u8, ByteIdParseError> {
 
 /// Define a newtype wrapping `[u8; 32]` with hex Display/FromStr and serde.
 #[macro_export]
-macro_rules! define_byte_id {
+macro_rules! define_byte_id_32 {
     (
+        $(#[$meta:meta])*
+        $vis:vis struct $Name:ident;
+    ) => {
+        $crate::__define_byte_id! { 32; $(#[$meta])* $vis struct $Name; }
+    };
+}
+
+/// Define a newtype wrapping `[u8; 16]` with hex Display/FromStr and serde.
+#[macro_export]
+macro_rules! define_byte_id_16 {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $Name:ident;
+    ) => {
+        $crate::__define_byte_id! { 16; $(#[$meta])* $vis struct $Name; }
+    };
+}
+
+/// The body of `define_byte_id_32!` and `define_byte_id_16!`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __define_byte_id {
+    (
+        $N:literal;
         $(#[$meta:meta])*
         $vis:vis struct $Name:ident;
     ) => {
@@ -66,28 +92,28 @@ macro_rules! define_byte_id {
         // sides a memo is written from, which of two dials survives — where
         // the choice must only be the same on both sides and at both ends.
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        $vis struct $Name([u8; 32]);
+        $vis struct $Name([u8; $N]);
 
         impl $Name {
             /// Create from raw bytes.
-            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+            pub const fn from_bytes(bytes: [u8; $N]) -> Self {
                 Self(bytes)
             }
 
             /// View as raw bytes.
-            pub const fn as_bytes(&self) -> &[u8; 32] {
+            pub const fn as_bytes(&self) -> &[u8; $N] {
                 &self.0
             }
         }
 
-        impl From<[u8; 32]> for $Name {
-            fn from(b: [u8; 32]) -> Self {
+        impl From<[u8; $N]> for $Name {
+            fn from(b: [u8; $N]) -> Self {
                 Self(b)
             }
         }
 
-        impl AsRef<[u8; 32]> for $Name {
-            fn as_ref(&self) -> &[u8; 32] {
+        impl AsRef<[u8; $N]> for $Name {
+            fn as_ref(&self) -> &[u8; $N] {
                 &self.0
             }
         }
@@ -114,7 +140,7 @@ macro_rules! define_byte_id {
         impl ::std::str::FromStr for $Name {
             type Err = $crate::ByteIdParseError;
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                $crate::parse_hex_32(s).map(Self)
+                $crate::parse_hex(s).map(Self)
             }
         }
 
@@ -137,14 +163,14 @@ macro_rules! define_byte_id {
 // Domain types
 // ---------------------------------------------------------------------------
 
-define_byte_id! {
+define_byte_id_32! {
     /// iroh endpoint identifier (ed25519 public key, 32 bytes).
     pub struct NodeId;
 }
 
 // -- PDN identity ----------------------------------------------------------
 
-define_byte_id! {
+define_byte_id_32! {
     /// Stable identifier of a participant on the PDN.
     ///
     /// Used at the PDN domain layer (claims, connections, delegation) so
@@ -159,7 +185,7 @@ pub struct PdnIdentityProof {}
 
 // -- KERI identity types ----------------------------------------------------
 
-define_byte_id! {
+define_byte_id_32! {
     /// KERI Autonomic Identifier (ed25519 inception public key, 32 bytes).
     ///
     /// A self-certifying root identifier that never changes even as
@@ -168,14 +194,14 @@ define_byte_id! {
     pub struct Aid;
 }
 
-define_byte_id! {
+define_byte_id_32! {
     /// Current ed25519 operational signing key from the latest KEL event.
     ///
     /// Changes on key rotation (unlike `Aid`, which is permanent).
     pub struct OperationalKey;
 }
 
-define_byte_id! {
+define_byte_id_32! {
     /// Stable identifier of a claim in the PDN domain layer.
     ///
     /// Used as the resource in `UWill` capability tokens (`res`), so that
