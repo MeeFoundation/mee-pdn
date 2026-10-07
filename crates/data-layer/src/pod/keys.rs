@@ -46,7 +46,7 @@ pub enum EventKind {
     Founded,
     Joined,
     Left,
-    Kicked,
+    Removed,
     Promoted,
     Demoted,
 }
@@ -56,7 +56,7 @@ impl EventKind {
         Self::Founded,
         Self::Joined,
         Self::Left,
-        Self::Kicked,
+        Self::Removed,
         Self::Promoted,
         Self::Demoted,
     ];
@@ -66,7 +66,7 @@ impl EventKind {
             Self::Founded => "founded",
             Self::Joined => "joined",
             Self::Left => "left",
-            Self::Kicked => "kicked",
+            Self::Removed => "removed",
             Self::Promoted => "promoted",
             Self::Demoted => "demoted",
         }

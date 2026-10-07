@@ -126,16 +126,16 @@ pub enum PodAct {
     /// Of another owner.
     Demote(PdnId),
     /// Of another member, an owner or a plain member alike.
-    Kick(PdnId),
+    Remove(PdnId),
     Leave,
 }
 
 /// Why [`ActRefused`] refused an act.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActRefusal {
-    /// A promotion, a demotion or a kick by a member that is no owner.
+    /// A promotion, a demotion or a removal by a member that is no owner.
     NotAnOwner,
-    /// A demotion or a kick of the acting identity: its way out is leaving.
+    /// A demotion or a removal of the acting identity: its way out is leaving.
     OnItself,
     SubjectNotMember,
     /// A demotion of a plain member.
@@ -700,7 +700,7 @@ fn act_event(
         }
         PodAct::Promote(subject) => (subject, EventKind::Promoted),
         PodAct::Demote(subject) => (subject, EventKind::Demoted),
-        PodAct::Kick(subject) => (subject, EventKind::Kicked),
+        PodAct::Remove(subject) => (subject, EventKind::Removed),
     };
     if !actor.state.owner {
         return Err(ActRefusal::NotAnOwner);
@@ -731,7 +731,7 @@ async fn depart(state: &State, identity: PdnId, pod: PodId, seq: Seq) -> Result<
 }
 
 /// Acts on every notice the data layer reports of a hosted identity's
-/// pods: a departure is settled — how a kicked member's device, or a
+/// pods: a departure is settled — how a removed member's device, or a
 /// departed member's other device, learns of it — and a device its
 /// member's statements do not list registers itself. A failure is logged
 /// and reported again at the next change to the membership store or the

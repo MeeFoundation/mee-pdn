@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(status(JoinRefused), StatusCode::FORBIDDEN);
         assert_eq!(
             status(ActRefused {
-                act: PodAct::Kick(PEER),
+                act: PodAct::Remove(PEER),
                 reason: ActRefusal::NotAnOwner,
             }),
             StatusCode::FORBIDDEN

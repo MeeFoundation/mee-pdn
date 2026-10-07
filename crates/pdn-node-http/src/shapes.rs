@@ -187,13 +187,13 @@ impl From<PodMember> for Member {
     }
 }
 
-/// A membership act, `{"kick": "<pdn-id>"}` or `"leave"`.
+/// A membership act, `{"remove": "<pdn-id>"}` or `"leave"`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Act {
     Promote(PdnId),
     Demote(PdnId),
-    Kick(PdnId),
+    Remove(PdnId),
     Leave,
 }
 
@@ -202,7 +202,7 @@ impl From<Act> for PodAct {
         match act {
             Act::Promote(subject) => Self::Promote(subject),
             Act::Demote(subject) => Self::Demote(subject),
-            Act::Kick(subject) => Self::Kick(subject),
+            Act::Remove(subject) => Self::Remove(subject),
             Act::Leave => Self::Leave,
         }
     }

@@ -47,7 +47,7 @@ pub enum ForNothing {
     /// subject's.
     KeyOfAnother,
     BadSignature,
-    /// A join, kick or demotion whose actor is its subject; a leave whose
+    /// A join, removal or demotion whose actor is its subject; a leave whose
     /// actor is not.
     WrongActor,
     /// Its author is no device of the actor, or the writer, its key names.
@@ -396,7 +396,7 @@ impl<'a> Pass<'a> {
             EventKind::Left if event.actor != event.subject => {
                 return nothing(ForNothing::WrongActor)
             }
-            EventKind::Kicked | EventKind::Demoted if event.actor == event.subject => {
+            EventKind::Removed | EventKind::Demoted if event.actor == event.subject => {
                 return nothing(ForNothing::WrongActor);
             }
             _ => {}
@@ -650,7 +650,7 @@ impl<'a> Pass<'a> {
     fn judge(&self, event: &Event, actor: MemberState) -> Verdict {
         let needed = match event.kind {
             EventKind::Joined => actor.member,
-            EventKind::Promoted | EventKind::Kicked | EventKind::Demoted => actor.owner,
+            EventKind::Promoted | EventKind::Removed | EventKind::Demoted => actor.owner,
             EventKind::Founded | EventKind::Left => true,
         };
         if !needed {
@@ -683,7 +683,7 @@ impl<'a> Pass<'a> {
 
     /// The guard over the last owner: with no owner left, the demotions
     /// that ended the role of a former owner still a member, taken in the
-    /// order of their actors' `PdnId`s, and those that would remove the last
+    /// order of their actors' `PdnId`s, and those that would demote the last
     /// of them.
     fn demotions_to_set_aside(&self) -> BTreeSet<usize> {
         let finals: Vec<(PdnId, MemberState)> = self
@@ -804,7 +804,7 @@ impl Settling {
 fn allows(before: MemberState, kind: EventKind) -> bool {
     match kind {
         EventKind::Founded | EventKind::Joined => !before.member,
-        EventKind::Left | EventKind::Kicked | EventKind::Promoted => before.member,
+        EventKind::Left | EventKind::Removed | EventKind::Promoted => before.member,
         EventKind::Demoted => before.owner,
     }
 }
@@ -813,7 +813,7 @@ fn allows(before: MemberState, kind: EventKind) -> bool {
 /// event and a join compete only where the subject is no member.
 fn rank(kind: EventKind) -> u8 {
     match kind {
-        EventKind::Kicked => 6,
+        EventKind::Removed => 6,
         EventKind::Left => 5,
         EventKind::Demoted => 4,
         EventKind::Promoted => 3,
@@ -833,7 +833,7 @@ fn apply(kind: EventKind) -> MemberState {
             member: true,
             owner: false,
         },
-        EventKind::Left | EventKind::Kicked => MemberState::default(),
+        EventKind::Left | EventKind::Removed => MemberState::default(),
     }
 }
 

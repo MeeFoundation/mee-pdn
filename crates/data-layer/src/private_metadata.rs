@@ -543,7 +543,7 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// Record that the identity's left event at `seq`, or a kicked event at
+    /// Record that the identity's left event at `seq`, or a removed event at
     /// `seq` its device learned of, ends its holding of `pod`: a tombstone
     /// at that sequence.
     pub async fn tombstone_pod(&self, pod: PodId, seq: Seq) -> Result<()> {

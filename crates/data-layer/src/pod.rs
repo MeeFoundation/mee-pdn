@@ -130,7 +130,7 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: PodStore) -> Result<Vec<Un
 /// [`SyncNode::take_pod_notices`](crate::SyncNode::take_pod_notices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodNotice {
-    /// `identity`'s chain in `pod` ends in a counted left or kicked event
+    /// `identity`'s chain in `pod` ends in a counted left or removed event
     /// at `seq`.
     Departed {
         identity: PdnId,

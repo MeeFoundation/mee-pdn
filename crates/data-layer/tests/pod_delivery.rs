@@ -253,13 +253,13 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
 /// contacts the membership derives: every device of every current member
 /// dialed as that member, a co-located member's device among them and
 /// reached inside the process, and the identity's own siblings by its
-/// directory, never this device as itself. Denied: once a member is kicked,
+/// directory, never this device as itself. Denied: once a member is removed,
 /// no run's contacts hold its devices.
 ///
 /// Nothing is written between the co-located member's catch-up and its
 /// in-process sessions being counted, and the other pass is out of reach,
 /// so every session counted comes from a draw.
-#[allow(clippy::too_many_lines)] // one scenario: the derivation, the draws and the kick
+#[allow(clippy::too_many_lines)] // one scenario: the derivation, the draws and the removal
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membership_derives(
 ) -> Result<()> {
@@ -338,15 +338,15 @@ async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membershi
         "a drawn contact naming this node was not reached inside the process"
     );
 
-    // Denied: Bob's devices, once Alice kicks him.
-    let kick = MembershipKey::Event {
+    // Denied: Bob's devices, once Alice removes him.
+    let removal = MembershipKey::Event {
         subject: bob.id,
         seq: Seq::new(2),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    write(&tablet, &alice, pod, kick, vec![0]).await?;
+    write(&tablet, &alice, pod, removal, vec![0]).await?;
     let without_bob: HashSet<_> = expected
         .iter()
         .filter(|(_device, identity)| *identity != identity_of(bob.id))
@@ -976,12 +976,12 @@ async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that
     Ok(())
 }
 
-/// A kicked member, served the record store before its kick, is refused it
+/// A removed member, served the record store before its removal, is refused it
 /// by a member device in the session after the one that brings the device
-/// the kick.
-#[allow(clippy::too_many_lines)] // one scenario: the served session, the kick and the refusal
+/// the removal.
+#[allow(clippy::too_many_lines)] // one scenario: the served session, the removal and the refusal
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_one_that_brings_its_kick(
+async fn a_removed_member_is_refused_the_record_store_in_the_session_after_the_one_that_brings_its_removal(
 ) -> Result<()> {
     let (alice_phone, bob_phone, carol_phone) = (
         node(QUIET, QUIET).await?,
@@ -1033,21 +1033,21 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
             .is_some_and(|session| session.exchanged.is_ok()),
         "a member device refused a member: {served:?}"
     );
-    // Out of the membership store's swarm and settled, so the kick reaches
+    // Out of the membership store's swarm and settled, so the removal reaches
     // Bob's phone only in the session Carol's phone dials.
     bob_phone
         .leave_swarm_for_test(bob.id, tickets.membership.capability.id())
         .await?;
     assert!(settle(&phones, pod).await?);
 
-    let kick = MembershipKey::Event {
+    let removal = MembershipKey::Event {
         subject: carol.id,
         seq: Seq::new(2),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
     assert!(
         lists(
             &carol_phone,
@@ -1077,7 +1077,7 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
         .await?;
     assert!(
         refused.is_some_and(|session| session.exchanged.is_err()),
-        "the session after the one that brought the kick served the kicked member"
+        "the session after the one that brought the removal served the removed member"
     );
     assert_eq!(
         state_on(&bob_phone, bob.id, pod, carol.id).await,
@@ -1091,7 +1091,7 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
 }
 
 /// A member's device dialing a member's device serves it the pod's records.
-/// Denied: a kicked member's device takes no record from the same dial, and
+/// Denied: a removed member's device takes no record from the same dial, and
 /// a holder of both tickets that is no member no entry of either store.
 ///
 /// Every device dialed serves whatever session it is asked to whole, as a
@@ -1151,14 +1151,14 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
     let phones = [&alice_phone, &bob_phone, &carol_phone, &dave_phone];
     assert!(settle(&phones, pod).await?);
 
-    let kick = MembershipKey::Event {
+    let removal = MembershipKey::Event {
         subject: carol.id,
         seq: Seq::new(2),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
     for (phone, holder) in [
         (&bob_phone, &bob),
@@ -1184,7 +1184,7 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
         reads(&bob_phone, bob.id, pod, claim).await?,
         "a member's device took no record from a member's dial"
     );
-    // Denied: the kicked member's device, on the record store.
+    // Denied: the removed member's device, on the record store.
     dial(
         &alice_phone,
         &alice,
@@ -1199,11 +1199,11 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
             .next_served_with(carol_phone.node_id(), TIMEOUT)
             .await?
             .is_some(),
-        "the dial to the kicked member's device did not go through"
+        "the dial to the removed member's device did not go through"
     );
     assert!(
         holds_no_record(&carol_phone, carol.id, pod).await?,
-        "a member's dial served a kicked member's device a record"
+        "a member's dial served a removed member's device a record"
     );
     // Denied: the ticket holder that is no member, on either store.
     dial(

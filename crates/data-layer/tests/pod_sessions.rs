@@ -202,7 +202,7 @@ async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> 
 /// A member's device is served both stores and folds the pod from nothing.
 /// Denied: the callee of its first dial, which it does not yet resolve to a
 /// member; a holder of both tickets that is no member, on either store; and
-/// the member itself once kicked, on the record store.
+/// the member itself once removed, on the record store.
 #[allow(clippy::too_many_lines)] // one scenario: the served member beside each denial
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
@@ -350,16 +350,16 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         )
         .await
     ));
-    // Denied: the member once kicked, on the record store; the membership
-    // store is served to it over the kick's past.
-    let kick = MembershipKey::Event {
+    // Denied: the member once removed, on the record store; the membership
+    // store is served to it over the removal's past.
+    let removal = MembershipKey::Event {
         subject: bob.id,
         seq: Seq::new(3),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::new(1),
     };
-    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
     assert!(refused(
         session(&bob_phone, bob.id, records, &alice_phone, alice.id, bob.id).await
     ));

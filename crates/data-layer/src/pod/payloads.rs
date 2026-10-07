@@ -5,7 +5,7 @@
 use pdn_store::AuthorId;
 use pdn_types::NodeId;
 
-/// A left, kicked, promoted or demoted event's payload: its key carries
+/// A left, removed, promoted or demoted event's payload: its key carries
 /// all of the event, and an empty entry is a tombstone.
 pub const ACT_PAYLOAD: [u8; 1] = [0];
 

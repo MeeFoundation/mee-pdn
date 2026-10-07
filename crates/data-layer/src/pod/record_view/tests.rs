@@ -193,23 +193,23 @@ fn an_operation_reads_as_the_writer_its_key_names() {
 }
 
 /// A departed member's operation naming a sequence at which it was a member
-/// reads after its kick, and after it joins again beside its new one.
-/// Paired denial: its operation naming the kick's own sequence is read by
+/// reads after its removal, and after it joins again beside its new one.
+/// Paired denial: its operation naming the removal's own sequence is read by
 /// nothing.
 #[test]
-fn a_departed_members_earlier_operation_reads_and_one_naming_its_kick_does_not() {
+fn a_departed_members_earlier_operation_reads_and_one_naming_its_removal_does_not() {
     let cast = Cast::new();
     let (alice, carol) = (&cast.alice, &cast.carol);
     let mut store = Store::founded_by(alice);
     store.invite(alice, 1, carol);
-    store.act(EventKind::Kicked, carol, 2, alice, 1);
+    store.act(EventKind::Removed, carol, 2, alice, 1);
     let mut records = Records::default();
     let earlier = records.put(op(alice, 1, carol, carol.author(), 1), carol.author());
-    let at_kick = records.put(op(alice, 2, carol, carol.author(), 2), carol.author());
-    let claim_at_kick = records.put(claim(carol, 3, 2), carol.author());
+    let at_removal = records.put(op(alice, 2, carol, carol.author(), 2), carol.author());
+    let claim_at_removal = records.put(claim(carol, 3, 2), carol.author());
     let view = records.view(&store);
     assert_eq!(verdict(&view, earlier), Verdict::Counted);
-    for entry in [at_kick, claim_at_kick] {
+    for entry in [at_removal, claim_at_removal] {
         assert_eq!(verdict(&view, entry), nothing(ForNothing::ActorLacksState));
     }
 
@@ -220,7 +220,7 @@ fn a_departed_members_earlier_operation_reads_and_one_naming_its_kick_does_not()
         assert_eq!(verdict(&view, entry), Verdict::Counted);
     }
     assert_eq!(
-        verdict(&view, at_kick),
+        verdict(&view, at_removal),
         nothing(ForNothing::ActorLacksState)
     );
     let note = op(alice, 1, carol, carol.author(), 1).record();

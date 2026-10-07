@@ -263,7 +263,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             operation(bob_author, 0).to_bytes(),
             b"eggs".to_vec(),
         ),
-        // A plain member's promotion of itself, and its kick of another.
+        // A plain member's promotion of itself, and its removal of another.
         forgery(
             bob_phone,
             bob.id,
@@ -277,16 +277,16 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             bob.id,
             bob_author,
             membership,
-            event(carol.id, 2, EventKind::Kicked, bob.id).to_bytes(),
+            event(carol.id, 2, EventKind::Removed, bob.id).to_bytes(),
             vec![0],
         ),
-        // An owner's kick and demotion of itself.
+        // An owner's removal and demotion of itself.
         forgery(
             alice_phone,
             alice.id,
             alice_author,
             membership,
-            event(alice.id, 2, EventKind::Kicked, alice.id).to_bytes(),
+            event(alice.id, 2, EventKind::Removed, alice.id).to_bytes(),
             vec![0],
         ),
         forgery(

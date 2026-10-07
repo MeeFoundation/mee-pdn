@@ -192,7 +192,7 @@ async fn verdicts_come_to(
     }
 }
 
-/// A promotion and a kick two owners write at one point of a member's
+/// A promotion and a removal two owners write at one point of a member's
 /// chain while out of reach of each other take the member out on every
 /// member device, and so do a demotion and the subject's own leave at one
 /// point of its chain, every member device holding all four entries.
@@ -221,7 +221,7 @@ async fn acts_at_one_point_resolve_by_precedence_on_every_member_device() -> Res
 
     let written = [
         act(alice_phone, alice, 1, EventKind::Promoted, bob, 2, pod).await?,
-        act(carol_phone, carol, 2, EventKind::Kicked, bob, 2, pod).await?,
+        act(carol_phone, carol, 2, EventKind::Removed, bob, 2, pod).await?,
         act(alice_phone, alice, 1, EventKind::Demoted, dave, 3, pod).await?,
         act(dave_phone, dave, 2, EventKind::Left, dave, 3, pod).await?,
     ];
@@ -242,12 +242,12 @@ async fn acts_at_one_point_resolve_by_precedence_on_every_member_device() -> Res
             assert!(lists(phone, holder.id, pod, member.id, want).await?);
         }
     }
-    // Only once Alice's phone holds the kick: a dial returns when asked for,
+    // Only once Alice's phone holds the removal: a dial returns when asked for,
     // and its session serves what Alice's phone held as it opened.
     dial(bob_phone, bob, pod, alice_phone, alice).await?;
     assert!(
         lists(bob_phone, bob.id, pod, bob.id, OUT).await?,
-        "the kicked member's device did not take the kick that outranks its promotion"
+        "the removed member's device did not take the removal that outranks its promotion"
     );
 
     for phone in phones {

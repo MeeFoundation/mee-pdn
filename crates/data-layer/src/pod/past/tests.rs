@@ -13,25 +13,25 @@ fn entry(store: &Store, index: usize) -> PastEntry {
     (held.key.clone(), held.author)
 }
 
-/// A kick's past is the kicked event, the kicked member's chain before it
+/// A removal's past is the removed event, the removed member's chain before it
 /// and the owner's chain up to the point it names, with what resolves each
 /// author, down to the founding event. Denied: another member's join and a
-/// newcomer the kick does not rest on are left out.
+/// newcomer the removal does not rest on are left out.
 #[test]
-fn a_kicks_past_holds_what_it_rests_on_and_nothing_else() {
+fn a_removals_past_holds_what_it_rests_on_and_nothing_else() {
     let cast = Cast::new();
     let (alice, bob, carol, dave) = (&cast.alice, &cast.bob, &cast.carol, &cast.dave);
     let mut store = Store::founded_by(alice);
     let bob_joined = store.invite(alice, 1, bob);
     let carol_joined = store.invite(alice, 1, carol);
-    let kick = store.act(EventKind::Kicked, carol, 2, alice, 1);
+    let removal = store.act(EventKind::Removed, carol, 2, alice, 1);
     let dave_joined = store.invite(bob, 1, dave);
     let past = past_of(&store, carol).expect("Carol departed");
     for (index, name) in [
         (0, "the founding event"),
         (1, "the founder's statement"),
         (carol_joined, "Carol's joined event"),
-        (kick, "the kick"),
+        (removal, "the removal"),
     ] {
         assert!(past.contains(&entry(&store, index)), "{name} left out");
     }
@@ -77,10 +77,10 @@ fn an_earlier_sequence_held_by_an_entry_counting_for_nothing_stays_in_the_past()
     let mut store = Store::founded_by(alice);
     store.invite(alice, 1, carol);
     let own_promotion = store.act(EventKind::Promoted, carol, 2, carol, 1);
-    let kick = store.act(EventKind::Kicked, carol, 3, alice, 1);
+    let removal = store.act(EventKind::Removed, carol, 3, alice, 1);
     let past = past_of(&store, carol).expect("Carol departed");
     assert!(past.contains(&entry(&store, own_promotion)));
-    assert!(past.contains(&entry(&store, kick)));
+    assert!(past.contains(&entry(&store, removal)));
 }
 
 /// A member and an identity that never joined have no departure's past.

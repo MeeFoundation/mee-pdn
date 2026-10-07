@@ -133,14 +133,14 @@ async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
     Ok(false)
 }
 
-/// A device offline while its member is kicked learns of the kick at its
-/// first session with a member device, taking the kick and what it rests
-/// on. Denied: a membership event outside the kick's past and a record
+/// A device offline while its member is removed learns of the removal at its
+/// first session with a member device, taking the removal and what it rests
+/// on. Denied: a membership event outside the removal's past and a record
 /// placed after it reach the device from no member device, the record
 /// store refused to it.
-#[allow(clippy::too_many_lines)] // one scenario: the kick while offline, the return and each denial
+#[allow(clippy::too_many_lines)] // one scenario: the removal while offline, the return and each denial
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing_after(
+async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_nothing_after(
 ) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (alice_phone, bob_phone) = (node(QUIET).await?, node(QUIET).await?);
@@ -168,7 +168,7 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     carol_phone.shutdown().await?;
     drop(carol_phone);
 
-    depart(&alice_phone, &carol, pod, EventKind::Kicked, &alice, 2).await?;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
     let dave = Person::generate();
     invite(&bob_phone, &bob, pod, &dave, vec![nowhere(0xd0)]).await?;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
@@ -181,7 +181,7 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     carol_phone.import_pod(carol.id, pod, tickets).await?;
     assert!(
         lists(&carol_phone, carol.id, pod, carol.id, OUT).await?,
-        "the device did not learn of its member's kick"
+        "the device did not learn of its member's removal"
     );
     let mut records = carol_phone
         .watch_pod_sessions(carol.id, pod, PodStore::Records)
@@ -198,10 +198,10 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     let refused = records
         .next_with(bob_phone.node_id(), true, TIMEOUT)
         .await?;
-    // Denied: the record store, and everything outside the kick's past.
+    // Denied: the record store, and everything outside the removal's past.
     assert!(
         refused.is_some_and(|session| session.exchanged.is_err()),
-        "a member device served the kicked member's record store"
+        "a member device served the removed member's record store"
     );
     assert!(!knows(&carol_phone, &carol, pod, &dave).await?);
     assert!(holds_no_record(&carol_phone, carol.id, pod).await?);
@@ -548,13 +548,13 @@ async fn linked(phone: &SyncNode, laptop: &SyncNode) -> Result<(Person, PrivateM
     Ok((person, directory))
 }
 
-/// A kicked member's record from while a member reads on a device linked
-/// after the kick, and once invited again the member writes under its new
+/// A removed member's record from while a member reads on a device linked
+/// after the removal, and once invited again the member writes under its new
 /// sequence, both records reading as its own on every device. Denied: its
-/// device is refused the record store between the kick and the new join.
-#[allow(clippy::too_many_lines)] // one scenario: the kick, the late device and the return
+/// device is refused the record store between the removal and the new join.
+#[allow(clippy::too_many_lines)] // one scenario: the removal, the late device and the return
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Result<()> {
+async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> Result<()> {
     let (alice_phone, bob_phone, bob_laptop, carol_phone) = (
         node(QUIET).await?,
         node(QUIET).await?,
@@ -585,10 +585,10 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
     let earlier = place_claim(&carol_phone, &carol, pod, 1).await?;
     assert!(reads(&bob_phone, bob.id, pod, earlier).await?);
 
-    depart(&alice_phone, &carol, pod, EventKind::Kicked, &alice, 2).await?;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
     assert!(lists(&bob_phone, bob.id, pod, carol.id, OUT).await?);
     assert!(lists(&carol_phone, carol.id, pod, carol.id, OUT).await?);
-    // Denied: Carol's device, on the record store, while kicked.
+    // Denied: Carol's device, on the record store, while removed.
     let mut carols = carol_phone
         .watch_pod_sessions(carol.id, pod, PodStore::Records)
         .await?;
@@ -604,7 +604,7 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
     let refused = carols.next_with(bob_phone.node_id(), true, TIMEOUT).await?;
     assert!(refused.is_some_and(|session| session.exchanged.is_err()));
 
-    // Bob's laptop, linked after the kick, reads Carol's earlier record.
+    // Bob's laptop, linked after the removal, reads Carol's earlier record.
     bob_directory.add_device(bob_laptop.node_id()).await?;
     let directory_ticket = bob_directory
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)

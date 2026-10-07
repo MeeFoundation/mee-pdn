@@ -27,7 +27,7 @@ pub(crate) struct Departure {
 
 /// The past of `member`'s departure over `entries`, the ones `membership`
 /// folded; `None` while `member` has not departed — its chain does not end
-/// in a counted left or kicked event.
+/// in a counted left or removed event.
 pub(crate) fn departure_past(
     membership: &Membership,
     entries: &[HeldEntry],
@@ -36,7 +36,7 @@ pub(crate) fn departure_past(
     let index = Index::of(membership, entries);
     let run = index.run(member);
     let at_end = index.events.get(&(*member, run))?;
-    let kind = [EventKind::Kicked, EventKind::Left]
+    let kind = [EventKind::Removed, EventKind::Left]
         .into_iter()
         .find(|kind| {
             at_end
