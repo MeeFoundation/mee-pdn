@@ -361,8 +361,8 @@ pub struct NamespaceImport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedHosting {
     pub identity: PdnId,
-    /// The namespace of the identity's private metadata directory.
-    pub directory: NamespaceId,
+    /// The namespace of the identity's PMS.
+    pub pms: NamespaceId,
     /// Whether the replica store beside the record is on disk.
     pub store_present: bool,
 }
@@ -851,21 +851,21 @@ impl SyncNode {
         Ok(self.require(identity)?.docs.replica_cache_bytes())
     }
 
-    /// Record `identity` as hosted here, with `directory` as its private
-    /// metadata directory: the commit point of a create or a link. The
+    /// Record `identity` as hosted here, with `pms` as its private
+    /// PMS: the commit point of a create or a link. The
     /// replicas are flushed first, so the record never names one the store
     /// has not written, and the record is written beside, synced and
     /// renamed over, so a process that dies mid-write leaves none. The
     /// parent directory is not synced after the rename, so an OS crash or a
     /// power loss can take the record back after this returned `Ok`. A node
     /// in memory records nothing.
-    pub async fn record_hosting(&self, identity: PdnId, directory: NamespaceId) -> Result<()> {
+    pub async fn record_hosting(&self, identity: PdnId, pms: NamespaceId) -> Result<()> {
         let StorageConfig::Directory(root) = &self.storage else {
             return Ok(());
         };
-        self.flush_replicas(identity, directory).await?;
+        self.flush_replicas(identity, pms).await?;
         let own = identity_directory(root, identity);
-        tokio::task::spawn_blocking(move || write_hosting_record(&own, directory))
+        tokio::task::spawn_blocking(move || write_hosting_record(&own, pms))
             .await
             .context("the hosting record writer did not run")?
     }
@@ -881,15 +881,15 @@ impl SyncNode {
         read_hosting_records(root)
     }
 
-    /// Arm `identity`'s directory for session classification: its device
+    /// Arm `identity`'s PMS for session classification: its device
     /// records decide who is one of its devices, and its data namespaces
-    /// serve fail-closed from here on. The directory's sync starts here,
+    /// serve fail-closed from here on. The PMS's sync starts here,
     /// after the arming, so its first session is one the book can judge.
-    pub fn host_identity(&self, identity: PdnId, directory: &PrivateMetadataStore) -> Result<()> {
+    pub fn host_identity(&self, identity: PdnId, pms: &PrivateMetadataStore) -> Result<()> {
         let stack = self.require(identity)?;
-        stack.access.arm_directory(directory.doc_handle())?;
-        stack.start_armed(directory.namespace())?;
-        watch_own_devices(&stack, self.router.endpoint().id(), directory.doc_handle());
+        stack.access.arm_pms(pms.doc_handle())?;
+        stack.start_armed(pms.namespace())?;
+        watch_own_devices(&stack, self.router.endpoint().id(), pms.doc_handle());
         Ok(())
     }
 
@@ -908,7 +908,7 @@ impl SyncNode {
         let Some(stack) = stack else {
             return Ok(());
         };
-        stack.access.disarm_directory()?;
+        stack.access.disarm_pms()?;
         for tracked in stack.tracked_snapshot() {
             self.retraction
                 .untrack_namespace(identity, tracked.doc.id());
@@ -937,7 +937,7 @@ impl SyncNode {
         if let Some(peer_half) = stack.tracked(peer_store.namespace())? {
             stack.add_contacts(own.namespace(), peer_half.contacts)?;
         }
-        // After the arming, as `host_identity` starts the directory's.
+        // After the arming, as `host_identity` starts the PMS's.
         stack.start_armed(own.namespace())?;
         stack.start_armed(peer_store.namespace())
     }
@@ -1259,7 +1259,7 @@ impl SyncNode {
     }
 
     /// [`sync_as_for_test`](Self::sync_as_for_test) for any replica
-    /// `identity` holds, named by its namespace — a directory or a
+    /// `identity` holds, named by its namespace — a PMS or a
     /// connection metadata store as well as a data replica. No session
     /// access is asked on the dialing side, so it serves its replica whole.
     #[cfg(feature = "test-util")]
@@ -1328,7 +1328,7 @@ impl SyncNode {
     }
 
     /// Refuses a ticket naming a namespace this identity already holds in
-    /// another role: its data replica, its directory, a store of one of
+    /// another role: its data replica, its PMS, a store of one of
     /// its connections. A device-shared store is classified on its ticket
     /// alone (Invariants 1 and 3), so a namespace that took that role by
     /// a counterparty's word would be served whole, past the grant that
@@ -2835,14 +2835,14 @@ fn hosted_identity_count(directory: &std::path::Path, opening: PdnId) -> Result<
     })
 }
 
-fn write_hosting_record(own: &std::path::Path, directory: NamespaceId) -> Result<()> {
+fn write_hosting_record(own: &std::path::Path, pms: NamespaceId) -> Result<()> {
     use std::io::Write as _;
     let path = own.join(HOSTING_RECORD_FILE);
     let staged = own.join(format!("{HOSTING_RECORD_FILE}.tmp"));
     let context = || format!("cannot write the hosting record {}", path.display());
     {
         let mut file = std::fs::File::create(&staged).with_context(context)?;
-        file.write_all(directory.to_string().as_bytes())
+        file.write_all(pms.to_string().as_bytes())
             .with_context(context)?;
         // A rename can commit before the data reaches the disk.
         file.sync_all().with_context(context)?;
@@ -2889,14 +2889,14 @@ fn read_hosting_records(directory: &std::path::Path) -> Result<Vec<RecordedHosti
                     .with_context(|| format!("cannot read the hosting record {}", path.display()))
             }
         };
-        let directory = text
+        let pms = text
             .trim()
             .parse::<NamespaceId>()
             .with_context(|| format!("cannot parse the hosting record {}", path.display()))?;
         let store_present = entry.path().join(REPLICA_STORE_FILE).is_file();
         recorded.push(RecordedHosting {
             identity,
-            directory,
+            pms,
             store_present,
         });
     }
@@ -3094,13 +3094,13 @@ async fn referenced_payloads(stack: &HostedStack) -> Result<Vec<Hash>> {
 
 /// One subdirectory per identity, each holding that identity's replica
 /// store (`docs.redb`), its persisted author (`default-author`) and, once
-/// a create or link commits, its hosting record (`directory`).
+/// a create or link commits, its hosting record (`pms`).
 const IDENTITIES_DIR: &str = "identities";
 /// The store pdn-store opens in an identity's subdirectory.
 const REPLICA_STORE_FILE: &str = "docs.redb";
-/// The namespace of the identity's private metadata directory, as text: a
+/// The namespace of the identity's PMS, as text: a
 /// start hosts exactly the identities whose subdirectory holds one.
-const HOSTING_RECORD_FILE: &str = "directory";
+const HOSTING_RECORD_FILE: &str = "pms";
 const BLOBS_DIR: &str = "blobs";
 /// The endpoint's secret key, hex-encoded.
 const NODE_KEY_FILE: &str = "node.key";
@@ -3687,25 +3687,25 @@ async fn derive_before_start(
 }
 
 /// Dial every store of the identity's pods toward each device its
-/// directory newly lists, as the identity: a sibling whose first dial came
+/// PMS newly lists, as the identity: a sibling whose first dial came
 /// before its listing reached this device is refused, and nothing else
-/// dials it again before the pod stores' pass. Ends with the directory's
+/// dials it again before the pod stores' pass. Ends with the PMS's
 /// subscription or the identity's half of the node.
-fn watch_own_devices(stack: &Arc<HostedStack>, node: EndpointId, directory: Doc) {
+fn watch_own_devices(stack: &Arc<HostedStack>, node: EndpointId, pms: Doc) {
     let stack = Arc::downgrade(stack);
     let _detached = tokio::spawn(async move {
-        let Ok(events) = directory.subscribe().await else {
+        let Ok(events) = pms.subscribe().await else {
             return;
         };
         // A burst can end with the stream, which panics when polled again.
         let mut events = events.fuse();
-        let mut listed: HashSet<NodeId> = crate::private_metadata::listed_devices(&directory)
+        let mut listed: HashSet<NodeId> = crate::private_metadata::listed_devices(&pms)
             .await
             .map(|devices| devices.into_iter().collect())
             .unwrap_or_default();
         while events.next().await.is_some() {
             while let Some(Some(_queued)) = futures_lite::future::poll_once(events.next()).await {}
-            let Ok(now) = crate::private_metadata::listed_devices(&directory).await else {
+            let Ok(now) = crate::private_metadata::listed_devices(&pms).await else {
                 continue;
             };
             let fresh: Vec<NodeId> = now
@@ -3826,7 +3826,7 @@ fn note_event(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>
 
 /// A pod store's contacts: every device the statements of the pod's
 /// current members list, each dialed as its member, and the identity's own
-/// devices by its directory, dialed as the identity; never this device as
+/// devices by its PMS, dialed as the identity; never this device as
 /// this identity. `None` while the membership store folds into nobody: a
 /// replica that holds nothing yet keeps the contacts its ticket gave it.
 /// A tombstone drops the members' devices once a session with one of them

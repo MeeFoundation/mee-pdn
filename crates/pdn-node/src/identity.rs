@@ -18,7 +18,7 @@ use crate::{
     runtime::{HostedIdentity, Runtime},
 };
 
-/// The directory kind of the identity's own data-namespace ticket. The
+/// The PMS kind of the identity's own data-namespace ticket. The
 /// linking critical path never reads it (the reply hands the tickets over
 /// directly); restart recovery re-binds the data namespace from it.
 pub(crate) const DATA_TICKET_KIND: &str = "data";
@@ -31,10 +31,10 @@ pub(crate) const DATA_TICKET_KIND: &str = "data";
 struct CreateRollback {
     node: Arc<data_layer::SyncNode>,
     identity: PdnId,
-    /// `None` until the directory exists: the identity's half of the node
+    /// `None` until the PMS exists: the identity's half of the node
     /// is brought up before it, and that half is the first thing a failure
     /// has to take back down.
-    directory_namespace: Option<data_layer::NamespaceId>,
+    pms_namespace: Option<data_layer::NamespaceId>,
     hosting_armed: bool,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
     armed: bool,
@@ -53,15 +53,15 @@ impl CreateRollback {
         Self {
             node,
             identity,
-            directory_namespace: None,
+            pms_namespace: None,
             hosting_armed: false,
             cleanup_tasks,
             armed: true,
         }
     }
 
-    fn armed_directory(&mut self, namespace: data_layer::NamespaceId) {
-        self.directory_namespace = Some(namespace);
+    fn armed_pms(&mut self, namespace: data_layer::NamespaceId) {
+        self.pms_namespace = Some(namespace);
     }
 
     fn armed_hosting(&mut self) {
@@ -72,7 +72,7 @@ impl CreateRollback {
         undo_create(
             &self.node,
             self.identity,
-            self.directory_namespace,
+            self.pms_namespace,
             self.hosting_armed,
         )
         .await;
@@ -90,11 +90,11 @@ impl Drop for CreateRollback {
             return;
         }
         let node = Arc::clone(&self.node);
-        let (identity, directory_namespace, hosting_armed) =
-            (self.identity, self.directory_namespace, self.hosting_armed);
+        let (identity, pms_namespace, hosting_armed) =
+            (self.identity, self.pms_namespace, self.hosting_armed);
         // Through the supervisor, so shutdown waits for it.
         let _detached = self.cleanup_tasks.spawn(async move {
-            undo_create(&node, identity, directory_namespace, hosting_armed).await;
+            undo_create(&node, identity, pms_namespace, hosting_armed).await;
         });
     }
 }
@@ -106,12 +106,12 @@ impl Drop for CreateRollback {
 async fn undo_create(
     node: &data_layer::SyncNode,
     identity: PdnId,
-    directory_namespace: Option<data_layer::NamespaceId>,
+    pms_namespace: Option<data_layer::NamespaceId>,
     _hosting_armed: bool,
 ) {
     let _ = node.forget_namespace(identity, identity).await;
-    if let Some(directory) = directory_namespace {
-        let _ = node.forget_doc(identity, directory).await;
+    if let Some(pms) = pms_namespace {
+        let _ = node.forget_doc(identity, pms).await;
     }
     let _ = node.unhost_identity(identity).await;
 }
@@ -121,7 +121,7 @@ async fn undo_create(
 pub trait IdentityService {
     /// Create an identity on its first device: its announcement key pair,
     /// the [`PdnId`] that pair's public key derives, and its store set
-    /// provisioned, the pair kept in its directory.
+    /// provisioned, the pair kept in its PMS.
     async fn create(&self) -> Result<PdnId>;
 
     /// Mint a linking invite for hosted `identity`; `lifetime` overrides
@@ -133,7 +133,7 @@ pub trait IdentityService {
     ) -> Result<LinkingPayload>;
 
     /// Link this runtime as a device of the payload's identity, returning
-    /// once the imported directory has completed one successful sync
+    /// once the imported PMS has completed one successful sync
     /// exchange. `timeout` is the budget of the whole act: the dialogue
     /// spends from it first ([`DialogueTimeout`](crate::linking::DialogueTimeout)),
     /// the catch-up gets what remains ([`CatchUpTimeout`](crate::CatchUpTimeout));
@@ -167,7 +167,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
             #[cfg(not(feature = "test-util"))]
             let state = self.runtime.state.lock().await;
             #[cfg(feature = "test-util")]
-            let injected_failure = std::mem::take(&mut state.fail_next_directory_create);
+            let injected_failure = std::mem::take(&mut state.fail_next_pms_create);
             #[cfg(not(feature = "test-util"))]
             let injected_failure = false;
             (
@@ -181,24 +181,24 @@ impl IdentityService for RuntimeIdentityService<'_> {
         node.provision_identity(identity).await?;
         let mut rollback = CreateRollback::new(Arc::clone(&node), identity, cleanup_tasks);
         let created = if injected_failure {
-            Err(anyhow::anyhow!("directory creation failed for test"))
+            Err(anyhow::anyhow!("PMS creation failed for test"))
         } else {
             PrivateMetadataStore::create(&node, identity).await
         };
-        let directory = match created {
-            Ok(directory) => directory,
+        let pms = match created {
+            Ok(pms) => pms,
             Err(err) => {
                 rollback.roll_back().await;
                 return Err(err);
             }
         };
-        rollback.armed_directory(directory.namespace());
+        rollback.armed_pms(pms.namespace());
         let provisioned = async {
             // Before the commit point, unlike a link's confirmation: no other
-            // device holds a ticket to this fresh directory, so nothing
+            // device holds a ticket to this fresh PMS, so nothing
             // written here can reach anyone.
-            directory.add_device(node.node_id()).await?;
-            directory.put_announcement_key(&announcement_key).await?;
+            pms.add_device(node.node_id()).await?;
+            pms.put_announcement_key(&announcement_key).await?;
             node.create_namespace(identity, identity).await?;
             let data_ticket = node
                 .share_ticket(
@@ -208,11 +208,11 @@ impl IdentityService for RuntimeIdentityService<'_> {
                     AddrInfoOptions::RelayAndAddresses,
                 )
                 .await?;
-            directory.put_ticket(DATA_TICKET_KIND, &data_ticket).await?;
+            pms.put_ticket(DATA_TICKET_KIND, &data_ticket).await?;
             // The armer's subscription, taken before the handle moves into
             // the hosted set.
-            let changes = directory.changes().await?;
-            node.host_identity(identity, &directory)?;
+            let changes = pms.changes().await?;
+            node.host_identity(identity, &pms)?;
             anyhow::Ok(changes)
         }
         .await;
@@ -230,7 +230,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
         // poisoned: the create then fails, the record stays, and the next
         // start hosts the identity.
         let mut state = self.runtime.state.lock().await;
-        if let Err(err) = state.commit_hosting(identity, directory.namespace()).await {
+        if let Err(err) = state.commit_hosting(identity, pms.namespace()).await {
             drop(state);
             rollback.roll_back().await;
             return Err(err);
@@ -238,7 +238,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
         let author = node.default_author(identity)?;
         state
             .identities
-            .insert(identity, HostedIdentity { directory, author });
+            .insert(identity, HostedIdentity { pms, author });
         drop(state);
         crate::connections::spawn_connection_armer(
             Arc::downgrade(&self.runtime.state),

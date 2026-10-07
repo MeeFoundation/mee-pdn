@@ -31,18 +31,18 @@ pub mod ids {
 }
 
 /// Bring up `identity`'s half of `node` the way the product does: its own
-/// stores, a directory naming this device, and the arming that lets a
+/// stores, a PMS naming this device, and the arming that lets a
 /// session be judged. A replica of an identity the node does not host is
 /// served to nobody, so no scenario reaches a data replica without this.
 pub async fn host_identity(node: &SyncNode, identity: PdnId) -> Result<PrivateMetadataStore> {
     node.provision_identity(identity).await?;
-    let directory = PrivateMetadataStore::create(node, identity).await?;
-    directory.add_device(node.node_id()).await?;
-    node.host_identity(identity, &directory)?;
-    Ok(directory)
+    let pms = PrivateMetadataStore::create(node, identity).await?;
+    pms.add_device(node.node_id()).await?;
+    node.host_identity(identity, &pms)?;
+    Ok(pms)
 }
 
-/// [`host_identity`] for a further device of an identity whose directory
+/// [`host_identity`] for a further device of an identity whose PMS
 /// already exists: import it under that identity and arm.
 pub async fn join_identity(
     node: &SyncNode,
@@ -50,9 +50,9 @@ pub async fn join_identity(
     ticket: DocTicket,
 ) -> Result<PrivateMetadataStore> {
     node.provision_identity(identity).await?;
-    let directory = PrivateMetadataStore::import(node, identity, ticket).await?;
-    node.host_identity(identity, &directory)?;
-    Ok(directory)
+    let pms = PrivateMetadataStore::import(node, identity, ticket).await?;
+    node.host_identity(identity, &pms)?;
+    Ok(pms)
 }
 
 /// The liveness budget of a scenario wait: a few of the node's periodic
@@ -79,7 +79,7 @@ where
     }
 }
 
-/// Wait until `is_connected(peer)` on the directory `pms` equals `want`.
+/// Wait until `is_connected(peer)` on the PMS `pms` equals `want`.
 pub async fn wait_connected(pms: &PrivateMetadataStore, peer: PdnId, want: bool) -> Result<bool> {
     eventually(|| async { Ok(pms.is_connected(peer).await? == want) }).await
 }

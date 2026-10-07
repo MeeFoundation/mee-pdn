@@ -11,9 +11,9 @@ use test_utils::{
     host_identity, ids, join_identity, memory_node, wait_connected, wait_devices, wait_entry_is,
 };
 
-/// Bring one identity up on `phone` with its fixtures: a directory with the
+/// Bring one identity up on `phone` with its fixtures: a PMS with the
 /// phone registered and a connection to `peer`, plus `value` at `path` in
-/// the data namespace of `issuer`. Returns the phone-side directory and its
+/// the data namespace of `issuer`. Returns the phone-side PMS and its
 /// write ticket.
 async fn provision_with_fixtures(
     phone: &mut SyncNode,
@@ -22,28 +22,28 @@ async fn provision_with_fixtures(
     path: &EntryPath,
     value: &[u8],
 ) -> Result<(PrivateMetadataStore, DocTicket)> {
-    let directory = host_identity(phone, issuer).await?;
-    directory.connect(peer).await?;
+    let pms = host_identity(phone, issuer).await?;
+    pms.connect(peer).await?;
     let author = phone.default_author(issuer)?;
     phone.create_namespace(issuer, issuer).await?;
     phone.write(issuer, issuer, author, path, value).await?;
-    let ticket = directory
+    let ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    Ok((directory, ticket))
+    Ok((pms, ticket))
 }
 
 /// Bring the identity behind `ticket` up on `node`, as device linking does
 /// at the store level: bring up the identity's stores, import the
-/// directory and join the device set.
+/// PMS and join the device set.
 async fn join_from(
     node: &SyncNode,
     identity: PdnId,
     ticket: DocTicket,
 ) -> Result<PrivateMetadataStore> {
-    let directory = join_identity(node, identity, ticket).await?;
-    directory.add_device(node.node_id()).await?;
-    Ok(directory)
+    let pms = join_identity(node, identity, ticket).await?;
+    pms.add_device(node.node_id()).await?;
+    Ok(pms)
 }
 
 /// Hand `issuer`'s data namespace from one node to another by ticket.
@@ -78,7 +78,7 @@ async fn three_devices_two_identities() -> Result<()> {
     let tablet_id = tablet.node_id();
 
     // Phone brings up both identities, each with a connection and one entry.
-    let (work_phone_dir, work_ticket) = provision_with_fixtures(
+    let (work_phone_pms, work_ticket) = provision_with_fixtures(
         &mut phone,
         ids::ALICE_AT_WORK,
         ids::BOB,
@@ -86,7 +86,7 @@ async fn three_devices_two_identities() -> Result<()> {
         b"Acme Engineering",
     )
     .await?;
-    let (_leisure_phone_dir, leisure_ticket) = provision_with_fixtures(
+    let (_leisure_phone_pms, leisure_ticket) = provision_with_fixtures(
         &mut phone,
         ids::ALICE_AT_LEISURE,
         ids::CAROL,
@@ -97,8 +97,8 @@ async fn three_devices_two_identities() -> Result<()> {
 
     // Laptop joins both identities from phone's tickets and imports the
     // work data namespace.
-    let work_laptop_dir = join_from(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
-    let leisure_laptop_dir = join_from(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
+    let work_laptop_pms = join_from(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
+    let leisure_laptop_pms = join_from(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
     import_data_from(&phone, &mut laptop, ids::ALICE_AT_WORK).await?;
     assert!(
         wait_entry_is(
@@ -112,18 +112,18 @@ async fn three_devices_two_identities() -> Result<()> {
         "work data did not reach laptop"
     );
 
-    // Tablet joins work only — directory and data tickets issued by the
+    // Tablet joins work only — PMS and data tickets issued by the
     // LAPTOP.
-    let tablet_ticket = work_laptop_dir
+    let tablet_ticket = work_laptop_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let work_tablet_dir = join_from(&tablet, ids::ALICE_AT_WORK, tablet_ticket).await?;
+    let work_tablet_pms = join_from(&tablet, ids::ALICE_AT_WORK, tablet_ticket).await?;
     import_data_from(&laptop, &mut tablet, ids::ALICE_AT_WORK).await?;
 
     // Transitive catch-up: state authored on phone reaches the tablet
     // through stores it obtained via the laptop.
     assert!(
-        wait_connected(&work_tablet_dir, ids::BOB, true).await?,
+        wait_connected(&work_tablet_pms, ids::BOB, true).await?,
         "the Bob connection did not reach the tablet"
     );
     assert!(
@@ -139,30 +139,30 @@ async fn three_devices_two_identities() -> Result<()> {
     );
 
     // Live through the three-device swarm: a fresh connection on phone.
-    work_phone_dir.connect(ids::DAVE).await?;
+    work_phone_pms.connect(ids::DAVE).await?;
     assert!(
-        wait_connected(&work_tablet_dir, ids::DAVE, true).await?,
+        wait_connected(&work_tablet_pms, ids::DAVE, true).await?,
         "a live work update did not reach the tablet"
     );
 
     // The work device set converges to all three — on the first device too.
     let all = [phone_id, laptop_id, tablet_id];
     assert!(
-        wait_devices(&work_tablet_dir, &all).await?,
+        wait_devices(&work_tablet_pms, &all).await?,
         "the tablet's work device set is incomplete"
     );
     assert!(
-        wait_devices(&work_phone_dir, &all).await?,
+        wait_devices(&work_phone_pms, &all).await?,
         "the phone's work device set is incomplete"
     );
 
     // The leisure device set stays at two: the tablet is not in it.
     assert!(
-        wait_devices(&leisure_laptop_dir, &[phone_id, laptop_id]).await?,
+        wait_devices(&leisure_laptop_pms, &[phone_id, laptop_id]).await?,
         "the leisure device set did not converge"
     );
     assert!(
-        !leisure_laptop_dir
+        !leisure_laptop_pms
             .list_devices()
             .await?
             .contains(&tablet_id),

@@ -67,14 +67,14 @@ impl RuntimeSyncService<'_> {
     }
 
     /// The issuer and path of every retraction marker in `identity`'s own
-    /// directory — what shows a verdict was recorded there and in no
+    /// PMS — what shows a verdict was recorded there and in no
     /// co-located identity's.
     #[cfg(feature = "test-util")]
     pub async fn retraction_markers(&self, identity: PdnId) -> Result<Vec<(PdnId, String)>> {
         let state = self.runtime.state.lock().await;
         Ok(state
             .hosted(identity)?
-            .directory
+            .pms
             .list_retractions()
             .await?
             .into_iter()

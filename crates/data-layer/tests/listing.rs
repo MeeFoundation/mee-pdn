@@ -11,7 +11,7 @@ use test_utils::{host_identity, ids, memory_node};
 #[tokio::test(flavor = "multi_thread")]
 async fn listing_yields_written_paths_and_prefix_matches_whole_components() -> Result<()> {
     let node = memory_node().await?;
-    let _directory = host_identity(&node, ids::ALICE).await?;
+    let _pms = host_identity(&node, ids::ALICE).await?;
     let author = node.default_author(ids::ALICE)?;
     node.create_namespace(ids::ALICE, ids::ALICE).await?;
 

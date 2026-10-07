@@ -228,7 +228,7 @@ pub trait PodsService {
     /// event; the identity is the first owner.
     async fn create(&self, identity: PdnId) -> Result<PodId>;
 
-    /// The pods the identity holds, by its directory.
+    /// The pods the identity holds, by its PMS.
     async fn list(&self, identity: PdnId) -> Result<Vec<PodInfo>>;
 
     /// The current members, each with its role.
@@ -248,13 +248,13 @@ pub trait PodsService {
     /// caught up and the identity's replica folds it as a member; the
     /// identity joins as a plain member. A catch-up cut short
     /// fails with [`data_layer::CatchUpTimeout`] and leaves both tickets and
-    /// the directory's entry recorded.
+    /// the PMS's entry recorded.
     async fn join(&self, identity: PdnId, invite: PodInvite) -> Result<PodId>;
 
     /// Write a membership act once the identity's role allows it, both
     /// sequences picked from what the replica holds;
     /// [`ActRefused`] writes nothing. A leave also tombstones the pod in the
-    /// identity's directory at the left event's sequence and forgets the
+    /// identity's PMS at the left event's sequence and forgets the
     /// record store, the membership store kept as the pod's tombstone.
     async fn act(&self, identity: PdnId, pod: PodId, act: PodAct) -> Result<()>;
 
@@ -337,7 +337,7 @@ impl PodsService for RuntimePodsService<'_> {
         let state = self.runtime.state.lock().await;
         let hosted = state.hosted(identity)?;
         let keys = hosted
-            .directory
+            .pms
             .announcement_key()
             .await?
             .ok_or(AnnouncementKeyPending { identity })?;
@@ -380,7 +380,7 @@ impl PodsService for RuntimePodsService<'_> {
                 &keys.device_statement(1, vec![device]).encode(),
             )
             .await?;
-            record_pod(&node, &hosted.directory, identity, pod, Seq::FIRST, None).await
+            record_pod(&node, &hosted.pms, identity, pod, Seq::FIRST, None).await
         }
         .await;
         match written {
@@ -399,7 +399,7 @@ impl PodsService for RuntimePodsService<'_> {
         let state = self.runtime.state.lock().await;
         let mut pods: Vec<PodInfo> = state
             .hosted(identity)?
-            .directory
+            .pms
             .held_pods()
             .await?
             .into_iter()
@@ -719,14 +719,10 @@ fn act_event(
 }
 
 /// `identity`'s departure from `pod` at `seq` of its chain: the
-/// directory's tombstone at that sequence, then the record store forgotten,
+/// PMS's tombstone at that sequence, then the record store forgotten,
 /// the membership store kept as the pod's tombstone.
 async fn depart(state: &State, identity: PdnId, pod: PodId, seq: Seq) -> Result<()> {
-    state
-        .hosted(identity)?
-        .directory
-        .tombstone_pod(pod, seq)
-        .await?;
+    state.hosted(identity)?.pms.tombstone_pod(pod, seq).await?;
     state.node.forget_pod(identity, pod).await
 }
 
@@ -767,9 +763,9 @@ async fn settle_departure(state: &State, identity: PdnId, pod: PodId, seq: Seq) 
     if state.joining_in_flight.contains(&(identity, pod)) {
         return Ok(());
     }
-    let directory = &state.hosted(identity)?.directory;
+    let pms = &state.hosted(identity)?.pms;
     // A later join recorded: the departure ends an earlier membership.
-    if directory
+    if pms
         .pod_record(pod)
         .await?
         .is_some_and(|(recorded, held)| held && recorded > seq)
@@ -789,7 +785,7 @@ async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<(
         return Ok(());
     }
     let hosted = state.hosted(identity)?;
-    let Some(keys) = hosted.directory.announcement_key().await? else {
+    let Some(keys) = hosted.pms.announcement_key().await? else {
         return Ok(());
     };
     let membership = state.node.pod_membership(identity, pod).await?;
@@ -827,7 +823,7 @@ async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<(
         .await
 }
 
-/// Open every pod `identity`'s directory holds that this device does not,
+/// Open every pod `identity`'s PMS holds that this device does not,
 /// from the tickets beside its record; open the tombstone of every pod it
 /// departed that this device holds nothing of, and forget the record store
 /// of every one this device still holds. The sweep after a restart
@@ -838,8 +834,8 @@ pub(crate) async fn arm_pods(state: &State, identity: PdnId) {
         return;
     };
     let (Ok(held), Ok(departed), Ok(holdings)) = (
-        hosted.directory.held_pods().await,
-        hosted.directory.departed_pods().await,
+        hosted.pms.held_pods().await,
+        hosted.pms.departed_pods().await,
         state.node.pod_holdings(identity),
     ) else {
         return;
@@ -857,7 +853,7 @@ pub(crate) async fn arm_pods(state: &State, identity: PdnId) {
             continue;
         }
         if let Err(err) = open_pod(state, identity, pod).await {
-            tracing::warn!(%identity, %pod, "opening the pod from the directory failed: {err:#}");
+            tracing::warn!(%identity, %pod, "opening the pod from the PMS failed: {err:#}");
         }
     }
     for pod in departed {
@@ -876,14 +872,14 @@ pub(crate) async fn arm_pods(state: &State, identity: PdnId) {
 }
 
 async fn open_tombstone(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
-    let directory = &state.hosted(identity)?.directory;
-    let Some(membership) = directory
+    let pms = &state.hosted(identity)?.pms;
+    let Some(membership) = pms
         .get_ticket(&pod_ticket_kind(&pod, PodStore::Membership))
         .await?
     else {
         return Ok(());
     };
-    let inviter = directory
+    let inviter = pms
         .get_ticket(&pod_inviter_ticket_kind(&pod, PodStore::Membership))
         .await?;
     state
@@ -893,11 +889,11 @@ async fn open_tombstone(state: &State, identity: PdnId, pod: PodId) -> Result<()
 }
 
 async fn open_pod(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
-    let directory = &state.hosted(identity)?.directory;
-    let Some(own) = pod_tickets(directory, pod, pod_ticket_kind).await? else {
+    let pms = &state.hosted(identity)?.pms;
+    let Some(own) = pod_tickets(pms, pod, pod_ticket_kind).await? else {
         return Ok(());
     };
-    let inviter = pod_tickets(directory, pod, pod_inviter_ticket_kind).await?;
+    let inviter = pod_tickets(pms, pod, pod_inviter_ticket_kind).await?;
     let _caught_up = state
         .node
         .import_pod_with(identity, pod, own, inviter.as_slice())
@@ -905,17 +901,15 @@ async fn open_pod(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
     Ok(())
 }
 
-/// Both stores' tickets of `pod` the directory holds under the kinds
+/// Both stores' tickets of `pod` the PMS holds under the kinds
 /// `kind` names; `None` until both have arrived.
 async fn pod_tickets(
-    directory: &data_layer::PrivateMetadataStore,
+    pms: &data_layer::PrivateMetadataStore,
     pod: PodId,
     kind: fn(&PodId, PodStore) -> String,
 ) -> Result<Option<PodTickets>> {
-    let membership = directory
-        .get_ticket(&kind(&pod, PodStore::Membership))
-        .await?;
-    let records = directory.get_ticket(&kind(&pod, PodStore::Records)).await?;
+    let membership = pms.get_ticket(&kind(&pod, PodStore::Membership)).await?;
+    let records = pms.get_ticket(&kind(&pod, PodStore::Records)).await?;
     Ok(membership
         .zip(records)
         .map(|(membership, records)| PodTickets {
@@ -934,7 +928,7 @@ async fn writer(state: &State, identity: PdnId, pod: PodId) -> Result<(AuthorId,
 }
 
 /// The joiner's half: dial, run the dialogue, then record both tickets and
-/// the directory's entry before the catch-up the join waits for.
+/// the PMS's entry before the catch-up the join waits for.
 #[allow(clippy::too_many_lines)] // one dialogue, both transports and each record in one place
 async fn join_via_dialogue(
     state: &Arc<Mutex<State>>,
@@ -945,7 +939,7 @@ async fn join_via_dialogue(
         let state = state.lock().await;
         let hosted = state.hosted(identity)?;
         let keys = hosted
-            .directory
+            .pms
             .announcement_key()
             .await?
             .ok_or(AnnouncementKeyPending { identity })?;
@@ -1024,10 +1018,10 @@ async fn join_via_dialogue(
     let caught_up = node.import_pod(identity, pod, inviter.clone()).await?;
     {
         let state = state.lock().await;
-        let directory = &state.hosted(identity)?.directory;
+        let pms = &state.hosted(identity)?.pms;
         record_pod(
             &node,
-            directory,
+            pms,
             identity,
             pod,
             Seq::new(offer.seq),
@@ -1252,14 +1246,14 @@ where
 }
 
 /// The identity holds `pod` from `seq` of its chain on: both stores' write
-/// tickets and the pod's entry in its directory, which reach
+/// tickets and the pod's entry in its PMS, which reach
 /// its other devices. Beside its own tickets go the ones the inviter handed
 /// over at a join, so a sibling, or this device after a restart, has a
 /// member's device to dial, named as that member, before its replica folds
 /// anyone.
 async fn record_pod(
     node: &data_layer::SyncNode,
-    directory: &data_layer::PrivateMetadataStore,
+    pms: &data_layer::PrivateMetadataStore,
     identity: PdnId,
     pod: PodId,
     seq: Seq,
@@ -1283,9 +1277,9 @@ async fn record_pod(
         ));
     }
     for (kind, ticket) in kinds {
-        directory.put_ticket(&kind, ticket).await?;
+        pms.put_ticket(&kind, ticket).await?;
     }
-    directory.record_pod(pod, seq).await
+    pms.record_pod(pod, seq).await
 }
 
 /// Filled once, right after the node spawns, and held weakly, as pairing's

@@ -1,7 +1,7 @@
 //! One pair of devices hosts two identities side by side — Alice-at-work
 //! and Alice-at-leisure, each a `PdnId` with its own store set. The phone
 //! brings up both; the laptop joins each by a separate import of that
-//! identity's directory ticket.
+//! identity's PMS ticket.
 
 use anyhow::Result;
 use data_layer::{
@@ -14,10 +14,10 @@ use test_utils::{
 };
 
 /// Bring one identity up on `node` and lay down its test fixtures: a
-/// directory with the node registered and a connection to `peer`, and a data
+/// PMS with the node registered and a connection to `peer`, and a data
 /// namespace of `issuer` with `value` written at `path`. Returns the
-/// phone-side directory handle, the author for further data writes, the
-/// directory's write ticket, and the data-namespace ticket.
+/// phone-side PMS handle, the author for further data writes, the
+/// PMS's write ticket, and the data-namespace ticket.
 async fn provision_identity_with_data(
     node: &mut SyncNode,
     issuer: PdnId,
@@ -25,9 +25,9 @@ async fn provision_identity_with_data(
     path: &EntryPath,
     value: &[u8],
 ) -> Result<(PrivateMetadataStore, AuthorId, DocTicket, DocTicket)> {
-    let directory = host_identity(node, issuer).await?;
-    directory.connect(peer).await?;
-    let ticket = directory
+    let pms = host_identity(node, issuer).await?;
+    pms.connect(peer).await?;
+    let ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
@@ -43,7 +43,7 @@ async fn provision_identity_with_data(
         )
         .await?;
 
-    Ok((directory, author, ticket, data_ticket))
+    Ok((pms, author, ticket, data_ticket))
 }
 
 /// Both identities' store sets replicate to the laptop, each by its own
@@ -61,7 +61,7 @@ async fn multi_identity_two_devices() -> Result<()> {
     let laptop = memory_node().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
-    let (work_phone_dir, work_author, work_ticket, work_data) = provision_identity_with_data(
+    let (work_phone_pms, work_author, work_ticket, work_data) = provision_identity_with_data(
         &mut phone,
         ids::ALICE_AT_WORK,
         ids::BOB,
@@ -69,7 +69,7 @@ async fn multi_identity_two_devices() -> Result<()> {
         b"Acme Engineering",
     )
     .await?;
-    let (_leisure_phone_dir, _leisure_author, leisure_ticket, leisure_data) =
+    let (_leisure_phone_pms, _leisure_author, leisure_ticket, leisure_data) =
         provision_identity_with_data(
             &mut phone,
             ids::ALICE_AT_LEISURE,
@@ -80,17 +80,17 @@ async fn multi_identity_two_devices() -> Result<()> {
         .await?;
 
     // Join the laptop into the work identity only.
-    let laptop_work_dir = join_identity(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
-    laptop_work_dir.add_device(laptop.node_id()).await?;
+    let laptop_work_pms = join_identity(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
+    laptop_work_pms.add_device(laptop.node_id()).await?;
     assert!(
-        wait_connected(&laptop_work_dir, ids::BOB, true).await?,
+        wait_connected(&laptop_work_pms, ids::BOB, true).await?,
         "work connections did not replicate to laptop"
     );
 
     // Isolation: nothing of the leisure identity arrived through that act —
-    // its peer is not in the work directory, and its namespace is unknown
+    // its peer is not in the work PMS, and its namespace is unknown
     // here (specifically unknown, not just any error).
-    assert!(!laptop_work_dir.is_connected(ids::CAROL).await?);
+    assert!(!laptop_work_pms.is_connected(ids::CAROL).await?);
     let err = laptop
         .read(ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE, &path)
         .await
@@ -98,15 +98,15 @@ async fn multi_identity_two_devices() -> Result<()> {
     assert!(err.downcast_ref::<UnknownIssuer>().is_some());
 
     // Second identity joins the already-joined node by its own act.
-    let laptop_leisure_dir = join_identity(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
-    laptop_leisure_dir.add_device(laptop.node_id()).await?;
+    let laptop_leisure_pms = join_identity(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
+    laptop_leisure_pms.add_device(laptop.node_id()).await?;
     assert!(
-        wait_connected(&laptop_leisure_dir, ids::CAROL, true).await?,
+        wait_connected(&laptop_leisure_pms, ids::CAROL, true).await?,
         "leisure connections did not replicate to laptop"
     );
-    assert!(!laptop_leisure_dir.is_connected(ids::BOB).await?);
+    assert!(!laptop_leisure_pms.is_connected(ids::BOB).await?);
     assert!(
-        wait_devices(&laptop_leisure_dir, &[phone_id, laptop_id]).await?,
+        wait_devices(&laptop_leisure_pms, &[phone_id, laptop_id]).await?,
         "leisure device set did not converge on laptop"
     );
 
@@ -143,9 +143,9 @@ async fn multi_identity_two_devices() -> Result<()> {
     // The first identity keeps operating after the second joined: a fresh
     // connection and a fresh data write (an LWW overwrite of the same path)
     // both still reach the laptop.
-    work_phone_dir.connect(ids::DAVE).await?;
+    work_phone_pms.connect(ids::DAVE).await?;
     assert!(
-        wait_connected(&laptop_work_dir, ids::DAVE, true).await?,
+        wait_connected(&laptop_work_pms, ids::DAVE, true).await?,
         "work connections stopped replicating after the second identity joined"
     );
     phone
@@ -186,7 +186,7 @@ async fn forgetting_a_namespace_unregisters_its_issuer() -> Result<()> {
     // Phone issues both namespaces; the laptop imports both.
     let mut phone = memory_node().await?;
     let laptop = memory_node().await?;
-    let (work_dir, _work_author, work_ticket, work_data) = provision_identity_with_data(
+    let (work_pms, _work_author, work_ticket, work_data) = provision_identity_with_data(
         &mut phone,
         ids::ALICE_AT_WORK,
         ids::BOB,
@@ -194,7 +194,7 @@ async fn forgetting_a_namespace_unregisters_its_issuer() -> Result<()> {
         b"Acme Engineering",
     )
     .await?;
-    let (leisure_dir, _leisure_author, leisure_ticket, leisure_data) =
+    let (leisure_pms, _leisure_author, leisure_ticket, leisure_data) =
         provision_identity_with_data(
             &mut phone,
             ids::ALICE_AT_LEISURE,
@@ -205,10 +205,10 @@ async fn forgetting_a_namespace_unregisters_its_issuer() -> Result<()> {
         .await?;
     // The laptop is a device of both identities, so the phone serves it
     // both replicas: the product's own way to a device replication.
-    let _laptop_work_dir = join_identity(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
-    let _laptop_leisure_dir = join_identity(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
-    work_dir.add_device(laptop.node_id()).await?;
-    leisure_dir.add_device(laptop.node_id()).await?;
+    let _laptop_work_pms = join_identity(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
+    let _laptop_leisure_pms = join_identity(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
+    work_pms.add_device(laptop.node_id()).await?;
+    leisure_pms.add_device(laptop.node_id()).await?;
     laptop
         .import_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, work_data)
         .await?;

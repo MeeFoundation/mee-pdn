@@ -52,7 +52,7 @@ async fn an_issuer_reads_what_it_published_and_a_co_hosted_identity_reads_none_o
     assert_eq!(grant.claims, claims, "the whole set travels in one grant");
 
     // Denied, first degree: Y is hosted beside X and holds no pair toward
-    // P, so its own directory answers nothing — while X's record, read on
+    // P, so its own PMS answers nothing — while X's record, read on
     // the same runtime a line above, is what makes the emptiness a denial
     // rather than an operation that answers nothing to everyone.
     assert!(

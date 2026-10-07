@@ -274,12 +274,12 @@ async fn cancelling_establish_leaves_no_replica_behind() -> Result<()> {
     Ok(())
 }
 
-/// Wait until the probe's directory lists exactly `kinds` (order-free).
-async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
+/// Wait until the probe's PMS lists exactly `kinds` (order-free).
+async fn wait_kinds_exactly(pms: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
     let mut expected: Vec<String> = kinds.to_vec();
     expected.sort();
     eventually(|| async {
-        let mut have = directory.list_ticket_kinds().await?;
+        let mut have = pms.list_ticket_kinds().await?;
         have.sort();
         Ok(have == expected)
     })
@@ -289,7 +289,7 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
 /// The full flow: invite on one runtime, establish from another, both sides
 /// list each other, and a grant published afterwards crosses the pair with
 /// no new pairing. The payload is bearer-free with every secret distinct;
-/// the receiving directory gains the pair's kinds and no ticket to the
+/// the receiving PMS gains the pair's kinds and no ticket to the
 /// peer's data namespace.
 #[tokio::test(flavor = "multi_thread")]
 async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
@@ -361,12 +361,12 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
         "Z must not reach X's granted data — it never received the grant to import"
     );
 
-    // Y's directory carries the pair's kinds for X and nothing else; the
+    // Y's PMS carries the pair's kinds for X and nothing else; the
     // data-namespace ticket lives only in the metadata store.
-    let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_b, y).await?;
     assert!(
         wait_kinds_exactly(
-            &probe_dir,
+            &probe_pms,
             &[
                 "data".to_owned(),
                 format!("connection-metadata/{x}/own"),
@@ -374,7 +374,7 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
             ],
         )
         .await?,
-        "the receiving directory must hold exactly the pair's kinds and no data ticket"
+        "the receiving PMS must hold exactly the pair's kinds and no data ticket"
     );
 
     probe_node.shutdown().await?;
@@ -386,7 +386,7 @@ async fn establishment_completes_and_grants_flow_end_to_end() -> Result<()> {
 
 /// Establishment on the phones is visible from the laptops: the connections
 /// records replicate, and each laptop opens the counterpart's store from
-/// its directory's tickets.
+/// its PMS's tickets.
 #[tokio::test(flavor = "multi_thread")]
 async fn connection_is_visible_from_linked_devices() -> Result<()> {
     let a_phone = memory_runtime().await?;
@@ -415,7 +415,7 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
     );
 
     // ...and read the counterpart's metadata store from the pair their
-    // directories carry.
+    // PMSs carry.
     a_phone
         .connections()
         .publish_grant(x, y, x, common::nominal_claims(x))
@@ -434,7 +434,7 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
                 .any(|g| g.grant.issuer == x))
         })
         .await?,
-        "X's grant did not reach Y's laptop through the directory-opened pair"
+        "X's grant did not reach Y's laptop through the PMS-opened pair"
     );
     assert!(
         eventually(|| async {
@@ -446,7 +446,7 @@ async fn connection_is_visible_from_linked_devices() -> Result<()> {
                 .any(|g| g.grant.issuer == y))
         })
         .await?,
-        "Y's grant did not reach X's laptop through the directory-opened pair"
+        "Y's grant did not reach X's laptop through the PMS-opened pair"
     );
 
     a_phone.shutdown().await?;
@@ -479,13 +479,13 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     );
 
     // The own store's namespace must be the same replica after each attempt.
-    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_a, x).await?;
     let own_kind = format!("connection-metadata/{y}/own");
     assert!(
-        eventually(|| async { Ok(probe_dir.get_ticket(&own_kind).await?.is_some()) }).await?,
-        "the own-kind ticket did not reach the directory probe"
+        eventually(|| async { Ok(probe_pms.get_ticket(&own_kind).await?.is_some()) }).await?,
+        "the own-kind ticket did not reach the PMS probe"
     );
-    let first_namespace = probe_dir
+    let first_namespace = probe_pms
         .get_ticket(&own_kind)
         .await?
         .expect("just observed")
@@ -507,7 +507,7 @@ async fn re_establishment_converges_and_may_swap_directions() -> Result<()> {
     // The same replica every time...
     assert!(
         eventually(|| async {
-            Ok(probe_dir
+            Ok(probe_pms
                 .get_ticket(&own_kind)
                 .await?
                 .is_some_and(|ticket| ticket.capability.id() == first_namespace))
@@ -611,13 +611,13 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     let y = rt_b.identity().create().await?;
     let z = rt_c.identity().create().await?;
 
-    // The no-state probe: X's directory from a linked-device view; baseline
+    // The no-state probe: X's PMS from a linked-device view; baseline
     // is the data kind from creation.
-    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_a, x).await?;
     let baseline = vec!["data".to_owned()];
     assert!(
-        wait_kinds_exactly(&probe_dir, &baseline).await?,
-        "directory probe did not sync its baseline"
+        wait_kinds_exactly(&probe_pms, &baseline).await?,
+        "PMS probe did not sync its baseline"
     );
 
     // Expired: no state on either side.
@@ -630,7 +630,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     );
     assert!(rt_a.connections().list(x).await?.is_empty());
     assert!(rt_b.connections().list(y).await?.is_empty());
-    assert!(wait_kinds_exactly(&probe_dir, &baseline).await?);
+    assert!(wait_kinds_exactly(&probe_pms, &baseline).await?);
 
     // Unknown identity: an invite mints nothing, an establish refuses before
     // dialing.
@@ -658,7 +658,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         "a never-minted secret must be refused"
     );
     assert!(rt_a.connections().list(x).await?.is_empty());
-    assert!(wait_kinds_exactly(&probe_dir, &baseline).await?);
+    assert!(wait_kinds_exactly(&probe_pms, &baseline).await?);
 
     // ...and an unknown payload version refuses before dialing, typed.
     let unversioned = InvitePayload {
@@ -684,7 +684,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         format!("connection-metadata/{y}/own"),
         format!("connection-metadata/{y}/peer"),
     ];
-    assert!(wait_kinds_exactly(&probe_dir, &established).await?);
+    assert!(wait_kinds_exactly(&probe_pms, &established).await?);
 
     // A replay is refused and the inviter's stores are as the establishment
     // left them.
@@ -694,7 +694,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
     );
     assert_eq!(rt_a.connections().list(x).await?, vec![y]);
     assert!(rt_c.connections().list(z).await?.is_empty());
-    assert!(wait_kinds_exactly(&probe_dir, &established).await?);
+    assert!(wait_kinds_exactly(&probe_pms, &established).await?);
 
     probe_node.shutdown().await?;
     rt_a.shutdown().await?;
@@ -813,12 +813,12 @@ async fn reciprocal_establishment_does_not_deadlock() -> Result<()> {
     Ok(())
 }
 
-/// The pair follows the directory, not the pair-map cache: a peer-kind
+/// The pair follows the PMS, not the pair-map cache: a peer-kind
 /// rewritten onto a fresh replica — what another device publishes once the
 /// counterparty re-establishes — moves grant reads there. Without
 /// re-validating the cache the pair would silently miss every later grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
+async fn pair_follows_the_pms_not_a_stale_cache() -> Result<()> {
     let rt_a = memory_runtime().await?;
     let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
@@ -840,20 +840,20 @@ async fn pair_follows_the_directory_not_a_stale_cache() -> Result<()> {
     );
 
     // Stand in for another device of Y: the linking reply carries a write
-    // ticket to Y's directory.
-    let (probe_node, probe_dir) = link_probe(&rt_b, y).await?;
+    // ticket to Y's PMS.
+    let (probe_node, probe_pms) = link_probe(&rt_b, y).await?;
     let replacement = ConnectionMetadataStore::create(&probe_node, y).await?;
     let replacement_ticket = replacement
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    probe_dir
+    probe_pms
         .put_ticket(&data_layer::peer_ticket_kind(&x), &replacement_ticket)
         .await?;
 
     // Reads move to the (empty) replacement replica.
     assert!(
         eventually(|| async { Ok(rt_b.connections().read_grants(y, x).await?.is_empty()) }).await?,
-        "read_grants kept reading the superseded replica from cache instead of the one the directory names"
+        "read_grants kept reading the superseded replica from cache instead of the one the PMS names"
     );
 
     probe_node.shutdown().await?;

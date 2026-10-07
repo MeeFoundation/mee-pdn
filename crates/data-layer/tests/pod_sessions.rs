@@ -1,5 +1,5 @@
 //! Sessions on a pod's stores, served by the member the caller
-//! names: a sibling device by its identity's own directory, another member's
+//! names: a sibling device by its identity's own PMS, another member's
 //! device by that member's device statements, and every other caller refused
 //! as for an unhosted replica. The entries a pod's creation and its joins
 //! write arrive by the store-level writes the pods service performs, and
@@ -49,8 +49,8 @@ struct Identity {
 async fn host(node: &SyncNode) -> Result<(Identity, PrivateMetadataStore)> {
     let keys = AnnouncementKeyPair::generate();
     let id = keys.pdn_id();
-    let directory = host_identity(node, id).await?;
-    Ok((Identity { keys, id }, directory))
+    let pms = host_identity(node, id).await?;
+    Ok((Identity { keys, id }, pms))
 }
 
 fn device_of(node: &SyncNode, identity: &Identity) -> Result<MemberDevice> {
@@ -413,10 +413,10 @@ async fn a_co_located_non_member_is_refused_where_its_node_mate_is_served() -> R
 }
 
 /// A freshly linked device is served by its sibling at once, by its
-/// identity's directory, and by another member once the statement it wrote
+/// identity's PMS, and by another member once the statement it wrote
 /// reaches that member. Paired denials: the same device refused by the other
 /// member before that statement exists, and by the sibling a device naming
-/// the identity that the identity's directory does not list.
+/// the identity that the identity's PMS does not list.
 #[allow(clippy::too_many_lines)] // one scenario: the linking, the refusal and the statement that ends it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> {
@@ -427,7 +427,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
         node(QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
     let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
@@ -455,18 +455,14 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
             .await?
     );
 
-    bob_directory.add_device(bob_laptop.node_id()).await?;
-    let ticket = bob_directory
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    let ticket = bob_pms
         .share_ticket(data_layer::ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(&bob_laptop, bob.id, ticket).await?;
+    let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
     assert!(
-        wait_devices(
-            &laptop_directory,
-            &[bob_phone.node_id(), bob_laptop.node_id()]
-        )
-        .await?,
-        "the laptop's directory did not list both devices"
+        wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?,
+        "the laptop's PMS did not list both devices"
     );
     bob_laptop.import_pod(bob.id, pod, tickets.clone()).await?;
     dave_phone.import_pod(dave.id, pod, tickets).await?;
@@ -484,7 +480,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
         .await
     ));
     session(&bob_laptop, bob.id, membership, &bob_phone, bob.id, bob.id).await?;
-    // Denied: a device naming Bob that Bob's directory does not list.
+    // Denied: a device naming Bob that Bob's PMS does not list.
     assert!(refused(
         session(&dave_phone, dave.id, membership, &bob_phone, bob.id, bob.id).await
     ));

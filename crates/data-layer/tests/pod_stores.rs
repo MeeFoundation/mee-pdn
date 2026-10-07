@@ -1,7 +1,7 @@
 //! A pod's two stores as replica kinds of one hosted identity: created,
 //! imported from their write tickets, forgotten at a departure into the
 //! pod's tombstone, and held once per member identity on one node. The join
-//! dialogue and the directory that carry a pod's tickets live in pdn-node;
+//! dialogue and the PMS that carry a pod's tickets live in pdn-node;
 //! here the tickets travel by hand, and the import each reaches is its
 //! scenario's subject, as a granted data replica arrives by the import the
 //! grant binder performs. No session on a pod's store is served, so nothing
@@ -88,7 +88,7 @@ async fn creating_a_pod_allocates_two_dedicated_replicas() -> Result<()> {
 
 /// An import of a pod's stores is refused, with nothing registered, when a
 /// ticket names a namespace the identity already holds in another role: a
-/// data store received under a grant, its directory, another pod's store,
+/// data store received under a grant, its PMS, another pod's store,
 /// or the pod's other store. The same tickets, honest, import afterwards,
 /// and every replica the refusals named is still held in its own role.
 #[allow(clippy::too_many_lines)] // one scenario: every role a refused ticket names, beside the honest import
@@ -97,7 +97,7 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
     let bob_phone = memory_node().await?;
     let alice_phone = memory_node().await?;
     host_identity(&bob_phone, ids::BOB).await?;
-    let alice_directory = host_identity(&alice_phone, ids::ALICE).await?;
+    let alice_pms = host_identity(&alice_phone, ids::ALICE).await?;
 
     bob_phone.create_namespace(ids::BOB, ids::BOB).await?;
     let bob_data = bob_phone
@@ -113,7 +113,7 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
         .await?;
     alice_phone.create_pod(ids::ALICE, WEDDING).await?;
     let wedding = tickets(&alice_phone, ids::ALICE, WEDDING).await?;
-    let directory_ticket = alice_directory
+    let pms_ticket = alice_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
     bob_phone.create_pod(ids::BOB, FAMILY).await?;
@@ -128,10 +128,10 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
             },
         ),
         (
-            "the identity's directory",
+            "the identity's PMS",
             PodTickets {
                 membership: family.membership.clone(),
-                records: directory_ticket,
+                records: pms_ticket,
             },
         ),
         (
@@ -171,9 +171,9 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
     );
     assert!(
         alice_phone
-            .holds_replica(ids::ALICE, alice_directory.namespace())
+            .holds_replica(ids::ALICE, alice_pms.namespace())
             .await?,
-        "the directory stopped being held"
+        "the PMS stopped being held"
     );
     assert_eq!(
         namespaces(&tickets(&alice_phone, ids::ALICE, WEDDING).await?),
@@ -195,7 +195,7 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
 }
 
 /// A data import handed a ticket naming a pod's store is refused, as a
-/// device of the issuer and as a grantee, and so is a directory import; the
+/// device of the issuer and as a grantee, and so is a PMS import; the
 /// membership store is still refused once it is the pod's tombstone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_import_refuses_a_pods_store() -> Result<()> {
@@ -220,7 +220,7 @@ async fn a_data_import_refuses_a_pods_store() -> Result<()> {
         PrivateMetadataStore::import(&node, ids::ALICE, family.records.clone())
             .await
             .is_err(),
-        "a directory import took the record store"
+        "a PMS import took the record store"
     );
     assert_eq!(node.data_namespace_of(ids::ALICE, ids::BOB)?, None);
     assert_eq!(

@@ -53,7 +53,7 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 
 /// Run the linking dialogue raw from a bare node. The request mirrors the
 /// protocol's `{version, secret}` message (postcard encodes the struct
-/// exactly as this tuple), the reply its `{directory, data}`.
+/// exactly as this tuple), the reply its `{pms, data}`.
 pub async fn dial_linking(
     node: &SyncNode,
     payload: &LinkingPayload,
@@ -72,9 +72,9 @@ pub async fn dial_linking(
     let reply = read_frame(&mut recv)
         .await
         .context("linking refused by the inviter")?;
-    let (directory, data): (DocTicket, DocTicket) = postcard::from_bytes(&reply)?;
+    let (pms, data): (DocTicket, DocTicket) = postcard::from_bytes(&reply)?;
     connection.close(0u32.into(), b"done");
-    Ok((directory, data))
+    Ok((pms, data))
 }
 
 /// Present `payload`'s secret and never read the reply. The connection is
@@ -103,7 +103,7 @@ pub async fn dial_linking_without_reading_from(
     Ok(connection)
 }
 
-/// A store-level probe of `identity`'s directory: a bare node that links
+/// A store-level probe of `identity`'s PMS: a bare node that links
 /// raw and confirms itself, so everything it reads is what any device of
 /// the identity reads. The probe ends up in the device set, so device-set
 /// assertions never use counts that forget it.
@@ -114,14 +114,14 @@ pub async fn link_probe(
     let node = memory_node().await?;
     node.provision_identity(identity).await?;
     let payload = runtime.identity().linking_invite(identity, None).await?;
-    let (directory_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
-    let directory = PrivateMetadataStore::import(&node, identity, directory_ticket).await?;
+    let (pms_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
+    let pms = PrivateMetadataStore::import(&node, identity, pms_ticket).await?;
     // Armed as any device of the identity is: an identity's replicas are
     // judged by its own records, and a probe that armed nothing would
     // serve and pull nothing (ADR-0013).
-    node.host_identity(identity, &directory)?;
-    directory.confirm_device(node.node_id()).await?;
-    Ok((node, directory))
+    node.host_identity(identity, &pms)?;
+    pms.confirm_device(node.node_id()).await?;
+    Ok((node, pms))
 }
 
 /// Mint a fresh invite on `inviter` and link once. Assertions about one

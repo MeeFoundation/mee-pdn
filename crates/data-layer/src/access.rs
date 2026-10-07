@@ -1,5 +1,5 @@
 //! Caller classification for reconciliation sessions, decided from
-//! material one hosted identity already holds — its own directory and its
+//! material one hosted identity already holds — its own PMS and its
 //! connection metadata pairs. Nothing is presented over the wire: the
 //! transport-authenticated caller node id, the identities the session names
 //! and the requested namespace are the only inputs. One book per hosted
@@ -112,10 +112,10 @@ type ArmedRetractions = HashMap<(AuthorId, Vec<u8>), Armed>;
 pub(crate) struct AccessBook {
     /// Whom this book judges for.
     identity: PdnId,
-    /// This identity's own directory, armed by `host_identity`. Until it
+    /// This identity's own PMS, armed by `host_identity`. Until it
     /// is here every data session is refused: the records that judge one
     /// are in it.
-    directory: RwLock<Option<Doc>>,
+    pms: RwLock<Option<Doc>>,
     connections: RwLock<Vec<HostedConnection>>,
     /// Set right after the stack spawns, before any session can arrive.
     blobs: OnceLock<iroh_blobs::api::Store>,
@@ -148,7 +148,7 @@ impl AccessBook {
     pub(crate) fn new(identity: PdnId) -> Self {
         Self {
             identity,
-            directory: RwLock::new(None),
+            pms: RwLock::new(None),
             connections: RwLock::new(Vec::new()),
             blobs: OnceLock::new(),
             grant_cache: RwLock::new(HashMap::new()),
@@ -178,17 +178,17 @@ impl AccessBook {
         let _ = self.blobs.set(blobs);
     }
 
-    pub(crate) fn arm_directory(&self, directory: Doc) -> Result<()> {
+    pub(crate) fn arm_pms(&self, pms: Doc) -> Result<()> {
         *self
-            .directory
+            .pms
             .write()
-            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))? = Some(directory);
+            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))? = Some(pms);
         Ok(())
     }
 
-    pub(crate) fn disarm_directory(&self) -> Result<()> {
+    pub(crate) fn disarm_pms(&self) -> Result<()> {
         *self
-            .directory
+            .pms
             .write()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))? = None;
         Ok(())
@@ -252,12 +252,12 @@ impl AccessBook {
                 .classify_pod(&registry, pod, store, remote, peer, role)
                 .await;
         }
-        // The directory and the connection metadata stores are ticket-gated
+        // The PMS and the connection metadata stores are ticket-gated
         // (Invariants 1 and 3). Classifying them against their own, possibly
         // not yet converged, device records would deadlock the bootstrap
         // that delivers those records.
         let ticket_bound =
-            self.directory_is(namespace)? || self.connection_by_namespace(namespace)?.is_some();
+            self.pms_is(namespace)? || self.connection_by_namespace(namespace)?.is_some();
         match (registry.binding_of(namespace)?, ticket_bound) {
             (None, true) => Ok(SessionAccess::whole()),
             (Some((issuer, posture)), false) => {
@@ -409,7 +409,7 @@ impl AccessBook {
     }
 
     /// A pod's membership store, served whole to a device of the member
-    /// the caller names — a sibling by this identity's own directory,
+    /// the caller names — a sibling by this identity's own PMS,
     /// another member by the device statements this identity's replica
     /// folds — and to nobody else, by the pod stores spec. The record
     /// store serves no session.
@@ -632,20 +632,20 @@ impl AccessBook {
     }
 
     /// Whether the peer is a device of this book's own identity.
-    /// The devices the identity's own directory lists; none before it is
+    /// The devices the identity's own PMS lists; none before it is
     /// armed.
     pub(crate) async fn own_devices(&self) -> Result<Vec<NodeId>> {
-        let Some(directory) = self.own_directory()? else {
+        let Some(pms) = self.own_pms()? else {
             return Ok(Vec::new());
         };
-        crate::private_metadata::listed_devices(&directory).await
+        crate::private_metadata::listed_devices(&pms).await
     }
 
     async fn peer_is_own_device(&self, peer_key: &[u8]) -> Result<bool> {
-        let Some(directory) = self.own_directory()? else {
+        let Some(pms) = self.own_pms()? else {
             return Ok(false);
         };
-        device_listed(&directory, peer_key).await
+        device_listed(&pms, peer_key).await
     }
 
     /// The claims one grant record carries toward `audience`. Claims come
@@ -892,9 +892,9 @@ impl AccessBook {
         retraction_names(&self.retractions, namespace, entry)
     }
 
-    fn own_directory(&self) -> Result<Option<Doc>> {
+    fn own_pms(&self) -> Result<Option<Doc>> {
         Ok(self
-            .directory
+            .pms
             .read()
             .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
             .clone())
@@ -905,18 +905,16 @@ impl AccessBook {
     /// the ticket alone (Invariants 1 and 3), so a replica that took one
     /// by mistake is served whole.
     pub(crate) fn ticket_bound_role(&self, namespace: NamespaceId) -> Result<Option<&'static str>> {
-        if self.directory_is(namespace)? {
-            return Ok(Some("this identity's directory"));
+        if self.pms_is(namespace)? {
+            return Ok(Some("this identity's PMS"));
         }
         Ok(self
             .connection_by_namespace(namespace)?
             .map(|_connection| "a connection metadata store of this identity"))
     }
 
-    fn directory_is(&self, namespace: NamespaceId) -> Result<bool> {
-        Ok(self
-            .own_directory()?
-            .is_some_and(|doc| doc.id() == namespace))
+    fn pms_is(&self, namespace: NamespaceId) -> Result<bool> {
+        Ok(self.own_pms()?.is_some_and(|doc| doc.id() == namespace))
     }
 
     fn connection_by_namespace(&self, namespace: NamespaceId) -> Result<Option<HostedConnection>> {

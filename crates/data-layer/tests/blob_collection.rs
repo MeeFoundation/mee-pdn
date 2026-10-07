@@ -158,10 +158,8 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
     };
     let first = on_dir().await?;
     let carol = Person::generate();
-    let directory = test_utils::host_identity(&first, carol.id).await?;
-    first
-        .record_hosting(carol.id, directory.namespace())
-        .await?;
+    let pms = test_utils::host_identity(&first, carol.id).await?;
+    first.record_hosting(carol.id, pms.namespace()).await?;
     first.create_namespace(carol.id, carol.id).await?;
     let photo = EntryPath::new("photos/beach")?;
     first
@@ -183,9 +181,9 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
         "a payload was removed before the host let collection start"
     );
     second.provision_identity(carol.id).await?;
-    let reopened = data_layer::PrivateMetadataStore::open(&second, carol.id, directory.namespace())
+    let reopened = data_layer::PrivateMetadataStore::open(&second, carol.id, pms.namespace())
         .await?
-        .expect("the directory survives the restart");
+        .expect("the PMS survives the restart");
     second.host_identity(carol.id, &reopened)?;
     second.start_blob_collection();
     // Collection runs from the start on: a payload nothing references goes.

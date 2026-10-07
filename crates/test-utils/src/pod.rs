@@ -24,12 +24,12 @@ impl Person {
     }
 }
 
-/// A fresh person hosted on `node`, with the directory [`host_identity`]
+/// A fresh person hosted on `node`, with the PMS [`host_identity`]
 /// gives it.
 pub async fn host(node: &SyncNode) -> Result<(Person, PrivateMetadataStore)> {
     let person = Person::generate();
-    let directory = host_identity(node, person.id).await?;
-    Ok((person, directory))
+    let pms = host_identity(node, person.id).await?;
+    Ok((person, pms))
 }
 
 /// `person`'s device on `node`: the node id and the author it writes with.

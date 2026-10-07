@@ -358,16 +358,16 @@ async fn a_retraction_does_not_flap_back_from_a_sibling() -> Result<()> {
     Ok(())
 }
 
-/// A retraction verdict is recorded in the directory of the identity
+/// A retraction verdict is recorded in the PMS of the identity
 /// whose author it names and in no other: one identity of a node writes
 /// past the grant it holds, and the co-located identity granted the same
-/// claim keeps its directory and its replica as they were.
+/// claim keeps its PMS and its replica as they were.
 ///
-/// Denied: the co-located identity's directory gains no marker and its
+/// Denied: the co-located identity's PMS gains no marker and its
 /// replica keeps the issuer's value, asserted after the writing
 /// identity's own marker has demonstrably landed.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_retraction_marks_only_the_directory_of_the_author_it_names() -> Result<()> {
+async fn a_retraction_marks_only_the_pms_of_the_author_it_names() -> Result<()> {
     let rt_bob = spawn_runtime().await?;
     let rt_alice = spawn_runtime().await?;
     let bob = rt_bob.identity().create().await?;
@@ -426,14 +426,14 @@ async fn a_retraction_marks_only_the_directory_of_the_author_it_names() -> Resul
     assert!(
         eventually(|| async { Ok(!rt_alice.sync().retraction_markers(work).await?.is_empty()) })
             .await?,
-        "the verdict never reached the writing identity's own directory"
+        "the verdict never reached the writing identity's own PMS"
     );
     assert!(
         reads_value(&rt_alice, work, bob, &email, b"bob@example.org").await?,
         "the retraction did not take the forced write back to the issuer's value"
     );
 
-    // Denied: nothing of it in the co-located identity, directory or
+    // Denied: nothing of it in the co-located identity, PMS or
     // replica.
     assert!(
         rt_alice
@@ -441,7 +441,7 @@ async fn a_retraction_marks_only_the_directory_of_the_author_it_names() -> Resul
             .retraction_markers(leisure)
             .await?
             .is_empty(),
-        "a verdict was recorded in a co-located identity's directory"
+        "a verdict was recorded in a co-located identity's PMS"
     );
     assert_eq!(
         rt_alice.data().read(leisure, bob, &email).await?.as_deref(),
@@ -459,7 +459,7 @@ async fn a_retraction_marks_only_the_directory_of_the_author_it_names() -> Resul
 /// leaves the audience's runtime serving: the markers go, and every call
 /// that waits on the runtime's state answers.
 ///
-/// Four hundred markers: a directory subscription buffers around 320
+/// Four hundred markers: a PMS subscription buffers around 320
 /// events, and the unbind's deletes each emit one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawal_over_many_markers_leaves_the_runtime_serving() -> Result<()> {

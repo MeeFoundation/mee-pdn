@@ -30,23 +30,21 @@ fn marker(bound: u64) -> RetractionMarker {
 #[tokio::test(flavor = "multi_thread")]
 async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
     let node = memory_node().await?;
-    let directory = host_identity(&node, ids::ALICE).await?;
+    let pms = host_identity(&node, ids::ALICE).await?;
     let author = node.default_author(ids::ALICE)?;
     let other_issuer: PdnId = ids::CAROL;
 
-    directory
-        .record_retraction(ids::BOB, author, "contact/email", &marker(10))
+    pms.record_retraction(ids::BOB, author, "contact/email", &marker(10))
         .await?;
-    directory
-        .record_retraction(other_issuer, author, "contact/phone", &marker(20))
+    pms.record_retraction(other_issuer, author, "contact/phone", &marker(20))
         .await?;
 
     // Both markers list once their payloads are readable (local, so prompt).
     assert!(
-        eventually(|| async { Ok(directory.list_retractions().await?.len() == 2) }).await?,
+        eventually(|| async { Ok(pms.list_retractions().await?.len() == 2) }).await?,
         "both markers must list"
     );
-    let bob_marker = directory
+    let bob_marker = pms
         .list_retractions()
         .await?
         .into_iter()
@@ -56,12 +54,11 @@ async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
     assert_eq!(bob_marker.1, author);
 
     // A wider bound replaces the record wholesale.
-    directory
-        .record_retraction(ids::BOB, author, "contact/email", &marker(15))
+    pms.record_retraction(ids::BOB, author, "contact/email", &marker(15))
         .await?;
     assert!(
         eventually(|| async {
-            Ok(directory
+            Ok(pms
                 .list_retractions()
                 .await?
                 .into_iter()
@@ -74,10 +71,10 @@ async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
     );
 
     // Pruning Bob's issuer drops his marker and leaves the other issuer's.
-    directory.prune_retractions(ids::BOB).await?;
+    pms.prune_retractions(ids::BOB).await?;
     assert!(
         eventually(|| async {
-            let listed = directory.list_retractions().await?;
+            let listed = pms.list_retractions().await?;
             Ok(listed.len() == 1 && listed[0].0 == other_issuer)
         })
         .await?,
@@ -89,29 +86,25 @@ async fn markers_record_list_and_prune_by_issuer() -> Result<()> {
 }
 
 /// The retention-window GC drops this device's aged markers and spares fresh
-/// ones — aging is judged by the marker's directory-entry timestamp, so it
+/// ones — aging is judged by the marker's PMS-entry timestamp, so it
 /// holds whatever the marker's bound is.
 #[tokio::test(flavor = "multi_thread")]
 async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
     let node = memory_node().await?;
-    let directory = host_identity(&node, ids::ALICE).await?;
+    let pms = host_identity(&node, ids::ALICE).await?;
     let author = node.default_author(ids::ALICE)?;
 
-    directory
-        .record_retraction(ids::BOB, author, "contact/email", &marker(10))
+    pms.record_retraction(ids::BOB, author, "contact/email", &marker(10))
         .await?;
     assert!(
-        eventually(|| async { Ok(directory.list_retractions().await?.len() == 1) }).await?,
+        eventually(|| async { Ok(pms.list_retractions().await?.len() == 1) }).await?,
         "the marker must list"
     );
 
     // Cutoff below the marker's write time (now == 0) spares it.
-    assert!(directory
-        .prune_aged_retractions(0, u64::MAX)
-        .await?
-        .is_empty());
+    assert!(pms.prune_aged_retractions(0, u64::MAX).await?.is_empty());
     assert_eq!(
-        directory.list_retractions().await?.len(),
+        pms.list_retractions().await?.len(),
         1,
         "a fresh marker survives the GC"
     );
@@ -126,12 +119,9 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
             .as_micros(),
     )?;
     let hour = 60 * 60 * 1_000_000;
-    assert!(directory
-        .prune_aged_retractions(now, hour)
-        .await?
-        .is_empty());
+    assert!(pms.prune_aged_retractions(now, hour).await?.is_empty());
     assert_eq!(
-        directory.list_retractions().await?.len(),
+        pms.list_retractions().await?.len(),
         1,
         "a marker younger than the retention window survives"
     );
@@ -139,14 +129,14 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
     // The same `now` with no retention puts the cutoff at this instant, past
     // the marker's write time: it goes, and it is named back so the caller
     // can take down what it armed.
-    let dropped = directory.prune_aged_retractions(now, 0).await?;
+    let dropped = pms.prune_aged_retractions(now, 0).await?;
     assert_eq!(
         dropped,
         vec![(ids::BOB, author, "contact/email".to_owned())],
         "the pruned marker's address is reported"
     );
     assert!(
-        eventually(|| async { Ok(directory.list_retractions().await?.is_empty()) }).await?,
+        eventually(|| async { Ok(pms.list_retractions().await?.is_empty()) }).await?,
         "an aged marker is pruned"
     );
 
@@ -160,26 +150,26 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
 async fn a_marker_at_a_path_leaves_the_markers_at_longer_paths() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
-    let ticket = phone_dir
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
-    laptop_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
     let author = phone.default_author(ids::ALICE)?;
 
-    phone_dir
+    phone_pms
         .record_retraction(ids::BOB, author, "contact/email", &marker(10))
         .await?;
-    phone_dir
+    phone_pms
         .record_retraction(ids::BOB, author, "contact", &marker(20))
         .await?;
 
-    for (device, directory) in [("phone", &phone_dir), ("laptop", &laptop_dir)] {
+    for (device, pms) in [("phone", &phone_pms), ("laptop", &laptop_pms)] {
         assert!(
             eventually(|| async {
-                let mut paths: Vec<String> = directory
+                let mut paths: Vec<String> = pms
                     .list_retractions()
                     .await?
                     .into_iter()
@@ -200,10 +190,10 @@ async fn a_marker_at_a_path_leaves_the_markers_at_longer_paths() -> Result<()> {
 
 /// Each marker as (issuer, recorded by `author`, path), sorted.
 async fn listed(
-    directory: &PrivateMetadataStore,
+    pms: &PrivateMetadataStore,
     author: AuthorId,
 ) -> Result<Vec<(PdnId, bool, String)>> {
-    let mut listed: Vec<(PdnId, bool, String)> = directory
+    let mut listed: Vec<(PdnId, bool, String)> = pms
         .list_retractions()
         .await?
         .into_iter()
@@ -223,43 +213,43 @@ async fn listed(
 async fn pruning_an_issuer_drops_every_own_marker_and_spares_a_siblings() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
-    let ticket = phone_dir
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
-    laptop_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
     let phone_author = phone.default_author(ids::ALICE)?;
     let laptop_author = laptop.default_author(ids::ALICE)?;
 
     for path in ["contact", "contact/email", "notes/x"] {
-        phone_dir
+        phone_pms
             .record_retraction(ids::BOB, phone_author, path, &marker(10))
             .await?;
     }
-    phone_dir
+    phone_pms
         .record_retraction(ids::CAROL, phone_author, "contact/phone", &marker(10))
         .await?;
-    laptop_dir
+    laptop_pms
         .record_retraction(ids::BOB, laptop_author, "notes/y", &marker(10))
         .await?;
 
     // Sentinel: every marker has replicated to the phone before it prunes.
     assert!(
-        eventually(|| async { Ok(listed(&phone_dir, phone_author).await?.len() == 5) }).await?,
+        eventually(|| async { Ok(listed(&phone_pms, phone_author).await?.len() == 5) }).await?,
         "every marker must list on the phone"
     );
 
-    phone_dir.prune_retractions(ids::BOB).await?;
+    phone_pms.prune_retractions(ids::BOB).await?;
     let mut standing = vec![
         (ids::BOB, false, "notes/y".to_owned()),
         (ids::CAROL, true, "contact/phone".to_owned()),
     ];
     standing.sort_unstable();
-    for (device, directory) in [("phone", &phone_dir), ("laptop", &laptop_dir)] {
+    for (device, pms) in [("phone", &phone_pms), ("laptop", &laptop_pms)] {
         assert!(
-            eventually(|| async { Ok(listed(directory, phone_author).await? == standing) }).await?,
+            eventually(|| async { Ok(listed(pms, phone_author).await? == standing) }).await?,
             "the {device} must list the sibling's marker and the other issuer's alone"
         );
     }
@@ -280,7 +270,7 @@ async fn pruning_an_issuer_drops_every_own_marker_and_spares_a_siblings() -> Res
 #[tokio::test(flavor = "multi_thread")]
 async fn a_verdict_naming_no_local_record_is_not_honored() -> Result<()> {
     let node = memory_node().await?;
-    let _directory = host_identity(&node, ids::ALICE).await?;
+    let _pms = host_identity(&node, ids::ALICE).await?;
     node.create_namespace(ids::ALICE, ids::BOB).await?;
     let author = node.default_author(ids::ALICE)?;
     let stranger = node.create_author(ids::ALICE).await?;

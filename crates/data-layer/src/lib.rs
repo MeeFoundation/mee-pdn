@@ -7,9 +7,9 @@
 //! hook (ADR-0008), both installed at spawn of that identity's own
 //! engine. A hosted identity owns its half of the node (ADR-0013):
 //! [`SyncNode::provision_identity`] brings it up, [`SyncNode::host_identity`]
-//! arms its directory and [`SyncNode::host_connection`] its connections.
+//! arms its PMS and [`SyncNode::host_connection`] its connections.
 //! A data replica no records can judge a caller against is refused, and a
-//! directory and a connection metadata store keep the ticket bound
+//! PMS and a connection metadata store keep the ticket bound
 //! Invariants 1 and 3 give them.
 //!
 //! Capability *semantics* (`UWill` tokens, chains) do not live here: tokens

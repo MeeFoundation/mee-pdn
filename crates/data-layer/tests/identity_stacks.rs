@@ -206,7 +206,7 @@ async fn an_identity_created_on_a_running_node_leaves_the_open_store_alone() -> 
     // from before still answer, and its author still writes.
     assert!(
         work.list_devices().await?.contains(&node.node_id()),
-        "the directory held across the act stopped answering"
+        "the PMS held across the act stopped answering"
     );
     node.write(
         ids::ALICE_AT_WORK,
@@ -230,7 +230,7 @@ async fn an_identity_created_on_a_running_node_leaves_the_open_store_alone() -> 
 /// Two identities of one node that converged in the process converge
 /// again after a restart: every address they hold of each other was
 /// minted by this node before it stopped — the tickets in each
-/// identity's directory, the device records in them — and each such dial
+/// identity's PMS, the device records in them — and each such dial
 /// takes the in-process path rather than failing against the node's own
 /// endpoint.
 ///
@@ -245,10 +245,10 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
     let withheld = EntryPath::new("notes/diary")?;
 
     let first = spawn_on(dir.path()).await?;
-    let work_directory = host_identity(&first, ids::ALICE_AT_WORK).await?;
-    let leisure_directory = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
-    let work_namespace = work_directory.namespace();
-    let leisure_namespace = leisure_directory.namespace();
+    let work_pms = host_identity(&first, ids::ALICE_AT_WORK).await?;
+    let leisure_pms = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
+    let work_namespace = work_pms.namespace();
+    let leisure_namespace = leisure_pms.namespace();
 
     first
         .create_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
@@ -346,12 +346,10 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
     );
 
     // Everything the restart needs, where recovery looks for it.
-    work_directory.put_ticket("connection", &work_read).await?;
-    work_directory.put_ticket("data", &data_write).await?;
-    leisure_directory
-        .put_ticket("connection", &leisure_read)
-        .await?;
-    leisure_directory.put_ticket("granted", &data_read).await?;
+    work_pms.put_ticket("connection", &work_read).await?;
+    work_pms.put_ticket("data", &data_write).await?;
+    leisure_pms.put_ticket("connection", &leisure_read).await?;
+    leisure_pms.put_ticket("granted", &data_read).await?;
     first
         .flush_replicas(ids::ALICE_AT_WORK, work_namespace)
         .await?;
@@ -361,8 +359,8 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
     first.shutdown().await?;
     drop(work_own);
     drop(leisure_own);
-    drop(work_directory);
-    drop(leisure_directory);
+    drop(work_pms);
+    drop(leisure_pms);
     drop(first);
 
     // The restart. Every address below was minted by this node before it
@@ -370,20 +368,19 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
     let second = spawn_on(dir.path()).await?;
     second.provision_identity(ids::ALICE_AT_WORK).await?;
     second.provision_identity(ids::ALICE_AT_LEISURE).await?;
-    let work_directory = PrivateMetadataStore::open(&second, ids::ALICE_AT_WORK, work_namespace)
+    let work_pms = PrivateMetadataStore::open(&second, ids::ALICE_AT_WORK, work_namespace)
         .await?
-        .expect("the work directory must come back");
-    let leisure_directory =
-        PrivateMetadataStore::open(&second, ids::ALICE_AT_LEISURE, leisure_namespace)
-            .await?
-            .expect("the leisure directory must come back");
-    second.host_identity(ids::ALICE_AT_WORK, &work_directory)?;
-    second.host_identity(ids::ALICE_AT_LEISURE, &leisure_directory)?;
+        .expect("the work PMS must come back");
+    let leisure_pms = PrivateMetadataStore::open(&second, ids::ALICE_AT_LEISURE, leisure_namespace)
+        .await?
+        .expect("the leisure PMS must come back");
+    second.host_identity(ids::ALICE_AT_WORK, &work_pms)?;
+    second.host_identity(ids::ALICE_AT_LEISURE, &leisure_pms)?;
 
     let work_own = ConnectionMetadataStore::import(
         &second,
         ids::ALICE_AT_WORK,
-        work_directory
+        work_pms
             .get_ticket("connection")
             .await?
             .expect("work's own connection ticket"),
@@ -392,7 +389,7 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
     let leisure_own = ConnectionMetadataStore::import(
         &second,
         ids::ALICE_AT_LEISURE,
-        leisure_directory
+        leisure_pms
             .get_ticket("connection")
             .await?
             .expect("leisure's own connection ticket"),
@@ -418,7 +415,7 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
         .import_namespace(
             ids::ALICE_AT_WORK,
             ids::ALICE_AT_WORK,
-            work_directory
+            work_pms
                 .get_ticket("data")
                 .await?
                 .expect("work's data ticket"),
@@ -428,7 +425,7 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
         .import_namespace_scoped(
             ids::ALICE_AT_LEISURE,
             ids::ALICE_AT_WORK,
-            leisure_directory
+            leisure_pms
                 .get_ticket("granted")
                 .await?
                 .expect("leisure's granted ticket"),
@@ -490,7 +487,7 @@ async fn spawn_on(dir: &std::path::Path) -> Result<SyncNode> {
 /// nothing registered — not for the named identity, which has no stack,
 /// and not for the identity hosted beside it.
 ///
-/// Denied: the directory, the connection metadata store and the data
+/// Denied: the PMS, the connection metadata store and the data
 /// namespace all refuse the same way, and the hosted identity's own
 /// issuer stays the only one it resolves.
 #[tokio::test(flavor = "multi_thread")]
@@ -517,7 +514,7 @@ async fn an_import_naming_an_identity_the_node_does_not_host_registers_nothing()
             AddrInfoOptions::RelayAndAddresses,
         )
         .await?;
-    let directory_ticket = work
+    let pms_ticket = work
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
@@ -525,7 +522,7 @@ async fn an_import_naming_an_identity_the_node_does_not_host_registers_nothing()
         PrivateMetadataStore::create(&node, ids::ALICE_AT_LEISURE)
             .await
             .err(),
-        PrivateMetadataStore::import(&node, ids::ALICE_AT_LEISURE, directory_ticket)
+        PrivateMetadataStore::import(&node, ids::ALICE_AT_LEISURE, pms_ticket)
             .await
             .err(),
         ConnectionMetadataStore::create(&node, ids::ALICE_AT_LEISURE)

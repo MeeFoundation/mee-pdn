@@ -363,7 +363,7 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
 }
 
 /// A join whose `join` future is dropped during its catch-up, once both
-/// tickets and the directory's entry are recorded, ends caught up all the
+/// tickets and the PMS's entry are recorded, ends caught up all the
 /// same: the newcomer lists the pod and its members and reads what was
 /// placed before and after, by the one joined event. Denied: the invite
 /// presented again.
@@ -414,7 +414,7 @@ async fn a_join_whose_future_is_dropped_during_its_catch_up_is_finished() -> Res
 }
 
 /// A join cut by a restart during its catch-up, once both tickets and the
-/// directory's entry are recorded, is finished by the armer after the
+/// PMS's entry are recorded, is finished by the armer after the
 /// restart: the newcomer lists the pod and its members and reads what was
 /// placed before the join and while it was down, by the one joined event.
 /// Denied: the invite presented again.
@@ -474,7 +474,7 @@ async fn a_join_cut_by_a_restart_during_its_catch_up_is_finished_by_the_armer() 
 }
 
 /// A join whose inviter goes out of reach for its whole catch-up fails with
-/// the catch-up timeout and leaves both tickets and the directory's entry
+/// the catch-up timeout and leaves both tickets and the PMS's entry
 /// recorded; once the inviter is reachable again the newcomer's pod pass
 /// catches it up, by the one joined event. Denied: the invite presented
 /// again. The inviter refusing every pod session stands in for the
@@ -1232,7 +1232,7 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
 }
 
 /// Devices linked into a member before and after its join reach the pod
-/// from the identity's directory, read it, and register themselves, so the
+/// from the identity's PMS, read it, and register themselves, so the
 /// owner's device reads what they write and serves one of them with every
 /// other device of the member gone. Denied: a co-located identity that is
 /// no member lists no such pod and reads nothing of it.
@@ -1311,12 +1311,12 @@ async fn a_pods_tickets_reach_a_linked_device_each_naming_its_holder() -> Result
         (&alice_phone, alice, None),
         (&bob_phone, bob, Some((&alice_phone, alice))),
     ] {
-        let (probe, directory) = link_probe(runtime, holder).await?;
+        let (probe, pms) = link_probe(runtime, holder).await?;
         for store in [PodStore::Membership, PodStore::Records] {
             let own = pod_ticket_kind(&pod, store);
             assert!(
                 eventually(|| async {
-                    Ok(directory
+                    Ok(pms
                         .get_ticket(&own)
                         .await?
                         .is_some_and(|ticket| names(&ticket, runtime, holder)))
@@ -1326,10 +1326,10 @@ async fn a_pods_tickets_reach_a_linked_device_each_naming_its_holder() -> Result
             );
             let handed = pod_inviter_ticket_kind(&pod, store);
             match inviter {
-                None => assert!(directory.get_ticket(&handed).await?.is_none()),
+                None => assert!(pms.get_ticket(&handed).await?.is_none()),
                 Some((inviting, inviter)) => assert!(
                     eventually(|| async {
-                        Ok(directory
+                        Ok(pms
                             .get_ticket(&handed)
                             .await?
                             .is_some_and(|ticket| names(&ticket, inviting, inviter)))
@@ -1409,7 +1409,7 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
 }
 
 /// A member's runtime on a storage directory hosts its pod again after a
-/// restart, from its directory alone: the claim another member placed
+/// restart, from its PMS alone: the claim another member placed
 /// meanwhile arrives, the member's next operation continues its author's
 /// count, and its hosting record is the one its create wrote.
 #[tokio::test(flavor = "multi_thread")]
@@ -1435,7 +1435,7 @@ async fn a_pod_is_hosted_again_after_a_restart() -> Result<()> {
         .path()
         .join("identities")
         .join(bob.to_string())
-        .join("directory");
+        .join("PMS");
     let recorded = std::fs::read(&record)?;
     bob_tablet.shutdown().await?;
     drop(bob_tablet);

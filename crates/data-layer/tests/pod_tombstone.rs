@@ -535,17 +535,17 @@ async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_sho
     Ok(())
 }
 
-/// A person hosted on `phone`, its directory listing `laptop` as a device
+/// A person hosted on `phone`, its PMS listing `laptop` as a device
 /// of its own too, and the laptop joined to it.
 async fn linked(phone: &SyncNode, laptop: &SyncNode) -> Result<(Person, PrivateMetadataStore)> {
-    let (person, directory) = host(phone).await?;
-    directory.add_device(laptop.node_id()).await?;
-    let ticket = directory
+    let (person, pms) = host(phone).await?;
+    pms.add_device(laptop.node_id()).await?;
+    let ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(laptop, person.id, ticket).await?;
-    assert!(wait_devices(&laptop_directory, &[phone.node_id(), laptop.node_id()]).await?);
-    Ok((person, directory))
+    let laptop_pms = join_identity(laptop, person.id, ticket).await?;
+    assert!(wait_devices(&laptop_pms, &[phone.node_id(), laptop.node_id()]).await?);
+    Ok((person, pms))
 }
 
 /// A removed member's record from while a member reads on a device linked
@@ -562,7 +562,7 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
         node(QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
@@ -605,11 +605,11 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
     assert!(refused.is_some_and(|session| session.exchanged.is_err()));
 
     // Bob's laptop, linked after the removal, reads Carol's earlier record.
-    bob_directory.add_device(bob_laptop.node_id()).await?;
-    let directory_ticket = bob_directory
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    let pms_ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    join_identity(&bob_laptop, bob.id, directory_ticket).await?;
+    join_identity(&bob_laptop, bob.id, pms_ticket).await?;
     let bobs = MembershipKey::Devices {
         member: bob.id,
         version: 2,
@@ -687,32 +687,31 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leave_dated_before_its_join_still_ends_holding_on_every_device() -> Result<()> {
     let (carol_phone, carol_laptop) = (node(QUIET).await?, node(QUIET).await?);
-    let (carol, phone_directory) = host(&carol_phone).await?;
-    phone_directory.add_device(carol_laptop.node_id()).await?;
-    let ticket = phone_directory
+    let (carol, phone_pms) = host(&carol_phone).await?;
+    phone_pms.add_device(carol_laptop.node_id()).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(&carol_laptop, carol.id, ticket).await?;
+    let laptop_pms = join_identity(&carol_laptop, carol.id, ticket).await?;
     let both = [carol_phone.node_id(), carol_laptop.node_id()];
-    assert!(wait_devices(&laptop_directory, &both).await?);
+    assert!(wait_devices(&laptop_pms, &both).await?);
     let pod = PodId::from_bytes([0x9c; 16]);
 
-    laptop_directory.tombstone_pod(pod, Seq::new(2)).await?;
-    phone_directory.record_pod(pod, Seq::FIRST).await?;
-    for directory in [&phone_directory, &laptop_directory] {
+    laptop_pms.tombstone_pod(pod, Seq::new(2)).await?;
+    phone_pms.record_pod(pod, Seq::FIRST).await?;
+    for pms in [&phone_pms, &laptop_pms] {
         assert!(
             test_utils::eventually(|| async {
-                Ok(directory.held_pods().await?.is_empty()
-                    && directory.departed_pods().await? == [pod])
+                Ok(pms.held_pods().await?.is_empty() && pms.departed_pods().await? == [pod])
             })
             .await?,
             "the leave lost to a join dated after it"
         );
     }
-    phone_directory.record_pod(pod, Seq::new(3)).await?;
-    for directory in [&phone_directory, &laptop_directory] {
+    phone_pms.record_pod(pod, Seq::new(3)).await?;
+    for pms in [&phone_pms, &laptop_pms] {
         assert!(
-            test_utils::eventually(|| async { Ok(directory.held_pods().await? == [pod]) }).await?,
+            test_utils::eventually(|| async { Ok(pms.held_pods().await? == [pod]) }).await?,
             "the join after the leave did not hold the pod again"
         );
     }

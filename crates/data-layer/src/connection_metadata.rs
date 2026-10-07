@@ -95,13 +95,13 @@ fn decode_grant_ticket(ticket: &str) -> Option<DocTicket> {
     ticket.parse().ok()
 }
 
-/// The directory kind of the write ticket to the identity's own metadata
+/// The PMS kind of the write ticket to the identity's own metadata
 /// store toward `peer` — how the issuer's other devices open `own`.
 pub fn own_ticket_kind(peer: &PdnId) -> String {
     format!("connection-metadata/{peer}/own")
 }
 
-/// The directory kind of the read ticket to the counterpart's metadata
+/// The PMS kind of the read ticket to the counterpart's metadata
 /// store received from `peer` — how the identity's other devices open
 /// `peer`.
 pub fn peer_ticket_kind(peer: &PdnId) -> String {
@@ -150,7 +150,7 @@ impl ConnectionMetadataStore {
 
     /// Import a metadata store via `ticket` — the counterpart's replica from
     /// the read ticket, or this identity's own replica from the write ticket
-    /// in the directory. Usable at once; content converges asynchronously.
+    /// in the PMS. Usable at once; content converges asynchronously.
     pub async fn import(node: &SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see `create`.
         let author = node.default_author(identity)?;
@@ -196,7 +196,7 @@ impl ConnectionMetadataStore {
     }
 
     /// `ShareMode::Read` for the counterparty (inside the establishment
-    /// dialogue), `ShareMode::Write` for the issuer's own directory.
+    /// dialogue), `ShareMode::Write` for the issuer's own PMS.
     pub async fn share_ticket(
         &self,
         mode: ShareMode,

@@ -131,7 +131,7 @@ pub struct UnknownIdentity {
 /// data-layer keeps no such list.
 #[derive(Debug)]
 pub(crate) struct HostedIdentity {
-    pub(crate) directory: PrivateMetadataStore,
+    pub(crate) pms: PrivateMetadataStore,
     /// One author per hosted identity (ADR-0013), persisted with that
     /// identity's replicas.
     pub(crate) author: AuthorId,
@@ -157,7 +157,7 @@ pub(crate) struct State {
     pub(crate) pending_pod_invites: PendingInvites<(PdnId, pdn_types::PodId)>,
     /// Keyed by `(joining identity, pod)`.
     pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::PodId)>,
-    /// A cache keyed by `(hosted identity, counterparty)`; the directory is
+    /// A cache keyed by `(hosted identity, counterparty)`; the PMS is
     /// the durable lookup.
     pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
     /// One binder per pair: the sweep inserts before spawning and the
@@ -198,7 +198,7 @@ pub(crate) struct State {
     /// the statement are written, before the tickets go out: a reply lost.
     #[cfg(feature = "test-util")]
     pub(crate) drop_next_join_reply: bool,
-    /// A pause of the next join once both tickets and the directory's entry
+    /// A pause of the next join once both tickets and the PMS's entry
     /// are recorded, before its catch-up wait.
     #[cfg(feature = "test-util")]
     pub(crate) join_catch_up_pause: Option<Arc<CeremonyPause>>,
@@ -206,11 +206,11 @@ pub(crate) struct State {
     /// ended before it landed; a restart clears it.
     #[cfg(feature = "test-util")]
     pub(crate) failing_device_statements: HashSet<pdn_types::PodId>,
-    /// Fails the next `create` where its directory would be made — a step
+    /// Fails the next `create` where its PMS would be made — a step
     /// between provisioning an identity and hosting it, which a full disk is
     /// the product's reason to reach.
     #[cfg(feature = "test-util")]
-    pub(crate) fail_next_directory_create: bool,
+    pub(crate) fail_next_pms_create: bool,
     /// Fails the next commit point's hosting record, the write a full disk
     /// refuses there.
     #[cfg(feature = "test-util")]
@@ -220,7 +220,7 @@ pub(crate) struct State {
     /// for "repeated attempts leave nothing open".
     #[cfg(feature = "test-util")]
     pub(crate) pair_arm_failures: Option<usize>,
-    /// How long a connection armer waits for a directory change before
+    /// How long a connection armer waits for a PMS change before
     /// sweeping anyway — the spawn's reconcile interval.
     pub(crate) sweep_interval: std::time::Duration,
     pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
@@ -269,7 +269,7 @@ impl State {
             #[cfg(feature = "test-util")]
             failing_device_statements: HashSet::new(),
             #[cfg(feature = "test-util")]
-            fail_next_directory_create: false,
+            fail_next_pms_create: false,
             #[cfg(feature = "test-util")]
             fail_next_hosting_record: false,
             #[cfg(feature = "test-util")]
@@ -286,20 +286,16 @@ impl State {
     }
 
     /// The commit point of a create or a link: record `identity` as hosted
-    /// with `directory` as its private metadata directory. Called once the
+    /// with `pms` as its PMS. Called once the
     /// store set is provisioned and armed for session classification, and
     /// before the identity enters `identities`; a failure leaves no record,
     /// and the identity comes back at no start.
-    pub(crate) async fn commit_hosting(
-        &mut self,
-        identity: PdnId,
-        directory: NamespaceId,
-    ) -> Result<()> {
+    pub(crate) async fn commit_hosting(&mut self, identity: PdnId, pms: NamespaceId) -> Result<()> {
         #[cfg(feature = "test-util")]
         if std::mem::take(&mut self.fail_next_hosting_record) {
             anyhow::bail!("recording the hosting failed for test");
         }
-        self.node.record_hosting(identity, directory).await
+        self.node.record_hosting(identity, pms).await
     }
 }
 
@@ -316,7 +312,7 @@ pub struct Runtime {
 impl Runtime {
     /// On a directory-configured runtime, every identity whose subdirectory
     /// records its hosting is hosted again before the spawn returns, through
-    /// the same tail `create` runs: the directory opens from the replica the
+    /// the same tail `create` runs: the PMS opens from the replica the
     /// node holds, arms classification, and its connection armer's sweeps
     /// bring the rest back. No ceremony, no dial; an unreadable record stops
     /// the spawn, and a directory with none is a first start.
@@ -504,8 +500,8 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
-    pub async fn fail_next_directory_create_for_test(&self) {
-        self.state.lock().await.fail_next_directory_create = true;
+    pub async fn fail_next_pms_create_for_test(&self) {
+        self.state.lock().await.fail_next_pms_create = true;
     }
 
     #[cfg(feature = "test-util")]
@@ -522,7 +518,7 @@ impl Runtime {
         self.state.lock().await.node.hosted_identities()
     }
 
-    /// The announcement public key in `identity`'s own directory on this
+    /// The announcement public key in `identity`'s own PMS on this
     /// runtime; `None` until its payload has arrived.
     #[cfg(feature = "test-util")]
     pub async fn announcement_public_key_for_test(
@@ -530,7 +526,7 @@ impl Runtime {
         identity: pdn_types::PdnId,
     ) -> anyhow::Result<Option<[u8; 32]>> {
         let state = self.state.lock().await;
-        let key = state.hosted(identity)?.directory.announcement_key().await?;
+        let key = state.hosted(identity)?.pms.announcement_key().await?;
         Ok(key.map(|key| key.public_key()))
     }
 
@@ -624,56 +620,53 @@ impl Runtime {
     }
 }
 
-type DirectoryChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static>;
+type PmsChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static>;
 
 /// Host every identity whose subdirectory records its hosting. An
-/// identity whose record names a directory replica the store does not hold
+/// identity whose record names a PMS replica the store does not hold
 /// is skipped, loudly, and the rest come back; one the store holds but
 /// cannot open fails the start, because a runtime hosting less than its
 /// records name would look healthy while refusing everything.
 async fn recover_hosted_identities(
     node: &SyncNode,
-) -> Result<(
-    HashMap<PdnId, HostedIdentity>,
-    Vec<(PdnId, DirectoryChanges)>,
-)> {
+) -> Result<(HashMap<PdnId, HostedIdentity>, Vec<(PdnId, PmsChanges)>)> {
     let mut identities = HashMap::new();
-    let mut armers: Vec<(PdnId, DirectoryChanges)> = Vec::new();
+    let mut armers: Vec<(PdnId, PmsChanges)> = Vec::new();
     // Each skip leaves its record where it is, so it repeats on every start
     // rather than being erased by one.
     for record in node.recorded_hosting()? {
         if !record.store_present {
             tracing::warn!(
                 identity = %record.identity,
-                directory = %record.directory,
+                pms = %record.pms,
                 "a hosting record names an identity whose replica store is absent; the identity is not hosted"
             );
             continue;
         }
         // The identity's own half of the node comes up first: its store is
-        // where its directory replica lives.
+        // where its PMS replica lives.
         node.provision_identity(record.identity).await?;
-        let opened = PrivateMetadataStore::open(node, record.identity, record.directory)
+        let opened = PrivateMetadataStore::open(node, record.identity, record.pms)
             .await
             .with_context(|| {
                 format!(
-                    "cannot recover hosted identity {}: its directory replica did not open",
+                    "cannot recover hosted identity {}: its PMS replica did not open",
                     record.identity
                 )
             })?;
-        let Some(directory) = opened else {
+        let Some(pms) = opened else {
             let _ = node.unhost_identity(record.identity).await;
             tracing::warn!(
                 identity = %record.identity,
-                directory = %record.directory,
-                "a hosting record names a directory replica this node's store does not hold; the identity is not hosted"
+                pms = %record.pms,
+                "a hosting record names a PMS replica this node's store does not hold; the identity is not hosted"
             );
             continue;
         };
-        let changes = directory.changes().await?;
+        let changes = pms.changes().await?;
         let author = node.default_author(record.identity)?;
-        node.host_identity(record.identity, &directory)?;
-        identities.insert(record.identity, HostedIdentity { directory, author });
+        node.host_identity(record.identity, &pms)?;
+        identities.insert(record.identity, HostedIdentity { pms, author });
         armers.push((record.identity, Box::new(changes)));
     }
     Ok((identities, armers))

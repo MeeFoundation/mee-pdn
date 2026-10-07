@@ -33,7 +33,7 @@ impl AnnouncementKeyPair {
         pdn_id_of(&self.public_key())
     }
 
-    /// The pair follows from these 32 bytes, which the directory stores.
+    /// The pair follows from these 32 bytes, which the PMS stores.
     pub(crate) fn from_secret_bytes(secret: &[u8; 32]) -> Self {
         Self(SecretKey::from_bytes(secret))
     }

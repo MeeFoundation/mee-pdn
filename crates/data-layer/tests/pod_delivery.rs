@@ -253,7 +253,7 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
 /// contacts the membership derives: every device of every current member
 /// dialed as that member, a co-located member's device among them and
 /// reached inside the process, and the identity's own siblings by its
-/// directory, never this device as itself. Denied: once a member is removed,
+/// PMS, never this device as itself. Denied: once a member is removed,
 /// no run's contacts hold its devices.
 ///
 /// Nothing is written between the co-located member's catch-up and its
@@ -264,10 +264,10 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
 async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membership_derives(
 ) -> Result<()> {
     let tablet = node(QUIET, POD_RUN).await?;
-    let (alice, alice_directory) = host(&tablet).await?;
+    let (alice, alice_pms) = host(&tablet).await?;
     let (carol, _) = host(&tablet).await?;
     let sibling = nowhere(0xa2);
-    alice_directory.add_device(sibling.node).await?;
+    alice_pms.add_device(sibling.node).await?;
     let pod = create(&tablet, &alice).await?;
     let bob = Person::generate();
     let bobs: Vec<MemberDevice> = (0xb1..=0xb7).map(nowhere).collect();
@@ -647,19 +647,13 @@ async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_mem
         node(QUIET, QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_laptop).await?;
-    bob_directory.add_device(bob_phone.node_id()).await?;
-    let ticket = bob_directory
+    let (bob, bob_pms) = host(&bob_laptop).await?;
+    bob_pms.add_device(bob_phone.node_id()).await?;
+    let ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let phone_directory = join_identity(&bob_phone, bob.id, ticket).await?;
-    assert!(
-        wait_devices(
-            &phone_directory,
-            &[bob_laptop.node_id(), bob_phone.node_id()]
-        )
-        .await?
-    );
+    let phone_pms = join_identity(&bob_phone, bob.id, ticket).await?;
+    assert!(wait_devices(&phone_pms, &[bob_laptop.node_id(), bob_phone.node_id()]).await?);
     let pod = create(&alice_phone, &alice).await?;
     let unlisted_node = MemberDevice {
         node: nowhere(0xb2).node,
