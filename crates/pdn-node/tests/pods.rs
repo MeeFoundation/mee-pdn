@@ -1232,20 +1232,11 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
 /// from the identity's directory, read it, and register themselves, so the
 /// owner's device reads what they write and serves one of them with every
 /// other device of the member gone. Denied: a co-located identity that is
-/// no member lists no such pod and reads nothing of it. A linked device's
-/// first session can reach its sibling before its confirmation does, and is
-/// refused; its pod pass, every half second here, opens the next one.
+/// no member lists no such pod and reads nothing of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_linked_before_and_after_the_join_reach_the_pod() -> Result<()> {
-    let quick = || SpawnOptions {
-        pod_reconcile_interval: Duration::from_millis(500),
-        ..SpawnOptions::memory()
-    };
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
-    let (bob_laptop, bob_tablet) = (
-        Runtime::spawn(quick()).await?,
-        Runtime::spawn(quick()).await?,
-    );
+    let (bob_laptop, bob_tablet) = (memory_runtime().await?, memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
     let dave = bob_laptop.identity().create().await?;
