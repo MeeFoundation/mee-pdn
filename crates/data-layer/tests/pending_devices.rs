@@ -5,30 +5,28 @@ use data_layer::{AddrInfoOptions, ShareMode};
 use test_utils::{eventually, host_identity, ids, join_identity, memory_node};
 
 /// Pending registrations older than the expiry are dropped by the cleanup
-/// on a re-imported directory, a recent one is kept, and none of them is a
+/// on a re-imported PMS, a recent one is kept, and none of them is a
 /// device.
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_pending_devices_are_reclaimed_after_reimport() -> Result<()> {
     let owner = memory_node().await?;
-    let directory = host_identity(&owner, ids::ALICE).await?;
+    let pms = host_identity(&owner, ids::ALICE).await?;
     let abandoned_a = memory_node().await?;
     let abandoned_b = memory_node().await?;
     let recent = memory_node().await?;
     let old = SystemTime::now() - Duration::from_hours(25);
-    directory
-        .add_pending_device_at_for_test(abandoned_a.node_id(), old)
+    pms.add_pending_device_at_for_test(abandoned_a.node_id(), old)
         .await?;
-    directory
-        .add_pending_device_at_for_test(abandoned_b.node_id(), old)
+    pms.add_pending_device_at_for_test(abandoned_b.node_id(), old)
         .await?;
-    directory.add_pending_device(recent.node_id()).await?;
+    pms.add_pending_device(recent.node_id()).await?;
 
-    let ticket = directory
+    let ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     let restarted = memory_node().await?;
     let reopened = join_identity(&restarted, ids::ALICE, ticket).await?;
-    directory.add_device(restarted.node_id()).await?;
+    pms.add_device(restarted.node_id()).await?;
     assert!(
         eventually(|| async {
             reopened.cleanup_pending_devices().await?;

@@ -1,4 +1,4 @@
-//! The private metadata store: the one device-replicated directory of an
+//! The private metadata store (PMS): the one device-replicated store of an
 //! identity's own state, device-internal by ticket alone (Invariant 1).
 //! Five record families under disjoint prefixes: `devices/`,
 //! `pending-devices/`, `tickets/`, `connections/`, `retractions/`, and the
@@ -94,11 +94,11 @@ impl CatchUpWatch {
     }
 }
 
-/// The one key shape shared by the directory's device set, the connection
+/// The one key shape shared by the PMS's device set, the connection
 /// metadata store's published device sets, and the access book's probe:
 /// it decides who counts as an identity's own device, so a drifted copy
 /// would be an access-control bug. A record here is a *confirmed* device,
-/// one holding this directory's write ticket.
+/// one holding this PMS's write ticket.
 pub(crate) const DEVICES_PREFIX: &str = "devices/";
 /// Disjoint from [`DEVICES_PREFIX`] on purpose: the access book probes that
 /// prefix alone, so a pending record grants nothing until the newcomer
@@ -112,13 +112,13 @@ const RETRACTIONS_PREFIX: &str = "retractions/";
 const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
 const PODS_PREFIX: &str = "pods/";
 
-/// The directory kind of one of a pod's stores' write tickets, minted by
+/// The PMS kind of one of a pod's stores' write tickets, minted by
 /// the identity itself: its own devices are the nodes it names.
 pub fn pod_ticket_kind(pod: &PodId, store: PodStore) -> String {
     format!("pod/{pod}/{}", pod_store_name(store))
 }
 
-/// The directory kind of the write ticket to one of a pod's stores that
+/// The PMS kind of the write ticket to one of a pod's stores that
 /// the device which invited the identity handed over, naming that device
 /// as the inviter: a ticket names all its nodes as one identity.
 pub fn pod_inviter_ticket_kind(pod: &PodId, store: PodStore) -> String {
@@ -162,7 +162,7 @@ fn connection_key(peer: &PdnId) -> String {
     format!("{CONNECTIONS_PREFIX}{peer}")
 }
 
-/// The confirmed devices a directory replica lists, record-level.
+/// The confirmed devices a PMS replica lists, record-level.
 pub(crate) async fn listed_devices(doc: &Doc) -> Result<Vec<NodeId>> {
     let query = Query::single_latest_per_key().key_prefix(DEVICES_PREFIX.as_bytes());
     let mut stream = std::pin::pin!(doc.get_many(query).await?);
@@ -346,7 +346,7 @@ impl PrivateMetadataStore {
         self.doc.clone()
     }
 
-    /// Record `device` as a confirmed device — one holding this directory's
+    /// Record `device` as a confirmed device — one holding this PMS's
     /// write ticket.
     pub async fn add_device(&self, device: NodeId) -> Result<()> {
         self.doc
@@ -531,7 +531,7 @@ impl PrivateMetadataStore {
     }
 
     /// Record that the identity's membership event at `seq` of its chain in
-    /// `pod` — its founding or joined event — holds the pod.
+    /// `pod` — its created or joined event — holds the pod.
     pub async fn record_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
         self.doc
             .set_bytes(
@@ -543,7 +543,7 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
-    /// Record that the identity's left event at `seq`, or a kicked event at
+    /// Record that the identity's left event at `seq`, or a removed event at
     /// `seq` its device learned of, ends its holding of `pod`: a tombstone
     /// at that sequence.
     pub async fn tombstone_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
@@ -675,7 +675,7 @@ impl PrivateMetadataStore {
 
     /// Drop every marker this device recorded for `issuer` — with the
     /// granted namespace binding. Only own-author markers, since deletion is
-    /// per directory author; each sibling prunes its own at its unbind.
+    /// per PMS author; each sibling prunes its own at its unbind.
     pub async fn prune_retractions(&self, issuer: PdnId) -> Result<()> {
         let query = Query::author(self.author)
             .key_prefix(format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes());
@@ -694,7 +694,7 @@ impl PrivateMetadataStore {
 
     /// Drop the markers this device recorded whose entry aged past
     /// `retention` (microseconds, like entry timestamps). Only own-author
-    /// markers, since deletion is per directory author. Returns the dropped
+    /// markers, since deletion is per PMS author. Returns the dropped
     /// addresses so the caller can disarm what each one armed.
     pub async fn prune_aged_retractions(
         &self,
@@ -793,7 +793,7 @@ impl PrivateMetadataStore {
     }
 
     /// Taken before whatever starts the replica's sessions — before
-    /// `host_identity` arms a directory — or a session finished before the
+    /// `host_identity` arms a PMS — or a session finished before the
     /// subscription goes unseen and the wait holds out for the next one.
     pub async fn watch_catch_up(&self) -> Result<CatchUpWatch> {
         watch_doc(&self.doc).await

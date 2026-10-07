@@ -119,19 +119,19 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
 
     // The node survived: a device of Alice still catches up her data
     // namespace from it.
-    let directory = host_identity(&node_a, ids::ALICE).await?;
+    let pms = host_identity(&node_a, ids::ALICE).await?;
     let author = node_a.default_author(ids::ALICE)?;
     node_a.create_namespace(ids::ALICE, ids::ALICE).await?;
     let name = EntryPath::new("contact/name")?;
     node_a
         .write(ids::ALICE, ids::ALICE, author, &name, b"Alice")
         .await?;
-    let directory_ticket = directory
+    let pms_ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let sibling_dir = join_identity(&node_b, ids::ALICE, directory_ticket).await?;
-    directory.add_device(node_b.node_id()).await?;
-    sibling_dir.add_device(node_b.node_id()).await?;
+    let sibling_pms = join_identity(&node_b, ids::ALICE, pms_ticket).await?;
+    pms.add_device(node_b.node_id()).await?;
+    sibling_pms.add_device(node_b.node_id()).await?;
     let ticket = node_a
         .share_ticket(
             ids::ALICE,

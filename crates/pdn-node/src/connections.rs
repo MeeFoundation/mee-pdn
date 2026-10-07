@@ -215,7 +215,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
 
     async fn list(&self, identity: PdnId) -> Result<Vec<PdnId>> {
         let state = self.runtime.state.lock().await;
-        state.hosted(identity)?.directory.list_connections().await
+        state.hosted(identity)?.pms.list_connections().await
     }
 
     async fn withdraw_grant(&self, identity: PdnId, peer: PdnId, issuer: PdnId) -> Result<()> {
@@ -307,7 +307,7 @@ impl ConnectionsService for RuntimeConnectionsService<'_> {
 }
 
 /// Keep hosted `identity`'s connections bound and its pods open: one sweep
-/// now, then one per directory change and one per sweep interval. Without
+/// now, then one per PMS change and one per sweep interval. Without
 /// it a linked device would refuse grants its identity issued until its
 /// first grant read, stay invisible to the counterparty, and reach none of
 /// its identity's pods. Holds the state weakly and upgrades
@@ -332,9 +332,9 @@ pub(crate) fn spawn_connection_armer(
                 crate::pods::arm_pods(&guard, identity).await;
                 guard.sweep_interval
             };
-            // Two wake sources: a sweep can fail for a reason the directory
+            // Two wake sources: a sweep can fail for a reason the PMS
             // knows nothing about (an import that met a full disk), and
-            // nothing then writes to the directory to ask for another try.
+            // nothing then writes to the PMS to ask for another try.
             tokio::select! {
                 change = changes.next() => match change {
                     Some(Ok(())) => {}
@@ -543,7 +543,7 @@ async fn refresh_replica_contacts(
 ) -> Result<()> {
     let own = state.node.node_id();
     let siblings: Vec<NodeId> = match state.hosted(identity) {
-        Ok(hosted) => hosted.directory.list_devices().await?,
+        Ok(hosted) => hosted.pms.list_devices().await?,
         Err(_not_hosted) => Vec::new(),
     };
     // Keyed by bytes because two id types meet here: a contact carries the
@@ -620,13 +620,13 @@ async fn unbind_withdrawn(state: &mut State, identity: PdnId, peer: PdnId, live:
             }
         }
         if let Ok(hosted) = state.hosted(identity) {
-            let _cold_until_next_sweep = hosted.directory.prune_retractions(issuer).await;
+            let _cold_until_next_sweep = hosted.pms.prune_retractions(issuer).await;
         }
         state.bound_grants.remove(&(identity, peer, issuer));
     }
 }
 
-/// One arming sweep: open every directory-listed pair not yet cached, and
+/// One arming sweep: open every PMS-listed pair not yet cached, and
 /// put a grant binder on every open pair. A pair that cannot open stays
 /// cold until the next sweep. Binders are keyed off the cache rather than
 /// this sweep's own opening, because establishment fills the cache
@@ -635,15 +635,15 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
     apply_retractions(state, identity).await;
     bind_data_namespace(state, identity).await;
     if let Err(err) = ensure_own_device_confirmed(state, identity).await {
-        tracing::warn!(%identity, "confirming this device in the directory failed: {err:#}");
+        tracing::warn!(%identity, "confirming this device in the PMS failed: {err:#}");
     }
     let peers = {
         let Ok(hosted) = state.hosted(identity) else {
             return;
         };
-        match hosted.directory.list_connections().await {
+        match hosted.pms.list_connections().await {
             Ok(peers) => peers,
-            Err(_directory_unreadable) => return,
+            Err(_pms_unreadable) => return,
         }
     };
     for peer in peers {
@@ -674,10 +674,10 @@ async fn arm_connections(state: &mut State, identity: PdnId, runtime: &Weak<Mute
 pub(crate) async fn ensure_own_device_confirmed(state: &mut State, identity: PdnId) -> Result<()> {
     let own_device = state.node.node_id();
     let hosted = state.hosted(identity)?;
-    if hosted.directory.list_devices().await?.contains(&own_device) {
+    if hosted.pms.list_devices().await?.contains(&own_device) {
         return Ok(());
     }
-    hosted.directory.confirm_device(own_device).await
+    hosted.pms.confirm_device(own_device).await
 }
 
 /// The recovery half of the data-namespace binding: a restarted node holds
@@ -692,7 +692,7 @@ async fn bind_data_namespace(state: &mut State, identity: PdnId) {
         return;
     };
     let Ok(Some(ticket)) = hosted
-        .directory
+        .pms
         .get_ticket(crate::identity::DATA_TICKET_KIND)
         .await
     else {
@@ -710,24 +710,20 @@ async fn bind_data_namespace(state: &mut State, identity: PdnId) {
 }
 
 /// The metadata pair of `(identity, peer)`, resolved against the
-/// directory's per-connection kinds; `metadata_pairs` is only a handle
+/// PMS's per-connection kinds; `metadata_pairs` is only a handle
 /// cache, and a cached side is reused only while it still names the
-/// replica the directory names — otherwise a pair cached before the
+/// replica the PMS names — otherwise a pair cached before the
 /// counterparty re-established onto a fresh replica would silently miss
-/// every later grant. `None` when the directory has no complete pair and
+/// every later grant. `None` when the PMS has no complete pair and
 /// nothing is cached.
 async fn open_pair(
     state: &mut State,
     identity: PdnId,
     peer: PdnId,
 ) -> Result<Option<ConnectionMetadata>> {
-    let directory = &state.hosted(identity)?.directory;
-    let own_ticket = directory
-        .get_ticket(&data_layer::own_ticket_kind(&peer))
-        .await?;
-    let peer_ticket = directory
-        .get_ticket(&data_layer::peer_ticket_kind(&peer))
-        .await?;
+    let pms = &state.hosted(identity)?.pms;
+    let own_ticket = pms.get_ticket(&data_layer::own_ticket_kind(&peer)).await?;
+    let peer_ticket = pms.get_ticket(&data_layer::peer_ticket_kind(&peer)).await?;
     let (Some(own_ticket), Some(peer_ticket)) = (own_ticket, peer_ticket) else {
         // An already-open pair keeps working rather than blinking out.
         return Ok(state.metadata_pairs.get(&(identity, peer)).cloned());
@@ -836,13 +832,13 @@ async fn point_pair_at_its_devices(
     peer: PdnId,
     pair: &ConnectionMetadata,
 ) -> Result<()> {
-    let directory = &state.hosted(identity)?.directory;
-    let own_nodes = directory
+    let pms = &state.hosted(identity)?.pms;
+    let own_nodes = pms
         .get_ticket(&data_layer::own_ticket_kind(&peer))
         .await?
         .map(|ticket| ticket.contacts())
         .unwrap_or_default();
-    let peer_nodes = directory
+    let peer_nodes = pms
         .get_ticket(&data_layer::peer_ticket_kind(&peer))
         .await?
         .map(|ticket| ticket.contacts())
@@ -859,8 +855,8 @@ async fn point_pair_at(
     pair: &ConnectionMetadata,
     (own_nodes, peer_nodes): (Vec<Contact>, Vec<Contact>),
 ) -> Result<()> {
-    let directory = &state.hosted(identity)?.directory;
-    let siblings = directory.list_devices().await?;
+    let pms = &state.hosted(identity)?.pms;
+    let siblings = pms.list_devices().await?;
     let counterparty = pair.peer.published_devices().await?;
 
     let own_device = state.node.node_id();

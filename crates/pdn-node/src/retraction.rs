@@ -1,5 +1,5 @@
 //! Write retraction at the runtime: the verdict consumer records a
-//! directory marker and emits an event; the marker sweep — the one act path
+//! PMS marker and emits an event; the marker sweep — the one act path
 //! every device shares — removes the addressed entries and arms their
 //! ingest refusal.
 
@@ -26,7 +26,7 @@ pub struct RetractionEvent {
     pub decided_by: NodeId,
 }
 
-/// Each verdict becomes a directory marker, a warning, and an event. The
+/// Each verdict becomes a PMS marker, a warning, and an event. The
 /// removal is the marker sweep's, on every device alike, so the verdict
 /// path and the sibling path cannot drift apart.
 pub(crate) fn spawn_retraction_consumer(
@@ -56,7 +56,7 @@ pub(crate) fn spawn_retraction_consumer(
     });
 }
 
-/// The marker goes into the directory of the identity whose replica holds
+/// The marker goes into the PMS of the identity whose replica holds
 /// the retracted entry — the identity the verdict itself names. A
 /// co-located identity's replica holds what its own grant covers, so a
 /// marker there would address entries this verdict never judged.
@@ -100,7 +100,7 @@ async fn record_verdict(state: &State, verdict: &RetractionVerdict, decided_by: 
         return;
     };
     if let Err(err) = hosted
-        .directory
+        .pms
         .record_retraction(issuer, verdict.author, path.as_str(), &marker)
         .await
     {
@@ -140,7 +140,7 @@ fn now_micros() -> u64 {
 
 /// One marker sweep: age out this device's stale markers, then arm and
 /// remove for every readable marker version not applied yet. Idempotent, so
-/// it runs on every directory change and every grant-binder sweep —
+/// it runs on every PMS change and every grant-binder sweep —
 /// whichever of the marker and the namespace binding arrives second, the
 /// sweep after it acts. A version is applied once, its payload read and its
 /// removal run then; a disarm forgets it.
@@ -149,7 +149,7 @@ pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
         return;
     };
     if let Ok(dropped) = hosted
-        .directory
+        .pms
         .prune_aged_retractions(now_micros(), MARKER_RETENTION_MICROS)
         .await
     {
@@ -159,7 +159,7 @@ pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
                 .disarm_retraction(identity, issuer, author, path.as_bytes());
         }
     }
-    let Ok(heads) = hosted.directory.list_retraction_heads().await else {
+    let Ok(heads) = hosted.pms.list_retraction_heads().await else {
         return;
     };
     for head in heads {
@@ -173,7 +173,7 @@ pub(crate) async fn apply_retractions(state: &State, identity: PdnId) {
         ) {
             continue;
         }
-        let Ok(Some(marker)) = hosted.directory.read_retraction(&head).await else {
+        let Ok(Some(marker)) = hosted.pms.read_retraction(&head).await else {
             continue;
         };
         if state

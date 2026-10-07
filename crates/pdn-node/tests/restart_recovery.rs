@@ -1,6 +1,6 @@
 //! Restart recovery at the runtime level: a runtime spawned on a shut-down
 //! one's directory hosts the identities whose subdirectory records their
-//! hosting, and everything else re-derives from each identity's directory.
+//! hosting, and everything else re-derives from each identity's PMS.
 //! An in-process respawn proves the recovery logic — the record's commit
 //! point, the re-derivation paths, a withdrawal during the outage — not a
 //! process that exits; that half is the container stand.
@@ -33,7 +33,7 @@ async fn memory_rt() -> Result<Runtime> {
 /// nothing of it: the node hosts no more identities than before, and the
 /// next create still works. Provisioning is the first act with something
 /// to undo — an actor thread, an open store, an entry in the hosted set —
-/// and the failure is injected where the directory would be made, a step
+/// and the failure is injected where the PMS would be made, a step
 /// between provisioning and hosting, which a full disk is the product's
 /// reason to reach.
 #[tokio::test(flavor = "multi_thread")]
@@ -41,7 +41,7 @@ async fn a_create_that_fails_leaves_no_half_hosted_identity() -> Result<()> {
     let runtime = memory_rt().await?;
     let before = runtime.provisioned_identities_for_test().await?.len();
 
-    runtime.fail_next_directory_create_for_test().await;
+    runtime.fail_next_pms_create_for_test().await;
     assert!(
         runtime.identity().create().await.is_err(),
         "the injected failure did not fail the create"
@@ -110,7 +110,7 @@ fn subdirectory_of(dir: &std::path::Path, identity: pdn_types::PdnId) -> std::pa
 /// Where `identity`'s hosting record lands under `dir`, as the node writes
 /// it.
 fn record_of(dir: &std::path::Path, identity: pdn_types::PdnId) -> std::path::PathBuf {
-    subdirectory_of(dir, identity).join("directory")
+    subdirectory_of(dir, identity).join("pms")
 }
 
 /// Copy the files of one identity's subdirectory — it holds no others.
@@ -151,7 +151,7 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
         vec![alice],
         "the recorded identity must be hosted again"
     );
-    // The data namespace re-binds from the directory's `data` ticket on the
+    // The data namespace re-binds from the PMS's `data` ticket on the
     // armer's first sweep; the payload is local.
     assert!(
         eventually(|| async {
@@ -238,7 +238,7 @@ async fn two_identities_each_recover_their_own_connections() -> Result<()> {
 /// Two identities of one node, granted a different claim each of one
 /// issuer, come back after a restart reading each its own and neither
 /// the other's: every identity is restored with stores of its own, its
-/// directory opened there and its granted namespace imported there.
+/// PMS opened there and its granted namespace imported there.
 ///
 /// Denied: neither identity reads the claim granted to its co-located
 /// sibling, before the restart or after it.
@@ -530,7 +530,7 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
     Ok(())
 }
 
-/// A hosting record whose directory replica the store does not hold is
+/// A hosting record whose PMS replica the store does not hold is
 /// skipped: the start succeeds, that identity is not hosted, and every
 /// healthy identity beside it comes back — whether the replica store is
 /// gone from the record's subdirectory or holds no such replica. The
@@ -894,7 +894,7 @@ async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audienc
 }
 
 /// A link whose record cannot be written leaves nothing anywhere: the
-/// identity's directory never names the device, because the confirmation
+/// identity's PMS never names the device, because the confirmation
 /// is written after the record, and a start on the directory the failed
 /// link left hosts nothing from it. The injected failure is the identity's
 /// subdirectory made unwritable while a pause holds the link at its commit
@@ -906,8 +906,8 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
 
     let inviter = memory_rt().await?;
     let identity = inviter.identity().create().await?;
-    // The store-level view of the directory.
-    let (probe, directory) = common::link_probe(&inviter, identity).await?;
+    // The store-level view of the PMS.
+    let (probe, pms) = common::link_probe(&inviter, identity).await?;
 
     let dir = tempfile::tempdir()?;
     let dialer = std::sync::Arc::new(runtime_on(dir.path()).await?);
@@ -960,12 +960,12 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
     // Not late either: the sweep that repeats a confirmation runs only for
     // a hosted identity. The order itself is asserted below.
     assert!(
-        !directory.list_devices().await?.contains(&newcomer),
-        "the failed link must not name this device in the identity's directory"
+        !pms.list_devices().await?.contains(&newcomer),
+        "the failed link must not name this device in the identity's PMS"
     );
     tokio::time::sleep(RECONCILE * 3).await;
     assert!(
-        !directory.list_devices().await?.contains(&newcomer),
+        !pms.list_devices().await?.contains(&newcomer),
         "the failed link's device record must not arrive later either"
     );
 
@@ -977,8 +977,8 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
         "the retried link must host the identity"
     );
     assert!(
-        eventually(|| async { Ok(directory.list_devices().await?.contains(&newcomer)) }).await?,
-        "the retried link must name this device in the identity's directory"
+        eventually(|| async { Ok(pms.list_devices().await?.contains(&newcomer)) }).await?,
+        "the retried link must name this device in the identity's PMS"
     );
 
     dialer.shutdown().await?;
@@ -988,7 +988,7 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
 }
 
 /// The order the failure above depends on: at the moment a link is about
-/// to commit it has published nothing into the directory. Held there by a
+/// to commit it has published nothing into the PMS. Held there by a
 /// pause, read from a device that already belongs to the identity, waiting
 /// long enough for an earlier record to have replicated. A rollback undoes
 /// what is local and cannot take back what replicated; committing first
@@ -997,7 +997,7 @@ async fn a_link_that_cannot_be_recorded_leaves_nothing_on_the_identity() -> Resu
 async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
     let inviter = memory_rt().await?;
     let identity = inviter.identity().create().await?;
-    let (probe, directory) = common::link_probe(&inviter, identity).await?;
+    let (probe, pms) = common::link_probe(&inviter, identity).await?;
 
     let dialer = std::sync::Arc::new(memory_rt().await?);
     let newcomer = dialer.node_id();
@@ -1019,10 +1019,10 @@ async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
     // this replica: the ceremony's own catch-up ran over the same path, and
     // three intervals follow.
     tokio::time::sleep(RECONCILE * 3).await;
-    let published = directory.list_devices().await?;
+    let published = pms.list_devices().await?;
     assert!(
         !published.contains(&newcomer),
-        "a link must publish nothing into the directory before it commits: {published:?}"
+        "a link must publish nothing into the PMS before it commits: {published:?}"
     );
     assert!(
         published.contains(&probe.node_id()),
@@ -1032,7 +1032,7 @@ async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
     pause.release();
     linking.await??;
     assert!(
-        eventually(|| async { Ok(directory.list_devices().await?.contains(&newcomer)) }).await?,
+        eventually(|| async { Ok(pms.list_devices().await?.contains(&newcomer)) }).await?,
         "the committed link must confirm the device afterwards"
     );
 

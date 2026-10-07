@@ -363,7 +363,7 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
 }
 
 /// A join whose `join` future is dropped during its catch-up, once both
-/// tickets and the directory's entry are recorded, ends caught up all the
+/// tickets and the PMS's entry are recorded, ends caught up all the
 /// same: the newcomer lists the pod and its members and reads what was
 /// placed before and after, by the one joined event. Denied: the invite
 /// presented again.
@@ -414,7 +414,7 @@ async fn a_join_whose_future_is_dropped_during_its_catch_up_is_finished() -> Res
 }
 
 /// A join cut by a restart during its catch-up, once both tickets and the
-/// directory's entry are recorded, is finished by the armer after the
+/// PMS's entry are recorded, is finished by the armer after the
 /// restart: the newcomer lists the pod and its members and reads what was
 /// placed before the join and while it was down, by the one joined event.
 /// Denied: the invite presented again.
@@ -474,7 +474,7 @@ async fn a_join_cut_by_a_restart_during_its_catch_up_is_finished_by_the_armer() 
 }
 
 /// A join whose inviter goes out of reach for its whole catch-up fails with
-/// the catch-up timeout and leaves both tickets and the directory's entry
+/// the catch-up timeout and leaves both tickets and the PMS's entry
 /// recorded; once the inviter is reachable again the newcomer's pod pass
 /// catches it up, by the one joined event. Denied: the invite presented
 /// again. The inviter refusing every pod session stands in for the
@@ -999,13 +999,13 @@ async fn an_owner_demotes_another_owner_and_not_itself() -> Result<()> {
     Ok(())
 }
 
-/// An owner kicked by another owner learns of the kick and stops listing
+/// An owner removed by another owner learns of the removal and stops listing
 /// the pod; invited again it joins as a plain member, every member listing
 /// it so, until an owner promotes it anew and its demotion of that owner
 /// goes through. Denied: the same demotion between the rejoin and the new
 /// promotion.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_former_owner_kicked_and_invited_again_is_a_plain_member() -> Result<()> {
+async fn a_former_owner_removed_and_invited_again_is_a_plain_member() -> Result<()> {
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
@@ -1019,7 +1019,7 @@ async fn a_former_owner_kicked_and_invited_again_is_a_plain_member() -> Result<(
 
     alice_phone
         .pods()
-        .act(alice, pod, PodAct::Kick(bob))
+        .act(alice, pod, PodAct::Remove(bob))
         .await?;
     assert_eq!(
         alice_phone.pods().members(alice, pod).await?,
@@ -1027,7 +1027,7 @@ async fn a_former_owner_kicked_and_invited_again_is_a_plain_member() -> Result<(
     );
     assert!(
         lists_pod(&bob_phone, bob, pod, false).await?,
-        "the kicked owner's device did not learn of its kick"
+        "the removed owner's device did not learn of its removal"
     );
     let asked = bob_phone.pods().members(bob, pod).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
@@ -1063,13 +1063,13 @@ async fn a_former_owner_kicked_and_invited_again_is_a_plain_member() -> Result<(
     Ok(())
 }
 
-/// An owner's kick of a plain member reaches the remaining member, the two
-/// still syncing, and the kicked member's device stops listing the pod.
-/// Denied: the kicked member's kick of the remaining one, refused while it
-/// was a plain member, and the owner's kick of itself, the remaining member
+/// An owner's removal of a plain member reaches the remaining member, the two
+/// still syncing, and the removed member's device stops listing the pod.
+/// Denied: the removed member's removal of the remaining one, refused while it
+/// was a plain member, and the owner's removal of itself, the remaining member
 /// still listed and served.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_owner_kicks_a_member_and_a_plain_member_kicks_nobody() -> Result<()> {
+async fn an_owner_removes_a_member_and_a_plain_member_removes_nobody() -> Result<()> {
     let (alice_phone, bob_phone, carol_phone) = (
         memory_runtime().await?,
         memory_runtime().await?,
@@ -1086,29 +1086,32 @@ async fn an_owner_kicks_a_member_and_a_plain_member_kicks_nobody() -> Result<()>
     .await?;
 
     // Denied (a plain member, and on itself).
-    let kicked = carol_phone.pods().act(carol, pod, PodAct::Kick(bob)).await;
-    assert!(refused(kicked, ActRefusal::NotAnOwner));
-    let kicked = alice_phone
+    let removed = carol_phone
         .pods()
-        .act(alice, pod, PodAct::Kick(alice))
+        .act(carol, pod, PodAct::Remove(bob))
         .await;
-    assert!(refused(kicked, ActRefusal::OnItself));
+    assert!(refused(removed, ActRefusal::NotAnOwner));
+    let removed = alice_phone
+        .pods()
+        .act(alice, pod, PodAct::Remove(alice))
+        .await;
+    assert!(refused(removed, ActRefusal::OnItself));
 
     alice_phone
         .pods()
-        .act(alice, pod, PodAct::Kick(carol))
+        .act(alice, pod, PodAct::Remove(carol))
         .await?;
     let remaining = vec![member(alice, true), member(bob, false)];
     assert!(lists_members(&bob_phone, bob, pod, remaining).await?);
     assert!(
         lists_pod(&carol_phone, carol, pod, false).await?,
-        "the kicked member's device did not learn of its kick"
+        "the removed member's device did not learn of its removal"
     );
     let claim = alice_phone
         .pods()
-        .put_record(alice, pod, RecordKind::Claim, b"after the kick")
+        .put_record(alice, pod, RecordKind::Claim, b"after the removal")
         .await?;
-    assert!(reads(&bob_phone, bob, pod, claim, b"after the kick").await?);
+    assert!(reads(&bob_phone, bob, pod, claim, b"after the removal").await?);
     let asked = carol_phone.pods().read(carol, pod, claim).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
 
@@ -1229,23 +1232,14 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
 }
 
 /// Devices linked into a member before and after its join reach the pod
-/// from the identity's directory, read it, and register themselves, so the
+/// from the identity's PMS, read it, and register themselves, so the
 /// owner's device reads what they write and serves one of them with every
 /// other device of the member gone. Denied: a co-located identity that is
-/// no member lists no such pod and reads nothing of it. A linked device's
-/// first session can reach its sibling before its confirmation does, and is
-/// refused; its pod pass, every half second here, opens the next one.
+/// no member lists no such pod and reads nothing of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_linked_before_and_after_the_join_reach_the_pod() -> Result<()> {
-    let quick = || SpawnOptions {
-        pod_reconcile_interval: Duration::from_millis(500),
-        ..SpawnOptions::memory()
-    };
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
-    let (bob_laptop, bob_tablet) = (
-        Runtime::spawn(quick()).await?,
-        Runtime::spawn(quick()).await?,
-    );
+    let (bob_laptop, bob_tablet) = (memory_runtime().await?, memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
     let dave = bob_laptop.identity().create().await?;
@@ -1317,12 +1311,12 @@ async fn a_pods_tickets_reach_a_linked_device_each_naming_its_holder() -> Result
         (&alice_phone, alice, None),
         (&bob_phone, bob, Some((&alice_phone, alice))),
     ] {
-        let (probe, directory) = link_probe(runtime, holder).await?;
+        let (probe, pms) = link_probe(runtime, holder).await?;
         for store in [PodStore::Membership, PodStore::Records] {
             let own = pod_ticket_kind(&pod, store);
             assert!(
                 eventually(|| async {
-                    Ok(directory
+                    Ok(pms
                         .get_ticket(&own)
                         .await?
                         .is_some_and(|ticket| names(&ticket, runtime, holder)))
@@ -1332,10 +1326,10 @@ async fn a_pods_tickets_reach_a_linked_device_each_naming_its_holder() -> Result
             );
             let handed = pod_inviter_ticket_kind(&pod, store);
             match inviter {
-                None => assert!(directory.get_ticket(&handed).await?.is_none()),
+                None => assert!(pms.get_ticket(&handed).await?.is_none()),
                 Some((inviting, inviter)) => assert!(
                     eventually(|| async {
-                        Ok(directory
+                        Ok(pms
                             .get_ticket(&handed)
                             .await?
                             .is_some_and(|ticket| names(&ticket, inviting, inviter)))
@@ -1354,7 +1348,7 @@ async fn a_pods_tickets_reach_a_linked_device_each_naming_its_holder() -> Result
     Ok(())
 }
 
-/// A leave on one of a member's devices, and an owner's kick of the member,
+/// A leave on one of a member's devices, and an owner's removal of the member,
 /// each reach the member's other device, which stops listing the pod and
 /// reads nothing of it, while the owner goes on.
 #[tokio::test(flavor = "multi_thread")]
@@ -1389,7 +1383,7 @@ async fn a_departure_reaches_the_members_other_devices() -> Result<()> {
     bob_phone.pods().act(bob, family, PodAct::Leave).await?;
     alice_phone
         .pods()
-        .act(alice, wedding, PodAct::Kick(bob))
+        .act(alice, wedding, PodAct::Remove(bob))
         .await?;
     for (pod, claim) in [(family, claims[0]), (wedding, claims[1])] {
         for device in [&bob_phone, &bob_laptop] {
@@ -1415,7 +1409,7 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
 }
 
 /// A member's runtime on a storage directory hosts its pod again after a
-/// restart, from its directory alone: the claim another member placed
+/// restart, from its PMS alone: the claim another member placed
 /// meanwhile arrives, the member's next operation continues its author's
 /// count, and its hosting record is the one its create wrote.
 #[tokio::test(flavor = "multi_thread")]
@@ -1441,7 +1435,7 @@ async fn a_pod_is_hosted_again_after_a_restart() -> Result<()> {
         .path()
         .join("identities")
         .join(bob.to_string())
-        .join("directory");
+        .join("pms");
     let recorded = std::fs::read(&record)?;
     bob_tablet.shutdown().await?;
     drop(bob_tablet);
@@ -1656,13 +1650,13 @@ async fn a_member_that_left_as_an_owner_joins_again_as_a_plain_member() -> Resul
     Ok(())
 }
 
-/// A member promoted, demoted and promoted again kicks as its role at each
+/// A member promoted, demoted and promoted again removes as its role at each
 /// point allows, every member listing the roles its chain gives: its first
-/// kick goes through, and its second once it is an owner again. Denied:
-/// the second kick while it is a plain member.
-#[allow(clippy::too_many_lines)] // one scenario: three role flips and a kick beside each
+/// removal goes through, and its second once it is an owner again. Denied:
+/// the second removal while it is a plain member.
+#[allow(clippy::too_many_lines)] // one scenario: three role flips and a removal beside each
 #[tokio::test(flavor = "multi_thread")]
-async fn a_member_promoted_demoted_and_promoted_again_kicks_as_its_role_allows() -> Result<()> {
+async fn a_member_promoted_demoted_and_promoted_again_removes_as_its_role_allows() -> Result<()> {
     let (alice_phone, bob_phone, carol_phone, dave_phone) = (
         memory_runtime().await?,
         memory_runtime().await?,
@@ -1696,7 +1690,10 @@ async fn a_member_promoted_demoted_and_promoted_again_kicks_as_its_role_allows()
         })
         .await?
     );
-    bob_phone.pods().act(bob, pod, PodAct::Kick(carol)).await?;
+    bob_phone
+        .pods()
+        .act(bob, pod, PodAct::Remove(carol))
+        .await?;
     assert!(lists_members(&alice_phone, alice, pod, owner_bob(true)).await?);
 
     alice_phone
@@ -1705,8 +1702,8 @@ async fn a_member_promoted_demoted_and_promoted_again_kicks_as_its_role_allows()
         .await?;
     assert!(lists_members(&bob_phone, bob, pod, owner_bob(false)).await?);
     // Denied (a plain member again).
-    let kicked = bob_phone.pods().act(bob, pod, PodAct::Kick(dave)).await;
-    assert!(refused(kicked, ActRefusal::NotAnOwner));
+    let removed = bob_phone.pods().act(bob, pod, PodAct::Remove(dave)).await;
+    assert!(refused(removed, ActRefusal::NotAnOwner));
     assert!(lists_members(&dave_phone, dave, pod, owner_bob(false)).await?);
 
     alice_phone
@@ -1714,7 +1711,7 @@ async fn a_member_promoted_demoted_and_promoted_again_kicks_as_its_role_allows()
         .act(alice, pod, PodAct::Promote(bob))
         .await?;
     assert!(lists_members(&bob_phone, bob, pod, owner_bob(true)).await?);
-    bob_phone.pods().act(bob, pod, PodAct::Kick(dave)).await?;
+    bob_phone.pods().act(bob, pod, PodAct::Remove(dave)).await?;
     let remaining = vec![member(alice, true), member(bob, true)];
     for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
         assert!(lists_members(runtime, holder, pod, remaining.clone()).await?);

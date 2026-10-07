@@ -18,7 +18,7 @@ use pdn_types::{NodeId, PodId};
 use test_utils::{
     eventually, join_identity,
     pod::{
-        device_of, folds_nobody, found, holds_no_record, host, invite, lists, lists_device,
+        create, device_of, folds_nobody, holds_no_record, host, invite, lists, lists_device,
         place_claim, reads, state_on, statement, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -120,7 +120,7 @@ async fn a_write_arrives_live_over_the_swarm_and_a_ticket_holder_takes_nothing()
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -202,7 +202,7 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -253,22 +253,22 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
 /// contacts the membership derives: every device of every current member
 /// dialed as that member, a co-located member's device among them and
 /// reached inside the process, and the identity's own siblings by its
-/// directory, never this device as itself. Denied: once a member is kicked,
+/// PMS, never this device as itself. Denied: once a member is removed,
 /// no run's contacts hold its devices.
 ///
 /// Nothing is written between the co-located member's catch-up and its
 /// in-process sessions being counted, and the other pass is out of reach,
 /// so every session counted comes from a draw.
-#[allow(clippy::too_many_lines)] // one scenario: the derivation, the draws and the kick
+#[allow(clippy::too_many_lines)] // one scenario: the derivation, the draws and the removal
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membership_derives(
 ) -> Result<()> {
     let tablet = node(QUIET, POD_RUN).await?;
-    let (alice, alice_directory) = host(&tablet).await?;
+    let (alice, alice_pms) = host(&tablet).await?;
     let (carol, _) = host(&tablet).await?;
     let sibling = nowhere(0xa2);
-    alice_directory.add_device(sibling.node).await?;
-    let pod = found(&tablet, &alice).await?;
+    alice_pms.add_device(sibling.node).await?;
+    let pod = create(&tablet, &alice).await?;
     let bob = Person::generate();
     let bobs: Vec<MemberDevice> = (0xb1..=0xb7).map(nowhere).collect();
     invite(&tablet, &alice, pod, &bob, bobs.clone()).await?;
@@ -338,15 +338,15 @@ async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membershi
         "a drawn contact naming this node was not reached inside the process"
     );
 
-    // Denied: Bob's devices, once Alice kicks him.
-    let kick = MembershipKey::Event {
+    // Denied: Bob's devices, once Alice removes him.
+    let removal = MembershipKey::Event {
         subject: bob.id,
         seq: Seq::new(2),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    write(&tablet, &alice, pod, kick, vec![0]).await?;
+    write(&tablet, &alice, pod, removal, vec![0]).await?;
     let without_bob: HashSet<_> = expected
         .iter()
         .filter(|(_device, identity)| *identity != identity_of(bob.id))
@@ -380,7 +380,7 @@ async fn an_invited_device_is_a_contact_once_the_invite_is_written() -> Result<(
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     let as_bob = Contact::new(bob_phone.dial_handle().addr(), identity_of(bob.id));
     let lists_bob = |contacts: Vec<Contact>| {
         contacts
@@ -433,7 +433,7 @@ async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> 
     let (alice_phone, carol_phone) = (spawn().await?, spawn().await?);
     let (alice, _) = host(&alice_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -497,15 +497,15 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let founding = alice.keys.founding([0xa0; 16]);
-    let pod = pod_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    let creation = alice.keys.creation([0xa0; 16]);
+    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
         &alice,
         pod,
-        MembershipKey::founded(alice.id),
-        founding.encode(),
+        MembershipKey::created(alice.id),
+        creation.encode(),
     )
     .await?;
     let elsewhere = MemberDevice {
@@ -571,15 +571,15 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let founding = alice.keys.founding([0xa1; 16]);
-    let pod = pod_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    let creation = alice.keys.creation([0xa1; 16]);
+    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
         &alice,
         pod,
-        MembershipKey::founded(alice.id),
-        founding.encode(),
+        MembershipKey::created(alice.id),
+        creation.encode(),
     )
     .await?;
     let elsewhere = MemberDevice {
@@ -647,20 +647,14 @@ async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_mem
         node(QUIET, QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_laptop).await?;
-    bob_directory.add_device(bob_phone.node_id()).await?;
-    let ticket = bob_directory
+    let (bob, bob_pms) = host(&bob_laptop).await?;
+    bob_pms.add_device(bob_phone.node_id()).await?;
+    let ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let phone_directory = join_identity(&bob_phone, bob.id, ticket).await?;
-    assert!(
-        wait_devices(
-            &phone_directory,
-            &[bob_laptop.node_id(), bob_phone.node_id()]
-        )
-        .await?
-    );
-    let pod = found(&alice_phone, &alice).await?;
+    let phone_pms = join_identity(&bob_phone, bob.id, ticket).await?;
+    assert!(wait_devices(&phone_pms, &[bob_laptop.node_id(), bob_phone.node_id()]).await?);
+    let pod = create(&alice_phone, &alice).await?;
     let unlisted_node = MemberDevice {
         node: nowhere(0xb2).node,
         author: bob_phone.default_author(bob.id)?,
@@ -720,7 +714,7 @@ async fn a_write_whose_announcement_was_lost_arrives_at_the_next_run() -> Result
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -764,7 +758,7 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
     );
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -818,7 +812,7 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
     let (erin, _) = host(&erin_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -910,7 +904,7 @@ async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (nina, _) = host(&nina_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -976,12 +970,12 @@ async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that
     Ok(())
 }
 
-/// A kicked member, served the record store before its kick, is refused it
+/// A removed member, served the record store before its removal, is refused it
 /// by a member device in the session after the one that brings the device
-/// the kick.
-#[allow(clippy::too_many_lines)] // one scenario: the served session, the kick and the refusal
+/// the removal.
+#[allow(clippy::too_many_lines)] // one scenario: the served session, the removal and the refusal
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_one_that_brings_its_kick(
+async fn a_removed_member_is_refused_the_record_store_in_the_session_after_the_one_that_brings_its_removal(
 ) -> Result<()> {
     let (alice_phone, bob_phone, carol_phone) = (
         node(QUIET, QUIET).await?,
@@ -991,7 +985,7 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -1033,21 +1027,21 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
             .is_some_and(|session| session.exchanged.is_ok()),
         "a member device refused a member: {served:?}"
     );
-    // Out of the membership store's swarm and settled, so the kick reaches
+    // Out of the membership store's swarm and settled, so the removal reaches
     // Bob's phone only in the session Carol's phone dials.
     bob_phone
         .leave_swarm_for_test(bob.id, tickets.membership.capability.id())
         .await?;
     assert!(settle(&phones, pod).await?);
 
-    let kick = MembershipKey::Event {
+    let removal = MembershipKey::Event {
         subject: carol.id,
         seq: Seq::new(2),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
     assert!(
         lists(
             &carol_phone,
@@ -1077,7 +1071,7 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
         .await?;
     assert!(
         refused.is_some_and(|session| session.exchanged.is_err()),
-        "the session after the one that brought the kick served the kicked member"
+        "the session after the one that brought the removal served the removed member"
     );
     assert_eq!(
         state_on(&bob_phone, bob.id, pod, carol.id).await,
@@ -1091,7 +1085,7 @@ async fn a_kicked_member_is_refused_the_record_store_in_the_session_after_the_on
 }
 
 /// A member's device dialing a member's device serves it the pod's records.
-/// Denied: a kicked member's device takes no record from the same dial, and
+/// Denied: a removed member's device takes no record from the same dial, and
 /// a holder of both tickets that is no member no entry of either store.
 ///
 /// Every device dialed serves whatever session it is asked to whole, as a
@@ -1112,7 +1106,7 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -1151,14 +1145,14 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
     let phones = [&alice_phone, &bob_phone, &carol_phone, &dave_phone];
     assert!(settle(&phones, pod).await?);
 
-    let kick = MembershipKey::Event {
+    let removal = MembershipKey::Event {
         subject: carol.id,
         seq: Seq::new(2),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
     for (phone, holder) in [
         (&bob_phone, &bob),
@@ -1184,7 +1178,7 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
         reads(&bob_phone, bob.id, pod, claim).await?,
         "a member's device took no record from a member's dial"
     );
-    // Denied: the kicked member's device, on the record store.
+    // Denied: the removed member's device, on the record store.
     dial(
         &alice_phone,
         &alice,
@@ -1199,11 +1193,11 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
             .next_served_with(carol_phone.node_id(), TIMEOUT)
             .await?
             .is_some(),
-        "the dial to the kicked member's device did not go through"
+        "the dial to the removed member's device did not go through"
     );
     assert!(
         holds_no_record(&carol_phone, carol.id, pod).await?,
-        "a member's dial served a kicked member's device a record"
+        "a member's dial served a removed member's device a record"
     );
     // Denied: the ticket holder that is no member, on either store.
     dial(
@@ -1253,7 +1247,7 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let pod = found(&mia_phone, &mia).await?;
+    let pod = create(&mia_phone, &mia).await?;
     invite(&mia_phone, &mia, pod, &bob, vec![device_of(&tablet, &bob)?]).await?;
     let tickets = tickets(&mia_phone, &mia, pod).await?;
     tablet.import_pod(bob.id, pod, tickets.clone()).await?;
@@ -1304,8 +1298,8 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
 /// them on the next pass, and the other member reads a newcomer's record it
 /// held and read nothing of.
 ///
-/// Both members are out of every swarm and settled with the founder's node
-/// before the newcomer's joined event is written, the founder's node is gone
+/// Both members are out of every swarm and settled with the creator's node
+/// before the newcomer's joined event is written, the creator's node is gone
 /// once the newcomer has caught up, and the newcomer's node is dialed only
 /// by the sessions named below, so what moves between the two is the pass's.
 #[allow(clippy::too_many_lines)] // one scenario: the quiet pair, the membership event and both sessions
@@ -1317,7 +1311,7 @@ async fn a_membership_event_with_no_record_written_opens_both_of_a_pods_sessions
     let (erin, _) = host(&erin_phone).await?;
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
-    let pod = found(&mia_phone, &mia).await?;
+    let pod = create(&mia_phone, &mia).await?;
     for member in [&bob, &dave] {
         invite(
             &mia_phone,

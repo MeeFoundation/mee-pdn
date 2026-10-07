@@ -86,7 +86,7 @@ async fn aimed_at_phone(rt_phone: &Runtime, alice: PdnId, bob: PdnId) -> Result<
 /// runtime, catches up on the pair, the grant, and the claim while Bob is
 /// offline. Denied: Bob's withheld claim never reaches it — the phone
 /// serves the claim set, not its holdings; Carol, holding a ticket aimed at
-/// the phone by hand (`aimed_at_phone`), resolves in no audience directory
+/// the phone by hand (`aimed_at_phone`), resolves in no audience PMS
 /// and obtains nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline() -> Result<()> {
@@ -161,7 +161,7 @@ async fn a_linked_device_catches_up_from_its_sibling_while_the_issuer_is_offline
     );
 
     // Denied, outsider: Carol's ticket is sibling-addressed and reachable,
-    // and she resolves in no audience directory.
+    // and she resolves in no audience PMS.
     let leaked = aimed_at_phone(&rt_phone, alice, bob).await?;
     rt_carol.data().import_scoped(carol, bob, leaked).await?;
     tokio::time::sleep(RECONCILE * 3).await;

@@ -619,7 +619,7 @@ impl Drop for EstablishGuard {
     }
 }
 
-/// The cached pair first, then the directory's own-kind write ticket — so
+/// The cached pair first, then the PMS's own-kind write ticket — so
 /// re-establishment and linked devices converge on one replica — and only
 /// then a fresh replica. The bool is `true` only for a fresh replica, the
 /// one a failed establishment may forget; a reused one other devices
@@ -632,8 +632,8 @@ async fn own_store_toward(
     if let Some(pair) = state.metadata_pairs.get(&(identity, peer)) {
         return Ok((pair.own.clone(), false));
     }
-    let directory = &state.hosted(identity)?.directory;
-    match directory.get_ticket(&own_ticket_kind(&peer)).await? {
+    let pms = &state.hosted(identity)?.pms;
+    match pms.get_ticket(&own_ticket_kind(&peer)).await? {
         Some(write_ticket) => Ok((
             ConnectionMetadataStore::import(&state.node, identity, write_ticket).await?,
             false,
@@ -669,14 +669,12 @@ async fn assemble_connection(
     let own_write_ticket = own
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let directory = &state.hosted(identity)?.directory;
-    directory
-        .put_ticket(&own_ticket_kind(&peer), &own_write_ticket)
+    let pms = &state.hosted(identity)?.pms;
+    pms.put_ticket(&own_ticket_kind(&peer), &own_write_ticket)
         .await?;
-    directory
-        .put_ticket(&peer_ticket_kind(&peer), &peer_ticket)
+    pms.put_ticket(&peer_ticket_kind(&peer), &peer_ticket)
         .await?;
-    directory.connect(peer).await?;
+    pms.connect(peer).await?;
 
     // Assert-once, like every pair opening.
     own.ensure_device_published(state.node.node_id()).await?;

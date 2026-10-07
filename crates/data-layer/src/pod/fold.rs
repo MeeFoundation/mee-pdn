@@ -10,9 +10,9 @@ use pdn_types::{PdnId, PodId};
 
 use super::{
     keys::{EventKind, MembershipKey, Seq},
-    payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice},
+    payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice},
 };
-use crate::announcement::{devices_verify, founding_verifies, join_verifies, pdn_id_of, pod_id_of};
+use crate::announcement::{creation_verifies, devices_verify, join_verifies, pdn_id_of, pod_id_of};
 
 /// One entry of a membership store as a device holds it; `payload` is
 /// `None` until its bytes have arrived.
@@ -38,16 +38,16 @@ pub enum Verdict {
 pub enum ForNothing {
     /// The payload does not decode.
     Malformed,
-    /// A founding event anywhere but the creator's sequence 1 naming its
+    /// A created event anywhere but the creator's sequence 1 naming its
     /// creator at 0, or an event at sequence 0.
     Misplaced,
-    /// The founding event's fields derive another pod id.
+    /// The created event's fields derive another pod id.
     OtherPod,
     /// The announcement key it carries derives another `PdnId` than its
     /// subject's.
     KeyOfAnother,
     BadSignature,
-    /// A join, kick or demotion whose actor is its subject; a leave whose
+    /// A join, removal or demotion whose actor is its subject; a leave whose
     /// actor is not.
     WrongActor,
     /// Its author is no device of the actor, or the writer, its key names.
@@ -107,7 +107,7 @@ impl Member {
         self.chain.keys().next_back().copied().unwrap_or(0)
     }
 
-    /// The sequence at which the member last became one — its founding or
+    /// The sequence at which the member last became one — its created or
     /// its latest joined event — while it is a member.
     pub fn joined_at(&self) -> Option<u64> {
         if !self.state.member {
@@ -313,7 +313,7 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// A member's announcement key is the one any held founding or joined
+    /// A member's announcement key is the one any held created or joined
     /// event in its chain carries that derives the member's `PdnId`.
     fn find_keys(&mut self) {
         for event in &self.parsed.events {
@@ -321,7 +321,7 @@ impl<'a> Pass<'a> {
                 continue;
             };
             let key = match event.kind {
-                EventKind::Founded => FoundedPayload::decode(payload).map(|p| p.announcement_key),
+                EventKind::Created => CreatedPayload::decode(payload).map(|p| p.announcement_key),
                 EventKind::Joined => JoinedPayload::decode(payload).map(|p| p.announcement_key),
                 _ => None,
             };
@@ -391,12 +391,12 @@ impl<'a> Pass<'a> {
             return nothing(ForNothing::Misplaced);
         }
         match event.kind {
-            EventKind::Founded => self.founding_alone(event)?,
+            EventKind::Created => self.creation_alone(event)?,
             EventKind::Joined => self.joining_alone(event)?,
             EventKind::Left if event.actor != event.subject => {
                 return nothing(ForNothing::WrongActor)
             }
-            EventKind::Kicked | EventKind::Demoted if event.actor == event.subject => {
+            EventKind::Removed | EventKind::Demoted if event.actor == event.subject => {
                 return nothing(ForNothing::WrongActor);
             }
             _ => {}
@@ -418,7 +418,7 @@ impl<'a> Pass<'a> {
         Ok(())
     }
 
-    fn founding_alone(&self, event: &Event) -> Result<(), Verdict> {
+    fn creation_alone(&self, event: &Event) -> Result<(), Verdict> {
         let nothing = |why| Err(Verdict::CountedForNothing(why));
         if event.seq != 1 || event.actor != event.subject || event.actor_seq != 0 {
             return nothing(ForNothing::Misplaced);
@@ -426,16 +426,16 @@ impl<'a> Pass<'a> {
         let Some(payload) = self.payload(event.entry) else {
             return Err(Verdict::NotYet(Awaiting::Payload));
         };
-        let Some(founding) = FoundedPayload::decode(payload) else {
+        let Some(creation) = CreatedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
-        if pod_id_of(&event.subject, &founding.announcement_key, &founding.nonce) != *self.pod {
+        if pod_id_of(&event.subject, &creation.announcement_key, &creation.nonce) != *self.pod {
             return nothing(ForNothing::OtherPod);
         }
-        if pdn_id_of(&founding.announcement_key) != event.subject {
+        if pdn_id_of(&creation.announcement_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
         }
-        if !founding_verifies(&event.subject, &founding) {
+        if !creation_verifies(&event.subject, &creation) {
             return nothing(ForNothing::BadSignature);
         }
         Ok(())
@@ -622,7 +622,7 @@ impl<'a> Pass<'a> {
     /// `None` while the point the event names is unsettled.
     fn actor_state(&self, event: &Event) -> Option<MemberState> {
         match event.kind {
-            EventKind::Founded | EventKind::Left => Some(MemberState::default()),
+            EventKind::Created | EventKind::Left => Some(MemberState::default()),
             _ if event.actor_seq == 0 => Some(MemberState::default()),
             _ => self.states.get(&(event.actor, event.actor_seq)).copied(),
         }
@@ -650,8 +650,8 @@ impl<'a> Pass<'a> {
     fn judge(&self, event: &Event, actor: MemberState) -> Verdict {
         let needed = match event.kind {
             EventKind::Joined => actor.member,
-            EventKind::Promoted | EventKind::Kicked | EventKind::Demoted => actor.owner,
-            EventKind::Founded | EventKind::Left => true,
+            EventKind::Promoted | EventKind::Removed | EventKind::Demoted => actor.owner,
+            EventKind::Created | EventKind::Left => true,
         };
         if !needed {
             return Verdict::CountedForNothing(ForNothing::ActorLacksState);
@@ -683,7 +683,7 @@ impl<'a> Pass<'a> {
 
     /// The guard over the last owner: with no owner left, the demotions
     /// that ended the role of a former owner still a member, taken in the
-    /// order of their actors' `PdnId`s, and those that would remove the last
+    /// order of their actors' `PdnId`s, and those that would demote the last
     /// of them.
     fn demotions_to_set_aside(&self) -> BTreeSet<usize> {
         let finals: Vec<(PdnId, MemberState)> = self
@@ -803,21 +803,21 @@ impl Settling {
 /// Whether the state before a sequence allows the event's transition.
 fn allows(before: MemberState, kind: EventKind) -> bool {
     match kind {
-        EventKind::Founded | EventKind::Joined => !before.member,
-        EventKind::Left | EventKind::Kicked | EventKind::Promoted => before.member,
+        EventKind::Created | EventKind::Joined => !before.member,
+        EventKind::Left | EventKind::Removed | EventKind::Promoted => before.member,
         EventKind::Demoted => before.owner,
     }
 }
 
-/// Precedence at one sequence, the narrowest state first; the founding
+/// Precedence at one sequence, the narrowest state first; the created
 /// event and a join compete only where the subject is no member.
 fn rank(kind: EventKind) -> u8 {
     match kind {
-        EventKind::Kicked => 6,
+        EventKind::Removed => 6,
         EventKind::Left => 5,
         EventKind::Demoted => 4,
         EventKind::Promoted => 3,
-        EventKind::Founded => 2,
+        EventKind::Created => 2,
         EventKind::Joined => 1,
     }
 }
@@ -825,7 +825,7 @@ fn rank(kind: EventKind) -> u8 {
 /// The state an allowed transition leaves.
 fn apply(kind: EventKind) -> MemberState {
     match kind {
-        EventKind::Founded | EventKind::Promoted => MemberState {
+        EventKind::Created | EventKind::Promoted => MemberState {
             member: true,
             owner: true,
         },
@@ -833,7 +833,7 @@ fn apply(kind: EventKind) -> MemberState {
             member: true,
             owner: false,
         },
-        EventKind::Left | EventKind::Kicked => MemberState::default(),
+        EventKind::Left | EventKind::Removed => MemberState::default(),
     }
 }
 

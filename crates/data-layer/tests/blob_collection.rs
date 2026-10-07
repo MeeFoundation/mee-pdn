@@ -11,7 +11,7 @@ use iroh_blobs::Hash;
 use pdn_types::{EntryPath, RecordId, RecordRef};
 use test_utils::{
     eventually,
-    pod::{device_of, found, host, invite, place_claim, reads, tickets, Person},
+    pod::{create, device_of, host, invite, place_claim, reads, tickets, Person},
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -53,7 +53,7 @@ async fn claim(
 async fn a_payload_no_replica_references_is_removed() -> Result<()> {
     let phone = node().await?;
     let (carol, _) = host(&phone).await?;
-    let pod = found(&phone, &carol).await?;
+    let pod = create(&phone, &carol).await?;
     claim(&phone, &carol, pod, 1, b"lease scan").await?;
     claim(&phone, &carol, pod, 2, b"photo").await?;
     phone.create_namespace(carol.id, carol.id).await?;
@@ -99,7 +99,7 @@ async fn a_payload_a_co_located_identity_references_stays() -> Result<()> {
     let tablet = node().await?;
     let (leisure, _) = host(&tablet).await?;
     let (work, _) = host(&tablet).await?;
-    let pod = found(&tablet, &leisure).await?;
+    let pod = create(&tablet, &leisure).await?;
     invite(
         &tablet,
         &leisure,
@@ -158,10 +158,8 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
     };
     let first = on_dir().await?;
     let carol = Person::generate();
-    let directory = test_utils::host_identity(&first, carol.id).await?;
-    first
-        .record_hosting(carol.id, directory.namespace())
-        .await?;
+    let pms = test_utils::host_identity(&first, carol.id).await?;
+    first.record_hosting(carol.id, pms.namespace()).await?;
     first.create_namespace(carol.id, carol.id).await?;
     let photo = EntryPath::new("photos/beach")?;
     first
@@ -183,9 +181,9 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
         "a payload was removed before the host let collection start"
     );
     second.provision_identity(carol.id).await?;
-    let reopened = data_layer::PrivateMetadataStore::open(&second, carol.id, directory.namespace())
+    let reopened = data_layer::PrivateMetadataStore::open(&second, carol.id, pms.namespace())
         .await?
-        .expect("the directory survives the restart");
+        .expect("the PMS survives the restart");
     second.host_identity(carol.id, &reopened)?;
     second.start_blob_collection();
     // Collection runs from the start on: a payload nothing references goes.

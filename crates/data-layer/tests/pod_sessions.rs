@@ -1,5 +1,5 @@
 //! Sessions on a pod's stores, served by the member the caller
-//! names: a sibling device by its identity's own directory, another member's
+//! names: a sibling device by its identity's own PMS, another member's
 //! device by that member's device statements, and every other caller refused
 //! as for an unhosted replica. The entries a pod's creation and its joins
 //! write arrive by the store-level writes the pods service performs, and
@@ -49,8 +49,8 @@ struct Identity {
 async fn host(node: &SyncNode) -> Result<(Identity, PrivateMetadataStore)> {
     let keys = AnnouncementKeyPair::generate();
     let id = keys.pdn_id();
-    let directory = host_identity(node, id).await?;
-    Ok((Identity { keys, id }, directory))
+    let pms = host_identity(node, id).await?;
+    Ok((Identity { keys, id }, pms))
 }
 
 fn device_of(node: &SyncNode, identity: &Identity) -> Result<MemberDevice> {
@@ -93,18 +93,18 @@ async fn statement(
     write(node, writer, pod, key, payload).await
 }
 
-/// `creator`'s pod on `node`: both stores, the founding event, the
+/// `creator`'s pod on `node`: both stores, the created event, the
 /// creator's first device statement, and the tickets to both stores.
-async fn found(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
-    let founding = creator.keys.founding([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
+async fn create(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
+    let creation = creator.keys.creation([0x5a; 16]);
+    let pod = data_layer::pod_id_of(&creator.id, &creation.announcement_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(
         node,
         creator,
         pod,
-        MembershipKey::founded(creator.id),
-        founding.encode(),
+        MembershipKey::created(creator.id),
+        creation.encode(),
     )
     .await?;
     statement(
@@ -202,7 +202,7 @@ async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> 
 /// A member's device is served both stores and folds the pod from nothing.
 /// Denied: the callee of its first dial, which it does not yet resolve to a
 /// member; a holder of both tickets that is no member, on either store; and
-/// the member itself once kicked, on the record store.
+/// the member itself once removed, on the record store.
 #[allow(clippy::too_many_lines)] // one scenario: the served member beside each denial
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
@@ -211,7 +211,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -270,7 +270,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         "the member's device did not fold the pod from its first session"
     );
     // A joined event counts once its payload lands, which can trail the
-    // founding event's.
+    // created event's.
     assert!(
         eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, bob.id).await == PLAIN) })
             .await?,
@@ -350,16 +350,16 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         )
         .await
     ));
-    // Denied: the member once kicked, on the record store; the membership
-    // store is served to it over the kick's past.
-    let kick = MembershipKey::Event {
+    // Denied: the member once removed, on the record store; the membership
+    // store is served to it over the removal's past.
+    let removal = MembershipKey::Event {
         subject: bob.id,
         seq: Seq::new(3),
-        kind: EventKind::Kicked,
+        kind: EventKind::Removed,
         actor: alice.id,
         actor_seq: Seq::new(1),
     };
-    write(&alice_phone, &alice, pod, kick, vec![0]).await?;
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
     assert!(refused(
         session(&bob_phone, bob.id, records, &alice_phone, alice.id, bob.id).await
     ));
@@ -388,7 +388,7 @@ async fn a_co_located_non_member_is_refused_where_its_node_mate_is_served() -> R
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -413,10 +413,10 @@ async fn a_co_located_non_member_is_refused_where_its_node_mate_is_served() -> R
 }
 
 /// A freshly linked device is served by its sibling at once, by its
-/// identity's directory, and by another member once the statement it wrote
+/// identity's PMS, and by another member once the statement it wrote
 /// reaches that member. Paired denials: the same device refused by the other
 /// member before that statement exists, and by the sibling a device naming
-/// the identity that the identity's directory does not list.
+/// the identity that the identity's PMS does not list.
 #[allow(clippy::too_many_lines)] // one scenario: the linking, the refusal and the statement that ends it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> {
@@ -427,9 +427,9 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
         node(QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -455,18 +455,14 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
             .await?
     );
 
-    bob_directory.add_device(bob_laptop.node_id()).await?;
-    let ticket = bob_directory
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    let ticket = bob_pms
         .share_ticket(data_layer::ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(&bob_laptop, bob.id, ticket).await?;
+    let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
     assert!(
-        wait_devices(
-            &laptop_directory,
-            &[bob_phone.node_id(), bob_laptop.node_id()]
-        )
-        .await?,
-        "the laptop's directory did not list both devices"
+        wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?,
+        "the laptop's PMS did not list both devices"
     );
     bob_laptop.import_pod(bob.id, pod, tickets.clone()).await?;
     dave_phone.import_pod(dave.id, pod, tickets).await?;
@@ -484,7 +480,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
         .await
     ));
     session(&bob_laptop, bob.id, membership, &bob_phone, bob.id, bob.id).await?;
-    // Denied: a device naming Bob that Bob's directory does not list.
+    // Denied: a device naming Bob that Bob's PMS does not list.
     assert!(refused(
         session(&dave_phone, dave.id, membership, &bob_phone, bob.id, bob.id).await
     ));
@@ -536,7 +532,7 @@ async fn wrongly_refused_without_anchoring_d19() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -633,7 +629,7 @@ async fn co_located_members_converge_and_a_co_located_ticket_holder_takes_nothin
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let (pod, tickets) = found(&tablet, &bob).await?;
+    let (pod, tickets) = create(&tablet, &bob).await?;
     invite(&tablet, &bob, 1, pod, &dave, device_of(&tablet, &dave)?).await?;
     tablet.import_pod(dave.id, pod, tickets.clone()).await?;
     tablet.import_pod(erin.id, pod, tickets).await?;

@@ -1,6 +1,6 @@
-//! Two devices of one identity (Alice) replicate her stores: the directory
+//! Two devices of one identity (Alice) replicate her stores: the PMS
 //! and the data namespace she issues. Both nodes host Alice the way the
-//! product does — her own stores, her directory naming the device — so a
+//! product does — her own stores, her PMS naming the device — so a
 //! session is judged by her records rather than by ticket possession.
 
 use std::time::Duration;
@@ -17,7 +17,7 @@ use test_utils::{
 /// written before the import arrive as catch-up, a disconnect and a data
 /// write made after the swarm is joined arrive live.
 ///
-/// Denied: the laptop is served only once Alice's directory lists it, so
+/// Denied: the laptop is served only once Alice's PMS lists it, so
 /// the assertion rests on her device set and not on the ticket it holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_two_devices() -> Result<()> {
@@ -25,11 +25,11 @@ async fn sync_two_devices() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    // Phone owns the directory and already has a connection to Bob recorded
+    // Phone owns the PMS and already has a connection to Bob recorded
     // before the laptop imports — so the laptop must catch this up via the
     // initial set-reconciliation when it imports.
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
-    phone_dir.connect(ids::BOB).await?;
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    phone_pms.connect(ids::BOB).await?;
 
     // Phone also issues Alice's data namespace, with one entry written
     // before the laptop imports — same catch-up path, data-namespace store.
@@ -40,15 +40,15 @@ async fn sync_two_devices() -> Result<()> {
         .write(ids::ALICE, ids::ALICE, author, &name, b"Alice")
         .await?;
 
-    // The laptop joins Alice, and the phone's directory records it as one
+    // The laptop joins Alice, and the phone's PMS records it as one
     // of her devices — the product's own order, and what makes the phone
     // serve the laptop at all.
-    let dir_ticket = phone_dir
+    let pms_ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, dir_ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
-    laptop_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, pms_ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
 
     let data_ticket = phone
         .share_ticket(
@@ -64,7 +64,7 @@ async fn sync_two_devices() -> Result<()> {
 
     // Catch-up: Bob replicates to laptop (reconciliation on import).
     assert!(
-        wait_connected(&laptop_dir, ids::BOB, true).await?,
+        wait_connected(&laptop_pms, ids::BOB, true).await?,
         "laptop did not catch up connect(bob) from phone"
     );
 
@@ -76,9 +76,9 @@ async fn sync_two_devices() -> Result<()> {
 
     // Live update: a fresh disconnect on phone propagates to laptop (the
     // swarm is joined by now), and the tombstone flips Bob to not-live.
-    phone_dir.disconnect(ids::BOB).await?;
+    phone_pms.disconnect(ids::BOB).await?;
     assert!(
-        wait_connected(&laptop_dir, ids::BOB, false).await?,
+        wait_connected(&laptop_pms, ids::BOB, false).await?,
         "laptop did not observe disconnect(bob) from phone"
     );
 
@@ -112,16 +112,16 @@ async fn concurrent_writes_converge() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
     phone.create_namespace(ids::ALICE, ids::ALICE).await?;
     let phone_author = phone.default_author(ids::ALICE)?;
 
-    let dir_ticket = phone_dir
+    let pms_ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, dir_ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
-    laptop_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, pms_ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
     let laptop_author = laptop.default_author(ids::ALICE)?;
 
     let ticket = phone
@@ -206,16 +206,16 @@ async fn a_write_at_a_shorter_path_leaves_the_longer_ones_standing() -> Result<(
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
     phone.create_namespace(ids::ALICE, ids::ALICE).await?;
     let author = phone.default_author(ids::ALICE)?;
 
-    let dir_ticket = phone_dir
+    let pms_ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, dir_ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
-    laptop_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, pms_ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
     let ticket = phone
         .share_ticket(
             ids::ALICE,
@@ -274,33 +274,33 @@ async fn a_write_at_a_shorter_path_leaves_the_longer_ones_standing() -> Result<(
     Ok(())
 }
 
-/// The directory carries tickets of any kind: published on one device, a
+/// The PMS carries tickets of any kind: published on one device, a
 /// ticket becomes readable on another once its payload arrives (`get_ticket`
 /// is `None` on the record alone). `data` is the kind creation actually
 /// publishes — the identity's own data-namespace ticket.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_carries_arbitrary_tickets() -> Result<()> {
+async fn pms_carries_arbitrary_tickets() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
     // Any ticket serves as payload — here, another fresh replica's.
     let payload_ticket = PrivateMetadataStore::create(&phone, ids::ALICE)
         .await?
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    phone_dir.put_ticket("data", &payload_ticket).await?;
+    phone_pms.put_ticket("data", &payload_ticket).await?;
 
-    let ticket = phone_dir
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
 
     let arrived =
-        eventually(|| async { Ok(laptop_dir.get_ticket("data").await?.is_some()) }).await?;
+        eventually(|| async { Ok(laptop_pms.get_ticket("data").await?.is_some()) }).await?;
     assert!(arrived, "the published ticket did not become readable");
-    let got = laptop_dir.get_ticket("data").await?.expect("just observed");
+    let got = laptop_pms.get_ticket("data").await?.expect("just observed");
     assert_eq!(
         got.to_string(),
         payload_ticket.to_string(),
@@ -312,7 +312,7 @@ async fn directory_carries_arbitrary_tickets() -> Result<()> {
     Ok(())
 }
 
-/// The directory's catch-up wait returns on a completed sync session, not
+/// The PMS's catch-up wait returns on a completed sync session, not
 /// on arrived content: the first wait, watched from before the arming,
 /// covers the arming's first session (and the content it carried), and a
 /// second wait from a fresh instant — after
@@ -320,54 +320,54 @@ async fn directory_carries_arbitrary_tickets() -> Result<()> {
 /// session that found nothing new. A content poll cannot see that session;
 /// the wait must.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_wait_returns_on_a_session_not_on_content() -> Result<()> {
+async fn pms_wait_returns_on_a_session_not_on_content() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
-    phone_dir.connect(ids::BOB).await?;
-    let ticket = phone_dir
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    phone_pms.connect(ids::BOB).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
     laptop.provision_identity(ids::ALICE).await?;
-    let laptop_dir = PrivateMetadataStore::import(&laptop, ids::ALICE, ticket).await?;
-    let catch_up = laptop_dir.watch_catch_up().await?;
-    laptop.host_identity(ids::ALICE, &laptop_dir)?;
+    let laptop_pms = PrivateMetadataStore::import(&laptop, ids::ALICE, ticket).await?;
+    let catch_up = laptop_pms.watch_catch_up().await?;
+    laptop.host_identity(ids::ALICE, &laptop_pms)?;
     catch_up.wait(TIMEOUT).await?;
     // The session that returned the wait carried the pre-import record.
     assert!(
-        laptop_dir.is_connected(ids::BOB).await?,
+        laptop_pms.is_connected(ids::BOB).await?,
         "a successful catch-up session must have carried the existing records"
     );
 
     // From a fresh instant nothing new will arrive — the wait returns on
     // the next completed session alone (the node's periodic reconcile pass).
-    laptop_dir.watch_catch_up().await?.wait(TIMEOUT).await?;
+    laptop_pms.watch_catch_up().await?.wait(TIMEOUT).await?;
 
     phone.shutdown().await?;
     laptop.shutdown().await?;
     Ok(())
 }
 
-/// A directory whose only peer is gone cannot catch up: the wait fails with
+/// A PMS whose only peer is gone cannot catch up: the wait fails with
 /// the distinguishable timeout, not a hang and not a success.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_wait_times_out_without_a_reachable_peer() -> Result<()> {
+async fn pms_wait_times_out_without_a_reachable_peer() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
-    let ticket = phone_dir
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     // The ticket's only contact goes away before the import.
     phone.shutdown().await?;
 
     laptop.provision_identity(ids::ALICE).await?;
-    let laptop_dir = PrivateMetadataStore::import(&laptop, ids::ALICE, ticket).await?;
-    let catch_up = laptop_dir.watch_catch_up().await?;
-    laptop.host_identity(ids::ALICE, &laptop_dir)?;
+    let laptop_pms = PrivateMetadataStore::import(&laptop, ids::ALICE, ticket).await?;
+    let catch_up = laptop_pms.watch_catch_up().await?;
+    laptop.host_identity(ids::ALICE, &laptop_pms)?;
     let err = catch_up.wait(Duration::from_secs(2)).await.unwrap_err();
     assert!(
         err.downcast_ref::<CatchUpTimeout>().is_some(),
@@ -384,7 +384,7 @@ async fn directory_wait_times_out_without_a_reachable_peer() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_payload_write_is_rejected() -> Result<()> {
     let node = memory_node().await?;
-    let _directory = host_identity(&node, ids::ALICE).await?;
+    let _pms = host_identity(&node, ids::ALICE).await?;
     let author = node.default_author(ids::ALICE)?;
     node.create_namespace(ids::ALICE, ids::ALICE).await?;
     let path = EntryPath::new("contact/email")?;
@@ -413,7 +413,7 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
 }
 
 /// A subscriber that stops reading holds up neither sync nor the device's
-/// own calls: the laptop's directory takes in more of the phone's records
+/// own calls: the laptop's PMS takes in more of the phone's records
 /// than its unread subscription buffers, reads them all, and still writes
 /// and lists, while the subscription reports the changes it dropped.
 ///
@@ -428,26 +428,26 @@ async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    let phone_dir = host_identity(&phone, ids::ALICE).await?;
-    let ticket = phone_dir
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::ALICE, ticket).await?;
-    phone_dir.add_device(laptop.node_id()).await?;
-    laptop_dir.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
 
-    let mut unread = laptop_dir.changes().await?;
+    let mut unread = laptop_pms.changes().await?;
     let peer = |n: u16| {
         let mut bytes = [0x5e; 32];
         bytes[..2].copy_from_slice(&n.to_be_bytes());
         pdn_types::PdnId::from_bytes(bytes)
     };
     for n in 0..RECORDS {
-        phone_dir.connect(peer(n)).await?;
+        phone_pms.connect(peer(n)).await?;
     }
     assert!(
         eventually(|| async {
-            let listed = tokio::time::timeout(TIMEOUT, laptop_dir.list_connections())
+            let listed = tokio::time::timeout(TIMEOUT, laptop_pms.list_connections())
                 .await
                 .map_err(|_| anyhow::anyhow!("the laptop's store stopped answering"))??;
             Ok(listed.len() >= usize::from(RECORDS))
@@ -455,7 +455,7 @@ async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
         .await?,
         "the laptop did not take in every record past its unread subscription"
     );
-    tokio::time::timeout(TIMEOUT, laptop_dir.connect(ids::BOB))
+    tokio::time::timeout(TIMEOUT, laptop_pms.connect(ids::BOB))
         .await
         .map_err(|_| anyhow::anyhow!("a local write waited on the unread subscription"))??;
 

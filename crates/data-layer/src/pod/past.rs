@@ -27,7 +27,7 @@ pub(crate) struct Departure {
 
 /// The past of `member`'s departure over `entries`, the ones `membership`
 /// folded; `None` while `member` has not departed — its chain does not end
-/// in a counted left or kicked event.
+/// in a counted left or removed event.
 pub(crate) fn departure_past(
     membership: &Membership,
     entries: &[HeldEntry],
@@ -36,7 +36,7 @@ pub(crate) fn departure_past(
     let index = Index::of(membership, entries);
     let run = index.run(member);
     let at_end = index.events.get(&(*member, run))?;
-    let kind = [EventKind::Kicked, EventKind::Left]
+    let kind = [EventKind::Removed, EventKind::Left]
         .into_iter()
         .find(|kind| {
             at_end
@@ -162,11 +162,11 @@ impl<'a> Index<'a> {
     }
 
     /// The event of `member`'s chain carrying its announcement key: its
-    /// counted founding or joined event of the lowest sequence.
+    /// counted created or joined event of the lowest sequence.
     fn key_event(&self, member: PdnId) -> Option<usize> {
         (1..=self.run(&member)).find_map(|seq| {
             self.events.get(&(member, seq))?.iter().find_map(|event| {
-                (event.counted && matches!(event.kind, EventKind::Founded | EventKind::Joined))
+                (event.counted && matches!(event.kind, EventKind::Created | EventKind::Joined))
                     .then_some(event.entry)
             })
         })

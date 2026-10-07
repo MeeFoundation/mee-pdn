@@ -16,17 +16,17 @@ use common::{members_read, ops_read, pod_listed, pod_route, record_reads, record
 
 /// Several times what an announced write takes to reach a member device,
 /// which the remaining member's read of the later record has just shown.
-const KICKED_WATCH: Duration = Duration::from_secs(5);
+const REMOVED_WATCH: Duration = Duration::from_secs(5);
 
 fn member(id: PdnId, owner: bool) -> Member {
     Member { id, owner }
 }
 
 /// A pod runs across three containers over HTTP alone: any member invites,
-/// a record and an edit reach every member, an owner's promotion and kick
-/// take effect, and the kicked member stops receiving. Paired denials: a
+/// a record and an edit reach every member, an owner's promotion and removal
+/// take effect, and the removed member stops receiving. Paired denials: a
 /// consumed invite, a plain member's owner-only acts beside the owner's
-/// promotion, and the kicked member's reads beside the remaining member's.
+/// promotion, and the removed member's reads beside the remaining member's.
 /// The consumed invite is presented by an identity of Carol's node that is
 /// no member — the one a live secret would admit.
 #[tokio::test(flavor = "multi_thread")]
@@ -100,7 +100,7 @@ async fn a_pod_runs_across_three_containers() -> Result<()> {
 
     // Denied (a plain member's owner-only acts). Beside them, the owner's
     // promotion of Bob takes effect on every node.
-    for act in [Act::Promote(carol), Act::Kick(bob)] {
+    for act in [Act::Promote(carol), Act::Remove(bob)] {
         let refused = carol_node.pod_act(carol, family, act).await?;
         assert_eq!(
             refused.status,
@@ -120,10 +120,10 @@ async fn a_pod_runs_across_three_containers() -> Result<()> {
     }
 
     bob_node
-        .pod_act(bob, family, Act::Kick(carol))
+        .pod_act(bob, family, Act::Remove(carol))
         .await?
         .ok()?;
-    // Placed before Alice's replica holds the kick, a record would rightly
+    // Placed before Alice's replica holds the removal, a record would rightly
     // still be served to Carol.
     members_read(
         &alice_node,
@@ -133,29 +133,34 @@ async fn a_pod_runs_across_three_containers() -> Result<()> {
     )
     .await?;
     let first = alice_node
-        .place_record(alice, family, RecordKind::Claim, b"after the kick")
+        .place_record(alice, family, RecordKind::Claim, b"after the removal")
         .await?;
     let second = alice_node
-        .place_record(alice, family, RecordKind::Claim, b"after the kick, again")
+        .place_record(
+            alice,
+            family,
+            RecordKind::Claim,
+            b"after the removal, again",
+        )
         .await?;
-    record_reads(&bob_node, bob, family, first, b"after the kick").await?;
-    record_reads(&bob_node, bob, family, second, b"after the kick, again").await?;
+    record_reads(&bob_node, bob, family, first, b"after the removal").await?;
+    record_reads(&bob_node, bob, family, second, b"after the removal, again").await?;
 
-    // Denied (the kicked member): absent or refused, never read.
-    let watched_until = tokio::time::Instant::now() + KICKED_WATCH;
+    // Denied (the removed member): absent or refused, never read.
+    let watched_until = tokio::time::Instant::now() + REMOVED_WATCH;
     while tokio::time::Instant::now() < watched_until {
         for record in [first, second] {
             let answer = carol_node.get(&record_route(carol, family, record)).await?;
             assert!(
                 matches!(answer.status, StatusCode::NOT_FOUND | StatusCode::CONFLICT),
-                "the kicked member answered {} for {record:?}: {}",
+                "the removed member answered {} for {record:?}: {}",
                 answer.status,
                 answer.text()
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // Carol's device learns of its kick.
+    // Carol's device learns of its removal.
     pod_listed(&carol_node, carol, family, false).await?;
     let refused = carol_node
         .get(&format!("{}/members", pod_route(carol, family)))
@@ -163,7 +168,7 @@ async fn a_pod_runs_across_three_containers() -> Result<()> {
     assert_eq!(
         refused.status,
         StatusCode::CONFLICT,
-        "the kicked member's requests on the pod must be refused, got {}: {}",
+        "the removed member's requests on the pod must be refused, got {}: {}",
         refused.status,
         refused.text()
     );

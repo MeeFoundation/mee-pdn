@@ -7,9 +7,9 @@
 //! hook (ADR-0008), both installed at spawn of that identity's own
 //! engine. A hosted identity owns its half of the node (ADR-0013):
 //! [`SyncNode::provision_identity`] brings it up, [`SyncNode::host_identity`]
-//! arms its directory and [`SyncNode::host_connection`] its connections.
+//! arms its PMS and [`SyncNode::host_connection`] its connections.
 //! A data replica no records can judge a caller against is refused, and a
-//! directory and a connection metadata store keep the ticket bound
+//! PMS and a connection metadata store keep the ticket bound
 //! Invariants 1 and 3 give them.
 //!
 //! Capability *semantics* (`UWill` tokens, chains) do not live here: tokens
@@ -38,7 +38,7 @@ pub use node::{PodSession, PodSessions, PodStartPause};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{
-    record_prefix, Awaiting, DevicesPayload, EventKind, ForNothing, FoundedPayload, HeldEntry,
+    record_prefix, Awaiting, CreatedPayload, DevicesPayload, EventKind, ForNothing, HeldEntry,
     JoinedPayload, Member, MemberDevice, MemberState, Membership, MembershipKey, OpId, Operation,
     PodCatchUp, PodNotice, PodStore, PodTickets, RecordEntry, RecordKey, RecordView, Seq,
     UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,

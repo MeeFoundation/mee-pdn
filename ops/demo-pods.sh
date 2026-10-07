@@ -222,8 +222,8 @@ edit_list "$CAROL_PHONE" "$CAROL" 'eggs'
 list_reads "$ALICE_LAPTOP" "$ALICE" "$FAMILY" "$LIST" "Alice's laptop" "$ALICE:milk:Alice" "$CAROL:eggs:Carol"
 list_reads "$BOB_LAPTOP" "$BOB" "$FAMILY" "$LIST" "Bob's laptop" "$ALICE:milk:Alice" "$CAROL:eggs:Carol"
 
-say "Membership has two roles. Carol, a plain member, cannot kick anyone."
-refused "$CAROL_PHONE" "$CAROL" "$FAMILY" "{\"kick\":\"$BOB\"}" "Carol kicking Bob"
+say "Membership has two roles. Carol, a plain member, cannot remove anyone."
+refused "$CAROL_PHONE" "$CAROL" "$FAMILY" "{\"remove\":\"$BOB\"}" "Carol removing Bob"
 
 say "Alice promotes Bob to owner."
 act "$ALICE_PHONE" "$ALICE" "$FAMILY" "{\"promote\":\"$BOB\"}"
@@ -276,8 +276,8 @@ list_reads "$ALICE_PHONE" "$ALICE" "$FAMILY" "$LIST" "Alice's phone" $FULL
 members_are "$ALICE_LAPTOP" "$ALICE" "$FAMILY" "Alice's laptop" \
   "$ALICE:owner:Alice" "$BOB:owner:Bob" "$CAROL:plain:Carol" "$DAVE:plain:Dave"
 
-say "Bob, an owner, kicks Dave. An owner's act needs no other owner."
-act "$BOB_PHONE" "$BOB" "$FAMILY" "{\"kick\":\"$DAVE\"}"
+say "Bob, an owner, removes Dave. An owner's act needs no other owner."
+act "$BOB_PHONE" "$BOB" "$FAMILY" "{\"remove\":\"$DAVE\"}"
 # shellcheck disable=SC2086
 members_are "$CAROL_PHONE" "$CAROL" "$FAMILY" "Carol's phone" $PROMOTED
 
@@ -295,6 +295,6 @@ act "$CAROL_PHONE" "$CAROL" "$FAMILY" '"leave"'
 members_are "$ALICE_PHONE" "$ALICE" "$FAMILY" "Alice's phone" "$ALICE:owner:Alice" "$BOB:owner:Bob"
 pod_gone "$CAROL_PHONE" "$CAROL" "$FAMILY" "Carol's phone"
 
-say "One pod on six devices: any member invited, the pod carried on while its creator was offline and the creator caught up on coming back, and an owner's kick stopped what reaches the one kicked."
+say "One pod on six devices: any member invited, the pod carried on while its creator was offline and the creator caught up on coming back, and an owner's removal stopped what reaches the one removed."
 
 printf '\n'

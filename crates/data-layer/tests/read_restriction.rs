@@ -58,7 +58,7 @@ struct ServingSide {
     own_toward_peer: ConnectionMetadataStore,
     own_read_ticket: data_layer::DocTicket,
     /// The device set the access book probes.
-    directory: PrivateMetadataStore,
+    pms: PrivateMetadataStore,
     /// Bob's copy of the peer's own store — the only record he holds of
     /// the peer's devices, and the one a scenario waits on before it
     /// expects a session of that peer to be admitted.
@@ -70,7 +70,7 @@ async fn serving_side(
     peer: PdnId,
     peer_own: &ConnectionMetadataStore,
 ) -> Result<ServingSide> {
-    let directory = host_identity(bob, ids::BOB).await?;
+    let pms = host_identity(bob, ids::BOB).await?;
 
     // The connection pair as establishment leaves it.
     let own_toward_peer = ConnectionMetadataStore::create(bob, ids::BOB).await?;
@@ -91,7 +91,7 @@ async fn serving_side(
     Ok(ServingSide {
         own_toward_peer,
         own_read_ticket,
-        directory,
+        pms,
         peer_store,
     })
 }
@@ -120,9 +120,9 @@ async fn write_bobs_entries(bob: &SyncNode) -> Result<()> {
 async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
     let carol = spawn_node().await?;
-    let _carol_dir = host_identity(&carol, ids::CAROL).await?;
+    let _carol_pms = host_identity(&carol, ids::CAROL).await?;
 
     // Alice's reverse-direction store, carrying her published device set.
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
@@ -253,7 +253,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
 
 /// A device set never widens a session that names another identity:
 /// Alice, a scoped grantee of Bob who is also a device in Bob's own
-/// directory, receives exactly her granted claim — pending or confirmed
+/// PMS, receives exactly her granted claim — pending or confirmed
 /// alike, because the session names ALICE and the rights follow the
 /// named identity alone (ADR-0013).
 ///
@@ -264,7 +264,7 @@ async fn read_restricted_peer_receives_exactly_the_granted_subset() -> Result<()
 async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
 
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     alice_own.publish_device(alice.node_id()).await?;
@@ -274,10 +274,7 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     write_bobs_entries(&bob).await?;
 
     // The registration a linking dialogue leaves on the inviter.
-    serving
-        .directory
-        .add_pending_device(alice.node_id())
-        .await?;
+    serving.pms.add_pending_device(alice.node_id()).await?;
 
     // Alice's grant on one claim, consumed as the grant binder would.
     let email = EntryPath::new(GRANTED)?;
@@ -330,11 +327,11 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
         );
     }
 
-    // The confirmation: Alice's node is a device in Bob's own directory
+    // The confirmation: Alice's node is a device in Bob's own PMS
     // now. It widens nothing — her session names ALICE, and what ALICE
     // was granted is one claim. Sentinel: a fresh write on the granted
     // claim crossing proves the path is live through the window.
-    serving.directory.confirm_device(alice.node_id()).await?;
+    serving.pms.confirm_device(alice.node_id()).await?;
     let bob_author = bob.default_author(ids::BOB)?;
     bob.write(
         ids::BOB,
@@ -360,7 +357,7 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
                 .read(ids::ALICE, ids::BOB, &EntryPath::new(withheld)?)
                 .await?
                 .is_none(),
-            "a device of the issuer's own directory widened a session naming another identity: \
+            "a device of the issuer's own PMS widened a session naming another identity: \
              {withheld}"
         );
     }
@@ -378,7 +375,7 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
 async fn a_grant_addressed_to_another_identity_serves_nobody() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
 
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     alice_own.publish_device(alice.node_id()).await?;
@@ -456,7 +453,7 @@ async fn a_grant_addressed_to_another_identity_serves_nobody() -> Result<()> {
 async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
 
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     alice_own.publish_device(alice.node_id()).await?;
@@ -592,7 +589,7 @@ async fn write_grant_round_trips_while_reads_stay_scoped() -> Result<()> {
 async fn withdrawn_grant_refuses_the_next_session_but_keeps_delivered_data() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
 
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     alice_own.publish_device(alice.node_id()).await?;
@@ -683,7 +680,7 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
 
     let bob = spawn_node().await?;
     let dave = spawn_node().await?;
-    let _dave_dir = host_identity(&dave, ids::DAVE).await?;
+    let _dave_pms = host_identity(&dave, ids::DAVE).await?;
 
     // Bob's serving side, armed, with a connection toward Dave — so Bob can
     // resolve Dave's node id and carry a grant for him.
@@ -768,7 +765,7 @@ async fn swarm_membership_does_not_bypass_the_access_book() -> Result<()> {
 async fn a_mixed_grant_admits_exactly_its_write_claims() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
 
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     alice_own.publish_device(alice.node_id()).await?;
@@ -876,7 +873,7 @@ async fn a_mixed_grant_admits_exactly_its_write_claims() -> Result<()> {
 async fn a_withdrawn_write_grant_refuses_the_next_sessions_writes() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
 
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     alice_own.publish_device(alice.node_id()).await?;
@@ -981,8 +978,8 @@ async fn a_device_the_issuer_has_not_seen_published_is_served_once_it_publishes(
     let bob = spawn_node().await?;
     let laptop = spawn_node().await?;
     let phone = spawn_node().await?;
-    let _laptop_dir = host_identity(&laptop, ids::ALICE).await?;
-    let _phone_dir = host_identity(&phone, ids::ALICE).await?;
+    let _laptop_pms = host_identity(&laptop, ids::ALICE).await?;
+    let _phone_pms = host_identity(&phone, ids::ALICE).await?;
 
     // Alice's half of the pair, published from the laptop alone.
     let alice_own = ConnectionMetadataStore::create(&laptop, ids::ALICE).await?;
@@ -1072,7 +1069,7 @@ async fn a_device_the_issuer_has_not_seen_published_is_served_once_it_publishes(
     );
 
     // The phone opens the pair the way a device that linked into Alice
-    // does — the write ticket of her own half is in her directory — and
+    // does — the write ticket of her own half is in her PMS — and
     // publishes itself. Its contacts name the issuer, as the runtime's
     // connection armer sets them, so the record travels without the
     // laptop.
@@ -1181,10 +1178,10 @@ async fn an_issuers_session_is_served_by_the_audience_it_names() -> Result<()> {
     // A session's last message lands within milliseconds of its return.
     const LANDED: Duration = Duration::from_secs(2);
     let bob = spawn_node().await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
     let alice = spawn_node().await?;
-    let _work_dir = host_identity(&alice, ids::ALICE_AT_WORK).await?;
-    let _leisure_dir = host_identity(&alice, ids::ALICE_AT_LEISURE).await?;
+    let _work_pms = host_identity(&alice, ids::ALICE_AT_WORK).await?;
+    let _leisure_pms = host_identity(&alice, ids::ALICE_AT_LEISURE).await?;
 
     bob.create_namespace(ids::BOB, ids::BOB).await?;
     write_bobs_entries(&bob).await?;
@@ -1285,10 +1282,10 @@ async fn an_issuers_session_is_served_by_the_audience_it_names() -> Result<()> {
 #[allow(clippy::too_many_lines)] // one scenario, both audiences and both denials in one place
 async fn two_co_located_audiences_of_one_issuer_receive_each_its_own_claim() -> Result<()> {
     let bob = spawn_node().await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
     let alice = spawn_node().await?;
-    let _work_dir = host_identity(&alice, ids::ALICE_AT_WORK).await?;
-    let _leisure_dir = host_identity(&alice, ids::ALICE_AT_LEISURE).await?;
+    let _work_pms = host_identity(&alice, ids::ALICE_AT_WORK).await?;
+    let _leisure_pms = host_identity(&alice, ids::ALICE_AT_LEISURE).await?;
 
     bob.create_namespace(ids::BOB, ids::BOB).await?;
     write_bobs_entries(&bob).await?;
@@ -1405,14 +1402,14 @@ async fn two_co_located_audiences_of_one_issuer_receive_each_its_own_claim() -> 
 
 /// A data replica is refused a caller its identity's records entitle to
 /// nothing, the identity of that replica's own read ticket included, while
-/// the identity's directory and its connection metadata store stay bound
+/// the identity's PMS and its connection metadata store stay bound
 /// to their tickets (Invariants 1 and 3).
 ///
 /// Denied: Carol, connected to Bob and granted no claim, obtains neither
 /// the entries nor their existence over several of her passes although
 /// she holds the data replica's read ticket. Ordered after the two paths
 /// that do run on a ticket alone — Bob's laptop replicating his
-/// directory, and Carol's import of Bob's connection metadata store — so
+/// PMS, and Carol's import of Bob's connection metadata store — so
 /// the refusal is the data replica's verdict and not a node that answers
 /// nobody.
 #[tokio::test(flavor = "multi_thread")]
@@ -1420,7 +1417,7 @@ async fn a_data_replica_no_record_judges_is_refused_its_own_ticket() -> Result<(
     let bob = spawn_node().await?;
     let laptop = spawn_node().await?;
     let carol = spawn_node().await?;
-    let _carol_dir = host_identity(&carol, ids::CAROL).await?;
+    let _carol_pms = host_identity(&carol, ids::CAROL).await?;
 
     // Bob and Carol are connected and Bob has granted her nothing: his
     // records place her and entitle her to no claim, the tightest caller
@@ -1446,16 +1443,16 @@ async fn a_data_replica_no_record_judges_is_refused_its_own_ticket() -> Result<(
         .await?;
 
     // Allowed on its ticket: Bob's laptop joins his device set and
-    // replicates his directory.
-    let directory_ticket = serving
-        .directory
+    // replicates his PMS.
+    let pms_ticket = serving
+        .pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let laptop_dir = join_identity(&laptop, ids::BOB, directory_ticket).await?;
-    serving.directory.add_device(laptop.node_id()).await?;
+    let laptop_pms = join_identity(&laptop, ids::BOB, pms_ticket).await?;
+    serving.pms.add_device(laptop.node_id()).await?;
     assert!(
-        wait_devices(&laptop_dir, &[bob.node_id(), laptop.node_id()]).await?,
-        "the directory did not replicate to a device of its own identity"
+        wait_devices(&laptop_pms, &[bob.node_id(), laptop.node_id()]).await?,
+        "the PMS did not replicate to a device of its own identity"
     );
 
     // Allowed on its ticket: Carol's import of the connection metadata
@@ -1512,9 +1509,9 @@ async fn a_data_replica_no_record_judges_is_refused_its_own_ticket() -> Result<(
 async fn a_caller_is_admitted_only_where_the_named_identity_lists_its_node() -> Result<()> {
     let bob = spawn_node().await?;
     let alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
     let mallory = spawn_node().await?;
-    let _mallory_dir = host_identity(&mallory, ids::DAVE).await?;
+    let _mallory_pms = host_identity(&mallory, ids::DAVE).await?;
 
     // Alice's published device set names her node and no other.
     let alice_own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;

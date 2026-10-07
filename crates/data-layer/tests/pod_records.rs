@@ -157,17 +157,17 @@ async fn a_members_records_read_on_its_device_and_its_forgery_under_another_name
     let phone = memory_node().await?;
     let alice = host(&phone).await?;
     let bob = host(&phone).await?;
-    let founding = alice.keys.founding([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    let creation = alice.keys.creation([0x5a; 16]);
+    let pod = data_layer::pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
     phone.create_pod(alice.id, pod).await?;
-    let founded = MembershipKey::founded(alice.id).to_bytes();
+    let created = MembershipKey::created(alice.id).to_bytes();
     write(
         &phone,
         &alice,
         pod,
         PodStore::Membership,
-        founded,
-        &founding.encode(),
+        created,
+        &creation.encode(),
     )
     .await?;
 
@@ -297,7 +297,7 @@ async fn a_relayed_claim_reads_as_its_authors_and_the_relays_entry_at_its_key_by
     let (bob, _) = c::host(&bob_phone).await?;
     let (carol, _) = c::host(&carol_phone).await?;
     let (dave, _) = c::host(&dave_phone).await?;
-    let pod = c::found(&alice_phone, &alice).await?;
+    let pod = c::create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         c::invite(
             &alice_phone,
@@ -384,7 +384,7 @@ async fn an_unknown_entry_from_a_member_converges_and_changes_nothing() -> Resul
     let (bob, _) = c::host(&bob_phone).await?;
     let (carol, _) = c::host(&carol_phone).await?;
     let (dave, _) = c::host(&dave_phone).await?;
-    let pod = c::found(&alice_phone, &alice).await?;
+    let pod = c::create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         c::invite(
             &alice_phone,
@@ -476,7 +476,7 @@ async fn an_unknown_entry_is_held_whoever_authored_it() -> Result<()> {
     let (alice, _) = c::host(&alice_phone).await?;
     let (bob, _) = c::host(&bob_phone).await?;
     let (dave, _) = c::host(&dave_phone).await?;
-    let pod = c::found(&alice_phone, &alice).await?;
+    let pod = c::create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&dave_phone, &dave)] {
         c::invite(
             &alice_phone,

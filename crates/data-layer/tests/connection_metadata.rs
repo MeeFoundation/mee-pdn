@@ -6,7 +6,7 @@
 //!
 //! Establishment (the pairing dialogue) lives in pdn-node; here the tickets
 //! travel by direct handover, exactly the store-level acts the dialogue and
-//! the directory perform. Registering the pair is what arms the ticket
+//! the PMS perform. Registering the pair is what arms the ticket
 //! bound Invariant 3 gives these stores, so every scenario arms the halves
 //! it holds; a scenario that models one direction gets a locally created
 //! stand-in for the other, which takes no part in what it asserts.
@@ -113,9 +113,9 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
     let mut alice = memory_node().await?;
     let bob = memory_node().await?;
     let carol = memory_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
-    let _carol_dir = host_identity(&carol, ids::CAROL).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
+    let _carol_pms = host_identity(&carol, ids::CAROL).await?;
 
     // Alice issues one store per counterparty; Bob issues one toward Alice.
     let a_own_b = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
@@ -235,10 +235,10 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
     let mut a_laptop = memory_node().await?;
     let b_phone = memory_node().await?;
     let b_laptop = memory_node().await?;
-    let _a_phone_dir = host_identity(&a_phone, ids::ALICE).await?;
-    let _a_laptop_dir = host_identity(&a_laptop, ids::ALICE).await?;
-    let _b_phone_dir = host_identity(&b_phone, ids::BOB).await?;
-    let _b_laptop_dir = host_identity(&b_laptop, ids::BOB).await?;
+    let _a_phone_pms = host_identity(&a_phone, ids::ALICE).await?;
+    let _a_laptop_pms = host_identity(&a_laptop, ids::ALICE).await?;
+    let _b_phone_pms = host_identity(&b_phone, ids::BOB).await?;
+    let _b_laptop_pms = host_identity(&b_laptop, ids::BOB).await?;
 
     // The laptop opens from the write ticket, Bob's devices from the read
     // ticket.
@@ -357,8 +357,8 @@ async fn grants_replicate_withdraw_and_converge_across_devices() -> Result<()> {
 async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
     let mut alice = memory_node().await?;
     let bob = memory_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
 
     // Alice's own store toward Bob; Bob imports the read ticket.
     let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
@@ -425,13 +425,13 @@ async fn one_grant_record_replaces_and_withdraws_atomically() -> Result<()> {
 }
 
 /// A data replica refuses to be opened as a device-shared store; beside it,
-/// the directory this node created opens. `PrivateMetadataStore::open`
+/// the PMS this node created opens. `PrivateMetadataStore::open`
 /// enrols what it opens in the gossip swarm, so an open aimed at a data
 /// namespace would silently widen the data path of a grantee import.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
     let alice = memory_node().await?;
-    let directory = host_identity(&alice, ids::ALICE).await?;
+    let pms = host_identity(&alice, ids::ALICE).await?;
     alice.create_namespace(ids::ALICE, ids::ALICE).await?;
     let data = alice
         .share_ticket(
@@ -448,12 +448,12 @@ async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
             .is_err(),
         "a data replica must not open as a device-shared store"
     );
-    let reopened = PrivateMetadataStore::open(&alice, ids::ALICE, directory.namespace())
+    let reopened = PrivateMetadataStore::open(&alice, ids::ALICE, pms.namespace())
         .await?
-        .expect("the node holds its own directory replica");
+        .expect("the node holds its own PMS replica");
     assert!(
         reopened.list_devices().await?.contains(&alice.node_id()),
-        "the directory itself must still open and read back"
+        "the PMS itself must still open and read back"
     );
 
     alice.shutdown().await?;
@@ -467,7 +467,7 @@ async fn a_data_replica_refuses_a_device_shared_open() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
     let alice = memory_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
     let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     let ticket = own
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
@@ -512,7 +512,7 @@ async fn a_device_shared_replica_refuses_a_data_import() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_naming_another_issuer_is_refused_before_it_rewrites_tracking() -> Result<()> {
     let mut alice = spawn_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
     let own = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
 
     // A sibling device of Alice's own, as the product's contacts name one.
@@ -575,7 +575,7 @@ async fn an_import_naming_another_issuer_is_refused_before_it_rewrites_tracking(
 /// replica over entire, past the grant that bounds it.
 ///
 /// Denied: three roles in turn — the identity's own data replica, a
-/// replica it holds under a grant, and its directory — each offered the
+/// replica it holds under a grant, and its PMS — each offered the
 /// way a counterparty offers its connection metadata store.
 ///
 /// The tickets are minted here rather than handed over by a ceremony
@@ -585,18 +585,18 @@ async fn an_import_naming_another_issuer_is_refused_before_it_rewrites_tracking(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_namespace_held_in_another_role_refuses_a_device_shared_import() -> Result<()> {
     let mut alice = spawn_node().await?;
-    let directory = host_identity(&alice, ids::ALICE).await?;
+    let pms = host_identity(&alice, ids::ALICE).await?;
 
     // The identity's own data replica, and one it holds under a grant.
     let own_data = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
     let mut bob = spawn_node().await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
     let bobs_data = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
     alice
         .import_namespace_scoped(ids::ALICE, ids::BOB, bobs_data.clone())
         .await?;
 
-    let directory_ticket = directory
+    let pms_ticket = pms
         .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
         .await?;
 
@@ -604,7 +604,7 @@ async fn a_namespace_held_in_another_role_refuses_a_device_shared_import() -> Re
     for (role, ticket) in [
         ("its own data replica", own_data),
         ("a replica held under a grant", bobs_data),
-        ("its directory", directory_ticket),
+        ("its PMS", pms_ticket),
     ] {
         // Denied (a counterparty naming a namespace already in use).
         assert!(
@@ -649,7 +649,7 @@ async fn a_namespace_held_in_another_role_refuses_a_device_shared_import() -> Re
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Result<()> {
     let alice = memory_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
     let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
     let device = alice.node_id();
 
@@ -683,7 +683,7 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
 #[tokio::test(flavor = "multi_thread")]
 async fn a_garbage_device_key_withholds_itself_not_the_set() -> Result<()> {
     let alice = memory_node().await?;
-    let _alice_dir = host_identity(&alice, ids::ALICE).await?;
+    let _alice_pms = host_identity(&alice, ids::ALICE).await?;
     let own = ConnectionMetadataStore::create(&alice, ids::ALICE).await?;
 
     let device = alice.node_id();
@@ -717,10 +717,10 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
     let mut a_laptop = memory_node().await?;
     let mut bob = memory_node().await?;
     let carol = memory_node().await?;
-    let _a_phone_dir = host_identity(&a_phone, ids::ALICE).await?;
-    let _a_laptop_dir = host_identity(&a_laptop, ids::ALICE).await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
-    let _carol_dir = host_identity(&carol, ids::CAROL).await?;
+    let _a_phone_pms = host_identity(&a_phone, ids::ALICE).await?;
+    let _a_laptop_pms = host_identity(&a_laptop, ids::ALICE).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
+    let _carol_pms = host_identity(&carol, ids::CAROL).await?;
 
     // The A→B pair: laptop on the write ticket, Bob on the read ticket.
     let own_b_phone = ConnectionMetadataStore::create(&a_phone, ids::ALICE).await?;
@@ -847,10 +847,10 @@ async fn issuer_devices_write_counterparty_reads_third_party_observes_nothing() 
 }
 
 /// The sibling path preserves the issuer's scope, refuses a device listed
-/// only in a co-located identity's directory, and honors the withdrawal
+/// only in a co-located identity's PMS, and honors the withdrawal
 /// from the next session while retaining what was delivered.
 ///
-/// Denied: the intruder resolves in the co-located identity's directory
+/// Denied: the intruder resolves in the co-located identity's PMS
 /// alone, so the phone refuses it although it holds the replica; and
 /// after the withdrawal neither device advances. Every denial is ordered
 /// after a write that demonstrably reached the audience.
@@ -862,19 +862,19 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
     let intruder = spawn_node().await?;
     let mut bob = spawn_node().await?;
 
-    // Alice's directory lists her devices. A co-located second identity's
-    // directory — hosted on the same phone — lists the intruder.
-    let directory = host_identity(&a_phone, ids::ALICE).await?;
-    directory.add_device(a_laptop.node_id()).await?;
-    let leisure_dir = host_identity(&a_phone, ids::ALICE_AT_LEISURE).await?;
-    leisure_dir.add_device(intruder.node_id()).await?;
-    let laptop_dir = host_identity(&a_laptop, ids::ALICE).await?;
-    laptop_dir.add_device(a_phone.node_id()).await?;
-    let _intruder_dir = host_identity(&intruder, ids::ALICE_AT_LEISURE).await?;
+    // Alice's PMS lists her devices. A co-located second identity's
+    // PMS — hosted on the same phone — lists the intruder.
+    let pms = host_identity(&a_phone, ids::ALICE).await?;
+    pms.add_device(a_laptop.node_id()).await?;
+    let leisure_pms = host_identity(&a_phone, ids::ALICE_AT_LEISURE).await?;
+    leisure_pms.add_device(intruder.node_id()).await?;
+    let laptop_pms = host_identity(&a_laptop, ids::ALICE).await?;
+    laptop_pms.add_device(a_phone.node_id()).await?;
+    let _intruder_pms = host_identity(&intruder, ids::ALICE_AT_LEISURE).await?;
 
     // Bob's namespace holds a granted claim and a withheld one; his store
     // toward Alice carries a scoped grant on the granted claim alone.
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
     let email = EntryPath::new("contact/email")?;
     let withheld = EntryPath::new("contact/phone")?;
     let data_read = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;
@@ -978,7 +978,7 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
         .is_none());
 
     // Denied: the intruder resolves only in the co-located identity's
-    // directory. Bob's next update reaching the laptop orders the refusal
+    // PMS. Bob's next update reaching the laptop orders the refusal
     // after a window in which the phone demonstrably serves the audience.
     intruder
         .import_namespace_scoped(ids::ALICE_AT_LEISURE, ids::BOB, phone_ticket)
@@ -1064,8 +1064,8 @@ async fn a_withdrawal_holds_against_a_device_that_still_holds_the_record() -> Re
         ..SpawnOptions::memory()
     })
     .await?;
-    let _bob_dir = host_identity(&bob, ids::BOB).await?;
-    let _alice_dir = host_identity(&a_phone, ids::ALICE).await?;
+    let _bob_pms = host_identity(&bob, ids::BOB).await?;
+    let _alice_pms = host_identity(&a_phone, ids::ALICE).await?;
 
     let email = EntryPath::new("contact/email")?;
     let data_read = data_ticket(&mut bob, ids::BOB, ids::BOB).await?;

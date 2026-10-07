@@ -13,7 +13,7 @@ use data_layer::{
 };
 use pdn_types::{PodId, RecordId};
 use test_utils::{
-    pod::{device_of, found, host, invite, lists, reads, tickets, write, Person},
+    pod::{create, device_of, host, invite, lists, reads, tickets, write, Person},
     TIMEOUT,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -81,23 +81,23 @@ async fn act(
     Ok(bytes)
 }
 
-/// A pod the person on the first of `phones` founds, a person on each
-/// other phone invited by the founder, at the founder's sequence 1, and
+/// A pod the person on the first of `phones` creates, a person on each
+/// other phone invited by the creator, at the creator's sequence 1, and
 /// every one of them holding both stores.
 async fn pod_on(phones: &[&SyncNode]) -> Result<(Vec<Person>, PodId, PodTickets)> {
     let mut people = Vec::new();
     for phone in phones {
         people.push(host(phone).await?.0);
     }
-    let (Some(founder_phone), Some(founder)) = (phones.first(), people.first()) else {
-        anyhow::bail!("a pod needs its founder");
+    let (Some(creator_phone), Some(creator)) = (phones.first(), people.first()) else {
+        anyhow::bail!("a pod needs its creator");
     };
-    let pod = found(founder_phone, founder).await?;
+    let pod = create(creator_phone, creator).await?;
     for (phone, member) in phones.iter().zip(&people).skip(1) {
         let devices = vec![device_of(phone, member)?];
-        invite(founder_phone, founder, pod, member, devices).await?;
+        invite(creator_phone, creator, pod, member, devices).await?;
     }
-    let tickets = tickets(founder_phone, founder, pod).await?;
+    let tickets = tickets(creator_phone, creator, pod).await?;
     for (phone, member) in phones.iter().zip(&people).skip(1) {
         phone.import_pod(member.id, pod, tickets.clone()).await?;
         for other in people.iter().skip(1) {
@@ -192,7 +192,7 @@ async fn verdicts_come_to(
     }
 }
 
-/// A promotion and a kick two owners write at one point of a member's
+/// A promotion and a removal two owners write at one point of a member's
 /// chain while out of reach of each other take the member out on every
 /// member device, and so do a demotion and the subject's own leave at one
 /// point of its chain, every member device holding all four entries.
@@ -221,7 +221,7 @@ async fn acts_at_one_point_resolve_by_precedence_on_every_member_device() -> Res
 
     let written = [
         act(alice_phone, alice, 1, EventKind::Promoted, bob, 2, pod).await?,
-        act(carol_phone, carol, 2, EventKind::Kicked, bob, 2, pod).await?,
+        act(carol_phone, carol, 2, EventKind::Removed, bob, 2, pod).await?,
         act(alice_phone, alice, 1, EventKind::Demoted, dave, 3, pod).await?,
         act(dave_phone, dave, 2, EventKind::Left, dave, 3, pod).await?,
     ];
@@ -242,12 +242,12 @@ async fn acts_at_one_point_resolve_by_precedence_on_every_member_device() -> Res
             assert!(lists(phone, holder.id, pod, member.id, want).await?);
         }
     }
-    // Only once Alice's phone holds the kick: a dial returns when asked for,
+    // Only once Alice's phone holds the removal: a dial returns when asked for,
     // and its session serves what Alice's phone held as it opened.
     dial(bob_phone, bob, pod, alice_phone, alice).await?;
     assert!(
         lists(bob_phone, bob.id, pod, bob.id, OUT).await?,
-        "the kicked member's device did not take the kick that outranks its promotion"
+        "the removed member's device did not take the removal that outranks its promotion"
     );
 
     for phone in phones {

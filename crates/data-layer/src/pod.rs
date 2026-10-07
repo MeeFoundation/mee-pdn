@@ -18,7 +18,7 @@ pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership,
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
 pub(crate) use past::{departure_past, PastEntry};
 pub(crate) use payloads::encode_devices;
-pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
+pub use payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
 pub use record_view::{Operation, RecordEntry, RecordView};
 
 /// `identity` holds no pod `pod` here, or holds only its tombstone.
@@ -130,7 +130,7 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: PodStore) -> Result<Vec<Un
 /// [`SyncNode::take_pod_notices`](crate::SyncNode::take_pod_notices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodNotice {
-    /// `identity`'s chain in `pod` ends in a counted left or kicked event
+    /// `identity`'s chain in `pod` ends in a counted left or removed event
     /// at `seq`.
     Departed {
         identity: PdnId,

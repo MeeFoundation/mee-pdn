@@ -1,6 +1,6 @@
 //! Device linking end to end: the linking dialogue between in-process
 //! runtimes (the payload passed as a value), the full store set the reply
-//! bootstraps, the non-founder chain, the refusal pairs of the
+//! bootstraps, the chain through a linked device, the refusal pairs of the
 //! verify-and-burn requirement — each probed for no observable state on
 //! either side — lost-reply convergence, the rollback of a link that could
 //! not catch up, per-identity isolation across several linkings, the
@@ -30,39 +30,33 @@ use common::{
     link_probe, memory_runtime, read_frame, write_frame, LINKING_ALPN,
 };
 
-/// Wait until the probe's directory lists exactly `devices` (order-free).
-async fn wait_devices_exactly(
-    directory: &PrivateMetadataStore,
-    devices: &[NodeId],
-) -> Result<bool> {
+/// Wait until the probe's PMS lists exactly `devices` (order-free).
+async fn wait_devices_exactly(pms: &PrivateMetadataStore, devices: &[NodeId]) -> Result<bool> {
     let mut expected: Vec<NodeId> = devices.to_vec();
     expected.sort_unstable();
     eventually(|| async {
-        let mut have = directory.list_devices().await?;
+        let mut have = pms.list_devices().await?;
         have.sort_unstable();
         Ok(have == expected)
     })
     .await
 }
 
-/// Wait until the probe's directory lists every id in `devices` as pending.
-async fn wait_pending_devices(
-    directory: &PrivateMetadataStore,
-    devices: &[NodeId],
-) -> Result<bool> {
+/// Wait until the probe's PMS lists every id in `devices` as pending.
+async fn wait_pending_devices(pms: &PrivateMetadataStore, devices: &[NodeId]) -> Result<bool> {
     eventually(|| async {
-        let have = directory.list_pending_devices().await?;
+        let have = pms.list_pending_devices().await?;
         Ok(devices.iter().all(|d| have.contains(d)))
     })
     .await
 }
 
-/// Wait until the probe's directory lists exactly `kinds` (order-free).
-async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
+/// Wait until the probe's PMS lists exactly `kinds` (order-free).
+async fn wait_kinds_exactly(pms: &PrivateMetadataStore, kinds: &[String]) -> Result<bool> {
     let mut expected: Vec<String> = kinds.to_vec();
     expected.sort();
     eventually(|| async {
-        let mut have = directory.list_ticket_kinds().await?;
+        let mut have = pms.list_ticket_kinds().await?;
         have.sort();
         Ok(have == expected)
     })
@@ -71,24 +65,24 @@ async fn wait_kinds_exactly(directory: &PrivateMetadataStore, kinds: &[String]) 
 
 /// The inviter-side state a refusal must leave untouched, checked as one
 /// act.
-async fn assert_directory_is(
-    directory: &PrivateMetadataStore,
+async fn assert_pms_is(
+    pms: &PrivateMetadataStore,
     devices: &[NodeId],
     kinds: &[String],
 ) -> Result<()> {
     assert!(
-        wait_devices_exactly(directory, devices).await?,
-        "the directory's device set is not what it must be"
+        wait_devices_exactly(pms, devices).await?,
+        "the PMS's device set is not what it must be"
     );
     assert!(
-        wait_kinds_exactly(directory, kinds).await?,
-        "the directory's ticket kinds are not what they must be"
+        wait_kinds_exactly(pms, kinds).await?,
+        "the PMS's ticket kinds are not what they must be"
     );
     Ok(())
 }
 
 /// The positive ceremony: create on A, invite on A, link on B. Link's
-/// return means the directory is caught up (a connection recorded before
+/// return means the PMS is caught up (a connection recorded before
 /// the invite lists with no poll), the newcomer is a confirmed device, and
 /// the full store set is up — an entry written on either runtime reads on
 /// the other.
@@ -103,9 +97,9 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     // Fixtures that predate the linking, authored on A.
     let invite = rt_a.connections().invite(x, None).await?;
     establish_patiently(&rt_peer, p, &rt_a, x, invite).await?;
-    let founder_path = EntryPath::new("contact/name")?;
+    let first_device_path = EntryPath::new("contact/name")?;
     rt_a.data()
-        .write(x, x, &founder_path, b"from-founder")
+        .write(x, x, &first_device_path, b"from-first-device")
         .await?;
 
     // Bearer-free: format version, the inviting device's address, the
@@ -125,30 +119,30 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     // Patiently: cold transport retries with fresh invites.
     link_patiently(&rt_b, &rt_a, x).await?;
 
-    // Success implies the directory is caught up: no poll.
+    // Success implies the PMS is caught up: no poll.
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![x]);
     assert_eq!(
         rt_b.connections().list(x).await?,
         vec![p],
-        "a caught-up directory must already hold the pre-linking connection record"
+        "a caught-up PMS must already hold the pre-linking connection record"
     );
 
     // A registered it as pending, B's own confirmation made it a device;
     // probed from a raw linked node.
-    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_a, x).await?;
     assert!(
-        wait_devices(&probe_dir, &[rt_a.node_id(), rt_b.node_id()]).await?,
+        wait_devices(&probe_pms, &[rt_a.node_id(), rt_b.node_id()]).await?,
         "the linked device did not appear in the device set"
     );
 
     // The full store set.
     assert!(
         eventually(|| async {
-            Ok(rt_b.data().read(x, x, &founder_path).await?.as_deref()
-                == Some(&b"from-founder"[..]))
+            Ok(rt_b.data().read(x, x, &first_device_path).await?.as_deref()
+                == Some(&b"from-first-device"[..]))
         })
         .await?,
-        "the founder's entry did not reach the newcomer's data namespace"
+        "the first device's entry did not reach the newcomer's data namespace"
     );
     let newcomer_path = EntryPath::new("contact/email")?;
     rt_b.data()
@@ -160,7 +154,7 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
                 == Some(&b"from-newcomer"[..]))
         })
         .await?,
-        "the newcomer's entry did not reach the founder"
+        "the newcomer's entry did not reach the first device"
     );
 
     probe_node.shutdown().await?;
@@ -170,7 +164,7 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     Ok(())
 }
 
-/// An identity's `PdnId` is the one the announcement key in its directory
+/// An identity's `PdnId` is the one the announcement key in its PMS
 /// derives, on the runtime that created it and on one linked into it, and a
 /// second identity created beside it derives its own.
 #[tokio::test(flavor = "multi_thread")]
@@ -210,7 +204,7 @@ async fn pdn_id_derives_from_the_announcement_key_on_every_device() -> Result<()
 /// mint a write ticket for the data namespace only because its own linking
 /// reply imported one.
 #[tokio::test(flavor = "multi_thread")]
-async fn linking_through_a_non_founder_device() -> Result<()> {
+async fn linking_through_a_linked_device() -> Result<()> {
     let rt_1 = memory_runtime().await?;
     let rt_2 = memory_runtime().await?;
     let rt_3 = memory_runtime().await?;
@@ -218,7 +212,7 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
     let path = EntryPath::new("affiliation/group")?;
     rt_1.data().write(x, x, &path, b"Acme Engineering").await?;
 
-    // Device 2 links from the founder; device 3 from device 2.
+    // Device 2 links from the first device; device 3 from device 2.
     link_patiently(&rt_2, &rt_1, x).await?;
     link_patiently(&rt_3, &rt_2, x).await?;
 
@@ -228,14 +222,14 @@ async fn linking_through_a_non_founder_device() -> Result<()> {
             Ok(rt_3.data().read(x, x, &path).await?.as_deref() == Some(&b"Acme Engineering"[..]))
         })
         .await?,
-        "data did not reach the third device through the non-founder chain"
+        "data did not reach the third device through the linked device"
     );
 
     // Probed from a raw linked node, itself a fourth device.
-    let (probe_node, probe_dir) = link_probe(&rt_3, x).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_3, x).await?;
     assert!(
         wait_devices(
-            &probe_dir,
+            &probe_pms,
             &[rt_1.node_id(), rt_2.node_id(), rt_3.node_id()],
         )
         .await?,
@@ -262,22 +256,22 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     let x = rt_a.identity().create().await?;
     let path = EntryPath::new("contact/name")?;
 
-    // The no-state probe: X's directory from a raw linked node; baseline is
-    // the founder, the probe, and the data kind.
-    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
+    // The no-state probe: X's PMS from a raw linked node; baseline is
+    // the first device, the probe, and the data kind.
+    let (probe_node, probe_pms) = link_probe(&rt_a, x).await?;
     let baseline_kinds = vec!["data".to_owned()];
     assert!(
-        wait_kinds_exactly(&probe_dir, &baseline_kinds).await?,
-        "directory probe did not sync its baseline"
+        wait_kinds_exactly(&probe_pms, &baseline_kinds).await?,
+        "PMS probe did not sync its baseline"
     );
     let probe_id = probe_node.node_id();
     let baseline_devices = [rt_a.node_id(), probe_id];
     assert!(
-        wait_devices_exactly(&probe_dir, &baseline_devices).await?,
-        "directory probe did not sync the baseline device set"
+        wait_devices_exactly(&probe_pms, &baseline_devices).await?,
+        "PMS probe did not sync the baseline device set"
     );
 
-    // Expired: B hosts nothing, the inviter's directory is unchanged.
+    // Expired: B hosts nothing, the inviter's PMS is unchanged.
     let tiny = Some(Duration::from_millis(1));
     let expired = rt_a.identity().linking_invite(x, tiny).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -288,7 +282,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![]);
     let err = rt_b.data().read(x, x, &path).await.unwrap_err();
     assert!(err.downcast_ref::<UnknownIdentity>().is_some());
-    assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
+    assert_pms_is(&probe_pms, &baseline_devices, &baseline_kinds).await?;
 
     // An invite for an unhosted identity mints nothing pending.
     let err = rt_a
@@ -309,7 +303,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "a never-minted secret must be refused"
     );
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
-    assert_directory_is(&probe_dir, &baseline_devices, &baseline_kinds).await?;
+    assert_pms_is(&probe_pms, &baseline_devices, &baseline_kinds).await?;
 
     // ...and an unknown payload version refuses before dialing, typed.
     let unversioned = LinkingPayload {
@@ -332,10 +326,10 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
     assert_eq!(rt_b.sync().hosted_identities().await?, vec![x]);
     let after_link = [rt_a.node_id(), probe_id, rt_b.node_id()];
     assert!(
-        wait_devices_exactly(&probe_dir, &after_link).await?,
+        wait_devices_exactly(&probe_pms, &after_link).await?,
         "the successful link must add exactly the newcomer's device record"
     );
-    assert!(wait_kinds_exactly(&probe_dir, &baseline_kinds).await?);
+    assert!(wait_kinds_exactly(&probe_pms, &baseline_kinds).await?);
 
     // A replay is refused and both sides are as the first linking left them.
     assert!(
@@ -343,7 +337,7 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "a replayed secret must be refused"
     );
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
-    assert_directory_is(&probe_dir, &after_link, &baseline_kinds).await?;
+    assert_pms_is(&probe_pms, &after_link, &baseline_kinds).await?;
 
     probe_node.shutdown().await?;
     rt_a.shutdown().await?;
@@ -477,10 +471,10 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     let x = rt_a.identity().create().await?;
 
     // The probe watches the device set and warms the path.
-    let (probe_node, probe_dir) = link_probe(&rt_a, x).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_a, x).await?;
     assert!(
-        wait_devices(&probe_dir, &[rt_a.node_id()]).await?,
-        "the probe did not sync the founder's device record"
+        wait_devices(&probe_pms, &[rt_a.node_id()]).await?,
+        "the probe did not sync the first device's record"
     );
 
     // The vanishing dialer: presents a live secret, never reads the reply.
@@ -492,13 +486,13 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
 
     // The registration precedes the reply, as pending.
     assert!(
-        wait_pending_devices(&probe_dir, &[vanisher_id]).await?,
+        wait_pending_devices(&probe_pms, &[vanisher_id]).await?,
         "the registration must exist on the inviter although the reply was never read"
     );
-    // Pending is all it is: the device set holds the founder and the probe
+    // Pending is all it is: the device set holds the first device and the probe
     // alone.
     assert!(
-        wait_devices_exactly(&probe_dir, &[rt_a.node_id(), probe_node.node_id()]).await?,
+        wait_devices_exactly(&probe_pms, &[rt_a.node_id(), probe_node.node_id()]).await?,
         "a device that never read its tickets must not be in the device set"
     );
     connection.close(0u32.into(), b"");
@@ -511,13 +505,13 @@ async fn a_dialogue_lost_after_commit_converges_on_a_fresh_invite() -> Result<()
     // ...its node id once, the pending registration cleared.
     assert!(
         eventually(|| async {
-            let occurrences = probe_dir
+            let occurrences = probe_pms
                 .list_devices()
                 .await?
                 .into_iter()
                 .filter(|d| *d == vanisher_id)
                 .count();
-            let pending = probe_dir.list_pending_devices().await?;
+            let pending = probe_pms.list_pending_devices().await?;
             Ok(occurrences == 1 && !pending.contains(&vanisher_id))
         })
         .await?,
@@ -602,7 +596,7 @@ async fn a_hung_inviter_costs_the_caller_its_budget_and_nothing_more() -> Result
 /// its rollback path.
 #[derive(Debug)]
 struct DeadTicketInviter {
-    directory: DocTicket,
+    pms: DocTicket,
     data: DocTicket,
 }
 
@@ -612,7 +606,7 @@ impl ProtocolHandler for DeadTicketInviter {
             let (mut send, mut recv) = connection.accept_bi().await.ok()?;
             // Read (and ignore) the request — every secret "verifies" here.
             read_frame(&mut recv).await.ok()?;
-            let reply = postcard::to_stdvec(&(&self.directory, &self.data)).ok()?;
+            let reply = postcard::to_stdvec(&(&self.pms, &self.data)).ok()?;
             write_frame(&mut send, &reply).await.ok()?;
             send.finish().ok()?;
             connection.closed().await;
@@ -634,8 +628,8 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     // Real tickets from a scratch node then taken away.
     let scratch = memory_node().await?;
     scratch.provision_identity(ids::DAVE).await?;
-    let dead_directory = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
-    let directory_ticket = dead_directory
+    let dead_pms = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
+    let pms_ticket = dead_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
@@ -654,7 +648,7 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
         vec![(
             LINKING_ALPN.to_vec(),
             Box::new(DeadTicketInviter {
-                directory: directory_ticket,
+                pms: pms_ticket,
                 data: data_ticket,
             }),
         )],
@@ -764,14 +758,14 @@ async fn cancelling_link_leaves_no_residue() -> Result<()> {
 /// rather than by `hosted_identities`, which reports the runtime's own map:
 /// a rollback unhosts the identity below that map without removing it
 /// there. The confirmed set is read from a probe linked beforehand, since
-/// the directory lives inside the runtimes.
+/// the PMS lives inside the runtimes.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_cancelled_after_its_commit_point_stands() -> Result<()> {
     let rt_inviter = memory_runtime().await?;
     let x = rt_inviter.identity().create().await?;
     let path = EntryPath::new("contact/name")?;
-    let (probe_node, probe_dir) = link_probe(&rt_inviter, x).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_inviter, x).await?;
 
     let rt = Arc::new(memory_runtime().await?);
     let pause = rt.pause_next_link_after_commit().await;
@@ -797,7 +791,7 @@ async fn a_link_cancelled_after_its_commit_point_stands() -> Result<()> {
     );
     assert!(
         wait_devices_exactly(
-            &probe_dir,
+            &probe_pms,
             &[rt_inviter.node_id(), probe_node.node_id(), rt.node_id()]
         )
         .await?,
@@ -810,7 +804,7 @@ async fn a_link_cancelled_after_its_commit_point_stands() -> Result<()> {
     Ok(())
 }
 
-/// A link whose directory finished its first sync exchanges before the
+/// A link whose PMS finished its first sync exchanges before the
 /// catch-up wait began still returns caught up, inside a budget that ends
 /// long before the next periodic reconcile pass. The pause after the
 /// imports holds the wait back past those exchanges: a loopback exchange
@@ -901,7 +895,7 @@ async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()
 async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothing() -> Result<()> {
     let inviter = memory_runtime().await?;
     let identity = inviter.identity().create().await?;
-    let (probe, directory) = link_probe(&inviter, identity).await?;
+    let (probe, pms) = link_probe(&inviter, identity).await?;
     let dialer = memory_runtime().await?;
     let newcomer = dialer.node_id();
     let mut failures = inviter.subscribe_linking_failures().await;
@@ -922,8 +916,8 @@ async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothi
         .unwrap_err()
         .downcast_ref::<LinkingRefused>()
         .is_some());
-    assert!(!directory.list_pending_devices().await?.contains(&newcomer));
-    assert!(!directory.list_devices().await?.contains(&newcomer));
+    assert!(!pms.list_pending_devices().await?.contains(&newcomer));
+    assert!(!pms.list_devices().await?.contains(&newcomer));
 
     dialer.shutdown().await?;
     probe.shutdown().await?;
@@ -977,8 +971,8 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
     // The link fails: its tickets address replicas hosted nowhere.
     let scratch = memory_node().await?;
     scratch.provision_identity(ids::DAVE).await?;
-    let dead_directory = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
-    let directory_ticket = dead_directory
+    let dead_pms = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
+    let pms_ticket = dead_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
@@ -996,7 +990,7 @@ async fn a_failed_link_leaves_a_granted_namespace_of_the_same_issuer_intact() ->
         vec![(
             LINKING_ALPN.to_vec(),
             Box::new(DeadTicketInviter {
-                directory: directory_ticket,
+                pms: pms_ticket,
                 data: data_ticket,
             }),
         )],

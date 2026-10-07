@@ -5,7 +5,7 @@
 use pdn_store::AuthorId;
 use pdn_types::NodeId;
 
-/// A left, kicked, promoted or demoted event's payload: its key carries
+/// A left, removed, promoted or demoted event's payload: its key carries
 /// all of the event, and an empty entry is a tombstone.
 pub const ACT_PAYLOAD: [u8; 1] = [0];
 
@@ -17,9 +17,9 @@ pub struct MemberDevice {
     pub author: AuthorId,
 }
 
-/// The founding event's payload: `nonce ‖ announcement_key ‖ signature`.
+/// The created event's payload: `nonce ‖ announcement_key ‖ signature`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FoundedPayload {
+pub struct CreatedPayload {
     pub nonce: [u8; 16],
     pub announcement_key: [u8; 32],
     pub signature: [u8; 64],
@@ -41,7 +41,7 @@ pub struct DevicesPayload {
     pub signature: [u8; 64],
 }
 
-impl FoundedPayload {
+impl CreatedPayload {
     pub fn encode(&self) -> Vec<u8> {
         [&self.nonce[..], &self.announcement_key, &self.signature].concat()
     }
@@ -123,7 +123,7 @@ mod tests {
     /// byte short or long decodes to nothing.
     #[test]
     fn payloads_decode_at_their_exact_length_only() {
-        let founded = FoundedPayload {
+        let created = CreatedPayload {
             nonce: [0x5a; 16],
             announcement_key: [0x17; 32],
             signature: [0x0e; 64],
@@ -146,9 +146,9 @@ mod tests {
             signature: [0x0e; 64],
         };
 
-        let encoded = founded.encode();
+        let encoded = created.encode();
         assert_eq!(encoded.len(), 112);
-        assert_eq!(FoundedPayload::decode(&encoded), Some(founded));
+        assert_eq!(CreatedPayload::decode(&encoded), Some(created));
         let encoded = joined.encode();
         assert_eq!(encoded.len(), 96);
         assert_eq!(JoinedPayload::decode(&encoded), Some(joined));
@@ -159,8 +159,8 @@ mod tests {
         let mut long = devices.encode();
         long.push(0);
         assert_eq!(DevicesPayload::decode(&long), None);
-        assert_eq!(FoundedPayload::decode(&[0; 111]), None);
-        assert_eq!(FoundedPayload::decode(&[0; 113]), None);
+        assert_eq!(CreatedPayload::decode(&[0; 111]), None);
+        assert_eq!(CreatedPayload::decode(&[0; 113]), None);
         assert_eq!(JoinedPayload::decode(&[0; 95]), None);
         assert_eq!(DevicesPayload::decode(&[0; 63]), None);
     }

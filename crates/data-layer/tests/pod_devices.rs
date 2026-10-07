@@ -13,7 +13,7 @@ use data_layer::{
 use pdn_types::{NodeId, PodId, RecordId};
 use test_utils::{
     eventually, join_identity,
-    pod::{device_of, folds_nobody, found, host, invite, lists_device, reads, tickets, Person},
+    pod::{create, device_of, folds_nobody, host, invite, lists_device, reads, tickets, Person},
     wait_devices, TIMEOUT,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -113,7 +113,7 @@ async fn holds(
 }
 
 /// A member's laptop whose first dials reached the member's phone before
-/// the phone's directory listed it is dialed by the phone once the listing
+/// the phone's PMS listed it is dialed by the phone once the listing
 /// arrives, and takes the pod. The phone joined on Alice's invite, so a
 /// dial a gossip neighbor prompts names Alice and is refused where only Bob
 /// is hosted; every pass is out of reach; and the listing is written only
@@ -123,8 +123,8 @@ async fn holds(
 async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -> Result<()> {
     let (alice_phone, bob_phone, bob_laptop) = (node().await?, node().await?, node().await?);
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -137,11 +137,11 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
         .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
         .await?;
     assert!(eventually(|| async { Ok(!folds_nobody(&bob_phone, bob.id, pod).await?) }).await?);
-    let ticket = bob_directory
+    let ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(&bob_laptop, bob.id, ticket).await?;
-    assert!(wait_devices(&laptop_directory, &[bob_phone.node_id()]).await?);
+    let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
+    assert!(wait_devices(&laptop_pms, &[bob_phone.node_id()]).await?);
     let tickets = tickets(&bob_phone, &bob, pod).await?;
 
     let pause = bob_laptop.pause_next_pod_start_for_test();
@@ -162,11 +162,11 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
     );
     assert!(folds_nobody(&bob_laptop, bob.id, pod).await?);
 
-    laptop_directory.add_device(bob_laptop.node_id()).await?;
-    assert!(wait_devices(&bob_directory, &[bob_laptop.node_id()]).await?);
+    laptop_pms.add_device(bob_laptop.node_id()).await?;
+    assert!(wait_devices(&bob_pms, &[bob_laptop.node_id()]).await?);
     assert!(
         eventually(|| async { Ok(!folds_nobody(&bob_laptop, bob.id, pod).await?) }).await?,
-        "the phone did not dial the laptop its directory came to list"
+        "the phone did not dial the laptop its PMS came to list"
     );
     Ok(())
 }
@@ -187,20 +187,14 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
     let (alice_phone, bob_phone, bob_laptop) = (node().await?, node().await?, node().await?);
     let mut alices = alice_phone.take_pod_verdicts().context("taken once")?;
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_phone).await?;
-    bob_directory.add_device(bob_laptop.node_id()).await?;
-    let ticket = bob_directory
+    let (bob, bob_pms) = host(&bob_phone).await?;
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    let ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(&bob_laptop, bob.id, ticket).await?;
-    assert!(
-        wait_devices(
-            &laptop_directory,
-            &[bob_phone.node_id(), bob_laptop.node_id()]
-        )
-        .await?
-    );
-    let pod = found(&alice_phone, &alice).await?;
+    let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
+    assert!(wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?);
+    let pod = create(&alice_phone, &alice).await?;
     let (b1, b2) = (device_of(&bob_phone, &bob)?, device_of(&bob_laptop, &bob)?);
     invite(&alice_phone, &alice, pod, &bob, vec![b1]).await?;
     let tickets = tickets(&alice_phone, &alice, pod).await?;

@@ -68,49 +68,46 @@ async fn claim_arrives(
 }
 
 /// Tombstone `device`'s published record in the issuer's own store toward
-/// `peer`, from a probe that opens the pair from the directory's tickets —
+/// `peer`, from a probe that opens the pair from the PMS's tickets —
 /// where the product's own withdrawal would go.
 async fn withdraw_device_toward(
     node: &SyncNode,
     identity: PdnId,
-    directory: &PrivateMetadataStore,
+    pms: &PrivateMetadataStore,
     peer: PdnId,
     device: NodeId,
 ) -> Result<()> {
-    own_store_toward(node, identity, directory, peer)
+    own_store_toward(node, identity, pms, peer)
         .await?
         .withdraw_device(device)
         .await
 }
 
 /// The issuer's own store toward `peer`, opened on a probe from the
-/// directory's tickets.
+/// PMS's tickets.
 async fn own_store_toward(
     node: &SyncNode,
     identity: PdnId,
-    directory: &PrivateMetadataStore,
+    pms: &PrivateMetadataStore,
     peer: PdnId,
 ) -> Result<ConnectionMetadataStore> {
-    let own = ticket_patiently(directory, &own_ticket_kind(&peer)).await?;
-    let counterpart = ticket_patiently(directory, &peer_ticket_kind(&peer)).await?;
+    let own = ticket_patiently(pms, &own_ticket_kind(&peer)).await?;
+    let counterpart = ticket_patiently(pms, &peer_ticket_kind(&peer)).await?;
     let own_store = ConnectionMetadataStore::import(node, identity, own).await?;
     let peer_store = ConnectionMetadataStore::import(node, identity, counterpart).await?;
     // Registered as a device of the identity registers a pair it opens
-    // from its directory: a replica no registration covers is judged by
+    // from its PMS: a replica no registration covers is judged by
     // nothing, so a write would never leave this node (ADR-0013).
     node.host_connection(identity, peer, &own_store, &peer_store)?;
     Ok(own_store)
 }
 
-/// Poll `directory` until the ticket of `kind` is readable, handing back
+/// Poll `pms` until the ticket of `kind` is readable, handing back
 /// the one the poll observed: a second read after it is not the same read.
-async fn ticket_patiently(
-    directory: &PrivateMetadataStore,
-    kind: &str,
-) -> Result<data_layer::DocTicket> {
+async fn ticket_patiently(pms: &PrivateMetadataStore, kind: &str) -> Result<data_layer::DocTicket> {
     let observed = RefCell::new(None);
     let arrived = eventually(|| async {
-        let found = directory.get_ticket(kind).await?;
+        let found = pms.get_ticket(kind).await?;
         let seen = found.is_some();
         *observed.borrow_mut() = found;
         Ok(seen)
@@ -238,9 +235,9 @@ async fn the_audience_converges_from_a_device_that_did_not_publish_the_grant() -
     Ok(())
 }
 
-/// No device is the founder: the grant is published from the linked device,
-/// so the ticket names the laptop, and the audience converges from the
-/// founder through the published device set.
+/// A grant published from the linked device reaches past it: the ticket
+/// names the laptop, and the audience converges from the first device
+/// through the published device set.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> {
     let rt_phone = spawn_runtime().await?;
@@ -272,24 +269,24 @@ async fn a_grant_published_from_a_linked_device_reaches_past_it() -> Result<()> 
     );
     assert!(
         claim_arrives(&rt_phone, alice, alice, &email, b"v1").await?,
-        "the claim did not replicate to the founder"
+        "the claim did not replicate to the first device"
     );
     let phone_id = rt_phone.node_id();
     assert!(
         eventually(|| async { contact_present(&rt_bob, bob, alice, phone_id).await }).await?,
-        "the founder never entered the audience replica's contacts"
+        "the first device never entered the audience replica's contacts"
     );
     assert!(
         serving_ready(&rt_phone, alice, bob, alice).await?,
         "the grant record never reached the device that must serve by it"
     );
 
-    // The publishing device goes offline; the founder writes the update.
+    // The publishing device goes offline; the first device writes the update.
     rt_laptop.shutdown().await?;
     rt_phone.data().write(alice, alice, &email, b"v2").await?;
     assert!(
         claim_arrives(&rt_bob, bob, alice, &email, b"v2").await?,
-        "the audience did not converge from the founder past the publishing laptop"
+        "the audience did not converge from the first device past the publishing laptop"
     );
 
     rt_phone.shutdown().await?;
@@ -464,8 +461,8 @@ async fn a_withdrawn_device_stops_being_a_contact() -> Result<()> {
     );
 
     // The withdrawal.
-    let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
-    withdraw_device_toward(&probe_node, alice, &probe_dir, bob, laptop_id).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_phone, alice).await?;
+    withdraw_device_toward(&probe_node, alice, &probe_pms, bob, laptop_id).await?;
 
     // Dropped from the re-derived set; the published one stays.
     assert!(
@@ -721,8 +718,8 @@ async fn an_issuer_device_leaves_the_contacts_of_the_pair_that_stopped_publishin
     );
 
     // Withdrawn toward Y alone.
-    let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
-    withdraw_device_toward(&probe_node, alice, &probe_dir, y, laptop_id).await?;
+    let (probe_node, probe_pms) = link_probe(&rt_phone, alice).await?;
+    withdraw_device_toward(&probe_node, alice, &probe_pms, y, laptop_id).await?;
     assert!(
         eventually(|| async {
             Ok(!rt_shared
@@ -1041,8 +1038,8 @@ async fn a_grant_republished_onto_a_fresh_store_replaces_the_replica() -> Result
         .share(elsewhere, elsewhere, ShareMode::Read)
         .await?;
     let moved_to = fresh.capability.id();
-    let (probe_node, probe_dir) = link_probe(&rt_phone, alice).await?;
-    own_store_toward(&probe_node, alice, &probe_dir, bob)
+    let (probe_node, probe_pms) = link_probe(&rt_phone, alice).await?;
+    own_store_toward(&probe_node, alice, &probe_pms, bob)
         .await?
         .publish_grant(
             &ReadGrant {

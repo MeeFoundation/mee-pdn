@@ -20,7 +20,7 @@ async fn node_on(dir: &std::path::Path) -> Result<SyncNode> {
 }
 
 /// The round trip with no peer running: same node id, both stores readable,
-/// the data namespace re-imported from the directory's own `data` ticket
+/// the data namespace re-imported from the PMS's own `data` ticket
 /// onto a replica the store already holds (the product path a restarted
 /// runtime walks). The denial beside it: a fresh directory is a different
 /// node holding none of it, and its reopen of a replica it never held
@@ -34,9 +34,9 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
     let first = node_on(dir.path()).await?;
     let first_id = first.node_id();
 
-    let directory = host_identity(&first, ids::ALICE).await?;
+    let pms = host_identity(&first, ids::ALICE).await?;
     let author = first.default_author(ids::ALICE)?;
-    let directory_namespace = directory.namespace();
+    let pms_namespace = pms.namespace();
     first.create_namespace(ids::ALICE, ids::ALICE).await?;
     first
         .write(ids::ALICE, ids::ALICE, author, &path, payload)
@@ -49,9 +49,9 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
             AddrInfoOptions::Addresses,
         )
         .await?;
-    directory.put_ticket("data", &data_ticket).await?;
+    pms.put_ticket("data", &data_ticket).await?;
     first.shutdown().await?;
-    drop(directory);
+    drop(pms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
@@ -61,13 +61,13 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         "the node id must come from the stored key"
     );
     second.provision_identity(ids::ALICE).await?;
-    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, directory_namespace)
+    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, pms_namespace)
         .await?
-        .expect("the respawned store must still hold the directory replica");
+        .expect("the respawned store must still hold the PMS replica");
     second.host_identity(ids::ALICE, &reopened)?;
     assert!(
         reopened.list_devices().await?.contains(&first_id),
-        "the directory's device set must survive the respawn"
+        "the PMS's device set must survive the respawn"
     );
     let stored_ticket = reopened
         .get_ticket("data")
@@ -96,7 +96,7 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         "a fresh node must refuse the issuer as unknown"
     );
     assert!(
-        PrivateMetadataStore::open(&fresh, ids::ALICE, directory_namespace)
+        PrivateMetadataStore::open(&fresh, ids::ALICE, pms_namespace)
             .await?
             .is_none(),
         "a replica this store never held must be reported absent, not as a failure to open"
@@ -117,8 +117,8 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     let path = EntryPath::new("contact/email")?;
 
     let first = node_on(dir.path()).await?;
-    let directory = host_identity(&first, ids::ALICE).await?;
-    let directory_namespace = directory.namespace();
+    let pms = host_identity(&first, ids::ALICE).await?;
+    let pms_namespace = pms.namespace();
     first.create_namespace(ids::ALICE, ids::ALICE).await?;
     let author = first.default_author(ids::ALICE)?;
     first
@@ -132,16 +132,16 @@ async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
             AddrInfoOptions::Addresses,
         )
         .await?;
-    directory.put_ticket("data", &ticket).await?;
+    pms.put_ticket("data", &ticket).await?;
     first.shutdown().await?;
-    drop(directory);
+    drop(pms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
     second.provision_identity(ids::ALICE).await?;
-    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, directory_namespace)
+    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, pms_namespace)
         .await?
-        .expect("the respawned store must still hold the directory replica");
+        .expect("the respawned store must still hold the PMS replica");
     second.host_identity(ids::ALICE, &reopened)?;
     let stored_ticket = reopened
         .get_ticket("data")
@@ -191,9 +191,9 @@ async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let first = node_on(dir.path()).await?;
-    let work_dir = host_identity(&first, ids::ALICE_AT_WORK).await?;
-    let leisure_dir = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
-    let (work_namespace, leisure_namespace) = (work_dir.namespace(), leisure_dir.namespace());
+    let work_pms = host_identity(&first, ids::ALICE_AT_WORK).await?;
+    let leisure_pms = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
+    let (work_namespace, leisure_namespace) = (work_pms.namespace(), leisure_pms.namespace());
     let work_author = first.default_author(ids::ALICE_AT_WORK)?;
     let leisure_author = first.default_author(ids::ALICE_AT_LEISURE)?;
     assert_ne!(
@@ -201,8 +201,8 @@ async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
         "two identities of one node wrote under one author"
     );
     first.shutdown().await?;
-    drop(work_dir);
-    drop(leisure_dir);
+    drop(work_pms);
+    drop(leisure_pms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
@@ -213,7 +213,7 @@ async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
         second.provision_identity(identity).await?;
         let reopened = PrivateMetadataStore::open(&second, identity, namespace)
             .await?
-            .expect("the respawned store must still hold the directory replica");
+            .expect("the respawned store must still hold the PMS replica");
         second.host_identity(identity, &reopened)?;
         assert_eq!(
             second.default_author(identity)?,
@@ -255,7 +255,7 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     );
 
     let first = node_on(dir.path()).await?;
-    let directory = host_identity(&first, ids::ALICE).await?;
+    let pms = host_identity(&first, ids::ALICE).await?;
     let own_node = first.node_id();
     let cms = ConnectionMetadataStore::create(&first, ids::ALICE).await?;
     let counterpart = ConnectionMetadataStore::create(&first, ids::ALICE).await?;
@@ -264,20 +264,28 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     let ticket = cms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let directory_ticket = directory
+    let pms_ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
 
     // A sibling device of the same identity writes the withdrawn device's
     // record, so it stands under another author than the tombstone below.
     let sibling = test_utils::memory_node().await?;
-    let sibling_dir = test_utils::join_identity(&sibling, ids::ALICE, directory_ticket).await?;
-    directory.add_device(sibling.node_id()).await?;
-    sibling_dir.add_device(sibling.node_id()).await?;
-    let sibling_cms = ConnectionMetadataStore::import(&sibling, ids::ALICE, ticket.clone()).await?;
+    let sibling_pms = test_utils::join_identity(&sibling, ids::ALICE, pms_ticket).await?;
+    pms.add_device(sibling.node_id()).await?;
+    sibling_pms.add_device(sibling.node_id()).await?;
+    let sibling_connection =
+        ConnectionMetadataStore::import(&sibling, ids::ALICE, ticket.clone()).await?;
     let sibling_counterpart = ConnectionMetadataStore::create(&sibling, ids::ALICE).await?;
-    sibling.host_connection(ids::ALICE, ids::BOB, &sibling_cms, &sibling_counterpart)?;
-    sibling_cms.ensure_device_published(withdrawn).await?;
+    sibling.host_connection(
+        ids::ALICE,
+        ids::BOB,
+        &sibling_connection,
+        &sibling_counterpart,
+    )?;
+    sibling_connection
+        .ensure_device_published(withdrawn)
+        .await?;
     assert!(
         test_utils::eventually(|| async {
             Ok(cms.published_devices().await?.contains(&withdrawn))
@@ -286,7 +294,7 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
         "the sibling's record never reached this replica"
     );
     sibling.shutdown().await?;
-    drop(sibling_cms);
+    drop(sibling_connection);
     drop(sibling);
     first.shutdown().await?;
     drop(cms);
@@ -319,7 +327,7 @@ async fn a_second_node_on_a_held_directory_is_refused_by_name() -> Result<()> {
     let path = EntryPath::new("contact/email")?;
 
     let running = node_on(dir.path()).await?;
-    let _directory = host_identity(&running, ids::ALICE).await?;
+    let _pms = host_identity(&running, ids::ALICE).await?;
     running.create_namespace(ids::ALICE, ids::ALICE).await?;
     let author = running.default_author(ids::ALICE)?;
 
@@ -348,7 +356,7 @@ async fn a_second_node_on_a_held_directory_is_refused_by_name() -> Result<()> {
 
 /// A key file that cannot be parsed stops the start with an error naming
 /// it, and the file is left exactly as it was — never a regenerated key,
-/// which would silently change the node id the directory's records and
+/// which would silently change the node id the PMS's records and
 /// tickets all name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_key_file_stops_the_start_and_is_not_replaced() -> Result<()> {
@@ -438,33 +446,33 @@ async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
 }
 
 /// A device record rewritten after a restart replaces its predecessor
-/// instead of accreting beside it under a second author: the directory
+/// instead of accreting beside it under a second author: the PMS
 /// writes with its identity's one author — the half a store that minted
 /// its own author would break invisibly, since every product read is
 /// latest-wins. The denial beside it: a record under a separate author does
 /// accrete, so the count is an instrument and not a constant.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result<()> {
+async fn a_pms_rewritten_after_a_restart_keeps_one_live_record() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let first = node_on(dir.path()).await?;
     let device = first.node_id();
-    let directory = host_identity(&first, ids::ALICE).await?;
-    let namespace = directory.namespace();
+    let pms = host_identity(&first, ids::ALICE).await?;
+    let namespace = pms.namespace();
     assert_eq!(
-        directory.live_device_record_count(device).await?,
+        pms.live_device_record_count(device).await?,
         1,
         "the first write must leave one record"
     );
     first.shutdown().await?;
-    drop(directory);
+    drop(pms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
     second.provision_identity(ids::ALICE).await?;
     let reopened = PrivateMetadataStore::open(&second, ids::ALICE, namespace)
         .await?
-        .expect("the respawned store must still hold the directory replica");
+        .expect("the respawned store must still hold the PMS replica");
     second.host_identity(ids::ALICE, &reopened)?;
     reopened.add_device(device).await?;
     assert_eq!(
@@ -489,7 +497,7 @@ async fn a_directory_rewritten_after_a_restart_keeps_one_live_record() -> Result
 }
 
 /// A start finds exactly the identities whose hosting was recorded, each
-/// with its directory's namespace and its replica store. Denied: an
+/// with its PMS's namespace and its replica store. Denied: an
 /// identity provisioned and never recorded is not listed, and neither is
 /// one whose record the disk refused — a read-only subdirectory, the
 /// closest stand-in for a full disk at the commit point.
@@ -523,7 +531,7 @@ async fn a_start_finds_the_identities_whose_hosting_was_recorded() -> Result<()>
         second.recorded_hosting()?,
         vec![RecordedHosting {
             identity: ids::ALICE_AT_WORK,
-            directory: work.namespace(),
+            pms: work.namespace(),
             store_present: true,
         }],
         "a start must find the recorded identity and nothing else"
@@ -544,7 +552,7 @@ async fn a_pod_imports_onto_its_replicas_after_a_respawn() -> Result<()> {
     ]);
 
     let first = node_on(dir.path()).await?;
-    let _directory = host_identity(&first, ids::ALICE).await?;
+    let _pms = host_identity(&first, ids::ALICE).await?;
     first.create_pod(ids::ALICE, family).await?;
     let tickets = first
         .share_pod_tickets(ids::ALICE, family, AddrInfoOptions::Addresses)
@@ -610,8 +618,8 @@ async fn append(on: &SyncNode, writer: PdnId, pod: PodId, note: &RecordRef) -> R
 async fn an_operation_sequence_continues_after_a_respawn() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let first = node_on(dir.path()).await?;
-    let (bob, _directory) = c::host(&first).await?;
-    let pod = c::found(&first, &bob).await?;
+    let (bob, _pms) = c::host(&first).await?;
+    let pod = c::create(&first, &bob).await?;
     let note = RecordRef {
         member: bob.id,
         kind: RecordKind::MergeableDocument,

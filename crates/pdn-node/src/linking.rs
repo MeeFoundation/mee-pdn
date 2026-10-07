@@ -1,13 +1,13 @@
 //! The device-linking protocol (ADR-0012): establishment's shape on a
 //! dedicated ALPN — separate from pairing's because the stakes differ (a
-//! whole-directory write ticket versus per-connection read tickets), so the
+//! whole-PMS write ticket versus per-connection read tickets), so the
 //! two wire formats evolve independently. The inviter verifies-and-burns
 //! before any state change, registers the newcomer as pending under the
 //! connection's authenticated node id, and replies with fresh write tickets
-//! to the directory and the data namespace. Pending confers nothing; the
+//! to the PMS and the data namespace. Pending confers nothing; the
 //! newcomer confirms itself once the tickets are in hand, since only a
-//! holder of the directory's write ticket can, which is evidence the reply
-//! arrived. The dial side arms classification the moment the directory is
+//! holder of the PMS's write ticket can, which is evidence the reply
+//! arrived. The dial side arms classification the moment the PMS is
 //! imported — before the data namespace exists, so no serving window opens
 //! on the long-lived namespace id — and rolls everything back on any
 //! failure after the import.
@@ -97,7 +97,7 @@ pub struct LinkingInProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkingLocalFailure {
     PendingDeviceWrite { identity: PdnId, newcomer: NodeId },
-    DirectoryTicketMint { identity: PdnId, newcomer: NodeId },
+    PmsTicketMint { identity: PdnId, newcomer: NodeId },
     DataTicketMint { identity: PdnId, newcomer: NodeId },
 }
 
@@ -111,10 +111,10 @@ struct LinkingRequest {
 }
 
 /// Both minted fresh from local replicas: the ceremony reads nothing through
-/// directory ticket entries, so no payload wait sits in the critical path.
+/// PMS ticket entries, so no payload wait sits in the critical path.
 #[derive(Debug, Serialize, Deserialize)]
 struct LinkingResponse {
-    directory: DocTicket,
+    pms: DocTicket,
     data: DocTicket,
 }
 
@@ -167,15 +167,15 @@ impl LinkingHandler {
             } else {
                 false
             };
-            let directory = &state.hosted(identity).ok()?.directory;
+            let pms = &state.hosted(identity).ok()?.pms;
             #[cfg(feature = "test-util")]
             let pending_write = if inject_pending_write_failure {
                 Err(anyhow::anyhow!("injected pending-device storage failure"))
             } else {
-                directory.add_pending_device(newcomer).await
+                pms.add_pending_device(newcomer).await
             };
             #[cfg(not(feature = "test-util"))]
-            let pending_write = directory.add_pending_device(newcomer).await;
+            let pending_write = pms.add_pending_device(newcomer).await;
             if let Err(err) = pending_write {
                 let _ = state
                     .linking_failures
@@ -186,7 +186,7 @@ impl LinkingHandler {
 
             // Every device that can mint an invite hosts both replicas —
             // the first by creation, every further one by its own reply.
-            let directory_ticket = match directory
+            let pms_ticket = match pms
                 .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
                 .await
             {
@@ -194,8 +194,8 @@ impl LinkingHandler {
                 Err(err) => {
                     let _ = state
                         .linking_failures
-                        .send(LinkingLocalFailure::DirectoryTicketMint { identity, newcomer });
-                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the directory ticket: {err:#}");
+                        .send(LinkingLocalFailure::PmsTicketMint { identity, newcomer });
+                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the PMS ticket: {err:#}");
                     return None;
                 }
             };
@@ -219,7 +219,7 @@ impl LinkingHandler {
                 }
             };
             LinkingResponse {
-                directory: directory_ticket,
+                pms: pms_ticket,
                 data,
             }
         };
@@ -318,17 +318,17 @@ async fn link_via_dialogue_inner(
     // `state` itself, so a detached rollback can call it.
     let rollback_state = Arc::clone(state);
     let mut rollback;
-    let (directory, catch_up) = {
+    let (pms, catch_up) = {
         let state_guard = state.lock().await;
-        let mut directory_ticket = response.directory;
-        directory_ticket.nodes.push(payload.inviter_addr.clone());
+        let mut pms_ticket = response.pms;
+        pms_ticket.nodes.push(payload.inviter_addr.clone());
         // The identity's own half of the node, brought up by this link and
         // dropped whole if it fails (ADR-0013).
         state_guard
             .node
             .provision_identity(payload.identity)
             .await?;
-        // Armed before the directory exists: an inviter whose ticket does
+        // Armed before the PMS exists: an inviter whose ticket does
         // not import would otherwise leave that half of the node standing.
         rollback = LinkRollbackGuard::new(
             rollback_state,
@@ -336,37 +336,34 @@ async fn link_via_dialogue_inner(
             rollback_owns_cleanup,
             cleanup_tasks,
         );
-        let directory = match PrivateMetadataStore::import(
-            &state_guard.node,
-            payload.identity,
-            directory_ticket,
-        )
-        .await
-        {
-            Ok(directory) => directory,
-            Err(err) => {
-                drop(state_guard);
-                undo_link(state, payload.identity, None, None).await;
-                rollback.disarm();
-                return Err(err);
-            }
-        };
-        rollback.armed_directory(directory.namespace());
-        // Before the arming starts the directory's sync.
-        let catch_up = match directory.watch_catch_up().await {
+        let pms =
+            match PrivateMetadataStore::import(&state_guard.node, payload.identity, pms_ticket)
+                .await
+            {
+                Ok(pms) => pms,
+                Err(err) => {
+                    drop(state_guard);
+                    undo_link(state, payload.identity, None, None).await;
+                    rollback.disarm();
+                    return Err(err);
+                }
+            };
+        rollback.armed_pms(pms.namespace());
+        // Before the arming starts the PMS's sync.
+        let catch_up = match pms.watch_catch_up().await {
             Ok(catch_up) => catch_up,
             Err(err) => {
                 drop(state_guard);
-                undo_link(state, payload.identity, Some(directory.namespace()), None).await;
+                undo_link(state, payload.identity, Some(pms.namespace()), None).await;
                 rollback.disarm();
                 return Err(err);
             }
         };
         // The book refuses callers it cannot resolve while it catches up,
         // so no serving window opens on the long-lived namespace id.
-        if let Err(err) = state_guard.node.host_identity(payload.identity, &directory) {
+        if let Err(err) = state_guard.node.host_identity(payload.identity, &pms) {
             drop(state_guard);
-            undo_link(state, payload.identity, Some(directory.namespace()), None).await;
+            undo_link(state, payload.identity, Some(pms.namespace()), None).await;
             rollback.disarm();
             return Err(err);
         }
@@ -378,12 +375,12 @@ async fn link_via_dialogue_inner(
             Ok(data_import) => rollback.set_data_import(data_import),
             Err(err) => {
                 drop(state_guard);
-                undo_link(state, payload.identity, Some(directory.namespace()), None).await;
+                undo_link(state, payload.identity, Some(pms.namespace()), None).await;
                 rollback.disarm();
                 return Err(err);
             }
         }
-        (directory, catch_up)
+        (pms, catch_up)
     };
 
     #[cfg(feature = "test-util")]
@@ -397,16 +394,16 @@ async fn link_via_dialogue_inner(
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if let Err(err) = catch_up.wait(remaining).await {
         rollback.roll_back().await;
-        return Err(err).context("the imported directory did not catch up in time");
+        return Err(err).context("the imported PMS did not catch up in time");
     }
-    if let Err(err) = directory.cleanup_pending_devices().await {
+    if let Err(err) = pms.cleanup_pending_devices().await {
         rollback.roll_back().await;
         return Err(err).context("pending-device cleanup failed after import");
     }
 
     // The armer's subscription, taken before the commit point so the commit
     // is the last thing that can fail.
-    let changes = match directory.changes().await {
+    let changes = match pms.changes().await {
         Ok(changes) => changes,
         Err(err) => {
             rollback.roll_back().await;
@@ -421,7 +418,7 @@ async fn link_via_dialogue_inner(
     }
 
     // The commit point: after the catch-up, before this device confirms its
-    // own record in the directory it now shares — a failure rolls the link
+    // own record in the PMS it now shares — a failure rolls the link
     // back whole, and no sibling ever sees this device confirmed.
     let mut guard = state.lock().await;
     let author = match guard.node.default_author(payload.identity) {
@@ -433,7 +430,7 @@ async fn link_via_dialogue_inner(
         }
     };
     if let Err(err) = guard
-        .commit_hosting(payload.identity, directory.namespace())
+        .commit_hosting(payload.identity, pms.namespace())
         .await
     {
         drop(guard);
@@ -442,7 +439,7 @@ async fn link_via_dialogue_inner(
     }
     guard
         .identities
-        .insert(payload.identity, HostedIdentity { directory, author });
+        .insert(payload.identity, HostedIdentity { pms, author });
     // Past the commit point the link stands: a failure below does not fail
     // it, so a cancellation must not undo it either, and the armer starts
     // before the one await that could be cancelled.
@@ -473,7 +470,7 @@ async fn link_via_dialogue_inner(
         tracing::warn!(
             identity = %payload.identity,
             %own_device,
-            "the linked device is not confirmed in the directory yet; the sweep repeats it: {err:#}"
+            "the linked device is not confirmed in the PMS yet; the sweep repeats it: {err:#}"
         );
     }
     drop(guard);
@@ -538,10 +535,10 @@ impl Drop for LinkingReservation {
 struct LinkRollbackGuard {
     state: Arc<Mutex<State>>,
     identity: PdnId,
-    /// `None` until the directory is imported: the identity's half of the
+    /// `None` until the PMS is imported: the identity's half of the
     /// node comes up before it, and that half is the first thing a failure
     /// has to take back down.
-    directory_namespace: Option<NamespaceId>,
+    pms_namespace: Option<NamespaceId>,
     data_import: Option<SelfCleaningImport>,
     owns_reservation_cleanup: Arc<AtomicBool>,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
@@ -561,7 +558,7 @@ impl LinkRollbackGuard {
         Self {
             state,
             identity,
-            directory_namespace: None,
+            pms_namespace: None,
             data_import: None,
             owns_reservation_cleanup,
             cleanup_tasks,
@@ -569,8 +566,8 @@ impl LinkRollbackGuard {
         }
     }
 
-    fn armed_directory(&mut self, namespace: NamespaceId) {
-        self.directory_namespace = Some(namespace);
+    fn armed_pms(&mut self, namespace: NamespaceId) {
+        self.pms_namespace = Some(namespace);
     }
 
     fn set_data_import(&mut self, data_import: NamespaceImport) {
@@ -587,13 +584,7 @@ impl LinkRollbackGuard {
 
     async fn roll_back(&mut self) {
         let data_import = self.take_data_import();
-        undo_link(
-            &self.state,
-            self.identity,
-            self.directory_namespace,
-            data_import,
-        )
-        .await;
+        undo_link(&self.state, self.identity, self.pms_namespace, data_import).await;
         self.disarm();
     }
 
@@ -618,11 +609,11 @@ impl Drop for LinkRollbackGuard {
         }
         let state = Arc::clone(&self.state);
         let identity = self.identity;
-        let directory_namespace = self.directory_namespace;
+        let pms_namespace = self.pms_namespace;
         let data_import = self.data_import.take();
         let owns_reservation_cleanup = Arc::clone(&self.owns_reservation_cleanup);
         self.cleanup_tasks.spawn(async move {
-            undo_link(&state, identity, directory_namespace, data_import).await;
+            undo_link(&state, identity, pms_namespace, data_import).await;
             state.lock().await.linking_in_flight.remove(&identity);
             owns_reservation_cleanup.store(false, Ordering::Release);
         });
@@ -717,7 +708,7 @@ async fn run_linking_dialogue(
 }
 
 /// Undo an abandoned link's local effects, best-effort: the data import,
-/// the directory, then the identity's half of the node, whose removal
+/// the PMS, then the identity's half of the node, whose removal
 /// disarms it. The link brought up that half, so dropping it reaches
 /// exactly what the link imported and nothing else: a namespace of the same
 /// issuer held under another identity's grant is in that identity's stores
@@ -726,15 +717,15 @@ async fn run_linking_dialogue(
 async fn undo_link(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
-    directory_namespace: Option<NamespaceId>,
+    pms_namespace: Option<NamespaceId>,
     data_import: Option<SelfCleaningImport>,
 ) {
     if let Some(import) = data_import {
         import.undo().await;
     }
     let state = state.lock().await;
-    if let Some(directory) = directory_namespace {
-        let _ = state.node.forget_doc(identity, directory).await;
+    if let Some(pms) = pms_namespace {
+        let _ = state.node.forget_doc(identity, pms).await;
     }
     let _ = state.node.unhost_identity(identity).await;
 }

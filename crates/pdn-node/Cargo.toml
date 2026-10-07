@@ -22,7 +22,7 @@ test-util = ["data-layer/test-util"]
 [dependencies]
 anyhow = "1"
 data-layer = { path = "../data-layer" }
-# Consuming data-layer's directory-changes stream (the connection armer).
+# Consuming data-layer's PMS change stream (the connection armer).
 futures-lite = "2"
 pdn-types = { path = "../pdn-types" }
 # Wire messages of the pairing dialogue.
@@ -43,7 +43,7 @@ tracing = { workspace = true }
 # The retraction event's content hash is the payload's blake3 hash, and a
 # scenario asserts it against the bytes it wrote.
 blake3 = "1.8"
-# Scenario tests probe an identity's directory by running the linking
+# Scenario tests probe an identity's PMS by running the linking
 # dialogue raw against a bare node — the store-level view of what the
 # ceremonies published, and the pin on the linking wire format.
 data-layer = { path = "../data-layer" }

@@ -99,7 +99,7 @@ fn by_id(mut writers: Vec<PdnId>) -> Vec<PdnId> {
 fn the_issuers_claim_reads_and_another_members_entry_at_its_key_does_not() {
     let cast = Cast::new();
     let (alice, bob) = (&cast.alice, &cast.bob);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     let mut records = Records::default();
     let own = records.put(claim(alice, 1, 1), alice.author());
@@ -127,7 +127,7 @@ fn the_issuers_claim_reads_and_another_members_entry_at_its_key_does_not() {
 fn an_immutable_document_reads_from_its_member_and_not_from_an_owner() {
     let cast = Cast::new();
     let (alice, bob) = (&cast.alice, &cast.bob);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     let mut records = Records::default();
     let bobs = records.put(scan(bob, 1, 1), bob.author());
@@ -152,7 +152,7 @@ fn an_immutable_document_reads_from_its_member_and_not_from_an_owner() {
 fn any_member_edits_another_members_mergeable_document() {
     let cast = Cast::new();
     let (alice, bob, carol) = (&cast.alice, &cast.bob, &cast.carol);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     store.invite(alice, 1, carol);
     let mut records = Records::default();
@@ -180,7 +180,7 @@ fn any_member_edits_another_members_mergeable_document() {
 fn an_operation_reads_as_the_writer_its_key_names() {
     let cast = Cast::new();
     let (alice, bob) = (&cast.alice, &cast.bob);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     let claiming = store.statement(bob, 2, &[bob.device, alice.device], bob.author());
     let mut records = Records::default();
@@ -193,23 +193,23 @@ fn an_operation_reads_as_the_writer_its_key_names() {
 }
 
 /// A departed member's operation naming a sequence at which it was a member
-/// reads after its kick, and after it joins again beside its new one.
-/// Paired denial: its operation naming the kick's own sequence is read by
+/// reads after its removal, and after it joins again beside its new one.
+/// Paired denial: its operation naming the removal's own sequence is read by
 /// nothing.
 #[test]
-fn a_departed_members_earlier_operation_reads_and_one_naming_its_kick_does_not() {
+fn a_departed_members_earlier_operation_reads_and_one_naming_its_removal_does_not() {
     let cast = Cast::new();
     let (alice, carol) = (&cast.alice, &cast.carol);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, carol);
-    store.act(EventKind::Kicked, carol, 2, alice, 1);
+    store.act(EventKind::Removed, carol, 2, alice, 1);
     let mut records = Records::default();
     let earlier = records.put(op(alice, 1, carol, carol.author(), 1), carol.author());
-    let at_kick = records.put(op(alice, 2, carol, carol.author(), 2), carol.author());
-    let claim_at_kick = records.put(claim(carol, 3, 2), carol.author());
+    let at_removal = records.put(op(alice, 2, carol, carol.author(), 2), carol.author());
+    let claim_at_removal = records.put(claim(carol, 3, 2), carol.author());
     let view = records.view(&store);
     assert_eq!(verdict(&view, earlier), Verdict::Counted);
-    for entry in [at_kick, claim_at_kick] {
+    for entry in [at_removal, claim_at_removal] {
         assert_eq!(verdict(&view, entry), nothing(ForNothing::ActorLacksState));
     }
 
@@ -220,7 +220,7 @@ fn a_departed_members_earlier_operation_reads_and_one_naming_its_kick_does_not()
         assert_eq!(verdict(&view, entry), Verdict::Counted);
     }
     assert_eq!(
-        verdict(&view, at_kick),
+        verdict(&view, at_removal),
         nothing(ForNothing::ActorLacksState)
     );
     let note = op(alice, 1, carol, carol.author(), 1).record();
@@ -236,7 +236,7 @@ fn a_departed_members_earlier_operation_reads_and_one_naming_its_kick_does_not()
 fn an_entry_ahead_of_what_it_names_reads_once_that_arrives() {
     let cast = Cast::new();
     let (alice, bob, dave) = (&cast.alice, &cast.bob, &cast.dave);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     let mut records = Records::default();
     let daves = records.put(op(alice, 1, dave, dave.author(), 1), dave.author());
@@ -278,7 +278,7 @@ fn an_entry_ahead_of_what_it_names_reads_once_that_arrives() {
 fn an_entry_at_another_writers_operation_key_reads_nothing() {
     let cast = Cast::new();
     let (alice, bob, carol) = (&cast.alice, &cast.bob, &cast.carol);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     store.invite(alice, 1, carol);
     let mut records = Records::default();
@@ -298,7 +298,7 @@ fn an_entry_at_another_writers_operation_key_reads_nothing() {
 fn entries_before_a_chain_or_outside_the_layout_read_nothing() {
     let cast = Cast::new();
     let (alice, bob) = (&cast.alice, &cast.bob);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     let mut records = Records::default();
     let read = records.put(claim(bob, 1, 1), bob.author());
@@ -322,7 +322,7 @@ fn entries_before_a_chain_or_outside_the_layout_read_nothing() {
 fn entries_in_any_order_read_the_same() {
     let cast = Cast::new();
     let (alice, bob, carol) = (&cast.alice, &cast.bob, &cast.carol);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     store.invite(bob, 1, carol);
     let mut records = Records::default();
@@ -356,7 +356,7 @@ fn entries_in_any_order_read_the_same() {
 fn the_next_operation_sequence_is_one_above_the_authors_highest_held() {
     let cast = Cast::new();
     let (alice, bob) = (&cast.alice, &cast.bob);
-    let mut store = Store::founded_by(alice);
+    let mut store = Store::created_by(alice);
     store.invite(alice, 1, bob);
     let numbered = |writer: &Person, id: u8, mseq: u64, op_seq: u64| RecordKey::Operation {
         member: bob.id(),

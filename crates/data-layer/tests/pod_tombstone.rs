@@ -17,7 +17,7 @@ use pdn_types::PodId;
 use test_utils::{
     join_identity,
     pod::{
-        device_of, found, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
+        create, device_of, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
         state_on, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -133,14 +133,14 @@ async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
     Ok(false)
 }
 
-/// A device offline while its member is kicked learns of the kick at its
-/// first session with a member device, taking the kick and what it rests
-/// on. Denied: a membership event outside the kick's past and a record
+/// A device offline while its member is removed learns of the removal at its
+/// first session with a member device, taking the removal and what it rests
+/// on. Denied: a membership event outside the removal's past and a record
 /// placed after it reach the device from no member device, the record
 /// store refused to it.
-#[allow(clippy::too_many_lines)] // one scenario: the kick while offline, the return and each denial
+#[allow(clippy::too_many_lines)] // one scenario: the removal while offline, the return and each denial
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing_after(
+async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_nothing_after(
 ) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (alice_phone, bob_phone) = (node(QUIET).await?, node(QUIET).await?);
@@ -148,7 +148,7 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -168,7 +168,7 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     carol_phone.shutdown().await?;
     drop(carol_phone);
 
-    depart(&alice_phone, &carol, pod, EventKind::Kicked, &alice, 2).await?;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
     let dave = Person::generate();
     invite(&bob_phone, &bob, pod, &dave, vec![nowhere(0xd0)]).await?;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
@@ -181,7 +181,7 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     carol_phone.import_pod(carol.id, pod, tickets).await?;
     assert!(
         lists(&carol_phone, carol.id, pod, carol.id, OUT).await?,
-        "the device did not learn of its member's kick"
+        "the device did not learn of its member's removal"
     );
     let mut records = carol_phone
         .watch_pod_sessions(carol.id, pod, PodStore::Records)
@@ -198,10 +198,10 @@ async fn a_device_offline_during_its_members_kick_learns_of_the_kick_and_nothing
     let refused = records
         .next_with(bob_phone.node_id(), true, TIMEOUT)
         .await?;
-    // Denied: the record store, and everything outside the kick's past.
+    // Denied: the record store, and everything outside the removal's past.
     assert!(
         refused.is_some_and(|session| session.exchanged.is_err()),
-        "a member device served the kicked member's record store"
+        "a member device served the removed member's record store"
     );
     assert!(!knows(&carol_phone, &carol, pod, &dave).await?);
     assert!(holds_no_record(&carol_phone, carol.id, pod).await?);
@@ -225,7 +225,7 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -329,7 +329,7 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -409,7 +409,7 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -501,7 +501,7 @@ async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_sho
     let (alice_phone, carol_phone) = (node(QUIET).await?, node(POD_RUN).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     let carols = vec![device_of(&carol_phone, &carol)?];
     invite(&alice_phone, &alice, pod, &carol, carols).await?;
     let from_alice = tickets(&alice_phone, &alice, pod).await?;
@@ -535,26 +535,26 @@ async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_sho
     Ok(())
 }
 
-/// A person hosted on `phone`, its directory listing `laptop` as a device
+/// A person hosted on `phone`, its PMS listing `laptop` as a device
 /// of its own too, and the laptop joined to it.
 async fn linked(phone: &SyncNode, laptop: &SyncNode) -> Result<(Person, PrivateMetadataStore)> {
-    let (person, directory) = host(phone).await?;
-    directory.add_device(laptop.node_id()).await?;
-    let ticket = directory
+    let (person, pms) = host(phone).await?;
+    pms.add_device(laptop.node_id()).await?;
+    let ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(laptop, person.id, ticket).await?;
-    assert!(wait_devices(&laptop_directory, &[phone.node_id(), laptop.node_id()]).await?);
-    Ok((person, directory))
+    let laptop_pms = join_identity(laptop, person.id, ticket).await?;
+    assert!(wait_devices(&laptop_pms, &[phone.node_id(), laptop.node_id()]).await?);
+    Ok((person, pms))
 }
 
-/// A kicked member's record from while a member reads on a device linked
-/// after the kick, and once invited again the member writes under its new
+/// A removed member's record from while a member reads on a device linked
+/// after the removal, and once invited again the member writes under its new
 /// sequence, both records reading as its own on every device. Denied: its
-/// device is refused the record store between the kick and the new join.
-#[allow(clippy::too_many_lines)] // one scenario: the kick, the late device and the return
+/// device is refused the record store between the removal and the new join.
+#[allow(clippy::too_many_lines)] // one scenario: the removal, the late device and the return
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Result<()> {
+async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> Result<()> {
     let (alice_phone, bob_phone, bob_laptop, carol_phone) = (
         node(QUIET).await?,
         node(QUIET).await?,
@@ -562,9 +562,9 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
         node(QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, bob_directory) = host(&bob_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -585,10 +585,10 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
     let earlier = place_claim(&carol_phone, &carol, pod, 1).await?;
     assert!(reads(&bob_phone, bob.id, pod, earlier).await?);
 
-    depart(&alice_phone, &carol, pod, EventKind::Kicked, &alice, 2).await?;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
     assert!(lists(&bob_phone, bob.id, pod, carol.id, OUT).await?);
     assert!(lists(&carol_phone, carol.id, pod, carol.id, OUT).await?);
-    // Denied: Carol's device, on the record store, while kicked.
+    // Denied: Carol's device, on the record store, while removed.
     let mut carols = carol_phone
         .watch_pod_sessions(carol.id, pod, PodStore::Records)
         .await?;
@@ -604,12 +604,12 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
     let refused = carols.next_with(bob_phone.node_id(), true, TIMEOUT).await?;
     assert!(refused.is_some_and(|session| session.exchanged.is_err()));
 
-    // Bob's laptop, linked after the kick, reads Carol's earlier record.
-    bob_directory.add_device(bob_laptop.node_id()).await?;
-    let directory_ticket = bob_directory
+    // Bob's laptop, linked after the removal, reads Carol's earlier record.
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    let pms_ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    join_identity(&bob_laptop, bob.id, directory_ticket).await?;
+    join_identity(&bob_laptop, bob.id, pms_ticket).await?;
     let bobs = MembershipKey::Devices {
         member: bob.id,
         version: 2,
@@ -687,32 +687,31 @@ async fn a_kicked_member_reads_as_itself_before_and_after_it_joins_again() -> Re
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leave_dated_before_its_join_still_ends_holding_on_every_device() -> Result<()> {
     let (carol_phone, carol_laptop) = (node(QUIET).await?, node(QUIET).await?);
-    let (carol, phone_directory) = host(&carol_phone).await?;
-    phone_directory.add_device(carol_laptop.node_id()).await?;
-    let ticket = phone_directory
+    let (carol, phone_pms) = host(&carol_phone).await?;
+    phone_pms.add_device(carol_laptop.node_id()).await?;
+    let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
-    let laptop_directory = join_identity(&carol_laptop, carol.id, ticket).await?;
+    let laptop_pms = join_identity(&carol_laptop, carol.id, ticket).await?;
     let both = [carol_phone.node_id(), carol_laptop.node_id()];
-    assert!(wait_devices(&laptop_directory, &both).await?);
+    assert!(wait_devices(&laptop_pms, &both).await?);
     let pod = PodId::from_bytes([0x9c; 16]);
 
-    laptop_directory.tombstone_pod(pod, Seq::new(2)).await?;
-    phone_directory.record_pod(pod, Seq::FIRST).await?;
-    for directory in [&phone_directory, &laptop_directory] {
+    laptop_pms.tombstone_pod(pod, Seq::new(2)).await?;
+    phone_pms.record_pod(pod, Seq::FIRST).await?;
+    for pms in [&phone_pms, &laptop_pms] {
         assert!(
             test_utils::eventually(|| async {
-                Ok(directory.held_pods().await?.is_empty()
-                    && directory.departed_pods().await? == [pod])
+                Ok(pms.held_pods().await?.is_empty() && pms.departed_pods().await? == [pod])
             })
             .await?,
             "the leave lost to a join dated after it"
         );
     }
-    phone_directory.record_pod(pod, Seq::new(3)).await?;
-    for directory in [&phone_directory, &laptop_directory] {
+    phone_pms.record_pod(pod, Seq::new(3)).await?;
+    for pms in [&phone_pms, &laptop_pms] {
         assert!(
-            test_utils::eventually(|| async { Ok(directory.held_pods().await? == [pod]) }).await?,
+            test_utils::eventually(|| async { Ok(pms.held_pods().await? == [pod]) }).await?,
             "the join after the leave did not hold the pod again"
         );
     }
