@@ -1,8 +1,7 @@
 # The flaky hunt, run without anyone deciding to look: one job per suite —
-# the container stand's, the in-process scenarios', and the store's tests
-# marked flaky. Beside the hunt, the dependency audit — deny.toml's policy
-# over the tree, rechecked nightly because the advisory database moves
-# while the repository stands still.
+# the container stand's and the in-process scenarios'. Beside the hunt, the
+# dependency audit — deny.toml's policy over the tree, rechecked nightly
+# because the advisory database moves while the repository stands still.
 #
 # Both cost seconds per test and pass on any given run; the failures worth
 # finding here show up once in tens or hundreds of them, which no pull
@@ -25,9 +24,6 @@ on:
       scenario_iterations:
         description: "How many times to repeat the in-process scenarios"
         default: "15"
-      store_iterations:
-        description: "How many times to repeat the store's tests marked flaky"
-        default: "10"
 
 jobs:
   # deny.toml's policy over the dependency tree: RustSec advisories, license
@@ -122,36 +118,8 @@ jobs:
       # `--no-fail-fast` for the reason the container hunt has it: an early
       # failure must not cancel the remaining repeats, or one flake hides
       # how often it happens and whether anything else fails too. The
-      # selection is the recipe's own default — the scenario tests, with the
-      # stand's container binaries skipped as they are everywhere else.
+      # selection is the recipe's own default — the scenario tests, the
+      # store's integration tests among them, with the stand's container
+      # binaries skipped as they are everywhere else.
       - name: Hunt the in-process scenarios
         run: just stress --stress-count "${{ github.event.inputs.scenario_iterations || '15' }}" --no-fail-fast
-
-  # The store's tests marked `#[ignore = "flaky"]`: skipped by every ordinary
-  # run for the reason the attribute gives, and run here, where a failure is
-  # what is being looked for rather than a red pull request. `-p` narrows the
-  # recipe's selection to the store; `ignored-only` then keeps just the marked
-  # tests.
-  store-flaky:
-    needs: dependency-audit
-    runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install
-
-      - name: Install just + nextest
-        uses: ./.github/actions/install-tools
-        with:
-          tools: just cargo-nextest
-
-      - name: Cache cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: . -> target
-
-      - name: Hunt the store's tests marked flaky
-        run: just stress -p pdn-store --run-ignored ignored-only --stress-count "${{ github.event.inputs.store_iterations || '10' }}" --no-fail-fast
