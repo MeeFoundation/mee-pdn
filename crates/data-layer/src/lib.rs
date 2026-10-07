@@ -38,7 +38,7 @@ pub use node::{PodSession, PodSessions, PodStartPause};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{
-    record_prefix, Awaiting, DevicesPayload, EventKind, ForNothing, FoundedPayload, HeldEntry,
+    record_prefix, Awaiting, CreatedPayload, DevicesPayload, EventKind, ForNothing, HeldEntry,
     JoinedPayload, Member, MemberDevice, MemberState, Membership, MembershipKey, OpId, Operation,
     PodCatchUp, PodNotice, PodStore, PodTickets, RecordEntry, RecordKey, RecordView, Seq,
     UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,

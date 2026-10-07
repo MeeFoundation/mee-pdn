@@ -18,7 +18,7 @@ pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership,
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
 pub(crate) use past::{departure_past, PastEntry};
 pub(crate) use payloads::encode_devices;
-pub use payloads::{DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
+pub use payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
 pub use record_view::{Operation, RecordEntry, RecordView};
 
 /// `identity` holds no pod `pod` here, or holds only its tombstone.

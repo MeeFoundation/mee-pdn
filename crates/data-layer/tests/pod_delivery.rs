@@ -18,7 +18,7 @@ use pdn_types::{NodeId, PodId};
 use test_utils::{
     eventually, join_identity,
     pod::{
-        device_of, folds_nobody, found, holds_no_record, host, invite, lists, lists_device,
+        create, device_of, folds_nobody, holds_no_record, host, invite, lists, lists_device,
         place_claim, reads, state_on, statement, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -120,7 +120,7 @@ async fn a_write_arrives_live_over_the_swarm_and_a_ticket_holder_takes_nothing()
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -202,7 +202,7 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -268,7 +268,7 @@ async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membershi
     let (carol, _) = host(&tablet).await?;
     let sibling = nowhere(0xa2);
     alice_directory.add_device(sibling.node).await?;
-    let pod = found(&tablet, &alice).await?;
+    let pod = create(&tablet, &alice).await?;
     let bob = Person::generate();
     let bobs: Vec<MemberDevice> = (0xb1..=0xb7).map(nowhere).collect();
     invite(&tablet, &alice, pod, &bob, bobs.clone()).await?;
@@ -380,7 +380,7 @@ async fn an_invited_device_is_a_contact_once_the_invite_is_written() -> Result<(
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     let as_bob = Contact::new(bob_phone.dial_handle().addr(), identity_of(bob.id));
     let lists_bob = |contacts: Vec<Contact>| {
         contacts
@@ -433,7 +433,7 @@ async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> 
     let (alice_phone, carol_phone) = (spawn().await?, spawn().await?);
     let (alice, _) = host(&alice_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -497,15 +497,15 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let founding = alice.keys.founding([0xa0; 16]);
-    let pod = pod_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    let creation = alice.keys.creation([0xa0; 16]);
+    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
         &alice,
         pod,
-        MembershipKey::founded(alice.id),
-        founding.encode(),
+        MembershipKey::created(alice.id),
+        creation.encode(),
     )
     .await?;
     let elsewhere = MemberDevice {
@@ -571,15 +571,15 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let founding = alice.keys.founding([0xa1; 16]);
-    let pod = pod_id_of(&alice.id, &founding.announcement_key, &founding.nonce);
+    let creation = alice.keys.creation([0xa1; 16]);
+    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
         &alice,
         pod,
-        MembershipKey::founded(alice.id),
-        founding.encode(),
+        MembershipKey::created(alice.id),
+        creation.encode(),
     )
     .await?;
     let elsewhere = MemberDevice {
@@ -660,7 +660,7 @@ async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_mem
         )
         .await?
     );
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     let unlisted_node = MemberDevice {
         node: nowhere(0xb2).node,
         author: bob_phone.default_author(bob.id)?,
@@ -720,7 +720,7 @@ async fn a_write_whose_announcement_was_lost_arrives_at_the_next_run() -> Result
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -764,7 +764,7 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
     );
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -818,7 +818,7 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
     let (erin, _) = host(&erin_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -910,7 +910,7 @@ async fn a_newcomer_is_served_the_record_store_in_the_session_after_the_one_that
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (nina, _) = host(&nina_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -991,7 +991,7 @@ async fn a_removed_member_is_refused_the_record_store_in_the_session_after_the_o
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -1112,7 +1112,7 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -1253,7 +1253,7 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let pod = found(&mia_phone, &mia).await?;
+    let pod = create(&mia_phone, &mia).await?;
     invite(&mia_phone, &mia, pod, &bob, vec![device_of(&tablet, &bob)?]).await?;
     let tickets = tickets(&mia_phone, &mia, pod).await?;
     tablet.import_pod(bob.id, pod, tickets.clone()).await?;
@@ -1304,8 +1304,8 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
 /// them on the next pass, and the other member reads a newcomer's record it
 /// held and read nothing of.
 ///
-/// Both members are out of every swarm and settled with the founder's node
-/// before the newcomer's joined event is written, the founder's node is gone
+/// Both members are out of every swarm and settled with the creator's node
+/// before the newcomer's joined event is written, the creator's node is gone
 /// once the newcomer has caught up, and the newcomer's node is dialed only
 /// by the sessions named below, so what moves between the two is the pass's.
 #[allow(clippy::too_many_lines)] // one scenario: the quiet pair, the membership event and both sessions
@@ -1317,7 +1317,7 @@ async fn a_membership_event_with_no_record_written_opens_both_of_a_pods_sessions
     let (erin, _) = host(&erin_phone).await?;
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
-    let pod = found(&mia_phone, &mia).await?;
+    let pod = create(&mia_phone, &mia).await?;
     for member in [&bob, &dave] {
         invite(
             &mia_phone,

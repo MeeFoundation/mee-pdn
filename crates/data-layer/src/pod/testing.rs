@@ -62,19 +62,19 @@ pub(super) struct Store {
 }
 
 impl Store {
-    /// Founded by `creator`, its first device statement beside the founding
+    /// Created by `creator`, its first device statement beside the created
     /// event.
-    pub(super) fn founded_by(creator: &Person) -> Self {
-        let founding = creator.keys.founding([0x5a; 16]);
-        let pod = pod_id_of(&creator.id(), &founding.announcement_key, &founding.nonce);
+    pub(super) fn created_by(creator: &Person) -> Self {
+        let creation = creator.keys.creation([0x5a; 16]);
+        let pod = pod_id_of(&creator.id(), &creation.announcement_key, &creation.nonce);
         let mut store = Self {
             pod,
             entries: Vec::new(),
         };
         store.write(
-            MembershipKey::founded(creator.id()),
+            MembershipKey::created(creator.id()),
             creator.author(),
-            founding.encode(),
+            creation.encode(),
         );
         store.statement(creator, 1, &[creator.device], creator.author());
         store

@@ -611,7 +611,7 @@ async fn an_operation_sequence_continues_after_a_respawn() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let first = node_on(dir.path()).await?;
     let (bob, _directory) = c::host(&first).await?;
-    let pod = c::found(&first, &bob).await?;
+    let pod = c::create(&first, &bob).await?;
     let note = RecordRef {
         member: bob.id,
         kind: RecordKind::MergeableDocument,

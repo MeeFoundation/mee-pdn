@@ -93,18 +93,18 @@ async fn statement(
     write(node, writer, pod, key, payload).await
 }
 
-/// `creator`'s pod on `node`: both stores, the founding event, the
+/// `creator`'s pod on `node`: both stores, the created event, the
 /// creator's first device statement, and the tickets to both stores.
-async fn found(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
-    let founding = creator.keys.founding([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
+async fn create(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
+    let creation = creator.keys.creation([0x5a; 16]);
+    let pod = data_layer::pod_id_of(&creator.id, &creation.announcement_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(
         node,
         creator,
         pod,
-        MembershipKey::founded(creator.id),
-        founding.encode(),
+        MembershipKey::created(creator.id),
+        creation.encode(),
     )
     .await?;
     statement(
@@ -211,7 +211,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -270,7 +270,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         "the member's device did not fold the pod from its first session"
     );
     // A joined event counts once its payload lands, which can trail the
-    // founding event's.
+    // created event's.
     assert!(
         eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, bob.id).await == PLAIN) })
             .await?,
@@ -388,7 +388,7 @@ async fn a_co_located_non_member_is_refused_where_its_node_mate_is_served() -> R
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -429,7 +429,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_directory) = host(&bob_phone).await?;
     let (dave, _) = host(&dave_phone).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -536,7 +536,7 @@ async fn wrongly_refused_without_anchoring_d19() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let (pod, tickets) = found(&alice_phone, &alice).await?;
+    let (pod, tickets) = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -633,7 +633,7 @@ async fn co_located_members_converge_and_a_co_located_ticket_holder_takes_nothin
     let (bob, _) = host(&tablet).await?;
     let (dave, _) = host(&tablet).await?;
     let (erin, _) = host(&tablet).await?;
-    let (pod, tickets) = found(&tablet, &bob).await?;
+    let (pod, tickets) = create(&tablet, &bob).await?;
     invite(&tablet, &bob, 1, pod, &dave, device_of(&tablet, &dave)?).await?;
     tablet.import_pod(dave.id, pod, tickets.clone()).await?;
     tablet.import_pod(erin.id, pod, tickets).await?;

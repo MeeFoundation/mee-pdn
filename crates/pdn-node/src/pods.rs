@@ -118,7 +118,7 @@ pub struct AnnouncementKeyPending {
     pub identity: PdnId,
 }
 
-/// A membership act through [`PodsService::act`]. The founding act is
+/// A membership act through [`PodsService::act`]. The create act is
 /// written by `create`, the invite act inside the join dialogue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodAct {
@@ -224,7 +224,7 @@ struct JoinTickets {
 /// identity is no member of fails with [`UnknownPod`].
 #[allow(async_fn_in_trait)]
 pub trait PodsService {
-    /// Derive the pod id, create both stores and write the signed founding
+    /// Derive the pod id, create both stores and write the signed created
     /// event; the identity is the first owner.
     async fn create(&self, identity: PdnId) -> Result<PodId>;
 
@@ -345,8 +345,8 @@ impl PodsService for RuntimePodsService<'_> {
         SysRng
             .try_fill_bytes(&mut nonce)
             .context("operating-system randomness unavailable")?;
-        let founding = keys.founding(nonce);
-        let pod = pod_id_of(&identity, &founding.announcement_key, &founding.nonce);
+        let creation = keys.creation(nonce);
+        let pod = pod_id_of(&identity, &creation.announcement_key, &creation.nonce);
         let node = Arc::clone(&state.node);
         node.create_pod(identity, pod).await?;
         let mut rollback = PodRollback::new(
@@ -364,8 +364,8 @@ impl PodsService for RuntimePodsService<'_> {
                 identity,
                 pod,
                 PodStore::Membership,
-                &MembershipKey::founded(identity).to_bytes(),
-                &founding.encode(),
+                &MembershipKey::created(identity).to_bytes(),
+                &creation.encode(),
             )
             .await?;
             let statement = MembershipKey::Devices {

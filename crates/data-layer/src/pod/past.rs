@@ -162,11 +162,11 @@ impl<'a> Index<'a> {
     }
 
     /// The event of `member`'s chain carrying its announcement key: its
-    /// counted founding or joined event of the lowest sequence.
+    /// counted created or joined event of the lowest sequence.
     fn key_event(&self, member: PdnId) -> Option<usize> {
         (1..=self.run(&member)).find_map(|seq| {
             self.events.get(&(member, seq))?.iter().find_map(|event| {
-                (event.counted && matches!(event.kind, EventKind::Founded | EventKind::Joined))
+                (event.counted && matches!(event.kind, EventKind::Created | EventKind::Joined))
                     .then_some(event.entry)
             })
         })

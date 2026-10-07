@@ -74,18 +74,18 @@ pub async fn statement(
     write(node, writer, pod, key, payload).await
 }
 
-/// `creator`'s pod on `node`: both stores, the founding event and the
+/// `creator`'s pod on `node`: both stores, the created event and the
 /// creator's first device statement.
-pub async fn found(node: &SyncNode, creator: &Person) -> Result<PodId> {
-    let founding = creator.keys.founding([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &founding.announcement_key, &founding.nonce);
+pub async fn create(node: &SyncNode, creator: &Person) -> Result<PodId> {
+    let creation = creator.keys.creation([0x5a; 16]);
+    let pod = data_layer::pod_id_of(&creator.id, &creation.announcement_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(
         node,
         creator,
         pod,
-        MembershipKey::founded(creator.id),
-        founding.encode(),
+        MembershipKey::created(creator.id),
+        creation.encode(),
     )
     .await?;
     statement(node, creator, pod, creator, vec![device_of(node, creator)?]).await?;

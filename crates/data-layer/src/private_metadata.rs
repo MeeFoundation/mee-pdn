@@ -531,7 +531,7 @@ impl PrivateMetadataStore {
     }
 
     /// Record that the identity's membership event at `seq` of its chain in
-    /// `pod` — its founding or joined event — holds the pod.
+    /// `pod` — its created or joined event — holds the pod.
     pub async fn record_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
         self.doc
             .set_bytes(

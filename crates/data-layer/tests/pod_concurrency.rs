@@ -13,7 +13,7 @@ use data_layer::{
 };
 use pdn_types::{PodId, RecordId};
 use test_utils::{
-    pod::{device_of, found, host, invite, lists, reads, tickets, write, Person},
+    pod::{create, device_of, host, invite, lists, reads, tickets, write, Person},
     TIMEOUT,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -81,23 +81,23 @@ async fn act(
     Ok(bytes)
 }
 
-/// A pod the person on the first of `phones` founds, a person on each
-/// other phone invited by the founder, at the founder's sequence 1, and
+/// A pod the person on the first of `phones` creates, a person on each
+/// other phone invited by the creator, at the creator's sequence 1, and
 /// every one of them holding both stores.
 async fn pod_on(phones: &[&SyncNode]) -> Result<(Vec<Person>, PodId, PodTickets)> {
     let mut people = Vec::new();
     for phone in phones {
         people.push(host(phone).await?.0);
     }
-    let (Some(founder_phone), Some(founder)) = (phones.first(), people.first()) else {
-        anyhow::bail!("a pod needs its founder");
+    let (Some(creator_phone), Some(creator)) = (phones.first(), people.first()) else {
+        anyhow::bail!("a pod needs its creator");
     };
-    let pod = found(founder_phone, founder).await?;
+    let pod = create(creator_phone, creator).await?;
     for (phone, member) in phones.iter().zip(&people).skip(1) {
         let devices = vec![device_of(phone, member)?];
-        invite(founder_phone, founder, pod, member, devices).await?;
+        invite(creator_phone, creator, pod, member, devices).await?;
     }
-    let tickets = tickets(founder_phone, founder, pod).await?;
+    let tickets = tickets(creator_phone, creator, pod).await?;
     for (phone, member) in phones.iter().zip(&people).skip(1) {
         phone.import_pod(member.id, pod, tickets.clone()).await?;
         for other in people.iter().skip(1) {

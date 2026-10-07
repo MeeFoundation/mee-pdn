@@ -6,12 +6,12 @@ use iroh::{PublicKey, SecretKey, Signature};
 use pdn_types::{PdnId, PodId};
 
 use crate::pod::{
-    encode_devices, DevicesPayload, FoundedPayload, JoinedPayload, MemberDevice, Seq,
+    encode_devices, CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice, Seq,
 };
 
 const PDN_ID_CONTEXT: &str = "pdn/pdn-id/v1";
 const POD_ID_CONTEXT: &str = "pdn/pod-id/v1";
-const POD_FOUNDING_CONTEXT: &[u8] = b"pdn/pod-founding/v1";
+const POD_CREATION_CONTEXT: &[u8] = b"pdn/pod-creation/v1";
 const POD_JOIN_CONTEXT: &[u8] = b"pdn/pod-join/v1";
 const POD_DEVICES_CONTEXT: &[u8] = b"pdn/pod-devices/v1";
 
@@ -42,11 +42,11 @@ impl AnnouncementKeyPair {
         self.0.to_bytes()
     }
 
-    /// The founding event of the pod `pod_id_of(self.pdn_id(), key, nonce)`.
-    pub fn founding(&self, nonce: [u8; 16]) -> FoundedPayload {
+    /// The created event of the pod `pod_id_of(self.pdn_id(), key, nonce)`.
+    pub fn creation(&self, nonce: [u8; 16]) -> CreatedPayload {
         let announcement_key = self.public_key();
-        let message = founding_message(&self.pdn_id(), &announcement_key, &nonce);
-        FoundedPayload {
+        let message = creation_message(&self.pdn_id(), &announcement_key, &nonce);
+        CreatedPayload {
             nonce,
             announcement_key,
             signature: self.0.sign(&message).to_bytes(),
@@ -74,10 +74,10 @@ impl AnnouncementKeyPair {
     }
 }
 
-/// Whether `payload`'s signature verifies for a founding event in
+/// Whether `payload`'s signature verifies for a created event in
 /// `creator`'s chain; what its fields derive is the fold's to check.
-pub(crate) fn founding_verifies(creator: &PdnId, payload: &FoundedPayload) -> bool {
-    let message = founding_message(creator, &payload.announcement_key, &payload.nonce);
+pub(crate) fn creation_verifies(creator: &PdnId, payload: &CreatedPayload) -> bool {
+    let message = creation_message(creator, &payload.announcement_key, &payload.nonce);
     verifies(&payload.announcement_key, &message, &payload.signature)
 }
 
@@ -100,9 +100,9 @@ pub fn devices_verify(announcement_key: &[u8; 32], version: u64, payload: &Devic
     verifies(announcement_key, &message, &payload.signature)
 }
 
-fn founding_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
+fn creation_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
     [
-        POD_FOUNDING_CONTEXT,
+        POD_CREATION_CONTEXT,
         creator.as_bytes(),
         announcement_key,
         nonce,
@@ -148,7 +148,7 @@ pub fn pdn_id_of(announcement_key: &[u8; 32]) -> PdnId {
     PdnId::from_bytes(blake3::derive_key(PDN_ID_CONTEXT, announcement_key))
 }
 
-/// The pod id a founding event's fields derive.
+/// The pod id a created event's fields derive.
 pub fn pod_id_of(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> PodId {
     let mut hasher = blake3::Hasher::new_derive_key(POD_ID_CONTEXT);
     hasher.update(creator.as_bytes());
@@ -185,24 +185,24 @@ mod tests {
         );
     }
 
-    /// Alice's founding event for "Family" carries the signature the pod
+    /// Alice's created event for "Family" carries the signature the pod
     /// stores spec prints, and its fields derive the pod's id.
     #[test]
-    fn the_specs_founding_event_signs_and_derives_family() {
+    fn the_specs_created_event_signs_and_derives_family() {
         let alice = AnnouncementKeyPair::from_secret_bytes(&[0x33; 32]);
-        let founding = alice.founding([0x5a; 16]);
-        let head: [u8; 8] = pdn_types::parse_hex("6ad63c810f41d368").unwrap();
-        let tail: [u8; 5] = pdn_types::parse_hex("807d085d09").unwrap();
-        assert!(founding.signature.starts_with(&head));
-        assert!(founding.signature.ends_with(&tail));
-        assert!(founding_verifies(&alice.pdn_id(), &founding));
+        let creation = alice.creation([0x5a; 16]);
+        let head: [u8; 8] = pdn_types::parse_hex("806ce2029b681a9a").unwrap();
+        let tail: [u8; 5] = pdn_types::parse_hex("0420513704").unwrap();
+        assert!(creation.signature.starts_with(&head));
+        assert!(creation.signature.ends_with(&tail));
+        assert!(creation_verifies(&alice.pdn_id(), &creation));
         assert_eq!(
-            pod_id_of(&alice.pdn_id(), &founding.announcement_key, &founding.nonce).to_string(),
+            pod_id_of(&alice.pdn_id(), &creation.announcement_key, &creation.nonce).to_string(),
             "ad58a3faa04cdc5576c8dc5823a347c6"
         );
         // Denied: the same event claimed for another creator's chain.
         let other = pdn_id_of(&key(OTHER_KEY));
-        assert!(!founding_verifies(&other, &founding));
+        assert!(!creation_verifies(&other, &creation));
     }
 
     /// A join statement verifies at the sequence it signs and in its pod
@@ -269,7 +269,7 @@ mod tests {
         );
     }
 
-    /// A founding event under another key derives another pod id, whether it
+    /// A created event under another key derives another pod id, whether it
     /// names Alice's `PdnId` or the one that key derives.
     #[test]
     fn another_key_derives_another_pod_id() {

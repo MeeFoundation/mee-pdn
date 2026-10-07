@@ -17,7 +17,7 @@ use pdn_types::PodId;
 use test_utils::{
     join_identity,
     pod::{
-        device_of, found, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
+        create, device_of, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
         state_on, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -148,7 +148,7 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,
@@ -225,7 +225,7 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -329,7 +329,7 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -409,7 +409,7 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let (carol, _) = linked(&carol_phone, &carol_laptop).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -501,7 +501,7 @@ async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_sho
     let (alice_phone, carol_phone) = (node(QUIET).await?, node(POD_RUN).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     let carols = vec![device_of(&carol_phone, &carol)?];
     invite(&alice_phone, &alice, pod, &carol, carols).await?;
     let from_alice = tickets(&alice_phone, &alice, pod).await?;
@@ -564,7 +564,7 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_directory) = host(&bob_phone).await?;
     let (carol, _) = host(&carol_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
         invite(
             &alice_phone,

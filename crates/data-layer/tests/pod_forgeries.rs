@@ -145,7 +145,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
     let (alice, _) = c::host(alice_phone).await?;
     let (bob, _) = c::host(bob_phone).await?;
     let (carol, _) = c::host(carol_phone).await?;
-    let pod = c::found(alice_phone, &alice).await?;
+    let pod = c::create(alice_phone, &alice).await?;
     for (phone, member) in [(bob_phone, &bob), (carol_phone, &carol)] {
         c::invite(
             alice_phone,

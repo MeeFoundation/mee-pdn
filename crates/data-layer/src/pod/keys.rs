@@ -19,11 +19,11 @@ const BY: &str = "by";
 pub struct Seq(u64);
 
 impl Seq {
-    /// A chain's first event, the founding event or a newcomer's joined event.
+    /// A chain's first event, the created event or a newcomer's joined event.
     pub const FIRST: Self = Self(1);
-    /// The actor sequence the founding event names: the creator holds no
+    /// The actor sequence the created event names: the creator holds no
     /// point of its chain before it.
-    pub const BEFORE_FOUNDING: Self = Self(0);
+    pub const BEFORE_CREATION: Self = Self(0);
 
     pub const fn new(value: u64) -> Self {
         Self(value)
@@ -43,7 +43,7 @@ impl fmt::Display for Seq {
 /// A membership event's kind, its key's `<kind>` segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventKind {
-    Founded,
+    Created,
     Joined,
     Left,
     Removed,
@@ -53,7 +53,7 @@ pub enum EventKind {
 
 impl EventKind {
     const ALL: [Self; 6] = [
-        Self::Founded,
+        Self::Created,
         Self::Joined,
         Self::Left,
         Self::Removed,
@@ -63,7 +63,7 @@ impl EventKind {
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Founded => "founded",
+            Self::Created => "created",
             Self::Joined => "joined",
             Self::Left => "left",
             Self::Removed => "removed",
@@ -94,15 +94,15 @@ pub enum MembershipKey {
 }
 
 impl MembershipKey {
-    /// The founding event's key: the creator's first sequence, naming the
-    /// creator as its actor at [`Seq::BEFORE_FOUNDING`].
-    pub const fn founded(creator: PdnId) -> Self {
+    /// The created event's key: the creator's first sequence, naming the
+    /// creator as its actor at [`Seq::BEFORE_CREATION`].
+    pub const fn created(creator: PdnId) -> Self {
         Self::Event {
             subject: creator,
             seq: Seq::FIRST,
-            kind: EventKind::Founded,
+            kind: EventKind::Created,
             actor: creator,
-            actor_seq: Seq::BEFORE_FOUNDING,
+            actor_seq: Seq::BEFORE_CREATION,
         }
     }
 
@@ -325,10 +325,10 @@ mod tests {
     /// name and prints back byte for byte.
     #[test]
     fn every_layout_round_trips() {
-        let alice_founded = format!("member/{ALICE}/1/founded/{ALICE}/0");
+        let alice_created = format!("member/{ALICE}/1/created/{ALICE}/0");
         assert_eq!(
-            MembershipKey::parse(alice_founded.as_bytes()),
-            Some(MembershipKey::founded(id(ALICE)))
+            MembershipKey::parse(alice_created.as_bytes()),
+            Some(MembershipKey::created(id(ALICE)))
         );
         let carol_joined = format!("member/{CAROL}/1/joined/{BOB}/2");
         assert_eq!(
@@ -382,7 +382,7 @@ mod tests {
                 },
             })
         );
-        for key in [&alice_founded, &carol_joined, &carol_devices] {
+        for key in [&alice_created, &carol_joined, &carol_devices] {
             let parsed = MembershipKey::parse(key.as_bytes()).unwrap();
             assert_eq!(parsed.to_bytes(), key.as_bytes());
         }
@@ -432,12 +432,12 @@ mod tests {
         let upper = ALICE.to_uppercase();
         let membership_misses = [
             "ext/anything".to_owned(),
-            format!("member/{ALICE}/01/founded/{ALICE}/0"),
-            format!("member/{ALICE}/+1/founded/{ALICE}/0"),
-            format!("member/{ALICE}/1/founded/{ALICE}/"),
-            format!("member/{upper}/1/founded/{upper}/0"),
+            format!("member/{ALICE}/01/created/{ALICE}/0"),
+            format!("member/{ALICE}/+1/created/{ALICE}/0"),
+            format!("member/{ALICE}/1/created/{ALICE}/"),
+            format!("member/{upper}/1/created/{upper}/0"),
             format!("member/{ALICE}/1/suspended/{ALICE}/0"),
-            format!("member/{ALICE}/1/founded/{ALICE}/0/extra"),
+            format!("member/{ALICE}/1/created/{ALICE}/0/extra"),
             format!("member/{ALICE}/devices/"),
             format!("member/{ALICE}/devices/1/2"),
             format!("member/{ALICE}/18446744073709551616/left/{ALICE}/1"),
@@ -457,7 +457,7 @@ mod tests {
             format!("by/{BOB}/mergeable-document/{ID}/{CAROL}.{B2_AUTHOR}.1.01"),
             format!("by/{BOB}/Claim/{ID}/1"),
             format!("by/{BOB}/claim/{ALICE}/1"),
-            format!("member/{ALICE}/1/founded/{ALICE}/0"),
+            format!("member/{ALICE}/1/created/{ALICE}/0"),
         ];
         for key in &record_misses {
             assert_eq!(RecordKey::parse(key.as_bytes()), None, "{key}");

@@ -13,7 +13,7 @@ use data_layer::{
 use pdn_types::{NodeId, PodId, RecordId};
 use test_utils::{
     eventually, join_identity,
-    pod::{device_of, folds_nobody, found, host, invite, lists_device, reads, tickets, Person},
+    pod::{create, device_of, folds_nobody, host, invite, lists_device, reads, tickets, Person},
     wait_devices, TIMEOUT,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -124,7 +124,7 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
     let (alice_phone, bob_phone, bob_laptop) = (node().await?, node().await?, node().await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_directory) = host(&bob_phone).await?;
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
         &alice,
@@ -200,7 +200,7 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
         )
         .await?
     );
-    let pod = found(&alice_phone, &alice).await?;
+    let pod = create(&alice_phone, &alice).await?;
     let (b1, b2) = (device_of(&bob_phone, &bob)?, device_of(&bob_laptop, &bob)?);
     invite(&alice_phone, &alice, pod, &bob, vec![b1]).await?;
     let tickets = tickets(&alice_phone, &alice, pod).await?;
