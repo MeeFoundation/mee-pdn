@@ -1045,9 +1045,9 @@ async fn a_link_publishes_nothing_before_its_commit_point() -> Result<()> {
 /// A runtime dropped without `shutdown` while the process goes on lets go
 /// of its directory: a runtime spawned on it again in the same process
 /// hosts what the first one hosted. The release runs on the dropped
-/// runtime's own tasks, so the respawn is retried within a budget, each
-/// attempt bounded because a store still held makes a spawn wait rather
-/// than fail.
+/// runtime's own tasks, so a spawn meeting a store still held fails and is
+/// retried within a budget; each attempt is bounded, so a spawn that hangs
+/// costs one attempt rather than the run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_runtime_dropped_without_shutdown_releases_its_directory() -> Result<()> {
     const RELEASE_BUDGET: Duration = Duration::from_secs(20);

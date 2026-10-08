@@ -25,6 +25,12 @@ tracing = "0.1"
 # `pdn-store` is our iroh-docs variant (capability-gated ingest).
 pdn-store = { path = "crates/pdn-store" }
 
+[patch.crates-io]
+# Upstream's latest release plus the fix for a store runtime dropped on its own
+# thread, which hangs a failed blob store open forever. What the fork carries
+# and when it goes: UPSTREAM.md in the fork.
+iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
