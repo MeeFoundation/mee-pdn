@@ -18,7 +18,7 @@ use pdn_types::{NodeId, PodId};
 use test_utils::{
     eventually, join_identity,
     pod::{
-        create, device_of, folds_nobody, holds_no_record, host, invite, lists, lists_device,
+        create, device_of, folds_nobody, held_records, host, invite, lists, lists_device,
         place_claim, reads, state_on, statement, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -174,7 +174,11 @@ async fn a_write_arrives_live_over_the_swarm_and_a_ticket_holder_takes_nothing()
         folds_nobody(&dave_phone, dave.id, pod).await?,
         "the ticket holder took entries from the swarm"
     );
-    assert!(holds_no_record(&dave_phone, dave.id, pod).await?);
+    let held = held_records(&dave_phone, dave.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the ticket holder took records from the swarm: {held:#?}"
+    );
 
     for node in [alice_phone, bob_phone, carol_phone, dave_phone] {
         node.shutdown().await?;
@@ -881,7 +885,11 @@ async fn a_newcomers_first_record_reads_once_the_session_brings_its_membership()
     dial(&erin_phone, &erin, pod, PodStore::Records, &bob_phone, &bob).await?;
     let refused = erins.next_with(bob_phone.node_id(), true, TIMEOUT).await?;
     assert!(refused.is_some_and(|session| session.exchanged.is_err()));
-    assert!(holds_no_record(&erin_phone, erin.id, pod).await?);
+    let held = held_records(&erin_phone, erin.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the ticket holder holds records: {held:#?}"
+    );
 
     for node in [alice_phone, bob_phone, carol_phone, dave_phone, erin_phone] {
         node.shutdown().await?;
@@ -1195,9 +1203,10 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
             .is_some(),
         "the dial to the removed member's device did not go through"
     );
+    let held = held_records(&carol_phone, carol.id, pod).await?;
     assert!(
-        holds_no_record(&carol_phone, carol.id, pod).await?,
-        "a member's dial served a removed member's device a record"
+        held.is_empty(),
+        "a member's dial served a removed member's device a record: {held:#?}"
     );
     // Denied: the ticket holder that is no member, on either store.
     dial(
@@ -1220,9 +1229,10 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
         folds_nobody(&dave_phone, dave.id, pod).await?,
         "a member's dial served a ticket holder the membership store"
     );
+    let held = held_records(&dave_phone, dave.id, pod).await?;
     assert!(
-        holds_no_record(&dave_phone, dave.id, pod).await?,
-        "a member's dial served a ticket holder a record"
+        held.is_empty(),
+        "a member's dial served a ticket holder a record: {held:#?}"
     );
 
     for node in [alice_phone, bob_phone, carol_phone, dave_phone] {
@@ -1285,7 +1295,11 @@ async fn a_write_reaches_a_co_located_newcomer_the_writer_does_not_know_yet() ->
         "the write did not reach the co-located newcomer"
     );
     // Denied: the co-located ticket holder that is no member.
-    assert!(holds_no_record(&tablet, erin.id, pod).await?);
+    let held = held_records(&tablet, erin.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the co-located ticket holder holds records: {held:#?}"
+    );
 
     for node in [mia_phone, tablet] {
         node.shutdown().await?;

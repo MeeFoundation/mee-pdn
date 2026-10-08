@@ -195,11 +195,19 @@ pub async fn reads(node: &SyncNode, holder: PdnId, pod: PodId, record: RecordRef
     eventually(|| async { Ok(node.read_pod_record(holder, pod, &record).await?.is_some()) }).await
 }
 
-pub async fn holds_no_record(node: &SyncNode, holder: PdnId, pod: PodId) -> Result<bool> {
+/// Every entry `holder`'s record store holds now, as `key by author:
+/// verdict`, so a denial that fails names what got through.
+pub async fn held_records(node: &SyncNode, holder: PdnId, pod: PodId) -> Result<Vec<String>> {
     Ok(node
         .pod_record_view(holder, pod)
         .await?
         .verdicts()
-        .next()
-        .is_none())
+        .map(|(entry, verdict)| {
+            format!(
+                "{} by {}: {verdict:?}",
+                String::from_utf8_lossy(&entry.key),
+                entry.author.fmt_short()
+            )
+        })
+        .collect())
 }
