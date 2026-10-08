@@ -378,7 +378,8 @@ pub struct SyncHandle {
 pub struct OpenOpts {
     /// Set to true to set sync state to true.
     pub sync: bool,
-    /// A [`Delivery::Blocking`] subscription: only the live actor opens one.
+    /// A [`Delivery::Blocking`] subscription: only the live actor opens one,
+    /// and it waits on this actor only through `DrainingSync`.
     pub(crate) subscribe: Option<async_channel::Sender<Event>>,
 }
 

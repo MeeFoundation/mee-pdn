@@ -1007,7 +1007,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -2247,9 +2247,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5be50b0e2d0a9ba65cee4e0dfb708b3704e02ad12bd4c14c6307e94245943126"
+version = "0.103.1"
+source = "git+https://github.com/MeeFoundation/iroh-blobs?rev=2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff#2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -4982,7 +4981,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

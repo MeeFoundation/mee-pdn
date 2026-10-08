@@ -358,7 +358,11 @@ async fn a_relayed_claim_reads_as_its_authors_and_the_relays_entry_at_its_key_by
         "the relay's entry is not held as read by nothing"
     );
     // Denied: the holder of the relay's tickets that is no member.
-    assert!(c::holds_no_record(&dave_phone, dave.id, pod).await?);
+    let held = c::held_records(&dave_phone, dave.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the ticket holder holds records: {held:#?}"
+    );
 
     for node in [bob_phone, carol_phone, dave_phone] {
         node.shutdown().await?;

@@ -2243,3 +2243,58 @@ async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
     }
     Ok(())
 }
+
+/// A catch-up of more entries than the live actor's events channel holds
+/// finishes while the live actor keeps asking the sync actor for the
+/// replica's recorded peers.
+///
+/// The importing node holds nothing, so the whole store arrives in one
+/// message the sync actor inserts in one step; a restart every few
+/// milliseconds puts the live actor's request behind that step.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_past_the_events_channel_finishes_while_the_live_actor_asks_the_sync_actor(
+) -> Result<()> {
+    const ENTRIES: usize = 2_000;
+    let mut rng = test_rng(b"a_catch_up_past_the_events_channel_finishes");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let author0 = clients[0].docs().author_create().await?;
+    let doc0 = clients[0].docs().create().await?;
+    for n in 0..ENTRIES {
+        doc0.set_bytes(author0, format!("k{n:04}"), format!("v{n:04}"))
+            .await?;
+    }
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = clients[1].docs().import(ticket).await?;
+
+    let caught_up = async {
+        while get_all(&doc1).await?.len() < ENTRIES {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::Ok(())
+    };
+    let asking = async {
+        loop {
+            if let Err(err) = doc1.start_sync(Vec::new(), util::TEST_HOLDER).await {
+                break Err::<(), _>(err);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(TIMEOUT, async {
+        tokio::select! {
+            res = caught_up => res,
+            res = asking => res.context("a restart failed"),
+        }
+    })
+    .await
+    .context("the importing node's live and sync actors stopped answering")??;
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

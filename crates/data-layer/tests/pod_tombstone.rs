@@ -17,7 +17,7 @@ use pdn_types::PodId;
 use test_utils::{
     join_identity,
     pod::{
-        create, device_of, holds_no_record, host, invite, lists, lists_device, place_claim, reads,
+        create, device_of, held_records, host, invite, lists, lists_device, place_claim, reads,
         state_on, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -204,7 +204,11 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
         "a member device served the removed member's record store"
     );
     assert!(!knows(&carol_phone, &carol, pod, &dave).await?);
-    assert!(holds_no_record(&carol_phone, carol.id, pod).await?);
+    let held = held_records(&carol_phone, carol.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the removed member's device holds records: {held:#?}"
+    );
 
     for node in [alice_phone, bob_phone, carol_phone] {
         node.shutdown().await?;
