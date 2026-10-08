@@ -1,8 +1,8 @@
 //! Acts written at one point of a chain by member devices out of reach of
 //! each other, and events reaching a device out of their order: once the
-//! devices meet, every one holds every entry and folds the same membership,
-//! by precedence and by the guard over demotions. The acts arrive by the
-//! store-level writes the pods service performs, the tickets by hand.
+//! devices meet, every one holds every entry and shows the same membership
+//! view, by precedence and by the guard over demotions. The acts arrive by
+//! the store-level writes the pods service performs, the tickets by hand.
 
 use std::time::Duration;
 
@@ -145,8 +145,8 @@ async fn out_of_reach(
 }
 
 /// Whether `holder`'s replica on `node` comes to hold every key of `keys`
-/// in its membership store, each verdict read from the fold a read
-/// reports on `reports`.
+/// in its membership store, each verdict read from the membership view a
+/// read reports on `reports`.
 async fn holds(
     node: &SyncNode,
     reports: &mut UnboundedReceiver<PodVerdicts>,
@@ -170,7 +170,7 @@ async fn verdicts_come_to(
 ) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        node.pod_membership(holder.id, pod).await?;
+        node.pod_membership_view(holder.id, pod).await?;
         let mut held = None;
         while let Ok(report) = reports.try_recv() {
             if report.identity == holder.id && report.pod == pod {
@@ -178,7 +178,7 @@ async fn verdicts_come_to(
             }
         }
         let held: Vec<(Vec<u8>, Verdict)> = held
-            .context("the read reported no fold")?
+            .context("the read reported no membership view")?
             .into_iter()
             .map(|(key, _author, verdict)| (key, verdict))
             .collect();
@@ -367,7 +367,7 @@ async fn the_last_two_owners_leaving_at_once_leave_the_pod_without_an_owner() ->
         assert!(lists(bob_phone, bob.id, pod, member.id, want).await?);
     }
     let owners = bob_phone
-        .pod_membership(bob.id, pod)
+        .pod_membership_view(bob.id, pod)
         .await?
         .identities()
         .filter(|(_id, member)| member.state.owner)
@@ -452,11 +452,15 @@ async fn a_role_flip_resolves_by_sequence_whatever_the_arrival_order() -> Result
     assert!(holds(carol_phone, &mut carols, carol, pod, &[demoted, last]).await?);
     assert!(lists(carol_phone, carol.id, pod, bob.id, OWNER).await?);
     let run = carol_phone
-        .pod_membership(carol.id, pod)
+        .pod_membership_view(carol.id, pod)
         .await?
         .member(&bob.id)
         .map(data_layer::Member::run);
-    assert_eq!(run, Some(4), "the chain did not fold through all four");
+    assert_eq!(
+        run,
+        Some(4),
+        "the membership view did not walk the chain through all four"
+    );
 
     for phone in phones {
         phone.shutdown().await?;

@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, AnnouncementKeyPair, PrivateMetadataStore, ShareMode};
+use data_layer::{AddrInfoOptions, IdentityKeyPair, PrivateMetadataStore, ShareMode};
 use pdn_types::PdnId;
 
 use crate::{
@@ -119,7 +119,7 @@ async fn undo_create(
 /// Creating and linking identities on a runtime.
 #[allow(async_fn_in_trait)]
 pub trait IdentityService {
-    /// Create an identity on its first device: its announcement key pair,
+    /// Create an identity on its first device: its identity key pair,
     /// the [`PdnId`] that pair's public key derives, and its store set
     /// provisioned, the pair kept in its PMS.
     async fn create(&self) -> Result<PdnId>;
@@ -157,8 +157,8 @@ impl<'rt> RuntimeIdentityService<'rt> {
 
 impl IdentityService for RuntimeIdentityService<'_> {
     async fn create(&self) -> Result<PdnId> {
-        let announcement_key = AnnouncementKeyPair::generate();
-        let identity = announcement_key.pdn_id();
+        let identity_key = IdentityKeyPair::generate();
+        let identity = identity_key.pdn_id();
         // Provisioning needs no coarse lock, and holding it across the
         // store work would put every other caller behind one ceremony.
         let (node, cleanup_tasks, injected_failure) = {
@@ -198,7 +198,7 @@ impl IdentityService for RuntimeIdentityService<'_> {
             // device holds a ticket to this fresh PMS, so nothing
             // written here can reach anyone.
             pms.add_device(node.node_id()).await?;
-            pms.put_announcement_key(&announcement_key).await?;
+            pms.put_identity_key(&identity_key).await?;
             node.create_namespace(identity, identity).await?;
             let data_ticket = node
                 .share_ticket(

@@ -9,8 +9,8 @@ use pdn_store::AuthorId;
 use pdn_types::PdnId;
 
 use super::{
-    fold::{HeldEntry, Membership, Verdict},
     keys::{EventKind, MembershipKey},
+    membership_view::{HeldEntry, MembershipView, Verdict},
     payloads::DevicesPayload,
 };
 
@@ -26,10 +26,10 @@ pub(crate) struct Departure {
 }
 
 /// The past of `member`'s departure over `entries`, the ones `membership`
-/// folded; `None` while `member` has not departed — its chain does not end
-/// in a counted left or removed event.
+/// was built from; `None` while `member` has not departed — its chain does
+/// not end in a counted left or removed event.
 pub(crate) fn departure_past(
-    membership: &Membership,
+    membership: &MembershipView,
     entries: &[HeldEntry],
     member: &PdnId,
 ) -> Option<Departure> {
@@ -89,7 +89,7 @@ struct Index<'a> {
 }
 
 impl<'a> Index<'a> {
-    fn of(membership: &Membership, entries: &'a [HeldEntry]) -> Self {
+    fn of(membership: &MembershipView, entries: &'a [HeldEntry]) -> Self {
         let mut index = Self {
             entries,
             events: HashMap::new(),
@@ -161,7 +161,7 @@ impl<'a> Index<'a> {
         })
     }
 
-    /// The event of `member`'s chain carrying its announcement key: its
+    /// The event of `member`'s chain carrying its identity key: its
     /// counted created or joined event of the lowest sequence.
     fn key_event(&self, member: PdnId) -> Option<usize> {
         (1..=self.run(&member)).find_map(|seq| {

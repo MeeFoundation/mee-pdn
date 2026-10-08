@@ -4,7 +4,7 @@
 //! verify-and-burn requirement — each probed for no observable state on
 //! either side — lost-reply convergence, the rollback of a link that could
 //! not catch up, per-identity isolation across several linkings, the
-//! `PdnId` every device of an identity derives from its announcement key,
+//! `PdnId` every device of an identity derives from its identity key,
 //! and a linked device serving a grant its identity established and
 //! published elsewhere (connection arming by replication).
 
@@ -164,11 +164,11 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     Ok(())
 }
 
-/// An identity's `PdnId` is the one the announcement key in its PMS
+/// An identity's `PdnId` is the one the identity key in its PMS
 /// derives, on the runtime that created it and on one linked into it, and a
 /// second identity created beside it derives its own.
 #[tokio::test(flavor = "multi_thread")]
-async fn pdn_id_derives_from_the_announcement_key_on_every_device() -> Result<()> {
+async fn pdn_id_derives_from_the_identity_key_on_every_device() -> Result<()> {
     let rt_a = memory_runtime().await?;
     let rt_b = memory_runtime().await?;
     let x = rt_a.identity().create().await?;
@@ -178,19 +178,11 @@ async fn pdn_id_derives_from_the_announcement_key_on_every_device() -> Result<()
 
     for (rt, identity) in [(&rt_a, x), (&rt_b, x), (&rt_a, y)] {
         assert!(
-            eventually(|| async {
-                Ok(rt
-                    .announcement_public_key_for_test(identity)
-                    .await?
-                    .is_some())
-            })
-            .await?,
-            "the announcement key never became readable"
+            eventually(|| async { Ok(rt.identity_public_key_for_test(identity).await?.is_some()) })
+                .await?,
+            "the identity key never became readable"
         );
-        let key = rt
-            .announcement_public_key_for_test(identity)
-            .await?
-            .unwrap();
+        let key = rt.identity_public_key_for_test(identity).await?.unwrap();
         assert_eq!(pdn_id_of(&key), identity);
     }
 

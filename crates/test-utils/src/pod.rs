@@ -3,22 +3,22 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, AnnouncementKeyPair, EventKind, MemberDevice, MemberState, MembershipKey,
+    AddrInfoOptions, EventKind, IdentityKeyPair, MemberDevice, MemberState, MembershipKey,
     PodStore, PodTickets, PrivateMetadataStore, RecordKey, Seq, SyncNode,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordRef};
 
 use crate::{eventually, host_identity};
 
-/// An identity whose `PdnId` derives from the announcement key pair beside it.
+/// An identity whose `PdnId` derives from the identity key pair beside it.
 pub struct Person {
-    pub keys: AnnouncementKeyPair,
+    pub keys: IdentityKeyPair,
     pub id: PdnId,
 }
 
 impl Person {
     pub fn generate() -> Self {
-        let keys = AnnouncementKeyPair::generate();
+        let keys = IdentityKeyPair::generate();
         let id = keys.pdn_id();
         Self { keys, id }
     }
@@ -78,7 +78,7 @@ pub async fn statement(
 /// creator's first device statement.
 pub async fn create(node: &SyncNode, creator: &Person) -> Result<PodId> {
     let creation = creator.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &creation.announcement_key, &creation.nonce);
+    let pod = data_layer::pod_id_of(&creator.id, &creation.identity_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(
         node,
@@ -119,10 +119,10 @@ pub async fn invite(
     statement(node, inviter, pod, newcomer, devices).await
 }
 
-/// `member`'s state as `holder`'s replica folds it; no member where the
-/// replica is not held.
+/// `member`'s state as the membership view of `holder`'s replica shows it;
+/// no member where the replica is not held.
 pub async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> MemberState {
-    match node.pod_membership(holder, pod).await {
+    match node.pod_membership_view(holder, pod).await {
         Ok(membership) => membership
             .member(&member)
             .map(|member| member.state)
@@ -131,7 +131,8 @@ pub async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId)
     }
 }
 
-/// Whether `holder`'s replica comes to fold `member` into `want`.
+/// Whether the membership view of `holder`'s replica comes to show `member`
+/// in `want`.
 pub async fn lists(
     node: &SyncNode,
     holder: PdnId,
@@ -142,7 +143,8 @@ pub async fn lists(
     eventually(|| async { Ok(state_on(node, holder, pod, member).await == want) }).await
 }
 
-/// Whether `holder`'s replica comes to fold `device` among `member`'s.
+/// Whether the membership view of `holder`'s replica comes to list `device`
+/// among `member`'s.
 pub async fn lists_device(
     node: &SyncNode,
     holder: PdnId,
@@ -152,20 +154,20 @@ pub async fn lists_device(
 ) -> Result<bool> {
     eventually(|| async {
         Ok(node
-            .pod_membership(holder, pod)
+            .pod_membership_view(holder, pod)
             .await
             .is_ok_and(|membership| {
                 membership
                     .member(&member)
-                    .is_some_and(|folded| folded.devices.contains(&device))
+                    .is_some_and(|member| member.devices.contains(&device))
             }))
     })
     .await
 }
 
-pub async fn folds_nobody(node: &SyncNode, holder: PdnId, pod: PodId) -> Result<bool> {
+pub async fn lists_nobody(node: &SyncNode, holder: PdnId, pod: PodId) -> Result<bool> {
     Ok(node
-        .pod_membership(holder, pod)
+        .pod_membership_view(holder, pod)
         .await?
         .identities()
         .next()

@@ -13,7 +13,7 @@ use data_layer::{
 use pdn_types::{NodeId, PodId, RecordId};
 use test_utils::{
     eventually, join_identity,
-    pod::{create, device_of, folds_nobody, host, invite, lists_device, reads, tickets, Person},
+    pod::{create, device_of, host, invite, lists_device, lists_nobody, reads, tickets, Person},
     wait_devices, TIMEOUT,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -79,8 +79,8 @@ async fn statement(
 }
 
 /// Whether `holder`'s replica on `node` comes to hold `key` in its
-/// membership store with a verdict `want` accepts, read from the fold a
-/// read reports on `reports`.
+/// membership store with a verdict `want` accepts, read from the membership
+/// view a read reports on `reports`.
 async fn holds(
     node: &SyncNode,
     reports: &mut UnboundedReceiver<PodVerdicts>,
@@ -91,14 +91,14 @@ async fn holds(
 ) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        node.pod_membership(holder.id, pod).await?;
+        node.pod_membership_view(holder.id, pod).await?;
         let mut held = None;
         while let Ok(report) = reports.try_recv() {
             if report.identity == holder.id && report.pod == pod {
                 held = Some(report.verdicts);
             }
         }
-        let held = held.context("the read reported no fold")?;
+        let held = held.context("the read reported no membership view")?;
         if held
             .iter()
             .any(|(held, _author, verdict)| held.as_slice() == key && want(*verdict))
@@ -136,7 +136,7 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
     bob_phone
         .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
         .await?;
-    assert!(eventually(|| async { Ok(!folds_nobody(&bob_phone, bob.id, pod).await?) }).await?);
+    assert!(eventually(|| async { Ok(!lists_nobody(&bob_phone, bob.id, pod).await?) }).await?);
     let ticket = bob_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
@@ -160,12 +160,12 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
         refused.exchanged.is_err(),
         "a phone that does not list the laptop served it"
     );
-    assert!(folds_nobody(&bob_laptop, bob.id, pod).await?);
+    assert!(lists_nobody(&bob_laptop, bob.id, pod).await?);
 
     laptop_pms.add_device(bob_laptop.node_id()).await?;
     assert!(wait_devices(&bob_pms, &[bob_laptop.node_id()]).await?);
     assert!(
-        eventually(|| async { Ok(!folds_nobody(&bob_laptop, bob.id, pod).await?) }).await?,
+        eventually(|| async { Ok(!lists_nobody(&bob_laptop, bob.id, pod).await?) }).await?,
         "the phone did not dial the laptop its PMS came to list"
     );
     Ok(())
@@ -344,7 +344,7 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
         .await?
     );
     let devices = alice_phone
-        .pod_membership(alice.id, pod)
+        .pod_membership_view(alice.id, pod)
         .await?
         .member(&bob.id)
         .map(|member| member.devices.clone())

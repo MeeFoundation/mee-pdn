@@ -18,7 +18,7 @@ use pdn_types::{NodeId, PodId};
 use test_utils::{
     eventually, join_identity,
     pod::{
-        create, device_of, folds_nobody, held_records, host, invite, lists, lists_device,
+        create, device_of, held_records, host, invite, lists, lists_device, lists_nobody,
         place_claim, reads, state_on, statement, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
@@ -171,7 +171,7 @@ async fn a_write_arrives_live_over_the_swarm_and_a_ticket_holder_takes_nothing()
     }
     // Denied: the ticket holder that is no member, on either store.
     assert!(
-        folds_nobody(&dave_phone, dave.id, pod).await?,
+        lists_nobody(&dave_phone, dave.id, pod).await?,
         "the ticket holder took entries from the swarm"
     );
     let held = held_records(&dave_phone, dave.id, pod).await?;
@@ -245,7 +245,7 @@ async fn a_write_reaches_a_member_through_another_member_payload_included() -> R
         "the write did not reach Carol's phone through Bob's"
     );
     // Denied: the ticket holder that is no member.
-    assert!(folds_nobody(&dave_phone, dave.id, pod).await?);
+    assert!(lists_nobody(&dave_phone, dave.id, pod).await?);
 
     for node in [bob_phone, carol_phone, dave_phone] {
         node.shutdown().await?;
@@ -492,9 +492,10 @@ async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> 
 /// A newcomer's record store reaches the inviter by its ticket, and the
 /// inviter's claim reads, though the membership store's first session
 /// derives contacts that leave the inviter's device out. Alice's statement
-/// lists another node here, as a fold whose payloads are still on their way
-/// lists none; the start is held between the two stores until that
-/// derivation lands, which the stress pass meets only now and then.
+/// lists another node here, as a membership view lists none while the
+/// payloads are still on their way; the start is held between the two stores
+/// until that derivation lands, which the stress pass meets only now and
+/// then.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no_inviter_device(
 ) -> Result<()> {
@@ -502,7 +503,7 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let creation = alice.keys.creation([0xa0; 16]);
-    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
@@ -565,10 +566,10 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
 /// while the contacts its membership derives still leave the inviter's
 /// device out: the share restarts each store's sync, which dials the peers
 /// the store recorded as the identity whose ticket the store came from.
-/// Alice's statement lists another node here, as a fold whose payloads are
-/// still on their way lists none; the newcomer is out of the record store's
-/// swarm while Alice writes, so the share's dial is the only way the write
-/// reaches it.
+/// Alice's statement lists another node here, as a membership view lists
+/// none while the payloads are still on their way; the newcomer is out of
+/// the record store's swarm while Alice writes, so the share's dial is the
+/// only way the write reaches it.
 #[allow(clippy::too_many_lines)] // one scenario: the arrangement, the write and the share
 #[tokio::test(flavor = "multi_thread")]
 async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
@@ -576,7 +577,7 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let creation = alice.keys.creation([0xa1; 16]);
-    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
@@ -636,11 +637,11 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
 /// A member's write announced from a device of that member whose node no
 /// statement lists reaches another member: the pull the announcement
 /// triggers addresses the member the announcement names. Bob's statement
-/// lists his phone's author beside another node, as a fold whose payloads
-/// are still on their way lists none; the phone takes the membership from
-/// its sibling, which then leaves the record store's swarm so it relays
-/// nothing, and every store settles before the write, so the announcement
-/// is the only way out of the phone.
+/// lists his phone's author beside another node, as a membership view lists
+/// none while the payloads are still on their way; the phone takes the
+/// membership from its sibling, which then leaves the record store's swarm
+/// so it relays nothing, and every store settles before the write, so the
+/// announcement is the only way out of the phone.
 #[allow(clippy::too_many_lines)] // one scenario: two devices of one member and the write
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_member() -> Result<()>
@@ -743,7 +744,7 @@ async fn a_write_whose_announcement_was_lost_arrives_at_the_next_run() -> Result
         "the pod pass did not bring the write whose announcement was lost"
     );
     // Denied: the ticket holder that is no member.
-    assert!(folds_nobody(&dave_phone, dave.id, pod).await?);
+    assert!(lists_nobody(&dave_phone, dave.id, pod).await?);
 
     for node in [alice_phone, bob_phone, dave_phone] {
         node.shutdown().await?;
@@ -1226,7 +1227,7 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
         "the dial to the ticket holder did not go through"
     );
     assert!(
-        folds_nobody(&dave_phone, dave.id, pod).await?,
+        lists_nobody(&dave_phone, dave.id, pod).await?,
         "a member's dial served a ticket holder the membership store"
     );
     let held = held_records(&dave_phone, dave.id, pod).await?;

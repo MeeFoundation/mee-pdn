@@ -43,7 +43,7 @@ use crate::{
     connection_metadata::ConnectionMetadataStore,
     pod::{
         departure_past, record_entries, record_prefix, unknown_entries, Member, MemberDevice,
-        Membership, Operation, PodCatchUp, PodNotice, PodStore, PodTickets, RecordView, Seq,
+        MembershipView, Operation, PodCatchUp, PodNotice, PodStore, PodTickets, RecordView, Seq,
         UnknownEntry, UnknownPod,
     },
     private_metadata::PrivateMetadataStore,
@@ -400,8 +400,9 @@ struct HostedStack {
     /// alone from then on.
     converged_tombstones: Mutex<HashSet<PodId>>,
     /// One per pod, held through each derivation of that pod's contacts,
-    /// from its fold to its last write: one that folded before a change
-    /// would otherwise set its list after the one that folded after it.
+    /// from its membership view to its last write: one that read the view
+    /// before a change would otherwise set its list after the one that read
+    /// it after.
     pod_derivations: Mutex<HashMap<PodId, Arc<tokio::sync::Mutex<()>>>>,
     notices: crate::pod::PodNoticeSink,
 }
@@ -1485,8 +1486,8 @@ impl SyncNode {
     }
 
     /// Every dial of the record store follows an exchange of the membership
-    /// store with the same counterpart, so the session that serves it folds
-    /// the membership that exchange brought.
+    /// store with the same counterpart, so the session that serves it judges
+    /// by the membership view that exchange brought.
     async fn order_pod_stores(stack: &HostedStack, membership: &Doc, records: &Doc) -> Result<()> {
         stack
             .docs
@@ -1671,9 +1672,9 @@ impl SyncNode {
         };
         Self::order_pod_stores(stack, membership, records).await?;
         // Read before either starts: the membership store's first session
-        // derives both stores' contacts again, from a fold that can list no
-        // device of the inviter yet, and the record store would start with
-        // none.
+        // derives both stores' contacts again, from a membership view that
+        // can list no device of the inviter yet, and the record store would
+        // start with none.
         let (membership, records) = (
             stack.tracked(membership.id())?,
             stack.tracked(records.id())?,
@@ -1856,16 +1857,16 @@ impl SyncNode {
         Ok(flush)
     }
 
-    /// The membership `identity`'s replica of `pod`'s membership store
-    /// folds into, payloads read as far as they have arrived.
+    /// The membership view of `identity`'s replica of `pod`'s membership
+    /// store, payloads read as far as they have arrived.
     /// [`UnknownPod`] for a tombstone too.
-    pub async fn pod_membership(&self, identity: PdnId, pod: PodId) -> Result<Membership> {
+    pub async fn pod_membership_view(&self, identity: PdnId, pod: PodId) -> Result<MembershipView> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
         if held.records.is_none() {
             return Err(UnknownPod { pod }.into());
         }
-        stack.access.fold_pod(pod, &held.membership).await
+        stack.access.membership_view(pod, &held.membership).await
     }
 
     /// The highest sequence of `subject`'s chain that `identity`'s replica
@@ -1875,13 +1876,14 @@ impl SyncNode {
         let Some(held) = stack.registry.pod(pod)? else {
             return Ok(0);
         };
-        let membership = stack.access.fold_pod(pod, &held.membership).await?;
+        let membership = stack.access.membership_view(pod, &held.membership).await?;
         Ok(membership.member(&subject).map_or(0, Member::run))
     }
 
-    /// Wait, at most `timeout`, until `identity`'s replica of `pod` folds
-    /// `identity` itself into a member: a session brings its own entries
-    /// ahead of their payloads. [`CatchUpTimeout`] when it does not.
+    /// Wait, at most `timeout`, until the membership view of `identity`'s
+    /// replica of `pod` lists `identity` itself as a member: a session
+    /// brings its own entries ahead of their payloads. [`CatchUpTimeout`]
+    /// when it does not.
     pub async fn await_pod_member(
         &self,
         identity: PdnId,
@@ -1890,12 +1892,13 @@ impl SyncNode {
     ) -> Result<()> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
-        // Subscribed before the first fold, so no change lands unseen.
+        // Subscribed before the first membership view, so no change lands
+        // unseen.
         let mut changes = held.membership.subscribe().await?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let folded = stack.access.fold_pod(pod, &held.membership).await?;
-            if folded
+            let view = stack.access.membership_view(pod, &held.membership).await?;
+            if view
                 .member(&identity)
                 .is_some_and(|member| member.state.member)
             {
@@ -1906,13 +1909,13 @@ impl SyncNode {
                 Ok(None) => anyhow::bail!("the membership store's change stream ended"),
                 Err(_elapsed) => return Err(crate::CatchUpTimeout.into()),
             }
-            // A burst — a session's entries, their payloads — folds once.
+            // A burst — a session's entries, their payloads — is read once.
             while let Some(Some(_change)) = futures_lite::future::poll_once(changes.next()).await {}
         }
     }
 
     /// The record view over `identity`'s replica of `pod`'s record store,
-    /// judged by the membership its membership store folds into; payloads
+    /// judged by the membership view of its membership store; payloads
     /// are checked for arrival, not read. [`UnknownPod`] for a tombstone
     /// too.
     pub async fn pod_record_view(&self, identity: PdnId, pod: PodId) -> Result<RecordView> {
@@ -1987,14 +1990,15 @@ impl SyncNode {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
         let records = held.records.ok_or(UnknownPod { pod })?;
-        let membership = stack.access.fold_pod(pod, &held.membership).await?;
+        let membership = stack.access.membership_view(pod, &held.membership).await?;
         let entries = record_entries(&records, &self.blobs, query).await?;
         Ok(RecordView::new(&membership, entries))
     }
 
     /// Write `payload` at `key` into one of `pod`'s stores with
     /// `identity`'s author, checking nothing the key or the payload says:
-    /// what the entry counts for is the fold's and the record view's.
+    /// what the entry counts for is the membership view's and the record
+    /// view's.
     /// [`UnknownPod`] for a tombstone too.
     pub async fn write_pod_entry(
         &self,
@@ -2078,9 +2082,9 @@ impl SyncNode {
         })
     }
 
-    /// Once; a second take yields `None`. From the take on, every fold of a
-    /// pod's membership store on this node — at a session's setup, at a
-    /// read and at a run of the pod stores' pass — reports its verdicts.
+    /// Once; a second take yields `None`. From the take on, every membership
+    /// view of a pod's membership store on this node — at a session's setup,
+    /// at a read and at a run of the pod stores' pass — reports its verdicts.
     #[cfg(feature = "test-util")]
     pub fn take_pod_verdicts(
         &self,
@@ -2161,16 +2165,17 @@ impl SyncNode {
         Ok(())
     }
 
-    /// [`pod_membership`](Self::pod_membership) over a tombstone as well.
+    /// [`pod_membership_view`](Self::pod_membership_view) over a tombstone as
+    /// well.
     #[cfg(feature = "test-util")]
-    pub async fn held_pod_membership_for_test(
+    pub async fn held_pod_membership_view_for_test(
         &self,
         identity: PdnId,
         pod: PodId,
-    ) -> Result<Membership> {
+    ) -> Result<MembershipView> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
-        stack.access.fold_pod(pod, &held.membership).await
+        stack.access.membership_view(pod, &held.membership).await
     }
 
     /// Every session one of `pod`'s stores finishes from now on, dialed or
@@ -3643,8 +3648,8 @@ async fn derive_pod_contacts_locked(
 /// Derive `held`'s contacts before its sync starts, so a reopened replica
 /// dials each member's devices as that member — a ticket names every node
 /// as the identity that minted it — and keep beside them each ticket
-/// contact whose node they leave out: a replica that folds nobody yet, or a
-/// tombstone past its convergence, has no other.
+/// contact whose node they leave out: a replica whose membership view lists
+/// nobody yet, or a tombstone past its convergence, has no other.
 async fn derive_before_start(
     stack: &HostedStack,
     node: EndpointId,
@@ -3827,12 +3832,12 @@ fn note_event(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>
 /// A pod store's contacts: every device the statements of the pod's
 /// current members list, each dialed as its member, and the identity's own
 /// devices by its PMS, dialed as the identity; never this device as
-/// this identity. `None` while the membership store folds into nobody: a
-/// replica that holds nothing yet keeps the contacts its ticket gave it.
+/// this identity. `None` while the membership view lists nobody: a replica
+/// that holds nothing yet keeps the contacts its ticket gave it.
 /// A tombstone drops the members' devices once a session with one of them
 /// — any device of another than itself among `met` — went through. A
-/// replica holding its record store again keeps them while its fold still
-/// shows the departure: they are how a rejoin dials its inviter.
+/// replica holding its record store again keeps them while its membership
+/// view still shows the departure: they are how a rejoin dials its inviter.
 async fn pod_contacts(
     stack: &HostedStack,
     node: EndpointId,
@@ -3841,16 +3846,18 @@ async fn pod_contacts(
     met: &[NodeId],
 ) -> Result<DerivedContacts> {
     let membership = &held.membership;
-    let (folded, entries) = stack.access.fold_pod_entries(pod, membership).await?;
-    if folded.identities().next().is_none() {
+    let (view, entries) = stack
+        .access
+        .membership_view_and_entries(pod, membership)
+        .await?;
+    if view.identities().next().is_none() {
         return Ok(DerivedContacts {
             contacts: None,
             departed: None,
             unlisted: false,
         });
     }
-    let departed =
-        departure_past(&folded, &entries, &stack.identity).map(|past| Seq::new(past.seq));
+    let departed = departure_past(&view, &entries, &stack.identity).map(|past| Seq::new(past.seq));
     let own = stack.identity();
     let own_devices = stack.access.own_devices().await?;
     let this_device = NodeId::from_bytes(*node.as_bytes());
@@ -3858,7 +3865,7 @@ async fn pod_contacts(
         node: this_device,
         author: stack.author,
     };
-    let unlisted = folded
+    let unlisted = view
         .member(&stack.identity)
         .is_some_and(|member| member.state.member && !member.devices.contains(&device));
     let converged = {
@@ -3878,7 +3885,7 @@ async fn pod_contacts(
         }
         converged.contains(&pod)
     };
-    let mut devices: Vec<(NodeId, Identity)> = folded
+    let mut devices: Vec<(NodeId, Identity)> = view
         .identities()
         .filter(|(_id, member)| member.state.member && !converged)
         .flat_map(|(id, member)| {
@@ -3955,9 +3962,9 @@ fn known_addresses(stack: &HostedStack, store: &Doc) -> Result<HashMap<EndpointI
         .unwrap_or_default())
 }
 
-/// What [`pod_contacts`] derives from one fold.
+/// What [`pod_contacts`] derives from one membership view.
 struct DerivedContacts {
-    /// `None` while the membership store folds into nobody.
+    /// `None` while the membership view lists nobody.
     contacts: Option<Vec<Contact>>,
     /// The sequence of the identity's own departure.
     departed: Option<Seq>,

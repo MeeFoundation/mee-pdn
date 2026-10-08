@@ -1,6 +1,6 @@
-//! The membership payloads the fold reads, each a run of fixed-size fields
-//! in a fixed order, decoded only at its exact length. What each signs is
-//! `announcement`'s.
+//! The membership payloads the membership view reads, each a run of
+//! fixed-size fields in a fixed order, decoded only at its exact length.
+//! What each signs is `identity_key`'s.
 
 use pdn_store::AuthorId;
 use pdn_types::NodeId;
@@ -17,19 +17,19 @@ pub struct MemberDevice {
     pub author: AuthorId,
 }
 
-/// The created event's payload: `nonce ‖ announcement_key ‖ signature`.
+/// The created event's payload: `nonce ‖ identity_key ‖ signature`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedPayload {
     pub nonce: [u8; 16],
-    pub announcement_key: [u8; 32],
+    pub identity_key: [u8; 32],
     pub signature: [u8; 64],
 }
 
 /// A joined event's payload, the newcomer's join statement:
-/// `announcement_key ‖ signature`.
+/// `identity_key ‖ signature`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinedPayload {
-    pub announcement_key: [u8; 32],
+    pub identity_key: [u8; 32],
     pub signature: [u8; 64],
 }
 
@@ -43,13 +43,13 @@ pub struct DevicesPayload {
 
 impl CreatedPayload {
     pub fn encode(&self) -> Vec<u8> {
-        [&self.nonce[..], &self.announcement_key, &self.signature].concat()
+        [&self.nonce[..], &self.identity_key, &self.signature].concat()
     }
 
     pub fn decode(mut bytes: &[u8]) -> Option<Self> {
         let payload = Self {
             nonce: take(&mut bytes)?,
-            announcement_key: take(&mut bytes)?,
+            identity_key: take(&mut bytes)?,
             signature: take(&mut bytes)?,
         };
         bytes.is_empty().then_some(payload)
@@ -58,12 +58,12 @@ impl CreatedPayload {
 
 impl JoinedPayload {
     pub fn encode(&self) -> Vec<u8> {
-        [&self.announcement_key[..], &self.signature].concat()
+        [&self.identity_key[..], &self.signature].concat()
     }
 
     pub fn decode(mut bytes: &[u8]) -> Option<Self> {
         let payload = Self {
-            announcement_key: take(&mut bytes)?,
+            identity_key: take(&mut bytes)?,
             signature: take(&mut bytes)?,
         };
         bytes.is_empty().then_some(payload)
@@ -125,11 +125,11 @@ mod tests {
     fn payloads_decode_at_their_exact_length_only() {
         let created = CreatedPayload {
             nonce: [0x5a; 16],
-            announcement_key: [0x17; 32],
+            identity_key: [0x17; 32],
             signature: [0x0e; 64],
         };
         let joined = JoinedPayload {
-            announcement_key: [0x17; 32],
+            identity_key: [0x17; 32],
             signature: [0x0e; 64],
         };
         let devices = DevicesPayload {

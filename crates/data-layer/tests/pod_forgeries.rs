@@ -53,14 +53,14 @@ async fn dial(
 
 /// Every entry `holder`'s replica on `node` holds in either store, by key
 /// and author, beside what it counts for: the membership store's from the
-/// fold a read reports on `reports`.
+/// membership view a read reports on `reports`.
 async fn held(
     node: &SyncNode,
     reports: &mut UnboundedReceiver<PodVerdicts>,
     holder: PdnId,
     pod: PodId,
 ) -> Result<Vec<(PodStore, Vec<u8>, AuthorId, Verdict)>> {
-    node.pod_membership(holder, pod).await?;
+    node.pod_membership_view(holder, pod).await?;
     let mut membership = None;
     while let Ok(report) = reports.try_recv() {
         if report.identity == holder && report.pod == pod {
@@ -68,7 +68,7 @@ async fn held(
         }
     }
     let mut held: Vec<_> = membership
-        .context("the read reported no fold")?
+        .context("the read reported no membership view")?
         .into_iter()
         .map(|(key, author, verdict)| (PodStore::Membership, key, author, verdict))
         .collect();
@@ -405,7 +405,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             MemberState::default()
         );
         let carols: BTreeSet<_> = phone
-            .pod_membership(holder.id, pod)
+            .pod_membership_view(holder.id, pod)
             .await?
             .member(&carol.id)
             .map(|member| member.devices.clone())

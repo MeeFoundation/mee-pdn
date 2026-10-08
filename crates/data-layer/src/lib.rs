@@ -17,9 +17,9 @@
 
 mod access;
 mod address_book;
-mod announcement;
 pub mod connection_metadata;
 pub mod grant;
+mod identity_key;
 pub mod layer;
 pub mod node;
 mod pod;
@@ -28,20 +28,20 @@ mod registry;
 mod retraction;
 
 pub use access::identity_of;
-pub use announcement::{devices_verify, join_verifies, pdn_id_of, pod_id_of, AnnouncementKeyPair};
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
+pub use identity_key::{devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair};
 #[cfg(feature = "test-util")]
 pub use node::{PodSession, PodSessions, PodStartPause};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{
     record_prefix, Awaiting, CreatedPayload, DevicesPayload, EventKind, ForNothing, HeldEntry,
-    JoinedPayload, Member, MemberDevice, MemberState, Membership, MembershipKey, OpId, Operation,
-    PodCatchUp, PodNotice, PodStore, PodTickets, RecordEntry, RecordKey, RecordView, Seq,
-    UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,
+    JoinedPayload, Member, MemberDevice, MemberState, MembershipKey, MembershipView, OpId,
+    Operation, PodCatchUp, PodNotice, PodStore, PodTickets, RecordEntry, RecordKey, RecordView,
+    Seq, UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,
 };
 // The ceremony registration point (ADR-0011, ADR-0012), re-exported so
 // consumers need no direct iroh dependency. The raw `Endpoint` is

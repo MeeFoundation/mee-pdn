@@ -1,4 +1,4 @@
-//! The membership fold: what the entries a device holds in a pod's
+//! The membership view: what the entries a device holds in a pod's
 //! membership store make of its members, and what each entry counts for,
 //! whatever order they arrived in — by the pod stores spec's requirements
 //! on the membership store and on device statements.
@@ -12,7 +12,7 @@ use super::{
     keys::{EventKind, MembershipKey, Seq},
     payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice},
 };
-use crate::announcement::{creation_verifies, devices_verify, join_verifies, pdn_id_of, pod_id_of};
+use crate::identity_key::{creation_verifies, devices_verify, join_verifies, pdn_id_of, pod_id_of};
 
 /// One entry of a membership store as a device holds it; `payload` is
 /// `None` until its bytes have arrived.
@@ -24,7 +24,8 @@ pub struct HeldEntry {
 }
 
 /// What one held entry counts for, over everything the device holds: in the
-/// membership store by the fold, in the record store by the record view.
+/// membership store by the membership view, in the record store by the
+/// record view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Counted,
@@ -43,7 +44,7 @@ pub enum ForNothing {
     Misplaced,
     /// The created event's fields derive another pod id.
     OtherPod,
-    /// The announcement key it carries derives another `PdnId` than its
+    /// The identity key it carries derives another `PdnId` than its
     /// subject's.
     KeyOfAnother,
     BadSignature,
@@ -74,8 +75,8 @@ pub enum Awaiting {
     /// The subject's chain is not held up to the sequence before the
     /// event's.
     SubjectChain,
-    /// No held event carries the member's announcement key.
-    AnnouncementKey,
+    /// No held event carries the member's identity key.
+    IdentityKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,12 +85,12 @@ pub struct MemberState {
     pub owner: bool,
 }
 
-/// An identity the membership store names, as the fold leaves it.
+/// An identity the membership store names, as the membership view shows it.
 #[derive(Clone, Debug, Default)]
 pub struct Member {
     /// After its chain as far as the first sequence holding no entry.
     pub state: MemberState,
-    pub announcement_key: Option<[u8; 32]>,
+    pub identity_key: Option<[u8; 32]>,
     /// The union of its counted device statements.
     pub devices: BTreeSet<MemberDevice>,
     /// The highest version among its counted device statements; `0` for
@@ -127,23 +128,23 @@ impl Member {
     }
 }
 
-/// The membership a device's entries fold into, and each entry's verdict
-/// in the order the entries were given.
+/// What a device's entries make of a pod's members, and each entry's
+/// verdict in the order the entries were given.
 #[derive(Clone, Debug)]
-pub struct Membership {
+pub struct MembershipView {
     members: BTreeMap<PdnId, Member>,
     verdicts: Vec<Verdict>,
 }
 
-impl Membership {
-    pub fn fold(pod: &PodId, entries: &[HeldEntry]) -> Self {
+impl MembershipView {
+    pub fn new(pod: &PodId, entries: &[HeldEntry]) -> Self {
         let parsed = Parsed::of(entries);
         let mut set_aside = BTreeSet::new();
         loop {
             let pass = Pass::run(pod, entries, &parsed, &set_aside);
             let more = pass.demotions_to_set_aside();
             if more.is_subset(&set_aside) {
-                return pass.into_membership();
+                return pass.into_view();
             }
             set_aside.extend(more);
         }
@@ -313,7 +314,7 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// A member's announcement key is the one any held created or joined
+    /// A member's identity key is the one any held created or joined
     /// event in its chain carries that derives the member's `PdnId`.
     fn find_keys(&mut self) {
         for event in &self.parsed.events {
@@ -321,8 +322,8 @@ impl<'a> Pass<'a> {
                 continue;
             };
             let key = match event.kind {
-                EventKind::Created => CreatedPayload::decode(payload).map(|p| p.announcement_key),
-                EventKind::Joined => JoinedPayload::decode(payload).map(|p| p.announcement_key),
+                EventKind::Created => CreatedPayload::decode(payload).map(|p| p.identity_key),
+                EventKind::Joined => JoinedPayload::decode(payload).map(|p| p.identity_key),
                 _ => None,
             };
             if let Some(key) = key.filter(|key| pdn_id_of(key) == event.subject) {
@@ -363,7 +364,7 @@ impl<'a> Pass<'a> {
             return Verdict::CountedForNothing(ForNothing::Malformed);
         };
         let Some(key) = self.keys.get(&statement.member) else {
-            return Verdict::NotYet(Awaiting::AnnouncementKey);
+            return Verdict::NotYet(Awaiting::IdentityKey);
         };
         if devices_verify(key, statement.version, &payload) {
             Verdict::Counted
@@ -429,10 +430,10 @@ impl<'a> Pass<'a> {
         let Some(creation) = CreatedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
-        if pod_id_of(&event.subject, &creation.announcement_key, &creation.nonce) != *self.pod {
+        if pod_id_of(&event.subject, &creation.identity_key, &creation.nonce) != *self.pod {
             return nothing(ForNothing::OtherPod);
         }
-        if pdn_id_of(&creation.announcement_key) != event.subject {
+        if pdn_id_of(&creation.identity_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
         }
         if !creation_verifies(&event.subject, &creation) {
@@ -452,7 +453,7 @@ impl<'a> Pass<'a> {
         let Some(statement) = JoinedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
-        if pdn_id_of(&statement.announcement_key) != event.subject {
+        if pdn_id_of(&statement.identity_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
         }
         if !join_verifies(&event.subject, self.pod, Seq::new(event.seq), &statement) {
@@ -747,7 +748,7 @@ impl<'a> Pass<'a> {
         ids.into_iter()
     }
 
-    fn into_membership(self) -> Membership {
+    fn into_view(self) -> MembershipView {
         let members = self
             .identities()
             .map(|id| {
@@ -755,7 +756,7 @@ impl<'a> Pass<'a> {
                 let chain = (1..=run).map(|seq| (seq, self.state(&id, seq))).collect();
                 let member = Member {
                     state: self.state(&id, run),
-                    announcement_key: self.keys.get(&id).copied(),
+                    identity_key: self.keys.get(&id).copied(),
                     devices: self.devices.get(&id).cloned().unwrap_or_default(),
                     statement_version: self.statement_versions.get(&id).copied().unwrap_or(0),
                     chain,
@@ -763,7 +764,7 @@ impl<'a> Pass<'a> {
                 (id, member)
             })
             .collect();
-        Membership {
+        MembershipView {
             members,
             verdicts: self.verdicts,
         }
@@ -838,7 +839,7 @@ fn apply(kind: EventKind) -> MemberState {
 }
 
 /// Strongly connected components, each after every component it reaches:
-/// iterative, so a store of any size folds on any stack.
+/// iterative, so a store of any size fits any stack.
 #[allow(clippy::indexing_slicing)] // every index is a node below `adjacency.len()`
 fn components(adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
     const UNVISITED: usize = usize::MAX;

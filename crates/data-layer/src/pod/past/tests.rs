@@ -5,7 +5,8 @@ use crate::pod::{
 };
 
 fn past_of(store: &Store, member: &Person) -> Option<HashSet<PastEntry>> {
-    departure_past(&store.fold(), &store.entries, &member.id()).map(|departure| departure.past)
+    departure_past(&store.membership_view(), &store.entries, &member.id())
+        .map(|departure| departure.past)
 }
 
 fn entry(store: &Store, index: usize) -> PastEntry {
@@ -68,7 +69,7 @@ fn a_leaves_past_holds_the_members_own_chain_and_statement() {
 }
 
 /// A sequence held by an entry that counts for nothing stays in the past,
-/// so the former member's device folds the chain as far as the member
+/// so the former member's device walks the chain as far as the member
 /// devices do.
 #[test]
 fn an_earlier_sequence_held_by_an_entry_counting_for_nothing_stays_in_the_past() {

@@ -21,8 +21,8 @@ pub use connections::{
 };
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 pub use pods::{
-    ActRefusal, ActRefused, AnnouncementKeyPending, JoinInProgress, JoinRefused, JoinTimeout,
-    PodAct, PodInfo, PodInvite, PodMember, PodsService, RecordPlacedOnce, RuntimePodsService,
+    ActRefusal, ActRefused, IdentityKeyPending, JoinInProgress, JoinRefused, JoinTimeout, PodAct,
+    PodInfo, PodInvite, PodMember, PodsService, RecordPlacedOnce, RuntimePodsService,
     UnknownRecord, UnsupportedPodInviteVersion, WrongRecordKind, JOIN_CATCH_UP_TIMEOUT,
     JOIN_DIALOGUE_TIMEOUT, LEAVE_FLUSH_TIMEOUT, POD_INVITE_FORMAT_VERSION,
 };

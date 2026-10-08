@@ -24,7 +24,7 @@ use crate::{
     connection_metadata::GrantRecord,
     grant::{claim_id_of_key, GrantedClaim, ReadGrant},
     pod::{
-        departure_past, held_entries, HeldEntry, Membership, MembershipKey, PastEntry, PodStore,
+        departure_past, held_entries, HeldEntry, MembershipKey, MembershipView, PastEntry, PodStore,
     },
     registry::{Registry, ServingPosture},
 };
@@ -139,7 +139,8 @@ pub(crate) struct AccessBook {
     serve_pods_whole: std::sync::atomic::AtomicBool,
 }
 
-/// Where each fold's verdicts go once a scenario takes the channel.
+/// Where each membership view's verdicts go once a scenario takes the
+/// channel.
 #[cfg(feature = "test-util")]
 pub(crate) type PodVerdictSink =
     Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::pod::PodVerdicts>>>>;
@@ -410,8 +411,8 @@ impl AccessBook {
 
     /// A pod's membership store, served whole to a device of the member
     /// the caller names — a sibling by this identity's own PMS,
-    /// another member by the device statements this identity's replica
-    /// folds — and to nobody else, by the pod stores spec. The record
+    /// another member by the device statements this identity's membership
+    /// view counts — and to nobody else, by the pod stores spec. The record
     /// store serves no session.
     async fn classify_pod(
         &self,
@@ -495,15 +496,15 @@ impl AccessBook {
         caller: PdnId,
         peer: NodeId,
     ) -> Result<Option<SessionAccess>> {
-        let (folded, entries) = self.fold_pod_entries(pod, membership).await?;
-        let Some(member) = folded.member(&caller) else {
+        let (view, entries) = self.membership_view_and_entries(pod, membership).await?;
+        let Some(member) = view.member(&caller) else {
             return Ok(None);
         };
         if !member.devices.iter().any(|device| device.node == peer) {
             return Ok(None);
         }
         let (departure, rejoin) = if member.state.member {
-            match departure_past(&folded, &entries, &self.identity) {
+            match departure_past(&view, &entries, &self.identity) {
                 None => return Ok(Some(self.whole(registry))),
                 Some(own) => {
                     let rejoin = Some((self.identity, own.seq));
@@ -511,7 +512,7 @@ impl AccessBook {
                 }
             }
         } else {
-            match departure_past(&folded, &entries, &caller) {
+            match departure_past(&view, &entries, &caller) {
                 None => return Ok(None),
                 Some(theirs) => (theirs, None),
             }
@@ -577,26 +578,31 @@ impl AccessBook {
         Ok(true)
     }
 
-    /// The membership this identity's replica of `pod`'s membership store
-    /// folds into, payloads read as far as they have arrived.
-    pub(crate) async fn fold_pod(&self, pod: PodId, membership: &Doc) -> Result<Membership> {
-        Ok(self.fold_pod_entries(pod, membership).await?.0)
-    }
-
-    /// [`fold_pod`](Self::fold_pod) beside the entries it folded.
-    pub(crate) async fn fold_pod_entries(
+    /// The membership view of this identity's replica of `pod`'s membership
+    /// store, payloads read as far as they have arrived.
+    pub(crate) async fn membership_view(
         &self,
         pod: PodId,
         membership: &Doc,
-    ) -> Result<(Membership, Vec<HeldEntry>)> {
+    ) -> Result<MembershipView> {
+        Ok(self.membership_view_and_entries(pod, membership).await?.0)
+    }
+
+    /// [`membership_view`](Self::membership_view) beside the entries it was
+    /// built from.
+    pub(crate) async fn membership_view_and_entries(
+        &self,
+        pod: PodId,
+        membership: &Doc,
+    ) -> Result<(MembershipView, Vec<HeldEntry>)> {
         let entries = match self.blobs.get() {
             Some(blobs) => held_entries(membership, blobs).await?,
             None => Vec::new(),
         };
-        let folded = Membership::fold(&pod, &entries);
+        let view = MembershipView::new(&pod, &entries);
         #[cfg(feature = "test-util")]
-        self.report_pod_verdicts(pod, &entries, &folded);
-        Ok((folded, entries))
+        self.report_pod_verdicts(pod, &entries, &view);
+        Ok((view, entries))
     }
 
     #[cfg(feature = "test-util")]
@@ -609,7 +615,7 @@ impl AccessBook {
         &self,
         pod: PodId,
         entries: &[crate::pod::HeldEntry],
-        folded: &Membership,
+        view: &MembershipView,
     ) {
         let Some(sink) = self.pod_verdicts.get() else {
             return;
@@ -620,7 +626,7 @@ impl AccessBook {
         if let Some(sender) = sender.as_ref() {
             let verdicts = entries
                 .iter()
-                .zip(folded.verdicts())
+                .zip(view.verdicts())
                 .map(|(entry, verdict)| (entry.key.clone(), entry.author, *verdict))
                 .collect();
             let _ = sender.send(crate::pod::PodVerdicts {

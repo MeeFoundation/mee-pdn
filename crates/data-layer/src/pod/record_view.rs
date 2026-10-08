@@ -9,8 +9,8 @@ use pdn_store::AuthorId;
 use pdn_types::{RecordKind, RecordRef};
 
 use super::{
-    fold::{Awaiting, ForNothing, Membership, Verdict},
     keys::{OpId, RecordKey},
+    membership_view::{Awaiting, ForNothing, MembershipView, Verdict},
 };
 
 /// One entry of a record store as a device holds it; `payload` is its
@@ -40,7 +40,7 @@ pub struct RecordView {
 }
 
 impl RecordView {
-    pub fn new(membership: &Membership, entries: Vec<RecordEntry>) -> Self {
+    pub fn new(membership: &MembershipView, entries: Vec<RecordEntry>) -> Self {
         let mut read: BTreeMap<RecordRef, Vec<usize>> = BTreeMap::new();
         let mut verdicts = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
@@ -126,7 +126,7 @@ impl RecordView {
 
 /// The writer's chain is checked first: an entry ahead of its writer's
 /// events waits for them rather than counting for nothing.
-fn judge(membership: &Membership, key: &RecordKey, entry: &RecordEntry) -> Verdict {
+fn judge(membership: &MembershipView, key: &RecordKey, entry: &RecordEntry) -> Verdict {
     let (writer, mseq) = match *key {
         RecordKey::Claim { member, mseq, .. }
         | RecordKey::ImmutableDocument { member, mseq, .. } => (member, mseq),

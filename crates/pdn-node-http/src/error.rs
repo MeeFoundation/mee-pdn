@@ -10,8 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pdn_node::{
-    ActRefused, AnnouncementKeyPending, DelegationUnsupported, EstablishmentInProgress,
-    EstablishmentRefused, IdentityAlreadyHosted, JoinInProgress, JoinRefused, LinkingInProgress,
+    ActRefused, DelegationUnsupported, EstablishmentInProgress, EstablishmentRefused,
+    IdentityAlreadyHosted, IdentityKeyPending, JoinInProgress, JoinRefused, LinkingInProgress,
     LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownIdentity, UnknownIssuer, UnknownPod,
     UnknownRecord, UnsupportedInviteVersion, UnsupportedLinkingVersion,
     UnsupportedPodInviteVersion, WriteNotGranted, WrongRecordKind,
@@ -86,7 +86,7 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
         || err.downcast_ref::<UnknownIssuer>().is_some()
         || err.downcast_ref::<UnknownPod>().is_some()
         || err.downcast_ref::<PeerNotConnected>().is_some()
-        || err.downcast_ref::<AnnouncementKeyPending>().is_some()
+        || err.downcast_ref::<IdentityKeyPending>().is_some()
         || err.downcast_ref::<IdentityAlreadyHosted>().is_some()
         || err.downcast_ref::<LinkingInProgress>().is_some()
         || err.downcast_ref::<EstablishmentInProgress>().is_some()
@@ -203,7 +203,7 @@ mod tests {
         );
         assert_eq!(status(UnknownPod { pod: POD }), StatusCode::CONFLICT);
         assert_eq!(
-            status(AnnouncementKeyPending { identity: ISSUER }),
+            status(IdentityKeyPending { identity: ISSUER }),
             StatusCode::CONFLICT
         );
         assert_eq!(
