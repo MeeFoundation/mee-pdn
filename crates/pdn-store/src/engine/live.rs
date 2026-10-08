@@ -29,9 +29,10 @@ use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 // use super::gossip::{GossipActor, ToGossipActor};
+use self::draining::DrainingSync;
 use super::state::{NamespaceStates, Origin, SyncReason};
 use crate::{
-    actor::{OpenOpts, SyncHandle},
+    actor::SyncHandle,
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
@@ -41,6 +42,8 @@ use crate::{
     subscribers::{Delivery, LagNotice, Subscribers},
     AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
 };
+
+mod draining;
 
 /// The stream halves an in-process session runs over: a pipe, since iroh
 /// refuses a connection to this endpoint's own id.
@@ -348,13 +351,11 @@ impl HeldDial {
 pub struct LiveActor {
     /// Receiver for actor messages.
     inbox: mpsc::Receiver<ToLiveActor>,
-    sync: SyncHandle,
+    sync: DrainingSync,
     endpoint: Endpoint,
     bao_store: Store,
     downloader: Downloader,
     memory_lookup: MemoryLookup,
-    replica_events_tx: async_channel::Sender<crate::Event>,
-    replica_events_rx: async_channel::Receiver<crate::Event>,
 
     /// Send messages to self.
     /// Note: Must not be used in methods called from `Self::run` directly to prevent deadlocks.
@@ -436,15 +437,12 @@ impl LiveActor {
         co_located: Option<crate::engine::CoLocatedRequests>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
         let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
         Ok(Self {
             inbox,
-            sync,
-            replica_events_rx,
-            replica_events_tx,
+            sync: DrainingSync::new(sync),
             endpoint,
             memory_lookup,
             gossip: gossip_state,
@@ -518,7 +516,7 @@ impl LiveActor {
                         }
                     }
                 }
-                event = self.replica_events_rx.recv() => {
+                event = self.sync.next_event() => {
                     trace!(?i, "tick: replica_event");
                     self.metrics.doc_live_tick_replica_event.inc();
                     let event = event.context("replica_events closed")?;
@@ -794,7 +792,7 @@ impl LiveActor {
             return;
         }
         let endpoint = self.endpoint.clone();
-        let sync = self.sync.clone();
+        let sync = self.sync.handle().clone();
         let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
         let caller = self.identity;
@@ -871,7 +869,7 @@ impl LiveActor {
         if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
         }
-        let sync = self.sync.clone();
+        let sync = self.sync.handle().clone();
         let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
         let caller = self.identity;
@@ -954,10 +952,7 @@ impl LiveActor {
         debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
         // update state to allow sync
         if !self.state.is_syncing(&namespace) {
-            let opts = OpenOpts::default()
-                .sync()
-                .subscribe(self.replica_events_tx.clone());
-            self.sync.open(namespace, opts).await?;
+            self.sync.open(namespace).await?;
             self.state.insert(namespace);
             // Before the first dial, so the first finished session retries it.
             if let Err(err) = self.park_missing_content(namespace).await {
@@ -1015,7 +1010,7 @@ impl LiveActor {
         self.sync
             .get_many(namespace, crate::store::Query::all().into(), tx)
             .await?;
-        while let Some(entry) = rx.recv().await? {
+        while let Some(entry) = self.sync.wait(rx.recv()).await? {
             let entry = entry?;
             if entry.content_len() == 0 || !policy.matches(entry.entry()) {
                 continue;
@@ -1049,9 +1044,7 @@ impl LiveActor {
             self.peer_identities
                 .retain(|(tracked, _peer), _identities| *tracked != namespace);
             self.sync.set_sync(namespace, false).await?;
-            self.sync
-                .unsubscribe(namespace, self.replica_events_tx.clone())
-                .await?;
+            self.sync.unsubscribe(namespace).await?;
             self.sync.close(namespace).await?;
             self.gossip.quit(&namespace);
         }
@@ -1723,7 +1716,7 @@ impl LiveActor {
     ) {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
         let accept_request_cb = self.accept_callback();
-        let sync = self.sync.clone();
+        let sync = self.sync.handle().clone();
         let metrics = self.metrics.clone();
         self.running_sync_accept.spawn(
             async move {
@@ -1742,7 +1735,7 @@ impl LiveActor {
     fn accept_in_process(&mut self, opening: SessionOpening<InProcessRecv, InProcessSend>) {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
         let accept_request_cb = self.accept_callback();
-        let sync = self.sync.clone();
+        let sync = self.sync.handle().clone();
         let metrics = self.metrics.clone();
         self.running_sync_accept.spawn(
             async move {
