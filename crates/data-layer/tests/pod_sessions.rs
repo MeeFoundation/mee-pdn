@@ -190,7 +190,7 @@ async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
 }
 
 async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> MemberState {
-    match node.pod_membership(holder, pod).await {
+    match node.pod_membership_view(holder, pod).await {
         Ok(membership) => membership
             .member(&member)
             .map(|member| member.state)
@@ -199,7 +199,8 @@ async fn state_on(node: &SyncNode, holder: PdnId, pod: PodId, member: PdnId) -> 
     }
 }
 
-/// A member's device is served both stores and folds the pod from nothing.
+/// A member's device is served both stores and builds the pod's membership
+/// view from nothing.
 /// Denied: the callee of its first dial, which it does not yet resolve to a
 /// member; a holder of both tickets that is no member, on either store; and
 /// the member itself once removed, on the record store.
@@ -267,7 +268,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     assert!(
         eventually(|| async { Ok(state_on(&bob_phone, bob.id, pod, alice.id).await == OWNER) })
             .await?,
-        "the member's device did not fold the pod from its first session"
+        "the member's device did not list the pod's creator after its first session"
     );
     // A joined event counts once its payload lands, which can trail the
     // created event's.
@@ -279,7 +280,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     // Denied: the callee of a dial whose member the dialer has not resolved
     // yet takes nothing from it.
     let promotion_key = own_promotion.to_bytes();
-    alice_phone.pod_membership(alice.id, pod).await?;
+    alice_phone.pod_membership_view(alice.id, pod).await?;
     let mut held_early = false;
     while let Ok(report) = verdicts.try_recv() {
         held_early |= report
@@ -296,7 +297,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
         .await?;
     let judged = tokio::time::timeout(TIMEOUT, async {
         loop {
-            alice_phone.pod_membership(alice.id, pod).await?;
+            alice_phone.pod_membership_view(alice.id, pod).await?;
             while let Ok(report) = verdicts.try_recv() {
                 let found = report
                     .verdicts
@@ -330,7 +331,7 @@ async fn a_member_device_is_served_and_a_ticket_holder_is_not() -> Result<()> {
     ));
     assert_eq!(
         dave_phone
-            .pod_membership(dave.id, pod)
+            .pod_membership_view(dave.id, pod)
             .await?
             .identities()
             .count(),
@@ -645,7 +646,7 @@ async fn co_located_members_converge_and_a_co_located_ticket_holder_takes_nothin
     // Sentinel: the passes that brought Dave the store reached Erin's pairs too.
     assert_eq!(
         tablet
-            .pod_membership(erin.id, pod)
+            .pod_membership_view(erin.id, pod)
             .await?
             .identities()
             .count(),

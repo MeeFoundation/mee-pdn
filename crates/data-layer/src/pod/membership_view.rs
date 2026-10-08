@@ -1,4 +1,4 @@
-//! The membership fold: what the entries a device holds in a pod's
+//! The membership view: what the entries a device holds in a pod's
 //! membership store make of its members, and what each entry counts for,
 //! whatever order they arrived in — by the pod stores spec's requirements
 //! on the membership store and on device statements.
@@ -24,7 +24,8 @@ pub struct HeldEntry {
 }
 
 /// What one held entry counts for, over everything the device holds: in the
-/// membership store by the fold, in the record store by the record view.
+/// membership store by the membership view, in the record store by the
+/// record view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Counted,
@@ -84,7 +85,7 @@ pub struct MemberState {
     pub owner: bool,
 }
 
-/// An identity the membership store names, as the fold leaves it.
+/// An identity the membership store names, as the membership view shows it.
 #[derive(Clone, Debug, Default)]
 pub struct Member {
     /// After its chain as far as the first sequence holding no entry.
@@ -127,23 +128,23 @@ impl Member {
     }
 }
 
-/// The membership a device's entries fold into, and each entry's verdict
-/// in the order the entries were given.
+/// What a device's entries make of a pod's members, and each entry's
+/// verdict in the order the entries were given.
 #[derive(Clone, Debug)]
-pub struct Membership {
+pub struct MembershipView {
     members: BTreeMap<PdnId, Member>,
     verdicts: Vec<Verdict>,
 }
 
-impl Membership {
-    pub fn fold(pod: &PodId, entries: &[HeldEntry]) -> Self {
+impl MembershipView {
+    pub fn new(pod: &PodId, entries: &[HeldEntry]) -> Self {
         let parsed = Parsed::of(entries);
         let mut set_aside = BTreeSet::new();
         loop {
             let pass = Pass::run(pod, entries, &parsed, &set_aside);
             let more = pass.demotions_to_set_aside();
             if more.is_subset(&set_aside) {
-                return pass.into_membership();
+                return pass.into_view();
             }
             set_aside.extend(more);
         }
@@ -747,7 +748,7 @@ impl<'a> Pass<'a> {
         ids.into_iter()
     }
 
-    fn into_membership(self) -> Membership {
+    fn into_view(self) -> MembershipView {
         let members = self
             .identities()
             .map(|id| {
@@ -763,7 +764,7 @@ impl<'a> Pass<'a> {
                 (id, member)
             })
             .collect();
-        Membership {
+        MembershipView {
             members,
             verdicts: self.verdicts,
         }
@@ -838,7 +839,7 @@ fn apply(kind: EventKind) -> MemberState {
 }
 
 /// Strongly connected components, each after every component it reaches:
-/// iterative, so a store of any size folds on any stack.
+/// iterative, so a store of any size fits any stack.
 #[allow(clippy::indexing_slicing)] // every index is a node below `adjacency.len()`
 fn components(adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
     const UNVISITED: usize = usize::MAX;

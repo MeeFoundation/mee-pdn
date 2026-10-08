@@ -1,6 +1,6 @@
 //! The record view over a device's replica of a pod's record store — what
-//! the entries it holds read as, by the membership its replica of the
-//! membership store folds into at each read — and the entries of either
+//! the entries it holds read as, by the membership view of its replica of
+//! the membership store at each read — and the entries of either
 //! store outside the key layout, held, read by nothing and listed with
 //! their authors. Every entry arrives by the store-level writes the pods
 //! service performs, and the tickets by hand.

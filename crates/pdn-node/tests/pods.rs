@@ -281,7 +281,7 @@ async fn two_members_on_one_node_write_converge_and_part_each_as_itself() -> Res
         assert!(reads(&tablet, holder, pod, scan, b"work's scan").await?);
         assert!(reads_ops(&tablet, holder, pod, note, edited.clone()).await?);
     }
-    let membership = tablet.pod_membership_for_test(work, pod).await?;
+    let membership = tablet.pod_membership_view_for_test(work, pod).await?;
     let device_of = |id: PdnId| -> Vec<MemberDevice> {
         membership
             .member(&id)
@@ -348,7 +348,7 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
     bob_phone.pods().join(bob, second).await?;
     assert!(lists_members(&bob_phone, bob, pod, both).await?);
     for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
-        let membership = runtime.pod_membership_for_test(holder, pod).await?;
+        let membership = runtime.pod_membership_view_for_test(holder, pod).await?;
         assert_eq!(
             membership.member(&bob).map(data_layer::Member::run),
             Some(1),
@@ -399,7 +399,7 @@ async fn a_join_whose_future_is_dropped_during_its_catch_up_is_finished() -> Res
         .put_record(alice, pod, RecordKind::Claim, b"after")
         .await?;
     assert!(reads(&bob_phone, bob, pod, after, b"after").await?);
-    let membership = bob_phone.pod_membership_for_test(bob, pod).await?;
+    let membership = bob_phone.pod_membership_view_for_test(bob, pod).await?;
     assert_eq!(
         membership.member(&bob).map(data_layer::Member::run),
         Some(1)
@@ -458,7 +458,7 @@ async fn a_join_cut_by_a_restart_during_its_catch_up_is_finished_by_the_armer() 
             "the armer did not catch the pod up after the restart"
         );
     }
-    let membership = bob_tablet.pod_membership_for_test(bob, pod).await?;
+    let membership = bob_tablet.pod_membership_view_for_test(bob, pod).await?;
     assert_eq!(
         membership.member(&bob).map(data_layer::Member::run),
         Some(1)
@@ -513,7 +513,7 @@ async fn a_join_whose_inviter_drops_out_during_its_catch_up_is_finished_later() 
         "the pod pass did not catch the cut join up"
     );
     assert!(reads(&bob_phone, bob, pod, before, b"before").await?);
-    let membership = bob_phone.pod_membership_for_test(bob, pod).await?;
+    let membership = bob_phone.pod_membership_view_for_test(bob, pod).await?;
     assert_eq!(
         membership.member(&bob).map(data_layer::Member::run),
         Some(1)
@@ -567,11 +567,11 @@ async fn a_former_member_invited_by_a_device_that_has_not_seen_its_leave_joins_a
         tokio::spawn(async move { bob_phone.pods().join(bob, invite).await })
     };
     pause.wait_until_reached().await;
-    let offered_on = alice_phone.pod_membership_for_test(alice, pod).await?;
+    let offered_on = alice_phone.pod_membership_view_for_test(alice, pod).await?;
     assert_eq!(
         offered_on
             .member(&bob)
-            .map(|folded| (folded.run(), folded.state.member)),
+            .map(|member| (member.run(), member.state.member)),
         Some((1, true)),
         "the inviting device saw the leave before it made its offer"
     );
@@ -584,7 +584,7 @@ async fn a_former_member_invited_by_a_device_that_has_not_seen_its_leave_joins_a
     for (runtime, holder) in [(&alice_phone, alice), (&*bob_phone, bob)] {
         assert!(lists_members(runtime, holder, pod, both.clone()).await?);
     }
-    let rejoined = bob_phone.pod_membership_for_test(bob, pod).await?;
+    let rejoined = bob_phone.pod_membership_view_for_test(bob, pod).await?;
     assert_eq!(
         rejoined.member(&bob).map(data_layer::Member::run),
         Some(3),
@@ -1716,7 +1716,7 @@ async fn a_member_promoted_demoted_and_promoted_again_removes_as_its_role_allows
     for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
         assert!(lists_members(runtime, holder, pod, remaining.clone()).await?);
     }
-    let membership = alice_phone.pod_membership_for_test(alice, pod).await?;
+    let membership = alice_phone.pod_membership_view_for_test(alice, pod).await?;
     assert_eq!(
         membership.member(&bob).map(data_layer::Member::run),
         Some(4)
@@ -1934,10 +1934,11 @@ async fn a_fan_out_cut_by_a_restart_is_healed_by_the_sweep() -> Result<()> {
 }
 
 /// A device linked into a member after its leave takes the pod's tombstone
-/// from its sibling: it holds the membership store alone, folding its
-/// member there as no member, and lists no such pod. Denied: it reads
-/// nothing of the pod. A tombstone, out of the swarm, is reconciled by the
-/// pod pass alone, which runs every half second on the laptop here.
+/// from its sibling: it holds the membership store alone, its membership
+/// view showing its member there as no member, and lists no such pod.
+/// Denied: it reads nothing of the pod. A tombstone, out of the swarm, is
+/// reconciled by the pod pass alone, which runs every half second on the
+/// laptop here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_linked_after_the_departure_takes_the_tombstone_from_a_sibling() -> Result<()> {
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
@@ -1964,9 +1965,9 @@ async fn a_device_linked_after_the_departure_takes_the_tombstone_from_a_sibling(
     assert!(
         eventually(|| async {
             let holdings = bob_laptop.pod_holdings_for_test(bob).await?;
-            let folded = bob_laptop.pod_membership_for_test(bob, pod).await;
+            let view = bob_laptop.pod_membership_view_for_test(bob, pod).await;
             Ok(holdings == [(pod, false)]
-                && folded.is_ok_and(|membership| {
+                && view.is_ok_and(|membership| {
                     membership.member(&bob).map(|bob| bob.state) == Some(left)
                 }))
         })

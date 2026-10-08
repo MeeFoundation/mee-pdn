@@ -1,8 +1,8 @@
 //! A pod's two stores, the membership store and the record store, by the
 //! pod stores spec.
 
-mod fold;
 mod keys;
+mod membership_view;
 mod past;
 mod payloads;
 mod record_view;
@@ -14,8 +14,10 @@ use futures_lite::StreamExt;
 use pdn_store::{api::Doc, store::Query, AuthorId, DocTicket};
 use pdn_types::{PdnId, PodId};
 
-pub use fold::{Awaiting, ForNothing, HeldEntry, Member, MemberState, Membership, Verdict};
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
+pub use membership_view::{
+    Awaiting, ForNothing, HeldEntry, Member, MemberState, MembershipView, Verdict,
+};
 pub(crate) use past::{departure_past, PastEntry};
 pub(crate) use payloads::encode_devices;
 pub use payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
@@ -36,8 +38,8 @@ pub enum PodStore {
     Records,
 }
 
-/// The fold's verdicts on one run over one identity's replica of a pod's
-/// membership store: each entry by its key and author.
+/// The membership view's verdicts on one run over one identity's replica
+/// of a pod's membership store: each entry by its key and author.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Clone)]
 pub struct PodVerdicts {

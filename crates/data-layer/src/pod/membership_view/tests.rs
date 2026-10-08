@@ -17,14 +17,14 @@ const OUT: MemberState = MemberState {
     owner: false,
 };
 
-fn state(membership: &Membership, person: &Person) -> MemberState {
+fn state(membership: &MembershipView, person: &Person) -> MemberState {
     membership
         .member(&person.id())
         .map(|member| member.state)
         .unwrap_or_default()
 }
 
-fn verdict(membership: &Membership, entry: usize) -> Verdict {
+fn verdict(membership: &MembershipView, entry: usize) -> Verdict {
     membership.verdicts()[entry]
 }
 
@@ -39,7 +39,7 @@ fn a_created_pod_lists_its_creator_as_owner() {
     let cast = Cast::new();
     let store = Store::created_by(&cast.alice);
     assert_eq!(store.pod.to_string(), "ad58a3faa04cdc5576c8dc5823a347c6");
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(state(&membership, &cast.alice), OWNER);
     assert!(membership.verdicts().iter().all(|v| *v == Verdict::Counted));
 }
@@ -53,7 +53,7 @@ fn any_member_invites_and_a_newcomer_joins_as_a_plain_member() {
     store.invite(&cast.alice, 1, &cast.bob);
     store.invite(&cast.bob, 1, &cast.carol);
     let before_its_join = store.invite(&cast.bob, 0, &cast.dave);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(state(&membership, &cast.bob), PLAIN);
     assert_eq!(state(&membership, &cast.carol), PLAIN);
     assert_eq!(state(&membership, &cast.dave), OUT);
@@ -73,7 +73,7 @@ fn an_owner_promotes_and_a_plain_member_does_not() {
     store.invite(&cast.alice, 1, &cast.carol);
     store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
     let own = store.act(EventKind::Promoted, &cast.carol, 2, &cast.carol, 1);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(state(&membership, &cast.bob), OWNER);
     assert_eq!(state(&membership, &cast.carol), PLAIN);
     assert_eq!(
@@ -95,7 +95,7 @@ fn what_an_owner_did_while_an_owner_stands_after_its_demotion() {
     store.act(EventKind::Promoted, &cast.carol, 2, &cast.bob, 2);
     store.act(EventKind::Demoted, &cast.bob, 3, &cast.alice, 1);
     let after_demotion = store.act(EventKind::Promoted, &cast.dave, 2, &cast.bob, 3);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(state(&membership, &cast.carol), OWNER);
     assert_eq!(state(&membership, &cast.bob), PLAIN);
     assert_eq!(state(&membership, &cast.dave), PLAIN);
@@ -114,7 +114,7 @@ fn a_member_leaves_for_itself_alone() {
     store.invite(&cast.alice, 1, &cast.bob);
     store.invite(&cast.alice, 1, &cast.carol);
     let for_another = store.act(EventKind::Left, &cast.bob, 2, &cast.carol, 1);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(state(&membership, &cast.bob), PLAIN);
     assert_eq!(
         verdict(&membership, for_another),
@@ -122,7 +122,7 @@ fn a_member_leaves_for_itself_alone() {
     );
 
     store.act(EventKind::Left, &cast.bob, 2, &cast.bob, 1);
-    assert_eq!(state(&store.fold(), &cast.bob), OUT);
+    assert_eq!(state(&store.membership_view(), &cast.bob), OUT);
 }
 
 /// An owner's removal of a member and demotion of another owner apply.
@@ -141,7 +141,7 @@ fn nobody_removes_demotes_or_invites_itself() {
     let removal = store.act(EventKind::Removed, alice, 2, alice, 1);
     let demotion = store.act(EventKind::Demoted, alice, 2, alice, 1);
     let invite = store.join(alice, 1, alice, 2);
-    let membership = store.fold();
+    let membership = store.membership_view();
     for entry in [removed, demoted] {
         assert_eq!(verdict(&membership, entry), Verdict::Counted);
     }
@@ -164,7 +164,7 @@ fn a_former_owner_invited_again_joins_as_a_plain_member() {
     store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
     store.act(EventKind::Left, &cast.bob, 3, &cast.bob, 2);
     store.join(&cast.carol, 1, &cast.bob, 4);
-    let membership = store.fold();
+    let membership = store.membership_view();
     let bob = membership.member(&cast.bob.id()).unwrap();
     assert_eq!(bob.state, PLAIN);
     assert_eq!(bob.state_at(2), Some(OWNER));
@@ -173,10 +173,10 @@ fn a_former_owner_invited_again_joins_as_a_plain_member() {
     assert_eq!(bob.state_at(5), None);
 }
 
-/// Entries arriving in any order fold into the same membership and give
+/// Entries arriving in any order give the same membership view and give
 /// each entry the same verdict.
 #[test]
-fn entries_in_any_order_fold_the_same() {
+fn entries_in_any_order_give_the_same_membership_view() {
     let cast = Cast::new();
     let mut store = Store::created_by(&cast.alice);
     for newcomer in [&cast.bob, &cast.carol, &cast.dave] {
@@ -193,7 +193,7 @@ fn entries_in_any_order_fold_the_same() {
         &[cast.bob.device, device(0xb2)],
         device(0xb2).author,
     );
-    let forward = store.fold();
+    let forward = store.membership_view();
 
     let count = store.entries.len();
     let orders: [Vec<usize>; 3] = [
@@ -206,7 +206,7 @@ fn entries_in_any_order_fold_the_same() {
     ];
     for order in orders {
         let entries: Vec<HeldEntry> = order.iter().map(|&i| store.entries[i].clone()).collect();
-        let shuffled = Membership::fold(&store.pod, &entries);
+        let shuffled = MembershipView::new(&store.pod, &entries);
         for person in [&cast.alice, &cast.bob, &cast.carol, &cast.dave] {
             assert_eq!(state(&shuffled, person), state(&forward, person));
         }
@@ -240,7 +240,7 @@ fn a_device_statement_counts_whoever_writes_it() {
             .device_statement(3, vec![cast.dave.device])
             .encode(),
     );
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, relayed), Verdict::Counted);
     assert_eq!(
         verdict(&membership, forged),
@@ -284,7 +284,7 @@ fn two_statements_at_one_version_both_count() {
             .device_statement(1, vec![device(0xb9)])
             .encode(),
     );
-    let membership = store.fold();
+    let membership = store.membership_view();
     for entry in [wrong_key, moved] {
         assert_eq!(
             verdict(&membership, entry),
@@ -318,7 +318,7 @@ fn created_events_that_do_not_derive_the_pod_count_for_nothing() {
         cast.alice.author(),
         cast.alice.keys.creation([0x5a; 16]).encode(),
     );
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, bobs), nothing(ForNothing::OtherPod));
     assert_eq!(
         verdict(&membership, other_key),
@@ -345,7 +345,7 @@ fn an_invented_creator_roots_nothing() {
     );
     invented.statement(&cast.bob, 1, &[cast.bob.device], cast.bob.author());
     let joined = invented.invite(&cast.bob, 1, &cast.dave);
-    let membership = invented.fold();
+    let membership = invented.membership_view();
     assert_eq!(
         verdict(&membership, creation),
         nothing(ForNothing::OtherPod)
@@ -417,7 +417,7 @@ fn a_join_counts_only_under_its_members_own_statement() {
             .device_statement(2, vec![cast.bob.device])
             .encode(),
     );
-    let membership = store.fold();
+    let membership = store.membership_view();
     for entry in [readmitted, beside, never] {
         assert_eq!(
             verdict(&membership, entry),
@@ -438,7 +438,7 @@ fn a_join_counts_only_under_its_members_own_statement() {
     assert_eq!(carol.devices, BTreeSet::from([cast.carol.device]));
 
     let back = store.join(&cast.alice, 1, &cast.carol, 3);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, back), Verdict::Counted);
     assert_eq!(state(&membership, &cast.carol), PLAIN);
 }
@@ -455,7 +455,7 @@ fn an_event_by_no_device_of_its_actor_counts_for_nothing() {
         cast.dave.author(),
         vec![0],
     );
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(
         verdict(&membership, forged),
         nothing(ForNothing::AuthorNotActorDevice)
@@ -472,7 +472,7 @@ fn an_event_ahead_of_its_actors_point_counts_once_the_point_arrives() {
     early.invite(&cast.alice, 1, &cast.bob);
     early.invite(&cast.alice, 1, &cast.carol);
     let ahead = early.act(EventKind::Promoted, &cast.carol, 2, &cast.bob, 2);
-    let membership = early.fold();
+    let membership = early.membership_view();
     assert_eq!(
         verdict(&membership, ahead),
         Verdict::NotYet(Awaiting::ActorChain)
@@ -481,7 +481,7 @@ fn an_event_ahead_of_its_actors_point_counts_once_the_point_arrives() {
 
     let mut full = early.clone();
     full.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
-    let membership = full.fold();
+    let membership = full.membership_view();
     assert_eq!(verdict(&membership, ahead), Verdict::Counted);
     assert_eq!(state(&membership, &cast.carol), OWNER);
 }
@@ -497,7 +497,7 @@ fn an_entry_waits_for_its_payload_and_a_statement_for_its_key() {
     let statement = joined + 1;
     let mut early = store.clone();
     early.entries[joined].payload = None;
-    let membership = early.fold();
+    let membership = early.membership_view();
     assert_eq!(
         verdict(&membership, joined),
         Verdict::NotYet(Awaiting::Payload)
@@ -508,7 +508,7 @@ fn an_entry_waits_for_its_payload_and_a_statement_for_its_key() {
     );
     assert_eq!(state(&membership, &cast.bob), OUT);
 
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, joined), Verdict::Counted);
     assert_eq!(verdict(&membership, statement), Verdict::Counted);
     assert_eq!(state(&membership, &cast.bob), PLAIN);
@@ -534,7 +534,7 @@ fn events_at_one_sequence_resolve_by_precedence() {
     let mut store = two_owners(&cast);
     let promotion = store.act(EventKind::Promoted, bob, 2, alice, 1);
     let removal = store.act(EventKind::Removed, bob, 2, carol, 2);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, promotion), Verdict::Counted);
     assert_eq!(verdict(&membership, removal), Verdict::Counted);
     assert_eq!(state(&membership, bob), OUT);
@@ -543,12 +543,12 @@ fn events_at_one_sequence_resolve_by_precedence() {
     store.act(EventKind::Promoted, bob, 2, alice, 1);
     store.act(EventKind::Demoted, bob, 3, carol, 2);
     store.act(EventKind::Left, bob, 3, bob, 2);
-    assert_eq!(state(&store.fold(), bob), OUT);
+    assert_eq!(state(&store.membership_view(), bob), OUT);
 
     let mut store = two_owners(&cast);
     store.act(EventKind::Promoted, bob, 2, alice, 1);
     store.act(EventKind::Promoted, bob, 2, carol, 2);
-    assert_eq!(state(&store.fold(), bob), OWNER);
+    assert_eq!(state(&store.membership_view(), bob), OWNER);
 }
 
 /// A removal placed at the sequence where a member joined, and one placed at
@@ -561,7 +561,7 @@ fn an_event_placed_at_a_joining_point_changes_nothing() {
     store.invite(&cast.bob, 1, &cast.dave);
     let at_bob = store.act(EventKind::Removed, &cast.bob, 1, &cast.carol, 2);
     let at_alice = store.act(EventKind::Removed, &cast.alice, 1, &cast.carol, 2);
-    let membership = store.fold();
+    let membership = store.membership_view();
     for entry in [at_bob, at_alice] {
         assert_eq!(
             verdict(&membership, entry),
@@ -584,7 +584,7 @@ fn an_entry_far_beyond_a_chain_waits_and_blocks_nothing() {
     store.invite(&cast.alice, 1, &cast.dave);
     let far = store.act(EventKind::Promoted, &cast.alice, 1_000_000, &cast.dave, 1);
     let promotion = store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(
         verdict(&membership, far),
         Verdict::NotYet(Awaiting::SubjectChain)
@@ -603,7 +603,7 @@ fn two_owners_demoting_each_other_leave_one_owner() {
     let mut store = two_owners(&cast);
     let alice_demotes_carol = store.act(EventKind::Demoted, &cast.carol, 3, &cast.alice, 1);
     let carol_demotes_alice = store.act(EventKind::Demoted, &cast.alice, 2, &cast.carol, 2);
-    let membership = store.fold();
+    let membership = store.membership_view();
     let (standing, set_aside, owner, demoted) = if cast.carol.id() < cast.alice.id() {
         (
             carol_demotes_alice,
@@ -628,10 +628,10 @@ fn two_owners_demoting_each_other_leave_one_owner() {
     assert_eq!(state(&membership, demoted), PLAIN);
 }
 
-/// A chain past sequence 9 folds in number order, whatever order its
+/// A chain past sequence 9 is walked in number order, whatever order its
 /// entries arrive in: the demotion at 10 applies after the promotion at 9.
 #[test]
-fn a_chain_past_nine_folds_in_number_order() {
+fn a_chain_past_nine_is_walked_in_number_order() {
     let cast = Cast::new();
     let mut store = Store::created_by(&cast.alice);
     store.invite(&cast.alice, 1, &cast.bob);
@@ -644,7 +644,7 @@ fn a_chain_past_nine_folds_in_number_order() {
         };
         store.act(kind, &cast.bob, seq, &cast.alice, 1);
     }
-    let membership = store.fold();
+    let membership = store.membership_view();
     let bob = membership.member(&cast.bob.id()).unwrap();
     assert_eq!(bob.state_at(9), Some(OWNER));
     assert_eq!(bob.state, PLAIN);
@@ -661,7 +661,7 @@ fn events_waiting_on_each_other_in_a_loop_count_for_nothing() {
     store.act(EventKind::Promoted, bob, 2, alice, 1);
     let removal = store.act(EventKind::Removed, bob, 3, carol, 3);
     let demotion = store.act(EventKind::Demoted, carol, 3, bob, 3);
-    let membership = store.fold();
+    let membership = store.membership_view();
     for entry in [removal, demotion] {
         assert_eq!(verdict(&membership, entry), nothing(ForNothing::Cyclic));
     }
@@ -671,7 +671,7 @@ fn events_waiting_on_each_other_in_a_loop_count_for_nothing() {
     let mut store = two_owners(&cast);
     store.act(EventKind::Promoted, bob, 2, alice, 1);
     let own = store.act(EventKind::Promoted, bob, 3, bob, 3);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, own), nothing(ForNothing::Cyclic));
     assert_eq!(state(&membership, bob), OWNER);
 }
@@ -691,7 +691,7 @@ fn an_entry_outside_the_layout_changes_no_member() {
         author: cast.alice.author(),
         payload: Some(vec![1]),
     });
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(membership.verdicts().last(), Some(&Verdict::OutsideLayout));
     assert_eq!(state(&membership, &cast.alice), OWNER);
 }
@@ -699,8 +699,8 @@ fn an_entry_outside_the_layout_changes_no_member() {
 /// A row of a verdict class's table: what the case is, and its check.
 type Case = (&'static str, fn(&Cast, &str));
 
-/// What the fold counts on honest devices, one case per row over the
-/// entries one device holds. The session that brings a newcomer's device
+/// What the membership view counts on honest devices, one case per row over
+/// the entries one device holds. The session that brings a newcomer's device
 /// the store from nothing is `a_member_device_is_served_and_a_ticket_holder_is_not`
 /// in `tests/pod_sessions.rs`. Paired: `rightly_counted_for_nothing`.
 #[allow(clippy::too_many_lines)] // one table: every case of the class
@@ -708,7 +708,7 @@ type Case = (&'static str, fn(&Cast, &str));
 fn rightly_counted() {
     let cases: [Case; 9] = [
         ("the created event deriving the pod id", |cast, case| {
-            let membership = Store::created_by(&cast.alice).fold();
+            let membership = Store::created_by(&cast.alice).membership_view();
             assert_eq!(verdict(&membership, 0), Verdict::Counted, "{case}");
             assert_eq!(state(&membership, &cast.alice), OWNER, "{case}");
         }),
@@ -716,7 +716,7 @@ fn rightly_counted() {
             let mut store = Store::created_by(&cast.alice);
             store.invite(&cast.alice, 1, &cast.bob);
             let joined = store.invite(&cast.bob, 1, &cast.carol);
-            let membership = store.fold();
+            let membership = store.membership_view();
             assert_eq!(verdict(&membership, joined), Verdict::Counted, "{case}");
             assert_eq!(state(&membership, &cast.carol), PLAIN, "{case}");
         }),
@@ -726,7 +726,7 @@ fn rightly_counted() {
                 let mut store = Store::created_by(&cast.alice);
                 store.invite(&cast.alice, 1, &cast.bob);
                 let promoted = store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
-                let membership = store.fold();
+                let membership = store.membership_view();
                 assert_eq!(verdict(&membership, promoted), Verdict::Counted, "{case}");
                 assert_eq!(state(&membership, &cast.bob), OWNER, "{case}");
             },
@@ -740,7 +740,7 @@ fn rightly_counted() {
                 store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
                 let promoted = store.act(EventKind::Promoted, &cast.carol, 2, &cast.bob, 2);
                 store.act(EventKind::Demoted, &cast.bob, 3, &cast.alice, 1);
-                let membership = store.fold();
+                let membership = store.membership_view();
                 assert_eq!(verdict(&membership, promoted), Verdict::Counted, "{case}");
                 assert_eq!(state(&membership, &cast.carol), OWNER, "{case}");
                 assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
@@ -750,7 +750,7 @@ fn rightly_counted() {
             let mut store = Store::created_by(&cast.alice);
             store.invite(&cast.alice, 1, &cast.bob);
             let left = store.act(EventKind::Left, &cast.bob, 2, &cast.bob, 1);
-            let membership = store.fold();
+            let membership = store.membership_view();
             assert_eq!(verdict(&membership, left), Verdict::Counted, "{case}");
             assert_eq!(state(&membership, &cast.bob), OUT, "{case}");
         }),
@@ -763,13 +763,13 @@ fn rightly_counted() {
                 store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
                 store.act(EventKind::Left, &cast.bob, 3, &cast.bob, 2);
                 let back = store.join(&cast.carol, 1, &cast.bob, 4);
-                let membership = store.fold();
+                let membership = store.membership_view();
                 assert_eq!(verdict(&membership, back), Verdict::Counted, "{case}");
                 assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
             },
         ),
         (
-            "a newcomer's device folding from nothing, each statement before its join",
+            "a newcomer's device building its view from nothing, each statement before its join",
             |cast, case| {
                 let mut store = Store::created_by(&cast.alice);
                 store.invite(&cast.alice, 1, &cast.bob);
@@ -777,7 +777,7 @@ fn rightly_counted() {
                 let b2 = device(0xb2);
                 store.statement(&cast.bob, 2, &[cast.bob.device, b2], b2.author);
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let membership = Membership::fold(&store.pod, &backwards);
+                let membership = MembershipView::new(&store.pod, &backwards);
                 assert!(
                     membership.verdicts().iter().all(|v| *v == Verdict::Counted),
                     "{case}"
@@ -793,7 +793,7 @@ fn rightly_counted() {
             let b2 = device(0xb2);
             let relayed =
                 store.statement(&cast.bob, 2, &[cast.bob.device, b2], cast.alice.author());
-            let membership = store.fold();
+            let membership = store.membership_view();
             assert_eq!(verdict(&membership, relayed), Verdict::Counted, "{case}");
             let bob = membership.member(&cast.bob.id()).unwrap();
             assert!(bob.devices.contains(&b2), "{case}");
@@ -804,9 +804,9 @@ fn rightly_counted() {
                 let mut store = two_owners(cast);
                 let promotion = store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
                 let removal = store.act(EventKind::Removed, &cast.bob, 2, &cast.carol, 2);
-                let forward = store.fold();
+                let forward = store.membership_view();
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let other_device = Membership::fold(&store.pod, &backwards);
+                let other_device = MembershipView::new(&store.pod, &backwards);
                 for membership in [&forward, &other_device] {
                     assert_eq!(state(membership, &cast.bob), OUT, "{case}");
                 }
@@ -824,9 +824,9 @@ fn rightly_counted() {
     }
 }
 
-/// What the fold holds and counts for nothing on honest devices, one case
-/// per row over the entries one device holds. A removed member's device
-/// asking for a session is refused in
+/// What the membership view holds and counts for nothing on honest devices,
+/// one case per row over the entries one device holds. A removed member's
+/// device asking for a session is refused in
 /// `a_member_device_is_served_and_a_ticket_holder_is_not` in
 /// `tests/pod_sessions.rs`. Paired: `rightly_counted`.
 #[allow(clippy::too_many_lines)] // one table: every case of the class
@@ -839,7 +839,7 @@ fn rightly_counted_for_nothing() {
             store.invite(&cast.alice, 1, &cast.carol);
             let promoted = store.act(EventKind::Promoted, &cast.bob, 2, &cast.carol, 1);
             let removed = store.act(EventKind::Removed, &cast.bob, 2, &cast.carol, 1);
-            let membership = store.fold();
+            let membership = store.membership_view();
             for entry in [promoted, removed] {
                 assert_eq!(
                     verdict(&membership, entry),
@@ -853,7 +853,7 @@ fn rightly_counted_for_nothing() {
             let mut store = Store::created_by(&cast.alice);
             store.invite(&cast.alice, 1, &cast.bob);
             let left = store.act(EventKind::Left, &cast.bob, 2, &cast.alice, 1);
-            let membership = store.fold();
+            let membership = store.membership_view();
             assert_eq!(
                 verdict(&membership, left),
                 nothing(ForNothing::WrongActor),
@@ -866,7 +866,7 @@ fn rightly_counted_for_nothing() {
             let joined = store.join(&cast.alice, 1, &cast.alice, 2);
             let removed = store.act(EventKind::Removed, &cast.alice, 2, &cast.alice, 1);
             let demoted = store.act(EventKind::Demoted, &cast.alice, 2, &cast.alice, 1);
-            let membership = store.fold();
+            let membership = store.membership_view();
             for entry in [joined, removed, demoted] {
                 assert_eq!(
                     verdict(&membership, entry),
@@ -887,7 +887,7 @@ fn rightly_counted_for_nothing() {
                     cast.bob.keys.creation([0x5a; 16]).encode(),
                 );
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let membership = Membership::fold(&store.pod, &backwards);
+                let membership = MembershipView::new(&store.pod, &backwards);
                 assert_eq!(
                     membership.verdicts()[0],
                     nothing(ForNothing::OtherPod),
@@ -904,7 +904,7 @@ fn rightly_counted_for_nothing() {
                     cast.bob.author(),
                     cast.bob.keys.creation([0x5a; 16]).encode(),
                 );
-                let membership = invented.fold();
+                let membership = invented.membership_view();
                 assert_eq!(
                     verdict(&membership, creation),
                     nothing(ForNothing::OtherPod),
@@ -921,7 +921,7 @@ fn rightly_counted_for_nothing() {
                 cast.dave.author(),
                 vec![0],
             );
-            let membership = store.fold();
+            let membership = store.membership_view();
             assert_eq!(
                 verdict(&membership, forged),
                 nothing(ForNothing::AuthorNotActorDevice),
@@ -943,7 +943,7 @@ fn rightly_counted_for_nothing() {
                     .device_statement(2, vec![cast.dave.device])
                     .encode(),
             );
-            let membership = store.fold();
+            let membership = store.membership_view();
             assert_eq!(
                 verdict(&membership, forged),
                 nothing(ForNothing::BadSignature),
@@ -993,7 +993,7 @@ fn rightly_counted_for_nothing() {
                     cast.alice.author(),
                     copied,
                 );
-                let membership = store.fold();
+                let membership = store.membership_view();
                 for entry in [next_sequence, first_sequence, never_member] {
                     assert_eq!(
                         verdict(&membership, entry),
@@ -1017,7 +1017,7 @@ fn rightly_counted_for_nothing() {
                 store.invite(&cast.alice, 1, &cast.bob);
                 store.invite(&cast.alice, 1, &cast.carol);
                 let ahead = store.act(EventKind::Promoted, &cast.carol, 2, &cast.bob, 2);
-                let membership = store.fold();
+                let membership = store.membership_view();
                 assert_eq!(
                     verdict(&membership, ahead),
                     Verdict::NotYet(Awaiting::ActorChain),
@@ -1026,7 +1026,7 @@ fn rightly_counted_for_nothing() {
                 assert_eq!(state(&membership, &cast.carol), PLAIN, "{case}");
 
                 store.act(EventKind::Promoted, &cast.bob, 2, &cast.alice, 1);
-                let membership = store.fold();
+                let membership = store.membership_view();
                 assert_eq!(verdict(&membership, ahead), Verdict::Counted, "{case}");
                 assert_eq!(state(&membership, &cast.carol), OWNER, "{case}");
             },
@@ -1054,7 +1054,7 @@ fn wrongly_left_uncounted_without_anchoring_d23() {
     // Bob's promotion of Carol at Carol's sequence 2 reached Carol's device
     // alone, and both devices died: no device here holds that point.
     let stranded = store.act(EventKind::Promoted, dave, 2, carol, 2);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(
         verdict(&membership, stranded),
         Verdict::NotYet(Awaiting::ActorChain)
@@ -1062,7 +1062,7 @@ fn wrongly_left_uncounted_without_anchoring_d23() {
     assert_eq!(state(&membership, dave), PLAIN);
 
     let anew = store.act(EventKind::Promoted, dave, 3, alice, 1);
-    let membership = store.fold();
+    let membership = store.membership_view();
     assert_eq!(verdict(&membership, anew), Verdict::Counted);
     assert_eq!(
         verdict(&membership, stranded),

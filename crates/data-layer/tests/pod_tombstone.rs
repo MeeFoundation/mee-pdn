@@ -86,7 +86,7 @@ async fn depart(
 
 async fn knows(node: &SyncNode, holder: &Person, pod: PodId, member: &Person) -> Result<bool> {
     Ok(node
-        .pod_membership(holder.id, pod)
+        .pod_membership_view(holder.id, pod)
         .await?
         .member(&member.id)
         .is_some())
@@ -495,12 +495,13 @@ async fn draws_contact(
 }
 
 /// A departed member's device that takes its record store back on a rejoin
-/// dials its inviter as the inviter while its fold still shows the
-/// departure. Paired: the converged tombstone, before the rejoin, leaves the
-/// inviter out. The inviter writes no joined event, which stands in for one
-/// still on its way: any session would otherwise bring it and move the fold.
+/// dials its inviter as the inviter while its membership view still shows
+/// the departure. Paired: the converged tombstone, before the rejoin, leaves
+/// the inviter out. The inviter writes no joined event, which stands in for
+/// one still on its way: any session would otherwise bring it and move the
+/// membership view.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_fold_shows_the_join(
+async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_membership_view_shows_the_join(
 ) -> Result<()> {
     let (alice_phone, carol_phone) = (node(QUIET).await?, node(POD_RUN).await?);
     let (alice, _) = host(&alice_phone).await?;

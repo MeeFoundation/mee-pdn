@@ -33,7 +33,7 @@ impl Records {
     }
 
     fn view(&self, store: &Store) -> RecordView {
-        RecordView::new(&store.fold(), self.entries.clone())
+        RecordView::new(&store.membership_view(), self.entries.clone())
     }
 }
 
@@ -186,7 +186,10 @@ fn an_operation_reads_as_the_writer_its_key_names() {
     let mut records = Records::default();
     let alices = records.put(op(bob, 1, alice, alice.author(), 1), alice.author());
     let view = records.view(&store);
-    assert_eq!(store.fold().verdicts()[claiming], Verdict::Counted);
+    assert_eq!(
+        store.membership_view().verdicts()[claiming],
+        Verdict::Counted
+    );
     assert_eq!(verdict(&view, alices), Verdict::Counted);
     let note = op(bob, 1, alice, alice.author(), 1).record();
     assert_eq!(writers(&view, &note), [alice.id()]);

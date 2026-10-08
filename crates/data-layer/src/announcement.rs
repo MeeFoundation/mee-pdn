@@ -75,7 +75,8 @@ impl AnnouncementKeyPair {
 }
 
 /// Whether `payload`'s signature verifies for a created event in
-/// `creator`'s chain; what its fields derive is the fold's to check.
+/// `creator`'s chain; what its fields derive is the membership view's to
+/// check.
 pub(crate) fn creation_verifies(creator: &PdnId, payload: &CreatedPayload) -> bool {
     let message = creation_message(creator, &payload.announcement_key, &payload.nonce);
     verifies(&payload.announcement_key, &message, &payload.signature)

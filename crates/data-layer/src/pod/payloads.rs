@@ -1,6 +1,6 @@
-//! The membership payloads the fold reads, each a run of fixed-size fields
-//! in a fixed order, decoded only at its exact length. What each signs is
-//! `announcement`'s.
+//! The membership payloads the membership view reads, each a run of
+//! fixed-size fields in a fixed order, decoded only at its exact length.
+//! What each signs is `announcement`'s.
 
 use pdn_store::AuthorId;
 use pdn_types::NodeId;

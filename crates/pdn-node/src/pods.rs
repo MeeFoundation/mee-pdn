@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use data_layer::{
     devices_verify, join_verifies, pdn_id_of, pod_id_of, pod_inviter_ticket_kind, pod_ticket_kind,
     AcceptError, AddrInfoOptions, AuthorId, Connection, DevicesPayload, DocTicket, EndpointAddr,
-    EventKind, JoinedPayload, Member, MemberDevice, Membership, MembershipKey, OpId, Operation,
+    EventKind, JoinedPayload, Member, MemberDevice, MembershipKey, MembershipView, OpId, Operation,
     PodNotice, PodStore, PodTickets, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownEntry,
     UnknownPod, ACT_PAYLOAD,
 };
@@ -146,8 +146,8 @@ pub enum ActRefusal {
 }
 
 /// A membership act the identity's role or the pod's membership does not
-/// allow, as the identity's replica folds it; refused before anything is
-/// written. Downcast from the `anyhow::Error` of `act`.
+/// allow, as the membership view of the identity's replica shows it; refused
+/// before anything is written. Downcast from the `anyhow::Error` of `act`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{act:?} refused: {reason:?}")]
 pub struct ActRefused {
@@ -245,7 +245,7 @@ pub trait PodsService {
     ) -> Result<PodInvite>;
 
     /// Join through the invite's dialogue, returning once both stores
-    /// caught up and the identity's replica folds it as a member; the
+    /// caught up and the identity's membership view lists it as a member; the
     /// identity joins as a plain member. A catch-up cut short
     /// fails with [`data_layer::CatchUpTimeout`] and leaves both tickets and
     /// the PMS's entry recorded.
@@ -317,15 +317,19 @@ impl<'rt> RuntimePodsService<'rt> {
         Self { runtime }
     }
 
-    /// The node, and the membership `identity`'s replica of `pod` folds
-    /// into, once `identity` is a member there.
-    async fn as_member(&self, identity: PdnId, pod: PodId) -> Result<(Arc<SyncNode>, Membership)> {
+    /// The node, and the membership view of `identity`'s replica of `pod`,
+    /// once `identity` is a member there.
+    async fn as_member(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+    ) -> Result<(Arc<SyncNode>, MembershipView)> {
         let node = {
             let state = self.runtime.state.lock().await;
             state.hosted(identity)?;
             Arc::clone(&state.node)
         };
-        let membership = node.pod_membership(identity, pod).await?;
+        let membership = node.pod_membership_view(identity, pod).await?;
         require_member(&membership, identity, pod)?;
         Ok((node, membership))
     }
@@ -644,8 +648,8 @@ impl PodsService for RuntimePodsService<'_> {
     }
 }
 
-/// `identity` as `membership` folds it; [`UnknownPod`] for no member.
-fn require_member(membership: &Membership, identity: PdnId, pod: PodId) -> Result<&Member> {
+/// `identity` as `membership` shows it; [`UnknownPod`] for no member.
+fn require_member(membership: &MembershipView, identity: PdnId, pod: PodId) -> Result<&Member> {
     membership
         .member(&identity)
         .filter(|member| member.state.member)
@@ -658,7 +662,7 @@ fn require_member(membership: &Membership, identity: PdnId, pod: PodId) -> Resul
 /// [`act_event`].
 async fn act_key(state: &State, identity: PdnId, pod: PodId, act: PodAct) -> Result<MembershipKey> {
     state.hosted(identity)?;
-    let membership = state.node.pod_membership(identity, pod).await?;
+    let membership = state.node.pod_membership_view(identity, pod).await?;
     let actor = require_member(&membership, identity, pod)?;
     let (subject, kind) = act_event(&membership, identity, actor, act)
         .map_err(|reason| ActRefused { act, reason })?;
@@ -677,10 +681,10 @@ async fn act_key(state: &State, identity: PdnId, pod: PodId, act: PodAct) -> Res
     })
 }
 
-/// The event `act` writes as `identity`, by the checks the fold applies to
-/// it and the guard on the one owner's leave.
+/// The event `act` writes as `identity`, by the checks the membership view
+/// applies to it and the guard on the one owner's leave.
 fn act_event(
-    membership: &Membership,
+    membership: &MembershipView,
     identity: PdnId,
     actor: &Member,
     act: PodAct,
@@ -788,7 +792,7 @@ async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<(
     let Some(keys) = hosted.pms.announcement_key().await? else {
         return Ok(());
     };
-    let membership = state.node.pod_membership(identity, pod).await?;
+    let membership = state.node.pod_membership_view(identity, pod).await?;
     let member = require_member(&membership, identity, pod)?;
     let device = MemberDevice {
         node: state.node.node_id(),
@@ -922,7 +926,7 @@ async fn pod_tickets(
 /// records name, once it is a member of `pod`.
 async fn writer(state: &State, identity: PdnId, pod: PodId) -> Result<(AuthorId, Seq)> {
     let author = state.hosted(identity)?.author;
-    let membership = state.node.pod_membership(identity, pod).await?;
+    let membership = state.node.pod_membership_view(identity, pod).await?;
     let seq = require_member(&membership, identity, pod)?.run();
     Ok((author, Seq::new(seq)))
 }
@@ -1039,7 +1043,7 @@ async fn join_via_dialogue(
     }
     let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
     caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
-    // A member from here on: the caller's next act checks the fold.
+    // A member from here on: the caller's next act checks the membership view.
     node.await_pod_member(
         identity,
         pod,
@@ -1148,7 +1152,7 @@ where
             .verify_and_burn(&request.secret, Instant::now())?;
         (Arc::clone(&state.node), identity, pod)
     };
-    let membership = node.pod_membership(identity, pod).await.ok()?;
+    let membership = node.pod_membership_view(identity, pod).await.ok()?;
     let inviter = membership.member(&identity)?;
     if !inviter.state.member {
         return None;
@@ -1249,8 +1253,8 @@ where
 /// tickets and the pod's entry in its PMS, which reach
 /// its other devices. Beside its own tickets go the ones the inviter handed
 /// over at a join, so a sibling, or this device after a restart, has a
-/// member's device to dial, named as that member, before its replica folds
-/// anyone.
+/// member's device to dial, named as that member, before its membership view
+/// lists anyone.
 async fn record_pod(
     node: &data_layer::SyncNode,
     pms: &data_layer::PrivateMetadataStore,

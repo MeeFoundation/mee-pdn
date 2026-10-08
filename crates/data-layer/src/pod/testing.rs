@@ -3,7 +3,7 @@
 use pdn_store::AuthorId;
 use pdn_types::{NodeId, PdnId, PodId};
 
-use super::{EventKind, HeldEntry, MemberDevice, Membership, MembershipKey, Seq};
+use super::{EventKind, HeldEntry, MemberDevice, MembershipKey, MembershipView, Seq};
 use crate::announcement::{pod_id_of, AnnouncementKeyPair};
 
 pub(super) struct Person {
@@ -149,8 +149,8 @@ impl Store {
         self.write(key, actor.author(), vec![0])
     }
 
-    pub(super) fn fold(&self) -> Membership {
-        Membership::fold(&self.pod, &self.entries)
+    pub(super) fn membership_view(&self) -> MembershipView {
+        MembershipView::new(&self.pod, &self.entries)
     }
 }
 

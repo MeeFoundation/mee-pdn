@@ -4,7 +4,7 @@ What has landed in n0's `iroh-docs` since this crate was forked from it, and wha
 
 Refresh the list by fetching upstream and reading `git log <bottom hash>..upstream/main`. Every new commit gets an entry with a verdict, including the ones that need no action — an absent entry means the commit was never looked at, which is what this file exists to make visible.
 
-A hash of this crate's own history dated before 2026-08-25 belongs to the former `MeeFoundation/pdn-store` repository, folded into this tree by `0b66bea` ("Implement pdn-store-in-tree spec"); it does not resolve here. An entry that cites one for a fix also names the code and the test that carry it, and those are the pointers to follow.
+A hash of this crate's own history dated before 2026-08-25 belongs to the former `MeeFoundation/pdn-store` repository, merged into this tree by `0b66bea` ("Implement pdn-store-in-tree spec"); it does not resolve here. An entry that cites one for a fix also names the code and the test that carry it, and those are the pointers to follow.
 
 ## 2026-08-19 · `8cfeacb` · Franz Heinzmann · fix: Improve API around untrusted range bounds (#119)
 
