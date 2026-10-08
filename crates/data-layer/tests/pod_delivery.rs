@@ -503,7 +503,7 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let creation = alice.keys.creation([0xa0; 16]);
-    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,
@@ -577,7 +577,7 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
     let creation = alice.keys.creation([0xa1; 16]);
-    let pod = pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
     alice_phone.create_pod(alice.id, pod).await?;
     write(
         &alice_phone,

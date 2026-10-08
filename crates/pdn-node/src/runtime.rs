@@ -518,15 +518,15 @@ impl Runtime {
         self.state.lock().await.node.hosted_identities()
     }
 
-    /// The announcement public key in `identity`'s own PMS on this
+    /// The public identity key in `identity`'s own PMS on this
     /// runtime; `None` until its payload has arrived.
     #[cfg(feature = "test-util")]
-    pub async fn announcement_public_key_for_test(
+    pub async fn identity_public_key_for_test(
         &self,
         identity: pdn_types::PdnId,
     ) -> anyhow::Result<Option<[u8; 32]>> {
         let state = self.state.lock().await;
-        let key = state.hosted(identity)?.pms.announcement_key().await?;
+        let key = state.hosted(identity)?.pms.identity_key().await?;
         Ok(key.map(|key| key.public_key()))
     }
 

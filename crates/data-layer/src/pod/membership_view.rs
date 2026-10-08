@@ -12,7 +12,7 @@ use super::{
     keys::{EventKind, MembershipKey, Seq},
     payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice},
 };
-use crate::announcement::{creation_verifies, devices_verify, join_verifies, pdn_id_of, pod_id_of};
+use crate::identity_key::{creation_verifies, devices_verify, join_verifies, pdn_id_of, pod_id_of};
 
 /// One entry of a membership store as a device holds it; `payload` is
 /// `None` until its bytes have arrived.
@@ -44,7 +44,7 @@ pub enum ForNothing {
     Misplaced,
     /// The created event's fields derive another pod id.
     OtherPod,
-    /// The announcement key it carries derives another `PdnId` than its
+    /// The identity key it carries derives another `PdnId` than its
     /// subject's.
     KeyOfAnother,
     BadSignature,
@@ -75,8 +75,8 @@ pub enum Awaiting {
     /// The subject's chain is not held up to the sequence before the
     /// event's.
     SubjectChain,
-    /// No held event carries the member's announcement key.
-    AnnouncementKey,
+    /// No held event carries the member's identity key.
+    IdentityKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,7 +90,7 @@ pub struct MemberState {
 pub struct Member {
     /// After its chain as far as the first sequence holding no entry.
     pub state: MemberState,
-    pub announcement_key: Option<[u8; 32]>,
+    pub identity_key: Option<[u8; 32]>,
     /// The union of its counted device statements.
     pub devices: BTreeSet<MemberDevice>,
     /// The highest version among its counted device statements; `0` for
@@ -314,7 +314,7 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// A member's announcement key is the one any held created or joined
+    /// A member's identity key is the one any held created or joined
     /// event in its chain carries that derives the member's `PdnId`.
     fn find_keys(&mut self) {
         for event in &self.parsed.events {
@@ -322,8 +322,8 @@ impl<'a> Pass<'a> {
                 continue;
             };
             let key = match event.kind {
-                EventKind::Created => CreatedPayload::decode(payload).map(|p| p.announcement_key),
-                EventKind::Joined => JoinedPayload::decode(payload).map(|p| p.announcement_key),
+                EventKind::Created => CreatedPayload::decode(payload).map(|p| p.identity_key),
+                EventKind::Joined => JoinedPayload::decode(payload).map(|p| p.identity_key),
                 _ => None,
             };
             if let Some(key) = key.filter(|key| pdn_id_of(key) == event.subject) {
@@ -364,7 +364,7 @@ impl<'a> Pass<'a> {
             return Verdict::CountedForNothing(ForNothing::Malformed);
         };
         let Some(key) = self.keys.get(&statement.member) else {
-            return Verdict::NotYet(Awaiting::AnnouncementKey);
+            return Verdict::NotYet(Awaiting::IdentityKey);
         };
         if devices_verify(key, statement.version, &payload) {
             Verdict::Counted
@@ -430,10 +430,10 @@ impl<'a> Pass<'a> {
         let Some(creation) = CreatedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
-        if pod_id_of(&event.subject, &creation.announcement_key, &creation.nonce) != *self.pod {
+        if pod_id_of(&event.subject, &creation.identity_key, &creation.nonce) != *self.pod {
             return nothing(ForNothing::OtherPod);
         }
-        if pdn_id_of(&creation.announcement_key) != event.subject {
+        if pdn_id_of(&creation.identity_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
         }
         if !creation_verifies(&event.subject, &creation) {
@@ -453,7 +453,7 @@ impl<'a> Pass<'a> {
         let Some(statement) = JoinedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
-        if pdn_id_of(&statement.announcement_key) != event.subject {
+        if pdn_id_of(&statement.identity_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);
         }
         if !join_verifies(&event.subject, self.pod, Seq::new(event.seq), &statement) {
@@ -756,7 +756,7 @@ impl<'a> Pass<'a> {
                 let chain = (1..=run).map(|seq| (seq, self.state(&id, seq))).collect();
                 let member = Member {
                     state: self.state(&id, run),
-                    announcement_key: self.keys.get(&id).copied(),
+                    identity_key: self.keys.get(&id).copied(),
                     devices: self.devices.get(&id).cloned().unwrap_or_default(),
                     statement_version: self.statement_versions.get(&id).copied().unwrap_or(0),
                     chain,

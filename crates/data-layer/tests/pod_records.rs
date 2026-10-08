@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    identity_of, AnnouncementKeyPair, Contact, EventKind, ForNothing, MemberDevice, MembershipKey,
+    identity_of, Contact, EventKind, ForNothing, IdentityKeyPair, MemberDevice, MembershipKey,
     OpId, PodStore, RecordKey, Seq, SpawnOptions, SyncNode, UnknownEntry, UnknownPod, Verdict,
 };
 use pdn_types::{PdnId, PodId, RecordId};
@@ -83,14 +83,14 @@ async fn next_session_exchanges(
     Ok(session.and_then(|session| session.exchanged.ok()))
 }
 
-/// An identity whose `PdnId` derives from the announcement key pair beside it.
+/// An identity whose `PdnId` derives from the identity key pair beside it.
 struct Identity {
-    keys: AnnouncementKeyPair,
+    keys: IdentityKeyPair,
     id: PdnId,
 }
 
 async fn host(node: &SyncNode) -> Result<Identity> {
-    let keys = AnnouncementKeyPair::generate();
+    let keys = IdentityKeyPair::generate();
     let id = keys.pdn_id();
     host_identity(node, id).await?;
     Ok(Identity { keys, id })
@@ -158,7 +158,7 @@ async fn a_members_records_read_on_its_device_and_its_forgery_under_another_name
     let alice = host(&phone).await?;
     let bob = host(&phone).await?;
     let creation = alice.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&alice.id, &creation.announcement_key, &creation.nonce);
+    let pod = data_layer::pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
     phone.create_pod(alice.id, pod).await?;
     let created = MembershipKey::created(alice.id).to_bytes();
     write(

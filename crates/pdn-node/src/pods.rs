@@ -109,12 +109,12 @@ pub struct JoinInProgress {
     pub pod: PodId,
 }
 
-/// The identity's announcement key pair has not reached this device yet:
+/// The identity key pair has not reached this device yet:
 /// a device linked a moment ago signs nothing until it does. Downcast from
 /// the `anyhow::Error` of `create` and `join`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("the announcement key of {identity} has not reached this device yet")]
-pub struct AnnouncementKeyPending {
+#[error("the identity key of {identity} has not reached this device yet")]
+pub struct IdentityKeyPending {
     pub identity: PdnId,
 }
 
@@ -186,7 +186,7 @@ struct JoinRequest {
     version: u8,
     secret: [u8; 32],
     joiner: PdnId,
-    announcement_key: [u8; 32],
+    identity_key: [u8; 32],
     /// The highest sequence of the joiner's own chain its replica holds, a
     /// tombstone's included.
     run: u64,
@@ -342,15 +342,15 @@ impl PodsService for RuntimePodsService<'_> {
         let hosted = state.hosted(identity)?;
         let keys = hosted
             .pms
-            .announcement_key()
+            .identity_key()
             .await?
-            .ok_or(AnnouncementKeyPending { identity })?;
+            .ok_or(IdentityKeyPending { identity })?;
         let mut nonce = [0u8; 16];
         SysRng
             .try_fill_bytes(&mut nonce)
             .context("operating-system randomness unavailable")?;
         let creation = keys.creation(nonce);
-        let pod = pod_id_of(&identity, &creation.announcement_key, &creation.nonce);
+        let pod = pod_id_of(&identity, &creation.identity_key, &creation.nonce);
         let node = Arc::clone(&state.node);
         node.create_pod(identity, pod).await?;
         let mut rollback = PodRollback::new(
@@ -781,15 +781,15 @@ async fn settle_departure(state: &State, identity: PdnId, pod: PodId, seq: Seq) 
 
 /// Write `identity`'s next device statement in `pod` — its counted list
 /// with this device added — when that list does not name this device with
-/// the author `identity` writes with here. Nothing while the announcement
-/// key has not reached this device, or while a join of the pod is in
+/// the author `identity` writes with here. Nothing while the identity key
+/// has not reached this device, or while a join of the pod is in
 /// flight here, its dialogue carrying a statement of its own.
 async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
     if state.joining_in_flight.contains(&(identity, pod)) {
         return Ok(());
     }
     let hosted = state.hosted(identity)?;
-    let Some(keys) = hosted.pms.announcement_key().await? else {
+    let Some(keys) = hosted.pms.identity_key().await? else {
         return Ok(());
     };
     let membership = state.node.pod_membership_view(identity, pod).await?;
@@ -944,9 +944,9 @@ async fn join_via_dialogue(
         let hosted = state.hosted(identity)?;
         let keys = hosted
             .pms
-            .announcement_key()
+            .identity_key()
             .await?
-            .ok_or(AnnouncementKeyPending { identity })?;
+            .ok_or(IdentityKeyPending { identity })?;
         (Arc::clone(&state.node), keys, hosted.author)
     };
     let dial = node.dial_handle();
@@ -965,7 +965,7 @@ async fn join_via_dialogue(
         version: POD_INVITE_FORMAT_VERSION,
         secret: invite.secret,
         joiner: identity,
-        announcement_key: keys.public_key(),
+        identity_key: keys.public_key(),
         run: node.pod_chain_run(identity, invite.pod, identity).await?,
     };
     let device = MemberDevice {
@@ -1140,7 +1140,7 @@ where
 {
     let request: JoinRequest = read_message(recv).await.ok()?;
     if request.version != POD_INVITE_FORMAT_VERSION
-        || pdn_id_of(&request.announcement_key) != request.joiner
+        || pdn_id_of(&request.identity_key) != request.joiner
     {
         return None;
     }
@@ -1181,12 +1181,12 @@ where
     let acceptance: JoinAcceptance = read_message(recv).await.ok()?;
 
     let statement = DevicesPayload::decode(&acceptance.device_statement)?;
-    if !devices_verify(&request.announcement_key, statement_version, &statement) {
+    if !devices_verify(&request.identity_key, statement_version, &statement) {
         return None;
     }
     if write_joined {
         let joined = JoinedPayload::decode(acceptance.join_statement.as_deref()?)?;
-        if joined.announcement_key != request.announcement_key
+        if joined.identity_key != request.identity_key
             || !join_verifies(&request.joiner, &pod, Seq::new(seq), &joined)
         {
             return None;

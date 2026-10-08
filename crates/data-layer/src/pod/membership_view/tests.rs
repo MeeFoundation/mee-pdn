@@ -504,7 +504,7 @@ fn an_entry_waits_for_its_payload_and_a_statement_for_its_key() {
     );
     assert_eq!(
         verdict(&membership, statement),
-        Verdict::NotYet(Awaiting::AnnouncementKey)
+        Verdict::NotYet(Awaiting::IdentityKey)
     );
     assert_eq!(state(&membership, &cast.bob), OUT);
 
@@ -929,7 +929,7 @@ fn rightly_counted_for_nothing() {
             );
             assert_eq!(state(&membership, &cast.bob), PLAIN, "{case}");
         }),
-        ("a device statement under a wrong announcement key", |cast, case| {
+        ("a device statement under a wrong identity key", |cast, case| {
             let mut store = Store::created_by(&cast.alice);
             store.invite(&cast.alice, 1, &cast.bob);
             let forged = store.write(

@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    identity_of, AddrInfoOptions, AnnouncementKeyPair, Contact, EventKind, MemberDevice,
-    MemberState, MembershipKey, NamespaceId, PodStore, PodTickets, PrivateMetadataStore, Seq,
-    SpawnOptions, SyncNode, Verdict,
+    identity_of, AddrInfoOptions, Contact, EventKind, IdentityKeyPair, MemberDevice, MemberState,
+    MembershipKey, NamespaceId, PodStore, PodTickets, PrivateMetadataStore, Seq, SpawnOptions,
+    SyncNode, Verdict,
 };
 use pdn_types::{PdnId, PodId};
 use test_utils::{eventually, host_identity, join_identity, wait_devices, TIMEOUT};
@@ -40,14 +40,14 @@ async fn node(reconcile_interval: Duration) -> Result<SyncNode> {
     .await
 }
 
-/// An identity whose `PdnId` derives from the announcement key pair beside it.
+/// An identity whose `PdnId` derives from the identity key pair beside it.
 struct Identity {
-    keys: AnnouncementKeyPair,
+    keys: IdentityKeyPair,
     id: PdnId,
 }
 
 async fn host(node: &SyncNode) -> Result<(Identity, PrivateMetadataStore)> {
-    let keys = AnnouncementKeyPair::generate();
+    let keys = IdentityKeyPair::generate();
     let id = keys.pdn_id();
     let pms = host_identity(node, id).await?;
     Ok((Identity { keys, id }, pms))
@@ -97,7 +97,7 @@ async fn statement(
 /// creator's first device statement, and the tickets to both stores.
 async fn create(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
     let creation = creator.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &creation.announcement_key, &creation.nonce);
+    let pod = data_layer::pod_id_of(&creator.id, &creation.identity_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(
         node,

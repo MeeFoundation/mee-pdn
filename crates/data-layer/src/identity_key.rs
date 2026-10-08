@@ -1,5 +1,5 @@
-//! An identity's announcement key pair and everything derived from it or
-//! signed by it, each under a context string of its own, all of them here;
+//! The identity key pair and everything derived from it or signed by
+//! it, each under a context string of its own, all of them here;
 //! the steps are the pod stores spec's.
 
 use iroh::{PublicKey, SecretKey, Signature};
@@ -15,12 +15,12 @@ const POD_CREATION_CONTEXT: &[u8] = b"pdn/pod-creation/v1";
 const POD_JOIN_CONTEXT: &[u8] = b"pdn/pod-join/v1";
 const POD_DEVICES_CONTEXT: &[u8] = b"pdn/pod-devices/v1";
 
-/// An identity's device-announcement key pair: one per identity, minted with
-/// it, its public key deriving the identity's `PdnId`.
+/// The identity key pair: one per identity, minted with it, its public
+/// key deriving the identity's `PdnId`.
 #[derive(Clone, Debug)]
-pub struct AnnouncementKeyPair(SecretKey);
+pub struct IdentityKeyPair(SecretKey);
 
-impl AnnouncementKeyPair {
+impl IdentityKeyPair {
     pub fn generate() -> Self {
         Self(SecretKey::generate())
     }
@@ -44,11 +44,11 @@ impl AnnouncementKeyPair {
 
     /// The created event of the pod `pod_id_of(self.pdn_id(), key, nonce)`.
     pub fn creation(&self, nonce: [u8; 16]) -> CreatedPayload {
-        let announcement_key = self.public_key();
-        let message = creation_message(&self.pdn_id(), &announcement_key, &nonce);
+        let identity_key = self.public_key();
+        let message = creation_message(&self.pdn_id(), &identity_key, &nonce);
         CreatedPayload {
             nonce,
-            announcement_key,
+            identity_key,
             signature: self.0.sign(&message).to_bytes(),
         }
     }
@@ -56,10 +56,10 @@ impl AnnouncementKeyPair {
     /// The join statement over `subject_seq`, the sequence the inviting
     /// device names for this identity's joined event.
     pub fn join_statement(&self, pod: &PodId, subject_seq: Seq) -> JoinedPayload {
-        let announcement_key = self.public_key();
-        let message = join_message(&self.pdn_id(), &announcement_key, pod, subject_seq);
+        let identity_key = self.public_key();
+        let message = join_message(&self.pdn_id(), &identity_key, pod, subject_seq);
         JoinedPayload {
-            announcement_key,
+            identity_key,
             signature: self.0.sign(&message).to_bytes(),
         }
     }
@@ -78,8 +78,8 @@ impl AnnouncementKeyPair {
 /// `creator`'s chain; what its fields derive is the membership view's to
 /// check.
 pub(crate) fn creation_verifies(creator: &PdnId, payload: &CreatedPayload) -> bool {
-    let message = creation_message(creator, &payload.announcement_key, &payload.nonce);
-    verifies(&payload.announcement_key, &message, &payload.signature)
+    let message = creation_message(creator, &payload.identity_key, &payload.nonce);
+    verifies(&payload.identity_key, &message, &payload.signature)
 }
 
 /// Whether `payload`'s signature verifies for a joined event at
@@ -90,22 +90,22 @@ pub fn join_verifies(
     subject_seq: Seq,
     payload: &JoinedPayload,
 ) -> bool {
-    let message = join_message(subject, &payload.announcement_key, pod, subject_seq);
-    verifies(&payload.announcement_key, &message, &payload.signature)
+    let message = join_message(subject, &payload.identity_key, pod, subject_seq);
+    verifies(&payload.identity_key, &message, &payload.signature)
 }
 
-/// Whether `payload`'s signature verifies under `announcement_key` for the
+/// Whether `payload`'s signature verifies under `identity_key` for the
 /// statement at `version`.
-pub fn devices_verify(announcement_key: &[u8; 32], version: u64, payload: &DevicesPayload) -> bool {
+pub fn devices_verify(identity_key: &[u8; 32], version: u64, payload: &DevicesPayload) -> bool {
     let message = devices_message(version, &payload.devices);
-    verifies(announcement_key, &message, &payload.signature)
+    verifies(identity_key, &message, &payload.signature)
 }
 
-fn creation_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
+fn creation_message(creator: &PdnId, identity_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
     [
         POD_CREATION_CONTEXT,
         creator.as_bytes(),
-        announcement_key,
+        identity_key,
         nonce,
     ]
     .concat()
@@ -113,14 +113,14 @@ fn creation_message(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 1
 
 fn join_message(
     subject: &PdnId,
-    announcement_key: &[u8; 32],
+    identity_key: &[u8; 32],
     pod: &PodId,
     subject_seq: Seq,
 ) -> Vec<u8> {
     [
         POD_JOIN_CONTEXT,
         subject.as_bytes(),
-        announcement_key,
+        identity_key,
         pod.as_bytes(),
         &subject_seq.get().to_be_bytes(),
     ]
@@ -137,23 +137,23 @@ fn devices_message(version: u64, devices: &[MemberDevice]) -> Vec<u8> {
 }
 
 /// Strict verification: a key that is no curve point verifies nothing.
-fn verifies(announcement_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-    PublicKey::from_bytes(announcement_key).is_ok_and(|key| {
+fn verifies(identity_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    PublicKey::from_bytes(identity_key).is_ok_and(|key| {
         key.verify(message, &Signature::from_bytes(signature))
             .is_ok()
     })
 }
 
-/// The `PdnId` an announcement public key derives.
-pub fn pdn_id_of(announcement_key: &[u8; 32]) -> PdnId {
-    PdnId::from_bytes(blake3::derive_key(PDN_ID_CONTEXT, announcement_key))
+/// The `PdnId` a public identity key derives.
+pub fn pdn_id_of(identity_key: &[u8; 32]) -> PdnId {
+    PdnId::from_bytes(blake3::derive_key(PDN_ID_CONTEXT, identity_key))
 }
 
 /// The pod id a created event's fields derive.
-pub fn pod_id_of(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16]) -> PodId {
+pub fn pod_id_of(creator: &PdnId, identity_key: &[u8; 32], nonce: &[u8; 16]) -> PodId {
     let mut hasher = blake3::Hasher::new_derive_key(POD_ID_CONTEXT);
     hasher.update(creator.as_bytes());
-    hasher.update(announcement_key);
+    hasher.update(identity_key);
     hasher.update(nonce);
     // The output stream's first 16 bytes are the hash's first 16.
     let mut id = [0u8; 16];
@@ -165,9 +165,9 @@ pub fn pod_id_of(creator: &PdnId, announcement_key: &[u8; 32], nonce: &[u8; 16])
 mod tests {
     use super::*;
 
-    /// Alice's announcement public key in the specs' examples.
+    /// Alice's public identity key in the specs' examples.
     const ALICE_KEY: &str = "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce";
-    /// The second announcement key of the specs' examples.
+    /// The second identity key of the specs' examples.
     const OTHER_KEY: &str = "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48";
 
     fn key(hex: &str) -> [u8; 32] {
@@ -178,7 +178,7 @@ mod tests {
     /// specs print for Alice and derives the `PdnId` they print for her.
     #[test]
     fn the_specs_example_key_pair_derives_alices_pdn_id() {
-        let pair = AnnouncementKeyPair::from_secret_bytes(&[0x33; 32]);
+        let pair = IdentityKeyPair::from_secret_bytes(&[0x33; 32]);
         assert_eq!(pair.public_key(), key(ALICE_KEY));
         assert_eq!(
             pair.pdn_id().to_string(),
@@ -190,7 +190,7 @@ mod tests {
     /// stores spec prints, and its fields derive the pod's id.
     #[test]
     fn the_specs_created_event_signs_and_derives_family() {
-        let alice = AnnouncementKeyPair::from_secret_bytes(&[0x33; 32]);
+        let alice = IdentityKeyPair::from_secret_bytes(&[0x33; 32]);
         let creation = alice.creation([0x5a; 16]);
         let head: [u8; 8] = pdn_types::parse_hex("806ce2029b681a9a").unwrap();
         let tail: [u8; 5] = pdn_types::parse_hex("0420513704").unwrap();
@@ -198,7 +198,7 @@ mod tests {
         assert!(creation.signature.ends_with(&tail));
         assert!(creation_verifies(&alice.pdn_id(), &creation));
         assert_eq!(
-            pod_id_of(&alice.pdn_id(), &creation.announcement_key, &creation.nonce).to_string(),
+            pod_id_of(&alice.pdn_id(), &creation.identity_key, &creation.nonce).to_string(),
             "ad58a3faa04cdc5576c8dc5823a347c6"
         );
         // Denied: the same event claimed for another creator's chain.
@@ -210,7 +210,7 @@ mod tests {
     /// alone: one copied from an earlier join verifies at no later sequence.
     #[test]
     fn a_join_statement_verifies_at_its_own_sequence_only() {
-        let carol = AnnouncementKeyPair::generate();
+        let carol = IdentityKeyPair::generate();
         let family = PodId::from_bytes([0x9c; 16]);
         let statement = carol.join_statement(&family, Seq::new(1));
         assert!(join_verifies(
@@ -233,7 +233,7 @@ mod tests {
             Seq::new(1),
             &statement
         ));
-        let dave = AnnouncementKeyPair::generate().pdn_id();
+        let dave = IdentityKeyPair::generate().pdn_id();
         assert!(!join_verifies(&dave, &family, Seq::new(1), &statement));
     }
 
@@ -241,7 +241,7 @@ mod tests {
     /// moved to another version, or checked under another key, it does not.
     #[test]
     fn a_device_statement_verifies_under_its_key_at_its_version_only() {
-        let bob = AnnouncementKeyPair::generate();
+        let bob = IdentityKeyPair::generate();
         let devices = vec![MemberDevice {
             node: pdn_types::NodeId::from_bytes([0xb1; 32]),
             author: pdn_store::AuthorId::from(&[0xa1; 32]),
@@ -250,7 +250,7 @@ mod tests {
         assert!(devices_verify(&bob.public_key(), 2, &statement));
         // Denied: the statement at another version, and under another key.
         assert!(!devices_verify(&bob.public_key(), 3, &statement));
-        let dave = AnnouncementKeyPair::generate();
+        let dave = IdentityKeyPair::generate();
         assert!(!devices_verify(&dave.public_key(), 2, &statement));
     }
 

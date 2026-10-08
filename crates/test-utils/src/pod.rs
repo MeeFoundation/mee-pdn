@@ -3,22 +3,22 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, AnnouncementKeyPair, EventKind, MemberDevice, MemberState, MembershipKey,
+    AddrInfoOptions, EventKind, IdentityKeyPair, MemberDevice, MemberState, MembershipKey,
     PodStore, PodTickets, PrivateMetadataStore, RecordKey, Seq, SyncNode,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordRef};
 
 use crate::{eventually, host_identity};
 
-/// An identity whose `PdnId` derives from the announcement key pair beside it.
+/// An identity whose `PdnId` derives from the identity key pair beside it.
 pub struct Person {
-    pub keys: AnnouncementKeyPair,
+    pub keys: IdentityKeyPair,
     pub id: PdnId,
 }
 
 impl Person {
     pub fn generate() -> Self {
-        let keys = AnnouncementKeyPair::generate();
+        let keys = IdentityKeyPair::generate();
         let id = keys.pdn_id();
         Self { keys, id }
     }
@@ -78,7 +78,7 @@ pub async fn statement(
 /// creator's first device statement.
 pub async fn create(node: &SyncNode, creator: &Person) -> Result<PodId> {
     let creation = creator.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &creation.announcement_key, &creation.nonce);
+    let pod = data_layer::pod_id_of(&creator.id, &creation.identity_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(
         node,

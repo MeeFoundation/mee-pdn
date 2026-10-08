@@ -2,7 +2,7 @@
 //! identity's own state, device-internal by ticket alone (Invariant 1).
 //! Five record families under disjoint prefixes: `devices/`,
 //! `pending-devices/`, `tickets/`, `connections/`, `retractions/`, and the
-//! announcement key pair at `announcement-key`. Device and connection
+//! identity key pair at `identity-key`. Device and connection
 //! records are record-level; ticket, marker and key payloads are blobs, so
 //! their reads wait for content.
 
@@ -29,7 +29,7 @@ use pdn_types::{NodeId, PdnId, PodId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    announcement::AnnouncementKeyPair,
+    identity_key::IdentityKeyPair,
     node::{read_payload, SyncNode},
     pod::{PodStore, Seq},
 };
@@ -109,7 +109,7 @@ pub const PENDING_DEVICE_TTL: Duration = Duration::from_hours(24);
 const TICKETS_PREFIX: &str = "tickets/";
 const CONNECTIONS_PREFIX: &str = "connections/";
 const RETRACTIONS_PREFIX: &str = "retractions/";
-const ANNOUNCEMENT_KEY_PATH: &str = "announcement-key";
+const IDENTITY_KEY_PATH: &str = "identity-key";
 const PODS_PREFIX: &str = "pods/";
 
 /// The PMS kind of one of a pod's stores' write tickets, minted by
@@ -736,11 +736,11 @@ impl PrivateMetadataStore {
 
     /// Written once, by the identity's creation; the payload is the 32
     /// secret bytes, from which the pair follows.
-    pub async fn put_announcement_key(&self, key: &AnnouncementKeyPair) -> Result<()> {
+    pub async fn put_identity_key(&self, key: &IdentityKeyPair) -> Result<()> {
         self.doc
             .set_bytes(
                 self.author,
-                ANNOUNCEMENT_KEY_PATH.as_bytes().to_vec(),
+                IDENTITY_KEY_PATH.as_bytes().to_vec(),
                 key.secret_bytes().to_vec(),
             )
             .await?;
@@ -749,17 +749,17 @@ impl PrivateMetadataStore {
 
     /// `Ok(None)` while the payload is still syncing. A payload that does
     /// not decode is an error, as for [`Self::get_ticket`].
-    pub async fn announcement_key(&self) -> Result<Option<AnnouncementKeyPair>> {
+    pub async fn identity_key(&self) -> Result<Option<IdentityKeyPair>> {
         let Some(bytes) =
-            read_payload(&self.doc, &self.blobs, ANNOUNCEMENT_KEY_PATH.as_bytes()).await?
+            read_payload(&self.doc, &self.blobs, IDENTITY_KEY_PATH.as_bytes()).await?
         else {
             return Ok(None);
         };
         let secret: [u8; 32] = bytes
             .as_slice()
             .try_into()
-            .context("an announcement key payload is not 32 bytes")?;
-        Ok(Some(AnnouncementKeyPair::from_secret_bytes(&secret)))
+            .context("an identity key payload is not 32 bytes")?;
+        Ok(Some(IdentityKeyPair::from_secret_bytes(&secret)))
     }
 
     /// Crate-private: the fork's event type stays behind this layer.

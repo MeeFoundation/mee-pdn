@@ -4,17 +4,17 @@ use pdn_store::AuthorId;
 use pdn_types::{NodeId, PdnId, PodId};
 
 use super::{EventKind, HeldEntry, MemberDevice, MembershipKey, MembershipView, Seq};
-use crate::announcement::{pod_id_of, AnnouncementKeyPair};
+use crate::identity_key::{pod_id_of, IdentityKeyPair};
 
 pub(super) struct Person {
-    pub(super) keys: AnnouncementKeyPair,
+    pub(super) keys: IdentityKeyPair,
     pub(super) device: MemberDevice,
 }
 
 impl Person {
     pub(super) fn new(seed: u8) -> Self {
         Self {
-            keys: AnnouncementKeyPair::from_secret_bytes(&[seed; 32]),
+            keys: IdentityKeyPair::from_secret_bytes(&[seed; 32]),
             device: device(seed),
         }
     }
@@ -66,7 +66,7 @@ impl Store {
     /// event.
     pub(super) fn created_by(creator: &Person) -> Self {
         let creation = creator.keys.creation([0x5a; 16]);
-        let pod = pod_id_of(&creator.id(), &creation.announcement_key, &creation.nonce);
+        let pod = pod_id_of(&creator.id(), &creation.identity_key, &creation.nonce);
         let mut store = Self {
             pod,
             entries: Vec::new(),
