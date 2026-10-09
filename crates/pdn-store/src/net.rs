@@ -30,6 +30,26 @@ mod codec;
 /// kbit/s up.
 pub const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Names one session over a network connection: both ends export it from
+/// the connection's keying material, so they report the same id and no other
+/// connection carries it.
+pub type SessionId = [u8; 16];
+
+/// What [`SessionId`] is exported under; another label yields other ids.
+const SESSION_ID_LABEL: &[u8] = b"pdn-store/session-id";
+
+/// `None` when the connection cannot export keying material.
+pub(crate) fn session_id(connection: &iroh::endpoint::Connection) -> Option<SessionId> {
+    let mut id = SessionId::default();
+    match connection.export_keying_material(&mut id, SESSION_ID_LABEL, &[]) {
+        Ok(()) => Some(id),
+        Err(error) => {
+            debug!(?error, "no session id");
+            None
+        }
+    }
+}
+
 /// Connect to a peer and sync a replica.
 ///
 /// `filter` is this side's egress filter for the session: what the dialing
@@ -65,6 +85,7 @@ pub async fn connect_and_sync(
             peer,
             metrics,
             DialAccess::Given { filter, ingest },
+            &mut None,
         ),
     )
     .await
@@ -78,7 +99,9 @@ pub async fn connect_and_sync(
 
 /// [`connect_and_sync`], with this side's access asked of `access` once the
 /// connection stands and the session's snapshot is open, so a connect that
-/// waits across a change of access serves by the access after it.
+/// waits across a change of access serves by the access after it. The
+/// session id goes into `session` once the connection is established, so a
+/// failure after that carries it too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_and_sync_asking(
     endpoint: &Endpoint,
@@ -89,6 +112,7 @@ pub(crate) async fn connect_and_sync_asking(
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     access: &crate::filter::SessionAccessProvider,
+    session: &mut Option<SessionId>,
 ) -> Result<SyncFinished, ConnectError> {
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
@@ -101,6 +125,7 @@ pub(crate) async fn connect_and_sync_asking(
             peer,
             metrics,
             DialAccess::Asked(access),
+            session,
         ),
     )
     .await
@@ -122,6 +147,7 @@ async fn connect_and_sync_inner(
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     access: DialAccess<'_>,
+    session: &mut Option<SessionId>,
 ) -> Result<SyncFinished, ConnectError> {
     let t_start = Instant::now();
     let peer_id = peer.id;
@@ -130,6 +156,7 @@ async fn connect_and_sync_inner(
         .connect(peer, crate::ALPN)
         .await
         .map_err(ConnectError::connect)?;
+    *session = session_id(&connection);
 
     let (mut send_stream, mut recv_stream) =
         connection.open_bi().await.map_err(ConnectError::connect)?;

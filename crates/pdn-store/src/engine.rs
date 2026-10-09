@@ -12,7 +12,7 @@ use iroh_blobs::{
     Hash,
 };
 use iroh_gossip::net::Gossip;
-use n0_future::{task::AbortOnDropHandle, Stream, StreamExt};
+use n0_future::{boxed::BoxStream, task::AbortOnDropHandle, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, error_span, Instrument};
@@ -258,14 +258,38 @@ impl Engine {
         peers: Vec<Contact>,
         default_identity: Identity,
     ) -> Result<()> {
-        self.sync_with(namespace, peers, None, Some(default_identity), true)
+        self.sync_with(namespace, peers, None, Some(default_identity), true, None)
             .await
+    }
+
+    /// [`Self::start_sync`] with an ordered subscription attached, as
+    /// [`Self::observe`] gives it: registered before the replica is opened
+    /// for sync and before its first dial, so it reports that sync from its
+    /// first event. For a replica already syncing it is [`Self::observe`].
+    pub async fn start_sync_observed(
+        &self,
+        namespace: NamespaceId,
+        peers: Vec<Contact>,
+        default_identity: Identity,
+        capacity: usize,
+    ) -> Result<BoxStream<Result<LiveEvent>>> {
+        let (s, r) = async_channel::bounded(capacity);
+        self.sync_with(
+            namespace,
+            peers,
+            None,
+            Some(default_identity),
+            true,
+            Some(s),
+        )
+        .await?;
+        Ok(self.live_events(r))
     }
 
     /// Start to sync a document with no peers of its own, keeping whom an
     /// earlier start said its unnamed peers are dialed as.
     pub(crate) async fn start_sync_keeping_default(&self, namespace: NamespaceId) -> Result<()> {
-        self.sync_with(namespace, Vec::new(), None, None, true)
+        self.sync_with(namespace, Vec::new(), None, None, true, None)
             .await
     }
 
@@ -281,7 +305,7 @@ impl Engine {
         peers: Vec<Contact>,
         default_identity: Identity,
     ) -> Result<()> {
-        self.sync_with(namespace, peers, None, Some(default_identity), false)
+        self.sync_with(namespace, peers, None, Some(default_identity), false, None)
             .await
     }
 
@@ -302,6 +326,7 @@ impl Engine {
             Some(recorded),
             Some(default_identity),
             join_gossip,
+            None,
         )
         .await
     }
@@ -366,6 +391,7 @@ impl Engine {
         recorded: Option<Vec<PublicKey>>,
         default_identity: Option<Identity>,
         join_gossip: bool,
+        observer: Option<async_channel::Sender<live::Event>>,
     ) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
@@ -375,6 +401,7 @@ impl Engine {
                 recorded,
                 default_identity,
                 join_gossip,
+                observer,
                 reply,
             })
             .await?;
@@ -438,7 +465,6 @@ impl Engine {
         // Subscribe to events from the [`live::Actor`].
         let b = {
             let (s, r) = async_channel::bounded(SUBSCRIBE_CHANNEL_CAP);
-            let r = Box::pin(r);
             let (reply, reply_rx) = oneshot::channel();
             self.to_live_actor
                 .send(ToLiveActor::Subscribe {
@@ -448,10 +474,42 @@ impl Engine {
                 })
                 .await?;
             reply_rx.await??;
-            r.map(|event| Ok(LiveEvent::from(event)))
+            self.live_events(r)
         };
 
         Ok(a.or(b))
+    }
+
+    /// Subscribe to a replica's events in the order the live sync handled
+    /// them: a session's inserts before its end, a download's completion
+    /// after the insert that asked for it. Holds `capacity` events for a
+    /// reader that falls behind, then drops behind one [`LiveEvent::Lagged`].
+    /// Refused for a replica the live sync does not hold open; ends when the
+    /// sync leaves the replica with its subscribers.
+    pub async fn observe(
+        &self,
+        namespace: NamespaceId,
+        capacity: usize,
+    ) -> Result<BoxStream<Result<LiveEvent>>> {
+        let (s, r) = async_channel::bounded(capacity);
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::Observe {
+                namespace,
+                sender: s,
+                reply,
+            })
+            .await?;
+        reply_rx.await??;
+        Ok(self.live_events(r))
+    }
+
+    fn live_events(&self, r: async_channel::Receiver<live::Event>) -> BoxStream<Result<LiveEvent>> {
+        let content_status_cb = self.content_status_cb.clone();
+        Box::pin(Box::pin(r).then(move |ev| {
+            let content_status_cb = content_status_cb.clone();
+            Box::pin(async move { LiveEvent::from_live_event(ev, &content_status_cb).await })
+        }))
     }
 
     /// The identity every replica of this engine is held for.
@@ -594,24 +652,34 @@ pub enum LiveEvent {
     /// One of the subscription's two buffers was full and dropped events
     /// since the last one it delivered; each buffer sends a notice of its
     /// own. The entries they reported are in the replica by the time this
-    /// arrives; the sessions and downloads they reported are lost.
+    /// arrives; the sessions and downloads they reported are lost. An
+    /// ordered subscription has one buffer, and one notice.
     Lagged,
 }
 
-impl From<live::Event> for LiveEvent {
-    fn from(ev: live::Event) -> Self {
-        match ev {
+impl LiveEvent {
+    async fn from_live_event(
+        ev: live::Event,
+        content_status_cb: &ContentStatusCallback,
+    ) -> Result<Self> {
+        Ok(match ev {
+            live::Event::LocalInsert { entry } => Self::InsertLocal {
+                entry: entry.into(),
+            },
+            live::Event::RemoteInsert { from, entry } => Self::InsertRemote {
+                content_status: content_status_cb(entry.content_hash()).await,
+                entry: entry.into(),
+                from: PublicKey::from_bytes(&from)?,
+            },
             live::Event::ContentReady { hash } => Self::ContentReady { hash },
             live::Event::NeighborUp(peer) => Self::NeighborUp(peer),
             live::Event::NeighborDown(peer) => Self::NeighborDown(peer),
             live::Event::SyncFinished(ev) => Self::SyncFinished(ev),
             live::Event::PendingContentReady => Self::PendingContentReady,
             live::Event::Lagged => Self::Lagged,
-        }
+        })
     }
-}
 
-impl LiveEvent {
     async fn from_replica_event(
         ev: crate::Event,
         content_status_cb: &ContentStatusCallback,

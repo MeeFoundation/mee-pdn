@@ -17,10 +17,11 @@ use super::{
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
         GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse,
         LeaveGossipRequest, LeaveGossipResponse, LeaveRequest, LeaveResponse, ListRequest,
-        ListResponse, OpenRequest, OpenResponse, RetractRequest, RetractResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
-        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
-        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
+        ListResponse, ObserveRequest, ObserveResponse, OpenRequest, OpenResponse, RetractRequest,
+        RetractResponse, SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest,
+        SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse,
+        StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest,
+        SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -174,6 +175,10 @@ impl RpcActor {
             DocsMessage::Subscribe(subscribe) => {
                 let WithChannels { tx, inner, .. } = subscribe;
                 self.doc_subscribe(inner, tx).await;
+            }
+            DocsMessage::Observe(observe) => {
+                let WithChannels { tx, inner, .. } = observe;
+                self.doc_observe(inner, tx).await;
             }
             DocsMessage::GetDownloadPolicy(get_policy) => {
                 let WithChannels { tx, inner, .. } = get_policy;
@@ -465,6 +470,53 @@ impl RpcActor {
                         let msg = msg
                             .map_err(|err| RpcError::new(&*err))
                             .map(|event| SubscribeResponse { event });
+                        if let Err(_err) = reply.send(msg).await {
+                            break;
+                        }
+                    },
+                    _ = reply.closed() => break,
+                }
+            }
+        });
+    }
+
+    pub(super) async fn doc_observe(
+        &self,
+        req: ObserveRequest,
+        reply: irpc::channel::mpsc::Sender<RpcResult<ObserveResponse>>,
+    ) {
+        let ObserveRequest {
+            doc_id,
+            capacity,
+            start,
+        } = req;
+        let opened = match start {
+            Some((peers, default_identity)) => {
+                self.start_sync_observed(doc_id, peers, default_identity, capacity)
+                    .await
+            }
+            None => self.observe(doc_id, capacity).await,
+        };
+        let mut stream = match opened {
+            Ok(stream) => stream,
+            Err(err) => {
+                reply.send(Err(RpcError::new(&*err))).await.ok();
+                return;
+            }
+        };
+        if reply.send(Ok(ObserveResponse::Opened)).await.is_err() {
+            return;
+        }
+        n0_future::task::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = stream.next() => {
+                        let Some(msg) = msg else {
+                            break;
+                        };
+                        let msg = msg
+                            .map_err(|err| RpcError::new(&*err))
+                            .map(ObserveResponse::Event);
                         if let Err(_err) = reply.send(msg).await {
                             break;
                         }

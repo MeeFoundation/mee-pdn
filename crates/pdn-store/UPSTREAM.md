@@ -4,6 +4,8 @@ What has landed in n0's `iroh-docs` since this crate was forked from it, and wha
 
 Refresh the list by fetching upstream and reading `git log <bottom hash>..upstream/main`. Every new commit gets an entry with a verdict, including the ones that need no action — an absent entry means the commit was never looked at, which is what this file exists to make visible.
 
+An upstream commit touching what this crate changed is adapted, not taken as it is; the crate's `CLAUDE.md` lists those changes under "Conventions & gotchas". The ordered subscription and the session id there are the ones a change to `live::Event`, `SyncEvent`, the live actor's handling of replica events or `connect_and_sync` meets.
+
 A hash of this crate's own history dated before 2026-08-25 belongs to the former `MeeFoundation/pdn-store` repository, merged into this tree by `0b66bea` ("Implement pdn-store-in-tree spec"); it does not resolve here. An entry that cites one for a fix also names the code and the test that carry it, and those are the pointers to follow.
 
 ## 2026-08-19 · `8cfeacb` · Franz Heinzmann · fix: Improve API around untrusted range bounds (#119)

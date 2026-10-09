@@ -28,9 +28,9 @@ use self::{
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
         GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveGossipRequest, LeaveRequest, ListRequest, OpenRequest, RetractRequest,
-        SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
-        StartSyncRequest, StatusRequest, SubscribeRequest,
+        ImportRequest, LeaveGossipRequest, LeaveRequest, ListRequest, ObserveRequest,
+        ObserveResponse, OpenRequest, RetractRequest, SetDownloadPolicyRequest, SetHashRequest,
+        SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -104,6 +104,7 @@ impl DocsApi {
                     DocsProtocol::LeaveGossip(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Share(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Subscribe(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::Observe(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetSyncPeers(msg) => local.send((msg, tx)).await,
@@ -601,6 +602,62 @@ impl Doc {
             Err(err) => Err(err.into()),
             Ok(Err(err)) => Err(err.into()),
             Ok(Ok(res)) => Ok(res.event),
+        })))
+    }
+
+    /// An ordered subscription to this document, as
+    /// [`Engine::observe`](crate::engine::Engine::observe) gives it, except
+    /// that a reader behind receives up to 65 events more than `capacity`
+    /// before the lag notice: the API's own buffer and its forwarding hold them.
+    pub async fn observe(
+        &self,
+        capacity: usize,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.observe_with(capacity, None).await
+    }
+
+    /// [`Self::start_sync`] with an ordered subscription attached, as
+    /// [`Engine::start_sync_observed`](crate::engine::Engine::start_sync_observed)
+    /// gives it.
+    pub async fn start_sync_observed(
+        &self,
+        peers: Vec<Contact>,
+        default_identity: Identity,
+        capacity: usize,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.observe_with(capacity, Some((peers, default_identity)))
+            .await
+    }
+
+    async fn observe_with(
+        &self,
+        capacity: usize,
+        start: Option<(Vec<Contact>, Identity)>,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.ensure_open()?;
+        let mut stream = self
+            .inner
+            .server_streaming(
+                ObserveRequest {
+                    doc_id: self.namespace_id,
+                    capacity,
+                    start,
+                },
+                64,
+            )
+            .await?;
+        match stream.recv().await? {
+            Some(Ok(ObserveResponse::Opened)) => {}
+            Some(Err(err)) => return Err(err.into()),
+            Some(Ok(ObserveResponse::Event(_))) | None => {
+                anyhow::bail!("the subscription ended before it opened")
+            }
+        }
+        Ok(Box::pin(stream.into_stream().filter_map(|res| match res {
+            Err(err) => Some(Err(err.into())),
+            Ok(Err(err)) => Some(Err(err.into())),
+            Ok(Ok(ObserveResponse::Event(event))) => Some(Ok(event)),
+            Ok(Ok(ObserveResponse::Opened)) => None,
         })))
     }
 

@@ -255,6 +255,23 @@ pub struct SubscribeResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ObserveRequest {
+    pub doc_id: NamespaceId,
+    /// Events held for a reader that falls behind.
+    pub capacity: usize,
+    /// Starts the sync with these peers and this default identity, the
+    /// subscription attached to the start; `None` observes a running sync.
+    pub start: Option<(Vec<Contact>, Identity)>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum ObserveResponse {
+    /// The subscription is open; sent once, before any event.
+    Opened,
+    Event(LiveEvent),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GetDownloadPolicyRequest {
     pub doc_id: NamespaceId,
 }
@@ -388,6 +405,8 @@ pub enum DocsProtocol {
     Share(ShareRequest),
     #[rpc(tx = mpsc::Sender<RpcResult<SubscribeResponse>>)]
     Subscribe(SubscribeRequest),
+    #[rpc(tx = mpsc::Sender<RpcResult<ObserveResponse>>)]
+    Observe(ObserveRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<GetDownloadPolicyResponse>>)]
     GetDownloadPolicy(GetDownloadPolicyRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<SetDownloadPolicyResponse>>)]
