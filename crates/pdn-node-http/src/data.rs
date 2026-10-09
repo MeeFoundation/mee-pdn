@@ -50,7 +50,7 @@ pub(crate) async fn claim_id(
     Path((issuer, path)): Path<(String, String)>,
     Query(NoQuery {}): Query<NoQuery>,
 ) -> Result<String, HostError> {
-    let issuer = parse::id(&issuer, "issuer")?;
+    let issuer = parse::segment(&issuer, "issuer")?;
     let path = parse::entry_path(&path)?;
     Ok(claim_id_of(&issuer, &path).to_string())
 }

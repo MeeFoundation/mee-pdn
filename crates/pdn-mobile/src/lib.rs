@@ -65,9 +65,12 @@ mod node;
 mod payload;
 mod shapes;
 
-pub use error::PdnError;
+pub use error::{PdnError, PodActRefusal};
 pub use node::PdnNode;
-pub use shapes::{EntryListing, GrantCapability, GrantedClaimId, GrantedPath, MAX_ENTRY_PAYLOAD};
+pub use shapes::{
+    EntryListing, GrantCapability, GrantedClaimId, GrantedPath, PodMemberInfo, PodMembershipAct,
+    PodOperation, PodRecord, PodRecordKind, MAX_ENTRY_PAYLOAD,
+};
 
 uniffi::setup_scaffolding!();
 

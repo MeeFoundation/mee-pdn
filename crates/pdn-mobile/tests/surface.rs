@@ -16,7 +16,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pdn_mobile::{claim_id, GrantedPath, PdnError, PdnNode};
+use pdn_mobile::{
+    claim_id, GrantedPath, PdnError, PdnNode, PodActRefusal, PodMembershipAct, PodRecordKind,
+};
 use pdn_node::InvitePayload;
 use tempfile::TempDir;
 use test_utils::eventually;
@@ -92,6 +94,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
         .node
         .write_entry(
             alice.clone(),
+            alice.clone(),
             "contact/email".to_owned(),
             b"a@example".to_vec(),
         )
@@ -153,7 +156,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     let read = eventually(|| async {
         let value = grantee
             .node
-            .read_entry(alice.clone(), "contact/email".to_owned())
+            .read_entry(bob.clone(), alice.clone(), "contact/email".to_owned())
             .await
             .map_err(anyhow::Error::new)?;
         Ok(value.as_deref() == Some(b"a@example".as_slice()))
@@ -168,7 +171,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     // the facade; it stays with the runtime's own suites.
     let refused = outsider
         .node
-        .read_entry(alice.clone(), "contact/email".to_owned())
+        .read_entry(carol.clone(), alice.clone(), "contact/email".to_owned())
         .await
         .expect_err("an outsider must not read the granter's data");
     assert!(
@@ -177,7 +180,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     );
     let listed = outsider
         .node
-        .list_entries(alice.clone(), None)
+        .list_entries(carol.clone(), alice.clone(), None)
         .await
         .expect_err("an outsider must not list the granter's entries");
     assert!(
@@ -195,6 +198,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     let write = grantee
         .node
         .write_entry(
+            bob.clone(),
             alice.clone(),
             "contact/email".to_owned(),
             b"z@example".to_vec(),
@@ -208,7 +212,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     assert_eq!(
         grantee
             .node
-            .read_entry(alice.clone(), "contact/email".to_owned())
+            .read_entry(bob.clone(), alice.clone(), "contact/email".to_owned())
             .await?
             .as_deref(),
         Some(b"a@example".as_slice()),
@@ -221,7 +225,12 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     // no longer among what it may read.
     granter
         .node
-        .write_entry(alice.clone(), "contact/phone".to_owned(), b"+1000".to_vec())
+        .write_entry(
+            alice.clone(),
+            alice.clone(),
+            "contact/phone".to_owned(),
+            b"+1000".to_vec(),
+        )
         .await?;
     granter
         .node
@@ -265,7 +274,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
         Ok(matches!(
             grantee
                 .node
-                .read_entry(alice.clone(), "contact/email".to_owned())
+                .read_entry(bob.clone(), alice.clone(), "contact/email".to_owned())
                 .await,
             Err(PdnError::UnknownIssuer { .. })
         ))
@@ -290,7 +299,7 @@ async fn a_granted_claim_reads_for_the_grantee_and_for_nobody_else() -> Result<(
     let reopened = eventually(|| async {
         let value = grantee
             .node
-            .read_entry(alice.clone(), "contact/email".to_owned())
+            .read_entry(bob.clone(), alice.clone(), "contact/email".to_owned())
             .await
             .unwrap_or(None);
         Ok(value.as_deref() == Some(b"a@example".as_slice()))
@@ -315,11 +324,17 @@ async fn entries_cross_as_bytes_and_list_by_component() -> Result<()> {
     let payload: Vec<u8> = (0..=255_u8).cycle().take(4096).collect();
     device
         .node
-        .write_entry(alice.clone(), "contact/email".to_owned(), payload.clone())
+        .write_entry(
+            alice.clone(),
+            alice.clone(),
+            "contact/email".to_owned(),
+            payload.clone(),
+        )
         .await?;
     device
         .node
         .write_entry(
+            alice.clone(),
             alice.clone(),
             "contacts/email".to_owned(),
             b"other".to_vec(),
@@ -329,7 +344,7 @@ async fn entries_cross_as_bytes_and_list_by_component() -> Result<()> {
     assert_eq!(
         device
             .node
-            .read_entry(alice.clone(), "contact/email".to_owned())
+            .read_entry(alice.clone(), alice.clone(), "contact/email".to_owned())
             .await?,
         Some(payload.clone()),
         "what was written is what is read, with no framing of the facade's own"
@@ -337,7 +352,7 @@ async fn entries_cross_as_bytes_and_list_by_component() -> Result<()> {
 
     let listed = device
         .node
-        .list_entries(alice.clone(), Some("contact".to_owned()))
+        .list_entries(alice.clone(), alice.clone(), Some("contact".to_owned()))
         .await?;
     let paths: Vec<&str> = listed.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(
@@ -357,7 +372,7 @@ async fn entries_cross_as_bytes_and_list_by_component() -> Result<()> {
     let stranger = "a".repeat(64);
     let refused = device
         .node
-        .list_entries(stranger, None)
+        .list_entries(alice.clone(), stranger, None)
         .await
         .expect_err("an unknown issuer must be refused");
     assert!(
@@ -403,6 +418,112 @@ async fn a_payload_crosses_in_the_runtimes_own_encoding() -> Result<()> {
     assert_eq!(scanner.node.connections(bob).await?, vec![alice]);
 
     for device in [inviter, scanner] {
+        device.node.stop().await?;
+    }
+    Ok(())
+}
+
+/// A pod member reads every record placed in the pod, and an identity that
+/// never joined reads nothing of it.
+///
+/// Paired denial: the outsider, holding no invite, is refused the pod's
+/// listing and its record. Beside it, the refusals a screen renders: a
+/// claim takes no operation, a plain member removes nobody.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one scenario, its denials in the same place
+#[allow(clippy::similar_names)] // the roles of the scenario, named for what they are
+async fn a_pod_member_reads_its_records_and_an_outsider_reads_nothing() -> Result<()> {
+    let first_device = Device::boot().await?;
+    let joiner = Device::boot().await?;
+    let outsider = Device::boot().await?;
+    let alice = first_device.node.create_identity().await?;
+    let bob = joiner.node.create_identity().await?;
+    let carol = outsider.node.create_identity().await?;
+
+    let pod = first_device.node.create_pod(alice.clone()).await?;
+    let claim = first_device
+        .node
+        .put_record(
+            alice.clone(),
+            pod.clone(),
+            PodRecordKind::Claim,
+            b"blood type 0+".to_vec(),
+        )
+        .await?;
+    let code = first_device
+        .node
+        .mint_pod_invite(alice.clone(), pod.clone(), Some(120))
+        .await?;
+    assert_eq!(joiner.node.join_pod(bob.clone(), code).await?, pod);
+
+    let read = eventually(|| async {
+        let value = joiner
+            .node
+            .read_record(bob.clone(), pod.clone(), claim.clone())
+            .await
+            .unwrap_or(None);
+        Ok(value.as_deref() == Some(b"blood type 0+".as_slice()))
+    })
+    .await;
+    assert!(read.is_ok(), "the joiner reads the creator's claim");
+    let mut members = joiner.node.pod_members(bob.clone(), pod.clone()).await?;
+    members.sort_by(|a, b| a.identity.cmp(&b.identity));
+    let mut expected = vec![(alice.clone(), true), (bob.clone(), false)];
+    expected.sort();
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| (member.identity.clone(), member.owner))
+            .collect::<Vec<_>>(),
+        expected,
+        "the creator owns, the joiner is a plain member"
+    );
+
+    // Denied (outsider).
+    let refused = outsider
+        .node
+        .list_records(carol.clone(), pod.clone())
+        .await
+        .expect_err("an outsider must not list the pod");
+    assert!(
+        matches!(refused, PdnError::UnknownPod { .. }),
+        "{refused:?}"
+    );
+    let refused = outsider
+        .node
+        .read_record(carol, pod.clone(), claim.clone())
+        .await
+        .expect_err("an outsider must not read the claim");
+    assert!(
+        matches!(refused, PdnError::UnknownPod { .. }),
+        "{refused:?}"
+    );
+
+    let refused = joiner
+        .node
+        .append_op(bob.clone(), pod.clone(), claim, b"edit".to_vec())
+        .await
+        .expect_err("a claim is placed once");
+    assert!(
+        matches!(refused, PdnError::RecordPlacedOnce { .. }),
+        "{refused:?}"
+    );
+    let refused = joiner
+        .node
+        .pod_act(bob, pod, PodMembershipAct::Remove { member: alice })
+        .await
+        .expect_err("a plain member removes nobody");
+    assert!(
+        matches!(
+            refused,
+            PdnError::ActRefused {
+                reason: PodActRefusal::NotAnOwner
+            }
+        ),
+        "{refused:?}"
+    );
+
+    for device in [first_device, joiner, outsider] {
         device.node.stop().await?;
     }
     Ok(())
@@ -575,6 +696,7 @@ async fn a_node_comes_back_on_its_directory() -> Result<()> {
     let node_id = node.node_id().await?;
     node.write_entry(
         alice.clone(),
+        alice.clone(),
         "contact/email".to_owned(),
         b"a@example".to_vec(),
     )
@@ -591,7 +713,7 @@ async fn a_node_comes_back_on_its_directory() -> Result<()> {
         "the identity it hosted is hosted again, with no ceremony repeated"
     );
     assert_eq!(
-        node.read_entry(alice.clone(), "contact/email".to_owned())
+        node.read_entry(alice.clone(), alice.clone(), "contact/email".to_owned())
             .await?
             .as_deref(),
         Some(b"a@example".as_slice()),

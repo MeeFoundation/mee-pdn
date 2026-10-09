@@ -23,10 +23,12 @@
 //! paired denial vacuous.
 
 use pdn_node::{
-    CatchUpTimeout, DelegationUnsupported, DialogueTimeout, DirectoryHeld, EstablishmentInProgress,
-    EstablishmentRefused, EstablishmentTimeout, IdentityAlreadyHosted, InviterUnreachable,
-    LinkingInProgress, LinkingRefused, PeerNotConnected, UnknownIdentity, UnknownIssuer,
-    UnsupportedInviteVersion, UnsupportedLinkingVersion, WriteNotGranted,
+    ActRefusal, ActRefused, CatchUpTimeout, DelegationUnsupported, DialogueTimeout, DirectoryHeld,
+    EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, IdentityAlreadyHosted,
+    IdentityKeyPending, InviterUnreachable, JoinInProgress, JoinRefused, JoinTimeout,
+    LinkingInProgress, LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownIdentity,
+    UnknownIssuer, UnknownPod, UnknownRecord, UnsupportedInviteVersion, UnsupportedLinkingVersion,
+    UnsupportedPodInviteVersion, WriteNotGranted, WrongRecordKind,
 };
 
 /// Every way an exported call fails. Identities and paths travel as the
@@ -76,10 +78,38 @@ pub enum PdnError {
     #[error("the ceremony dialogue ran out of its bound")]
     DialogueTimedOut,
 
-    /// The dialogue succeeded and the catch-up did not finish inside the
-    /// caller's bound; the attempt left nothing behind.
+    /// The dialogue succeeded and the catch-up did not finish inside its
+    /// bound. A linking attempt left nothing behind; a pod join left the
+    /// pod recorded, its catch-up continuing.
     #[error("the catch-up ran out of its bound")]
     CatchUpTimedOut,
+
+    /// The identity is no member of that pod, as its replica folds the
+    /// membership — never joined, departed, or its join not caught up.
+    #[error("the identity is no member of pod {pod}")]
+    UnknownPod { pod: String },
+
+    /// The identity's role, or the pod's membership, does not allow the
+    /// act; nothing was written.
+    #[error("the membership act was refused: {reason:?}")]
+    ActRefused { reason: PodActRefusal },
+
+    /// A claim or an immutable-document takes no operation.
+    #[error("{record} is placed once")]
+    RecordPlacedOnce { record: String },
+
+    /// No entry of the record reads here: none exists, or none has arrived.
+    #[error("{record} reads on no entry here")]
+    UnknownRecord { record: String },
+
+    /// The record's kind is read by the other call.
+    #[error("{record} is not read by this call")]
+    WrongRecordKind { record: String },
+
+    /// The identity key has not reached this device: a
+    /// device linked a moment ago signs nothing until it does.
+    #[error("the identity key of {identity} has not reached this device yet")]
+    IdentityKeyPending { identity: String },
 
     /// A scanned code was minted by a build this runtime does not speak
     /// the payload format of. The counterparty needs an update, and the
@@ -108,6 +138,30 @@ pub enum PdnError {
     /// platform log.
     #[error("internal failure")]
     Internal,
+}
+
+/// Why a membership act was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PodActRefusal {
+    NotAnOwner,
+    /// A demotion or a removal of the acting identity: its way out is leaving.
+    OnItself,
+    SubjectNotMember,
+    SubjectNotOwner,
+    /// The pod's one owner leaving while it has other members.
+    SoleOwner,
+}
+
+impl From<ActRefusal> for PodActRefusal {
+    fn from(reason: ActRefusal) -> Self {
+        match reason {
+            ActRefusal::NotAnOwner => Self::NotAnOwner,
+            ActRefusal::OnItself => Self::OnItself,
+            ActRefusal::SubjectNotMember => Self::SubjectNotMember,
+            ActRefusal::SubjectNotOwner => Self::SubjectNotOwner,
+            ActRefusal::SoleOwner => Self::SoleOwner,
+        }
+    }
 }
 
 impl PdnError {
@@ -148,6 +202,9 @@ pub(crate) fn table(err: &anyhow::Error) -> PdnError {
             peer: unconnected.peer.to_string(),
         };
     }
+    if let Some(kind) = pod_refusal(err) {
+        return kind;
+    }
     if let Some(unspoken) = err.downcast_ref::<UnsupportedInviteVersion>() {
         return PdnError::UnsupportedPayloadVersion {
             version: unspoken.version,
@@ -187,6 +244,60 @@ pub(crate) fn table(err: &anyhow::Error) -> PdnError {
     }
     tracing::error!("unmapped facade error: {err:#}");
     PdnError::Internal
+}
+
+/// The pods service's refusals; its ceremony outcomes fold into the kinds
+/// pairing and linking report.
+fn pod_refusal(err: &anyhow::Error) -> Option<PdnError> {
+    if let Some(unknown) = err.downcast_ref::<UnknownPod>() {
+        return Some(PdnError::UnknownPod {
+            pod: unknown.pod.to_string(),
+        });
+    }
+    if let Some(refused) = err.downcast_ref::<ActRefused>() {
+        return Some(PdnError::ActRefused {
+            reason: refused.reason.into(),
+        });
+    }
+    if let Some(refused) = err.downcast_ref::<RecordPlacedOnce>() {
+        return Some(PdnError::RecordPlacedOnce {
+            record: record_text(&refused.record),
+        });
+    }
+    if let Some(unknown) = err.downcast_ref::<UnknownRecord>() {
+        return Some(PdnError::UnknownRecord {
+            record: record_text(&unknown.record),
+        });
+    }
+    if let Some(wrong) = err.downcast_ref::<WrongRecordKind>() {
+        return Some(PdnError::WrongRecordKind {
+            record: record_text(&wrong.record),
+        });
+    }
+    if let Some(pending) = err.downcast_ref::<IdentityKeyPending>() {
+        return Some(PdnError::IdentityKeyPending {
+            identity: pending.identity.to_string(),
+        });
+    }
+    if let Some(unspoken) = err.downcast_ref::<UnsupportedPodInviteVersion>() {
+        return Some(PdnError::UnsupportedPayloadVersion {
+            version: unspoken.version,
+        });
+    }
+    if err.downcast_ref::<JoinRefused>().is_some() {
+        return Some(PdnError::CeremonyRefused);
+    }
+    if err.downcast_ref::<JoinInProgress>().is_some() {
+        return Some(PdnError::ActAlreadyUnderway);
+    }
+    if err.downcast_ref::<JoinTimeout>().is_some() {
+        return Some(PdnError::DialogueTimedOut);
+    }
+    None
+}
+
+fn record_text(record: &pdn_node::RecordRef) -> String {
+    format!("{} {} under {}", record.kind, record.id, record.member)
 }
 
 #[cfg(test)]
@@ -284,6 +395,62 @@ mod tests {
         ));
         assert!(matches!(
             kind(UnsupportedLinkingVersion { version: 9 }),
+            PdnError::UnsupportedPayloadVersion { version: 9 }
+        ));
+    }
+
+    /// A pod's refusals keep their kinds, and its ceremony outcomes fold
+    /// into the ones pairing and linking report.
+    #[test]
+    fn pod_refusals_keep_their_kinds() {
+        use pdn_node::{PodAct, PodId, RecordId, RecordKind, RecordRef};
+        let record = RecordRef {
+            member: ISSUER,
+            kind: RecordKind::Claim,
+            id: RecordId::from_bytes([0x44; 16]),
+        };
+        assert!(matches!(
+            kind(UnknownPod {
+                pod: PodId::from_bytes([0x33; 16])
+            }),
+            PdnError::UnknownPod { .. }
+        ));
+        assert!(matches!(
+            kind(ActRefused {
+                act: PodAct::Remove(PEER),
+                reason: ActRefusal::NotAnOwner,
+            }),
+            PdnError::ActRefused {
+                reason: PodActRefusal::NotAnOwner
+            }
+        ));
+        assert!(matches!(
+            kind(RecordPlacedOnce { record }),
+            PdnError::RecordPlacedOnce { .. }
+        ));
+        assert!(matches!(
+            kind(UnknownRecord { record }),
+            PdnError::UnknownRecord { .. }
+        ));
+        assert!(matches!(
+            kind(WrongRecordKind { record }),
+            PdnError::WrongRecordKind { .. }
+        ));
+        assert!(matches!(
+            kind(IdentityKeyPending { identity: ISSUER }),
+            PdnError::IdentityKeyPending { .. }
+        ));
+        assert!(matches!(kind(JoinRefused), PdnError::CeremonyRefused));
+        assert!(matches!(kind(JoinTimeout), PdnError::DialogueTimedOut));
+        assert!(matches!(
+            kind(JoinInProgress {
+                identity: ISSUER,
+                pod: PodId::from_bytes([0x33; 16]),
+            }),
+            PdnError::ActAlreadyUnderway
+        ));
+        assert!(matches!(
+            kind(UnsupportedPodInviteVersion { version: 9 }),
             PdnError::UnsupportedPayloadVersion { version: 9 }
         ));
     }

@@ -24,13 +24,16 @@ use std::{
 
 use pdn_node::{
     ConnectionsService as _, DataService as _, IdentityService as _, InvitePayload, LinkingPayload,
-    Runtime, SpawnOptions, SyncService as _,
+    PodInvite, PodsService as _, Runtime, SpawnOptions, SyncService as _,
 };
 
 use crate::{
     error::{self, PdnError},
     payload,
-    shapes::{self, EntryListing, GrantCapability, GrantedPath},
+    shapes::{
+        self, EntryListing, GrantCapability, GrantedPath, PodMemberInfo, PodMembershipAct,
+        PodOperation, PodRecord, PodRecordKind,
+    },
 };
 
 /// What a handle holds. `ComingUp` is a state of its own so 2 concurrent
@@ -384,16 +387,23 @@ impl PdnNode {
     /// retracted there with no answer here carrying that verdict.
     pub async fn write_entry(
         &self,
+        identity: String,
         issuer: String,
         path: String,
         payload: Vec<u8>,
     ) -> Result<(), PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
         let issuer = shapes::identity(&issuer, "issuer")?;
         let path = shapes::entry_path(&path)?;
         shapes::entry_payload(&payload)?;
         let runtime = self.runtime()?;
-        self.on_node(async move { runtime.data().write(issuer, &path, &payload).await })
-            .await
+        self.on_node(async move {
+            runtime
+                .data()
+                .write(identity, issuer, &path, &payload)
+                .await
+        })
+        .await
     }
 
     /// Read the entry at `path` of `issuer`'s data.
@@ -405,13 +415,15 @@ impl PdnNode {
     /// concluding.
     pub async fn read_entry(
         &self,
+        identity: String,
         issuer: String,
         path: String,
     ) -> Result<Option<Vec<u8>>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
         let issuer = shapes::identity(&issuer, "issuer")?;
         let path = shapes::entry_path(&path)?;
         let runtime = self.runtime()?;
-        self.on_node(async move { runtime.data().read(issuer, &path).await })
+        self.on_node(async move { runtime.data().read(identity, issuer, &path).await })
             .await
     }
 
@@ -420,15 +432,192 @@ impl PdnNode {
     /// than characters.
     pub async fn list_entries(
         &self,
+        identity: String,
         issuer: String,
         path_prefix: Option<String>,
     ) -> Result<Vec<EntryListing>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
         let issuer = shapes::identity(&issuer, "issuer")?;
         let prefix = path_prefix.as_deref().map(shapes::entry_path).transpose()?;
         let runtime = self.runtime()?;
         self.on_node(async move {
-            let entries = runtime.data().list(issuer, prefix.as_ref()).await?;
+            let entries = runtime
+                .data()
+                .list(identity, issuer, prefix.as_ref())
+                .await?;
             Ok(entries.into_iter().map(EntryListing::from).collect())
+        })
+        .await
+    }
+
+    /// Create a pod with `identity` as its first owner.
+    pub async fn create_pod(&self, identity: String) -> Result<String, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().create(identity).await })
+            .await
+            .map(|pod| pod.to_string())
+    }
+
+    /// The pods `identity` holds, by its PMS.
+    pub async fn pods(&self, identity: String) -> Result<Vec<String>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let runtime = self.runtime()?;
+        self.on_node(async move {
+            let pods = runtime.pods().list(identity).await?;
+            Ok(pods.iter().map(|info| info.id.to_string()).collect())
+        })
+        .await
+    }
+
+    /// The pod's current members as `identity`'s replica folds them.
+    pub async fn pod_members(
+        &self,
+        identity: String,
+        pod: String,
+    ) -> Result<Vec<PodMemberInfo>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move {
+            let members = runtime.pods().members(identity, pod).await?;
+            Ok(members.into_iter().map(PodMemberInfo::from).collect())
+        })
+        .await
+    }
+
+    /// Mint an invitation into `pod`. Its exposure is the one
+    /// [`Self::mint_linking_payload`] describes.
+    pub async fn mint_pod_invite(
+        &self,
+        identity: String,
+        pod: String,
+        lifetime_secs: Option<u64>,
+    ) -> Result<String, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let lifetime = shapes::lifetime(lifetime_secs)?;
+        let runtime = self.runtime()?;
+        let minted = self
+            .on_node(async move { runtime.pods().invite(identity, pod, lifetime).await })
+            .await?;
+        payload::encode(&minted)
+    }
+
+    /// Join the pod an invitation names, as a plain member. Answers once
+    /// both stores caught up; [`PdnError::CatchUpTimedOut`] leaves the pod
+    /// recorded, its catch-up continuing.
+    pub async fn join_pod(&self, identity: String, code: String) -> Result<String, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let invite: PodInvite = payload::decode(&code)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().join(identity, invite).await })
+            .await
+            .map(|pod| pod.to_string())
+    }
+
+    /// Write a membership act; a refused one writes nothing.
+    pub async fn pod_act(
+        &self,
+        identity: String,
+        pod: String,
+        act: PodMembershipAct,
+    ) -> Result<(), PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let act = act.parse()?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().act(identity, pod, act).await })
+            .await
+    }
+
+    /// Place a record under `identity`'s own name at a fresh id.
+    pub async fn put_record(
+        &self,
+        identity: String,
+        pod: String,
+        kind: PodRecordKind,
+        payload: Vec<u8>,
+    ) -> Result<PodRecord, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        shapes::entry_payload(&payload)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move {
+            runtime
+                .pods()
+                .put_record(identity, pod, kind.into(), &payload)
+                .await
+        })
+        .await
+        .map(PodRecord::from)
+    }
+
+    /// Append an operation to a mergeable-document, whoever's name it sits
+    /// under.
+    pub async fn append_op(
+        &self,
+        identity: String,
+        pod: String,
+        record: PodRecord,
+        op: Vec<u8>,
+    ) -> Result<(), PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let record = shapes::record(&record)?;
+        shapes::entry_payload(&op)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().append_op(identity, pod, record, &op).await })
+            .await
+    }
+
+    /// A claim's or an immutable-document's payload. `None` covers a record
+    /// that has not arrived yet as well as one that does not exist.
+    pub async fn read_record(
+        &self,
+        identity: String,
+        pod: String,
+        record: PodRecord,
+    ) -> Result<Option<Vec<u8>>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let record = shapes::record(&record)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().read(identity, pod, record).await })
+            .await
+    }
+
+    /// A mergeable-document's operations in the order of their ids, each
+    /// with its writer.
+    pub async fn read_ops(
+        &self,
+        identity: String,
+        pod: String,
+        record: PodRecord,
+    ) -> Result<Vec<PodOperation>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let record = shapes::record(&record)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move {
+            let ops = runtime.pods().read_ops(identity, pod, record).await?;
+            Ok(ops.into_iter().map(PodOperation::from).collect())
+        })
+        .await
+    }
+
+    /// Every record an entry of which reads on `identity`'s replica.
+    pub async fn list_records(
+        &self,
+        identity: String,
+        pod: String,
+    ) -> Result<Vec<PodRecord>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move {
+            let records = runtime.pods().list_records(identity, pod).await?;
+            Ok(records.into_iter().map(PodRecord::from).collect())
         })
         .await
     }

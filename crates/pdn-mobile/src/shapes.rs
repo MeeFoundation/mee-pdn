@@ -14,7 +14,10 @@
 
 use std::time::Duration;
 
-use pdn_node::{claim_id_of, EntryInfo, EntryPath, GrantedClaim, NonEmpty, PdnId, ReadGrant};
+use pdn_node::{
+    claim_id_of, EntryInfo, EntryPath, GrantedClaim, NonEmpty, Operation, PdnId, PodAct, PodId,
+    PodMember, ReadGrant, RecordId, RecordKind, RecordRef,
+};
 
 use crate::error::PdnError;
 
@@ -114,6 +117,136 @@ impl From<EntryInfo> for EntryListing {
             payload_len: info.payload_len,
         }
     }
+}
+
+/// A pod member and whether it is an owner.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PodMemberInfo {
+    pub identity: String,
+    pub owner: bool,
+}
+
+impl From<PodMember> for PodMemberInfo {
+    fn from(member: PodMember) -> Self {
+        Self {
+            identity: member.id.to_string(),
+            owner: member.owner,
+        }
+    }
+}
+
+/// The kind a record is placed as, chosen once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PodRecordKind {
+    Claim,
+    MergeableDocument,
+    ImmutableDocument,
+}
+
+impl From<PodRecordKind> for RecordKind {
+    fn from(kind: PodRecordKind) -> Self {
+        match kind {
+            PodRecordKind::Claim => Self::Claim,
+            PodRecordKind::MergeableDocument => Self::MergeableDocument,
+            PodRecordKind::ImmutableDocument => Self::ImmutableDocument,
+        }
+    }
+}
+
+impl From<RecordKind> for PodRecordKind {
+    fn from(kind: RecordKind) -> Self {
+        match kind {
+            RecordKind::Claim => Self::Claim,
+            RecordKind::MergeableDocument => Self::MergeableDocument,
+            RecordKind::ImmutableDocument => Self::ImmutableDocument,
+        }
+    }
+}
+
+/// A record's address: the member it sits under, its kind and its id.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PodRecord {
+    pub member: String,
+    pub kind: PodRecordKind,
+    pub id: String,
+}
+
+impl From<RecordRef> for PodRecord {
+    fn from(record: RecordRef) -> Self {
+        Self {
+            member: record.member.to_string(),
+            kind: record.kind.into(),
+            id: record.id.to_string(),
+        }
+    }
+}
+
+/// A mergeable-document's operation, with its writer; merged into nothing.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PodOperation {
+    pub writer: String,
+    /// The operation's key segment, unique within the record.
+    pub id: String,
+    pub payload: Vec<u8>,
+}
+
+impl From<Operation> for PodOperation {
+    fn from(operation: Operation) -> Self {
+        Self {
+            writer: operation.id.writer.to_string(),
+            id: operation.id.to_string(),
+            payload: operation.payload,
+        }
+    }
+}
+
+/// A membership act. Founding is `create`'s and inviting is the join's.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum PodMembershipAct {
+    Promote {
+        member: String,
+    },
+    /// Of another owner.
+    Demote {
+        member: String,
+    },
+    /// Of another member, an owner or a plain member alike.
+    Remove {
+        member: String,
+    },
+    Leave,
+}
+
+impl PodMembershipAct {
+    pub(crate) fn parse(&self) -> Result<PodAct, PdnError> {
+        Ok(match self {
+            Self::Promote { member } => PodAct::Promote(identity(member, "member")?),
+            Self::Demote { member } => PodAct::Demote(identity(member, "member")?),
+            Self::Remove { member } => PodAct::Remove(identity(member, "member")?),
+            Self::Leave => PodAct::Leave,
+        })
+    }
+}
+
+/// A pod id from the text a screen holds.
+pub(crate) fn pod(raw: &str) -> Result<PodId, PdnError> {
+    let preview: String = raw.chars().take(64).collect();
+    raw.parse()
+        .map_err(|err| PdnError::malformed(format!("malformed pod {preview:?}: {err}")))
+}
+
+/// A record's address from the text a screen holds.
+pub(crate) fn record(raw: &PodRecord) -> Result<RecordRef, PdnError> {
+    let preview: String = raw.id.chars().take(64).collect();
+    let id: RecordId = raw
+        .id
+        .parse()
+        .map_err(|err| PdnError::malformed(format!("malformed record id {preview:?}: {err}")))?;
+    Ok(RecordRef {
+        member: identity(&raw.member, "member")?,
+        kind: raw.kind.into(),
+        id,
+    })
 }
 
 /// An identity from the text a screen holds.
