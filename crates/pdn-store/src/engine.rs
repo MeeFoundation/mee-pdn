@@ -262,8 +262,9 @@ impl Engine {
             .await
     }
 
-    /// [`Self::start_sync`] with an ordered subscription attached, as
-    /// [`Self::observe`] gives it: registered before the replica is opened
+    /// [`Self::sync_with_peers`] with no recorded peer and the swarm joined —
+    /// a pod store's start in the data layer — with an ordered subscription
+    /// attached, as [`Self::observe`] gives it: registered before the replica is opened
     /// for sync and before its first dial, so it reports that sync from its
     /// first event. For a replica already syncing it is [`Self::observe`].
     pub async fn start_sync_observed(
@@ -277,7 +278,7 @@ impl Engine {
         self.sync_with(
             namespace,
             peers,
-            None,
+            Some(Vec::new()),
             Some(default_identity),
             true,
             Some(s),

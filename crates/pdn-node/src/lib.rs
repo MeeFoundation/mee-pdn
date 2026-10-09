@@ -9,6 +9,8 @@ pub mod connections;
 pub mod data;
 pub mod identity;
 pub mod linking;
+#[cfg(feature = "test-util")]
+pub mod observation;
 pub mod pairing;
 pub mod pods;
 pub mod retraction;

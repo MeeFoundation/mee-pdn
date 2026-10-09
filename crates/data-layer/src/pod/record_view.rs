@@ -14,12 +14,15 @@ use super::{
 };
 
 /// One entry of a record store as a device holds it; `payload` is its
-/// content hash once the bytes have arrived.
+/// content hash once the bytes have arrived, `hash` and `len` whether or not
+/// they have.
 #[derive(Clone, Debug)]
 pub struct RecordEntry {
     pub key: Vec<u8>,
     pub author: AuthorId,
     pub timestamp: u64,
+    pub hash: Hash,
+    pub len: u64,
     pub payload: Option<Hash>,
 }
 

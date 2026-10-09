@@ -127,6 +127,33 @@ impl<'rt> RuntimeDataService<'rt> {
         state.node.holds_replica(identity, namespace).await
     }
 
+    /// [`read`](DataService::read) without the reconciliation a read of a
+    /// grant-imported namespace starts: what the replica already holds.
+    #[cfg(feature = "test-util")]
+    pub async fn read_unnudged(
+        &self,
+        identity: PdnId,
+        issuer: PdnId,
+        path: &EntryPath,
+    ) -> Result<Option<Vec<u8>>> {
+        let state = self.runtime.state.lock().await;
+        let _hosted = state.hosted(identity)?;
+        state.node.read_unnudged(identity, issuer, path).await
+    }
+
+    /// One scoped session of `identity`'s grant-imported replica of
+    /// `issuer`, run to its end: the entries it received. The runtime lock
+    /// is not held across the session.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_scoped_once(&self, identity: PdnId, issuer: PdnId) -> Result<usize> {
+        let node = {
+            let state = self.runtime.state.lock().await;
+            let _hosted = state.hosted(identity)?;
+            std::sync::Arc::clone(&state.node)
+        };
+        node.sync_scoped_once_for_test(identity, issuer).await
+    }
+
     /// Forget `issuer`'s replica out from under the grant binder's memo — a
     /// memo/registry desync the product paths never produce.
     #[cfg(feature = "test-util")]

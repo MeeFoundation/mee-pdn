@@ -1281,6 +1281,61 @@ impl SyncNode {
         read_payload(&doc, &self.blobs, path.as_str().as_bytes()).await
     }
 
+    /// One reconciliation of `issuer`'s grant-imported replica through the
+    /// product's scoped path — the nudge's `start_sync_scoped` with the
+    /// tracked contacts, judged by the session access provider — answered
+    /// with the count of entries the dialed session received. A start
+    /// dropped because an older session of the pair still runs is issued
+    /// again once that one finishes. `Err` on a failed session, or on none
+    /// within the wait.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_scoped_once_for_test(&self, identity: PdnId, issuer: PdnId) -> Result<usize> {
+        use pdn_store::engine::{LiveEvent, Origin};
+
+        let stack = self.require(identity)?;
+        let namespace = stack
+            .registry
+            .binding(issuer)?
+            .ok_or(UnknownIssuer { issuer })?
+            .doc
+            .id();
+        let tracked = stack
+            .tracked(namespace)?
+            .context("the identity tracks no replica of that namespace")?;
+        anyhow::ensure!(
+            tracked.strategy == SyncStrategy::ContactsOnly,
+            "{issuer}'s replica is not held under a grant"
+        );
+        let mut events = tracked.doc.subscribe().await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let since = std::time::SystemTime::now();
+            tracked
+                .doc
+                .start_sync_scoped(tracked.contacts.clone(), tracked.default_identity)
+                .await?;
+            loop {
+                let event = tokio::time::timeout_at(deadline, events.next())
+                    .await
+                    .context("no scoped session finished within the wait")?
+                    .context("replica event stream ended")??;
+                let LiveEvent::SyncFinished(sync) = event else {
+                    continue;
+                };
+                if !matches!(sync.origin, Origin::Connect(_)) {
+                    continue;
+                }
+                if sync.started < since {
+                    break;
+                }
+                return sync
+                    .result
+                    .map(|details| details.entries_received)
+                    .map_err(|err| anyhow::anyhow!(err));
+            }
+        }
+    }
+
     /// Open one session for `issuer`'s replica against `contact`, naming
     /// `caller` as the identity this side acts for — whoever this node
     /// hosts. The session a caller that claims an identity it does not
@@ -1668,6 +1723,68 @@ impl SyncNode {
         tickets: PodTickets,
         others: &[PodTickets],
     ) -> Result<PodCatchUp> {
+        let (caught_up, _observation) = self
+            .import_pod_observing(identity, pod, tickets, others, None)
+            .await?;
+        Ok(caught_up)
+    }
+
+    /// [`import_pod_with`](Self::import_pod_with) with each store's sync
+    /// started with an ordered subscription of `capacity` attached; a store
+    /// whose sync already runs gets the one [`Doc::observe`] gives.
+    #[cfg(feature = "test-util")]
+    pub async fn import_pod_observed_for_test(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        tickets: PodTickets,
+        others: &[PodTickets],
+        capacity: usize,
+    ) -> Result<(PodCatchUp, PodObservation)> {
+        let (caught_up, observation) = self
+            .import_pod_observing(identity, pod, tickets, others, Some(capacity))
+            .await?;
+        let (membership, records) =
+            observation.context("an observed import started no subscription")?;
+        Ok((
+            caught_up,
+            PodObservation {
+                membership,
+                records: Some(records),
+            },
+        ))
+    }
+
+    /// The ordered subscription of each store of `pod` `identity` holds,
+    /// `records` `None` on a tombstone. [`UnknownPod`] for a pod not held.
+    #[cfg(feature = "test-util")]
+    pub async fn observe_pod_for_test(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        capacity: usize,
+    ) -> Result<PodObservation> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
+        let membership: OrderedEvents = Box::pin(held.membership.observe(capacity).await?);
+        let records: Option<OrderedEvents> = match held.records {
+            Some(records) => Some(Box::pin(records.observe(capacity).await?)),
+            None => None,
+        };
+        Ok(PodObservation {
+            membership,
+            records,
+        })
+    }
+
+    async fn import_pod_observing(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        tickets: PodTickets,
+        others: &[PodTickets],
+        observe: Option<usize>,
+    ) -> Result<(PodCatchUp, Option<(OrderedEvents, OrderedEvents)>)> {
         let stack = self.require(identity)?;
         let held = Self::admit_pod_tickets(&stack, pod, &tickets)?;
         let membership_contacts = contacts_of(
@@ -1679,7 +1796,7 @@ impl SyncNode {
         if let Some(held) = held {
             return match held.records {
                 Some(records) => {
-                    self.start_pod(&stack, pod, &held.membership, &records)
+                    self.start_pod(&stack, pod, &held.membership, &records, observe)
                         .await
                 }
                 None => {
@@ -1689,6 +1806,7 @@ impl SyncNode {
                         &held.membership,
                         tickets.records,
                         records_contacts,
+                        observe,
                     )
                     .await
                 }
@@ -1711,20 +1829,15 @@ impl SyncNode {
                 records: Some(records.clone()),
             },
         )?;
-        stack.track(
-            &membership,
-            membership_contacts,
-            SyncStrategy::Swarm,
-            membership_minted_by,
-        )?;
-        stack.track(
-            &records,
-            records_contacts,
-            SyncStrategy::Swarm,
-            records_minted_by,
-        )?;
+        for (doc, contacts, minted_by) in [
+            (&membership, membership_contacts, membership_minted_by),
+            (&records, records_contacts, records_minted_by),
+        ] {
+            stack.track(doc, contacts, SyncStrategy::Swarm, minted_by)?;
+        }
         self.watch_pod(&stack, pod, &membership);
-        self.start_pod(&stack, pod, &membership, &records).await
+        self.start_pod(&stack, pod, &membership, &records, observe)
+            .await
     }
 
     /// A join after a departure: the record store imported again beside the
@@ -1736,14 +1849,16 @@ impl SyncNode {
         membership: &Doc,
         ticket: DocTicket,
         contacts: Vec<Contact>,
-    ) -> Result<PodCatchUp> {
+        observe: Option<usize>,
+    ) -> Result<(PodCatchUp, Option<(OrderedEvents, OrderedEvents)>)> {
         Self::guard_pod_import(stack, ticket.capability.id())?;
         let minted_by = ticket.identity;
         let records = stack.api.import_namespace(ticket.capability).await?;
         stack.registry.set_pod_records(pod, Some(records.clone()))?;
         stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
         stack.set_strategy(membership.id(), SyncStrategy::Swarm)?;
-        self.start_pod(stack, pod, membership, &records).await
+        self.start_pod(stack, pod, membership, &records, observe)
+            .await
     }
 
     fn watch_pod(&self, stack: &Arc<HostedStack>, pod: PodId, membership: &Doc) {
@@ -1753,14 +1868,16 @@ impl SyncNode {
 
     /// Start both tracked stores' sync, the record store's every dial
     /// ordered after the membership store's, behind a wait for the first
-    /// session of each that this start brings.
+    /// session of each that this start brings. With `observe`, each start
+    /// carries an ordered subscription of that capacity, returned beside.
     async fn start_pod(
         &self,
         stack: &HostedStack,
         pod: PodId,
         membership: &Doc,
         records: &Doc,
-    ) -> Result<PodCatchUp> {
+        observe: Option<usize>,
+    ) -> Result<(PodCatchUp, Option<(OrderedEvents, OrderedEvents)>)> {
         let held = PodBinding {
             membership: membership.clone(),
             records: Some(records.clone()),
@@ -1779,7 +1896,7 @@ impl SyncNode {
             stack.tracked(membership.id())?,
             stack.tracked(records.id())?,
         );
-        Self::start_tracked(membership).await?;
+        let membership = Self::start_tracked(membership, observe).await?;
         #[cfg(feature = "test-util")]
         {
             let pause = self
@@ -1792,8 +1909,8 @@ impl SyncNode {
                 pause.release.notified().await;
             }
         }
-        Self::start_tracked(records).await?;
-        Ok(caught_up)
+        let records = Self::start_tracked(records, observe).await?;
+        Ok((caught_up, membership.zip(records)))
     }
 
     /// Drop both of `pod`'s stores and its registration, as if the pod
@@ -1816,18 +1933,30 @@ impl SyncNode {
     }
 
     /// Start a tracked pod store's sync with the contacts and the default
-    /// identity it is tracked with.
-    async fn start_tracked(tracked: Option<TrackedDoc>) -> Result<()> {
+    /// identity it is tracked with, with an ordered subscription of
+    /// `observe`'s capacity attached when asked.
+    async fn start_tracked(
+        tracked: Option<TrackedDoc>,
+        observe: Option<usize>,
+    ) -> Result<Option<OrderedEvents>> {
         let Some(tracked) = tracked else {
-            return Ok(());
+            return Ok(None);
         };
-        start_pod_store(
-            &tracked.doc,
-            tracked.contacts,
-            tracked.default_identity,
-            true,
-        )
-        .await
+        let Some(capacity) = observe else {
+            start_pod_store(
+                &tracked.doc,
+                tracked.contacts,
+                tracked.default_identity,
+                true,
+            )
+            .await?;
+            return Ok(None);
+        };
+        let events = tracked
+            .doc
+            .start_sync_observed(tracked.contacts, tracked.default_identity, capacity)
+            .await?;
+        Ok(Some(Box::pin(events)))
     }
 
     /// `Ok` when [`import_pod`](Self::import_pod) would take `tickets` as
@@ -2104,6 +2233,26 @@ impl SyncNode {
     /// too.
     pub async fn pod_record_view(&self, identity: PdnId, pod: PodId) -> Result<RecordView> {
         self.record_view(identity, pod, Query::all()).await
+    }
+
+    /// Every entry of [`pod_record_view`](Self::pod_record_view) with its
+    /// verdict and, when it has arrived, its payload.
+    #[cfg(feature = "test-util")]
+    pub async fn pod_record_listing_for_test(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+    ) -> Result<Vec<(crate::RecordEntry, crate::Verdict, Option<Vec<u8>>)>> {
+        let view = self.pod_record_view(identity, pod).await?;
+        let mut listing = Vec::new();
+        for (entry, verdict) in view.verdicts() {
+            let payload = match entry.payload {
+                Some(hash) => Some(self.blobs.get_bytes(hash).await?.to_vec()),
+                None => None,
+            };
+            listing.push((entry.clone(), verdict, payload));
+        }
+        Ok(listing)
     }
 
     /// [`pod_record_view`](Self::pod_record_view) over `record`'s own
@@ -4597,6 +4746,17 @@ async fn own_payloads(
         }
     }
     Ok(payloads.into_iter().collect())
+}
+
+/// A store's ordered subscription (the change subscription spec).
+pub type OrderedEvents = futures_lite::stream::Boxed<Result<pdn_store::engine::LiveEvent>>;
+
+/// The ordered subscription of each store of one pod an identity holds;
+/// `records` is `None` on a tombstone.
+#[cfg(feature = "test-util")]
+pub struct PodObservation {
+    pub membership: OrderedEvents,
+    pub records: Option<OrderedEvents>,
 }
 
 /// The hold [`SyncNode::pause_next_pod_start_for_test`] puts on a pod

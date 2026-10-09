@@ -259,7 +259,8 @@ pub struct ObserveRequest {
     pub doc_id: NamespaceId,
     /// Events held for a reader that falls behind.
     pub capacity: usize,
-    /// Starts the sync with these peers and this default identity, the
+    /// Starts the sync with these peers alone, none the store recorded, and
+    /// this default identity, the
     /// subscription attached to the start; `None` observes a running sync.
     pub start: Option<(Vec<Contact>, Identity)>,
 }

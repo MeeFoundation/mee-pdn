@@ -320,6 +320,10 @@ impl State {
 pub struct Runtime {
     node_id: NodeId,
     pub(crate) state: Arc<Mutex<State>>,
+    /// Cancelled as the stop begins, so an observation ends with no record
+    /// rather than a `closed` for each store the stop drops.
+    #[cfg(feature = "test-util")]
+    stopping: tokio_util::sync::CancellationToken,
 }
 
 impl Runtime {
@@ -392,7 +396,12 @@ impl Runtime {
         join_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("join state slot filled twice"))?;
-        Ok(Self { node_id, state })
+        Ok(Self {
+            node_id,
+            state,
+            #[cfg(feature = "test-util")]
+            stopping: tokio_util::sync::CancellationToken::new(),
+        })
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -476,6 +485,123 @@ impl Runtime {
     ) -> anyhow::Result<data_layer::RecordView> {
         let node = Arc::clone(&self.state.lock().await.node);
         node.pod_record_view(identity, pod).await
+    }
+
+    /// A subscription to the stores of `pod` `identity` holds here, both or
+    /// a tombstone's membership store alone. [`UnknownIdentity`] for an
+    /// identity not hosted, [`data_layer::UnknownPod`] for one holding no
+    /// store of the pod.
+    #[cfg(feature = "test-util")]
+    pub async fn observe_pod_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        pod: pdn_types::PodId,
+    ) -> anyhow::Result<crate::observation::PodSubscription> {
+        let node = {
+            let state = self.state.lock().await;
+            state.hosted(identity)?;
+            Arc::clone(&state.node)
+        };
+        let observation = node
+            .observe_pod_for_test(identity, pod, crate::observation::STORE_CAPACITY)
+            .await?;
+        let sub = crate::observation::fresh_sub()?;
+        Ok(crate::observation::subscribe(
+            pod,
+            observation,
+            self.stopping.clone(),
+            crate::observation::RECORD_BUFFER_BOUND,
+            sub,
+        ))
+    }
+
+    /// `join` with the subscription of `identity` to the pod opened between
+    /// the import and the start of either store's sync. Answers both also
+    /// when the catch-up outlasts the join's wait, the pod left recorded as
+    /// `join` leaves it; a join refused or failed before then answers as
+    /// `join` does and opens nothing.
+    #[cfg(feature = "test-util")]
+    pub async fn join_pod_observed_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        invite: crate::PodInvite,
+    ) -> anyhow::Result<(pdn_types::PodId, crate::observation::PodSubscription)> {
+        let sub = crate::observation::fresh_sub()?;
+        let (pod, stopping) = (invite.pod, self.stopping.clone());
+        let (pod, subscription, _waited) = self
+            .pods()
+            .join_with(identity, invite, move |node, tickets| async move {
+                let (caught_up, observation) = node
+                    .import_pod_observed_for_test(
+                        identity,
+                        pod,
+                        tickets,
+                        &[],
+                        crate::observation::STORE_CAPACITY,
+                    )
+                    .await?;
+                let subscription = crate::observation::subscribe(
+                    pod,
+                    observation,
+                    stopping,
+                    crate::observation::RECORD_BUFFER_BOUND,
+                    sub,
+                );
+                Ok((caught_up, subscription))
+            })
+            .await?;
+        Ok((pod, subscription))
+    }
+
+    /// Every entry of `identity`'s record store of `pod` as the record view
+    /// holds it, with its verdict and its payload when present. Starts no
+    /// session; refused as the record view refuses, a tombstone included.
+    #[cfg(feature = "test-util")]
+    pub async fn pod_record_listing_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        pod: pdn_types::PodId,
+    ) -> anyhow::Result<Vec<crate::observation::ListedEntry>> {
+        let node = {
+            let state = self.state.lock().await;
+            state.hosted(identity)?;
+            Arc::clone(&state.node)
+        };
+        Ok(node
+            .pod_record_listing_for_test(identity, pod)
+            .await?
+            .into_iter()
+            .map(|(entry, verdict, payload)| {
+                crate::observation::ListedEntry::new(&entry, verdict, payload)
+            })
+            .collect())
+    }
+
+    /// Write `payload` at `key` of `identity`'s record store of `pod` under
+    /// a fresh author, which no device statement lists: a forged entry.
+    #[cfg(feature = "test-util")]
+    pub async fn forge_pod_record_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+        pod: pdn_types::PodId,
+        key: &[u8],
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let node = {
+            let state = self.state.lock().await;
+            state.hosted(identity)?;
+            Arc::clone(&state.node)
+        };
+        let forger = node.create_author(identity).await?;
+        node.write_pod_entry_as_for_test(
+            identity,
+            pod,
+            data_layer::PodStore::Records,
+            forger,
+            key,
+            payload,
+        )
+        .await
     }
 
     #[cfg(feature = "test-util")]
@@ -639,6 +765,8 @@ impl Runtime {
     /// host awaits them before it stops the runtime.
     pub async fn shutdown(&self) -> Result<()> {
         const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        #[cfg(feature = "test-util")]
+        self.stopping.cancel();
         let (node, cleanup_tasks, serving_halves) = {
             let state = self.state.lock().await;
             (

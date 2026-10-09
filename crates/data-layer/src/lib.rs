@@ -38,7 +38,15 @@ pub use identity_key::{
     creates, devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair,
 };
 #[cfg(feature = "test-util")]
-pub use node::{CollectionPause, PodSession, PodSessions, PodStartPause};
+pub use node::{
+    CollectionPause, OrderedEvents, PodObservation, PodSession, PodSessions, PodStartPause,
+};
+// The ordered subscription's vocabulary, for the runtime's observation.
+#[cfg(feature = "test-util")]
+pub use pdn_store::{
+    engine::{LiveEvent, Origin, SyncEvent},
+    ContentStatus,
+};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{

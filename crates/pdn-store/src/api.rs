@@ -616,7 +616,8 @@ impl Doc {
         self.observe_with(capacity, None).await
     }
 
-    /// [`Self::start_sync`] with an ordered subscription attached, as
+    /// [`Self::sync_with_peers`] with no recorded peer and the swarm joined,
+    /// with an ordered subscription attached, as
     /// [`Engine::start_sync_observed`](crate::engine::Engine::start_sync_observed)
     /// gives it.
     pub async fn start_sync_observed(
