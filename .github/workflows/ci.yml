@@ -173,6 +173,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The same build with the host's observation routes, which only the
+      # observation scenarios run against; its own cache scope, so neither
+      # build evicts the other's dependency layer.
+      - name: Build the observation image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ops/Dockerfile
+          tags: pdn-node-http:observation
+          build-args: FEATURES=observation
+          load: true
+          cache-from: type=gha,scope=observation
+          cache-to: type=gha,mode=max,scope=observation
+
       # Both of the run's own inputs come from recipes the local run uses too,
       # so the two cannot drift apart: the parallelism bound from the daemon
       # on this runner rather than a number baked in for a development
@@ -181,8 +195,9 @@ jobs:
       - name: Run the container scenarios
         run: |
           PDN_STAND_IMAGE="$(just stand-image)"
-          [ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
-          export PDN_STAND_IMAGE
+          PDN_STAND_OBSERVATION_IMAGE="$(just stand-image pdn-node-http:observation)"
+          [ -n "$PDN_STAND_IMAGE" ] && [ -n "$PDN_STAND_OBSERVATION_IMAGE" ] || { echo "the images built, but the daemon does not name them"; exit 1; }
+          export PDN_STAND_IMAGE PDN_STAND_OBSERVATION_IMAGE
           cargo nextest run --profile "$(just stand-profile)" -p pdn-node-http -E 'binary(~stand)' --run-ignored all
 
       # The demos from the same image, whatever the scenarios returned: they

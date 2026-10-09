@@ -17,7 +17,10 @@ use std::{
 
 use anyhow::{ensure, Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node::{PdnId, PodId, RecordKind, RecordRef};
+use pdn_node::{
+    observation::{ListedEntry, PodRecord},
+    PdnId, PodId, RecordKind, RecordRef,
+};
 use pdn_node_http::shapes::{
     Act, CreatedIdentity, GrantPublication, GrantedPath, HeldPod, HeldPods, Member, Members,
     Operations, OwnGrant,
@@ -36,11 +39,26 @@ pub const IMAGE_TAG: &str = "dev";
 /// Where the recipe hands over the identity of the image this run tests.
 const IMAGE_ENV: &str = "PDN_STAND_IMAGE";
 
+/// The same for the image built with the observation routes.
+const OBSERVATION_IMAGE_ENV: &str = "PDN_STAND_OBSERVATION_IMAGE";
+const OBSERVATION_IMAGE_TAG: &str = "observation";
+
+/// Which of the run's two images a node starts from.
+#[derive(Debug, Clone, Copy)]
+pub enum Image {
+    Stand,
+    Observation,
+}
+
 /// The image every container of this run starts from: a content id the
 /// recipe resolved once, since a tag can move mid-run from another worktree
 /// sharing the daemon. Unset, the tag — a run started by hand still works.
-fn image_ref() -> String {
-    std::env::var(IMAGE_ENV).unwrap_or_else(|_| format!("{IMAGE_NAME}:{IMAGE_TAG}"))
+fn image_ref(image: Image) -> String {
+    let (env, tag) = match image {
+        Image::Stand => (IMAGE_ENV, IMAGE_TAG),
+        Image::Observation => (OBSERVATION_IMAGE_ENV, OBSERVATION_IMAGE_TAG),
+    };
+    std::env::var(env).unwrap_or_else(|_| format!("{IMAGE_NAME}:{tag}"))
 }
 
 /// Split the way the container client wants it; a content id (`sha256:…`)
@@ -115,29 +133,84 @@ impl Stand {
 
     /// Debug surface on; waits until the node answers liveness.
     pub async fn spawn(&self, label: &str) -> Result<Host> {
-        self.spawn_configured(label, true, None).await
+        self.spawn_configured(label, Image::Stand, true, None, &[])
+            .await
     }
 
     /// Debug surface off — the image's own default.
     pub async fn spawn_without_debug(&self, label: &str) -> Result<Host> {
-        self.spawn_configured(label, false, None).await
+        self.spawn_configured(label, Image::Stand, false, None, &[])
+            .await
     }
 
     /// A tmpfs of `state_bytes` over the image's state directory, so the
     /// store meets a disk that fills.
     pub async fn spawn_with_bounded_state(&self, label: &str, state_bytes: i64) -> Result<Host> {
-        self.spawn_configured(label, true, Some(state_bytes)).await
+        self.spawn_configured(label, Image::Stand, true, Some(state_bytes), &[])
+            .await
+    }
+
+    /// From `image`, with `PDN_DEBUG=1` when `debug` and `env` beside it.
+    pub async fn spawn_from(
+        &self,
+        label: &str,
+        image: Image,
+        debug: bool,
+        env: &[(&str, &str)],
+    ) -> Result<Host> {
+        self.spawn_configured(label, image, debug, None, env).await
+    }
+
+    /// A node from the stand's image with `env` that must stop its start:
+    /// the exit code and the log, once the process has exited.
+    pub async fn refused_start(&self, label: &str, env: &[(&str, &str)]) -> Result<(i64, String)> {
+        let reference = image_ref(Image::Stand);
+        let (image_name, image_tag) = split_ref(&reference);
+        let name = format!("{}-{label}", self.network);
+        let mut image = GenericImage::new(image_name, image_tag)
+            .with_exposed_port(HTTP_PORT)
+            .with_wait_for(WaitFor::Nothing)
+            .with_env_var("PDN_DEBUG", "1")
+            .with_network(&self.network)
+            .with_log_consumer(stream_to_file(&name))
+            .with_container_name(name);
+        for (key, value) in env {
+            image = image.with_env_var(*key, *value);
+        }
+        let container = image
+            .start()
+            .await
+            .with_context(|| format!("starting {label}: is {reference} built?"))?;
+        let deadline = tokio::time::Instant::now() + READY_BUDGET;
+        while container.is_running().await? {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "{label} still runs {READY_BUDGET:?} after its start"
+            );
+            tokio::time::sleep(READY_POLL).await;
+        }
+        let output = std::process::Command::new("docker")
+            .args(["inspect", "-f", "{{.State.ExitCode}}", container.id()])
+            .output()
+            .with_context(|| format!("reading the exit code of {label}"))?;
+        let code = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .with_context(|| format!("the exit code of {label} is not a number"))?;
+        Ok((code, log_tail(&container, label).await))
     }
 
     async fn spawn_configured(
         &self,
         label: &str,
+        image: Image,
         debug: bool,
         state_bytes: Option<i64>,
+        env: &[(&str, &str)],
     ) -> Result<Host> {
         let mut failed = None;
         let mut replaced = String::new();
-        let reference = image_ref();
+        let reference = image_ref(image);
         let (image_name, image_tag) = split_ref(&reference);
         for attempt in 1..=SPAWN_ATTEMPTS {
             // A replacement must not collide with a predecessor the daemon
@@ -158,6 +231,9 @@ impl Stand {
                 .with_container_name(name.clone());
             if debug {
                 image = image.with_env_var("PDN_DEBUG", "1");
+            }
+            for (key, value) in env {
+                image = image.with_env_var(*key, *value);
             }
             if let Some(state_bytes) = state_bytes {
                 // Mode 1777: the tmpfs arrives root-owned and the binary
@@ -355,6 +431,101 @@ impl Host {
         .await
     }
 
+    /// This node's endpoint id, from the status page's `node` line.
+    pub async fn node_id(&self) -> Result<String> {
+        let status = self.get("/debug/status").await?.ok()?;
+        String::from_utf8_lossy(&status)
+            .lines()
+            .find_map(|line| line.strip_prefix("node "))
+            .map(str::to_owned)
+            .context("the status page carries no node line")
+    }
+
+    pub async fn listing(&self, identity: PdnId, pod: PodId) -> Result<Vec<ListedEntry>> {
+        self.get(&format!("{}/listing", pod_route(identity, pod)))
+            .await?
+            .json()
+    }
+
+    /// The event route of `identity` on `pod`.
+    pub async fn events(&self, identity: PdnId, pod: PodId) -> Result<RecordStream> {
+        self.stream(
+            Method::Get,
+            &format!("{}/events", pod_route(identity, pod)),
+            Bytes::new(),
+        )
+        .await?
+        .map_err(|refused| {
+            anyhow::anyhow!(
+                "{} refused the event route: {}: {}",
+                self.label,
+                refused.status,
+                refused.text()
+            )
+        })
+    }
+
+    /// The observed join route: the stream, or the refusal it answered.
+    pub async fn join_pod_observed(
+        &self,
+        identity: PdnId,
+        invite: Bytes,
+    ) -> Result<std::result::Result<RecordStream, Answer>> {
+        self.stream(
+            Method::Post,
+            &format!("/debug/identities/{identity}/pods/join-observed"),
+            invite,
+        )
+        .await
+    }
+
+    /// A response read as it arrives, by a client with no overall timeout:
+    /// a stream outlives [`REQUEST_BUDGET`]. A non-success answer is read
+    /// whole.
+    async fn stream(
+        &self,
+        method: Method,
+        path: &str,
+        body: Bytes,
+    ) -> Result<std::result::Result<RecordStream, Answer>> {
+        let method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+        let base = self
+            .base
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("base-url lock poisoned"))?
+            .clone();
+        let client = reqwest::Client::builder()
+            .connect_timeout(READY_PROBE_TIMEOUT)
+            .build()
+            .context("building the stream client")?;
+        let response = tokio::time::timeout(
+            REQUEST_BUDGET,
+            client
+                .request(method, format!("{base}{path}"))
+                .body(body)
+                .send(),
+        )
+        .await
+        .with_context(|| format!("{} sent no headers for {path}", self.label))?
+        .with_context(|| format!("{} did not answer {path}", self.label))?;
+        let status = StatusCode::from_u16(response.status().as_u16())?;
+        if !status.is_success() {
+            let body = response.bytes().await?;
+            return Ok(Err(Answer { status, body }));
+        }
+        let pod = response
+            .headers()
+            .get(pdn_node_http::POD_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok(Ok(RecordStream {
+            label: self.label.clone(),
+            pod,
+            response,
+            pending: Vec::new(),
+        }))
+    }
+
     /// The container's filesystem stays for a later [`start`](Self::start).
     pub async fn stop(&self) -> Result<()> {
         self.container
@@ -472,6 +643,91 @@ impl Host {
         let status = StatusCode::from_u16(response.status().as_u16())?;
         let body = response.bytes().await?;
         Ok(Answer { status, body })
+    }
+}
+
+/// An event route's body, one [`PodRecord`] per line.
+pub struct RecordStream {
+    label: String,
+    /// The observed join's pod header.
+    pub pod: Option<String>,
+    response: reqwest::Response,
+    pending: Vec<u8>,
+}
+
+pub enum Read {
+    Record(Box<PodRecord>),
+    /// The body ended.
+    Ended,
+    /// Nothing arrived within the wait.
+    Quiet,
+}
+
+impl RecordStream {
+    pub async fn read(&mut self, wait: Duration) -> Result<Read> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=end).collect();
+                let record = serde_json::from_slice(line.get(..end).unwrap_or_default())
+                    .with_context(|| {
+                        format!(
+                            "{} wrote a line that is no record: {}",
+                            self.label,
+                            String::from_utf8_lossy(&line)
+                        )
+                    })?;
+                return Ok(Read::Record(Box::new(record)));
+            }
+            let Ok(chunk) = tokio::time::timeout_at(deadline, self.response.chunk()).await else {
+                return Ok(Read::Quiet);
+            };
+            let Some(chunk) = chunk.with_context(|| format!("{}'s stream broke", self.label))?
+            else {
+                ensure!(
+                    self.pending.is_empty(),
+                    "{}'s stream ended mid-line",
+                    self.label
+                );
+                return Ok(Read::Ended);
+            };
+            self.pending.extend_from_slice(&chunk);
+        }
+    }
+
+    /// Reads up to and including the first record `until` accepts, within
+    /// `budget`; a stream that ends or stays quiet first fails, naming
+    /// `what`.
+    pub async fn read_until(
+        &mut self,
+        budget: Duration,
+        what: &str,
+        mut until: impl FnMut(&PodRecord) -> bool,
+    ) -> Result<Vec<PodRecord>> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut read = Vec::new();
+        loop {
+            let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.read(wait).await? {
+                Read::Record(record) => {
+                    let done = until(&record);
+                    read.push(*record);
+                    if done {
+                        return Ok(read);
+                    }
+                }
+                Read::Ended => anyhow::bail!(
+                    "{}'s stream ended before {what}, after {} records",
+                    self.label,
+                    read.len()
+                ),
+                Read::Quiet => anyhow::bail!(
+                    "{}'s stream yielded no {what} within {budget:?}, after {} records",
+                    self.label,
+                    read.len()
+                ),
+            }
+        }
     }
 }
 

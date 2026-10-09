@@ -25,13 +25,16 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG CARGO_HTTP_CAINFO
+# The host's cargo features, empty for the stand's image; `observation` for
+# the sync tests' image (scripts/build-image.sh).
+ARG FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=secret,id=ca-bundle,required=false \
-    cargo chef cook --release -p pdn-node-http --recipe-path recipe.json
+    cargo chef cook --release -p pdn-node-http --features "$FEATURES" --recipe-path recipe.json
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release -p pdn-node-http
+    cargo build --release -p pdn-node-http --features "$FEATURES"
 
 FROM debian:bookworm-slim AS runtime
 # The state directory is created for the non-root user the binary runs as,

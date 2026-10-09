@@ -3587,6 +3587,7 @@ name = "pdn-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "data-layer",
  "futures-lite",
@@ -3594,6 +3595,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "serde",
+ "serde_json",
  "tempfile",
  "test-utils",
  "thiserror 2.0.20",
@@ -3608,6 +3610,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-lite",
  "pdn-node",
  "percent-encoding",
  "reqwest 0.12.28",
