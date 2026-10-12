@@ -36,8 +36,8 @@ use crate::{
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
-        connect_and_sync, handle_in_process_session, handle_session, AbortReason, AcceptError,
-        AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
+        connect_and_sync_asking, handle_in_process_session, handle_session, AbortReason,
+        AcceptError, AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
     },
     subscribers::{Delivery, LagNotice, Subscribers},
     AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
@@ -802,37 +802,19 @@ impl LiveActor {
         let fut = async move {
             // The dialing side serves entries too (reconciliation is
             // bidirectional), so the embedder's access provider gates this
-            // role exactly like the accept role.
-            // The addressed identity first, the acting one second, as on
-            // the accept path: dialing, the party across the session is
-            // the callee.
-            let access = session_access(
+            // role exactly like the accept role, asked once the session's
+            // snapshot is open.
+            let res = connect_and_sync_asking(
+                &endpoint,
+                &sync,
                 namespace,
                 callee,
                 caller,
-                peer,
-                crate::filter::SessionRole::Dial,
+                EndpointAddr::new(peer),
+                Some(&metrics),
+                &session_access,
             )
             .await;
-            let res = match access {
-                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
-                    "session denied by the local access provider"
-                ))),
-                crate::filter::SessionAccess::Allow { egress, ingest } => {
-                    connect_and_sync(
-                        &endpoint,
-                        &sync,
-                        namespace,
-                        callee,
-                        caller,
-                        EndpointAddr::new(peer),
-                        Some(&metrics),
-                        egress,
-                        ingest,
-                    )
-                    .await
-                }
-            };
             (namespace, peer, callee, reason, res)
         }
         .instrument(Span::current());
@@ -878,37 +860,18 @@ impl LiveActor {
         let caller = self.identity;
         self.in_process_sessions.fetch_add(1, Ordering::Relaxed);
         let fut = async move {
-            // The addressed identity first, the acting one second, as on
-            // the accept path: dialing, the party across the session is
-            // the callee.
-            let access = session_access(
+            let res = crate::net::sync_in_process(
+                &sync,
                 namespace,
                 callee,
                 caller,
                 peer,
-                crate::filter::SessionRole::Dial,
+                &mut send,
+                &mut recv,
+                Some(&metrics),
+                &session_access,
             )
             .await;
-            let res = match access {
-                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
-                    "session denied by the local access provider"
-                ))),
-                crate::filter::SessionAccess::Allow { egress, ingest } => {
-                    crate::net::sync_in_process(
-                        &sync,
-                        namespace,
-                        callee,
-                        caller,
-                        peer,
-                        &mut send,
-                        &mut recv,
-                        Some(&metrics),
-                        egress,
-                        ingest,
-                    )
-                    .await
-                }
-            };
             (namespace, peer, callee, reason, res)
         }
         .instrument(Span::current());

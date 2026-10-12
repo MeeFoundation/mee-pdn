@@ -189,6 +189,82 @@ fn sessions_with(
         .collect()
 }
 
+/// A member device's dial whose access was decided while a member was still
+/// one, and whose session reaches that member's device only after its
+/// removal and a record placed after it, takes the record to it nowhere.
+///
+/// The dial is held between its access decision and its connect, where a
+/// connect to a device that is down waits; the removed member's device stays
+/// out of both swarms, so its own view still lists it a member when the
+/// session arrives, as a device that was offline throughout does. The
+/// nodes settle first: a dial of that device's crossing the held one would
+/// supersede it by the tie-break.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_decided_before_a_removal_takes_nothing_placed_after_it() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) =
+        (node(QUIET).await?, node(QUIET).await?, node(QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        phone.import_pod(holder.id, pod, tickets.clone()).await?;
+    }
+    assert!(lists(&carol_phone, carol.id, pod, bob.id, PLAIN).await?);
+    let (membership, records) = carol_phone.pod_stores(carol.id, pod)?;
+    for namespace in [membership, records] {
+        carol_phone
+            .leave_swarm_for_test(carol.id, namespace)
+            .await?;
+    }
+
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    let mut accepted = carol_phone
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
+        .await?;
+    let held_dial =
+        alice_phone.pause_next_dial_for_test(alice.id, records, carol_phone.node_id())?;
+    dial(
+        &alice_phone,
+        &alice,
+        pod,
+        PodStore::Records,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    held_dial.reached.notified().await;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
+    place_claim(&alice_phone, &alice, pod, 1).await?;
+    held_dial.release.notify_one();
+    accepted
+        .next_with(alice_phone.node_id(), false, TIMEOUT)
+        .await?
+        .context("the held dial's session never reached the device")?;
+
+    let held = held_records(&carol_phone, carol.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the removed member's device holds records: {held:#?}"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A device offline while its member is removed learns of the removal at its
 /// first session with a member device, taking the removal and what it rests
 /// on. Denied: a membership event outside the removal's past and a record

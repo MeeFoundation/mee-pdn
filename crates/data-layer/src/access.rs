@@ -131,6 +131,10 @@ pub(crate) struct AccessBook {
     pod_verdicts: OnceLock<PodVerdictSink>,
     #[cfg(feature = "test-util")]
     session_traces: OnceLock<SessionTraceSink>,
+    /// Holds this identity's next dial on one namespace to one peer once its
+    /// access is decided, before the decision returns to the engine.
+    #[cfg(feature = "test-util")]
+    dial_pause: std::sync::Mutex<Option<(NamespaceId, NodeId, Arc<DialPause>)>>,
     /// Refuses every pod session this identity is asked to serve, as a
     /// device out of reach answers none.
     #[cfg(feature = "test-util")]
@@ -152,6 +156,15 @@ pub(crate) type PodVerdictSink =
 #[cfg(feature = "test-util")]
 pub(crate) type SessionTraceSink =
     Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SessionTrace>>>>;
+
+/// The hold [`SyncNode::pause_next_dial_for_test`](crate::SyncNode::pause_next_dial_for_test)
+/// puts on a dial: `reached` once its access is decided.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Default)]
+pub struct DialPause {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
 
 /// One session decision of one identity's book, or one entry that
 /// session's ingest admitted; `at` orders the traces of several nodes of
@@ -196,6 +209,8 @@ impl AccessBook {
             pod_verdicts: OnceLock::new(),
             #[cfg(feature = "test-util")]
             session_traces: OnceLock::new(),
+            #[cfg(feature = "test-util")]
+            dial_pause: std::sync::Mutex::default(),
             #[cfg(feature = "test-util")]
             refuse_pods: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
@@ -279,8 +294,36 @@ impl AccessBook {
             Err(_storage_error) => SessionAccess::Deny,
         };
         #[cfg(feature = "test-util")]
+        self.hold_dial(namespace, peer, role).await;
+        #[cfg(feature = "test-util")]
         let access = self.traced(access, namespace, remote, peer, role);
         access
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn pause_next_dial(&self, namespace: NamespaceId, peer: NodeId) -> Arc<DialPause> {
+        let pause = Arc::new(DialPause::default());
+        if let Ok(mut slot) = self.dial_pause.lock() {
+            *slot = Some((namespace, peer, Arc::clone(&pause)));
+        }
+        pause
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn hold_dial(&self, namespace: NamespaceId, peer: NodeId, role: SessionRole) {
+        if !matches!(role, SessionRole::Dial) {
+            return;
+        }
+        let pause = self.dial_pause.lock().ok().and_then(|mut slot| {
+            let held = slot
+                .as_ref()
+                .is_some_and(|(paused, to, _)| *paused == namespace && *to == peer);
+            held.then(|| slot.take()).flatten()
+        });
+        if let Some((_namespace, _peer, pause)) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     /// `access` as decided, reporting the decision and every entry its

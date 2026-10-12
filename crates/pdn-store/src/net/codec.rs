@@ -128,14 +128,27 @@ pub(super) struct Init {
     pub(super) message: crate::sync::ProtocolMessage,
 }
 
+/// What the initiator side serves and admits in a session.
+pub(crate) enum DialAccess<'a> {
+    /// Decided by the caller beforehand.
+    Given {
+        filter: Option<crate::filter::EntryFilter>,
+        ingest: Option<crate::filter::SessionIngest>,
+    },
+    /// Asked of the access provider once the session's snapshot is open: a
+    /// decision older than the snapshot would serve entries written after
+    /// the access changed.
+    Asked(&'a crate::filter::SessionAccessProvider),
+}
+
 /// Runs the initiator side of the sync protocol.
 ///
 /// `identity` names whose replica this session addresses on the peer and
 /// `caller` whom this side acts for; the peer dispatches the connection by
 /// the first and judges the session by the second.
 ///
-/// `filter` is this side's egress filter for the session: every value this
-/// side reveals — the initial range boundary and fingerprint included —
+/// `access` gives this side's egress filter for the session: every value
+/// this side reveals — the initial range boundary and fingerprint included —
 /// derives from the filtered view.
 ///
 /// The session reads through a store snapshot frozen here, before the
@@ -151,8 +164,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     identity: Identity,
     caller: Identity,
     peer: PublicKey,
-    filter: Option<crate::filter::EntryFilter>,
-    ingest: Option<crate::filter::SessionIngest>,
+    access: DialAccess<'_>,
 ) -> Result<SyncOutcome, ConnectError> {
     let peer_bytes = *peer.as_bytes();
     let mut reader = FramedRead::new(reader, SyncCodec::default());
@@ -165,6 +177,29 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .sync_session_start(namespace)
         .await
         .map_err(ConnectError::sync)?;
+    let (filter, ingest) = match access {
+        DialAccess::Given { filter, ingest } => (filter, ingest),
+        // The addressed identity first, the acting one second, as on the
+        // accept path: dialing, the party across the session is the callee.
+        DialAccess::Asked(provider) => {
+            match provider(
+                namespace,
+                identity,
+                caller,
+                peer,
+                crate::filter::SessionRole::Dial,
+            )
+            .await
+            {
+                crate::filter::SessionAccess::Allow { egress, ingest } => (egress, ingest),
+                crate::filter::SessionAccess::Deny => {
+                    return Err(ConnectError::sync(anyhow!(
+                        "session denied by the local access provider"
+                    )))
+                }
+            }
+        }
+    };
 
     // Init message
 
@@ -656,8 +691,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_peer_id,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -931,8 +968,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_node_pubkey,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1090,8 +1129,10 @@ mod tests {
                 addressed,
                 acting,
                 bob_peer,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1260,8 +1301,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_peer_id,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1890,8 +1933,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_peer,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });

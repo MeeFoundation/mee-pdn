@@ -1564,6 +1564,21 @@ impl SyncNode {
         pause
     }
 
+    /// Holds `identity`'s next dial on `namespace` to `peer` once its access
+    /// is decided, before the engine connects, until `release` is notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_dial_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        peer: NodeId,
+    ) -> Result<Arc<crate::access::DialPause>> {
+        Ok(self
+            .require(identity)?
+            .access
+            .pause_next_dial(namespace, peer))
+    }
+
     /// Holds the next blob collection run once every hosted identity's
     /// replicas are read, before it removes anything, until `release` is
     /// notified.
