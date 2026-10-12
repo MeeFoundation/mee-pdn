@@ -1,3 +1,9 @@
+# A test still running after ten minutes is killed and counted as failed.
+# The slowest honest test takes about a minute on a loaded runner; a hang
+# would otherwise hold a whole run to its job's limit and pass in the end.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # One node of the stand is a container, and one test starts up to four of
 # them. Left to the default, the runner schedules a test per core of *this*
 # machine, which is not always the machine the daemon runs on — a daemon on a

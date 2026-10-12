@@ -11,8 +11,8 @@ use data_layer::{
     Connection, DialHandle, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode,
 };
 use pdn_node::{
-    ConnectionsService as _, GrantedClaim, IdentityService as _, InvitePayload, LinkingPayload,
-    Runtime, SpawnOptions,
+    ConnectionsService as _, DataService as _, GrantedClaim, IdentityService as _, InvitePayload,
+    LinkingPayload, Runtime, SpawnOptions,
 };
 use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::{eventually, memory_node, TIMEOUT};
@@ -164,9 +164,9 @@ pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<Grant
 }
 
 /// Publish a grant and return once the receiver reads it whole over the
-/// pair. Delivery alone: a caller that needs the grant's value reads it
-/// inside its own poll, since a second read after this one is not the same
-/// read.
+/// pair and holds the issuer's namespace. A caller that needs the grant's
+/// value reads it inside its own poll, since a second read after this one
+/// is not the same read.
 pub async fn granted_patiently(
     gives: &Runtime,
     gives_id: PdnId,
@@ -189,5 +189,20 @@ pub async fn granted_patiently(
     })
     .await?;
     ensure!(crossed, "the grant did not reach the peer over the pair");
+    // The binder imports after the record lands; a read before it names an
+    // issuer the receiver does not hold yet.
+    let probe = EntryPath::new("probe")?;
+    let held = eventually(|| async {
+        Ok(receives
+            .data()
+            .read(receives_id, issuer, &probe)
+            .await
+            .is_ok())
+    })
+    .await?;
+    ensure!(
+        held,
+        "the receiver never came to hold the issuer's namespace"
+    );
     Ok(())
 }
