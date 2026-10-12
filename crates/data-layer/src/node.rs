@@ -42,9 +42,9 @@ use crate::{
     address_book::{AddressBook, ADDRESS_BOOK_INTERVAL},
     connection_metadata::ConnectionMetadataStore,
     pod::{
-        departure_past, record_entries, record_prefix, unknown_entries, Member, MemberDevice,
-        MembershipView, Operation, PodCatchUp, PodNotice, PodStore, PodTickets, RecordView, Seq,
-        UnknownEntry, UnknownPod,
+        departure_past, record_entries, record_prefix, unknown_entries, CreatedPayload, EventKind,
+        Member, MemberDevice, MembershipKey, MembershipView, Operation, PodCatchUp, PodNotice,
+        PodStore, PodTickets, RecordView, Seq, UnknownEntry, UnknownPod, Verdict,
     },
     private_metadata::PrivateMetadataStore,
     registry::{PodBinding, Registry, ServingPosture},
@@ -2306,6 +2306,49 @@ impl SyncNode {
         self.pass_probes
             .passes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The namespaces of `pod`'s membership store and record store as
+    /// `identity` holds them. [`UnknownPod`] for a tombstone too.
+    pub fn pod_stores(&self, identity: PdnId, pod: PodId) -> Result<(NamespaceId, NamespaceId)> {
+        let held = self
+            .require(identity)?
+            .registry
+            .pod(pod)?
+            .ok_or(UnknownPod { pod })?;
+        let records = held.records.ok_or(UnknownPod { pod })?;
+        Ok((held.membership.id(), records.id()))
+    }
+
+    /// The created event `identity`'s replica of `pod` counts; `None` while
+    /// it counts none. [`UnknownPod`] for a pod never held here.
+    pub async fn pod_creation(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+    ) -> Result<Option<CreatedPayload>> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
+        let (view, entries) = stack
+            .access
+            .membership_view_and_entries(pod, &held.membership)
+            .await?;
+        Ok(entries
+            .iter()
+            .zip(view.verdicts())
+            .find(|(entry, verdict)| {
+                **verdict == Verdict::Counted
+                    && matches!(
+                        MembershipKey::parse(&entry.key),
+                        Some(MembershipKey::Event {
+                            kind: EventKind::Created,
+                            ..
+                        })
+                    )
+            })
+            .and_then(|(entry, _verdict)| {
+                entry.payload.as_deref().and_then(CreatedPayload::decode)
+            }))
     }
 
     /// Minting starts both stores' sync, as the store's share does for every

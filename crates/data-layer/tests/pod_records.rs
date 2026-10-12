@@ -126,7 +126,7 @@ async fn statement(
         member: member.id,
         version: 1,
     };
-    let payload = member.keys.device_statement(1, devices).encode();
+    let payload = member.keys.device_statement(&pod, 1, devices).encode();
     write(
         node,
         writer,
@@ -157,9 +157,12 @@ async fn a_members_records_read_on_its_device_and_its_forgery_under_another_name
     let phone = memory_node().await?;
     let alice = host(&phone).await?;
     let bob = host(&phone).await?;
-    let creation = alice.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
+    let pod = data_layer::pod_id_of(&alice.id, &alice.keys.public_key(), &[0x5a; 16]);
     phone.create_pod(alice.id, pod).await?;
+    let (membership_store, record_store) = phone.pod_stores(alice.id, pod)?;
+    let creation = alice
+        .keys
+        .creation([0x5a; 16], membership_store, record_store);
     let created = MembershipKey::created(alice.id).to_bytes();
     write(
         &phone,
@@ -200,7 +203,10 @@ async fn a_members_records_read_on_its_device_and_its_forgery_under_another_name
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    let join_statement = bob.keys.join_statement(&pod, Seq::FIRST).encode();
+    let join_statement = bob
+        .keys
+        .join_statement(&pod, Seq::FIRST, device_of(&phone, &bob)?)
+        .encode();
     write(
         &phone,
         &alice,

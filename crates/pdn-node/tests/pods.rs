@@ -13,8 +13,8 @@ use data_layer::{
     Verdict,
 };
 use pdn_node::{
-    ActRefusal, ActRefused, ConnectionsService as _, IdentityService as _, JoinRefused, PodAct,
-    PodInvite, PodMember, PodsService as _, RecordPlacedOnce, Runtime, SpawnOptions,
+    ActRefusal, ActRefused, ConnectionsService as _, ForgedJoin, IdentityService as _, JoinRefused,
+    PodAct, PodInvite, PodMember, PodsService as _, RecordPlacedOnce, Runtime, SpawnOptions,
     UnknownIdentity, UnknownPod, UnknownRecord, UnsupportedPodInviteVersion, WrongRecordKind,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
@@ -1272,6 +1272,161 @@ async fn what_a_member_wrote_reaches_the_pod_when_its_device_stops_after_the_lea
     );
 
     alice_phone.shutdown().await?;
+    Ok(())
+}
+
+/// A join whose inviter offers a sequence past the joiner's own history is
+/// refused: the joiner signs nothing, so no joined event reaches the
+/// inviter's replica, and records nothing. Paired control: an honest offer
+/// after it joins at the joiner's first sequence, from its own device alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_past_the_joiners_history_is_refused() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = alice_phone.pods().create(alice).await?;
+
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    alice_phone
+        .forge_next_join_for_test(ForgedJoin::Seq(3))
+        .await;
+    let joined = bob_phone.pods().join(bob, invite).await;
+    assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
+    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(
+        alice_phone.pods().members(alice, pod).await?,
+        vec![member(alice, true)]
+    );
+
+    // Paired control: the honest offer.
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    bob_phone.pods().join(bob, invite).await?;
+    let both = vec![member(alice, true), member(bob, false)];
+    assert!(lists_members(&alice_phone, alice, pod, both).await?);
+    let view = alice_phone.pod_membership_view_for_test(alice, pod).await?;
+    let listed = view.member(&bob).expect("Bob listed");
+    assert_eq!(listed.run(), 1);
+    assert_eq!(listed.devices.len(), 1);
+    assert_eq!(listed.statement_version, 0);
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A join whose inviter offers another pod's created event is refused before
+/// the joiner signs anything, and records nothing. Paired control: the
+/// honest offer of the same pod joins.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_naming_another_pods_creation_is_refused() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let family = alice_phone.pods().create(alice).await?;
+    let wedding = alice_phone.pods().create(alice).await?;
+
+    let invite = alice_phone.pods().invite(alice, family, None).await?;
+    alice_phone
+        .forge_next_join_for_test(ForgedJoin::CreationOf(wedding))
+        .await;
+    let joined = bob_phone.pods().join(bob, invite).await;
+    assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
+    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(
+        alice_phone.pods().members(alice, family).await?,
+        vec![member(alice, true)]
+    );
+
+    // Paired control: the honest offer.
+    let invite = alice_phone.pods().invite(alice, family, None).await?;
+    bob_phone.pods().join(bob, invite).await?;
+    assert!(lists_pod(&bob_phone, bob, family, true).await?);
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A join whose inviter hands over tickets to stores the pod's created event
+/// does not name is refused with nothing imported or recorded, so the
+/// joiner holds no store under the invited pod's id. Paired control: a
+/// second, honest invite then hands over the pod's own stores, and the
+/// joiner reads its members.
+#[tokio::test(flavor = "multi_thread")]
+async fn tickets_to_stores_the_creation_does_not_name_are_refused() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let family = alice_phone.pods().create(alice).await?;
+    let wedding = alice_phone.pods().create(alice).await?;
+
+    let invite = alice_phone.pods().invite(alice, family, None).await?;
+    alice_phone
+        .forge_next_join_for_test(ForgedJoin::TicketsOf(wedding))
+        .await;
+    let joined = bob_phone.pods().join(bob, invite).await;
+    assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
+    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    for pod in [family, wedding] {
+        let held = bob_phone.pods().members(bob, pod).await;
+        assert!(held.is_err_and(|err| is::<UnknownPod>(&err)));
+    }
+
+    // Paired control: the honest invite.
+    let invite = alice_phone.pods().invite(alice, family, None).await?;
+    bob_phone.pods().join(bob, invite).await?;
+    let both = vec![member(alice, true), member(bob, false)];
+    assert!(lists_members(&bob_phone, bob, family, both).await?);
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A member whose one listed device never received the pod reaches it from
+/// another device through an invite: the dialogue lists that device by its
+/// own statement at version 0, and it reads the pod. Denied before: the
+/// member's listed devices are the first one's alone.
+///
+/// The first join's reply is dropped, so the phone its joined event lists
+/// holds nothing of the pod, and no sibling can serve the laptop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_reaches_the_pod_from_an_unlisted_device_through_an_invite() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let bob_laptop = memory_runtime().await?;
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = alice_phone.pods().create(alice).await?;
+    let lease = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"lease")
+        .await?;
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    alice_phone.drop_next_join_reply_for_test().await;
+    assert!(bob_phone.pods().join(bob, invite).await.is_err());
+    link_patiently(&bob_laptop, &bob_phone, bob).await?;
+    bob_phone.shutdown().await?;
+    // Denied: the laptop is no device of Bob's yet.
+    let view = alice_phone.pod_membership_view_for_test(alice, pod).await?;
+    let nodes: Vec<_> = view
+        .member(&bob)
+        .expect("Bob listed")
+        .devices
+        .iter()
+        .map(|device| device.node)
+        .collect();
+    assert!(!nodes.contains(&bob_laptop.node_id()));
+
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    bob_laptop.pods().join(bob, invite).await?;
+    assert!(reads(&bob_laptop, bob, pod, lease, b"lease").await?);
+
+    for runtime in [alice_phone, bob_laptop] {
+        runtime.shutdown().await?;
+    }
     Ok(())
 }
 

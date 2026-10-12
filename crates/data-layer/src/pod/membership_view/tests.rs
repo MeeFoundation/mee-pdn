@@ -1,7 +1,7 @@
 use super::*;
 use crate::pod::{
     keys::Seq,
-    testing::{device, event, Cast, Person, Store},
+    testing::{device, event, family_stores, Cast, Person, Store},
 };
 
 const PLAIN: MemberState = MemberState {
@@ -206,7 +206,7 @@ fn entries_in_any_order_give_the_same_membership_view() {
     ];
     for order in orders {
         let entries: Vec<HeldEntry> = order.iter().map(|&i| store.entries[i].clone()).collect();
-        let shuffled = MembershipView::new(&store.pod, &entries);
+        let shuffled = MembershipView::new(&store.pod, &store.namespace, &entries);
         for person in [&cast.alice, &cast.bob, &cast.carol, &cast.dave] {
             assert_eq!(state(&shuffled, person), state(&forward, person));
         }
@@ -237,7 +237,7 @@ fn a_device_statement_counts_whoever_writes_it() {
         cast.dave.author(),
         cast.dave
             .keys
-            .device_statement(3, vec![cast.dave.device])
+            .device_statement(&store.pod, 3, vec![cast.dave.device])
             .encode(),
     );
     let membership = store.membership_view();
@@ -270,7 +270,7 @@ fn two_statements_at_one_version_both_count() {
         cast.carol.author(),
         cast.carol
             .keys
-            .device_statement(2, vec![cast.bob.device, device(0xb4)])
+            .device_statement(&store.pod, 2, vec![cast.bob.device, device(0xb4)])
             .encode(),
     );
     let moved = store.write(
@@ -281,7 +281,7 @@ fn two_statements_at_one_version_both_count() {
         cast.bob.author(),
         cast.bob
             .keys
-            .device_statement(1, vec![device(0xb9)])
+            .device_statement(&store.pod, 1, vec![device(0xb9)])
             .encode(),
     );
     let membership = store.membership_view();
@@ -306,17 +306,26 @@ fn created_events_that_do_not_derive_the_pod_count_for_nothing() {
     let bobs = store.write(
         MembershipKey::created(cast.bob.id()),
         cast.bob.author(),
-        cast.bob.keys.creation([0x5a; 16]).encode(),
+        cast.bob
+            .keys
+            .creation([0x5a; 16], family_stores().0, family_stores().1)
+            .encode(),
     );
     let other_key = store.write(
         MembershipKey::created(cast.alice.id()),
         cast.dave.author(),
-        cast.dave.keys.creation([0x5a; 16]).encode(),
+        cast.dave
+            .keys
+            .creation([0x5a; 16], family_stores().0, family_stores().1)
+            .encode(),
     );
     let moved = store.write(
         event(cast.alice.id(), 2, EventKind::Created, cast.alice.id(), 0),
         cast.alice.author(),
-        cast.alice.keys.creation([0x5a; 16]).encode(),
+        cast.alice
+            .keys
+            .creation([0x5a; 16], family_stores().0, family_stores().1)
+            .encode(),
     );
     let membership = store.membership_view();
     assert_eq!(verdict(&membership, bobs), nothing(ForNothing::OtherPod));
@@ -329,6 +338,97 @@ fn created_events_that_do_not_derive_the_pod_count_for_nothing() {
     assert_eq!(state(&membership, &cast.bob), PLAIN);
 }
 
+/// A created event counts only in the membership store it names: copied
+/// into another namespace, it roots nothing there. Paired control: in its
+/// own store it counts.
+#[test]
+fn a_created_event_in_another_store_counts_for_nothing() {
+    let cast = Cast::new();
+    let store = Store::created_by(&cast.alice);
+    let elsewhere = Store {
+        namespace: NamespaceId::from(&[0xee; 32]),
+        ..store.clone()
+    };
+    let membership = elsewhere.membership_view();
+    assert_eq!(verdict(&membership, 0), nothing(ForNothing::OtherStore));
+    assert_eq!(state(&membership, &cast.alice), OUT);
+    // Paired control: its own store.
+    let membership = store.membership_view();
+    assert_eq!(verdict(&membership, 0), Verdict::Counted);
+    assert_eq!(state(&membership, &cast.alice), OWNER);
+}
+
+/// The device a join statement names is the newcomer's from its joined
+/// event on, with no statement of its own: its leave from that device
+/// counts. Denied: a join statement whose device another node swapped
+/// counts for nothing and lists that device for nobody.
+#[test]
+fn a_join_statement_lists_the_device_it_names() {
+    let cast = Cast::new();
+    let mut store = Store::created_by(&cast.alice);
+    store.invite(&cast.alice, 1, &cast.bob);
+    let left = store.act(EventKind::Left, &cast.bob, 2, &cast.bob, 1);
+    let mut swapped = cast
+        .carol
+        .keys
+        .join_statement(&store.pod, Seq::new(1), cast.carol.device);
+    swapped.device = cast.dave.device;
+    let forged = store.write(
+        event(cast.carol.id(), 1, EventKind::Joined, cast.alice.id(), 1),
+        cast.alice.author(),
+        swapped.encode(),
+    );
+    let membership = store.membership_view();
+    assert_eq!(verdict(&membership, left), Verdict::Counted);
+    let bob = membership.member(&cast.bob.id()).unwrap();
+    assert_eq!(bob.devices, BTreeSet::from([cast.bob.device]));
+    assert_eq!(bob.statement_version, 0);
+    // Denied: the swapped device.
+    assert_eq!(
+        verdict(&membership, forged),
+        nothing(ForNothing::BadSignature)
+    );
+    assert!(membership
+        .member(&cast.carol.id())
+        .is_none_or(|carol| carol.devices.is_empty()));
+}
+
+/// A statement a member signed for another pod counts for nothing here, so
+/// a device listed in "Wedding" is no device of the member in "Family".
+/// Paired control: the same devices signed for this pod count.
+#[test]
+fn a_statement_signed_for_another_pod_counts_for_nothing() {
+    let cast = Cast::new();
+    let mut store = Store::created_by(&cast.alice);
+    store.invite(&cast.alice, 1, &cast.bob);
+    let wedding = PodId::from_bytes([0xf9; 16]);
+    let devices = vec![cast.bob.device, cast.dave.device];
+    let copied = store.write(
+        MembershipKey::Devices {
+            member: cast.bob.id(),
+            version: 2,
+        },
+        cast.dave.author(),
+        cast.bob
+            .keys
+            .device_statement(&wedding, 2, devices.clone())
+            .encode(),
+    );
+    let membership = store.membership_view();
+    assert_eq!(
+        verdict(&membership, copied),
+        nothing(ForNothing::BadSignature)
+    );
+    let bob = membership.member(&cast.bob.id()).unwrap();
+    assert!(!bob.devices.contains(&cast.dave.device));
+    // Paired control: signed for this pod.
+    let own = store.statement(&cast.bob, 3, &devices, cast.bob.author());
+    let membership = store.membership_view();
+    assert_eq!(verdict(&membership, own), Verdict::Counted);
+    let bob = membership.member(&cast.bob.id()).unwrap();
+    assert!(bob.devices.contains(&cast.dave.device));
+}
+
 /// A device holding only a chain a modified device invented, rooted at
 /// another creator, counts none of it.
 #[test]
@@ -336,12 +436,16 @@ fn an_invented_creator_roots_nothing() {
     let cast = Cast::new();
     let mut invented = Store {
         pod: Store::created_by(&cast.alice).pod,
+        namespace: family_stores().0,
         entries: Vec::new(),
     };
     let creation = invented.write(
         MembershipKey::created(cast.bob.id()),
         cast.bob.author(),
-        cast.bob.keys.creation([0x5a; 16]).encode(),
+        cast.bob
+            .keys
+            .creation([0x5a; 16], family_stores().0, family_stores().1)
+            .encode(),
     );
     invented.statement(&cast.bob, 1, &[cast.bob.device], cast.bob.author());
     let joined = invented.invite(&cast.bob, 1, &cast.dave);
@@ -376,14 +480,14 @@ fn a_join_counts_only_under_its_members_own_statement() {
     let minted = |seq| {
         mallory
             .keys
-            .join_statement(&store.pod, Seq::new(seq))
+            .join_statement(&store.pod, Seq::new(seq), mallory.device)
             .encode()
     };
     let (at_three, at_one) = (minted(3), minted(1));
     let copied = cast
         .carol
         .keys
-        .join_statement(&store.pod, Seq::new(1))
+        .join_statement(&store.pod, Seq::new(1), cast.carol.device)
         .encode();
 
     let readmitted = store.write(
@@ -414,7 +518,7 @@ fn a_join_counts_only_under_its_members_own_statement() {
         cast.bob.author(),
         mallory
             .keys
-            .device_statement(2, vec![cast.bob.device])
+            .device_statement(&store.pod, 2, vec![cast.bob.device])
             .encode(),
     );
     let membership = store.membership_view();
@@ -494,7 +598,7 @@ fn an_entry_waits_for_its_payload_and_a_statement_for_its_key() {
     let cast = Cast::new();
     let mut store = Store::created_by(&cast.alice);
     let joined = store.invite(&cast.alice, 1, &cast.bob);
-    let statement = joined + 1;
+    let statement = store.statement(&cast.bob, 1, &[cast.bob.device], cast.alice.author());
     let mut early = store.clone();
     early.entries[joined].payload = None;
     let membership = early.membership_view();
@@ -777,7 +881,7 @@ fn rightly_counted() {
                 let b2 = device(0xb2);
                 store.statement(&cast.bob, 2, &[cast.bob.device, b2], b2.author);
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let membership = MembershipView::new(&store.pod, &backwards);
+                let membership = MembershipView::new(&store.pod, &store.namespace, &backwards);
                 assert!(
                     membership.verdicts().iter().all(|v| *v == Verdict::Counted),
                     "{case}"
@@ -806,7 +910,7 @@ fn rightly_counted() {
                 let removal = store.act(EventKind::Removed, &cast.bob, 2, &cast.carol, 2);
                 let forward = store.membership_view();
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let other_device = MembershipView::new(&store.pod, &backwards);
+                let other_device = MembershipView::new(&store.pod, &store.namespace, &backwards);
                 for membership in [&forward, &other_device] {
                     assert_eq!(state(membership, &cast.bob), OUT, "{case}");
                 }
@@ -884,10 +988,10 @@ fn rightly_counted_for_nothing() {
                 store.write(
                     MembershipKey::created(cast.bob.id()),
                     cast.bob.author(),
-                    cast.bob.keys.creation([0x5a; 16]).encode(),
+                    cast.bob.keys.creation([0x5a; 16], family_stores().0, family_stores().1).encode(),
                 );
                 let backwards: Vec<HeldEntry> = store.entries.iter().rev().cloned().collect();
-                let membership = MembershipView::new(&store.pod, &backwards);
+                let membership = MembershipView::new(&store.pod, &store.namespace, &backwards);
                 assert_eq!(
                     membership.verdicts()[0],
                     nothing(ForNothing::OtherPod),
@@ -897,12 +1001,13 @@ fn rightly_counted_for_nothing() {
 
                 let mut invented = Store {
                     pod: store.pod,
+                    namespace: family_stores().0,
                     entries: Vec::new(),
                 };
                 let creation = invented.write(
                     MembershipKey::created(cast.bob.id()),
                     cast.bob.author(),
-                    cast.bob.keys.creation([0x5a; 16]).encode(),
+                    cast.bob.keys.creation([0x5a; 16], family_stores().0, family_stores().1).encode(),
                 );
                 let membership = invented.membership_view();
                 assert_eq!(
@@ -940,7 +1045,7 @@ fn rightly_counted_for_nothing() {
                 cast.dave.author(),
                 cast.dave
                     .keys
-                    .device_statement(2, vec![cast.dave.device])
+                    .device_statement(&store.pod, 2, vec![cast.dave.device])
                     .encode(),
             );
             let membership = store.membership_view();
@@ -964,14 +1069,14 @@ fn rightly_counted_for_nothing() {
                 let minted = |seq| {
                     mallory
                         .keys
-                        .join_statement(&store.pod, Seq::new(seq))
+                        .join_statement(&store.pod, Seq::new(seq), mallory.device)
                         .encode()
                 };
                 let (at_three, at_one) = (minted(3), minted(1));
                 let copied = cast
                     .carol
                     .keys
-                    .join_statement(&store.pod, Seq::new(1))
+                    .join_statement(&store.pod, Seq::new(1), cast.carol.device)
                     .encode();
                 let next_sequence = store.write(
                     event(cast.carol.id(), 3, EventKind::Joined, cast.bob.id(), 1),

@@ -89,16 +89,22 @@ async fn statement(
         member: member.id,
         version,
     };
-    let payload = member.keys.device_statement(version, devices).encode();
+    let payload = member
+        .keys
+        .device_statement(&pod, version, devices)
+        .encode();
     write(node, writer, pod, key, payload).await
 }
 
 /// `creator`'s pod on `node`: both stores, the created event, the
 /// creator's first device statement, and the tickets to both stores.
 async fn create(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTickets)> {
-    let creation = creator.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &creation.identity_key, &creation.nonce);
+    let pod = data_layer::pod_id_of(&creator.id, &creator.keys.public_key(), &[0x5a; 16]);
     node.create_pod(creator.id, pod).await?;
+    let (membership_store, record_store) = node.pod_stores(creator.id, pod)?;
+    let creation = creator
+        .keys
+        .creation([0x5a; 16], membership_store, record_store);
     write(
         node,
         creator,
@@ -123,8 +129,8 @@ async fn create(node: &SyncNode, creator: &Identity) -> Result<(PodId, PodTicket
 }
 
 /// The invite act for `newcomer` at its sequence 1, naming `inviter`'s
-/// `inviter_seq`, and the newcomer's first device statement, both written on
-/// the inviter's node as the join dialogue writes them.
+/// `inviter_seq`, its join statement naming `newcomer_device`, written on the
+/// inviter's node as the join dialogue writes it.
 async fn invite(
     node: &SyncNode,
     inviter: &Identity,
@@ -140,9 +146,10 @@ async fn invite(
         actor: inviter.id,
         actor_seq: Seq::new(inviter_seq),
     };
-    let join_statement = newcomer.keys.join_statement(&pod, Seq::new(1));
-    write(node, inviter, pod, key, join_statement.encode()).await?;
-    statement(node, inviter, pod, newcomer, 1, vec![newcomer_device]).await
+    let join_statement = newcomer
+        .keys
+        .join_statement(&pod, Seq::new(1), newcomer_device);
+    write(node, inviter, pod, key, join_statement.encode()).await
 }
 
 /// A session `from` opens with `to` on `namespace`, from the replica of

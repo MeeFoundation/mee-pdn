@@ -502,9 +502,12 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let creation = alice.keys.creation([0xa0; 16]);
-    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &alice.keys.public_key(), &[0xa0; 16]);
     alice_phone.create_pod(alice.id, pod).await?;
+    let (membership_store, record_store) = alice_phone.pod_stores(alice.id, pod)?;
+    let creation = alice
+        .keys
+        .creation([0xa0; 16], membership_store, record_store);
     write(
         &alice_phone,
         &alice,
@@ -576,9 +579,12 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let creation = alice.keys.creation([0xa1; 16]);
-    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &alice.keys.public_key(), &[0xa1; 16]);
     alice_phone.create_pod(alice.id, pod).await?;
+    let (membership_store, record_store) = alice_phone.pod_stores(alice.id, pod)?;
+    let creation = alice
+        .keys
+        .creation([0xa1; 16], membership_store, record_store);
     write(
         &alice_phone,
         &alice,

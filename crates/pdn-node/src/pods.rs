@@ -1,8 +1,9 @@
 //! The pods service: creating a pod for a hosted identity, listing its
 //! pods and their members, the invite and join dialogue on
 //! the pod-join ALPN — the inviter verifies and burns the secret before any
-//! state change, names the newcomer's sequence, writes its joined event and
-//! device statement, and only then hands over both stores' write tickets —
+//! state change, names the newcomer's sequence and sends the pod's created
+//! event, writes the joined event the newcomer signs, and only then hands
+//! over both stores' write tickets —
 //! the membership acts, and placing, editing and reading records. The join's
 //! refusals are uniform, as pairing's are. The stores underneath are the
 //! data layer's pod stores.
@@ -14,13 +15,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use data_layer::{
-    devices_verify, join_verifies, pdn_id_of, pod_id_of, pod_inviter_ticket_kind, pod_ticket_kind,
-    AcceptError, AddrInfoOptions, AuthorId, Connection, DevicesPayload, DocTicket, EndpointAddr,
-    EventKind, JoinedPayload, Member, MemberDevice, MembershipKey, MembershipView, OpId, Operation,
-    PodNotice, PodStore, PodTickets, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownEntry,
-    UnknownPod, ACT_PAYLOAD,
+    creates, devices_verify, join_verifies, pdn_id_of, pod_id_of, pod_inviter_ticket_kind,
+    pod_ticket_kind, AcceptError, AddrInfoOptions, AuthorId, Connection, CreatedPayload,
+    DevicesPayload, DocTicket, EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice,
+    MembershipKey, MembershipView, OpId, Operation, PodNotice, PodStore, PodTickets,
+    ProtocolHandler, RecordKey, Seq, SyncNode, UnknownEntry, UnknownPod, ACT_PAYLOAD,
 };
-use pdn_types::{NodeId, PdnId, PodId, RecordId, RecordKind, RecordRef};
+use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -88,9 +89,11 @@ pub struct UnsupportedPodInviteVersion {
     pub version: u8,
 }
 
-/// The dialogue reached the inviter and ended without the tickets.
-/// Reasonless by design, as [`crate::EstablishmentRefused`] is. Downcast from
-/// the `anyhow::Error` of `join`.
+/// The dialogue reached the inviter and ended without the tickets, or with
+/// an offer the joiner refuses: another pod's created event, a sequence past
+/// the joiner's own history, tickets to stores the created event does not
+/// name. Reasonless by design, as [`crate::EstablishmentRefused`] is.
+/// Downcast from the `anyhow::Error` of `join`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("join refused by the inviter")]
 pub struct JoinRefused;
@@ -193,27 +196,41 @@ struct JoinRequest {
     run: u64,
 }
 
+/// What a modified inviter sends in a join dialogue in place of the honest
+/// value, by [`Runtime::forge_next_join_for_test`].
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone, Copy)]
+pub enum ForgedJoin {
+    /// Offers this sequence, a joined event written there.
+    Seq(u64),
+    /// Offers the created event of this other pod the inviting identity holds.
+    CreationOf(PodId),
+    /// Hands over the tickets of this other pod the inviting identity holds.
+    TicketsOf(PodId),
+}
+
 /// Sent only after the verify-and-burn: the sequence of the joiner's chain
-/// its membership sits at — a fresh one when `write_joined` — and what its
-/// next device statement extends.
+/// its membership sits at — a fresh one when `write_joined` — and the pod's
+/// encoded created event, which binds the pod id to its two stores.
 #[derive(Debug, Serialize, Deserialize)]
 struct JoinOffer {
     seq: u64,
     write_joined: bool,
-    statement_version: u64,
-    devices: Vec<(NodeId, AuthorId)>,
+    creation: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JoinAcceptance {
-    /// The encoded join statement, signed over the offered sequence;
-    /// absent when the offer writes no joined event.
+    /// The encoded join statement, signed over the offered sequence and the
+    /// joining device; absent when the offer writes no joined event.
     join_statement: Option<Vec<u8>>,
-    /// The encoded device statement at the offered version.
-    device_statement: Vec<u8>,
+    /// When the offer writes no joined event, the joiner's encoded statement
+    /// at version 0 naming the joining device alone: a member's device no
+    /// statement lists is served by no member device.
+    device_statement: Option<Vec<u8>>,
 }
 
-/// Sent only after the joined event and the statement are written.
+/// Sent only after the joined event is written.
 #[derive(Debug, Serialize, Deserialize)]
 struct JoinTickets {
     membership: DocTicket,
@@ -350,10 +367,11 @@ impl PodsService for RuntimePodsService<'_> {
         SysRng
             .try_fill_bytes(&mut nonce)
             .context("operating-system randomness unavailable")?;
-        let creation = keys.creation(nonce);
-        let pod = pod_id_of(&identity, &creation.identity_key, &creation.nonce);
+        let pod = pod_id_of(&identity, &keys.public_key(), &nonce);
         let node = Arc::clone(&state.node);
         node.create_pod(identity, pod).await?;
+        let (membership_store, record_store) = node.pod_stores(identity, pod)?;
+        let creation = keys.creation(nonce, membership_store, record_store);
         let mut rollback = PodRollback::new(
             Arc::clone(&node),
             identity,
@@ -382,7 +400,7 @@ impl PodsService for RuntimePodsService<'_> {
                 pod,
                 PodStore::Membership,
                 &statement.to_bytes(),
-                &keys.device_statement(1, vec![device]).encode(),
+                &keys.device_statement(&pod, 1, vec![device]).encode(),
             )
             .await?;
             record_pod(&node, &hosted.pms, identity, pod, Seq::FIRST, None).await
@@ -790,7 +808,7 @@ async fn settle_departure(state: &State, identity: PdnId, pod: PodId, seq: Seq) 
 /// with this device added — when that list does not name this device with
 /// the author `identity` writes with here. Nothing while the identity key
 /// has not reached this device, or while a join of the pod is in
-/// flight here, its dialogue carrying a statement of its own.
+/// flight here, its join statement naming this device.
 async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
     if state.joining_in_flight.contains(&(identity, pod)) {
         return Ok(());
@@ -829,7 +847,7 @@ async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<(
             pod,
             PodStore::Membership,
             &key.to_bytes(),
-            &keys.device_statement(version, devices).encode(),
+            &keys.device_statement(&pod, version, devices).encode(),
         )
         .await
 }
@@ -975,32 +993,35 @@ async fn join_via_dialogue(
         identity_key: keys.public_key(),
         run: node.pod_chain_run(identity, invite.pod, identity).await?,
     };
+    let recorded = recorded_seq(state, identity, invite.pod).await?;
+    // No sequence past the joiner's own history: a statement over a later
+    // one would readmit the joiner at a leave it has yet to write.
+    let furthest = request.run.max(recorded).saturating_add(1);
     let device = MemberDevice {
         node: node.node_id(),
         author,
     };
     let accept = |offer: &JoinOffer| {
-        let join_statement = offer.write_joined.then(|| {
-            keys.join_statement(&invite.pod, Seq::new(offer.seq))
-                .encode()
-        });
-        let mut devices: Vec<MemberDevice> = offer
-            .devices
-            .iter()
-            .map(|(node, author)| MemberDevice {
-                node: *node,
-                author: *author,
-            })
-            .collect();
-        if !devices.contains(&device) {
-            devices.push(device);
+        let creation = CreatedPayload::decode(&offer.creation)?;
+        if !creates(&invite.pod, &creation) || offer.seq == 0 || offer.seq > furthest {
+            return None;
         }
-        JoinAcceptance {
-            join_statement,
-            device_statement: keys
-                .device_statement(offer.statement_version, devices)
-                .encode(),
-        }
+        Some(if offer.write_joined {
+            JoinAcceptance {
+                join_statement: Some(
+                    keys.join_statement(&invite.pod, Seq::new(offer.seq), device)
+                        .encode(),
+                ),
+                device_statement: None,
+            }
+        } else {
+            JoinAcceptance {
+                join_statement: None,
+                device_statement: Some(
+                    keys.device_statement(&invite.pod, 0, vec![device]).encode(),
+                ),
+            }
+        })
     };
     let dialogue = async {
         match &connection {
@@ -1026,6 +1047,13 @@ async fn join_via_dialogue(
         membership: tickets.membership,
         records: tickets.records,
     };
+    // The stores the created event names, and no others, are this pod's.
+    let creation = CreatedPayload::decode(&offer.creation).ok_or(JoinRefused)?;
+    if inviter.membership.capability.id() != creation.membership_store
+        || inviter.records.capability.id() != creation.record_store
+    {
+        return Err(JoinRefused.into());
+    }
     let caught_up = node.import_pod(identity, pod, inviter.clone()).await?;
     {
         let state = state.lock().await;
@@ -1073,13 +1101,22 @@ fn offered_seq(joined_at: Option<u64>, known_run: u64, joiner_run: u64) -> (u64,
     }
 }
 
+/// The highest sequence `identity`'s PMS records `pod` at, a tombstone's
+/// included; `0` for a pod it does not record.
+async fn recorded_seq(state: &Arc<Mutex<State>>, identity: PdnId, pod: PodId) -> Result<u64> {
+    let state = state.lock().await;
+    let record = state.hosted(identity)?.pms.pod_record(pod).await?;
+    Ok(record.map_or(0, |(seq, _held)| seq.get()))
+}
+
 /// The joiner's messages over any pair of streams: the request, the
 /// acceptance of the offer the inviter answers it with, and the tickets.
+/// An offer `accept` refuses closes the dialogue.
 async fn run_joiner<R, W>(
     send: &mut W,
     recv: &mut R,
     request: &JoinRequest,
-    accept: impl Fn(&JoinOffer) -> JoinAcceptance,
+    accept: impl Fn(&JoinOffer) -> Option<JoinAcceptance>,
 ) -> Result<(JoinOffer, JoinTickets)>
 where
     R: AsyncRead + Unpin,
@@ -1088,7 +1125,8 @@ where
     write_message(send, request).await?;
     // A refusal is just the stream closing.
     let offer: JoinOffer = read_message(recv).await.context(JoinRefused)?;
-    write_message(send, &accept(&offer)).await?;
+    let acceptance = accept(&offer).ok_or(JoinRefused)?;
+    write_message(send, &acceptance).await?;
     let tickets: JoinTickets = read_message(recv).await.context(JoinRefused)?;
     Ok((offer, tickets))
 }
@@ -1104,7 +1142,7 @@ const JOIN_PIPE_BYTES: usize = MAX_WIRE_MESSAGE_LEN as usize + 4;
 async fn join_in_process(
     state: &Arc<Mutex<State>>,
     request: &JoinRequest,
-    accept: impl Fn(&JoinOffer) -> JoinAcceptance,
+    accept: impl Fn(&JoinOffer) -> Option<JoinAcceptance>,
 ) -> Result<(JoinOffer, JoinTickets)> {
     let serving_halves = state.lock().await.serving_halves.clone();
     let permit = serving_halves.enter().await.ok_or(JoinRefused)?;
@@ -1132,9 +1170,10 @@ async fn join_in_process(
 
 /// The inviter's half, over any pair of streams: read the request, verify
 /// and burn the secret before any state change, offer the newcomer its
-/// sequence, write its joined event and device statement into the replica
-/// of the identity the secret was minted for, then hand over both tickets.
-/// `None` is a refusal, any reason at all.
+/// sequence and the pod's created event, write its joined event — or, for
+/// a member already, the statement listing a device no statement lists yet
+/// — into the replica of the identity the secret was minted for, then hand
+/// over both tickets. `None` is a refusal, any reason at all.
 #[allow(clippy::too_many_lines)] // one dialogue, each refusal beside the step it guards
 pub(crate) async fn serve_join<R, W>(
     state: &Arc<Mutex<State>>,
@@ -1159,6 +1198,8 @@ where
             .verify_and_burn(&request.secret, Instant::now())?;
         (Arc::clone(&state.node), identity, pod)
     };
+    #[cfg(feature = "test-util")]
+    let forged = state.lock().await.forged_join.take();
     let membership = node.pod_membership_view(identity, pod).await.ok()?;
     let inviter = membership.member(&identity)?;
     if !inviter.state.member {
@@ -1171,26 +1212,25 @@ where
         known.map_or(0, Member::run),
         request.run,
     );
-    let known_devices: Vec<MemberDevice> = known
-        .map(|member| member.devices.iter().copied().collect())
-        .unwrap_or_default();
-    let statement_version = known.map_or(0, |member| member.statement_version) + 1;
+    let creation = node.pod_creation(identity, pod).await.ok()??;
+    #[cfg(feature = "test-util")]
+    let (seq, write_joined, creation) = match forged {
+        Some(ForgedJoin::Seq(forged)) => (forged, true, creation),
+        Some(ForgedJoin::CreationOf(other)) => (
+            seq,
+            write_joined,
+            node.pod_creation(identity, other).await.ok()??,
+        ),
+        _ => (seq, write_joined, creation),
+    };
     let offer = JoinOffer {
         seq,
         write_joined,
-        statement_version,
-        devices: known_devices
-            .iter()
-            .map(|device| (device.node, device.author))
-            .collect(),
+        creation: creation.encode(),
     };
     write_message(send, &offer).await.ok()?;
     let acceptance: JoinAcceptance = read_message(recv).await.ok()?;
 
-    let statement = DevicesPayload::decode(&acceptance.device_statement)?;
-    if !devices_verify(&request.identity_key, statement_version, &statement) {
-        return None;
-    }
     if write_joined {
         let joined = JoinedPayload::decode(acceptance.join_statement.as_deref()?)?;
         if joined.identity_key != request.identity_key
@@ -1214,25 +1254,29 @@ where
         )
         .await
         .ok()?;
-    }
-    if !statement
-        .devices
-        .iter()
-        .all(|device| known_devices.contains(device))
-    {
-        let key = MembershipKey::Devices {
-            member: request.joiner,
-            version: statement_version,
+    } else {
+        let statement = DevicesPayload::decode(acceptance.device_statement.as_deref()?)?;
+        let [device] = statement.devices.as_slice() else {
+            return None;
         };
-        node.write_pod_entry(
-            identity,
-            pod,
-            PodStore::Membership,
-            &key.to_bytes(),
-            &statement.encode(),
-        )
-        .await
-        .ok()?;
+        if !devices_verify(&request.identity_key, &pod, &request.joiner, 0, &statement) {
+            return None;
+        }
+        if !known.is_some_and(|member| member.devices.contains(device)) {
+            let key = MembershipKey::Devices {
+                member: request.joiner,
+                version: 0,
+            };
+            node.write_pod_entry(
+                identity,
+                pod,
+                PodStore::Membership,
+                &key.to_bytes(),
+                &statement.encode(),
+            )
+            .await
+            .ok()?;
+        }
     }
     #[cfg(feature = "test-util")]
     if std::mem::take(&mut state.lock().await.drop_next_join_reply) {
@@ -1240,6 +1284,11 @@ where
     }
     // Written before the reply: a lost reply leaves the newcomer listed,
     // and a second invite hands the tickets over again.
+    #[cfg(feature = "test-util")]
+    let pod = match forged {
+        Some(ForgedJoin::TicketsOf(other)) => other,
+        _ => pod,
+    };
     let tickets = node
         .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
         .await

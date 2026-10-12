@@ -194,10 +194,14 @@ pub(crate) struct State {
     pub(crate) link_after_commit_pause: Option<Arc<CeremonyPause>>,
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_pending_device_write: bool,
-    /// Ends the next join dialogue's serving half once the joined event and
-    /// the statement are written, before the tickets go out: a reply lost.
+    /// Ends the next join dialogue's serving half once the joined event is
+    /// written, before the tickets go out: a reply lost.
     #[cfg(feature = "test-util")]
     pub(crate) drop_next_join_reply: bool,
+    /// What the next join dialogue's serving half sends in place of the
+    /// honest value, as a modified inviter would.
+    #[cfg(feature = "test-util")]
+    pub(crate) forged_join: Option<crate::pods::ForgedJoin>,
     /// A pause of the next join once both tickets and the PMS's entry
     /// are recorded, before its catch-up wait.
     #[cfg(feature = "test-util")]
@@ -264,6 +268,8 @@ impl State {
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
             drop_next_join_reply: false,
+            #[cfg(feature = "test-util")]
+            forged_join: None,
             #[cfg(feature = "test-util")]
             join_catch_up_pause: None,
             #[cfg(feature = "test-util")]
@@ -427,6 +433,13 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn drop_next_join_reply_for_test(&self) {
         self.state.lock().await.drop_next_join_reply = true;
+    }
+
+    /// The next join this runtime serves sends `forged` in place of the
+    /// honest value.
+    #[cfg(feature = "test-util")]
+    pub async fn forge_next_join_for_test(&self, forged: crate::pods::ForgedJoin) {
+        self.state.lock().await.forged_join = Some(forged);
     }
 
     /// The membership view of `identity`'s replica of `pod`'s membership

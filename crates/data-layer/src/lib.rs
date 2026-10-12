@@ -34,7 +34,9 @@ pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
-pub use identity_key::{devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair};
+pub use identity_key::{
+    creates, devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair,
+};
 #[cfg(feature = "test-util")]
 pub use node::{CollectionPause, PodSession, PodSessions, PodStartPause};
 #[cfg(feature = "test-util")]

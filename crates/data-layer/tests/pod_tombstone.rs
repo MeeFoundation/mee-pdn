@@ -695,6 +695,7 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
     let statement = bob
         .keys
         .device_statement(
+            &pod,
             2,
             vec![device_of(&bob_phone, &bob)?, device_of(&bob_laptop, &bob)?],
         )
@@ -716,7 +717,10 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    let join_statement = carol.keys.join_statement(&pod, Seq::new(3)).encode();
+    let join_statement = carol
+        .keys
+        .join_statement(&pod, Seq::new(3), device_of(&carol_phone, &carol)?)
+        .encode();
     write(&alice_phone, &alice, pod, rejoined, join_statement).await?;
     dial(
         &carol_phone,

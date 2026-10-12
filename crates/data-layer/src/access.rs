@@ -705,7 +705,7 @@ impl AccessBook {
             Some(blobs) => held_entries(membership, blobs).await?,
             None => Vec::new(),
         };
-        let view = MembershipView::new(&pod, &entries);
+        let view = MembershipView::new(&pod, &membership.id(), &entries);
         #[cfg(feature = "test-util")]
         self.report_pod_verdicts(pod, &entries, &view);
         Ok((view, entries))
