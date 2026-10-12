@@ -582,6 +582,11 @@ impl Store {
                 .remove((&namespace.to_bytes(), key, &author.to_bytes()))?;
             Ok(true)
         })
+        .inspect(|removed| {
+            if *removed {
+                self.wrote(namespace);
+            }
+        })
     }
 
     /// Get all content hashes of all replicas in the store.

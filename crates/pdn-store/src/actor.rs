@@ -187,8 +187,10 @@ enum ReplicaAction {
         reply: oneshot::Sender<Result<()>>,
     },
     SyncSessionStart {
+        /// Write counts to compare in the step that opens the snapshot.
+        read: Vec<(NamespaceId, u64)>,
         #[debug("reply")]
-        reply: oneshot::Sender<Result<(SyncSessionId, Arc<()>)>>,
+        reply: oneshot::Sender<Result<(SyncSessionId, Arc<()>, bool)>>,
     },
     SyncInitialMessage {
         session: SyncSessionId,
@@ -549,16 +551,31 @@ impl SyncHandle {
     /// before session setup. The returned handle owns the snapshot;
     /// dropping it releases the snapshot on any session exit path.
     pub async fn sync_session_start(&self, namespace: NamespaceId) -> Result<SyncSession> {
+        Ok(self
+            .sync_session_start_unless_written(namespace, Vec::new())
+            .await?
+            .0)
+    }
+
+    /// [`sync_session_start`](Self::sync_session_start), beside whether every
+    /// replica in `read` still has the write count it names when the
+    /// snapshot opens.
+    pub async fn sync_session_start_unless_written(
+        &self,
+        namespace: NamespaceId,
+        read: Vec<(NamespaceId, u64)>,
+    ) -> Result<(SyncSession, bool)> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::SyncSessionStart { reply };
+        let action = ReplicaAction::SyncSessionStart { read, reply };
         self.send_replica(namespace, action).await?;
-        let (id, alive) = rx.await??;
-        Ok(SyncSession {
+        let (id, alive, unwritten) = rx.await??;
+        let session = SyncSession {
             id,
             namespace,
             tx: self.tx.clone(),
             _alive: alive,
-        })
+        };
+        Ok((session, unwritten))
     }
 
     /// Register a session and abandon the reply, as a caller cancelled
@@ -566,7 +583,10 @@ impl SyncHandle {
     #[cfg(test)]
     pub(crate) async fn debug_abandon_session_start(&self, namespace: NamespaceId) -> Result<()> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::SyncSessionStart { reply };
+        let action = ReplicaAction::SyncSessionStart {
+            read: Vec::new(),
+            reply,
+        };
         self.send_replica(namespace, action).await?;
         drop(rx);
         Ok(())
@@ -1167,33 +1187,38 @@ impl Actor {
                 .await
             }
 
-            ReplicaAction::SyncSessionStart { reply } => send_reply_with(reply, self, |this| {
-                this.states.ensure_syncing(&namespace)?;
-                // Committing the pending write batch is part of the
-                // contract (`snapshot_owned` flushes): the snapshot holds
-                // every entry inserted before session setup.
-                let tables = this.store.snapshot_owned()?;
-                let id = this.next_session_id;
-                this.next_session_id += 1;
-                // The strong reference travels in the reply, so an
-                // undelivered one leaves the registration unreferenced and
-                // the tick reclaims it.
-                let alive = Arc::new(());
-                let id = SyncSessionId {
-                    actor: this.actor_id,
-                    seq: id,
-                };
-                this.sessions.insert(
-                    id,
-                    SessionSnapshot {
-                        namespace,
-                        tables,
-                        alive: Arc::downgrade(&alive),
-                    },
-                );
-                this.record_open_sessions();
-                Ok((id, alive))
-            }),
+            ReplicaAction::SyncSessionStart { read, reply } => {
+                send_reply_with(reply, self, |this| {
+                    this.states.ensure_syncing(&namespace)?;
+                    // Committing the pending write batch is part of the
+                    // contract (`snapshot_owned` flushes): the snapshot holds
+                    // every entry inserted before session setup.
+                    let tables = this.store.snapshot_owned()?;
+                    let id = this.next_session_id;
+                    this.next_session_id += 1;
+                    // The strong reference travels in the reply, so an
+                    // undelivered one leaves the registration unreferenced and
+                    // the tick reclaims it.
+                    let alive = Arc::new(());
+                    let id = SyncSessionId {
+                        actor: this.actor_id,
+                        seq: id,
+                    };
+                    this.sessions.insert(
+                        id,
+                        SessionSnapshot {
+                            namespace,
+                            tables,
+                            alive: Arc::downgrade(&alive),
+                        },
+                    );
+                    this.record_open_sessions();
+                    let unwritten = read
+                        .iter()
+                        .all(|(read, writes)| this.store.writes_of(*read) == *writes);
+                    Ok((id, alive, unwritten))
+                })
+            }
             ReplicaAction::SyncInitialMessage {
                 session,
                 filter,

@@ -303,6 +303,7 @@ impl PeerState {
             SyncState::Idle => AcceptOutcome::Allow {
                 filter: None,
                 ingest: None,
+                recheck: None,
             },
             SyncState::Running { origin, .. } => match origin {
                 Origin::Accept => AcceptOutcome::Reject(AbortReason::AlreadySyncing),
@@ -314,6 +315,7 @@ impl PeerState {
                         SyncDirection::Accept => AcceptOutcome::Allow {
                             filter: None,
                             ingest: None,
+                            recheck: None,
                         },
                         SyncDirection::Connect => {
                             AcceptOutcome::Reject(AbortReason::AlreadySyncing)

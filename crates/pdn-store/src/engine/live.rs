@@ -1646,12 +1646,28 @@ impl LiveActor {
                     crate::filter::SessionRole::Accept,
                 )
                 .await;
-                let (egress, ingest) = match admitted {
-                    crate::filter::SessionAccess::Allow { egress, ingest } => (egress, ingest),
+                let (egress, ingest, rests_on) = match admitted {
+                    crate::filter::SessionAccess::Allow {
+                        egress,
+                        ingest,
+                        rests_on,
+                    } => (egress, ingest, rests_on),
                     // The one uniform refusal.
                     crate::filter::SessionAccess::Deny => {
                         return AcceptOutcome::Reject(AbortReason::NotFound)
                     }
+                };
+                let recheck = crate::net::Recheck {
+                    rests_on,
+                    ask: Arc::new(move || {
+                        session_access(
+                            namespace,
+                            identity,
+                            caller,
+                            peer,
+                            crate::filter::SessionRole::Accept,
+                        )
+                    }),
                 };
                 let (reply_tx, reply_rx) = oneshot::channel();
                 to_actor_tx
@@ -1667,6 +1683,7 @@ impl LiveActor {
                     Ok(AcceptOutcome::Allow { .. }) => AcceptOutcome::Allow {
                         filter: egress,
                         ingest,
+                        recheck: Some(recheck),
                     },
                     Ok(reject) => reject,
                     Err(err) => {

@@ -15,8 +15,8 @@ use std::{
 use anyhow::{Context, Result};
 use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice, MemberState,
-    MembershipKey, PodStore, PrivateMetadataStore, Seq, SessionTrace, ShareMode, SpawnOptions,
-    SyncNode, Traced,
+    MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace, ShareMode,
+    SpawnOptions, SyncNode, Traced,
 };
 use pdn_types::PodId;
 use test_utils::{
@@ -189,18 +189,21 @@ fn sessions_with(
         .collect()
 }
 
-/// A member device's dial whose access was decided while a member was still
-/// one, and whose session reaches that member's device only after its
-/// removal and a record placed after it, takes the record to it nowhere.
-///
-/// The dial is held between its access decision and its connect, where a
-/// connect to a device that is down waits; the removed member's device stays
-/// out of both swarms, so its own view still lists it a member when the
-/// session arrives, as a device that was offline throughout does. The
-/// nodes settle first: a dial of that device's crossing the held one would
-/// supersede it by the tie-break.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_dial_decided_before_a_removal_takes_nothing_placed_after_it() -> Result<()> {
+/// Alice's pod with Bob and Carol, Carol's device out of both swarms, so its
+/// own view still lists her a member when a session arrives, as a device
+/// offline throughout does, and every node settled: a dial of Carol's
+/// device's crossing a held session would supersede it by the tie-break.
+struct StaleMember {
+    alice_phone: SyncNode,
+    bob_phone: SyncNode,
+    carol_phone: SyncNode,
+    alice: Person,
+    carol: Person,
+    pod: PodId,
+    records: NamespaceId,
+}
+
+async fn stale_member() -> Result<StaleMember> {
     let (alice_phone, bob_phone, carol_phone) =
         (node(QUIET).await?, node(QUIET).await?, node(QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
@@ -228,8 +231,35 @@ async fn a_dial_decided_before_a_removal_takes_nothing_placed_after_it() -> Resu
             .leave_swarm_for_test(carol.id, namespace)
             .await?;
     }
-
     assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    Ok(StaleMember {
+        alice_phone,
+        bob_phone,
+        carol_phone,
+        alice,
+        carol,
+        pod,
+        records,
+    })
+}
+
+/// A member device's dial whose access was decided while a member was still
+/// one, and whose session reaches that member's device only after its
+/// removal and a record placed after it, takes the record to it nowhere.
+///
+/// The dial is held right after its access decision, as long as a connect
+/// to a device that is down would hold a decision taken before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_decided_before_a_removal_takes_nothing_placed_after_it() -> Result<()> {
+    let StaleMember {
+        alice_phone,
+        bob_phone,
+        carol_phone,
+        alice,
+        carol,
+        pod,
+        records,
+    } = stale_member().await?;
     let mut accepted = carol_phone
         .watch_pod_sessions(carol.id, pod, PodStore::Records)
         .await?;
@@ -252,6 +282,57 @@ async fn a_dial_decided_before_a_removal_takes_nothing_placed_after_it() -> Resu
         .next_with(alice_phone.node_id(), false, TIMEOUT)
         .await?
         .context("the held dial's session never reached the device")?;
+
+    let held = held_records(&carol_phone, carol.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the removed member's device holds records: {held:#?}"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A session a removed member's device dials, accepted on a decision taken
+/// before the removal, takes nothing placed after the removal to it.
+///
+/// The accept is held right after its access decision, as long as the
+/// engine's queues on a loaded node would hold it before its snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accept_decided_before_a_removal_takes_nothing_placed_after_it() -> Result<()> {
+    let StaleMember {
+        alice_phone,
+        bob_phone,
+        carol_phone,
+        alice,
+        carol,
+        pod,
+        records,
+    } = stale_member().await?;
+    let mut dialed = carol_phone
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
+        .await?;
+    let held_accept =
+        alice_phone.pause_next_accept_for_test(alice.id, records, carol_phone.node_id())?;
+    dial(
+        &carol_phone,
+        &carol,
+        pod,
+        PodStore::Records,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    held_accept.reached.notified().await;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
+    place_claim(&alice_phone, &alice, pod, 1).await?;
+    held_accept.release.notify_one();
+    dialed
+        .next_with(alice_phone.node_id(), true, TIMEOUT)
+        .await?
+        .context("the held session never ended on the device")?;
 
     let held = held_records(&carol_phone, carol.id, pod).await?;
     assert!(

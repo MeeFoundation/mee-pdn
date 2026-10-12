@@ -15,7 +15,7 @@ use std::{
 use anyhow::Result;
 use iroh_blobs::Hash;
 use pdn_store::{
-    api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, SessionAccess,
+    api::Doc, store::Query, AuthorId, EntryFilter, Identity, NamespaceId, RestsOn, SessionAccess,
     SessionIngest, SessionRole, ValidateOutcome,
 };
 use pdn_types::{ClaimId, NodeId, PdnId, PodId};
@@ -119,6 +119,9 @@ pub(crate) struct AccessBook {
     connections: RwLock<Vec<HostedConnection>>,
     /// Set right after the stack spawns, before any session can arrive.
     blobs: OnceLock<iroh_blobs::api::Store>,
+    /// Set once the stack spawns, before the identity is hosted; what an
+    /// accept decision rests on is read through it.
+    sync: OnceLock<pdn_store::actor::SyncHandle>,
     /// Decoded grant records keyed by replica, validated by content hash: a
     /// republish or withdrawal changes the hash and misses. A payload not
     /// yet replicated is never cached, so it is re-checked every session.
@@ -131,10 +134,11 @@ pub(crate) struct AccessBook {
     pod_verdicts: OnceLock<PodVerdictSink>,
     #[cfg(feature = "test-util")]
     session_traces: OnceLock<SessionTraceSink>,
-    /// Holds this identity's next dial on one namespace to one peer once its
-    /// access is decided, before the decision returns to the engine.
+    /// Holds this identity's next session in one role on one namespace with
+    /// one peer once its access is decided, before the decision returns to
+    /// the engine.
     #[cfg(feature = "test-util")]
-    dial_pause: std::sync::Mutex<Option<(NamespaceId, NodeId, Arc<DialPause>)>>,
+    session_pause: std::sync::Mutex<Option<SessionPauseSlot>>,
     /// Refuses every pod session this identity is asked to serve, as a
     /// device out of reach answers none.
     #[cfg(feature = "test-util")]
@@ -157,11 +161,15 @@ pub(crate) type PodVerdictSink =
 pub(crate) type SessionTraceSink =
     Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SessionTrace>>>>;
 
+#[cfg(feature = "test-util")]
+type SessionPauseSlot = (NamespaceId, NodeId, SessionRole, Arc<SessionPause>);
+
 /// The hold [`SyncNode::pause_next_dial_for_test`](crate::SyncNode::pause_next_dial_for_test)
-/// puts on a dial: `reached` once its access is decided.
+/// and [`SyncNode::pause_next_accept_for_test`](crate::SyncNode::pause_next_accept_for_test)
+/// put on a session: `reached` once its access is decided.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Default)]
-pub struct DialPause {
+pub struct SessionPause {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
 }
@@ -203,6 +211,7 @@ impl AccessBook {
             pms: RwLock::new(None),
             connections: RwLock::new(Vec::new()),
             blobs: OnceLock::new(),
+            sync: OnceLock::new(),
             grant_cache: RwLock::new(HashMap::new()),
             retractions: Arc::default(),
             #[cfg(feature = "test-util")]
@@ -210,7 +219,7 @@ impl AccessBook {
             #[cfg(feature = "test-util")]
             session_traces: OnceLock::new(),
             #[cfg(feature = "test-util")]
-            dial_pause: std::sync::Mutex::default(),
+            session_pause: std::sync::Mutex::default(),
             #[cfg(feature = "test-util")]
             refuse_pods: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
@@ -232,6 +241,10 @@ impl AccessBook {
 
     pub(crate) fn set_blobs(&self, blobs: iroh_blobs::api::Store) {
         let _ = self.blobs.set(blobs);
+    }
+
+    pub(crate) fn set_sync(&self, sync: pdn_store::actor::SyncHandle) {
+        let _ = self.sync.set(sync);
     }
 
     pub(crate) fn arm_pms(&self, pms: Doc) -> Result<()> {
@@ -286,6 +299,13 @@ impl AccessBook {
             SessionRole::Accept => acting,
             SessionRole::Dial => addressed,
         };
+        // A dial decides once its snapshot is open, so only an accept
+        // records what its decision reads; every decision below rests on
+        // nothing until `resting_on` names it here.
+        let read = match role {
+            SessionRole::Accept => Some(self.decision_reads(&registry, namespace, remote).await),
+            SessionRole::Dial => None,
+        };
         let access = match self
             .try_classify(registry, namespace, remote, peer, role)
             .await
@@ -293,37 +313,91 @@ impl AccessBook {
             Ok(access) => access,
             Err(_storage_error) => SessionAccess::Deny,
         };
+        let access = match read {
+            Some(read) => resting_on(access, read),
+            None => access,
+        };
         #[cfg(feature = "test-util")]
-        self.hold_dial(namespace, peer, role).await;
+        self.hold_session(namespace, peer, role).await;
         #[cfg(feature = "test-util")]
         let access = self.traced(access, namespace, remote, peer, role);
         access
     }
 
     #[cfg(feature = "test-util")]
-    pub(crate) fn pause_next_dial(&self, namespace: NamespaceId, peer: NodeId) -> Arc<DialPause> {
-        let pause = Arc::new(DialPause::default());
-        if let Ok(mut slot) = self.dial_pause.lock() {
-            *slot = Some((namespace, peer, Arc::clone(&pause)));
+    pub(crate) fn pause_next_session(
+        &self,
+        namespace: NamespaceId,
+        peer: NodeId,
+        role: SessionRole,
+    ) -> Arc<SessionPause> {
+        let pause = Arc::new(SessionPause::default());
+        if let Ok(mut slot) = self.session_pause.lock() {
+            *slot = Some((namespace, peer, role, Arc::clone(&pause)));
         }
         pause
     }
 
     #[cfg(feature = "test-util")]
-    async fn hold_dial(&self, namespace: NamespaceId, peer: NodeId, role: SessionRole) {
-        if !matches!(role, SessionRole::Dial) {
-            return;
-        }
-        let pause = self.dial_pause.lock().ok().and_then(|mut slot| {
-            let held = slot
-                .as_ref()
-                .is_some_and(|(paused, to, _)| *paused == namespace && *to == peer);
+    async fn hold_session(&self, namespace: NamespaceId, peer: NodeId, role: SessionRole) {
+        let pause = self.session_pause.lock().ok().and_then(|mut slot| {
+            let held = slot.as_ref().is_some_and(|(paused, with, in_role, _)| {
+                *paused == namespace && *with == peer && *in_role == role
+            });
             held.then(|| slot.take()).flatten()
         });
-        if let Some((_namespace, _peer, pause)) = pause {
+        if let Some((_namespace, _peer, _role, pause)) = pause {
             pause.reached.notify_one();
             pause.release.notified().await;
         }
+    }
+
+    /// The write counts of the replicas a decision on `namespace` for
+    /// `remote` reads, read before the decision reads them.
+    async fn decision_reads(
+        &self,
+        registry: &Registry,
+        namespace: NamespaceId,
+        remote: Identity,
+    ) -> RestsOn {
+        let (Ok(replicas), Some(sync)) = (
+            self.decision_replicas(registry, namespace, remote),
+            self.sync.get(),
+        ) else {
+            return RestsOn::Unknown;
+        };
+        let mut read = Vec::with_capacity(replicas.len());
+        for replica in replicas {
+            let Ok(writes) = sync.writes(replica).await else {
+                return RestsOn::Unknown;
+            };
+            read.push((replica, writes));
+        }
+        RestsOn::Writes(read)
+    }
+
+    /// The PMS and a pod's membership store, or the PMS and a connection's
+    /// two halves; nothing for a replica its ticket alone bounds.
+    fn decision_replicas(
+        &self,
+        registry: &Registry,
+        namespace: NamespaceId,
+        remote: Identity,
+    ) -> Result<Vec<NamespaceId>> {
+        let pms = self.own_pms()?.map(|pms| pms.id());
+        if let Some((pod, _store)) = registry.pod_of(namespace)? {
+            let membership = registry.pod(pod)?.map(|held| held.membership.id());
+            return Ok(pms.into_iter().chain(membership).collect());
+        }
+        let connection = match registry.binding_of(namespace)? {
+            Some((_issuer, ServingPosture::Serve)) => self.connection_with(remote)?,
+            Some((issuer, ServingPosture::AudienceDevices)) => self.connection_with_peer(issuer)?,
+            None => return Ok(Vec::new()),
+        };
+        let halves = connection
+            .into_iter()
+            .flat_map(|connection| [connection.own.id(), connection.peer_doc.id()]);
+        Ok(pms.into_iter().chain(halves).collect())
     }
 
     /// `access` as decided, reporting the decision and every entry its
@@ -361,7 +435,11 @@ impl AccessBook {
                 report(Traced::Denied);
                 SessionAccess::Deny
             }
-            SessionAccess::Allow { egress, ingest } => {
+            SessionAccess::Allow {
+                egress,
+                ingest,
+                rests_on,
+            } => {
                 report(if egress.is_some() {
                     Traced::AllowedFiltered
                 } else {
@@ -379,7 +457,11 @@ impl AccessBook {
                         outcome
                     })
                 });
-                SessionAccess::Allow { egress, ingest }
+                SessionAccess::Allow {
+                    egress,
+                    ingest,
+                    rests_on,
+                }
             }
         }
     }
@@ -447,6 +529,7 @@ impl AccessBook {
             SessionRole::Dial => SessionAccess::Allow {
                 egress: Some(closed_egress()),
                 ingest: Some(self.ingest(&registry, WriteAdmission::Nothing)),
+                rests_on: RestsOn::Nothing,
             },
             SessionRole::Accept => SessionAccess::Deny,
         };
@@ -479,6 +562,7 @@ impl AccessBook {
             return Ok(SessionAccess::Allow {
                 egress: None,
                 ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+                rests_on: RestsOn::Nothing,
             });
         }
         let Some(connection) = self.connection_with(remote)? else {
@@ -504,6 +588,7 @@ impl AccessBook {
         Ok(SessionAccess::Allow {
             egress: Some(egress_filter(issuer, rights.read)),
             ingest: Some(self.ingest(registry, WriteAdmission::Claims(rights.write))),
+            rests_on: RestsOn::Nothing,
         })
     }
 
@@ -532,6 +617,7 @@ impl AccessBook {
             return Ok(SessionAccess::Allow {
                 egress: None,
                 ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+                rests_on: RestsOn::Nothing,
             });
         }
         if remote != identity_of(self.identity) || !self.peer_is_own_device(peer_key).await? {
@@ -555,6 +641,7 @@ impl AccessBook {
         Ok(SessionAccess::Allow {
             egress: Some(egress_filter(issuer, rights.read)),
             ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+            rests_on: RestsOn::Nothing,
         })
     }
 
@@ -579,6 +666,7 @@ impl AccessBook {
             SessionRole::Dial => SessionAccess::Allow {
                 egress: Some(closed_egress()),
                 ingest: Some(self.ingest(registry, WriteAdmission::Nothing)),
+                rests_on: RestsOn::Nothing,
             },
             SessionRole::Accept => SessionAccess::Deny,
         };
@@ -646,6 +734,15 @@ impl AccessBook {
         peer: NodeId,
     ) -> Result<Option<SessionAccess>> {
         let (view, entries) = self.membership_view_and_entries(pod, membership).await?;
+        // A payload arriving moves the membership view and no write count.
+        let unread = entries.iter().any(|entry| entry.payload.is_none());
+        let rested = |access: SessionAccess| {
+            if unread {
+                resting_on(access, RestsOn::Unknown)
+            } else {
+                access
+            }
+        };
         let Some(member) = view.member(&caller) else {
             return Ok(None);
         };
@@ -654,7 +751,7 @@ impl AccessBook {
         }
         let (departure, rejoin) = if member.state.member {
             match departure_past(&view, &entries, &self.identity) {
-                None => return Ok(Some(self.whole(registry))),
+                None => return Ok(Some(rested(self.whole(registry)))),
                 Some(own) => {
                     let rejoin = Some((self.identity, own.seq));
                     (own, rejoin)
@@ -671,7 +768,7 @@ impl AccessBook {
         }
         let past = Arc::new(departure.past);
         let served = Arc::clone(&past);
-        Ok(Some(SessionAccess::Allow {
+        Ok(Some(rested(SessionAccess::Allow {
             egress: Some(Arc::new(move |entry: &pdn_store::SignedEntry| {
                 served.contains(&(entry.key().to_vec(), entry.author()))
             })),
@@ -682,13 +779,15 @@ impl AccessBook {
                     rejoin,
                 },
             )),
-        }))
+            rests_on: RestsOn::Nothing,
+        })))
     }
 
     fn whole(&self, registry: &Arc<Registry>) -> SessionAccess {
         SessionAccess::Allow {
             egress: None,
             ingest: Some(self.ingest(registry, WriteAdmission::Whole)),
+            rests_on: RestsOn::Nothing,
         }
     }
 
@@ -1144,6 +1243,27 @@ fn retraction_names(
 async fn device_listed(doc: &Doc, device_key: &[u8]) -> Result<bool> {
     let query = Query::single_latest_per_key().key_exact(device_key);
     Ok(doc.get_one(query).await?.is_some())
+}
+
+/// `access` resting on `read`, unless it rests on something no write count
+/// shows.
+fn resting_on(access: SessionAccess, read: RestsOn) -> SessionAccess {
+    match access {
+        SessionAccess::Allow {
+            egress,
+            ingest,
+            rests_on,
+        } => SessionAccess::Allow {
+            egress,
+            ingest,
+            rests_on: if rests_on == RestsOn::Unknown {
+                rests_on
+            } else {
+                read
+            },
+        },
+        SessionAccess::Deny => SessionAccess::Deny,
+    }
 }
 
 /// Dial-side stance toward callers a scoped identity cannot resolve: serve

@@ -781,6 +781,7 @@ impl SyncNode {
             )
             .await
             .map_err(|err| annotate_store_error(err, &self.storage))?;
+        access.set_sync(docs.engine().sync.clone());
         let api = docs.api().clone();
         let author = api.author_default().await?;
         self.retraction.track_author(identity, author);
@@ -1565,18 +1566,37 @@ impl SyncNode {
     }
 
     /// Holds `identity`'s next dial on `namespace` to `peer` once its access
-    /// is decided, before the engine connects, until `release` is notified.
+    /// is decided, before the decision returns to the engine, until
+    /// `release` is notified.
     #[cfg(feature = "test-util")]
     pub fn pause_next_dial_for_test(
         &self,
         identity: PdnId,
         namespace: NamespaceId,
         peer: NodeId,
-    ) -> Result<Arc<crate::access::DialPause>> {
-        Ok(self
-            .require(identity)?
-            .access
-            .pause_next_dial(namespace, peer))
+    ) -> Result<Arc<crate::access::SessionPause>> {
+        Ok(self.require(identity)?.access.pause_next_session(
+            namespace,
+            peer,
+            pdn_store::SessionRole::Dial,
+        ))
+    }
+
+    /// Holds the next session `identity` accepts on `namespace` from `peer`
+    /// once its access is decided, before the decision returns to the
+    /// engine, until `release` is notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_accept_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        peer: NodeId,
+    ) -> Result<Arc<crate::access::SessionPause>> {
+        Ok(self.require(identity)?.access.pause_next_session(
+            namespace,
+            peer,
+            pdn_store::SessionRole::Accept,
+        ))
     }
 
     /// Holds the next blob collection run once every hosted identity's

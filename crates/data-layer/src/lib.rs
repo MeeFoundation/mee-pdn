@@ -29,7 +29,7 @@ mod retraction;
 
 pub use access::identity_of;
 #[cfg(feature = "test-util")]
-pub use access::{DialPause, SessionTrace, Traced};
+pub use access::{SessionPause, SessionTrace, Traced};
 pub use connection_metadata::{
     own_ticket_kind, peer_ticket_kind, ConnectionMetadata, ConnectionMetadataStore, GrantRead,
 };

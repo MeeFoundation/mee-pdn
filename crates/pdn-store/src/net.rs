@@ -1,6 +1,6 @@
 //! Network implementation of the iroh-docs protocol
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use n0_future::time::{self, Duration, Instant};
@@ -224,18 +224,44 @@ pub enum AcceptOutcome {
         /// what the peer offers. `None` leaves that to the consumer's
         /// validator.
         ingest: Option<crate::filter::SessionIngest>,
+        /// Checked once the session's snapshot is open; `None` holds for
+        /// any snapshot.
+        recheck: Option<Recheck>,
     },
     /// Decline the sync request
     Reject(AbortReason),
 }
 
+/// The access decision behind an accepted session: the snapshot opens after
+/// it, so a decision whose replicas were written in between is asked again.
+#[derive(Clone)]
+pub struct Recheck {
+    /// What the decision was read from.
+    pub rests_on: crate::filter::RestsOn,
+    /// Asks for the decision again; its answer stands.
+    pub ask: Arc<dyn Fn() -> crate::filter::SessionAccessFuture + Send + Sync>,
+}
+
+impl std::fmt::Debug for Recheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recheck")
+            .field("rests_on", &self.rests_on)
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for AcceptOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcceptOutcome::Allow { filter, ingest } => f
+            AcceptOutcome::Allow {
+                filter,
+                ingest,
+                recheck,
+            } => f
                 .debug_struct("Allow")
                 .field("filter", &filter.as_ref().map(|_| "filtered"))
                 .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .field("recheck", recheck)
                 .finish(),
             AcceptOutcome::Reject(reason) => write!(f, "Reject({reason:?})"),
         }
