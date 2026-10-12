@@ -77,7 +77,12 @@ pub async fn statement(
 /// `creator`'s pod on `node`: both stores, the created event and the
 /// creator's first device statement.
 pub async fn create(node: &SyncNode, creator: &Person) -> Result<PodId> {
-    let creation = creator.keys.creation([0x5a; 16]);
+    create_at(node, creator, [0x5a; 16]).await
+}
+
+/// [`create`] under `nonce`: one creator's pods differ by nonce alone.
+pub async fn create_at(node: &SyncNode, creator: &Person, nonce: [u8; 16]) -> Result<PodId> {
+    let creation = creator.keys.creation(nonce);
     let pod = data_layer::pod_id_of(&creator.id, &creation.identity_key, &creation.nonce);
     node.create_pod(creator.id, pod).await?;
     write(

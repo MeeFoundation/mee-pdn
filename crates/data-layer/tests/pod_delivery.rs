@@ -18,8 +18,8 @@ use pdn_types::{NodeId, PodId};
 use test_utils::{
     eventually, join_identity,
     pod::{
-        create, device_of, held_records, host, invite, lists, lists_device, lists_nobody,
-        place_claim, reads, state_on, statement, tickets, write, Person,
+        create, create_at, device_of, held_records, host, invite, lists, lists_device,
+        lists_nobody, place_claim, reads, state_on, statement, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
 };
@@ -1413,6 +1413,63 @@ async fn a_membership_event_with_no_record_written_opens_both_of_a_pods_sessions
     assert!(reads(&tablet, dave.id, pod, claim).await?);
 
     for node in [erin_phone, tablet] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Two members on two nodes keep live delivery over 60 shared pods, 120
+/// swarm topics, past the 100 unidirectional streams a connection carries by
+/// the transport's default: a claim in the first and in the last pod reaches
+/// the other node either way, and after a burst of writes the writer's node
+/// still creates a pod.
+///
+/// Both passes are out of reach, so a claim arrives through the swarm alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_sharing_sixty_pods_keep_live_delivery_in_each() -> Result<()> {
+    const SHARED: u8 = 60;
+    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let mut pods = Vec::new();
+    for n in 0..SHARED {
+        let pod = create_at(&alice_phone, &alice, [n; 16]).await?;
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            &bob,
+            vec![device_of(&bob_phone, &bob)?],
+        )
+        .await?;
+        bob_phone
+            .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+            .await?;
+        pods.push(pod);
+    }
+
+    let ends = [pods.first().copied(), pods.last().copied()];
+    for pod in ends.into_iter().flatten() {
+        let from_alice = place_claim(&alice_phone, &alice, pod, 1).await?;
+        let from_bob = place_claim(&bob_phone, &bob, pod, 2).await?;
+        assert!(
+            reads(&bob_phone, bob.id, pod, from_alice).await?,
+            "Alice's claim did not reach Bob's node over the swarm"
+        );
+        assert!(
+            reads(&alice_phone, alice.id, pod, from_bob).await?,
+            "Bob's claim did not reach Alice's node over the swarm"
+        );
+    }
+    let last = pods.last().copied().expect("sixty pods");
+    for seed in 3..=202 {
+        place_claim(&bob_phone, &bob, last, seed).await?;
+    }
+    tokio::time::timeout(TIMEOUT, create_at(&bob_phone, &bob, [0xff; 16]))
+        .await
+        .map_err(|_| anyhow::anyhow!("the node stopped answering after a burst of writes"))??;
+
+    for node in [alice_phone, bob_phone] {
         node.shutdown().await?;
     }
     Ok(())

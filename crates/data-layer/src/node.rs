@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use futures_lite::{FutureExt, StreamExt};
 use iroh::{
-    endpoint::{default_relay_mode, presets, Connection},
+    endpoint::{default_relay_mode, presets, Connection, QuicTransportConfig, VarInt},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
@@ -150,6 +150,16 @@ const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Default of [`SpawnOptions::pod_change_settle`].
 const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
+
+/// Unidirectional streams a peer holds open on one connection. Gossip keeps
+/// one per swarm topic two nodes share, a pod's stores are two, and a sender
+/// past the count sends that peer nothing on any topic.
+const MAX_UNI_STREAMS: u32 = 4_096;
+
+/// What one connection buffers across its streams: the 199 streams times
+/// 1,250,000 bytes the transport's defaults allowed, so the larger stream
+/// count gives a caller no more memory.
+const CONNECTION_RECEIVE_WINDOW: u32 = 248_750_000;
 
 /// Chosen by name at spawn, with no default. Not read from the process
 /// environment: several nodes spawn in one process, and a directory belongs
@@ -3414,6 +3424,12 @@ async fn bind_endpoint(
         }
         Connectivity::RelaysAndAddressLookup => Endpoint::builder(presets::N0),
     };
+    let builder = builder.transport_config(
+        QuicTransportConfig::builder()
+            .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+            .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+            .build(),
+    );
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,
