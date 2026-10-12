@@ -129,6 +129,8 @@ pub(crate) struct AccessBook {
     retractions: Arc<RwLock<HashMap<NamespaceId, ArmedRetractions>>>,
     #[cfg(feature = "test-util")]
     pod_verdicts: OnceLock<PodVerdictSink>,
+    #[cfg(feature = "test-util")]
+    session_traces: OnceLock<SessionTraceSink>,
     /// Refuses every pod session this identity is asked to serve, as a
     /// device out of reach answers none.
     #[cfg(feature = "test-util")]
@@ -145,6 +147,42 @@ pub(crate) struct AccessBook {
 pub(crate) type PodVerdictSink =
     Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::pod::PodVerdicts>>>>;
 
+/// Where each session decision and each entry a session admits go once a
+/// scenario takes the channel.
+#[cfg(feature = "test-util")]
+pub(crate) type SessionTraceSink =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SessionTrace>>>>;
+
+/// One session decision of one identity's book, or one entry that
+/// session's ingest admitted; `at` orders the traces of several nodes of
+/// one process.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone)]
+pub struct SessionTrace {
+    pub at: std::time::Instant,
+    pub identity: PdnId,
+    pub namespace: NamespaceId,
+    pub role: SessionRole,
+    /// The party across the session, as the book judged it.
+    pub remote: Identity,
+    pub peer: NodeId,
+    pub traced: Traced,
+}
+
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone)]
+pub enum Traced {
+    Denied,
+    /// Allowed, this side's egress whole.
+    AllowedWhole,
+    /// Allowed, this side's egress narrowed — over a past, or closed.
+    AllowedFiltered,
+    Admitted {
+        key: Vec<u8>,
+        author: AuthorId,
+    },
+}
+
 impl AccessBook {
     pub(crate) fn new(identity: PdnId) -> Self {
         Self {
@@ -156,6 +194,8 @@ impl AccessBook {
             retractions: Arc::default(),
             #[cfg(feature = "test-util")]
             pod_verdicts: OnceLock::new(),
+            #[cfg(feature = "test-util")]
+            session_traces: OnceLock::new(),
             #[cfg(feature = "test-util")]
             refuse_pods: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
@@ -231,13 +271,79 @@ impl AccessBook {
             SessionRole::Accept => acting,
             SessionRole::Dial => addressed,
         };
-        match self
+        let access = match self
             .try_classify(registry, namespace, remote, peer, role)
             .await
         {
             Ok(access) => access,
             Err(_storage_error) => SessionAccess::Deny,
+        };
+        #[cfg(feature = "test-util")]
+        let access = self.traced(access, namespace, remote, peer, role);
+        access
+    }
+
+    /// `access` as decided, reporting the decision and every entry its
+    /// ingest admits once a scenario takes the channel.
+    #[cfg(feature = "test-util")]
+    fn traced(
+        &self,
+        access: SessionAccess,
+        namespace: NamespaceId,
+        remote: Identity,
+        peer: NodeId,
+        role: SessionRole,
+    ) -> SessionAccess {
+        let sender = self
+            .session_traces
+            .get()
+            .and_then(|sink| sink.lock().ok().and_then(|sender| sender.clone()));
+        let Some(sender) = sender else {
+            return access;
+        };
+        let identity = self.identity;
+        let report = move |traced: Traced| {
+            let _ = sender.send(SessionTrace {
+                at: std::time::Instant::now(),
+                identity,
+                namespace,
+                role,
+                remote,
+                peer,
+                traced,
+            });
+        };
+        match access {
+            SessionAccess::Deny => {
+                report(Traced::Denied);
+                SessionAccess::Deny
+            }
+            SessionAccess::Allow { egress, ingest } => {
+                report(if egress.is_some() {
+                    Traced::AllowedFiltered
+                } else {
+                    Traced::AllowedWhole
+                });
+                let ingest = ingest.map(|ingest| -> SessionIngest {
+                    Arc::new(move |entry: &pdn_store::SignedEntry| {
+                        let outcome = ingest(entry);
+                        if matches!(outcome, ValidateOutcome::Accept) {
+                            report(Traced::Admitted {
+                                key: entry.id().key().to_vec(),
+                                author: entry.author(),
+                            });
+                        }
+                        outcome
+                    })
+                });
+                SessionAccess::Allow { egress, ingest }
+            }
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_session_traces(&self, sink: SessionTraceSink) {
+        let _ = self.session_traces.set(sink);
     }
 
     async fn try_classify(

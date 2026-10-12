@@ -293,6 +293,9 @@ pub struct SyncNode {
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
     pod_verdicts: crate::access::PodVerdictSink,
+    /// Handed to every hosted identity's book like `pod_verdicts`.
+    #[cfg(feature = "test-util")]
+    session_traces: crate::access::SessionTraceSink,
     /// Blob collection runs once set: at spawn on memory, at the host's
     /// [`start_blob_collection`](Self::start_blob_collection) on a
     /// directory.
@@ -696,6 +699,8 @@ impl SyncNode {
             #[cfg(feature = "test-util")]
             pod_verdicts: Arc::default(),
             #[cfg(feature = "test-util")]
+            session_traces: Arc::default(),
+            #[cfg(feature = "test-util")]
             pass_probes,
             collecting,
             storage: options.storage,
@@ -726,6 +731,8 @@ impl SyncNode {
         access.set_blobs(self.blobs.clone());
         #[cfg(feature = "test-util")]
         access.set_pod_verdicts(Arc::clone(&self.pod_verdicts));
+        #[cfg(feature = "test-util")]
+        access.set_session_traces(Arc::clone(&self.session_traces));
         let observer_tracker = Arc::clone(&self.retraction);
         let docs = self
             .docs_builder(identity, &access, &registry)?
@@ -2090,6 +2097,22 @@ impl SyncNode {
         &self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::pod::PodVerdicts>> {
         let mut sender = self.pod_verdicts.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
+    }
+
+    /// Once; a second take yields `None`. From the take on, every session
+    /// decision of every identity this node hosts reports here, and every
+    /// entry an allowed session's ingest admits.
+    #[cfg(feature = "test-util")]
+    pub fn take_session_traces(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::access::SessionTrace>> {
+        let mut sender = self.session_traces.lock().ok()?;
         if sender.is_some() {
             return None;
         }

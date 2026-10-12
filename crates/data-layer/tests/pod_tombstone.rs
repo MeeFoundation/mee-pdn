@@ -6,12 +6,17 @@
 //! pod's creation, its joins and its departures write arrive by the
 //! store-level writes the pods service performs, and the tickets by hand.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write,
+    time::{Duration, Instant},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice, MemberState,
-    MembershipKey, PodStore, PrivateMetadataStore, Seq, ShareMode, SpawnOptions, SyncNode,
+    MembershipKey, PodStore, PrivateMetadataStore, Seq, SessionTrace, ShareMode, SpawnOptions,
+    SyncNode, Traced,
 };
 use pdn_types::PodId;
 use test_utils::{
@@ -133,6 +138,57 @@ async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
     Ok(false)
 }
 
+/// Every trace on `traces` whose session has `carol` on `c1` as either
+/// party, oldest first, as `+ms book role store remote@peer: what`.
+fn sessions_with(
+    traces: &mut [tokio::sync::mpsc::UnboundedReceiver<SessionTrace>],
+    since: Instant,
+    carol: &Person,
+    c1: pdn_types::NodeId,
+    names: &HashMap<[u8; 32], &str>,
+) -> Vec<String> {
+    let name = |bytes: &[u8; 32]| {
+        names.get(bytes).map_or_else(
+            || {
+                bytes.iter().take(5).fold(String::new(), |mut short, byte| {
+                    let _ = write!(short, "{byte:02x}");
+                    short
+                })
+            },
+            |name| (*name).to_owned(),
+        )
+    };
+    let mut held = Vec::new();
+    for receiver in traces.iter_mut() {
+        while let Ok(trace) = receiver.try_recv() {
+            held.push(trace);
+        }
+    }
+    held.sort_by_key(|trace| trace.at);
+    held.iter()
+        .filter(|trace| trace.identity == carol.id || trace.peer == c1)
+        .map(|trace| {
+            let what = match &trace.traced {
+                Traced::Admitted { key, author } => format!(
+                    "admitted {} by {}",
+                    String::from_utf8_lossy(key),
+                    author.fmt_short()
+                ),
+                decision => format!("{decision:?}"),
+            };
+            format!(
+                "+{}ms {} {:?} {} {}@{}: {what}",
+                trace.at.saturating_duration_since(since).as_millis(),
+                name(trace.identity.as_bytes()),
+                trace.role,
+                name(trace.namespace.as_bytes()),
+                name(trace.remote.as_bytes()),
+                name(trace.peer.as_bytes()),
+            )
+        })
+        .collect()
+}
+
 /// A device offline while its member is removed learns of the removal at its
 /// first session with a member device, taking the removal and what it rests
 /// on. Denied: a membership event outside the removal's past and a record
@@ -176,7 +232,23 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     assert!(lists(&alice_phone, alice.id, pod, dave.id, PLAIN).await?);
     assert!(reads(&bob_phone, bob.id, pod, claim).await?);
 
+    let restarted = Instant::now();
+    let mut traces = vec![
+        alice_phone.take_session_traces().context("taken once")?,
+        bob_phone.take_session_traces().context("taken once")?,
+    ];
     let carol_phone = node_on(dir.path()).await?;
+    traces.push(carol_phone.take_session_traces().context("taken once")?);
+    let names: HashMap<[u8; 32], &str> = HashMap::from([
+        (*alice_phone.node_id().as_bytes(), "a1"),
+        (*bob_phone.node_id().as_bytes(), "b1"),
+        (*carol_phone.node_id().as_bytes(), "c1"),
+        (*alice.id.as_bytes(), "alice"),
+        (*bob.id.as_bytes(), "bob"),
+        (*carol.id.as_bytes(), "carol"),
+        (*tickets.membership.capability.id().as_bytes(), "membership"),
+        (*tickets.records.capability.id().as_bytes(), "records"),
+    ]);
     carol_phone.provision_identity(carol.id).await?;
     carol_phone.import_pod(carol.id, pod, tickets).await?;
     assert!(
@@ -207,7 +279,8 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     let held = held_records(&carol_phone, carol.id, pod).await?;
     assert!(
         held.is_empty(),
-        "the removed member's device holds records: {held:#?}"
+        "the removed member's device holds records: {held:#?}\nsessions with c1 since its restart: {:#?}",
+        sessions_with(&mut traces, restarted, &carol, carol_phone.node_id(), &names)
     );
 
     for node in [alice_phone, bob_phone, carol_phone] {
