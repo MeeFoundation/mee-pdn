@@ -289,6 +289,9 @@ pub struct SyncNode {
     /// Holds the next pod start between its two stores' starts.
     #[cfg(feature = "test-util")]
     pod_start_pause: std::sync::Mutex<Option<Arc<PodStartPause>>>,
+    /// Holds the next blob collection run once it has read the replicas.
+    #[cfg(feature = "test-util")]
+    collection_pause: CollectionPauseSlot,
     /// Handed to every hosted identity's book; empty until a scenario takes
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
@@ -629,7 +632,16 @@ impl SyncNode {
             options.storage,
             StorageConfig::Memory
         )));
-        let blobs_store = open_blob_store(&options, &identities, &collecting).await?;
+        #[cfg(feature = "test-util")]
+        let collection_pause = CollectionPauseSlot::default();
+        let blobs_store = open_blob_store(
+            &options,
+            &identities,
+            &collecting,
+            #[cfg(feature = "test-util")]
+            &collection_pause,
+        )
+        .await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let (retraction, retraction_verdicts) = RetractionTracker::new();
@@ -696,6 +708,8 @@ impl SyncNode {
             fail_next_pod_records_create: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
             pod_start_pause: std::sync::Mutex::default(),
+            #[cfg(feature = "test-util")]
+            collection_pause,
             #[cfg(feature = "test-util")]
             pod_verdicts: Arc::default(),
             #[cfg(feature = "test-util")]
@@ -1526,6 +1540,18 @@ impl SyncNode {
     pub fn pause_next_pod_start_for_test(&self) -> Arc<PodStartPause> {
         let pause = Arc::new(PodStartPause::default());
         if let Ok(mut slot) = self.pod_start_pause.lock() {
+            *slot = Some(Arc::clone(&pause));
+        }
+        pause
+    }
+
+    /// Holds the next blob collection run once every hosted identity's
+    /// replicas are read, before it removes anything, until `release` is
+    /// notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_collection_for_test(&self) -> Arc<CollectionPause> {
+        let pause = Arc::new(CollectionPause::default());
+        if let Ok(mut slot) = self.collection_pause.lock() {
             *slot = Some(Arc::clone(&pause));
         }
         pause
@@ -3058,12 +3084,15 @@ async fn open_blob_store(
     options: &SpawnOptions,
     identities: &Identities,
     collecting: &Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-util")] pause: &CollectionPauseSlot,
 ) -> Result<iroh_blobs::api::Store> {
     let collection = GcConfig {
         interval: options.blob_collection_interval,
         add_protected: Some(protect_hosted(
             Arc::downgrade(identities),
             Arc::clone(collecting),
+            #[cfg(feature = "test-util")]
+            Arc::clone(pause),
         )),
     };
     Ok(match &options.storage {
@@ -3089,10 +3118,13 @@ async fn open_blob_store(
 fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
     collecting: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-util")] pause: CollectionPauseSlot,
 ) -> ProtectCb {
     Arc::new(move |live: &mut HashSet<Hash>| {
         let identities = identities.clone();
         let collecting = Arc::clone(&collecting);
+        #[cfg(feature = "test-util")]
+        let pause = Arc::clone(&pause);
         Box::pin(async move {
             if !collecting.load(std::sync::atomic::Ordering::Acquire) {
                 return ProtectOutcome::Abort;
@@ -3110,6 +3142,14 @@ fn protect_hosted(
                 };
                 live.extend(referenced);
             }
+            #[cfg(feature = "test-util")]
+            {
+                let pause = pause.lock().ok().and_then(|mut slot| slot.take());
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.release.notified().await;
+                }
+            }
             ProtectOutcome::Continue
         })
     })
@@ -3117,7 +3157,7 @@ fn protect_hosted(
 
 /// Every payload hash the replicas of one identity's store reference.
 async fn referenced_payloads(stack: &HostedStack) -> Result<Vec<Hash>> {
-    stack.docs.engine().sync.content_hashes().await?.collect()
+    stack.docs.engine().collection_hashes().await
 }
 
 /// One subdirectory per identity, each holding that identity's replica
@@ -4084,6 +4124,19 @@ pub struct PodStartPause {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
 }
+
+/// The hold [`SyncNode::pause_next_collection_for_test`] puts on a blob
+/// collection run: `reached` once the run has read every hosted identity's
+/// replicas.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Default)]
+pub struct CollectionPause {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-util")]
+type CollectionPauseSlot = Arc<std::sync::Mutex<Option<Arc<CollectionPause>>>>;
 
 /// The sessions one replica of a pod's store finishes, from
 /// [`SyncNode::watch_pod_sessions`]. Unread past its buffer it drops

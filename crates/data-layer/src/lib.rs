@@ -36,7 +36,7 @@ pub use connection_metadata::{
 pub use grant::{claim_id_of, GrantedClaim, ReadGrant};
 pub use identity_key::{devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair};
 #[cfg(feature = "test-util")]
-pub use node::{PodSession, PodSessions, PodStartPause};
+pub use node::{CollectionPause, PodSession, PodSessions, PodStartPause};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{

@@ -354,6 +354,7 @@ pub struct LiveActor {
     sync: DrainingSync,
     endpoint: Endpoint,
     bao_store: Store,
+    held_payloads: Arc<super::held::HeldPayloads>,
     downloader: Downloader,
     memory_lookup: MemoryLookup,
 
@@ -428,6 +429,7 @@ impl LiveActor {
         endpoint: Endpoint,
         gossip: Gossip,
         bao_store: Store,
+        held_payloads: Arc<super::held::HeldPayloads>,
         downloader: Downloader,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
@@ -447,6 +449,7 @@ impl LiveActor {
             memory_lookup,
             gossip: gossip_state,
             bao_store,
+            held_payloads,
             downloader,
             sync_actor_tx,
             running_sync_connect: Default::default(),
@@ -1579,6 +1582,18 @@ impl LiveActor {
                 // content.
                 if should_download {
                     let hash = entry.content_hash();
+                    // From the insert on: a collection read that missed the
+                    // entry would sweep its payload, landed or lying orphaned.
+                    if self.held_payloads.wants(&hash) {
+                        if let Ok(tag) = self
+                            .bao_store
+                            .tags()
+                            .temp_tag(HashAndFormat::raw(hash))
+                            .await
+                        {
+                            self.held_payloads.hold(tag);
+                        }
+                    }
                     if matches!(remote_content_status, ContentStatus::Complete) {
                         let node_id = PublicKey::from_bytes(&from)?;
                         self.start_download(namespace, hash, node_id, false).await;
