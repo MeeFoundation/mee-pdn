@@ -145,6 +145,15 @@ const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 /// pod's sessions stay bounded whatever its size.
 const POD_RECONCILE_PEERS: usize = 5;
 
+/// The slowest link a flush waits out, in bytes a second (1 Mbit/s): a
+/// payload the flushed device still lacks extends the wait by its length at
+/// this rate.
+const FLUSH_PAYLOAD_RATE: u64 = 125_000;
+
+/// Payloads a flush asks a device about at once, under the 100
+/// bidirectional streams a connection carries.
+const FLUSH_OBSERVES: usize = 16;
+
 /// Default of [`SpawnOptions::blob_collection_interval`].
 const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
@@ -1864,7 +1873,8 @@ impl SyncNode {
     /// tombstone alone — with at most [`POD_RECONCILE_PEERS`] devices of its
     /// other members, drawn afresh, the membership store's exchange first.
     /// Returns once the dials are asked for; [`PodFlush::wait`] waits for
-    /// their sessions. [`UnknownPod`] for a pod `identity` never held.
+    /// their sessions and for the payloads of the identity's own entries.
+    /// [`UnknownPod`] for a pod `identity` never held.
     pub async fn flush_pod(&self, identity: PdnId, pod: PodId) -> Result<PodFlush> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
@@ -1882,9 +1892,17 @@ impl SyncNode {
             since: std::time::SystemTime::now(),
             peers: drawn
                 .iter()
-                .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
+                .map(|contact| {
+                    (
+                        NodeId::from_bytes(*contact.addr.id.as_bytes()),
+                        contact.addr.clone(),
+                    )
+                })
                 .collect(),
             sessions: Vec::new(),
+            payloads: own_payloads(&stack, pod, &held).await?,
+            endpoint: self.router.endpoint().clone(),
+            blobs: self.blobs.clone(),
         };
         if drawn.is_empty() {
             return Ok(flush);
@@ -4087,49 +4105,206 @@ pub struct PodFlush {
     /// A session started before it may have missed the latest writes. A
     /// clock stepping back past it leaves the wait to its bound.
     since: std::time::SystemTime,
-    peers: HashSet<NodeId>,
+    peers: HashMap<NodeId, EndpointAddr>,
     sessions: Vec<
         std::pin::Pin<
             Box<dyn futures_core::Stream<Item = Result<pdn_store::engine::LiveEvent>> + Send>,
         >,
     >,
+    /// By hash, with the length its entry states, as the flush began.
+    payloads: Vec<(Hash, u64)>,
+    endpoint: Endpoint,
+    blobs: iroh_blobs::api::Store,
 }
 
 impl std::fmt::Debug for PodFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PodFlush")
-            .field("peers", &self.peers)
+            .field("peers", &self.peers.keys())
             .finish_non_exhaustive()
     }
 }
 
 impl PodFlush {
     /// Whether a session with one of the dialed devices went through on
-    /// each store within `timeout`; `false` at once when none was dialed.
+    /// each store within `timeout`, and the device whose session ended the
+    /// last store came to hold every payload of the identity's own entries,
+    /// within `timeout` and what the missing bytes take at
+    /// [`FLUSH_PAYLOAD_RATE`]; `false` at once when none was dialed.
     pub async fn wait(self, timeout: Duration) -> bool {
-        if self.peers.is_empty() {
+        let PodFlush {
+            since,
+            peers,
+            sessions,
+            payloads,
+            endpoint,
+            blobs,
+        } = self;
+        if peers.is_empty() {
             return false;
         }
         let deadline = tokio::time::Instant::now() + timeout;
-        for mut events in self.sessions {
+        let mut served_by = None;
+        for mut events in sessions {
             loop {
                 match tokio::time::timeout_at(deadline, events.next()).await {
                     Ok(Some(Ok(pdn_store::engine::LiveEvent::SyncFinished(sync))))
-                        if sync.result.is_ok()
-                            && sync.started >= self.since
-                            && self
-                                .peers
-                                .contains(&NodeId::from_bytes(*sync.peer.as_bytes())) =>
+                        if sync.result.is_ok() && sync.started >= since =>
                     {
-                        break;
+                        let peer = NodeId::from_bytes(*sync.peer.as_bytes());
+                        if peers.contains_key(&peer) {
+                            served_by = Some(peer);
+                            break;
+                        }
                     }
                     Ok(Some(_other)) => {}
                     Ok(None) | Err(_) => return false,
                 }
             }
         }
-        true
+        let Some(peer) = served_by else {
+            return true;
+        };
+        let held = FlushedPayloads {
+            payloads,
+            endpoint,
+            blobs,
+        };
+        match peers.get(&peer) {
+            Some(addr) => held.held_by(addr, deadline).await,
+            None => false,
+        }
     }
+}
+
+/// What [`PodFlush::wait`] asks the device that took the flush about once
+/// its sessions went through; apart from the sessions, which are not
+/// `Sync`, so a wait over it stays `Send`.
+struct FlushedPayloads {
+    payloads: Vec<(Hash, u64)>,
+    endpoint: Endpoint,
+    blobs: iroh_blobs::api::Store,
+}
+
+impl FlushedPayloads {
+    /// The first answer for every payload within `deadline` says which the
+    /// device lacks; their bytes at [`FLUSH_PAYLOAD_RATE`] then bound the
+    /// wait for the rest. A device on this node shares its blob store.
+    async fn held_by(&self, addr: &EndpointAddr, deadline: tokio::time::Instant) -> bool {
+        if self.payloads.is_empty() || addr.id == self.endpoint.id() {
+            return true;
+        }
+        let Ok(Ok(conn)) =
+            tokio::time::timeout_at(deadline, self.endpoint.connect(addr.clone(), BLOBS_ALPN))
+                .await
+        else {
+            return false;
+        };
+        let held_now = self.payloads.iter().copied().map(|(hash, len)| {
+            let mut updates = Box::pin(self.blobs.remote().observe(
+                conn.clone(),
+                iroh_blobs::protocol::ObserveRequest::new(hash),
+            ));
+            async move {
+                let complete =
+                    matches!(updates.next().await, Some(Ok(first)) if first.is_complete());
+                (hash, len, complete)
+            }
+        });
+        let Some(firsts) = bounded(held_now, deadline).await else {
+            return false;
+        };
+        let missing: Vec<(Hash, u64)> = firsts
+            .into_iter()
+            .filter(|(_hash, _len, complete)| !complete)
+            .map(|(hash, len, _complete)| (hash, len))
+            .collect();
+        if missing.is_empty() {
+            return true;
+        }
+        let missing_bytes = missing.iter().map(|(_hash, len)| *len).sum::<u64>();
+        let transfer = Duration::from_secs(missing_bytes.div_ceil(FLUSH_PAYLOAD_RATE));
+        let deadline = deadline.max(tokio::time::Instant::now() + transfer);
+        let completions = missing.into_iter().map(|(hash, _len)| {
+            let mut updates = Box::pin(self.blobs.remote().observe(
+                conn.clone(),
+                iroh_blobs::protocol::ObserveRequest::new(hash),
+            ));
+            async move {
+                let mut held = iroh_blobs::api::proto::Bitfield::empty();
+                while let Some(Ok(update)) = updates.next().await {
+                    held.update(&update);
+                    if held.is_complete() {
+                        return true;
+                    }
+                }
+                false
+            }
+        });
+        bounded(completions, deadline)
+            .await
+            .is_some_and(|completed| completed.into_iter().all(|complete| complete))
+    }
+}
+
+/// Every one of `tasks`, at most [`FLUSH_OBSERVES`] at a time, each opening
+/// its stream only as it starts; `None` past `deadline` or when a task
+/// fails.
+async fn bounded<T, F>(
+    tasks: impl Iterator<Item = F>,
+    deadline: tokio::time::Instant,
+) -> Option<Vec<T>>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let run = async {
+        let mut tasks = tasks.peekable();
+        let mut running = tokio::task::JoinSet::new();
+        let mut done = Vec::new();
+        loop {
+            while running.len() < FLUSH_OBSERVES {
+                let Some(task) = tasks.next() else {
+                    break;
+                };
+                running.spawn(task);
+            }
+            match running.join_next().await {
+                Some(Ok(result)) => done.push(result),
+                Some(Err(_panicked)) => return None,
+                None => return Some(done),
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, run).await.ok().flatten()
+}
+
+/// Every payload the entries of `identity`'s devices in `pod`'s stores
+/// reference, by its membership view's statements and this device's own
+/// author: the ones a departure leaves no copy of on those devices.
+async fn own_payloads(
+    stack: &HostedStack,
+    pod: PodId,
+    held: &PodBinding,
+) -> Result<Vec<(Hash, u64)>> {
+    let view = stack.access.membership_view(pod, &held.membership).await?;
+    let authors: HashSet<AuthorId> = view
+        .member(&stack.identity)
+        .into_iter()
+        .flat_map(|member| member.devices.iter().map(|device| device.author))
+        .chain(std::iter::once(stack.author))
+        .collect();
+    let mut payloads = HashMap::new();
+    for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+        let mut entries = std::pin::pin!(doc.get_many(Query::all()).await?);
+        while let Some(entry) = entries.next().await {
+            let entry = entry?;
+            if entry.content_len() > 0 && authors.contains(&entry.author()) {
+                payloads.insert(entry.content_hash(), entry.content_len());
+            }
+        }
+    }
+    Ok(payloads.into_iter().collect())
 }
 
 /// The hold [`SyncNode::pause_next_pod_start_for_test`] puts on a pod

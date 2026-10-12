@@ -1231,6 +1231,50 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
     Ok(())
 }
 
+/// A record a member places right before its leave, and the leave itself,
+/// reach the remaining member though the leaving device stops as soon as
+/// the leave returns.
+///
+/// The payload is large enough that its download outlasts the leave's
+/// sessions over loopback, and the leaving runtime is shut down before
+/// anything is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_member_wrote_reaches_the_pod_when_its_device_stops_after_the_leave() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = pod_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+    assert!(
+        lists_members(
+            &bob_phone,
+            bob,
+            pod,
+            vec![member(alice, true), member(bob, false)]
+        )
+        .await?
+    );
+    let scan = vec![0x5c_u8; 32 * 1024 * 1024];
+
+    let claim = bob_phone
+        .pods()
+        .put_record(bob, pod, RecordKind::Claim, &scan)
+        .await?;
+    bob_phone.pods().act(bob, pod, PodAct::Leave).await?;
+    bob_phone.shutdown().await?;
+
+    assert!(
+        reads(&alice_phone, alice, pod, claim, &scan).await?,
+        "the record placed before the leave did not reach the member"
+    );
+    assert!(
+        lists_members(&alice_phone, alice, pod, vec![member(alice, true)]).await?,
+        "the leave did not reach the member"
+    );
+
+    alice_phone.shutdown().await?;
+    Ok(())
+}
+
 /// Devices linked into a member before and after its join reach the pod
 /// from the identity's PMS, read it, and register themselves, so the
 /// owner's device reads what they write and serves one of them with every

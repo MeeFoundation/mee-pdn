@@ -46,9 +46,10 @@ pub const POD_INVITE_FORMAT_VERSION: u8 = 0;
 /// holds the caller for the transport's idle timeout.
 pub const JOIN_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// What a leave waits, before its left event, for a session with another
-/// member's device on each store: one with a reachable device goes through
-/// in about a second, and past it the device is taken as offline.
+/// What a leave waits for a session with another member's device on each
+/// store, before its left event and again after it: one with a reachable
+/// device goes through in about a second, and past it the device is taken
+/// as offline. Payloads that device lacks extend it (`PodFlush::wait`).
 pub const LEAVE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `join` waits, once both tickets are recorded, for each store's first
@@ -481,6 +482,7 @@ impl PodsService for RuntimePodsService<'_> {
     }
 
     async fn act(&self, identity: PdnId, pod: PodId, act: PodAct) -> Result<()> {
+        let mut flushed = false;
         if act == PodAct::Leave {
             // Checked before the flush too, so a refused leave dials nobody.
             let node = {
@@ -491,7 +493,7 @@ impl PodsService for RuntimePodsService<'_> {
             // What no member's device holds by the departure never leaves
             // this one: the tombstone serves the departure's past alone.
             // A round trip, so outside the lock.
-            let _flushed = node
+            flushed = node
                 .flush_pod(identity, pod)
                 .await?
                 .wait(LEAVE_FLUSH_TIMEOUT)
@@ -517,9 +519,14 @@ impl PodsService for RuntimePodsService<'_> {
         } = key
         {
             depart(&state, identity, pod, seq).await?;
-            // Without it the left event reaches the members at the pod
-            // pass's next run, should its announcement have been lost.
-            let _dialed = state.node.flush_pod(identity, pod).await;
+            let flush = state.node.flush_pod(identity, pod).await;
+            drop(state);
+            // A device that stops once the leave returns would otherwise
+            // count as a member until it comes back. Not waited when the
+            // first flush reached no member: offline, it would double the leave.
+            if let (true, Ok(flush)) = (flushed, flush) {
+                let _flushed = flush.wait(LEAVE_FLUSH_TIMEOUT).await;
+            }
         }
         Ok(())
     }
