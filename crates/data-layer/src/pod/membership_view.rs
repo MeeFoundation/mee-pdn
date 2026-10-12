@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use pdn_store::AuthorId;
+use pdn_store::{AuthorId, NamespaceId};
 use pdn_types::{PdnId, PodId};
 
 use super::{
@@ -44,6 +44,9 @@ pub enum ForNothing {
     Misplaced,
     /// The created event's fields derive another pod id.
     OtherPod,
+    /// The created event names another membership store than the one it
+    /// lies in.
+    OtherStore,
     /// The identity key it carries derives another `PdnId` than its
     /// subject's.
     KeyOfAnother,
@@ -137,11 +140,13 @@ pub struct MembershipView {
 }
 
 impl MembershipView {
-    pub fn new(pod: &PodId, entries: &[HeldEntry]) -> Self {
+    /// Over the `entries` one device holds of `pod`'s membership store,
+    /// `store` being that store's namespace.
+    pub fn new(pod: &PodId, store: &NamespaceId, entries: &[HeldEntry]) -> Self {
         let parsed = Parsed::of(entries);
         let mut set_aside = BTreeSet::new();
         loop {
-            let pass = Pass::run(pod, entries, &parsed, &set_aside);
+            let pass = Pass::run(pod, store, entries, &parsed, &set_aside);
             let more = pass.demotions_to_set_aside();
             if more.is_subset(&set_aside) {
                 return pass.into_view();
@@ -260,6 +265,7 @@ struct Winner {
 /// over the last owner ignores.
 struct Pass<'a> {
     pod: &'a PodId,
+    store: &'a NamespaceId,
     entries: &'a [HeldEntry],
     parsed: &'a Parsed,
     set_aside: &'a BTreeSet<usize>,
@@ -276,12 +282,14 @@ struct Pass<'a> {
 impl<'a> Pass<'a> {
     fn run(
         pod: &'a PodId,
+        store: &'a NamespaceId,
         entries: &'a [HeldEntry],
         parsed: &'a Parsed,
         set_aside: &'a BTreeSet<usize>,
     ) -> Self {
         let mut pass = Self {
             pod,
+            store,
             entries,
             parsed,
             set_aside,
@@ -295,6 +303,7 @@ impl<'a> Pass<'a> {
         };
         pass.find_keys();
         pass.count_statements();
+        pass.count_joining_devices();
         let candidates = pass.check_alone();
         pass.evaluate(&candidates);
         pass
@@ -356,6 +365,33 @@ impl<'a> Pass<'a> {
         }
     }
 
+    /// The device a join statement names is its member's by the member's
+    /// own signature, as a statement's devices are, whatever the joined
+    /// event itself counts for.
+    fn count_joining_devices(&mut self) {
+        for event in &self.parsed.events {
+            if event.kind != EventKind::Joined {
+                continue;
+            }
+            let Some(statement) = self.payload(event.entry).and_then(JoinedPayload::decode) else {
+                continue;
+            };
+            if pdn_id_of(&statement.identity_key) != event.subject
+                || !join_verifies(&event.subject, self.pod, Seq::new(event.seq), &statement)
+            {
+                continue;
+            }
+            self.authors
+                .entry(event.subject)
+                .or_default()
+                .insert(statement.device.author);
+            self.devices
+                .entry(event.subject)
+                .or_default()
+                .insert(statement.device);
+        }
+    }
+
     fn statement_verdict(&self, statement: &Statement) -> Verdict {
         let Some(payload) = self.payload(statement.entry) else {
             return Verdict::NotYet(Awaiting::Payload);
@@ -366,7 +402,13 @@ impl<'a> Pass<'a> {
         let Some(key) = self.keys.get(&statement.member) else {
             return Verdict::NotYet(Awaiting::IdentityKey);
         };
-        if devices_verify(key, statement.version, &payload) {
+        if devices_verify(
+            key,
+            self.pod,
+            &statement.member,
+            statement.version,
+            &payload,
+        ) {
             Verdict::Counted
         } else {
             Verdict::CountedForNothing(ForNothing::BadSignature)
@@ -432,6 +474,9 @@ impl<'a> Pass<'a> {
         };
         if pod_id_of(&event.subject, &creation.identity_key, &creation.nonce) != *self.pod {
             return nothing(ForNothing::OtherPod);
+        }
+        if creation.membership_store != *self.store {
+            return nothing(ForNothing::OtherStore);
         }
         if pdn_id_of(&creation.identity_key) != event.subject {
             return nothing(ForNothing::KeyOfAnother);

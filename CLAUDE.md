@@ -52,7 +52,7 @@ them skipped; `just test-docker` and the pipeline's own job run them with
 parallelism: the daemon holds a fixed share of the machine, and the runner's
 default width would saturate it.
 
-Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI through `.github/actions/install-tools`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing.
+Tests run under [cargo-nextest](https://nexte.st) (process-per-test, `--test-threads` defaults to CPU cores). It is a **required** tool: `just setup-tooling` installs it locally, CI through `.github/actions/install-tools`, and the devcontainer bakes it into the image (`.devcontainer/Dockerfile.app`). `just test`/`just stress` error out with a hint if it is missing. A test still running after ten minutes is killed and counted as failed (`slow-timeout` in `.config/nextest.toml`), so a hang shows as `TIMEOUT` instead of holding a run to its job's limit.
 
 On macOS a stress run now and then marks a test `LEAK`: it passed, and its stdout or stderr closed more than nextest's 100 ms after the process exited. The test holds nothing open. Rust's standard library creates a pipe on macOS with `pipe()` and marks it close-on-exec in a second call, so a test process nextest spawns from another thread in between inherits that pipe and keeps it until it exits itself. The marks fall on tests of the first spawn burst of an iteration and do not occur on Linux, where the pipe is created close-on-exec atomically. A `LEAK` that also shows on Linux is a real one.
 

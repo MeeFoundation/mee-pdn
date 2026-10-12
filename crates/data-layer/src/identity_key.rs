@@ -3,6 +3,7 @@
 //! the steps are the pod stores spec's.
 
 use iroh::{PublicKey, SecretKey, Signature};
+use pdn_store::NamespaceId;
 use pdn_types::{PdnId, PodId};
 
 use crate::pod::{
@@ -42,31 +43,56 @@ impl IdentityKeyPair {
         self.0.to_bytes()
     }
 
-    /// The created event of the pod `pod_id_of(self.pdn_id(), key, nonce)`.
-    pub fn creation(&self, nonce: [u8; 16]) -> CreatedPayload {
+    /// The created event of the pod `pod_id_of(self.pdn_id(), key, nonce)`,
+    /// held in `membership_store` beside `record_store`.
+    pub fn creation(
+        &self,
+        nonce: [u8; 16],
+        membership_store: NamespaceId,
+        record_store: NamespaceId,
+    ) -> CreatedPayload {
         let identity_key = self.public_key();
-        let message = creation_message(&self.pdn_id(), &identity_key, &nonce);
-        CreatedPayload {
+        let mut payload = CreatedPayload {
             nonce,
             identity_key,
-            signature: self.0.sign(&message).to_bytes(),
-        }
+            membership_store,
+            record_store,
+            signature: [0; 64],
+        };
+        payload.signature = self
+            .0
+            .sign(&creation_message(&self.pdn_id(), &payload))
+            .to_bytes();
+        payload
     }
 
     /// The join statement over `subject_seq`, the sequence the inviting
-    /// device names for this identity's joined event.
-    pub fn join_statement(&self, pod: &PodId, subject_seq: Seq) -> JoinedPayload {
+    /// device names for this identity's joined event, and `device`, the one
+    /// it joins from.
+    pub fn join_statement(
+        &self,
+        pod: &PodId,
+        subject_seq: Seq,
+        device: MemberDevice,
+    ) -> JoinedPayload {
         let identity_key = self.public_key();
-        let message = join_message(&self.pdn_id(), &identity_key, pod, subject_seq);
+        let message = join_message(&self.pdn_id(), &identity_key, pod, subject_seq, &device);
         JoinedPayload {
             identity_key,
+            device,
             signature: self.0.sign(&message).to_bytes(),
         }
     }
 
-    /// The device-list statement at `version`, the version its key names.
-    pub fn device_statement(&self, version: u64, devices: Vec<MemberDevice>) -> DevicesPayload {
-        let message = devices_message(version, &devices);
+    /// The device-list statement in `pod` at `version`, the version its key
+    /// names.
+    pub fn device_statement(
+        &self,
+        pod: &PodId,
+        version: u64,
+        devices: Vec<MemberDevice>,
+    ) -> DevicesPayload {
+        let message = devices_message(pod, &self.pdn_id(), version, &devices);
         DevicesPayload {
             devices,
             signature: self.0.sign(&message).to_bytes(),
@@ -78,8 +104,17 @@ impl IdentityKeyPair {
 /// `creator`'s chain; what its fields derive is the membership view's to
 /// check.
 pub(crate) fn creation_verifies(creator: &PdnId, payload: &CreatedPayload) -> bool {
-    let message = creation_message(creator, &payload.identity_key, &payload.nonce);
+    let message = creation_message(creator, payload);
     verifies(&payload.identity_key, &message, &payload.signature)
+}
+
+/// Whether `payload` is `pod`'s created event: its fields derive `pod`, and
+/// its signature verifies under the key it carries, whose `PdnId` is the
+/// creator's.
+pub fn creates(pod: &PodId, payload: &CreatedPayload) -> bool {
+    let creator = pdn_id_of(&payload.identity_key);
+    pod_id_of(&creator, &payload.identity_key, &payload.nonce) == *pod
+        && creation_verifies(&creator, payload)
 }
 
 /// Whether `payload`'s signature verifies for a joined event at
@@ -90,23 +125,37 @@ pub fn join_verifies(
     subject_seq: Seq,
     payload: &JoinedPayload,
 ) -> bool {
-    let message = join_message(subject, &payload.identity_key, pod, subject_seq);
+    let message = join_message(
+        subject,
+        &payload.identity_key,
+        pod,
+        subject_seq,
+        &payload.device,
+    );
     verifies(&payload.identity_key, &message, &payload.signature)
 }
 
-/// Whether `payload`'s signature verifies under `identity_key` for the
-/// statement at `version`.
-pub fn devices_verify(identity_key: &[u8; 32], version: u64, payload: &DevicesPayload) -> bool {
-    let message = devices_message(version, &payload.devices);
+/// Whether `payload`'s signature verifies under `identity_key` for
+/// `member`'s statement in `pod` at `version`.
+pub fn devices_verify(
+    identity_key: &[u8; 32],
+    pod: &PodId,
+    member: &PdnId,
+    version: u64,
+    payload: &DevicesPayload,
+) -> bool {
+    let message = devices_message(pod, member, version, &payload.devices);
     verifies(identity_key, &message, &payload.signature)
 }
 
-fn creation_message(creator: &PdnId, identity_key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
+fn creation_message(creator: &PdnId, payload: &CreatedPayload) -> Vec<u8> {
     [
         POD_CREATION_CONTEXT,
         creator.as_bytes(),
-        identity_key,
-        nonce,
+        &payload.identity_key,
+        &payload.nonce,
+        payload.membership_store.as_bytes(),
+        payload.record_store.as_bytes(),
     ]
     .concat()
 }
@@ -116,6 +165,7 @@ fn join_message(
     identity_key: &[u8; 32],
     pod: &PodId,
     subject_seq: Seq,
+    device: &MemberDevice,
 ) -> Vec<u8> {
     [
         POD_JOIN_CONTEXT,
@@ -123,13 +173,16 @@ fn join_message(
         identity_key,
         pod.as_bytes(),
         &subject_seq.get().to_be_bytes(),
+        &encode_devices(std::slice::from_ref(device)),
     ]
     .concat()
 }
 
-fn devices_message(version: u64, devices: &[MemberDevice]) -> Vec<u8> {
+fn devices_message(pod: &PodId, member: &PdnId, version: u64, devices: &[MemberDevice]) -> Vec<u8> {
     [
         POD_DEVICES_CONTEXT,
+        pod.as_bytes(),
+        member.as_bytes(),
         &version.to_be_bytes(),
         &encode_devices(devices),
     ]
@@ -186,40 +239,60 @@ mod tests {
         );
     }
 
+    /// The namespace ids the specs print for Family's two stores.
+    fn family_stores() -> (NamespaceId, NamespaceId) {
+        (
+            NamespaceId::from(&[0x4d; 32]),
+            NamespaceId::from(&[0x52; 32]),
+        )
+    }
+
     /// Alice's created event for "Family" carries the signature the pod
     /// stores spec prints, and its fields derive the pod's id.
     #[test]
     fn the_specs_created_event_signs_and_derives_family() {
         let alice = IdentityKeyPair::from_secret_bytes(&[0x33; 32]);
-        let creation = alice.creation([0x5a; 16]);
-        let head: [u8; 8] = pdn_types::parse_hex("806ce2029b681a9a").unwrap();
-        let tail: [u8; 5] = pdn_types::parse_hex("0420513704").unwrap();
+        let (membership, records) = family_stores();
+        let creation = alice.creation([0x5a; 16], membership, records);
+        let head: [u8; 8] = pdn_types::parse_hex("81532fb40a10f1a4").unwrap();
+        let tail: [u8; 4] = pdn_types::parse_hex("7c050a01").unwrap();
         assert!(creation.signature.starts_with(&head));
         assert!(creation.signature.ends_with(&tail));
-        assert!(creation_verifies(&alice.pdn_id(), &creation));
-        assert_eq!(
-            pod_id_of(&alice.pdn_id(), &creation.identity_key, &creation.nonce).to_string(),
-            "ad58a3faa04cdc5576c8dc5823a347c6"
-        );
-        // Denied: the same event claimed for another creator's chain.
+        let family =
+            PodId::from_bytes(pdn_types::parse_hex("ad58a3faa04cdc5576c8dc5823a347c6").unwrap());
+        assert!(creates(&family, &creation));
+        // Denied: the same event claimed for another creator's chain, for
+        // another pod, and over stores it does not name.
         let other = pdn_id_of(&key(OTHER_KEY));
         assert!(!creation_verifies(&other, &creation));
+        assert!(!creates(&PodId::from_bytes([0x0b; 16]), &creation));
+        let moved = CreatedPayload {
+            record_store: NamespaceId::from(&[0xee; 32]),
+            ..creation
+        };
+        assert!(!creates(&family, &moved));
     }
 
-    /// A join statement verifies at the sequence it signs and in its pod
-    /// alone: one copied from an earlier join verifies at no later sequence.
+    /// A join statement verifies at the sequence it signs, in its pod and for
+    /// its device alone: one copied from an earlier join verifies at no later
+    /// sequence, and another device in it verifies at none.
     #[test]
     fn a_join_statement_verifies_at_its_own_sequence_only() {
         let carol = IdentityKeyPair::generate();
         let family = PodId::from_bytes([0x9c; 16]);
-        let statement = carol.join_statement(&family, Seq::new(1));
+        let device = MemberDevice {
+            node: pdn_types::NodeId::from_bytes([0xc1; 32]),
+            author: pdn_store::AuthorId::from(&[0xc1; 32]),
+        };
+        let statement = carol.join_statement(&family, Seq::new(1), device);
         assert!(join_verifies(
             &carol.pdn_id(),
             &family,
             Seq::new(1),
             &statement
         ));
-        // Denied: the copy at a later sequence, in another pod, for another member.
+        // Denied: the copy at a later sequence, in another pod, for another
+        // member, and with another device in it.
         assert!(!join_verifies(
             &carol.pdn_id(),
             &family,
@@ -235,23 +308,61 @@ mod tests {
         ));
         let dave = IdentityKeyPair::generate().pdn_id();
         assert!(!join_verifies(&dave, &family, Seq::new(1), &statement));
+        let swapped = JoinedPayload {
+            device: MemberDevice {
+                node: pdn_types::NodeId::from_bytes([0xe1; 32]),
+                author: pdn_store::AuthorId::from(&[0xe9; 32]),
+            },
+            ..statement
+        };
+        assert!(!join_verifies(
+            &carol.pdn_id(),
+            &family,
+            Seq::new(1),
+            &swapped
+        ));
     }
 
-    /// A device statement verifies under its member's key at its own version;
-    /// moved to another version, or checked under another key, it does not.
+    /// A device statement verifies under its member's key, in its pod, for
+    /// its member, at its own version; moved to another version, pod or
+    /// member, or checked under another key, it does not.
     #[test]
     fn a_device_statement_verifies_under_its_key_at_its_version_only() {
         let bob = IdentityKeyPair::generate();
+        let family = PodId::from_bytes([0x9c; 16]);
         let devices = vec![MemberDevice {
             node: pdn_types::NodeId::from_bytes([0xb1; 32]),
             author: pdn_store::AuthorId::from(&[0xa1; 32]),
         }];
-        let statement = bob.device_statement(2, devices);
-        assert!(devices_verify(&bob.public_key(), 2, &statement));
-        // Denied: the statement at another version, and under another key.
-        assert!(!devices_verify(&bob.public_key(), 3, &statement));
+        let statement = bob.device_statement(&family, 2, devices);
+        let key = bob.public_key();
+        assert!(devices_verify(&key, &family, &bob.pdn_id(), 2, &statement));
+        // Denied: the statement at another version, in another pod, for
+        // another member, and under another key.
+        assert!(!devices_verify(&key, &family, &bob.pdn_id(), 3, &statement));
+        let wedding = PodId::from_bytes([0xf9; 16]);
+        assert!(!devices_verify(
+            &key,
+            &wedding,
+            &bob.pdn_id(),
+            2,
+            &statement
+        ));
         let dave = IdentityKeyPair::generate();
-        assert!(!devices_verify(&dave.public_key(), 2, &statement));
+        assert!(!devices_verify(
+            &key,
+            &family,
+            &dave.pdn_id(),
+            2,
+            &statement
+        ));
+        assert!(!devices_verify(
+            &dave.public_key(),
+            &family,
+            &bob.pdn_id(),
+            2,
+            &statement
+        ));
     }
 
     /// Alice's key and her `PdnId` derive the ids the specs print for "Family"

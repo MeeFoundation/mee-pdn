@@ -128,14 +128,27 @@ pub(super) struct Init {
     pub(super) message: crate::sync::ProtocolMessage,
 }
 
+/// What the initiator side serves and admits in a session.
+pub(crate) enum DialAccess<'a> {
+    /// Decided by the caller beforehand.
+    Given {
+        filter: Option<crate::filter::EntryFilter>,
+        ingest: Option<crate::filter::SessionIngest>,
+    },
+    /// Asked of the access provider once the session's snapshot is open: a
+    /// decision older than the snapshot would serve entries written after
+    /// the access changed.
+    Asked(&'a crate::filter::SessionAccessProvider),
+}
+
 /// Runs the initiator side of the sync protocol.
 ///
 /// `identity` names whose replica this session addresses on the peer and
 /// `caller` whom this side acts for; the peer dispatches the connection by
 /// the first and judges the session by the second.
 ///
-/// `filter` is this side's egress filter for the session: every value this
-/// side reveals — the initial range boundary and fingerprint included —
+/// `access` gives this side's egress filter for the session: every value
+/// this side reveals — the initial range boundary and fingerprint included —
 /// derives from the filtered view.
 ///
 /// The session reads through a store snapshot frozen here, before the
@@ -151,8 +164,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     identity: Identity,
     caller: Identity,
     peer: PublicKey,
-    filter: Option<crate::filter::EntryFilter>,
-    ingest: Option<crate::filter::SessionIngest>,
+    access: DialAccess<'_>,
 ) -> Result<SyncOutcome, ConnectError> {
     let peer_bytes = *peer.as_bytes();
     let mut reader = FramedRead::new(reader, SyncCodec::default());
@@ -165,6 +177,29 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .sync_session_start(namespace)
         .await
         .map_err(ConnectError::sync)?;
+    let (filter, ingest) = match access {
+        DialAccess::Given { filter, ingest } => (filter, ingest),
+        // The addressed identity first, the acting one second, as on the
+        // accept path: dialing, the party across the session is the callee.
+        DialAccess::Asked(provider) => {
+            match provider(
+                namespace,
+                identity,
+                caller,
+                peer,
+                crate::filter::SessionRole::Dial,
+            )
+            .await
+            {
+                crate::filter::SessionAccess::Allow { egress, ingest, .. } => (egress, ingest),
+                crate::filter::SessionAccess::Deny => {
+                    return Err(ConnectError::sync(anyhow!(
+                        "session denied by the local access provider"
+                    )))
+                }
+            }
+        }
+    };
 
     // Init message
 
@@ -387,6 +422,26 @@ impl BobState {
         AcceptError::sync(self.peer, self.namespace(), reason.into())
     }
 
+    async fn reject<W>(
+        &self,
+        writer: &mut FramedWrite<W, SyncCodec>,
+        namespace: NamespaceId,
+        reason: AbortReason,
+    ) -> AcceptError
+    where
+        W: AsyncWrite + Unpin,
+    {
+        debug!(?reason, "reject request");
+        if let Err(err) = writer.send(Message::Abort { reason }).await {
+            return self.fail(err);
+        }
+        AcceptError::Abort {
+            namespace,
+            peer: self.peer,
+            reason,
+        }
+    }
+
     /// Handle a session whose first message is already read, and run to end.
     ///
     /// An exchange that ends badly says so with a terminal frame: closing
@@ -456,33 +511,53 @@ impl BobState {
         // the caller is never told the exchange ended and holds the pair
         // until restart.
         self.namespace = Some(namespace);
-        match accept_cb(namespace, identity, caller, self.peer).await {
-            AcceptOutcome::Allow { filter, ingest } => {
+        let recheck = match accept_cb(namespace, identity, caller, self.peer).await {
+            AcceptOutcome::Allow {
+                filter,
+                ingest,
+                recheck,
+            } => {
                 trace!("allow request");
                 self.filter = filter;
                 self.ingest = ingest;
+                recheck
             }
             AcceptOutcome::Reject(reason) => {
-                debug!(?reason, "reject request");
-                writer
-                    .send(Message::Abort { reason })
-                    .await
-                    .map_err(|e| self.fail(e))?;
-                return Err(AcceptError::Abort {
-                    namespace,
-                    peer: self.peer,
-                    reason,
-                });
+                return Err(self.reject(writer, namespace, reason).await);
             }
-        }
+        };
         // Session setup: freeze the egress snapshot before the first
         // message is processed. A rejected request never opens one.
-        let session = sync
-            .sync_session_start(namespace)
+        let read = match recheck.as_ref().map(|recheck| &recheck.rests_on) {
+            Some(crate::filter::RestsOn::Writes(read)) => read.clone(),
+            _ => Vec::new(),
+        };
+        let (session, unwritten) = sync
+            .sync_session_start_unless_written(namespace, read)
             .await
             .map_err(|e| self.fail(e))?;
         let session_id = session.id();
         self.session = Some(session);
+        if let Some(recheck) = recheck {
+            let holds = match recheck.rests_on {
+                crate::filter::RestsOn::Nothing => true,
+                crate::filter::RestsOn::Writes(_) => unwritten,
+                crate::filter::RestsOn::Unknown => false,
+            };
+            if !holds {
+                match (recheck.ask)().await {
+                    crate::filter::SessionAccess::Allow { egress, ingest, .. } => {
+                        trace!("allow request again");
+                        self.filter = egress;
+                        self.ingest = ingest;
+                    }
+                    // The first decision's one uniform refusal.
+                    crate::filter::SessionAccess::Deny => {
+                        return Err(self.reject(writer, namespace, AbortReason::NotFound).await);
+                    }
+                }
+            }
+        }
         let mut next = sync
             .sync_process_message(
                 namespace,
@@ -656,8 +731,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_peer_id,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -677,6 +754,7 @@ mod tests {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
                         ingest: None,
+                        recheck: None,
                     })
                 },
                 alice_peer_id,
@@ -886,6 +964,7 @@ mod tests {
                 std::future::ready(AcceptOutcome::Allow {
                     filter: None,
                     ingest: None,
+                    recheck: None,
                 })
             },
         )
@@ -931,8 +1010,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_node_pubkey,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1090,8 +1171,10 @@ mod tests {
                 addressed,
                 acting,
                 bob_peer,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1114,6 +1197,7 @@ mod tests {
                         std::future::ready(AcceptOutcome::Allow {
                             filter: None,
                             ingest: None,
+                            recheck: None,
                         })
                     },
                 )
@@ -1185,6 +1269,7 @@ mod tests {
                 std::future::ready(AcceptOutcome::Allow {
                     filter: None,
                     ingest: None,
+                    recheck: None,
                 })
             },
         )
@@ -1260,8 +1345,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_peer_id,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1370,6 +1457,7 @@ mod tests {
             std::future::ready(AcceptOutcome::Allow {
                 filter: None,
                 ingest: None,
+                recheck: None,
             })
         };
 
@@ -1545,6 +1633,7 @@ mod tests {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
                         ingest: None,
+                        recheck: None,
                     })
                 },
             )
@@ -1856,6 +1945,134 @@ mod tests {
         Ok(())
     }
 
+    /// An accepted session's decision is asked again when a replica it read
+    /// was written between the decision and the snapshot, and only then.
+    ///
+    /// Paired denial: the decision asked again refuses, so the session that
+    /// was asked again serves nothing, the write that moved the count
+    /// included.
+    #[tokio::test]
+    async fn an_accept_decision_is_asked_again_when_what_it_read_was_written() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+        let (alice, _) = spawn_handle_with_replica(&namespace, "alice")?;
+        let mut bob_store = store::Store::memory();
+        bob_store.new_replica(namespace.clone())?;
+        bob_store.close_replica(ns);
+        let author = bob_store.new_author(&mut rng)?.id();
+        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        bob.open(ns, OpenOpts::default().sync()).await?;
+        async fn write(
+            handle: &SyncHandle,
+            ns: NamespaceId,
+            author: AuthorId,
+            key: &'static str,
+        ) -> Result<()> {
+            handle
+                .insert_local(
+                    ns,
+                    author,
+                    key.as_bytes().to_vec().into(),
+                    Hash::new(key),
+                    key.len() as u64,
+                )
+                .await
+        }
+        write(&bob, ns, author, "ape").await?;
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acceptor = |late: Option<&'static str>| {
+            let (bob, asked) = (bob.clone(), Arc::clone(&asked));
+            move |_namespace, _identity, _caller, _peer| {
+                let (bob, asked) = (bob.clone(), Arc::clone(&asked));
+                async move {
+                    let Ok(writes) = bob.writes(ns).await else {
+                        return AcceptOutcome::Reject(AbortReason::InternalServerError);
+                    };
+                    if let Some(key) = late {
+                        if write(&bob, ns, author, key).await.is_err() {
+                            return AcceptOutcome::Reject(AbortReason::InternalServerError);
+                        }
+                    }
+                    let ask: Arc<dyn Fn() -> crate::filter::SessionAccessFuture + Send + Sync> =
+                        Arc::new(move || {
+                            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Box::pin(std::future::ready(crate::filter::SessionAccess::Deny))
+                        });
+                    AcceptOutcome::Allow {
+                        filter: None,
+                        ingest: None,
+                        recheck: Some(crate::net::Recheck {
+                            rests_on: crate::filter::RestsOn::Writes(vec![(ns, writes)]),
+                            ask,
+                        }),
+                    }
+                }
+            }
+        };
+        let held = |key: &'static str| {
+            let alice = alice.clone();
+            async move {
+                anyhow::Ok(
+                    alice
+                        .get_exact(ns, author, key.as_bytes().to_vec().into(), false)
+                        .await?
+                        .is_some(),
+                )
+            }
+        };
+
+        let (dialed, accepted) = run_sync_with_acceptor(
+            alice.clone(),
+            alice_peer,
+            bob.clone(),
+            bob_peer,
+            ns,
+            acceptor(None),
+        )
+        .await?;
+        dialed?;
+        accepted?;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(held("ape").await?, "the unwritten decision served nothing");
+
+        // Denied: the decision asked again.
+        let (dialed, accepted) = run_sync_with_acceptor(
+            alice.clone(),
+            alice_peer,
+            bob.clone(),
+            bob_peer,
+            ns,
+            acceptor(Some("bee")),
+        )
+        .await?;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            dialed.is_err(),
+            "the refused session reached the dialer as served"
+        );
+        assert!(
+            matches!(
+                accepted,
+                Err(AcceptError::Abort {
+                    reason: AbortReason::NotFound,
+                    ..
+                })
+            ),
+            "the session asked again was not refused: {accepted:?}"
+        );
+        assert!(
+            !held("bee").await?,
+            "the write after the decision was served"
+        );
+
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
+
     /// A serving side that fails after allowing the request reaches the
     /// initiator as a failed exchange, not as one that carried nothing.
     ///
@@ -1890,8 +2107,10 @@ mod tests {
                 TEST_HOLDER,
                 TEST_HOLDER,
                 bob_peer,
-                None,
-                None,
+                DialAccess::Given {
+                    filter: None,
+                    ingest: None,
+                },
             )
             .await
         });
@@ -1906,6 +2125,7 @@ mod tests {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
                         ingest: None,
+                        recheck: None,
                     })
                 },
                 alice_peer,
@@ -1996,6 +2216,7 @@ mod tests {
                         std::future::ready(AcceptOutcome::Allow {
                             filter: None,
                             ingest: None,
+                            recheck: None,
                         })
                     },
                 )

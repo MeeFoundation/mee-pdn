@@ -20,6 +20,8 @@ pub use connections::{
     RuntimeConnectionsService,
 };
 pub use data::{DataService, RuntimeDataService, WriteNotGranted};
+#[cfg(feature = "test-util")]
+pub use pods::ForgedJoin;
 pub use pods::{
     ActRefusal, ActRefused, IdentityKeyPending, JoinInProgress, JoinRefused, JoinTimeout, PodAct,
     PodInfo, PodInvite, PodMember, PodsService, RecordPlacedOnce, RuntimePodsService,

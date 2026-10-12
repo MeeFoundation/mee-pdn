@@ -72,7 +72,10 @@ async fn statement(
         version,
     }
     .to_bytes();
-    let payload = signer.keys.device_statement(version, devices).encode();
+    let payload = signer
+        .keys
+        .device_statement(&pod, version, devices)
+        .encode();
     node.write_pod_entry_as_for_test(member.id, pod, PodStore::Membership, author, &key, &payload)
         .await?;
     Ok(key)

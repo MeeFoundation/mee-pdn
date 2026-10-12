@@ -9,17 +9,18 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use data_layer::{
     identity_of, pod_id_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice,
-    MemberState, MembershipKey, PodStore, Seq, ShareMode, SpawnOptions, SyncNode,
+    MemberState, MembershipKey, PodStore, Seq, SessionTrace, ShareMode, SpawnOptions, SyncNode,
 };
+use pdn_store::SessionRole;
 use pdn_types::{NodeId, PodId};
 use test_utils::{
-    eventually, join_identity,
+    eventually, host_identity, join_identity,
     pod::{
-        create, device_of, held_records, host, invite, lists, lists_device, lists_nobody,
-        place_claim, reads, state_on, statement, tickets, write, Person,
+        create, create_at, device_of, held_records, host, invite, lists, lists_device,
+        lists_nobody, place_claim, reads, state_on, statement, tickets, write, Person,
     },
     wait_devices, TIMEOUT,
 };
@@ -502,9 +503,12 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let creation = alice.keys.creation([0xa0; 16]);
-    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &alice.keys.public_key(), &[0xa0; 16]);
     alice_phone.create_pod(alice.id, pod).await?;
+    let (membership_store, record_store) = alice_phone.pod_stores(alice.id, pod)?;
+    let creation = alice
+        .keys
+        .creation([0xa0; 16], membership_store, record_store);
     write(
         &alice_phone,
         &alice,
@@ -576,9 +580,12 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
-    let creation = alice.keys.creation([0xa1; 16]);
-    let pod = pod_id_of(&alice.id, &creation.identity_key, &creation.nonce);
+    let pod = pod_id_of(&alice.id, &alice.keys.public_key(), &[0xa1; 16]);
     alice_phone.create_pod(alice.id, pod).await?;
+    let (membership_store, record_store) = alice_phone.pod_stores(alice.id, pod)?;
+    let creation = alice
+        .keys
+        .creation([0xa1; 16], membership_store, record_store);
     write(
         &alice_phone,
         &alice,
@@ -629,6 +636,94 @@ async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
     );
 
     for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// The first trace of `traces` that `wanted` picks, within the suites'
+/// budget.
+async fn next_trace(
+    traces: &mut tokio::sync::mpsc::UnboundedReceiver<SessionTrace>,
+    wanted: impl Fn(&SessionTrace) -> bool,
+) -> Option<SessionTrace> {
+    tokio::time::timeout(TIMEOUT, async {
+        while let Some(trace) = traces.recv().await {
+            if wanted(&trace) {
+                return Some(trace);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A pull an announcement triggers from a node no contact names is
+/// addressed as an identity the consumer named for the store, never as the
+/// name the announcement carries.
+///
+/// Dave, no member, imports Bob's tickets with Alice's phone out of both
+/// swarms, so his node is Bob's one neighbor there; the dial Bob makes when
+/// it becomes his neighbor is awaited and the nodes settle, so Bob's next
+/// dial to it is the pull Dave's announcement triggers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pull_from_a_node_no_contact_names_is_addressed_as_a_name_the_consumer_gave() -> Result<()>
+{
+    let (alice_phone, bob_phone, dave_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (dave, _) = host(&dave_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    let alices = tickets(&alice_phone, &alice, pod).await?;
+    bob_phone.import_pod(bob.id, pod, alices.clone()).await?;
+    assert!(lists(&bob_phone, bob.id, pod, alice.id, OWNER).await?);
+    for namespace in [
+        alices.membership.capability.id(),
+        alices.records.capability.id(),
+    ] {
+        alice_phone
+            .leave_swarm_for_test(alice.id, namespace)
+            .await?;
+    }
+    let mut traces = bob_phone
+        .take_session_traces()
+        .context("the trace channel is taken once")?;
+    let dave_node = dave_phone.node_id();
+    let to_dave = |trace: &SessionTrace| trace.role == SessionRole::Dial && trace.peer == dave_node;
+
+    dave_phone
+        .import_pod(dave.id, pod, tickets(&bob_phone, &bob, pod).await?)
+        .await?;
+    next_trace(&mut traces, to_dave)
+        .await
+        .context("Bob never dialed Dave's node as a neighbor")?;
+    assert!(settle(&[&alice_phone, &bob_phone, &dave_phone], pod).await?);
+    while traces.try_recv().is_ok() {}
+    place_claim(&dave_phone, &dave, pod, 4).await?;
+    let pull = next_trace(&mut traces, to_dave)
+        .await
+        .context("Dave's announcement triggered no pull")?;
+    assert_eq!(
+        pull.remote,
+        identity_of(alice.id),
+        "the pull was not addressed as the store's default identity"
+    );
+
+    for node in [alice_phone, bob_phone, dave_phone] {
         node.shutdown().await?;
     }
     Ok(())
@@ -701,6 +796,161 @@ async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_mem
     );
 
     for node in [alice_phone, bob_laptop, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A device of a member that no statement lists yet passes its member's
+/// statement to a member device pulling from it as that member, and its
+/// records follow once the statement counts there. Denied: a node answering
+/// as the same member from a node no statement lists passes a statement the
+/// member did not sign, which lists nothing, and none of its own records.
+///
+/// Carol's tablet takes the membership store from her phone, its sibling,
+/// with every device out of both swarms, so Alice's dials below are the
+/// statement's one way to her.
+#[allow(clippy::too_many_lines)] // one scenario: the linked device's way in beside the impostor's
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_no_statement_lists_passes_its_members_statement_to_a_member_pulling_from_it(
+) -> Result<()> {
+    let (alice_phone, carol_phone, carol_tablet, dave_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, carol_pms) = host(&carol_phone).await?;
+    carol_pms.add_device(carol_tablet.node_id()).await?;
+    let ticket = carol_pms
+        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
+    let tablet_pms = join_identity(&carol_tablet, carol.id, ticket).await?;
+    assert!(
+        wait_devices(
+            &tablet_pms,
+            &[carol_phone.node_id(), carol_tablet.node_id()]
+        )
+        .await?
+    );
+    host_identity(&dave_phone, carol.id).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &carol,
+        vec![device_of(&carol_phone, &carol)?],
+    )
+    .await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for device in [&carol_phone, &carol_tablet, &dave_phone] {
+        device.import_pod(carol.id, pod, tickets.clone()).await?;
+    }
+    assert!(lists(&carol_phone, carol.id, pod, alice.id, OWNER).await?);
+    for (device, holder) in [
+        (&alice_phone, alice.id),
+        (&carol_phone, carol.id),
+        (&carol_tablet, carol.id),
+        (&dave_phone, carol.id),
+    ] {
+        for namespace in [
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        ] {
+            device.leave_swarm_for_test(holder, namespace).await?;
+        }
+    }
+    let phones = [&alice_phone, &carol_phone, &carol_tablet, &dave_phone];
+    assert!(settle(&phones, pod).await?);
+    dial(
+        &carol_tablet,
+        &carol,
+        pod,
+        PodStore::Membership,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    assert!(lists(&carol_tablet, carol.id, pod, alice.id, OWNER).await?);
+    let tablet = device_of(&carol_tablet, &carol)?;
+    statement(
+        &carol_tablet,
+        &carol,
+        pod,
+        &carol,
+        vec![device_of(&carol_phone, &carol)?, tablet],
+    )
+    .await?;
+    let tablets = place_claim(&carol_tablet, &carol, pod, 5).await?;
+    let impostor = Person {
+        keys: data_layer::IdentityKeyPair::generate(),
+        id: carol.id,
+    };
+    let dave = device_of(&dave_phone, &carol)?;
+    statement(&dave_phone, &impostor, pod, &impostor, vec![dave]).await?;
+    place_claim(&dave_phone, &impostor, pod, 6).await?;
+    dave_phone.serve_pod_sessions_whole_for_test(carol.id, true)?;
+    let mut sessions = alice_phone
+        .watch_pod_sessions(alice.id, pod, PodStore::Records)
+        .await?;
+
+    // Denied: the node answering as Carol.
+    dial(
+        &alice_phone,
+        &alice,
+        pod,
+        PodStore::Records,
+        &dave_phone,
+        &carol,
+    )
+    .await?;
+    assert!(
+        sessions
+            .next_served_with(dave_phone.node_id(), TIMEOUT)
+            .await?
+            .is_some(),
+        "the dial to the node answering as Carol did not go through"
+    );
+    for store in [PodStore::Membership, PodStore::Records] {
+        dial(&alice_phone, &alice, pod, store, &carol_tablet, &carol).await?;
+    }
+    assert!(
+        lists_device(&alice_phone, alice.id, pod, carol.id, tablet).await?,
+        "the linked device's statement did not reach the member pulling from it"
+    );
+    dial(
+        &alice_phone,
+        &alice,
+        pod,
+        PodStore::Records,
+        &carol_tablet,
+        &carol,
+    )
+    .await?;
+    assert!(
+        reads(&alice_phone, alice.id, pod, tablets).await?,
+        "the linked device's record did not follow its statement"
+    );
+    assert!(
+        !alice_phone
+            .pod_membership_view(alice.id, pod)
+            .await?
+            .member(&carol.id)
+            .is_some_and(|member| member.devices.contains(&dave)),
+        "a statement Carol did not sign listed the node answering as her"
+    );
+    let held = held_records(&alice_phone, alice.id, pod).await?;
+    let impostors = dave.author.fmt_short();
+    assert!(
+        !held
+            .iter()
+            .any(|entry| entry.contains(&format!(" by {impostors}:"))),
+        "a dial took a record the node answering as Carol signed: {held:#?}"
+    );
+
+    for node in [alice_phone, carol_phone, carol_tablet, dave_phone] {
         node.shutdown().await?;
     }
     Ok(())
@@ -1242,6 +1492,225 @@ async fn a_dial_serves_records_to_a_member_and_none_to_a_device_whatever_it_acce
     Ok(())
 }
 
+/// A member's dial takes from a device it does not serve what current
+/// members' devices signed: a member's record that device holds reaches the
+/// dialer. Denied: the removed member's own claim placed after its removal,
+/// and the ticket holder's own claim, from the same dials.
+///
+/// Every device dialed serves whatever session it is asked to whole, as a
+/// modified node would, so the dialer's ingest is all that keeps their own
+/// entries out; every device is out of both swarms and settled, so the
+/// dials below are the only sessions.
+#[allow(clippy::too_many_lines)] // one scenario: the relayed record beside two denials
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_takes_from_a_device_it_does_not_serve_only_what_members_signed() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone, dave_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let (dave, _) = host(&dave_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for (phone, holder) in [
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+    ] {
+        phone.import_pod(holder.id, pod, tickets.clone()).await?;
+    }
+    for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        assert!(lists(phone, holder.id, pod, alice.id, OWNER).await?);
+    }
+    let devices = [
+        (&alice_phone, &alice),
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+    ];
+    for (phone, holder) in devices {
+        for namespace in [
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        ] {
+            phone.leave_swarm_for_test(holder.id, namespace).await?;
+        }
+    }
+    let phones = [&alice_phone, &bob_phone, &carol_phone, &dave_phone];
+    assert!(settle(&phones, pod).await?);
+
+    let removal = MembershipKey::Event {
+        subject: carol.id,
+        seq: Seq::new(2),
+        kind: EventKind::Removed,
+        actor: alice.id,
+        actor_seq: Seq::FIRST,
+    };
+    write(&alice_phone, &alice, pod, removal, vec![0]).await?;
+    let bobs = place_claim(&bob_phone, &bob, pod, 2).await?;
+    bob_phone.serve_pod_sessions_whole_for_test(bob.id, true)?;
+    for (phone, holder) in [(&carol_phone, &carol), (&dave_phone, &dave)] {
+        dial(phone, holder, pod, PodStore::Records, &bob_phone, &bob).await?;
+        assert!(reads(phone, holder.id, pod, bobs).await?);
+    }
+    for (phone, holder) in [(&carol_phone, &carol), (&dave_phone, &dave)] {
+        place_claim(phone, holder, pod, 3).await?;
+        phone.serve_pod_sessions_whole_for_test(holder.id, true)?;
+    }
+    let own = [
+        carol_phone.default_author(carol.id)?.fmt_short(),
+        dave_phone.default_author(dave.id)?.fmt_short(),
+    ];
+    let mut records = alice_phone
+        .watch_pod_sessions(alice.id, pod, PodStore::Records)
+        .await?;
+
+    dial(
+        &alice_phone,
+        &alice,
+        pod,
+        PodStore::Records,
+        &dave_phone,
+        &dave,
+    )
+    .await?;
+    assert!(
+        reads(&alice_phone, alice.id, pod, bobs).await?,
+        "a member's record held by a device the dialer does not serve did not reach it"
+    );
+    dial(
+        &alice_phone,
+        &alice,
+        pod,
+        PodStore::Records,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    assert!(
+        records
+            .next_served_with(carol_phone.node_id(), TIMEOUT)
+            .await?
+            .is_some(),
+        "the dial to the removed member's device did not go through"
+    );
+    // Denied: both devices' own claims.
+    let held = held_records(&alice_phone, alice.id, pod).await?;
+    let taken: Vec<_> = held
+        .iter()
+        .filter(|entry| {
+            own.iter()
+                .any(|author| entry.contains(&format!(" by {author}:")))
+        })
+        .collect();
+    assert!(
+        taken.is_empty(),
+        "a dial took entries of devices it does not serve: {taken:#?}"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone, dave_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A node answering as a current member from a node no statement of that
+/// member lists passes the dialer nothing it signed itself, as a node a
+/// swarm brings in is dialed as the store's default identity.
+///
+/// Dave's phone hosts an identity of Alice's `PdnId` writing with its own
+/// author, as a modified node answers for whichever identity it is dialed
+/// as, and serves every session whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_dialed_as_a_member_no_statement_lists_it_for_passes_nothing_it_signed() -> Result<()>
+{
+    let (alice_phone, bob_phone, dave_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    host_identity(&dave_phone, alice.id).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    bob_phone.import_pod(bob.id, pod, tickets.clone()).await?;
+    dave_phone
+        .import_pod(alice.id, pod, tickets.clone())
+        .await?;
+    assert!(lists(&bob_phone, bob.id, pod, alice.id, OWNER).await?);
+    for (phone, holder) in [
+        (&alice_phone, &alice),
+        (&bob_phone, &bob),
+        (&dave_phone, &alice),
+    ] {
+        for namespace in [
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        ] {
+            phone.leave_swarm_for_test(holder.id, namespace).await?;
+        }
+    }
+    assert!(settle(&[&alice_phone, &bob_phone, &dave_phone], pod).await?);
+    place_claim(&dave_phone, &alice, pod, 9).await?;
+    dave_phone.serve_pod_sessions_whole_for_test(alice.id, true)?;
+    let impostor = dave_phone.default_author(alice.id)?.fmt_short();
+    let mut records = bob_phone
+        .watch_pod_sessions(bob.id, pod, PodStore::Records)
+        .await?;
+
+    dial(
+        &bob_phone,
+        &bob,
+        pod,
+        PodStore::Records,
+        &dave_phone,
+        &alice,
+    )
+    .await?;
+    assert!(
+        records
+            .next_served_with(dave_phone.node_id(), TIMEOUT)
+            .await?
+            .is_some(),
+        "the dial to the node answering as the member did not go through"
+    );
+    let held = held_records(&bob_phone, bob.id, pod).await?;
+    assert!(
+        !held
+            .iter()
+            .any(|entry| entry.contains(&format!(" by {impostor}:"))),
+        "a dial took what a node no statement lists signed: {held:#?}"
+    );
+
+    for node in [alice_phone, bob_phone, dave_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A member's write reaches a co-located newcomer it does not yet know
 /// through the announcement inside the process, which reconciles the
 /// membership store first. Denied: a co-located holder of both tickets
@@ -1413,6 +1882,63 @@ async fn a_membership_event_with_no_record_written_opens_both_of_a_pods_sessions
     assert!(reads(&tablet, dave.id, pod, claim).await?);
 
     for node in [erin_phone, tablet] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Two members on two nodes keep live delivery over 60 shared pods, 120
+/// swarm topics, past the 100 unidirectional streams a connection carries by
+/// the transport's default: a claim in the first and in the last pod reaches
+/// the other node either way, and after a burst of writes the writer's node
+/// still creates a pod.
+///
+/// Both passes are out of reach, so a claim arrives through the swarm alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_sharing_sixty_pods_keep_live_delivery_in_each() -> Result<()> {
+    const SHARED: u8 = 60;
+    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let mut pods = Vec::new();
+    for n in 0..SHARED {
+        let pod = create_at(&alice_phone, &alice, [n; 16]).await?;
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            &bob,
+            vec![device_of(&bob_phone, &bob)?],
+        )
+        .await?;
+        bob_phone
+            .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+            .await?;
+        pods.push(pod);
+    }
+
+    let ends = [pods.first().copied(), pods.last().copied()];
+    for pod in ends.into_iter().flatten() {
+        let from_alice = place_claim(&alice_phone, &alice, pod, 1).await?;
+        let from_bob = place_claim(&bob_phone, &bob, pod, 2).await?;
+        assert!(
+            reads(&bob_phone, bob.id, pod, from_alice).await?,
+            "Alice's claim did not reach Bob's node over the swarm"
+        );
+        assert!(
+            reads(&alice_phone, alice.id, pod, from_bob).await?,
+            "Bob's claim did not reach Alice's node over the swarm"
+        );
+    }
+    let last = pods.last().copied().expect("sixty pods");
+    for seed in 3..=202 {
+        place_claim(&bob_phone, &bob, last, seed).await?;
+    }
+    tokio::time::timeout(TIMEOUT, create_at(&bob_phone, &bob, [0xff; 16]))
+        .await
+        .map_err(|_| anyhow::anyhow!("the node stopped answering after a burst of writes"))??;
+
+    for node in [alice_phone, bob_phone] {
         node.shutdown().await?;
     }
     Ok(())

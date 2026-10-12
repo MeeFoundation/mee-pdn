@@ -310,6 +310,7 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             .to_bytes(),
             bob.keys
                 .device_statement(
+                    &pod,
                     2,
                     vec![
                         c::device_of(carol_phone, &carol)?,
@@ -325,7 +326,10 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
             bob_author,
             membership,
             event(erin.id, 1, EventKind::Joined, bob.id).to_bytes(),
-            mallory.keys.join_statement(&pod, Seq::FIRST).encode(),
+            mallory
+                .keys
+                .join_statement(&pod, Seq::FIRST, c::device_of(bob_phone, &bob)?)
+                .encode(),
         ),
     ];
     for forgery in &forged {

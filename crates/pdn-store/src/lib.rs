@@ -59,8 +59,8 @@ pub use net::ALPN;
 
 pub use self::{
     filter::{
-        EntryFilter, SessionAccess, SessionAccessFuture, SessionAccessProvider, SessionIngest,
-        SessionRole,
+        EntryFilter, RestsOn, SessionAccess, SessionAccessFuture, SessionAccessProvider,
+        SessionIngest, SessionRole,
     },
     heads::*,
     identity::{Contact, Identity},

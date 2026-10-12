@@ -193,3 +193,93 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
     second.shutdown().await?;
     Ok(())
 }
+
+/// A payload written while a collection run is under way stays through that
+/// run, and reads.
+///
+/// The run is held once it has read the replicas, and the write lands in the
+/// hold; a stray payload added beside it leaves in the same run, so the run
+/// removed what nothing holds. The next run reaching its hold orders the
+/// assertions after this run's removals.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payload_written_while_a_run_is_under_way_stays() -> Result<()> {
+    let phone = node().await?;
+    let (carol, _) = host(&phone).await?;
+    phone.create_namespace(carol.id, carol.id).await?;
+    let photo = EntryPath::new("photos/beach")?;
+
+    let run = phone.pause_next_collection_for_test();
+    run.reached.notified().await;
+    phone
+        .write(
+            carol.id,
+            carol.id,
+            phone.default_author(carol.id)?,
+            &photo,
+            b"photo",
+        )
+        .await?;
+    let stray = phone.add_stray_payload_for_test(b"stray").await?;
+    run.release.notify_one();
+    let next = phone.pause_next_collection_for_test();
+    next.reached.notified().await;
+    next.release.notify_one();
+
+    assert!(!phone.holds_payload(stray).await?);
+    assert_eq!(
+        phone.read(carol.id, carol.id, &photo).await?.as_deref(),
+        Some(&b"photo"[..]),
+        "a payload written during a run was removed"
+    );
+
+    phone.shutdown().await?;
+    Ok(())
+}
+
+/// A payload that arrives from a member device while a collection run is
+/// under way stays through that run, and reads.
+///
+/// Held as the scenario above: the record arrives and its payload is fetched
+/// in the hold, and a stray payload leaves in the same run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
+    let (alice_phone, bob_phone) = (node().await?, node().await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    bob_phone
+        .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+        .await?;
+
+    let run = bob_phone.pause_next_collection_for_test();
+    run.reached.notified().await;
+    let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
+    assert!(reads(&bob_phone, bob.id, pod, claim).await?);
+    let stray = bob_phone.add_stray_payload_for_test(b"stray").await?;
+    run.release.notify_one();
+    let next = bob_phone.pause_next_collection_for_test();
+    next.reached.notified().await;
+    next.release.notify_one();
+
+    assert!(!bob_phone.holds_payload(stray).await?);
+    assert!(
+        bob_phone
+            .read_pod_record(bob.id, pod, &claim)
+            .await?
+            .is_some(),
+        "a payload fetched during a run was removed"
+    );
+
+    for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

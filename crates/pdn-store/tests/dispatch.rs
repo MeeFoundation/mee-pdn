@@ -18,7 +18,7 @@ use pdn_store::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc, DocsApi,
     },
-    net::{connect_and_sync, AbortReason, ConnectError},
+    net::{accept_session, connect_and_sync, refuse_session, AbortReason, ConnectError},
     protocol::{Docs, DocsDispatch, IdentityResolver},
     store::Query,
     Contact, Identity, NamespaceId, SessionAccess, SessionAccessFuture, SessionAccessProvider,
@@ -410,6 +410,60 @@ async fn the_dialing_side_is_asked_about_the_identity_it_addresses() -> Result<(
     );
 
     serving.router.shutdown().await?;
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A node that reads each session's first message and refuses it as already
+/// syncing, as a remote holding a pair's exchange forever answers.
+#[derive(Debug, Clone, Default)]
+struct AlwaysSyncing {
+    refused: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl iroh::protocol::ProtocolHandler for AlwaysSyncing {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        let Ok(opening) = accept_session(&connection).await else {
+            return Ok(());
+        };
+        self.refused
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = refuse_session(opening, AbortReason::AlreadySyncing).await;
+        Ok(())
+    }
+}
+
+/// A remote that answers every dial as already syncing is dialed again a
+/// bounded number of times in a row, not for as long as it answers so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_always_syncing_is_redialed_a_bounded_number_of_times() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let busy = AlwaysSyncing::default();
+    let busy_router = Router::builder(loopback_endpoint().await?)
+        .accept(pdn_store::ALPN, busy.clone())
+        .spawn();
+    let doc = dialing.docs.api().create().await?;
+    doc.start_sync_scoped(
+        vec![Contact::new(busy_router.endpoint().addr(), WORK)],
+        CALLER,
+    )
+    .await?;
+
+    let refused = || busy.refused.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        eventually(|| async { Ok(refused() >= 4) }).await?,
+        "the first dial and its redials did not reach the remote: {}",
+        refused()
+    );
+    // Past the delay an unbounded redial would wait after the last: twice
+    // the two seconds before it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(refused(), 4, "the remote was dialed past the bound");
+
+    busy_router.shutdown().await?;
     dialing.router.shutdown().await?;
     Ok(())
 }

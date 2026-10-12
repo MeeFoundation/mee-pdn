@@ -480,16 +480,12 @@ async fn a_withdrawal_over_many_markers_leaves_the_runtime_serving() -> Result<(
         .connections()
         .publish_grant(bob, alice, bob, common::claims_on(bob, &phone, true))
         .await?;
+    // Bound, not merely delivered: a write before the binder's import
+    // names an issuer Alice does not hold yet.
     assert!(
-        eventually(|| async {
-            Ok(!rt_alice
-                .connections()
-                .read_grants(alice, bob)
-                .await?
-                .is_empty())
-        })
-        .await?,
-        "the grant did not reach Alice"
+        eventually(|| async { Ok(rt_alice.connections().grant_bound(alice, bob, bob).await) })
+            .await?,
+        "the grant did not bind Bob's namespace on Alice"
     );
 
     // Every forced path lies outside the grant, so Bob's gate refuses each

@@ -36,8 +36,8 @@ use crate::{
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
-        connect_and_sync, handle_in_process_session, handle_session, AbortReason, AcceptError,
-        AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
+        connect_and_sync_asking, handle_in_process_session, handle_session, AbortReason,
+        AcceptError, AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
     },
     subscribers::{Delivery, LagNotice, Subscribers},
     AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
@@ -323,8 +323,14 @@ impl PeerIdentities {
 }
 
 /// How long after a remote aborted a dial as already syncing it is asked
-/// for again: enough for the remote's own exchange to have run.
+/// for again: enough for the remote's own exchange to have run. Each
+/// further abort in a row doubles it.
 const REDIAL_AFTER_ABORT: Duration = Duration::from_millis(500);
+
+/// Redials of one pair in a row before an abort is left to the next
+/// trigger: the remote picks the abort's reason, so without a bound a
+/// remote answering every dial as already syncing keeps one going forever.
+const MAX_REDIALS: u32 = 3;
 
 /// A dial held until the exchange it follows finishes.
 enum HeldDial {
@@ -354,6 +360,7 @@ pub struct LiveActor {
     sync: DrainingSync,
     endpoint: Endpoint,
     bao_store: Store,
+    held_payloads: Arc<super::held::HeldPayloads>,
     downloader: Downloader,
     memory_lookup: MemoryLookup,
 
@@ -411,6 +418,9 @@ pub struct LiveActor {
     held_dials: HashMap<(NamespaceId, PublicKey, Identity), Vec<HeldDial>>,
     /// Redials waiting out [`REDIAL_AFTER_ABORT`], by namespace.
     redials_due: HashMap<NamespaceId, usize>,
+    /// Aborts as already syncing in a row per pair, cleared by an exchange
+    /// that finishes.
+    redial_streaks: HashMap<(NamespaceId, PublicKey, Identity), u32>,
     /// In-process sessions opened, so a pass over a quiet pair can be
     /// shown to open none.
     in_process_sessions: Arc<AtomicU64>,
@@ -428,6 +438,7 @@ impl LiveActor {
         endpoint: Endpoint,
         gossip: Gossip,
         bao_store: Store,
+        held_payloads: Arc<super::held::HeldPayloads>,
         downloader: Downloader,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
@@ -447,6 +458,7 @@ impl LiveActor {
             memory_lookup,
             gossip: gossip_state,
             bao_store,
+            held_payloads,
             downloader,
             sync_actor_tx,
             running_sync_connect: Default::default(),
@@ -465,6 +477,7 @@ impl LiveActor {
             prerequisites: Default::default(),
             held_dials: Default::default(),
             redials_due: Default::default(),
+            redial_streaks: Default::default(),
             in_process_sessions,
             co_located,
             metrics,
@@ -723,19 +736,36 @@ impl LiveActor {
     }
 
     /// A pull of the news `peer` reported, addressed as contacts and running
-    /// sessions name it, else as the identity the report names. That name
-    /// is the sender's word and picks only which replica of its own node the
-    /// pull addresses; the access provider judges the session on both sides.
+    /// sessions name it, else as the identity the report names when the
+    /// consumer named that identity for the replica, else as
+    /// [`identities_of_peer`](Self::identities_of_peer) does. The report's
+    /// name is the sender's word, so it picks among the consumer's names
+    /// alone: a sender naming fresh identities would otherwise open a slot
+    /// and a dial for each.
     fn sync_with_reporter(&mut self, namespace: NamespaceId, peer: PublicKey, reporter: Identity) {
         let learned = self.learned_identities(namespace, peer);
-        let callees = if learned.is_empty() {
+        let callees = if !learned.is_empty() {
+            learned
+        } else if self.consumer_names(namespace, reporter) {
             vec![reporter]
         } else {
-            learned
+            self.identities_of_peer(namespace, peer)
         };
         for callee in callees {
             self.sync_with_identity(namespace, peer, callee, SyncReason::SyncReport);
         }
+    }
+
+    /// Whether the consumer named `identity` for `namespace`: as a contact's
+    /// or as the replica's default.
+    fn consumer_names(&self, namespace: NamespaceId, identity: Identity) -> bool {
+        self.default_identities.get(&namespace) == Some(&identity)
+            || self
+                .peer_identities
+                .iter()
+                .any(|((tracked, _peer), identities)| {
+                    *tracked == namespace && identities.stated.contains(&identity)
+                })
     }
 
     /// One dial per identity the peer is known as: co-located identities of one
@@ -771,6 +801,10 @@ impl LiveActor {
                 self.dial(first, peer, callee, reason);
             }
             if self.state.is_running(&first, (peer, callee)) {
+                // One held dial per trigger: merged, the second no longer
+                // queues its resync at release, and
+                // `two_nodes_sharing_sixty_pods_keep_live_delivery_in_each`
+                // in data-layer misses a claim in about one run in ten.
                 self.held_dials
                     .entry((first, peer, callee))
                     .or_default()
@@ -799,37 +833,19 @@ impl LiveActor {
         let fut = async move {
             // The dialing side serves entries too (reconciliation is
             // bidirectional), so the embedder's access provider gates this
-            // role exactly like the accept role.
-            // The addressed identity first, the acting one second, as on
-            // the accept path: dialing, the party across the session is
-            // the callee.
-            let access = session_access(
+            // role exactly like the accept role, asked once the session's
+            // snapshot is open.
+            let res = connect_and_sync_asking(
+                &endpoint,
+                &sync,
                 namespace,
                 callee,
                 caller,
-                peer,
-                crate::filter::SessionRole::Dial,
+                EndpointAddr::new(peer),
+                Some(&metrics),
+                &session_access,
             )
             .await;
-            let res = match access {
-                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
-                    "session denied by the local access provider"
-                ))),
-                crate::filter::SessionAccess::Allow { egress, ingest } => {
-                    connect_and_sync(
-                        &endpoint,
-                        &sync,
-                        namespace,
-                        callee,
-                        caller,
-                        EndpointAddr::new(peer),
-                        Some(&metrics),
-                        egress,
-                        ingest,
-                    )
-                    .await
-                }
-            };
             (namespace, peer, callee, reason, res)
         }
         .instrument(Span::current());
@@ -875,37 +891,18 @@ impl LiveActor {
         let caller = self.identity;
         self.in_process_sessions.fetch_add(1, Ordering::Relaxed);
         let fut = async move {
-            // The addressed identity first, the acting one second, as on
-            // the accept path: dialing, the party across the session is
-            // the callee.
-            let access = session_access(
+            let res = crate::net::sync_in_process(
+                &sync,
                 namespace,
                 callee,
                 caller,
                 peer,
-                crate::filter::SessionRole::Dial,
+                &mut send,
+                &mut recv,
+                Some(&metrics),
+                &session_access,
             )
             .await;
-            let res = match access {
-                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
-                    "session denied by the local access provider"
-                ))),
-                crate::filter::SessionAccess::Allow { egress, ingest } => {
-                    crate::net::sync_in_process(
-                        &sync,
-                        namespace,
-                        callee,
-                        caller,
-                        peer,
-                        &mut send,
-                        &mut recv,
-                        Some(&metrics),
-                        egress,
-                        ingest,
-                    )
-                    .await
-                }
-            };
             (namespace, peer, callee, reason, res)
         }
         .instrument(Span::current());
@@ -1043,6 +1040,8 @@ impl LiveActor {
         if self.state.remove(&namespace) {
             self.peer_identities
                 .retain(|(tracked, _peer), _identities| *tracked != namespace);
+            self.redial_streaks
+                .retain(|(tracked, _peer, _callee), _streak| *tracked != namespace);
             self.sync.set_sync(namespace, false).await?;
             self.sync.unsubscribe(namespace).await?;
             self.sync.close(namespace).await?;
@@ -1216,6 +1215,20 @@ impl LiveActor {
                 // neither runs; or one that froze the remote's view before
                 // the news this dial was for. Dialing again once it is over
                 // settles both, whatever finished in between.
+                let streak = self
+                    .redial_streaks
+                    .entry((namespace, peer, callee))
+                    .or_default();
+                *streak = streak.saturating_add(1);
+                if *streak > MAX_REDIALS {
+                    debug!(?reason, "redials in a row exhausted");
+                    return;
+                }
+                let delay = REDIAL_AFTER_ABORT.saturating_mul(
+                    1_u32
+                        .checked_shl(streak.saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                );
                 let redial = ToLiveActor::Redial {
                     namespace,
                     peer,
@@ -1226,7 +1239,7 @@ impl LiveActor {
                 *due = due.saturating_add(1);
                 let to_self = self.sync_actor_tx.clone();
                 n0_future::task::spawn(async move {
-                    n0_future::time::sleep(REDIAL_AFTER_ABORT).await;
+                    n0_future::time::sleep(delay).await;
                     to_self.send(redial).await.ok();
                 });
             }
@@ -1295,6 +1308,7 @@ impl LiveActor {
                 warn!(?origin, ?err, "sync failed");
             }
             Ok(ref details) => {
+                self.redial_streaks.remove(&(namespace, peer, counterpart));
                 info!(
                     sent = %details.outcome.num_sent,
                     recv = %details.outcome.num_recv,
@@ -1579,6 +1593,18 @@ impl LiveActor {
                 // content.
                 if should_download {
                     let hash = entry.content_hash();
+                    // From the insert on: a collection read that missed the
+                    // entry would sweep its payload, landed or lying orphaned.
+                    if self.held_payloads.wants(&hash) {
+                        if let Ok(tag) = self
+                            .bao_store
+                            .tags()
+                            .temp_tag(HashAndFormat::raw(hash))
+                            .await
+                        {
+                            self.held_payloads.hold(tag);
+                        }
+                    }
                     if matches!(remote_content_status, ContentStatus::Complete) {
                         let node_id = PublicKey::from_bytes(&from)?;
                         self.start_download(namespace, hash, node_id, false).await;
@@ -1668,12 +1694,28 @@ impl LiveActor {
                     crate::filter::SessionRole::Accept,
                 )
                 .await;
-                let (egress, ingest) = match admitted {
-                    crate::filter::SessionAccess::Allow { egress, ingest } => (egress, ingest),
+                let (egress, ingest, rests_on) = match admitted {
+                    crate::filter::SessionAccess::Allow {
+                        egress,
+                        ingest,
+                        rests_on,
+                    } => (egress, ingest, rests_on),
                     // The one uniform refusal.
                     crate::filter::SessionAccess::Deny => {
                         return AcceptOutcome::Reject(AbortReason::NotFound)
                     }
+                };
+                let recheck = crate::net::Recheck {
+                    rests_on,
+                    ask: Arc::new(move || {
+                        session_access(
+                            namespace,
+                            identity,
+                            caller,
+                            peer,
+                            crate::filter::SessionRole::Accept,
+                        )
+                    }),
                 };
                 let (reply_tx, reply_rx) = oneshot::channel();
                 to_actor_tx
@@ -1689,6 +1731,7 @@ impl LiveActor {
                     Ok(AcceptOutcome::Allow { .. }) => AcceptOutcome::Allow {
                         filter: egress,
                         ingest,
+                        recheck: Some(recheck),
                     },
                     Ok(reject) => reject,
                     Err(err) => {

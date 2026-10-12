@@ -1,7 +1,7 @@
 //! A pod's entries as the pods service writes them, by the store-level
 //! writes it performs, and the reads a scenario waits on.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use data_layer::{
     AddrInfoOptions, EventKind, IdentityKeyPair, MemberDevice, MemberState, MembershipKey,
     PodStore, PodTickets, PrivateMetadataStore, RecordKey, Seq, SyncNode,
@@ -70,16 +70,22 @@ pub async fn statement(
         member: member.id,
         version: 1,
     };
-    let payload = member.keys.device_statement(1, devices).encode();
+    let payload = member.keys.device_statement(&pod, 1, devices).encode();
     write(node, writer, pod, key, payload).await
 }
 
 /// `creator`'s pod on `node`: both stores, the created event and the
 /// creator's first device statement.
 pub async fn create(node: &SyncNode, creator: &Person) -> Result<PodId> {
-    let creation = creator.keys.creation([0x5a; 16]);
-    let pod = data_layer::pod_id_of(&creator.id, &creation.identity_key, &creation.nonce);
+    create_at(node, creator, [0x5a; 16]).await
+}
+
+/// [`create`] under `nonce`: one creator's pods differ by nonce alone.
+pub async fn create_at(node: &SyncNode, creator: &Person, nonce: [u8; 16]) -> Result<PodId> {
+    let pod = data_layer::pod_id_of(&creator.id, &creator.keys.public_key(), &nonce);
     node.create_pod(creator.id, pod).await?;
+    let (membership, records) = node.pod_stores(creator.id, pod)?;
+    let creation = creator.keys.creation(nonce, membership, records);
     write(
         node,
         creator,
@@ -98,8 +104,9 @@ pub async fn tickets(node: &SyncNode, holder: &Person, pod: PodId) -> Result<Pod
 }
 
 /// The invite act for `newcomer` at its sequence 1, naming the inviter's
-/// sequence 1, and the newcomer's first device statement, both written on
-/// the inviter's node as the join dialogue writes them.
+/// sequence 1, its join statement naming the first of `devices`, written on
+/// the inviter's node as the join dialogue writes it; more devices go into
+/// the newcomer's first device statement beside it.
 pub async fn invite(
     node: &SyncNode,
     inviter: &Person,
@@ -114,9 +121,13 @@ pub async fn invite(
         actor: inviter.id,
         actor_seq: Seq::FIRST,
     };
-    let join_statement = newcomer.keys.join_statement(&pod, Seq::FIRST);
+    let first = *devices.first().context("a newcomer joins from a device")?;
+    let join_statement = newcomer.keys.join_statement(&pod, Seq::FIRST, first);
     write(node, inviter, pod, key, join_statement.encode()).await?;
-    statement(node, inviter, pod, newcomer, devices).await
+    if devices.len() > 1 {
+        statement(node, inviter, pod, newcomer, devices).await?;
+    }
+    Ok(())
 }
 
 /// `member`'s state as the membership view of `holder`'s replica shows it;

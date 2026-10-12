@@ -6,12 +6,17 @@
 //! pod's creation, its joins and its departures write arrive by the
 //! store-level writes the pods service performs, and the tickets by hand.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write,
+    time::{Duration, Instant},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice, MemberState,
-    MembershipKey, PodStore, PrivateMetadataStore, Seq, ShareMode, SpawnOptions, SyncNode,
+    MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace, ShareMode,
+    SpawnOptions, SyncNode, Traced,
 };
 use pdn_types::PodId;
 use test_utils::{
@@ -133,6 +138,214 @@ async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
     Ok(false)
 }
 
+/// Every trace on `traces` whose session has `carol` on `c1` as either
+/// party, oldest first, as `+ms book role store remote@peer: what`.
+fn sessions_with(
+    traces: &mut [tokio::sync::mpsc::UnboundedReceiver<SessionTrace>],
+    since: Instant,
+    carol: &Person,
+    c1: pdn_types::NodeId,
+    names: &HashMap<[u8; 32], &str>,
+) -> Vec<String> {
+    let name = |bytes: &[u8; 32]| {
+        names.get(bytes).map_or_else(
+            || {
+                bytes.iter().take(5).fold(String::new(), |mut short, byte| {
+                    let _ = write!(short, "{byte:02x}");
+                    short
+                })
+            },
+            |name| (*name).to_owned(),
+        )
+    };
+    let mut held = Vec::new();
+    for receiver in traces.iter_mut() {
+        while let Ok(trace) = receiver.try_recv() {
+            held.push(trace);
+        }
+    }
+    held.sort_by_key(|trace| trace.at);
+    held.iter()
+        .filter(|trace| trace.identity == carol.id || trace.peer == c1)
+        .map(|trace| {
+            let what = match &trace.traced {
+                Traced::Admitted { key, author } => format!(
+                    "admitted {} by {}",
+                    String::from_utf8_lossy(key),
+                    author.fmt_short()
+                ),
+                decision => format!("{decision:?}"),
+            };
+            format!(
+                "+{}ms {} {:?} {} {}@{}: {what}",
+                trace.at.saturating_duration_since(since).as_millis(),
+                name(trace.identity.as_bytes()),
+                trace.role,
+                name(trace.namespace.as_bytes()),
+                name(trace.remote.as_bytes()),
+                name(trace.peer.as_bytes()),
+            )
+        })
+        .collect()
+}
+
+/// Alice's pod with Bob and Carol, Carol's device out of both swarms, so its
+/// own view still lists her a member when a session arrives, as a device
+/// offline throughout does, and every node settled: a dial of Carol's
+/// device's crossing a held session would supersede it by the tie-break.
+struct StaleMember {
+    alice_phone: SyncNode,
+    bob_phone: SyncNode,
+    carol_phone: SyncNode,
+    alice: Person,
+    carol: Person,
+    pod: PodId,
+    records: NamespaceId,
+}
+
+async fn stale_member() -> Result<StaleMember> {
+    let (alice_phone, bob_phone, carol_phone) =
+        (node(QUIET).await?, node(QUIET).await?, node(QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for (phone, holder) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        phone.import_pod(holder.id, pod, tickets.clone()).await?;
+    }
+    assert!(lists(&carol_phone, carol.id, pod, bob.id, PLAIN).await?);
+    let (membership, records) = carol_phone.pod_stores(carol.id, pod)?;
+    for namespace in [membership, records] {
+        carol_phone
+            .leave_swarm_for_test(carol.id, namespace)
+            .await?;
+    }
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    Ok(StaleMember {
+        alice_phone,
+        bob_phone,
+        carol_phone,
+        alice,
+        carol,
+        pod,
+        records,
+    })
+}
+
+/// A member device's dial whose access was decided while a member was still
+/// one, and whose session reaches that member's device only after its
+/// removal and a record placed after it, takes the record to it nowhere.
+///
+/// The dial is held right after its access decision, as long as a connect
+/// to a device that is down would hold a decision taken before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_decided_before_a_removal_takes_nothing_placed_after_it() -> Result<()> {
+    let StaleMember {
+        alice_phone,
+        bob_phone,
+        carol_phone,
+        alice,
+        carol,
+        pod,
+        records,
+    } = stale_member().await?;
+    let mut accepted = carol_phone
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
+        .await?;
+    let held_dial =
+        alice_phone.pause_next_dial_for_test(alice.id, records, carol_phone.node_id())?;
+    dial(
+        &alice_phone,
+        &alice,
+        pod,
+        PodStore::Records,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    held_dial.reached.notified().await;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
+    place_claim(&alice_phone, &alice, pod, 1).await?;
+    held_dial.release.notify_one();
+    accepted
+        .next_with(alice_phone.node_id(), false, TIMEOUT)
+        .await?
+        .context("the held dial's session never reached the device")?;
+
+    let held = held_records(&carol_phone, carol.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the removed member's device holds records: {held:#?}"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A session a removed member's device dials, accepted on a decision taken
+/// before the removal, takes nothing placed after the removal to it.
+///
+/// The accept is held right after its access decision, as long as the
+/// engine's queues on a loaded node would hold it before its snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accept_decided_before_a_removal_takes_nothing_placed_after_it() -> Result<()> {
+    let StaleMember {
+        alice_phone,
+        bob_phone,
+        carol_phone,
+        alice,
+        carol,
+        pod,
+        records,
+    } = stale_member().await?;
+    let mut dialed = carol_phone
+        .watch_pod_sessions(carol.id, pod, PodStore::Records)
+        .await?;
+    let held_accept =
+        alice_phone.pause_next_accept_for_test(alice.id, records, carol_phone.node_id())?;
+    dial(
+        &carol_phone,
+        &carol,
+        pod,
+        PodStore::Records,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    held_accept.reached.notified().await;
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
+    place_claim(&alice_phone, &alice, pod, 1).await?;
+    held_accept.release.notify_one();
+    dialed
+        .next_with(alice_phone.node_id(), true, TIMEOUT)
+        .await?
+        .context("the held session never ended on the device")?;
+
+    let held = held_records(&carol_phone, carol.id, pod).await?;
+    assert!(
+        held.is_empty(),
+        "the removed member's device holds records: {held:#?}"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A device offline while its member is removed learns of the removal at its
 /// first session with a member device, taking the removal and what it rests
 /// on. Denied: a membership event outside the removal's past and a record
@@ -176,7 +389,23 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     assert!(lists(&alice_phone, alice.id, pod, dave.id, PLAIN).await?);
     assert!(reads(&bob_phone, bob.id, pod, claim).await?);
 
+    let restarted = Instant::now();
+    let mut traces = vec![
+        alice_phone.take_session_traces().context("taken once")?,
+        bob_phone.take_session_traces().context("taken once")?,
+    ];
     let carol_phone = node_on(dir.path()).await?;
+    traces.push(carol_phone.take_session_traces().context("taken once")?);
+    let names: HashMap<[u8; 32], &str> = HashMap::from([
+        (*alice_phone.node_id().as_bytes(), "a1"),
+        (*bob_phone.node_id().as_bytes(), "b1"),
+        (*carol_phone.node_id().as_bytes(), "c1"),
+        (*alice.id.as_bytes(), "alice"),
+        (*bob.id.as_bytes(), "bob"),
+        (*carol.id.as_bytes(), "carol"),
+        (*tickets.membership.capability.id().as_bytes(), "membership"),
+        (*tickets.records.capability.id().as_bytes(), "records"),
+    ]);
     carol_phone.provision_identity(carol.id).await?;
     carol_phone.import_pod(carol.id, pod, tickets).await?;
     assert!(
@@ -207,7 +436,8 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     let held = held_records(&carol_phone, carol.id, pod).await?;
     assert!(
         held.is_empty(),
-        "the removed member's device holds records: {held:#?}"
+        "the removed member's device holds records: {held:#?}\nsessions with c1 since its restart: {:#?}",
+        sessions_with(&mut traces, restarted, &carol, carol_phone.node_id(), &names)
     );
 
     for node in [alice_phone, bob_phone, carol_phone] {
@@ -622,6 +852,7 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
     let statement = bob
         .keys
         .device_statement(
+            &pod,
             2,
             vec![device_of(&bob_phone, &bob)?, device_of(&bob_laptop, &bob)?],
         )
@@ -643,7 +874,10 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
         actor: alice.id,
         actor_seq: Seq::FIRST,
     };
-    let join_statement = carol.keys.join_statement(&pod, Seq::new(3)).encode();
+    let join_statement = carol
+        .keys
+        .join_statement(&pod, Seq::new(3), device_of(&carol_phone, &carol)?)
+        .encode();
     write(&alice_phone, &alice, pod, rejoined, join_statement).await?;
     dial(
         &carol_phone,

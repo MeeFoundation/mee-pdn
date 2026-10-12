@@ -38,20 +38,17 @@ fn a_removals_past_holds_what_it_rests_on_and_nothing_else() {
     }
     for (index, name) in [
         (bob_joined, "Bob's joined event"),
-        (bob_joined + 1, "Bob's statement"),
         (dave_joined, "Dave's joined event"),
-        (dave_joined + 1, "Dave's statement"),
     ] {
         assert!(!past.contains(&entry(&store, index)), "{name} taken in");
     }
     assert_eq!(past.len(), 4);
 }
 
-/// A leave's past holds the member's own chain and the statement resolving
-/// the device it left from, and what its join rests on. Denied: nobody
-/// else's entries.
+/// A leave's past holds the member's own chain, its join naming the device
+/// it left from, and what its join rests on. Denied: nobody else's entries.
 #[test]
-fn a_leaves_past_holds_the_members_own_chain_and_statement() {
+fn a_leaves_past_holds_the_members_own_chain_and_what_it_rests_on() {
     let cast = Cast::new();
     let (alice, bob, carol) = (&cast.alice, &cast.bob, &cast.carol);
     let mut store = Store::created_by(alice);
@@ -59,13 +56,11 @@ fn a_leaves_past_holds_the_members_own_chain_and_statement() {
     let carol_joined = store.invite(alice, 1, carol);
     let left = store.act(EventKind::Left, carol, 2, carol, 1);
     let past = past_of(&store, carol).expect("Carol departed");
-    for index in [0, 1, carol_joined, carol_joined + 1, left] {
+    for index in [0, 1, carol_joined, left] {
         assert!(past.contains(&entry(&store, index)));
     }
-    for index in [bob_joined, bob_joined + 1] {
-        assert!(!past.contains(&entry(&store, index)));
-    }
-    assert_eq!(past.len(), 5);
+    assert!(!past.contains(&entry(&store, bob_joined)));
+    assert_eq!(past.len(), 4);
 }
 
 /// A sequence held by an entry that counts for nothing stays in the past,

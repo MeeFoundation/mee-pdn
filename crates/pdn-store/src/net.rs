@@ -1,6 +1,6 @@
 //! Network implementation of the iroh-docs protocol
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use n0_future::time::{self, Duration, Instant};
@@ -10,7 +10,7 @@ use tracing::{debug, error_span, trace, Instrument};
 use crate::{
     actor::SyncHandle,
     metrics::Metrics,
-    net::codec::{run_alice, BobState},
+    net::codec::{run_alice, BobState, DialAccess},
     Identity, NamespaceId, SyncOutcome,
 };
 
@@ -34,6 +34,8 @@ pub const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 ///
 /// `filter` is this side's egress filter for the session: what the dialing
 /// node reveals of its replica to the peer. `None` serves the full view.
+/// The engine's own dials ask their access once the session's snapshot is
+/// open instead (`connect_and_sync_asking`).
 ///
 /// The session serves entries from a store snapshot frozen at session
 /// setup, so the served view is stable across the exchange; entries
@@ -55,7 +57,50 @@ pub async fn connect_and_sync(
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
         connect_and_sync_inner(
-            endpoint, sync, namespace, identity, caller, peer, metrics, filter, ingest,
+            endpoint,
+            sync,
+            namespace,
+            identity,
+            caller,
+            peer,
+            metrics,
+            DialAccess::Given { filter, ingest },
+        ),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_elapsed) => Err(ConnectError::connect(anyhow::anyhow!(
+            "sync exchange timed out after {SYNC_SESSION_TIMEOUT:?}"
+        ))),
+    }
+}
+
+/// [`connect_and_sync`], with this side's access asked of `access` once the
+/// connection stands and the session's snapshot is open, so a connect that
+/// waits across a change of access serves by the access after it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_and_sync_asking(
+    endpoint: &Endpoint,
+    sync: &SyncHandle,
+    namespace: NamespaceId,
+    identity: Identity,
+    caller: Identity,
+    peer: EndpointAddr,
+    metrics: Option<&Metrics>,
+    access: &crate::filter::SessionAccessProvider,
+) -> Result<SyncFinished, ConnectError> {
+    match time::timeout(
+        SYNC_SESSION_TIMEOUT,
+        connect_and_sync_inner(
+            endpoint,
+            sync,
+            namespace,
+            identity,
+            caller,
+            peer,
+            metrics,
+            DialAccess::Asked(access),
         ),
     )
     .await
@@ -76,8 +121,7 @@ async fn connect_and_sync_inner(
     caller: Identity,
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
-    filter: Option<crate::filter::EntryFilter>,
-    ingest: Option<crate::filter::SessionIngest>,
+    access: DialAccess<'_>,
 ) -> Result<SyncFinished, ConnectError> {
     let t_start = Instant::now();
     let peer_id = peer.id;
@@ -101,8 +145,7 @@ async fn connect_and_sync_inner(
         identity,
         caller,
         peer_id,
-        filter,
-        ingest,
+        access,
     )
     .await;
 
@@ -181,18 +224,44 @@ pub enum AcceptOutcome {
         /// what the peer offers. `None` leaves that to the consumer's
         /// validator.
         ingest: Option<crate::filter::SessionIngest>,
+        /// Checked once the session's snapshot is open; `None` holds for
+        /// any snapshot.
+        recheck: Option<Recheck>,
     },
     /// Decline the sync request
     Reject(AbortReason),
 }
 
+/// The access decision behind an accepted session: the snapshot opens after
+/// it, so a decision whose replicas were written in between is asked again.
+#[derive(Clone)]
+pub struct Recheck {
+    /// What the decision was read from.
+    pub rests_on: crate::filter::RestsOn,
+    /// Asks for the decision again; its answer stands.
+    pub ask: Arc<dyn Fn() -> crate::filter::SessionAccessFuture + Send + Sync>,
+}
+
+impl std::fmt::Debug for Recheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recheck")
+            .field("rests_on", &self.rests_on)
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for AcceptOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcceptOutcome::Allow { filter, ingest } => f
+            AcceptOutcome::Allow {
+                filter,
+                ingest,
+                recheck,
+            } => f
                 .debug_struct("Allow")
                 .field("filter", &filter.as_ref().map(|_| "filtered"))
                 .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .field("recheck", recheck)
                 .finish(),
             AcceptOutcome::Reject(reason) => write!(f, "Reject({reason:?})"),
         }
@@ -441,7 +510,8 @@ where
 
 /// Run the initiator side of a session over a stream pair inside this
 /// process, with the same codec and the same session setup the network
-/// path uses.
+/// path uses, this side's access asked of `access` once the session's
+/// snapshot is open.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_in_process<R, W>(
     sync: &SyncHandle,
@@ -452,8 +522,7 @@ pub async fn sync_in_process<R, W>(
     writer: &mut W,
     reader: &mut R,
     metrics: Option<&Metrics>,
-    filter: Option<crate::filter::EntryFilter>,
-    ingest: Option<crate::filter::SessionIngest>,
+    access: &crate::filter::SessionAccessProvider,
 ) -> Result<SyncFinished, ConnectError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -464,7 +533,14 @@ where
     let res = time::timeout(
         SYNC_SESSION_TIMEOUT,
         run_alice(
-            writer, reader, sync, namespace, identity, caller, peer, filter, ingest,
+            writer,
+            reader,
+            sync,
+            namespace,
+            identity,
+            caller,
+            peer,
+            DialAccess::Asked(access),
         ),
     )
     .await

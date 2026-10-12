@@ -2,7 +2,7 @@
 //! fixed-size fields in a fixed order, decoded only at its exact length.
 //! What each signs is `identity_key`'s.
 
-use pdn_store::AuthorId;
+use pdn_store::{AuthorId, NamespaceId};
 use pdn_types::NodeId;
 
 /// A left, removed, promoted or demoted event's payload: its key carries
@@ -17,19 +17,25 @@ pub struct MemberDevice {
     pub author: AuthorId,
 }
 
-/// The created event's payload: `nonce ‖ identity_key ‖ signature`.
+/// The created event's payload:
+/// `nonce ‖ identity_key ‖ membership_store ‖ record_store ‖ signature`,
+/// the two stores the namespaces the creator made for the pod.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedPayload {
     pub nonce: [u8; 16],
     pub identity_key: [u8; 32],
+    pub membership_store: NamespaceId,
+    pub record_store: NamespaceId,
     pub signature: [u8; 64],
 }
 
 /// A joined event's payload, the newcomer's join statement:
-/// `identity_key ‖ signature`.
+/// `identity_key ‖ node ‖ author ‖ signature`, the device the newcomer joins
+/// from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinedPayload {
     pub identity_key: [u8; 32],
+    pub device: MemberDevice,
     pub signature: [u8; 64],
 }
 
@@ -43,13 +49,22 @@ pub struct DevicesPayload {
 
 impl CreatedPayload {
     pub fn encode(&self) -> Vec<u8> {
-        [&self.nonce[..], &self.identity_key, &self.signature].concat()
+        [
+            &self.nonce[..],
+            &self.identity_key,
+            self.membership_store.as_bytes(),
+            self.record_store.as_bytes(),
+            &self.signature,
+        ]
+        .concat()
     }
 
     pub fn decode(mut bytes: &[u8]) -> Option<Self> {
         let payload = Self {
             nonce: take(&mut bytes)?,
             identity_key: take(&mut bytes)?,
+            membership_store: NamespaceId::from(&take::<32>(&mut bytes)?),
+            record_store: NamespaceId::from(&take::<32>(&mut bytes)?),
             signature: take(&mut bytes)?,
         };
         bytes.is_empty().then_some(payload)
@@ -58,12 +73,21 @@ impl CreatedPayload {
 
 impl JoinedPayload {
     pub fn encode(&self) -> Vec<u8> {
-        [&self.identity_key[..], &self.signature].concat()
+        [
+            &self.identity_key[..],
+            &encode_devices(std::slice::from_ref(&self.device)),
+            &self.signature,
+        ]
+        .concat()
     }
 
     pub fn decode(mut bytes: &[u8]) -> Option<Self> {
         let payload = Self {
             identity_key: take(&mut bytes)?,
+            device: MemberDevice {
+                node: NodeId::from_bytes(take(&mut bytes)?),
+                author: AuthorId::from(&take::<32>(&mut bytes)?),
+            },
             signature: take(&mut bytes)?,
         };
         bytes.is_empty().then_some(payload)
@@ -126,10 +150,16 @@ mod tests {
         let created = CreatedPayload {
             nonce: [0x5a; 16],
             identity_key: [0x17; 32],
+            membership_store: NamespaceId::from(&[0x4d; 32]),
+            record_store: NamespaceId::from(&[0x52; 32]),
             signature: [0x0e; 64],
         };
         let joined = JoinedPayload {
             identity_key: [0x17; 32],
+            device: MemberDevice {
+                node: NodeId::from_bytes([0xb1; 32]),
+                author: AuthorId::from(&[0xa1; 32]),
+            },
             signature: [0x0e; 64],
         };
         let devices = DevicesPayload {
@@ -147,10 +177,10 @@ mod tests {
         };
 
         let encoded = created.encode();
-        assert_eq!(encoded.len(), 112);
+        assert_eq!(encoded.len(), 176);
         assert_eq!(CreatedPayload::decode(&encoded), Some(created));
         let encoded = joined.encode();
-        assert_eq!(encoded.len(), 96);
+        assert_eq!(encoded.len(), 160);
         assert_eq!(JoinedPayload::decode(&encoded), Some(joined));
         let encoded = devices.encode();
         assert_eq!(encoded.len(), 2 * 64 + 64);
@@ -159,9 +189,9 @@ mod tests {
         let mut long = devices.encode();
         long.push(0);
         assert_eq!(DevicesPayload::decode(&long), None);
-        assert_eq!(CreatedPayload::decode(&[0; 111]), None);
-        assert_eq!(CreatedPayload::decode(&[0; 113]), None);
-        assert_eq!(JoinedPayload::decode(&[0; 95]), None);
+        assert_eq!(CreatedPayload::decode(&[0; 175]), None);
+        assert_eq!(CreatedPayload::decode(&[0; 177]), None);
+        assert_eq!(JoinedPayload::decode(&[0; 159]), None);
         assert_eq!(DevicesPayload::decode(&[0; 63]), None);
     }
 }

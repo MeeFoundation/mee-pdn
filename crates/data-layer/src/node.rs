@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use futures_lite::{FutureExt, StreamExt};
 use iroh::{
-    endpoint::{default_relay_mode, presets, Connection},
+    endpoint::{default_relay_mode, presets, Connection, QuicTransportConfig, VarInt},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
@@ -42,9 +42,9 @@ use crate::{
     address_book::{AddressBook, ADDRESS_BOOK_INTERVAL},
     connection_metadata::ConnectionMetadataStore,
     pod::{
-        departure_past, record_entries, record_prefix, unknown_entries, Member, MemberDevice,
-        MembershipView, Operation, PodCatchUp, PodNotice, PodStore, PodTickets, RecordView, Seq,
-        UnknownEntry, UnknownPod,
+        departure_past, record_entries, record_prefix, unknown_entries, CreatedPayload, EventKind,
+        Member, MemberDevice, MembershipKey, MembershipView, Operation, PodCatchUp, PodNotice,
+        PodStore, PodTickets, RecordView, Seq, UnknownEntry, UnknownPod, Verdict,
     },
     private_metadata::PrivateMetadataStore,
     registry::{PodBinding, Registry, ServingPosture},
@@ -145,11 +145,30 @@ const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 /// pod's sessions stay bounded whatever its size.
 const POD_RECONCILE_PEERS: usize = 5;
 
+/// The slowest link a flush waits out, in bytes a second (1 Mbit/s): a
+/// payload the flushed device still lacks extends the wait by its length at
+/// this rate.
+const FLUSH_PAYLOAD_RATE: u64 = 125_000;
+
+/// Payloads a flush asks a device about at once, under the 100
+/// bidirectional streams a connection carries.
+const FLUSH_OBSERVES: usize = 16;
+
 /// Default of [`SpawnOptions::blob_collection_interval`].
 const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Default of [`SpawnOptions::pod_change_settle`].
 const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
+
+/// Unidirectional streams a peer holds open on one connection. Gossip keeps
+/// one per swarm topic two nodes share, a pod's stores are two, and a sender
+/// past the count sends that peer nothing on any topic.
+const MAX_UNI_STREAMS: u32 = 4_096;
+
+/// What one connection buffers across its streams: the 199 streams times
+/// 1,250,000 bytes the transport's defaults allowed, so the larger stream
+/// count gives a caller no more memory.
+const CONNECTION_RECEIVE_WINDOW: u32 = 248_750_000;
 
 /// Chosen by name at spawn, with no default. Not read from the process
 /// environment: several nodes spawn in one process, and a directory belongs
@@ -289,10 +308,16 @@ pub struct SyncNode {
     /// Holds the next pod start between its two stores' starts.
     #[cfg(feature = "test-util")]
     pod_start_pause: std::sync::Mutex<Option<Arc<PodStartPause>>>,
+    /// Holds the next blob collection run once it has read the replicas.
+    #[cfg(feature = "test-util")]
+    collection_pause: CollectionPauseSlot,
     /// Handed to every hosted identity's book; empty until a scenario takes
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
     pod_verdicts: crate::access::PodVerdictSink,
+    /// Handed to every hosted identity's book like `pod_verdicts`.
+    #[cfg(feature = "test-util")]
+    session_traces: crate::access::SessionTraceSink,
     /// Blob collection runs once set: at spawn on memory, at the host's
     /// [`start_blob_collection`](Self::start_blob_collection) on a
     /// directory.
@@ -626,7 +651,16 @@ impl SyncNode {
             options.storage,
             StorageConfig::Memory
         )));
-        let blobs_store = open_blob_store(&options, &identities, &collecting).await?;
+        #[cfg(feature = "test-util")]
+        let collection_pause = CollectionPauseSlot::default();
+        let blobs_store = open_blob_store(
+            &options,
+            &identities,
+            &collecting,
+            #[cfg(feature = "test-util")]
+            &collection_pause,
+        )
+        .await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let (retraction, retraction_verdicts) = RetractionTracker::new();
@@ -694,7 +728,11 @@ impl SyncNode {
             #[cfg(feature = "test-util")]
             pod_start_pause: std::sync::Mutex::default(),
             #[cfg(feature = "test-util")]
+            collection_pause,
+            #[cfg(feature = "test-util")]
             pod_verdicts: Arc::default(),
+            #[cfg(feature = "test-util")]
+            session_traces: Arc::default(),
             #[cfg(feature = "test-util")]
             pass_probes,
             collecting,
@@ -726,6 +764,8 @@ impl SyncNode {
         access.set_blobs(self.blobs.clone());
         #[cfg(feature = "test-util")]
         access.set_pod_verdicts(Arc::clone(&self.pod_verdicts));
+        #[cfg(feature = "test-util")]
+        access.set_session_traces(Arc::clone(&self.session_traces));
         let observer_tracker = Arc::clone(&self.retraction);
         let docs = self
             .docs_builder(identity, &access, &registry)?
@@ -741,6 +781,7 @@ impl SyncNode {
             )
             .await
             .map_err(|err| annotate_store_error(err, &self.storage))?;
+        access.set_sync(docs.engine().sync.clone());
         let api = docs.api().clone();
         let author = api.author_default().await?;
         self.retraction.track_author(identity, author);
@@ -1524,6 +1565,52 @@ impl SyncNode {
         pause
     }
 
+    /// Holds `identity`'s next dial on `namespace` to `peer` once its access
+    /// is decided, before the decision returns to the engine, until
+    /// `release` is notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_dial_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        peer: NodeId,
+    ) -> Result<Arc<crate::access::SessionPause>> {
+        Ok(self.require(identity)?.access.pause_next_session(
+            namespace,
+            peer,
+            pdn_store::SessionRole::Dial,
+        ))
+    }
+
+    /// Holds the next session `identity` accepts on `namespace` from `peer`
+    /// once its access is decided, before the decision returns to the
+    /// engine, until `release` is notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_accept_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+        peer: NodeId,
+    ) -> Result<Arc<crate::access::SessionPause>> {
+        Ok(self.require(identity)?.access.pause_next_session(
+            namespace,
+            peer,
+            pdn_store::SessionRole::Accept,
+        ))
+    }
+
+    /// Holds the next blob collection run once every hosted identity's
+    /// replicas are read, before it removes anything, until `release` is
+    /// notified.
+    #[cfg(feature = "test-util")]
+    pub fn pause_next_collection_for_test(&self) -> Arc<CollectionPause> {
+        let pause = Arc::new(CollectionPause::default());
+        if let Ok(mut slot) = self.collection_pause.lock() {
+            *slot = Some(Arc::clone(&pause));
+        }
+        pause
+    }
+
     /// Import both stores of `pod` from their write tickets: nothing new for
     /// a pod held on these stores, the pod again for its tombstone. Both
     /// stores' sync starts once they are registered, as at `create_pod`. A failed import drops nothing — a replica may predate
@@ -1821,7 +1908,8 @@ impl SyncNode {
     /// tombstone alone — with at most [`POD_RECONCILE_PEERS`] devices of its
     /// other members, drawn afresh, the membership store's exchange first.
     /// Returns once the dials are asked for; [`PodFlush::wait`] waits for
-    /// their sessions. [`UnknownPod`] for a pod `identity` never held.
+    /// their sessions and for the payloads of the identity's own entries.
+    /// [`UnknownPod`] for a pod `identity` never held.
     pub async fn flush_pod(&self, identity: PdnId, pod: PodId) -> Result<PodFlush> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
@@ -1839,9 +1927,17 @@ impl SyncNode {
             since: std::time::SystemTime::now(),
             peers: drawn
                 .iter()
-                .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
+                .map(|contact| {
+                    (
+                        NodeId::from_bytes(*contact.addr.id.as_bytes()),
+                        contact.addr.clone(),
+                    )
+                })
                 .collect(),
             sessions: Vec::new(),
+            payloads: own_payloads(&stack, pod, &held).await?,
+            endpoint: self.router.endpoint().clone(),
+            blobs: self.blobs.clone(),
         };
         if drawn.is_empty() {
             return Ok(flush);
@@ -2098,6 +2194,22 @@ impl SyncNode {
         Some(rx)
     }
 
+    /// Once; a second take yields `None`. From the take on, every session
+    /// decision of every identity this node hosts reports here, and every
+    /// entry an allowed session's ingest admits.
+    #[cfg(feature = "test-util")]
+    pub fn take_session_traces(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::access::SessionTrace>> {
+        let mut sender = self.session_traces.lock().ok()?;
+        if sender.is_some() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *sender = Some(tx);
+        Some(rx)
+    }
+
     /// Reconcile one of `pod`'s stores with `contact` as a drawn contact
     /// is: through the engine, the record store after the membership
     /// store. Returns once the dial is asked for, not once it ends, and
@@ -2229,6 +2341,49 @@ impl SyncNode {
         self.pass_probes
             .passes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The namespaces of `pod`'s membership store and record store as
+    /// `identity` holds them. [`UnknownPod`] for a tombstone too.
+    pub fn pod_stores(&self, identity: PdnId, pod: PodId) -> Result<(NamespaceId, NamespaceId)> {
+        let held = self
+            .require(identity)?
+            .registry
+            .pod(pod)?
+            .ok_or(UnknownPod { pod })?;
+        let records = held.records.ok_or(UnknownPod { pod })?;
+        Ok((held.membership.id(), records.id()))
+    }
+
+    /// The created event `identity`'s replica of `pod` counts; `None` while
+    /// it counts none. [`UnknownPod`] for a pod never held here.
+    pub async fn pod_creation(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+    ) -> Result<Option<CreatedPayload>> {
+        let stack = self.require(identity)?;
+        let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
+        let (view, entries) = stack
+            .access
+            .membership_view_and_entries(pod, &held.membership)
+            .await?;
+        Ok(entries
+            .iter()
+            .zip(view.verdicts())
+            .find(|(entry, verdict)| {
+                **verdict == Verdict::Counted
+                    && matches!(
+                        MembershipKey::parse(&entry.key),
+                        Some(MembershipKey::Event {
+                            kind: EventKind::Created,
+                            ..
+                        })
+                    )
+            })
+            .and_then(|(entry, _verdict)| {
+                entry.payload.as_deref().and_then(CreatedPayload::decode)
+            }))
     }
 
     /// Minting starts both stores' sync, as the store's share does for every
@@ -3035,12 +3190,15 @@ async fn open_blob_store(
     options: &SpawnOptions,
     identities: &Identities,
     collecting: &Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-util")] pause: &CollectionPauseSlot,
 ) -> Result<iroh_blobs::api::Store> {
     let collection = GcConfig {
         interval: options.blob_collection_interval,
         add_protected: Some(protect_hosted(
             Arc::downgrade(identities),
             Arc::clone(collecting),
+            #[cfg(feature = "test-util")]
+            Arc::clone(pause),
         )),
     };
     Ok(match &options.storage {
@@ -3066,10 +3224,13 @@ async fn open_blob_store(
 fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
     collecting: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-util")] pause: CollectionPauseSlot,
 ) -> ProtectCb {
     Arc::new(move |live: &mut HashSet<Hash>| {
         let identities = identities.clone();
         let collecting = Arc::clone(&collecting);
+        #[cfg(feature = "test-util")]
+        let pause = Arc::clone(&pause);
         Box::pin(async move {
             if !collecting.load(std::sync::atomic::Ordering::Acquire) {
                 return ProtectOutcome::Abort;
@@ -3087,6 +3248,14 @@ fn protect_hosted(
                 };
                 live.extend(referenced);
             }
+            #[cfg(feature = "test-util")]
+            {
+                let pause = pause.lock().ok().and_then(|mut slot| slot.take());
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.release.notified().await;
+                }
+            }
             ProtectOutcome::Continue
         })
     })
@@ -3094,7 +3263,7 @@ fn protect_hosted(
 
 /// Every payload hash the replicas of one identity's store reference.
 async fn referenced_payloads(stack: &HostedStack) -> Result<Vec<Hash>> {
-    stack.docs.engine().sync.content_hashes().await?.collect()
+    stack.docs.engine().collection_hashes().await
 }
 
 /// One subdirectory per identity, each holding that identity's replica
@@ -3351,6 +3520,12 @@ async fn bind_endpoint(
         }
         Connectivity::RelaysAndAddressLookup => Endpoint::builder(presets::N0),
     };
+    let builder = builder.transport_config(
+        QuicTransportConfig::builder()
+            .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+            .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+            .build(),
+    );
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,
@@ -4008,49 +4183,206 @@ pub struct PodFlush {
     /// A session started before it may have missed the latest writes. A
     /// clock stepping back past it leaves the wait to its bound.
     since: std::time::SystemTime,
-    peers: HashSet<NodeId>,
+    peers: HashMap<NodeId, EndpointAddr>,
     sessions: Vec<
         std::pin::Pin<
             Box<dyn futures_core::Stream<Item = Result<pdn_store::engine::LiveEvent>> + Send>,
         >,
     >,
+    /// By hash, with the length its entry states, as the flush began.
+    payloads: Vec<(Hash, u64)>,
+    endpoint: Endpoint,
+    blobs: iroh_blobs::api::Store,
 }
 
 impl std::fmt::Debug for PodFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PodFlush")
-            .field("peers", &self.peers)
+            .field("peers", &self.peers.keys())
             .finish_non_exhaustive()
     }
 }
 
 impl PodFlush {
     /// Whether a session with one of the dialed devices went through on
-    /// each store within `timeout`; `false` at once when none was dialed.
+    /// each store within `timeout`, and the device whose session ended the
+    /// last store came to hold every payload of the identity's own entries,
+    /// within `timeout` and what the missing bytes take at
+    /// [`FLUSH_PAYLOAD_RATE`]; `false` at once when none was dialed.
     pub async fn wait(self, timeout: Duration) -> bool {
-        if self.peers.is_empty() {
+        let PodFlush {
+            since,
+            peers,
+            sessions,
+            payloads,
+            endpoint,
+            blobs,
+        } = self;
+        if peers.is_empty() {
             return false;
         }
         let deadline = tokio::time::Instant::now() + timeout;
-        for mut events in self.sessions {
+        let mut served_by = None;
+        for mut events in sessions {
             loop {
                 match tokio::time::timeout_at(deadline, events.next()).await {
                     Ok(Some(Ok(pdn_store::engine::LiveEvent::SyncFinished(sync))))
-                        if sync.result.is_ok()
-                            && sync.started >= self.since
-                            && self
-                                .peers
-                                .contains(&NodeId::from_bytes(*sync.peer.as_bytes())) =>
+                        if sync.result.is_ok() && sync.started >= since =>
                     {
-                        break;
+                        let peer = NodeId::from_bytes(*sync.peer.as_bytes());
+                        if peers.contains_key(&peer) {
+                            served_by = Some(peer);
+                            break;
+                        }
                     }
                     Ok(Some(_other)) => {}
                     Ok(None) | Err(_) => return false,
                 }
             }
         }
-        true
+        let Some(peer) = served_by else {
+            return true;
+        };
+        let held = FlushedPayloads {
+            payloads,
+            endpoint,
+            blobs,
+        };
+        match peers.get(&peer) {
+            Some(addr) => held.held_by(addr, deadline).await,
+            None => false,
+        }
     }
+}
+
+/// What [`PodFlush::wait`] asks the device that took the flush about once
+/// its sessions went through; apart from the sessions, which are not
+/// `Sync`, so a wait over it stays `Send`.
+struct FlushedPayloads {
+    payloads: Vec<(Hash, u64)>,
+    endpoint: Endpoint,
+    blobs: iroh_blobs::api::Store,
+}
+
+impl FlushedPayloads {
+    /// The first answer for every payload within `deadline` says which the
+    /// device lacks; their bytes at [`FLUSH_PAYLOAD_RATE`] then bound the
+    /// wait for the rest. A device on this node shares its blob store.
+    async fn held_by(&self, addr: &EndpointAddr, deadline: tokio::time::Instant) -> bool {
+        if self.payloads.is_empty() || addr.id == self.endpoint.id() {
+            return true;
+        }
+        let Ok(Ok(conn)) =
+            tokio::time::timeout_at(deadline, self.endpoint.connect(addr.clone(), BLOBS_ALPN))
+                .await
+        else {
+            return false;
+        };
+        let held_now = self.payloads.iter().copied().map(|(hash, len)| {
+            let mut updates = Box::pin(self.blobs.remote().observe(
+                conn.clone(),
+                iroh_blobs::protocol::ObserveRequest::new(hash),
+            ));
+            async move {
+                let complete =
+                    matches!(updates.next().await, Some(Ok(first)) if first.is_complete());
+                (hash, len, complete)
+            }
+        });
+        let Some(firsts) = bounded(held_now, deadline).await else {
+            return false;
+        };
+        let missing: Vec<(Hash, u64)> = firsts
+            .into_iter()
+            .filter(|(_hash, _len, complete)| !complete)
+            .map(|(hash, len, _complete)| (hash, len))
+            .collect();
+        if missing.is_empty() {
+            return true;
+        }
+        let missing_bytes = missing.iter().map(|(_hash, len)| *len).sum::<u64>();
+        let transfer = Duration::from_secs(missing_bytes.div_ceil(FLUSH_PAYLOAD_RATE));
+        let deadline = deadline.max(tokio::time::Instant::now() + transfer);
+        let completions = missing.into_iter().map(|(hash, _len)| {
+            let mut updates = Box::pin(self.blobs.remote().observe(
+                conn.clone(),
+                iroh_blobs::protocol::ObserveRequest::new(hash),
+            ));
+            async move {
+                let mut held = iroh_blobs::api::proto::Bitfield::empty();
+                while let Some(Ok(update)) = updates.next().await {
+                    held.update(&update);
+                    if held.is_complete() {
+                        return true;
+                    }
+                }
+                false
+            }
+        });
+        bounded(completions, deadline)
+            .await
+            .is_some_and(|completed| completed.into_iter().all(|complete| complete))
+    }
+}
+
+/// Every one of `tasks`, at most [`FLUSH_OBSERVES`] at a time, each opening
+/// its stream only as it starts; `None` past `deadline` or when a task
+/// fails.
+async fn bounded<T, F>(
+    tasks: impl Iterator<Item = F>,
+    deadline: tokio::time::Instant,
+) -> Option<Vec<T>>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let run = async {
+        let mut tasks = tasks.peekable();
+        let mut running = tokio::task::JoinSet::new();
+        let mut done = Vec::new();
+        loop {
+            while running.len() < FLUSH_OBSERVES {
+                let Some(task) = tasks.next() else {
+                    break;
+                };
+                running.spawn(task);
+            }
+            match running.join_next().await {
+                Some(Ok(result)) => done.push(result),
+                Some(Err(_panicked)) => return None,
+                None => return Some(done),
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, run).await.ok().flatten()
+}
+
+/// Every payload the entries of `identity`'s devices in `pod`'s stores
+/// reference, by its membership view's statements and this device's own
+/// author: the ones a departure leaves no copy of on those devices.
+async fn own_payloads(
+    stack: &HostedStack,
+    pod: PodId,
+    held: &PodBinding,
+) -> Result<Vec<(Hash, u64)>> {
+    let view = stack.access.membership_view(pod, &held.membership).await?;
+    let authors: HashSet<AuthorId> = view
+        .member(&stack.identity)
+        .into_iter()
+        .flat_map(|member| member.devices.iter().map(|device| device.author))
+        .chain(std::iter::once(stack.author))
+        .collect();
+    let mut payloads = HashMap::new();
+    for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+        let mut entries = std::pin::pin!(doc.get_many(Query::all()).await?);
+        while let Some(entry) = entries.next().await {
+            let entry = entry?;
+            if entry.content_len() > 0 && authors.contains(&entry.author()) {
+                payloads.insert(entry.content_hash(), entry.content_len());
+            }
+        }
+    }
+    Ok(payloads.into_iter().collect())
 }
 
 /// The hold [`SyncNode::pause_next_pod_start_for_test`] puts on a pod
@@ -4061,6 +4393,19 @@ pub struct PodStartPause {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
 }
+
+/// The hold [`SyncNode::pause_next_collection_for_test`] puts on a blob
+/// collection run: `reached` once the run has read every hosted identity's
+/// replicas.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Default)]
+pub struct CollectionPause {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-util")]
+type CollectionPauseSlot = Arc<std::sync::Mutex<Option<Arc<CollectionPause>>>>;
 
 /// The sessions one replica of a pod's store finishes, from
 /// [`SyncNode::watch_pod_sessions`]. Unread past its buffer it drops

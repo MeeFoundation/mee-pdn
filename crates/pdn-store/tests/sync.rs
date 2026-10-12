@@ -26,8 +26,8 @@ use pdn_store::{
     },
     engine::{LiveEvent, Origin},
     store::{DownloadPolicy, FilterKind, Query},
-    AuthorId, ContentStatus, Entry, EntryFilter, NamespaceId, SessionAccess, SessionAccessProvider,
-    SessionRole,
+    AuthorId, ContentStatus, Entry, EntryFilter, NamespaceId, RestsOn, SessionAccess,
+    SessionAccessProvider, SessionRole,
 };
 use rand::{CryptoRng, RngExt, SeedableRng};
 #[cfg(feature = "fs-store")]
@@ -1746,6 +1746,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
                         SessionAccess::Allow {
                             egress: Some(reached),
                             ingest: None,
+                            rests_on: RestsOn::Nothing,
                         }
                     }
                     _ => SessionAccess::whole(),
@@ -1765,6 +1766,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
                 SessionAccess::Allow {
                     egress: Some(slow_egress),
                     ingest: None,
+                    rests_on: RestsOn::Nothing,
                 }
             } else {
                 SessionAccess::whole()

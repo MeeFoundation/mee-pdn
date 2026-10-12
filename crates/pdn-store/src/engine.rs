@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, error_span, Instrument};
 
-use self::live::{LiveActor, ToLiveActor};
+use self::{
+    held::HeldPayloads,
+    live::{LiveActor, ToLiveActor},
+};
 pub use self::{
     live::SyncEvent,
     state::{Origin, SyncReason},
@@ -28,6 +31,7 @@ use crate::{
 };
 
 mod gossip;
+mod held;
 mod live;
 mod state;
 
@@ -90,6 +94,7 @@ pub struct Engine {
     /// Sessions handed to this engine over the in-process path, per caller,
     /// so a dial can be shown to reach only the identity it named.
     in_process_served: std::sync::Mutex<std::collections::HashMap<Identity, u64>>,
+    held_payloads: Arc<HeldPayloads>,
     _gc_protect_task: AbortOnDropHandle<()>,
 }
 
@@ -134,7 +139,9 @@ impl Engine {
             me.clone(),
         );
 
+        let held_payloads = Arc::new(HeldPayloads::default());
         let sync2 = sync.clone();
+        let held2 = Arc::clone(&held_payloads);
         let gc_protect_task = AbortOnDropHandle::new(n0_future::task::spawn(async move {
             let Some(mut protect_handler) = protect_cb else {
                 return;
@@ -144,7 +151,7 @@ impl Engine {
                 if let Err(_err) = reply_tx.send(rx) {
                     continue;
                 }
-                let hashes = match sync2.content_hashes().await {
+                let hashes = match collection_hashes(&sync2, &held2).await {
                     Ok(hashes) => hashes,
                     Err(err) => {
                         debug!("protect task: getting content hashes failed with {err:#}");
@@ -155,7 +162,7 @@ impl Engine {
                     }
                 };
                 for hash in hashes {
-                    if let Err(_err) = tx.send(hash).await {
+                    if let Err(_err) = tx.send(Ok(hash)).await {
                         debug!("protect task: failed to forward hash");
                         break;
                     }
@@ -169,6 +176,7 @@ impl Engine {
             endpoint.clone(),
             gossip.clone(),
             bao_store.clone(),
+            Arc::clone(&held_payloads),
             downloader,
             to_live_actor_recv,
             live_actor_tx.clone(),
@@ -211,8 +219,23 @@ impl Engine {
             identity,
             in_process_sessions,
             in_process_served: std::sync::Mutex::default(),
+            held_payloads,
             _gc_protect_task: gc_protect_task,
         })
+    }
+
+    /// Every payload hash this engine's replicas reference, for a blob
+    /// collection's protect callback; a payload written or fetched since
+    /// the previous call stays held until this one, whose read sees its
+    /// entry.
+    pub async fn collection_hashes(&self) -> Result<Vec<Hash>> {
+        collection_hashes(&self.sync, &self.held_payloads).await
+    }
+
+    /// Keeps `tag` until the next [`collection_hashes`](Self::collection_hashes),
+    /// its entry already in the store.
+    pub(crate) fn hold_payload(&self, tag: iroh_blobs::api::TempTag) {
+        self.held_payloads.hold(tag);
     }
 
     /// Get the blob store.
@@ -734,6 +757,20 @@ impl DefaultAuthor {
         *self.value.write().unwrap() = author_id;
         Ok(())
     }
+}
+
+/// The tags held so far are taken before the read and dropped after it, so
+/// a payload whose entry the read misses keeps its tag to the next one.
+async fn collection_hashes(sync: &SyncHandle, held: &HeldPayloads) -> Result<Vec<Hash>> {
+    let taken = held.take();
+    let read = sync
+        .content_hashes()
+        .await
+        .and_then(|hashes| hashes.collect::<Result<Vec<Hash>>>());
+    if read.is_err() {
+        held.restore(taken);
+    }
+    read
 }
 
 #[derive(Debug)]

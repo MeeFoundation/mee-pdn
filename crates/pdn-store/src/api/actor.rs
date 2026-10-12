@@ -555,6 +555,7 @@ impl RpcActor {
             .insert_local(doc_id, author_id, key.clone(), tag.hash(), len as u64)
             .await
             .map_err(|e| RpcError::new(&*e))?;
+        self.hold_payload(tag);
         let entry = self
             .sync
             .get_exact(doc_id, author_id, key, false)

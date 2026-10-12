@@ -56,9 +56,29 @@ pub enum SessionAccess {
         egress: Option<EntryFilter>,
         /// What this side admits; `None` leaves it to the validator.
         ingest: Option<SessionIngest>,
+        /// What the decision was read from; only an accepting node
+        /// checks it.
+        rests_on: RestsOn,
     },
     /// No session: reject as if the replica were not hosted here.
     Deny,
+}
+
+/// What a session decision was read from. An accepting node opens its
+/// snapshot after deciding and asks again when what the decision read
+/// changed in between; a dialing node decides once its snapshot is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestsOn {
+    /// Nothing a write moves: the decision holds for any snapshot.
+    Nothing,
+    /// These replicas at these write counts
+    /// ([`SyncHandle::writes`](crate::actor::SyncHandle::writes)), read
+    /// before the decision read the replicas: it holds while every count
+    /// stands.
+    Writes(Vec<(NamespaceId, u64)>),
+    /// Something no write count shows: asked again once the snapshot is
+    /// open.
+    Unknown,
 }
 
 impl SessionAccess {
@@ -67,6 +87,7 @@ impl SessionAccess {
         Self::Allow {
             egress: None,
             ingest: None,
+            rests_on: RestsOn::Nothing,
         }
     }
 }
@@ -74,10 +95,15 @@ impl SessionAccess {
 impl std::fmt::Debug for SessionAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionAccess::Allow { egress, ingest } => f
+            SessionAccess::Allow {
+                egress,
+                ingest,
+                rests_on,
+            } => f
                 .debug_struct("Allow")
                 .field("egress", &egress.as_ref().map(|_| "filtered"))
                 .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .field("rests_on", rests_on)
                 .finish(),
             SessionAccess::Deny => write!(f, "Deny"),
         }
@@ -292,10 +318,11 @@ mod tests {
         let access = SessionAccess::Allow {
             egress: Some(Arc::new(|_| true)),
             ingest: None,
+            rests_on: RestsOn::Nothing,
         };
         assert_eq!(
             format!("{access:?}"),
-            r#"Allow { egress: Some("filtered"), ingest: None }"#
+            r#"Allow { egress: Some("filtered"), ingest: None, rests_on: Nothing }"#
         );
     }
 }

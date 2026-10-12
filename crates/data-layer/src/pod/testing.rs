@@ -1,6 +1,6 @@
 //! The cast and the membership store the pod modules' unit tests write.
 
-use pdn_store::AuthorId;
+use pdn_store::{AuthorId, NamespaceId};
 use pdn_types::{NodeId, PdnId, PodId};
 
 use super::{EventKind, HeldEntry, MemberDevice, MembershipKey, MembershipView, Seq};
@@ -54,10 +54,21 @@ impl Cast {
     }
 }
 
+/// The namespace ids the specs print for Family's membership store and
+/// record store.
+pub(super) fn family_stores() -> (NamespaceId, NamespaceId) {
+    (
+        NamespaceId::from(&[0x4d; 32]),
+        NamespaceId::from(&[0x52; 32]),
+    )
+}
+
 /// A pod's membership store as one device holds it, written entry by entry.
 #[derive(Clone)]
 pub(super) struct Store {
     pub(super) pod: PodId,
+    /// The membership store's namespace, which the created event names.
+    pub(super) namespace: NamespaceId,
     pub(super) entries: Vec<HeldEntry>,
 }
 
@@ -65,10 +76,12 @@ impl Store {
     /// Created by `creator`, its first device statement beside the created
     /// event.
     pub(super) fn created_by(creator: &Person) -> Self {
-        let creation = creator.keys.creation([0x5a; 16]);
+        let (membership, records) = family_stores();
+        let creation = creator.keys.creation([0x5a; 16], membership, records);
         let pod = pod_id_of(&creator.id(), &creation.identity_key, &creation.nonce);
         let mut store = Self {
             pod,
+            namespace: membership,
             entries: Vec::new(),
         };
         store.write(
@@ -103,7 +116,7 @@ impl Store {
     ) -> usize {
         let payload = member
             .keys
-            .device_statement(version, devices.to_vec())
+            .device_statement(&self.pod, version, devices.to_vec())
             .encode();
         let key = MembershipKey::Devices {
             member: member.id(),
@@ -113,7 +126,7 @@ impl Store {
     }
 
     /// `actor`'s invite act at the newcomer's `seq`, naming the actor's
-    /// `actor_seq`, the newcomer's join statement inside.
+    /// `actor_seq`, the newcomer's join statement from its device inside.
     pub(super) fn join(
         &mut self,
         actor: &Person,
@@ -123,18 +136,15 @@ impl Store {
     ) -> usize {
         let statement = newcomer
             .keys
-            .join_statement(&self.pod, Seq::new(seq))
+            .join_statement(&self.pod, Seq::new(seq), newcomer.device)
             .encode();
         let key = event(newcomer.id(), seq, EventKind::Joined, actor.id(), actor_seq);
         self.write(key, actor.author(), statement)
     }
 
-    /// A first join and the newcomer's first device statement beside it, as
-    /// the join dialogue writes them.
+    /// A first join, as the join dialogue writes it.
     pub(super) fn invite(&mut self, actor: &Person, actor_seq: u64, newcomer: &Person) -> usize {
-        let joined = self.join(actor, actor_seq, newcomer, 1);
-        self.statement(newcomer, 1, &[newcomer.device], actor.author());
-        joined
+        self.join(actor, actor_seq, newcomer, 1)
     }
 
     pub(super) fn act(
@@ -150,7 +160,7 @@ impl Store {
     }
 
     pub(super) fn membership_view(&self) -> MembershipView {
-        MembershipView::new(&self.pod, &self.entries)
+        MembershipView::new(&self.pod, &self.namespace, &self.entries)
     }
 }
 
