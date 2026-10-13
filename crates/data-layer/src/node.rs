@@ -2433,8 +2433,9 @@ impl SyncNode {
             }))
     }
 
-    /// Minting starts both stores' sync, as the store's share does for every
-    /// replica. [`UnknownPod`] for a tombstone too.
+    /// Minted with no restart of either store's sync: a restart dials every
+    /// peer the store recorded, a former member's device among them.
+    /// [`UnknownPod`] for a tombstone too.
     pub async fn share_pod_tickets(
         &self,
         identity: PdnId,
@@ -2450,9 +2451,9 @@ impl SyncNode {
         Ok(PodTickets {
             membership: held
                 .membership
-                .share(ShareMode::Write, addr_options)
+                .ticket(ShareMode::Write, addr_options)
                 .await?,
-            records: records.share(ShareMode::Write, addr_options).await?,
+            records: records.ticket(ShareMode::Write, addr_options).await?,
         })
     }
 

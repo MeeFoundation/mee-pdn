@@ -668,6 +668,81 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     Ok(())
 }
 
+/// A member's device minting its tickets to a pod's stores, as it does for
+/// every join it serves, dials no former member's device it had sessions
+/// with.
+///
+/// The member's own pass is out of reach, and the act waits for the
+/// tombstone to converge and then for a second in which no session with the
+/// departed device starts, so only the mint can dial it after.
+#[tokio::test(flavor = "multi_thread")]
+async fn minting_a_pods_tickets_dials_no_former_members_device() -> Result<()> {
+    let (alice_phone, carol_phone) = (node(QUIET).await?, node(POD_RUN).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    let carols = vec![device_of(&carol_phone, &carol)?];
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let from_alice = tickets(&alice_phone, &alice, pod).await?;
+    carol_phone.import_pod(carol.id, pod, from_alice).await?;
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, PLAIN).await?);
+    let mut draws = carol_phone
+        .take_pod_pass_draws()
+        .expect("the draw channel is taken once");
+
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_pod(carol.id, pod).await?;
+    assert!(lists(&alice_phone, alice.id, pod, carol.id, OUT).await?);
+    let converged = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let draw = draws.recv().await.expect("the pass stopped drawing");
+            if draw.store == PodStore::Membership && draw.contacts.is_empty() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "the tombstone did not converge");
+    let mut sessions = alice_phone
+        .watch_pod_sessions(alice.id, pod, PodStore::Membership)
+        .await?;
+    let c1 = carol_phone.node_id();
+    let quiet = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let since = std::time::SystemTime::now();
+            if sessions
+                .next_started_with(c1, since, Duration::from_secs(1))
+                .await?
+                .is_none()
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(quiet, Ok(Ok(()))),
+        "sessions with the departed device went on"
+    );
+
+    let since = std::time::SystemTime::now();
+    alice_phone
+        .share_pod_tickets(alice.id, pod, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let reached = sessions
+        .next_started_with(c1, since, Duration::from_secs(2))
+        .await?;
+    assert!(
+        reached.is_none(),
+        "minting the pod's tickets dialed the former member's device: {reached:?}"
+    );
+
+    for node in [alice_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A tombstone whose one remaining member is co-located converges at its
 /// first session with that member's replica, inside the process, and is
 /// then reconciled with the identity's own devices alone: here, none.
