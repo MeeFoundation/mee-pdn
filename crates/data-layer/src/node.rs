@@ -1479,7 +1479,8 @@ impl SyncNode {
     /// Create both stores of `pod` for `identity`, both or neither: they
     /// join the registry and the reconcile pass together, once both exist,
     /// and their sync starts once they are registered, so their first
-    /// sessions are ones the book can judge.
+    /// sessions are ones the book can judge. A failure leaves neither; a call
+    /// dropped midway leaves what it made, so its caller runs it to its end.
     pub async fn create_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         if stack.registry.pod(pod)?.is_some() {
@@ -1513,17 +1514,27 @@ impl SyncNode {
             }
             return Err(err);
         }
-        stack.track(
-            &membership,
-            Vec::new(),
-            SyncStrategy::Swarm,
-            stack.identity(),
-        )?;
-        stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
-        Self::order_pod_stores(&stack, &membership, &records).await?;
-        self.watch_pod(&stack, pod, &membership);
-        membership.start_sync(Vec::new(), stack.identity()).await?;
-        records.start_sync(Vec::new(), stack.identity()).await
+        let started: Result<()> = async {
+            stack.track(
+                &membership,
+                Vec::new(),
+                SyncStrategy::Swarm,
+                stack.identity(),
+            )?;
+            stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
+            Self::order_pod_stores(&stack, &membership, &records).await?;
+            self.watch_pod(&stack, pod, &membership);
+            membership.start_sync(Vec::new(), stack.identity()).await?;
+            records.start_sync(Vec::new(), stack.identity()).await
+        }
+        .await;
+        if let Err(err) = started {
+            if let Err(discard_err) = self.discard_pod(identity, pod).await {
+                tracing::warn!(%pod, "a pod whose sync failed to start stayed held: {discard_err:#}");
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Every dial of the record store follows an exchange of the membership
@@ -1636,37 +1647,19 @@ impl SyncNode {
         others: &[PodTickets],
     ) -> Result<PodCatchUp> {
         let stack = self.require(identity)?;
+        let held = Self::admit_pod_tickets(&stack, pod, &tickets)?;
         let membership_contacts = contacts_of(
             &tickets.membership,
             others.iter().map(|other| &other.membership),
         )?;
         let records_contacts =
             contacts_of(&tickets.records, others.iter().map(|other| &other.records))?;
-        let (membership_namespace, records_namespace) = (
-            tickets.membership.capability.id(),
-            tickets.records.capability.id(),
-        );
-        if membership_namespace == records_namespace {
-            return Err(anyhow::anyhow!(
-                "namespace {membership_namespace} cannot be both stores of pod {pod}"
-            ));
-        }
-        if let Some(held) = stack.registry.pod(pod)? {
-            if held.membership.id() != membership_namespace {
-                return Err(anyhow::anyhow!(
-                    "pod {pod} is held on membership store {}, not {membership_namespace}",
-                    held.membership.id()
-                ));
-            }
+        if let Some(held) = held {
             return match held.records {
-                Some(records) if records.id() == records_namespace => {
+                Some(records) => {
                     self.start_pod(&stack, pod, &held.membership, &records)
                         .await
                 }
-                Some(records) => Err(anyhow::anyhow!(
-                    "pod {pod} is held on record store {}, not {records_namespace}",
-                    records.id()
-                )),
                 None => {
                     self.import_records_onto_tombstone(
                         &stack,
@@ -1679,8 +1672,6 @@ impl SyncNode {
                 }
             };
         }
-        Self::guard_pod_import(&stack, membership_namespace)?;
-        Self::guard_pod_import(&stack, records_namespace)?;
         let (membership_minted_by, records_minted_by) =
             (tickets.membership.identity, tickets.records.identity);
         let membership = stack
@@ -1812,6 +1803,59 @@ impl SyncNode {
             .doc
             .start_sync(tracked.contacts, tracked.default_identity)
             .await
+    }
+
+    /// `Ok` when [`import_pod`](Self::import_pod) would take `tickets` as
+    /// `pod`'s stores for `identity`, checked with nothing imported; the
+    /// error is the refusal the import would answer.
+    pub fn check_pod_import(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        tickets: &PodTickets,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        Self::admit_pod_tickets(&stack, pod, tickets).map(|_held| ())
+    }
+
+    /// The binding `pod` is held on, when `tickets` name its stores; `None`
+    /// for a pod not held whose stores no other role holds.
+    fn admit_pod_tickets(
+        stack: &HostedStack,
+        pod: PodId,
+        tickets: &PodTickets,
+    ) -> Result<Option<PodBinding>> {
+        let (membership_namespace, records_namespace) = (
+            tickets.membership.capability.id(),
+            tickets.records.capability.id(),
+        );
+        if membership_namespace == records_namespace {
+            return Err(anyhow::anyhow!(
+                "namespace {membership_namespace} cannot be both stores of pod {pod}"
+            ));
+        }
+        let Some(held) = stack.registry.pod(pod)? else {
+            Self::guard_pod_import(stack, membership_namespace)?;
+            Self::guard_pod_import(stack, records_namespace)?;
+            return Ok(None);
+        };
+        if held.membership.id() != membership_namespace {
+            return Err(anyhow::anyhow!(
+                "pod {pod} is held on membership store {}, not {membership_namespace}",
+                held.membership.id()
+            ));
+        }
+        match &held.records {
+            Some(records) if records.id() != records_namespace => {
+                return Err(anyhow::anyhow!(
+                    "pod {pod} is held on record store {}, not {records_namespace}",
+                    records.id()
+                ));
+            }
+            Some(_records) => {}
+            None => Self::guard_pod_import(stack, records_namespace)?,
+        }
+        Ok(Some(held))
     }
 
     /// Refuses a ticket naming a namespace this identity already holds in
@@ -2406,6 +2450,23 @@ impl SyncNode {
                 .share(ShareMode::Write, addr_options)
                 .await?,
             records: records.share(ShareMode::Write, addr_options).await?,
+        })
+    }
+
+    /// `identity`'s own write tickets to the two stores `tickets` name, this
+    /// device their one node as a share would name it, minted with no replica
+    /// held: a join records them before it imports the stores.
+    pub fn own_pod_tickets(&self, identity: PdnId, tickets: &PodTickets) -> Result<PodTickets> {
+        let own = self.require(identity)?.identity();
+        let node = AddrInfoOptions::RelayAndAddresses.apply(&self.router.endpoint().addr());
+        let mint = |ticket: &DocTicket| DocTicket {
+            capability: ticket.capability.clone(),
+            nodes: vec![node.clone()],
+            identity: own,
+        };
+        Ok(PodTickets {
+            membership: mint(&tickets.membership),
+            records: mint(&tickets.records),
         })
     }
 

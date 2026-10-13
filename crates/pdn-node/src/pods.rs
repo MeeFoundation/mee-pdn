@@ -191,8 +191,8 @@ struct JoinRequest {
     secret: [u8; 32],
     joiner: PdnId,
     identity_key: [u8; 32],
-    /// The highest sequence of the joiner's own chain its replica holds, a
-    /// tombstone's included.
+    /// The highest sequence of the joiner's own chain its replica holds or
+    /// its PMS records the pod at, a tombstone's included.
     run: u64,
 }
 
@@ -243,7 +243,8 @@ struct JoinTickets {
 #[allow(async_fn_in_trait)]
 pub trait PodsService {
     /// Derive the pod id, create both stores and write the signed created
-    /// event; the identity is the first owner.
+    /// event; the identity is the first owner. Runs to its end once called:
+    /// a dropped call leaves the pod whole and listed, or nothing.
     async fn create(&self, identity: PdnId) -> Result<PodId>;
 
     /// The pods the identity holds, by its PMS.
@@ -355,67 +356,14 @@ impl<'rt> RuntimePodsService<'rt> {
 
 impl PodsService for RuntimePodsService<'_> {
     async fn create(&self, identity: PdnId) -> Result<PodId> {
-        // Local writes alone: no round trip runs under the lock.
-        let state = self.runtime.state.lock().await;
-        let hosted = state.hosted(identity)?;
-        let keys = hosted
-            .pms
-            .identity_key()
-            .await?
-            .ok_or(IdentityKeyPending { identity })?;
-        let mut nonce = [0u8; 16];
-        SysRng
-            .try_fill_bytes(&mut nonce)
-            .context("operating-system randomness unavailable")?;
-        let pod = pod_id_of(&identity, &keys.public_key(), &nonce);
-        let node = Arc::clone(&state.node);
-        node.create_pod(identity, pod).await?;
-        let (membership_store, record_store) = node.pod_stores(identity, pod)?;
-        let creation = keys.creation(nonce, membership_store, record_store);
-        let mut rollback = PodRollback::new(
-            Arc::clone(&node),
-            identity,
-            pod,
-            state.cleanup_tasks.clone(),
-        );
-        let device = MemberDevice {
-            node: node.node_id(),
-            author: hosted.author,
-        };
-        let written = async {
-            node.write_pod_entry(
-                identity,
-                pod,
-                PodStore::Membership,
-                &MembershipKey::created(identity).to_bytes(),
-                &creation.encode(),
-            )
-            .await?;
-            let statement = MembershipKey::Devices {
-                member: identity,
-                version: 1,
-            };
-            node.write_pod_entry(
-                identity,
-                pod,
-                PodStore::Membership,
-                &statement.to_bytes(),
-                &keys.device_statement(&pod, 1, vec![device]).encode(),
-            )
-            .await?;
-            record_pod(&node, &hosted.pms, identity, pod, Seq::FIRST, None).await
-        }
-        .await;
-        match written {
-            Ok(()) => {
-                rollback.disarm();
-                Ok(pod)
-            }
-            Err(err) => {
-                rollback.roll_back().await;
-                Err(err)
-            }
-        }
+        let state = Arc::clone(&self.runtime.state);
+        let cleanup_tasks = state.lock().await.cleanup_tasks.clone();
+        // Runs to its end whatever the caller does: cut midway, it would
+        // leave stores that no PMS record names.
+        cleanup_tasks
+            .spawn(async move { create_to_record(&state, identity).await })
+            .await
+            .context("the pod's create ended without an answer")?
     }
 
     async fn list(&self, identity: PdnId) -> Result<Vec<PodInfo>> {
@@ -670,6 +618,74 @@ impl PodsService for RuntimePodsService<'_> {
     async fn list_unknown(&self, identity: PdnId, pod: PodId) -> Result<Vec<UnknownEntry>> {
         let (node, _membership) = self.as_member(identity, pod).await?;
         node.list_pod_unknown(identity, pod).await
+    }
+}
+
+/// The whole of `create`, its commit point the PMS's record of the pod: a
+/// failure before it discards both stores.
+async fn create_to_record(state: &Mutex<State>, identity: PdnId) -> Result<PodId> {
+    // Local writes alone: no round trip runs under the lock.
+    let state = state.lock().await;
+    let hosted = state.hosted(identity)?;
+    let keys = hosted
+        .pms
+        .identity_key()
+        .await?
+        .ok_or(IdentityKeyPending { identity })?;
+    let mut nonce = [0u8; 16];
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .context("operating-system randomness unavailable")?;
+    let pod = pod_id_of(&identity, &keys.public_key(), &nonce);
+    let node = Arc::clone(&state.node);
+    node.create_pod(identity, pod).await?;
+    let written = async {
+        let (membership_store, record_store) = node.pod_stores(identity, pod)?;
+        let creation = keys.creation(nonce, membership_store, record_store);
+        node.write_pod_entry(
+            identity,
+            pod,
+            PodStore::Membership,
+            &MembershipKey::created(identity).to_bytes(),
+            &creation.encode(),
+        )
+        .await?;
+        let statement = MembershipKey::Devices {
+            member: identity,
+            version: 1,
+        };
+        let device = MemberDevice {
+            node: node.node_id(),
+            author: hosted.author,
+        };
+        node.write_pod_entry(
+            identity,
+            pod,
+            PodStore::Membership,
+            &statement.to_bytes(),
+            &keys.device_statement(&pod, 1, vec![device]).encode(),
+        )
+        .await?;
+        let own = node
+            .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        record_pod(&hosted.pms, pod, Seq::FIRST, &own, None).await
+    }
+    .await;
+    let Err(err) = written else {
+        return Ok(pod);
+    };
+    match hosted.pms.pod_record(pod).await {
+        // The record landed though its write answered with an error.
+        Ok(Some(_recorded)) => Ok(pod),
+        Ok(None) => {
+            if let Err(discard_err) = node.discard_pod(identity, pod).await {
+                tracing::warn!(%identity, %pod, "a pod whose create failed stayed held: {discard_err:#}");
+            }
+            Err(err)
+        }
+        // Discarded once recorded, the pod would stay listed with empty stores.
+        Err(_unread) => Err(err),
     }
 }
 
@@ -956,8 +972,8 @@ async fn writer(state: &State, identity: PdnId, pod: PodId) -> Result<(AuthorId,
     Ok((author, Seq::new(seq)))
 }
 
-/// The joiner's half: dial, run the dialogue, then record both tickets and
-/// the PMS's entry before the catch-up the join waits for.
+/// The joiner's half: dial, run the dialogue, then record the tickets and
+/// the PMS's entry before it imports the stores and waits for their catch-up.
 #[allow(clippy::too_many_lines)] // one dialogue, both transports and each record in one place
 async fn join_via_dialogue(
     state: &Arc<Mutex<State>>,
@@ -986,17 +1002,22 @@ async fn join_via_dialogue(
                 .context(InviterUnreachable)?,
         )
     };
+    // The PMS's record too: a departure can reach this device through the
+    // PMS alone, its left event still on the device that wrote it.
+    let run = node
+        .pod_chain_run(identity, invite.pod, identity)
+        .await?
+        .max(recorded_seq(state, identity, invite.pod).await?);
     let request = JoinRequest {
         version: POD_INVITE_FORMAT_VERSION,
         secret: invite.secret,
         joiner: identity,
         identity_key: keys.public_key(),
-        run: node.pod_chain_run(identity, invite.pod, identity).await?,
+        run,
     };
-    let recorded = recorded_seq(state, identity, invite.pod).await?;
     // No sequence past the joiner's own history: a statement over a later
     // one would readmit the joiner at a leave it has yet to write.
-    let furthest = request.run.max(recorded).saturating_add(1);
+    let furthest = run.saturating_add(1);
     let device = MemberDevice {
         node: node.node_id(),
         author,
@@ -1054,28 +1075,27 @@ async fn join_via_dialogue(
     {
         return Err(JoinRefused.into());
     }
-    let caught_up = node.import_pod(identity, pod, inviter.clone()).await?;
+    // Recorded, tickets the import refuses would leave the pod listed and
+    // never opened.
+    node.check_pod_import(identity, pod, &inviter)
+        .context(JoinRefused)?;
+    // The commit point, before the first local effect: from here on the
+    // armer's sweep finishes whatever cuts the join short.
+    let own = node.own_pod_tickets(identity, &inviter)?;
     {
         let state = state.lock().await;
         let pms = &state.hosted(identity)?.pms;
-        record_pod(
-            &node,
-            pms,
-            identity,
-            pod,
-            Seq::new(offer.seq),
-            Some(&inviter),
-        )
-        .await?;
+        record_pod(pms, pod, Seq::new(offer.seq), &own, Some(&inviter)).await?;
     }
     #[cfg(feature = "test-util")]
     {
-        let pause = state.lock().await.join_catch_up_pause.take();
+        let pause = state.lock().await.join_import_pause.take();
         if let Some(pause) = pause {
             pause.reached.notify_one();
             pause.release.notified().await;
         }
     }
+    let caught_up = node.import_pod(identity, pod, inviter).await?;
     let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
     caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
     // A member from here on: the caller's next act checks the membership view.
@@ -1312,16 +1332,12 @@ where
 /// member's device to dial, named as that member, before its membership view
 /// lists anyone.
 async fn record_pod(
-    node: &data_layer::SyncNode,
     pms: &data_layer::PrivateMetadataStore,
-    identity: PdnId,
     pod: PodId,
     seq: Seq,
+    own: &PodTickets,
     inviter: Option<&PodTickets>,
 ) -> Result<()> {
-    let own = node
-        .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
-        .await?;
     let mut kinds = vec![
         (pod_ticket_kind(&pod, PodStore::Membership), &own.membership),
         (pod_ticket_kind(&pod, PodStore::Records), &own.records),
@@ -1414,55 +1430,6 @@ impl Drop for JoinReservation {
         let key = self.key;
         self.cleanup_tasks.spawn(async move {
             state.lock().await.joining_in_flight.remove(&key);
-        });
-    }
-}
-
-/// Discards a pod `create` brought up if it fails, or is dropped, before
-/// the pod is recorded.
-struct PodRollback {
-    node: Arc<data_layer::SyncNode>,
-    identity: PdnId,
-    pod: PodId,
-    armed: bool,
-    cleanup_tasks: CleanupSupervisor,
-}
-
-impl PodRollback {
-    fn new(
-        node: Arc<data_layer::SyncNode>,
-        identity: PdnId,
-        pod: PodId,
-        cleanup_tasks: CleanupSupervisor,
-    ) -> Self {
-        Self {
-            node,
-            identity,
-            pod,
-            armed: true,
-            cleanup_tasks,
-        }
-    }
-
-    async fn roll_back(&mut self) {
-        let _ = self.node.discard_pod(self.identity, self.pod).await;
-        self.disarm();
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PodRollback {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let node = Arc::clone(&self.node);
-        let (identity, pod) = (self.identity, self.pod);
-        self.cleanup_tasks.spawn(async move {
-            let _ = node.discard_pod(identity, pod).await;
         });
     }
 }

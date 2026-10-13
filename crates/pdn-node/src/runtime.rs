@@ -29,9 +29,10 @@ impl CleanupSupervisor {
         }
     }
 
-    pub(crate) fn spawn<F>(&self, task: F) -> tokio::task::JoinHandle<()>
+    pub(crate) fn spawn<F>(&self, task: F) -> tokio::task::JoinHandle<F::Output>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
         self.tasks.spawn_on(task, &self.runtime)
     }
@@ -172,8 +173,8 @@ pub(crate) struct State {
     pub(crate) linking_in_flight: HashSet<PdnId>,
     /// Keyed by `(scanning identity, inviter)`.
     pub(crate) establishing_in_flight: HashSet<(PdnId, PdnId)>,
-    /// Rollback work created by cancellation; shutdown joins it before
-    /// stopping the node.
+    /// Work a cancellation must not cut short — rollbacks, and a pod's
+    /// create; shutdown joins it before stopping the node.
     pub(crate) cleanup_tasks: CleanupSupervisor,
     pub(crate) linking_failures: tokio::sync::broadcast::Sender<LinkingLocalFailure>,
     /// The in-process serving half enters here as `accept` does.
@@ -202,10 +203,10 @@ pub(crate) struct State {
     /// honest value, as a modified inviter would.
     #[cfg(feature = "test-util")]
     pub(crate) forged_join: Option<crate::pods::ForgedJoin>,
-    /// A pause of the next join once both tickets and the PMS's entry
-    /// are recorded, before its catch-up wait.
+    /// A pause of the next join once its tickets and the PMS's entry are
+    /// recorded, before it imports the stores.
     #[cfg(feature = "test-util")]
-    pub(crate) join_catch_up_pause: Option<Arc<CeremonyPause>>,
+    pub(crate) join_import_pause: Option<Arc<CeremonyPause>>,
     /// Pods whose device statement every write fails in, as a process
     /// ended before it landed; a restart clears it.
     #[cfg(feature = "test-util")]
@@ -271,7 +272,7 @@ impl State {
             #[cfg(feature = "test-util")]
             forged_join: None,
             #[cfg(feature = "test-util")]
-            join_catch_up_pause: None,
+            join_import_pause: None,
             #[cfg(feature = "test-util")]
             failing_device_statements: HashSet::new(),
             #[cfg(feature = "test-util")]
@@ -467,12 +468,12 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
-    pub async fn pause_next_join_catch_up(&self) -> Arc<CeremonyPause> {
+    pub async fn pause_next_join_import(&self) -> Arc<CeremonyPause> {
         let pause = Arc::new(CeremonyPause {
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
-        self.state.lock().await.join_catch_up_pause = Some(Arc::clone(&pause));
+        self.state.lock().await.join_import_pause = Some(Arc::clone(&pause));
         pause
     }
 
@@ -510,6 +511,16 @@ impl Runtime {
         identity: pdn_types::PdnId,
     ) -> anyhow::Result<Vec<(pdn_types::PodId, bool)>> {
         self.state.lock().await.node.pod_holdings(identity)
+    }
+
+    /// The replicas `identity`'s store holds, tracked or not.
+    #[cfg(feature = "test-util")]
+    pub async fn held_replica_count_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<usize> {
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.held_replica_count(identity).await
     }
 
     #[cfg(feature = "test-util")]

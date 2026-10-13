@@ -46,6 +46,32 @@ fn is<E: std::error::Error + Send + Sync + 'static>(err: &anyhow::Error) -> bool
     err.downcast_ref::<E>().is_some()
 }
 
+/// `future` polled at most `left` times, each poll after a wake of its
+/// own; `None` once the polls run out first, the future then dropped.
+struct Polled<F> {
+    future: std::pin::Pin<Box<F>>,
+    left: usize,
+}
+
+impl<F: std::future::Future> std::future::Future for Polled<F> {
+    type Output = Option<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let std::task::Poll::Ready(output) = self.future.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(output));
+        }
+        self.left = self.left.saturating_sub(1);
+        if self.left == 0 {
+            std::task::Poll::Ready(None)
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
 /// A created pod is listed with its creator as its one member and owner,
 /// and a second pod of the same identity is a second id. Denied: a create
 /// for an identity the runtime does not host, and the members of a pod
@@ -83,6 +109,61 @@ async fn a_created_pod_is_listed_with_its_creator_as_owner() -> Result<()> {
     let asked = phone.pods().members(erin, family).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
     assert!(phone.pods().list(erin).await?.is_empty());
+
+    phone.shutdown().await?;
+    Ok(())
+}
+
+/// A create its caller drops at any point leaves the pod whole — listed,
+/// held, its creator its one owner — or nothing: no pod held and unlisted,
+/// none listed that answers no members, no replica beside the pods held.
+///
+/// Each attempt is dropped after one more wake than the last, until one
+/// completes, so every await of a create is a point some attempt stops at.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_its_caller_drops_leaves_the_pod_whole_or_nothing() -> Result<()> {
+    let phone = memory_runtime().await?;
+    let alice = phone.identity().create().await?;
+    let replicas = phone.held_replica_count_for_test(alice).await?;
+
+    let pods = phone.pods();
+    let mut completed = false;
+    for polls in 1..=200 {
+        let create = Box::pin(pods.create(alice));
+        if (Polled {
+            future: create,
+            left: polls,
+        })
+        .await
+        .is_some()
+        {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "no create completed within its polls");
+    let whole = eventually(|| async {
+        let mut listed: Vec<PodId> = phone
+            .pods()
+            .list(alice)
+            .await?
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
+        listed.sort();
+        let mut held = phone.pod_holdings_for_test(alice).await?;
+        held.sort();
+        let each_whole = held == listed.iter().map(|pod| (*pod, true)).collect::<Vec<_>>();
+        let mut owned = true;
+        for pod in &listed {
+            owned &=
+                phone.pods().members(alice, *pod).await.ok() == Some(vec![member(alice, true)]);
+        }
+        let count = phone.held_replica_count_for_test(alice).await?;
+        Ok(each_whole && owned && count == replicas + 2 * listed.len())
+    })
+    .await?;
+    assert!(whole, "a dropped create left a pod in part");
 
     phone.shutdown().await?;
     Ok(())
@@ -362,13 +443,13 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
     Ok(())
 }
 
-/// A join whose `join` future is dropped during its catch-up, once both
-/// tickets and the PMS's entry are recorded, ends caught up all the
-/// same: the newcomer lists the pod and its members and reads what was
+/// A join whose `join` future is dropped once its tickets and the PMS's
+/// entry are recorded, before it imports the stores, ends caught up all
+/// the same: the newcomer lists the pod and its members and reads what was
 /// placed before and after, by the one joined event. Denied: the invite
 /// presented again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_join_whose_future_is_dropped_during_its_catch_up_is_finished() -> Result<()> {
+async fn a_join_whose_future_is_dropped_before_its_import_is_finished() -> Result<()> {
     let alice_phone = memory_runtime().await?;
     let bob_phone = Arc::new(memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
@@ -380,7 +461,7 @@ async fn a_join_whose_future_is_dropped_during_its_catch_up_is_finished() -> Res
         .await?;
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
 
-    let pause = bob_phone.pause_next_join_catch_up().await;
+    let pause = bob_phone.pause_next_join_import().await;
     let joining = {
         let (bob_phone, invite) = (Arc::clone(&bob_phone), invite.clone());
         tokio::spawn(async move { bob_phone.pods().join(bob, invite).await })
@@ -413,13 +494,13 @@ async fn a_join_whose_future_is_dropped_during_its_catch_up_is_finished() -> Res
     Ok(())
 }
 
-/// A join cut by a restart during its catch-up, once both tickets and the
-/// PMS's entry are recorded, is finished by the armer after the
-/// restart: the newcomer lists the pod and its members and reads what was
-/// placed before the join and while it was down, by the one joined event.
-/// Denied: the invite presented again.
+/// A join cut by a restart once its tickets and the PMS's entry are
+/// recorded, before it imports the stores, is finished by the armer after
+/// the restart: the newcomer lists the pod and its members and reads what
+/// was placed before the join and while it was down, by the one joined
+/// event. Denied: the invite presented again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_join_cut_by_a_restart_during_its_catch_up_is_finished_by_the_armer() -> Result<()> {
+async fn a_join_cut_by_a_restart_before_its_import_is_finished_by_the_armer() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let alice_phone = memory_runtime().await?;
     let bob_tablet = Arc::new(runtime_on(dir.path()).await?);
@@ -432,7 +513,7 @@ async fn a_join_cut_by_a_restart_during_its_catch_up_is_finished_by_the_armer() 
         .await?;
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
 
-    let pause = bob_tablet.pause_next_join_catch_up().await;
+    let pause = bob_tablet.pause_next_join_import().await;
     let joining = {
         let (bob_tablet, invite) = (Arc::clone(&bob_tablet), invite.clone());
         tokio::spawn(async move { bob_tablet.pods().join(bob, invite).await })
@@ -534,7 +615,7 @@ async fn a_join_whose_inviter_drops_out_during_its_catch_up_is_finished_later() 
 ///
 /// Both devices refuse every pod session from the leave on, so the left
 /// event stays on the leaving device until the join's catch-up; the
-/// inviting device refuses until the join is paused before its catch-up,
+/// inviting device refuses until the join is paused before its import,
 /// since a session served earlier would carry the left event to it before
 /// it offers the sequence.
 #[tokio::test(flavor = "multi_thread")]
@@ -561,7 +642,7 @@ async fn a_former_member_invited_by_a_device_that_has_not_seen_its_leave_joins_a
     bob_phone.pods().act(bob, pod, PodAct::Leave).await?;
     assert!(lists_pod(&bob_phone, bob, pod, false).await?);
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
-    let pause = bob_phone.pause_next_join_catch_up().await;
+    let pause = bob_phone.pause_next_join_import().await;
     let joining = {
         let (bob_phone, invite) = (Arc::clone(&bob_phone), invite);
         tokio::spawn(async move { bob_phone.pods().join(bob, invite).await })
@@ -594,6 +675,84 @@ async fn a_former_member_invited_by_a_device_that_has_not_seen_its_leave_joins_a
 
     alice_phone.shutdown().await?;
     bob_phone.shutdown().await?;
+    Ok(())
+}
+
+/// A former member whose departure reached the joining device through its
+/// PMS alone joins again past it, though neither that device's replica nor
+/// the inviter's ever held the left event, and the pod stays listed with
+/// its record store held. Denied: the invite presented again.
+///
+/// Every pod session is refused from the leave until the leaving device
+/// stops, so the left event goes down with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_former_member_whose_departure_reached_the_device_through_its_pms_alone_joins_again(
+) -> Result<()> {
+    let alice_phone = memory_runtime().await?;
+    let carol_phone = memory_runtime().await?;
+    let carol_laptop = Runtime::spawn(SpawnOptions {
+        reconcile_interval: Duration::from_millis(300),
+        ..SpawnOptions::memory()
+    })
+    .await?;
+    let alice = alice_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    link_patiently(&carol_laptop, &carol_phone, carol).await?;
+    let pod = pod_of_two(&alice_phone, alice, &carol_phone, carol).await?;
+    let before = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"before")
+        .await?;
+    assert!(reads(&carol_laptop, carol, pod, before, b"before").await?);
+
+    for (runtime, holder) in [
+        (&alice_phone, alice),
+        (&carol_phone, carol),
+        (&carol_laptop, carol),
+    ] {
+        runtime.refuse_pod_sessions_for_test(holder, true).await?;
+    }
+    carol_phone.pods().act(carol, pod, PodAct::Leave).await?;
+    let tombstoned = eventually(|| async {
+        Ok(carol_laptop.pod_holdings_for_test(carol).await? == [(pod, false)])
+    })
+    .await?;
+    assert!(tombstoned, "the leave's tombstone did not reach the laptop");
+    carol_phone.shutdown().await?;
+    for (runtime, holder) in [(&alice_phone, alice), (&carol_laptop, carol)] {
+        runtime.refuse_pod_sessions_for_test(holder, false).await?;
+    }
+    for (runtime, holder) in [(&alice_phone, alice), (&carol_laptop, carol)] {
+        let membership = runtime.pod_membership_view_for_test(holder, pod).await?;
+        assert_eq!(
+            membership.member(&carol).map(data_layer::Member::run),
+            Some(1),
+            "the left event left the leaving device"
+        );
+    }
+
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    carol_laptop.pods().join(carol, invite.clone()).await?;
+    assert!(
+        lists_pod(&carol_laptop, carol, pod, true).await?,
+        "the rejoin lay below the departure the PMS records"
+    );
+    let after = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"after")
+        .await?;
+    assert!(reads(&carol_laptop, carol, pod, after, b"after").await?);
+    assert_eq!(
+        carol_laptop.pod_holdings_for_test(carol).await?,
+        [(pod, true)]
+    );
+    // Denied: the burned secret, again.
+    let replayed = carol_laptop.pods().join(carol, invite).await;
+    assert!(replayed.is_err_and(|err| is::<JoinRefused>(&err)));
+
+    for runtime in [alice_phone, carol_laptop] {
+        runtime.shutdown().await?;
+    }
     Ok(())
 }
 

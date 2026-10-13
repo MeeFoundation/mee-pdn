@@ -86,11 +86,12 @@ async fn creating_a_pod_allocates_two_dedicated_replicas() -> Result<()> {
     Ok(())
 }
 
-/// An import of a pod's stores is refused, with nothing registered, when a
-/// ticket names a namespace the identity already holds in another role: a
-/// data store received under a grant, its PMS, another pod's store,
-/// or the pod's other store. The same tickets, honest, import afterwards,
-/// and every replica the refusals named is still held in its own role.
+/// An import of a pod's stores, and its check with nothing imported, are
+/// refused, with nothing registered, when a ticket names a namespace the
+/// identity already holds in another role: a data store received under a
+/// grant, its PMS, another pod's store, or the pod's other store. The same
+/// tickets, honest, pass the check and import afterwards, and every replica
+/// the refusals named is still held in its own role.
 #[allow(clippy::too_many_lines)] // one scenario: every role a refused ticket names, beside the honest import
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
@@ -152,6 +153,12 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
     for (role, tickets_in_role) in refused {
         assert!(
             alice_phone
+                .check_pod_import(ids::ALICE, FAMILY, &tickets_in_role)
+                .is_err(),
+            "the check passed a ticket naming {role}"
+        );
+        assert!(
+            alice_phone
                 .import_pod(ids::ALICE, FAMILY, tickets_in_role)
                 .await
                 .is_err(),
@@ -180,6 +187,7 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
         namespaces(&wedding),
         "the other pod's stores changed"
     );
+    alice_phone.check_pod_import(ids::ALICE, FAMILY, &family)?;
     alice_phone
         .import_pod(ids::ALICE, FAMILY, family.clone())
         .await?;
