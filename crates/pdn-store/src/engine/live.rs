@@ -1406,6 +1406,7 @@ impl LiveActor {
 
         let ev = SyncEvent {
             peer,
+            counterpart,
             origin,
             result: result_for_event,
             finished: SystemTime::now(),
@@ -1807,6 +1808,10 @@ impl LiveActor {
 pub struct SyncEvent {
     /// Peer we synced with
     pub peer: PublicKey,
+    /// The identity the peer's side of the session was: the one a dial
+    /// named, the one an accept's caller acted for. One node id hosts
+    /// several identities (ADR-0013).
+    pub counterpart: Identity,
     /// Origin of the sync exchange
     pub origin: Origin,
     /// Timestamp when the sync finished

@@ -553,12 +553,18 @@ async fn a_leave_written_offline_reaches_the_members_and_takes_nothing_after_it(
 }
 
 /// A tombstone that has reached a member's device is reconciled with the
-/// identity's own devices alone.
-#[allow(clippy::too_many_lines)] // one scenario: the leave and the contacts before and after
+/// identity's own devices alone, and no member's device dials it after:
+/// neither side's pass reaches the other, though each had sessions with it.
+///
+/// What is waited for is a window of three runs of both passes in which no
+/// session with the departed device starts: a dial either side asked for
+/// before its contacts left the other out is redialed for a few seconds
+/// after, while a run that drew the other would start one in every window.
+#[allow(clippy::too_many_lines)] // one scenario: the leave, the contacts before and after, and the runs past it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_member() -> Result<()>
 {
-    let (alice_phone, bob_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let (alice_phone, bob_phone) = (node(POD_RUN).await?, node(QUIET).await?);
     let (carol_phone, carol_laptop) = (node(POD_RUN).await?, node(QUIET).await?);
     let (alice, _) = host(&alice_phone).await?;
     let (bob, _) = host(&bob_phone).await?;
@@ -591,6 +597,9 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     let mut draws = carol_phone
         .take_pod_pass_draws()
         .expect("the draw channel is taken once");
+    let mut alice_draws = alice_phone
+        .take_pod_pass_draws()
+        .expect("the draw channel is taken once");
     let contacts_of = |draw: &data_layer::PodPassDraw| -> HashSet<_> {
         draw.contacts
             .iter()
@@ -621,10 +630,112 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
     })
     .await?;
 
+    let carol_on_phone = (
+        data_layer::EndpointId::from_bytes(carol_phone.node_id().as_bytes())?,
+        identity_of(carol.id),
+    );
+    assert!(lists(&alice_phone, alice.id, pod, carol.id, OUT).await?);
+    assert!(draws_contact(&mut alice_draws, carol_on_phone, false).await?);
+    let mut inviter_sessions = alice_phone
+        .watch_pod_sessions(alice.id, pod, PodStore::Membership)
+        .await?;
+    let quiet = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let since = std::time::SystemTime::now();
+            for runs in [&mut draws, &mut alice_draws] {
+                while runs.try_recv().is_ok() {}
+                if !membership_runs(runs, 3).await {
+                    return Ok(false);
+                }
+            }
+            let started = inviter_sessions
+                .next_started_with(carol_phone.node_id(), since, Duration::from_millis(500))
+                .await?;
+            if started.is_none() {
+                return Ok::<bool, anyhow::Error>(true);
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(quiet, Ok(Ok(true))),
+        "pass runs kept reaching the converged tombstone from a member's device, or a member's device from it"
+    );
+
     for node in [alice_phone, bob_phone, carol_phone, carol_laptop] {
         node.shutdown().await?;
     }
     Ok(())
+}
+
+/// A tombstone whose one remaining member is co-located converges at its
+/// first session with that member's replica, inside the process, and is
+/// then reconciled with the identity's own devices alone: here, none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_a_co_located_members_replica_converges_a_tombstone() -> Result<()> {
+    let tablet = node(POD_RUN).await?;
+    let (leisure, _) = host(&tablet).await?;
+    let (work, _) = host(&tablet).await?;
+    let pod = create(&tablet, &leisure).await?;
+    invite(
+        &tablet,
+        &leisure,
+        pod,
+        &work,
+        vec![device_of(&tablet, &work)?],
+    )
+    .await?;
+    let tickets = tickets(&tablet, &leisure, pod).await?;
+    tablet.import_pod(work.id, pod, tickets).await?;
+    assert!(lists(&tablet, work.id, pod, work.id, PLAIN).await?);
+    let mut draws = tablet
+        .take_pod_pass_draws()
+        .expect("the draw channel is taken once");
+
+    depart(&tablet, &work, pod, EventKind::Left, &work, 2).await?;
+    tablet.forget_pod(work.id, pod).await?;
+    assert!(lists(&tablet, leisure.id, pod, work.id, OUT).await?);
+    let converged = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let draw = draws.recv().await.expect("the pass stopped drawing");
+            if draw.identity == work.id
+                && draw.store == PodStore::Membership
+                && draw.contacts.is_empty()
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        converged.is_ok(),
+        "the tombstone kept reconciling with its co-located member"
+    );
+
+    tablet.shutdown().await?;
+    Ok(())
+}
+
+/// Whether `count` runs of the pod pass `draws` reports draw a membership
+/// store, before [`TIMEOUT`].
+async fn membership_runs(
+    draws: &mut tokio::sync::mpsc::UnboundedReceiver<data_layer::PodPassDraw>,
+    count: usize,
+) -> bool {
+    let mut left = count;
+    tokio::time::timeout(TIMEOUT, async {
+        while left > 0 {
+            let Some(draw) = draws.recv().await else {
+                return false;
+            };
+            if draw.store == PodStore::Membership {
+                left = left.saturating_sub(1);
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// A tombstone that has reached no member's device yet is reconciled with

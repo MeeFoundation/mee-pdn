@@ -31,7 +31,7 @@ use pdn_store::{
     },
     protocol::{Docs, DocsDispatch},
     store::Query,
-    AuthorId, Contact, DocTicket, Identity, NamespaceId, PeerIdBytes, ALPN as DOCS_ALPN,
+    AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
 };
 use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId, PodId, RecordRef};
 use rand::seq::SliceRandom as _;
@@ -1524,8 +1524,8 @@ impl SyncNode {
             stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
             Self::order_pod_stores(&stack, &membership, &records).await?;
             self.watch_pod(&stack, pod, &membership);
-            membership.start_sync(Vec::new(), stack.identity()).await?;
-            records.start_sync(Vec::new(), stack.identity()).await
+            start_pod_store(&membership, Vec::new(), stack.identity(), true).await?;
+            start_pod_store(&records, Vec::new(), stack.identity(), true).await
         }
         .await;
         if let Err(err) = started {
@@ -1793,16 +1793,19 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Start a tracked store's sync with the contacts and the default
+    /// Start a tracked pod store's sync with the contacts and the default
     /// identity it is tracked with.
     async fn start_tracked(tracked: Option<TrackedDoc>) -> Result<()> {
         let Some(tracked) = tracked else {
             return Ok(());
         };
-        tracked
-            .doc
-            .start_sync(tracked.contacts, tracked.default_identity)
-            .await
+        start_pod_store(
+            &tracked.doc,
+            tracked.contacts,
+            tracked.default_identity,
+            true,
+        )
+        .await
     }
 
     /// `Ok` when [`import_pod`](Self::import_pod) would take `tickets` as
@@ -1916,7 +1919,7 @@ impl SyncNode {
             .tracked(doc.id())?
             .map(|tracked| tracked.contacts)
             .unwrap_or_default();
-        doc.start_sync_scoped(contacts, minted_by).await
+        start_pod_store(&doc, contacts, minted_by, false).await
     }
 
     /// The pods `identity` holds here, each with whether its record store
@@ -1966,7 +1969,7 @@ impl SyncNode {
             .into_iter()
             .filter(|contact| contact.identity != own)
             .collect();
-        let (drawn, _recorded) = draw(others, Vec::new());
+        let drawn = draw(others);
         let mut flush = PodFlush {
             since: std::time::SystemTime::now(),
             peers: drawn
@@ -1992,7 +1995,7 @@ impl SyncNode {
             };
             // Subscribed before the dial, so no session ends unseen.
             flush.sessions.push(Box::pin(doc.subscribe().await?));
-            sync_pod_store(&stack, &tracked, drawn.clone(), Vec::new()).await?;
+            sync_pod_store(&stack, &tracked, drawn.clone()).await?;
         }
         Ok(flush)
     }
@@ -3774,50 +3777,31 @@ async fn reconcile_pod(
             .map(|records| (PodStore::Records, records)),
     );
     for (store, doc) in stores {
-        let namespace = doc.id();
-        let Ok(Some(tracked)) = stack.tracked(namespace) else {
+        let Ok(Some(tracked)) = stack.tracked(doc.id()) else {
             continue;
         };
-        let recorded = stack
-            .docs
-            .engine()
-            .sync
-            .get_sync_peers(namespace)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let (contacts, recorded) = draw(tracked.contacts.clone(), recorded);
+        let drawn = draw(tracked.contacts.clone());
         probes.report(|| PodPassDraw {
             identity: stack.identity,
             pod,
             store,
             contacts: tracked.contacts.clone(),
-            drawn: contacts.clone(),
-            recorded: recorded
-                .iter()
-                .map(|peer| NodeId::from_bytes(*peer))
-                .collect(),
+            drawn: drawn.clone(),
         });
-        let _ = sync_pod_store(stack, &tracked, contacts, recorded).await;
+        let _ = sync_pod_store(stack, &tracked, drawn).await;
     }
 }
 
-/// Reconcile a pod store with `contacts` and `recorded`, in its swarm as
-/// `tracked` read. A store `forget_pod` turned out of its swarm after that
-/// read leaves the swarm again: the forget's own leave can run before this
-/// sync joins.
+/// Reconcile a pod store with `contacts`, in its swarm as `tracked` read.
+/// A store `forget_pod` turned out of its swarm after that read leaves the
+/// swarm again: the forget's own leave can run before this sync joins.
 async fn sync_pod_store(
     stack: &HostedStack,
     tracked: &TrackedDoc,
     contacts: Vec<Contact>,
-    recorded: Vec<PeerIdBytes>,
 ) -> Result<()> {
     let swarm = tracked.strategy == SyncStrategy::Swarm;
-    tracked
-        .doc
-        .sync_with_peers(contacts, recorded, tracked.default_identity, swarm)
-        .await?;
+    start_pod_store(&tracked.doc, contacts, tracked.default_identity, swarm).await?;
     let turned_out = stack
         .tracked(tracked.doc.id())?
         .is_some_and(|now| now.strategy == SyncStrategy::ContactsOnly);
@@ -3825,6 +3809,19 @@ async fn sync_pod_store(
         tracked.doc.leave_gossip().await?;
     }
     Ok(())
+}
+
+/// Start, or run again, a pod store's sync with `contacts` alone: a peer
+/// the engine recorded is a node the membership derivation may leave out —
+/// a former member's device, or a member's a converged tombstone is done with.
+async fn start_pod_store(
+    doc: &Doc,
+    contacts: Vec<Contact>,
+    default_identity: Identity,
+    join_gossip: bool,
+) -> Result<()> {
+    doc.sync_with_peers(contacts, Vec::new(), default_identity, join_gossip)
+        .await
 }
 
 /// Derive both of a pod's stores' contacts from its membership and set
@@ -3836,7 +3833,7 @@ async fn derive_pod_contacts(
     node: EndpointId,
     pod: PodId,
     held: &PodBinding,
-    met: &[NodeId],
+    met: &[Identity],
 ) {
     let derivation = stack.pod_derivation(pod);
     let _derivation = derivation.lock().await;
@@ -3849,7 +3846,7 @@ async fn derive_pod_contacts_locked(
     node: EndpointId,
     pod: PodId,
     held: &PodBinding,
-    met: &[NodeId],
+    met: &[Identity],
 ) {
     let derived = match pod_contacts(stack, node, pod, held, met).await {
         Ok(derived) => derived,
@@ -3986,7 +3983,7 @@ async fn dial_own_devices(stack: &HostedStack, node: EndpointId, devices: &[Node
             let Ok(Some(tracked)) = stack.tracked(doc.id()) else {
                 continue;
             };
-            if let Err(err) = sync_pod_store(stack, &tracked, contacts.clone(), Vec::new()).await {
+            if let Err(err) = sync_pod_store(stack, &tracked, contacts.clone()).await {
                 tracing::warn!(%pod, "dialing a newly listed device failed: {err:#}");
             }
         }
@@ -4042,15 +4039,15 @@ fn watch_pod_membership(
     });
 }
 
-/// Notes the peer of a session that went through; whether the event may
-/// list a device the contacts lack — an entry or a payload arriving, or
+/// Notes the counterpart of a session that went through; whether the event
+/// may list a device the contacts lack — an entry or a payload arriving, or
 /// events dropped unread.
-fn note_event(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>) -> bool {
+fn note_event(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<Identity>) -> bool {
     use pdn_store::engine::LiveEvent;
     match event {
         Ok(LiveEvent::SyncFinished(sync)) => {
             if sync.result.is_ok() {
-                met.push(NodeId::from_bytes(*sync.peer.as_bytes()));
+                met.push(sync.counterpart);
             }
             false
         }
@@ -4070,8 +4067,9 @@ fn note_event(event: Result<pdn_store::engine::LiveEvent>, met: &mut Vec<NodeId>
 /// devices by its PMS, dialed as the identity; never this device as
 /// this identity. `None` while the membership view lists nobody: a replica
 /// that holds nothing yet keeps the contacts its ticket gave it.
-/// A tombstone drops the members' devices once a session with one of them
-/// — any device of another than itself among `met` — went through. A
+/// A tombstone drops the members' devices once a session with a current
+/// member's replica — a counterpart among `met`, on whichever node — went
+/// through. A
 /// replica holding its record store again keeps them while its membership
 /// view still shows the departure: they are how a rejoin dials its inviter.
 async fn pod_contacts(
@@ -4079,7 +4077,7 @@ async fn pod_contacts(
     node: EndpointId,
     pod: PodId,
     held: &PodBinding,
-    met: &[NodeId],
+    met: &[Identity],
 ) -> Result<DerivedContacts> {
     let membership = &held.membership;
     let (view, entries) = stack
@@ -4110,10 +4108,11 @@ async fn pod_contacts(
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("tombstone lock poisoned"))?;
         if departed.is_some() && held.records.is_none() {
-            if met
-                .iter()
-                .any(|peer| *peer != this_device && !own_devices.contains(peer))
-            {
+            let member = |counterpart: &Identity| {
+                view.member(&PdnId::from_bytes(*counterpart.as_bytes()))
+                    .is_some_and(|member| member.state.member)
+            };
+            if met.iter().any(member) {
                 converged.insert(pod);
             }
         } else {
@@ -4209,33 +4208,11 @@ struct DerivedContacts {
     unlisted: bool,
 }
 
-/// At most [`POD_RECONCILE_PEERS`] of a store's contacts and recorded
-/// peers, drawn afresh; a recorded peer a contact names counts once, as the
-/// contact, which names the identity it is dialed as.
-fn draw(contacts: Vec<Contact>, recorded: Vec<PeerIdBytes>) -> (Vec<Contact>, Vec<PeerIdBytes>) {
-    enum Peer {
-        Contact(Contact),
-        Recorded(PeerIdBytes),
-    }
-    let mut peers: Vec<Peer> = recorded
-        .into_iter()
-        .filter(|peer| {
-            !contacts
-                .iter()
-                .any(|contact| contact.addr.id.as_bytes() == peer)
-        })
-        .map(Peer::Recorded)
-        .collect();
-    peers.extend(contacts.into_iter().map(Peer::Contact));
-    peers.shuffle(&mut rand::rng());
-    let (mut contacts, mut recorded) = (Vec::new(), Vec::new());
-    for peer in peers.into_iter().take(POD_RECONCILE_PEERS) {
-        match peer {
-            Peer::Contact(contact) => contacts.push(contact),
-            Peer::Recorded(peer) => recorded.push(peer),
-        }
-    }
-    (contacts, recorded)
+/// At most [`POD_RECONCILE_PEERS`] of a store's contacts, drawn afresh.
+fn draw(mut contacts: Vec<Contact>) -> Vec<Contact> {
+    contacts.shuffle(&mut rand::rng());
+    contacts.truncate(POD_RECONCILE_PEERS);
+    contacts
 }
 
 /// The sessions a [`SyncNode::flush_pod`] dialed, as each store finishes
@@ -4491,6 +4468,7 @@ impl std::fmt::Debug for PodSessions {
 pub struct PodSession {
     pub peer: NodeId,
     pub dialed: bool,
+    pub started: std::time::SystemTime,
     /// The session's entries received and sent, or why it failed or was
     /// refused.
     pub exchanged: std::result::Result<(usize, usize), String>,
@@ -4507,6 +4485,21 @@ impl PodSessions {
     ) -> Result<Option<PodSession>> {
         self.next_matching(timeout, |session| {
             session.peer == peer && session.exchanged.is_ok()
+        })
+        .await
+    }
+
+    /// The next session with `peer` started at `since` or later, whichever
+    /// side dialed and however it ended, or `None` once `timeout` passes
+    /// first.
+    pub async fn next_started_with(
+        &mut self,
+        peer: NodeId,
+        since: std::time::SystemTime,
+        timeout: Duration,
+    ) -> Result<Option<PodSession>> {
+        self.next_matching(timeout, |session| {
+            session.peer == peer && session.started >= since
         })
         .await
     }
@@ -4542,6 +4535,7 @@ impl PodSessions {
             let session = PodSession {
                 peer: NodeId::from_bytes(*sync.peer.as_bytes()),
                 dialed: matches!(sync.origin, pdn_store::engine::Origin::Connect(_)),
+                started: sync.started,
                 exchanged: sync
                     .result
                     .map(|details| (details.entries_received, details.entries_sent)),
@@ -4562,7 +4556,6 @@ pub struct PodPassDraw {
     /// The contacts the store was tracked with when the run drew.
     pub contacts: Vec<Contact>,
     pub drawn: Vec<Contact>,
-    pub recorded: Vec<NodeId>,
 }
 
 /// What the passes report: how many runs of [`reconcile_pass`] finished,
@@ -4771,14 +4764,12 @@ fn starts_with_components(path: &EntryPath, prefix: &EntryPath) -> bool {
 mod tests {
     use super::*;
 
-    /// Each draw reaches at most five of a store's contacts and recorded
-    /// peers, a recorded peer a contact names counting once, as the
-    /// contact, and draws differ from run to run until every peer has been
-    /// reached.
+    /// Each draw reaches at most five of a store's contacts, and draws
+    /// differ from run to run until every contact has been reached.
     #[test]
-    fn a_draw_reaches_at_most_five_peers_afresh_each_run() {
+    fn a_draw_reaches_at_most_five_contacts_afresh_each_run() {
         let key = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public();
-        let contacts: Vec<Contact> = (1..=6)
+        let contacts: Vec<Contact> = (1..=8)
             .map(|seed| {
                 Contact::new(
                     EndpointAddr::new(key(seed)),
@@ -4786,20 +4777,13 @@ mod tests {
                 )
             })
             .collect();
-        let named = *key(1).as_bytes();
-        let recorded = vec![named, *key(7).as_bytes(), *key(8).as_bytes()];
         let mut reached = HashSet::new();
         for _run in 0..200 {
-            let (drawn, drawn_recorded) = draw(contacts.clone(), recorded.clone());
-            assert_eq!(drawn.len() + drawn_recorded.len(), POD_RECONCILE_PEERS);
-            assert!(
-                !drawn_recorded.contains(&named),
-                "a recorded peer a contact names was drawn as recorded"
-            );
+            let drawn = draw(contacts.clone());
+            assert_eq!(drawn.len(), POD_RECONCILE_PEERS);
             reached.extend(drawn.iter().map(|contact| *contact.addr.id.as_bytes()));
-            reached.extend(drawn_recorded);
         }
-        assert_eq!(reached.len(), 8, "a peer went undrawn for 200 runs");
+        assert_eq!(reached.len(), 8, "a contact went undrawn for 200 runs");
     }
 
     /// Tested directly: the directory's advisory lock refuses a second node

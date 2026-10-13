@@ -325,7 +325,7 @@ async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membershi
                 continue;
             }
             assert_eq!(contacts, expected, "the contacts the membership derives");
-            assert!(draw.drawn.len() + draw.recorded.len() <= 5);
+            assert!(draw.drawn.len() <= 5);
             for contact in &draw.drawn {
                 assert!(contacts.contains(&(contact.addr.id, contact.identity)));
                 reached.insert((contact.addr.id, contact.identity));
