@@ -40,11 +40,10 @@ Upstream's pipeline also runs cross builds (freebsd, i686-linux, android), `carg
 
 ## Feature flags
 
-`default = ["metrics", "rpc", "fs-store", "redb-v2-migration"]`
+`default = ["metrics", "rpc", "fs-store"]`
 
 - `rpc` — exposes the API over the network (via `noq` + `irpc/rpc`); without it, the API is in-process only.
 - `fs-store` — persistent redb file storage; without it, only the in-memory backend is available.
-- `redb-v2-migration` — pulls in `redb_v3` to migrate stores written by older redb major versions on open.
 - `metrics` — `iroh-metrics` counters.
 
 The test matrix exercises `all` / `none` / `default` feature sets — changes must compile and pass under all three.
@@ -71,7 +70,7 @@ Docs (protocol.rs)          ── iroh ProtocolHandler; entry point. Builder: D
 **Storage** (`store.rs` + `store/fs/`):
 - `store::Store` (re-export of `store::fs::Store`) is the *only* store implementation, always backed by [`redb`]. "In-memory" = redb on a `Vec<u8>` backend; "persistent" = redb on a single file. It implements `ranger::Store`, so reconciliation runs directly against redb.
 - `store/fs/tables.rs` — redb table layout (records, the `records_by_key` index, namespaces, authors, `latest_per_author`, `namespace_peers`, `download_policy`).
-- `store/fs/migrations.rs` runs in-place schema migrations (001–004) automatically on open. `migrate_v1_v2.rs` / `migrate_redb_v2_tuples.rs` handle redb *major-version* upgrades and are gated behind `redb-v2-migration`.
+- `store/fs/migrations.rs` runs in-place schema migrations (001–004) automatically on open. A store written by iroh-docs 0.94–0.98, whose tuple tables redb 2 encoded, fails to open: no node of ours holds a store in that format, so upstream's `redb-v2-migration` feature and its modules are absent, and an upstream patch touching them is not applicable.
 - `DownloadPolicy` / `FilterKind` decide which entries' blobs get downloaded.
 
 **The sync actor** (`actor.rs`): `SyncHandle` is a cheaply-cloneable handle to a dedicated **`std::thread`** (`"sync-actor"`) that owns the `Store` and processes `Action` messages sequentially. It is a thread, not a tokio task, because **redb is blocking** — but on `wasm_browser` it falls back to a tokio task. All replica mutation goes through here; the last handle drop joins the thread. On shutdown the actor closes and empties its channel: a request queued behind the shutdown would otherwise keep its reply open for as long as any handle lives, and its caller would wait forever. Prefer `SyncHandle::shutdown().await` over relying on drop to avoid blocking an async context.

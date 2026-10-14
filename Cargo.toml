@@ -18,7 +18,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # The iroh stack is pinned here so every consumer agrees.
-iroh = "1.0.2"
+iroh = "1.3"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 tracing = "0.1"
@@ -30,6 +30,15 @@ pdn-store = { path = "crates/pdn-store" }
 # thread, which hangs a failed blob store open forever. What the fork carries
 # and when it goes: UPSTREAM.md in the fork.
 iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
+
+# Full debug info is copied into every test binary and build variant, and on
+# macOS into object files beside them: tens of gigabytes of target/. Backtraces
+# keep file and line in our crates and function names in dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [workspace.lints.rust]
 unsafe_code = "deny"

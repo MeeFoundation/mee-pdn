@@ -108,7 +108,7 @@ async fn a_created_pod_is_listed_with_its_creator_as_owner() -> Result<()> {
     let erin = phone.identity().create().await?;
     let asked = phone.pods().members(erin, family).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
-    assert!(phone.pods().list(erin).await?.is_empty());
+    assert_eq!(phone.pods().list(erin).await?, []);
 
     phone.shutdown().await?;
     Ok(())
@@ -205,7 +205,7 @@ async fn a_newcomer_joins_and_a_replayed_secret_is_refused() -> Result<()> {
         both.sort();
         both
     });
-    assert!(carol_phone.pods().list(carol).await?.is_empty());
+    assert_eq!(carol_phone.pods().list(carol).await?, []);
 
     for runtime in [alice_phone, bob_phone, carol_phone] {
         runtime.shutdown().await?;
@@ -268,7 +268,7 @@ async fn a_wrong_secret_burns_nothing() -> Result<()> {
         alice_phone.pods().members(alice, pod).await?,
         vec![member(alice, true)]
     );
-    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
     let expired = alice_phone
         .pods()
         .invite(alice, pod, Some(std::time::Duration::from_millis(1)))
@@ -276,7 +276,7 @@ async fn a_wrong_secret_burns_nothing() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let refused = bob_phone.pods().join(bob, expired).await;
     assert!(refused.is_err_and(|err| is::<JoinRefused>(&err)));
-    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
     let unknown_version = PodInvite {
         version: 9,
         ..invite.clone()
@@ -321,7 +321,7 @@ async fn two_identities_of_one_node_invite_and_join() -> Result<()> {
     // Denied: the burned secret, by a third co-located identity.
     let replayed = tablet.pods().join(erin, invite).await;
     assert!(replayed.is_err_and(|err| is::<JoinRefused>(&err)));
-    assert!(tablet.pods().list(erin).await?.is_empty());
+    assert_eq!(tablet.pods().list(erin).await?, []);
 
     tablet.shutdown().await?;
     Ok(())
@@ -391,7 +391,7 @@ async fn two_members_on_one_node_write_converge_and_part_each_as_itself() -> Res
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
 
     pods.act(work, pod, PodAct::Leave).await?;
-    assert!(pods.list(work).await?.is_empty());
+    assert_eq!(pods.list(work).await?, []);
     assert_eq!(tablet.pod_holdings_for_test(work).await?, [(pod, false)]);
     // Denied: the member that left.
     let asked = pods.read(work, pod, claim).await;
@@ -460,7 +460,7 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
     assert!(lost.is_err_and(|err| is::<JoinRefused>(&err)));
     let both = vec![member(alice, true), member(bob, false)];
     assert!(lists_members(&alice_phone, alice, pod, both.clone()).await?);
-    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
 
     let second = alice_phone.pods().invite(alice, pod, None).await?;
     bob_phone.pods().join(bob, second).await?;
@@ -1005,7 +1005,7 @@ async fn three_identities_share_through_a_pod_with_no_connections() -> Result<()
         (&bob_phone, bob),
         (&carol_phone, carol),
     ] {
-        assert!(runtime.connections().list(holder).await?.is_empty());
+        assert_eq!(runtime.connections().list(holder).await?, []);
     }
 
     // Denied: a connection with the author, no membership.
@@ -1013,7 +1013,7 @@ async fn three_identities_share_through_a_pod_with_no_connections() -> Result<()
     let invite = bob_phone.connections().invite(bob, None).await?;
     carol_phone.connections().establish(erin, invite).await?;
     assert_eq!(carol_phone.connections().list(erin).await?, [bob]);
-    assert!(carol_phone.pods().list(erin).await?.is_empty());
+    assert_eq!(carol_phone.pods().list(erin).await?, []);
     let refused = carol_phone.pods().read(erin, pod, claim).await;
     assert!(refused.is_err_and(|err| is::<UnknownPod>(&err)));
 
@@ -1054,7 +1054,7 @@ async fn two_pods_with_the_same_members_keep_their_entries_apart() -> Result<()>
                 .map(|(entry, _)| RecordKey::parse(&entry.key).map(|key| key.record()))
                 .collect();
             assert_eq!(held, [Some(own)]);
-            assert!(runtime.pods().list_unknown(holder, pod).await?.is_empty());
+            assert_eq!(runtime.pods().list_unknown(holder, pod).await?, []);
         }
         // Denied: the other pod's claim.
         assert_eq!(runtime.pods().read(holder, household, lease).await?, None);
@@ -1543,7 +1543,7 @@ async fn the_one_owner_leaves_once_another_member_is_an_owner() -> Result<()> {
     pods.act(alice, pod, PodAct::Promote(bob)).await?;
     pods.act(alice, pod, PodAct::Leave).await?;
     pods.act(alice, alone, PodAct::Leave).await?;
-    assert!(pods.list(alice).await?.is_empty());
+    assert_eq!(pods.list(alice).await?, []);
     let asked = pods.members(alice, pod).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
     let left = vec![member(bob, true), member(carol, false)];
@@ -1590,7 +1590,7 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
         .await?;
     pods.append_op(bob, pod, note, b"eggs").await?;
     pods.act(bob, pod, PodAct::Leave).await?;
-    assert!(pods.list(bob).await?.is_empty());
+    assert_eq!(pods.list(bob).await?, []);
     // Denied: the departed member.
     let asked = pods.read(bob, pod, claim).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
@@ -1603,7 +1603,7 @@ async fn a_member_leaves_and_what_it_wrote_stays() -> Result<()> {
     }
 
     tablet.pods().act(work, pod, PodAct::Leave).await?;
-    assert!(tablet.pods().list(work).await?.is_empty());
+    assert_eq!(tablet.pods().list(work).await?, []);
     let asked = tablet.pods().read(work, pod, claim).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
     assert!(lists_members(&tablet, leisure, pod, vec![member(leisure, true)]).await?);
@@ -1677,7 +1677,7 @@ async fn an_offer_past_the_joiners_history_is_refused() -> Result<()> {
         .await;
     let joined = bob_phone.pods().join(bob, invite).await;
     assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
-    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
     assert_eq!(
         alice_phone.pods().members(alice, pod).await?,
         vec![member(alice, true)]
@@ -1717,7 +1717,7 @@ async fn an_offer_naming_another_pods_creation_is_refused() -> Result<()> {
         .await;
     let joined = bob_phone.pods().join(bob, invite).await;
     assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
-    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
     assert_eq!(
         alice_phone.pods().members(alice, family).await?,
         vec![member(alice, true)]
@@ -1753,7 +1753,7 @@ async fn tickets_to_stores_the_creation_does_not_name_are_refused() -> Result<()
         .await;
     let joined = bob_phone.pods().join(bob, invite).await;
     assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
-    assert!(bob_phone.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
     for pod in [family, wedding] {
         let held = bob_phone.pods().members(bob, pod).await;
         assert!(held.is_err_and(|err| is::<UnknownPod>(&err)));
@@ -1908,7 +1908,7 @@ async fn devices_linked_before_and_after_the_join_reach_the_pod() -> Result<()> 
         );
     }
     // Denied (a co-located non-member).
-    assert!(bob_laptop.pods().list(dave).await?.is_empty());
+    assert_eq!(bob_laptop.pods().list(dave).await?, []);
     let asked = bob_laptop.pods().read(dave, pod, before).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
 
@@ -2616,7 +2616,7 @@ async fn a_device_linked_after_the_departure_takes_the_tombstone_from_a_sibling(
         .await?,
         "the linked device did not take the tombstone from its sibling"
     );
-    assert!(bob_laptop.pods().list(bob).await?.is_empty());
+    assert_eq!(bob_laptop.pods().list(bob).await?, []);
     // Denied: the departed member's new device.
     let asked = bob_laptop.pods().read(bob, pod, claim).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
