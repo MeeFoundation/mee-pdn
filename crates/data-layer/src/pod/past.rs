@@ -1,7 +1,8 @@
 //! A departure's past: the entries of a membership store a former member's
 //! departure depends on, which is all a member device serves it and takes
-//! from it — by the pod stores spec's requirement on a departed member's
-//! tombstone.
+//! from it, and the points of the chains it rests on, at which its
+//! tombstone takes every event — by the pod stores spec's requirement on a
+//! departed member's tombstone.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -17,34 +18,23 @@ use super::{
 /// An entry of the past, as a session's filters name it.
 pub(crate) type PastEntry = (Vec<u8>, AuthorId);
 
-/// A departure's past, and the sequence of the departure in its member's
-/// chain.
-#[derive(Debug, Clone)]
-pub(crate) struct Departure {
-    pub(crate) past: HashSet<PastEntry>,
-    pub(crate) seq: u64,
-}
-
 /// The past of `member`'s departure over `entries`, the ones `membership`
-/// was built from; `None` while `member` has not departed — its chain does
-/// not end in a counted left or removed event.
+/// was built from; `None` while the membership view shows no departure of
+/// `member` ([`Member::departed_at`](super::Member::departed_at)), whatever
+/// its chain holds after one.
 pub(crate) fn departure_past(
     membership: &MembershipView,
     entries: &[HeldEntry],
     member: &PdnId,
-) -> Option<Departure> {
+) -> Option<HashSet<PastEntry>> {
+    let seq = membership.member(member)?.departed_at()?;
     let index = Index::of(membership, entries);
-    let run = index.run(member);
-    let at_end = index.events.get(&(*member, run))?;
+    let at = index.events.get(&(*member, seq))?;
     let kind = [EventKind::Removed, EventKind::Left]
         .into_iter()
-        .find(|kind| {
-            at_end
-                .iter()
-                .any(|event| event.kind == *kind && event.counted)
-        })?;
+        .find(|kind| at.iter().any(|event| event.kind == *kind && event.counted))?;
     let mut past = HashSet::new();
-    let mut work: Vec<usize> = at_end
+    let mut work: Vec<usize> = at
         .iter()
         .filter(|event| event.kind == kind && event.counted)
         .map(|event| event.entry)
@@ -55,14 +45,81 @@ pub(crate) fn departure_past(
         }
         work.extend(index.depends_on(entry));
     }
-    Some(Departure {
-        past: past
-            .into_iter()
+    Some(
+        past.into_iter()
             .filter_map(|entry| entries.get(entry))
             .map(|held| (held.key.clone(), held.author))
             .collect(),
-        seq: run,
-    })
+    )
+}
+
+/// What a replica whose own identity departed takes from a member device:
+/// its own chain whole, every event at each point of another chain that an
+/// event it takes names as its actor's — held here or not, so an event that
+/// reverses the departure reaches it — and the device statements of each
+/// such actor. Read from the event keys alone, so each session reaches one
+/// layer of dependencies further than the last.
+#[derive(Debug, Default)]
+pub(crate) struct Rests {
+    /// Per chain, the highest sequence taken, with every one below it.
+    upto: HashMap<PdnId, u64>,
+    statements_of: HashSet<PdnId>,
+}
+
+impl Rests {
+    /// Over the `entries` the replica holds, `member` being its identity.
+    pub(crate) fn of(entries: &[HeldEntry], member: &PdnId) -> Self {
+        let mut actors: HashMap<PdnId, BTreeMap<u64, Vec<(PdnId, u64)>>> = HashMap::new();
+        for held in entries {
+            if let Some(MembershipKey::Event {
+                subject,
+                seq,
+                actor,
+                actor_seq,
+                ..
+            }) = MembershipKey::parse(&held.key)
+            {
+                actors
+                    .entry(subject)
+                    .or_default()
+                    .entry(seq.get())
+                    .or_default()
+                    .push((actor, actor_seq.get()));
+            }
+        }
+        let mut rests = Self::default();
+        rests.statements_of.insert(*member);
+        let mut work = vec![(*member, u64::MAX)];
+        while let Some((chain, upto)) = work.pop() {
+            let from = rests.upto.get(&chain).copied().unwrap_or(0);
+            if upto <= from {
+                continue;
+            }
+            rests.upto.insert(chain, upto);
+            let Some(held) = actors.get(&chain) else {
+                continue;
+            };
+            for (actor, actor_seq) in held
+                .range(from.saturating_add(1)..=upto)
+                .flat_map(|(_seq, events)| events)
+            {
+                rests.statements_of.insert(*actor);
+                work.push((*actor, *actor_seq));
+            }
+        }
+        rests
+    }
+
+    pub(crate) fn admits(&self, key: &[u8]) -> bool {
+        match MembershipKey::parse(key) {
+            Some(MembershipKey::Event { subject, seq, .. }) => self
+                .upto
+                .get(&subject)
+                .is_some_and(|upto| seq.get() <= *upto),
+            Some(MembershipKey::Devices { member, .. }) => self.statements_of.contains(&member),
+            None => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -184,7 +241,7 @@ impl<'a> Index<'a> {
                 .filter(|entry| {
                     self.entries
                         .get(*entry)
-                        .and_then(|held| held.payload.as_deref())
+                        .and_then(|held| held.payload.bytes())
                         .and_then(DevicesPayload::decode)
                         .is_some_and(|payload| {
                             payload.devices.iter().any(|device| device.author == author)

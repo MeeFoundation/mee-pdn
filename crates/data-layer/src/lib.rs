@@ -43,9 +43,9 @@ pub use node::{CollectionPause, PodSession, PodSessions, PodStartPause};
 pub use pod::PodVerdicts;
 pub use pod::{
     record_prefix, Awaiting, CreatedPayload, DevicesPayload, EventKind, ForNothing, HeldEntry,
-    JoinedPayload, Member, MemberDevice, MemberState, MembershipKey, MembershipView, OpId,
-    Operation, PodCatchUp, PodNotice, PodStore, PodTickets, RecordEntry, RecordKey, RecordView,
-    Seq, UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,
+    HeldPayload, JoinedPayload, Member, MemberDevice, MemberState, MembershipKey, MembershipView,
+    OpId, Operation, PodCatchUp, PodHolding, PodNotice, PodStore, PodTickets, RecordEntry,
+    RecordKey, RecordView, Seq, UnknownEntry, UnknownPod, Verdict, ACT_PAYLOAD,
 };
 // The ceremony registration point (ADR-0011, ADR-0012), re-exported so
 // consumers need no direct iroh dependency. The raw `Endpoint` is

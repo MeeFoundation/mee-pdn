@@ -199,6 +199,10 @@ pub(crate) struct State {
     /// written, before the tickets go out: a reply lost.
     #[cfg(feature = "test-util")]
     pub(crate) drop_next_join_reply: bool,
+    /// Fails the next join dialogue's write of the joined event, once its
+    /// secret is burned, as a full disk would.
+    #[cfg(feature = "test-util")]
+    pub(crate) fail_next_joined_write: bool,
     /// What the next join dialogue's serving half sends in place of the
     /// honest value, as a modified inviter would.
     #[cfg(feature = "test-util")]
@@ -269,6 +273,8 @@ impl State {
             fail_next_pending_device_write: false,
             #[cfg(feature = "test-util")]
             drop_next_join_reply: false,
+            #[cfg(feature = "test-util")]
+            fail_next_joined_write: false,
             #[cfg(feature = "test-util")]
             forged_join: None,
             #[cfg(feature = "test-util")]
@@ -434,6 +440,11 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn drop_next_join_reply_for_test(&self) {
         self.state.lock().await.drop_next_join_reply = true;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn fail_next_joined_write_for_test(&self) {
+        self.state.lock().await.fail_next_joined_write = true;
     }
 
     /// The next join this runtime serves sends `forged` in place of the

@@ -247,7 +247,8 @@ pub trait PodsService {
     /// a dropped call leaves the pod whole and listed, or nothing.
     async fn create(&self, identity: PdnId) -> Result<PodId>;
 
-    /// The pods the identity holds, by its PMS.
+    /// The pods the identity holds: those whose record store this device
+    /// holds, and those its PMS holds that this device has not opened yet.
     async fn list(&self, identity: PdnId) -> Result<Vec<PodInfo>>;
 
     /// The current members, each with its role.
@@ -368,14 +369,18 @@ impl PodsService for RuntimePodsService<'_> {
 
     async fn list(&self, identity: PdnId) -> Result<Vec<PodInfo>> {
         let state = self.runtime.state.lock().await;
-        let mut pods: Vec<PodInfo> = state
-            .hosted(identity)?
-            .pms
-            .held_pods()
-            .await?
+        let recorded = state.hosted(identity)?.pms.held_pods().await?;
+        let holdings = state.node.pod_holdings(identity)?;
+        // What this device holds follows the membership view once it holds
+        // a store; the record alone speaks for a pod not opened here yet.
+        let unopened = recorded
             .into_iter()
-            .map(|id| PodInfo { id })
-            .collect();
+            .filter(|pod| !holdings.iter().any(|(held, _records)| held == pod));
+        let opened = holdings
+            .iter()
+            .filter(|(_pod, records)| *records)
+            .map(|(pod, _records)| *pod);
+        let mut pods: Vec<PodInfo> = unopened.chain(opened).map(|id| PodInfo { id }).collect();
         pods.sort();
         Ok(pods)
     }
@@ -772,11 +777,12 @@ async fn depart(state: &State, identity: PdnId, pod: PodId, seq: Seq) -> Result<
 }
 
 /// Acts on every notice the data layer reports of a hosted identity's
-/// pods: a departure is settled — how a removed member's device, or a
-/// departed member's other device, learns of it — and a device its
-/// member's statements do not list registers itself. A failure is logged
-/// and reported again at the next change to the membership store or the
-/// next run of the pod stores' pass.
+/// pods: a departure or a reinstatement is settled — how a removed
+/// member's device, a departed member's other device, or a device whose
+/// member's departure a later event reversed learns of it — and a device
+/// its member's statements do not list registers itself. A failure is
+/// logged and reported again at the next change to the membership store or
+/// the next run of the pod stores' pass.
 pub(crate) fn spawn_pod_notice_consumer(
     state: Weak<Mutex<State>>,
     mut notices: mpsc::UnboundedReceiver<PodNotice>,
@@ -788,9 +794,10 @@ pub(crate) fn spawn_pod_notice_consumer(
             };
             let guard = state.lock().await;
             match notice {
-                PodNotice::Departed { identity, pod, seq } => {
-                    if let Err(err) = settle_departure(&guard, identity, pod, seq).await {
-                        tracing::warn!(%identity, %pod, "settling the departure failed: {err:#}");
+                PodNotice::Departed { identity, pod, .. }
+                | PodNotice::Reinstated { identity, pod } => {
+                    if let Err(err) = settle_pod(&guard, identity, pod).await {
+                        tracing::warn!(%identity, %pod, "settling the pod's holding failed: {err:#}");
                     }
                 }
                 PodNotice::Unlisted { identity, pod } => {
@@ -803,26 +810,57 @@ pub(crate) fn spawn_pod_notice_consumer(
     });
 }
 
-async fn settle_departure(state: &State, identity: PdnId, pod: PodId, seq: Seq) -> Result<()> {
-    // A join imports onto the tombstone before its joined event arrives.
+/// Bring what this device holds of `pod` for `identity` — both stores, the
+/// tombstone or nothing — in line with [`holds`]: the record store opened
+/// from the PMS's tickets or forgotten, the tombstone opened, and a
+/// departure the membership view shows tombstoned in the PMS. Nothing while
+/// a join of the pod is in flight here, since a join imports onto the
+/// tombstone before its joined event arrives.
+async fn settle_pod(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
     if state.joining_in_flight.contains(&(identity, pod)) {
         return Ok(());
     }
-    let pms = &state.hosted(identity)?.pms;
-    // A later join recorded: the departure ends an earlier membership.
-    if pms
-        .pod_record(pod)
-        .await?
-        .is_some_and(|(recorded, held)| held && recorded > seq)
-    {
-        return Ok(());
+    let record = state.hosted(identity)?.pms.pod_record(pod).await?;
+    let holding = state.node.pod_holding(identity, pod).await?;
+    let own = holding
+        .as_ref()
+        .and_then(|holding| holding.membership.member(&identity));
+    match (
+        holds(record, own),
+        holding.as_ref().map(|holding| holding.records),
+    ) {
+        (true, Some(true)) | (false, Some(false)) => Ok(()),
+        (true, _) => open_pod(state, identity, pod).await,
+        (false, None) => open_tombstone(state, identity, pod).await,
+        (false, Some(true)) => match own.and_then(Member::departed_at) {
+            Some(seq) => depart(state, identity, pod, Seq::new(seq)).await,
+            None => state.node.forget_pod(identity, pod).await,
+        },
     }
-    depart(state, identity, pod, seq).await
+}
+
+/// Whether `identity` holds a pod, by the highest record its PMS holds of
+/// it and by `own`, the identity as the membership view of its replica
+/// here shows it: the record decides while the replica holds the
+/// identity's chain short of the record's sequence — the event it mirrors
+/// has not arrived — and the membership view from there on, so a departure
+/// a later event reversed, or a join that counts for nothing, ends where the
+/// membership view does.
+fn holds(record: Option<(Seq, bool)>, own: Option<&Member>) -> bool {
+    match (record, own) {
+        (Some((seq, held)), Some(own)) if own.run() < seq.get() => held,
+        (_, Some(own)) => own.state.member,
+        (Some((_seq, held)), None) => held,
+        (None, None) => false,
+    }
 }
 
 /// Write `identity`'s next device statement in `pod` — its counted list
 /// with this device added — when that list does not name this device with
-/// the author `identity` writes with here. Nothing while the identity key
+/// the author `identity` writes with here, and reconcile it with the other
+/// members' devices at once; a replica that lists nobody yet writes version
+/// 1 naming this device alone, which counts beside every other statement,
+/// and reaches the devices its tickets name. Nothing while the identity key
 /// has not reached this device, or while a join of the pod is in
 /// flight here, its join statement naming this device.
 async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<()> {
@@ -834,19 +872,23 @@ async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<(
         return Ok(());
     };
     let membership = state.node.pod_membership_view(identity, pod).await?;
-    let member = require_member(&membership, identity, pod)?;
     let device = MemberDevice {
         node: state.node.node_id(),
         author: hosted.author,
     };
-    if member.devices.contains(&device) {
-        return Ok(());
-    }
-    let version = member
-        .statement_version
-        .checked_add(1)
-        .context("device statement version exhausted")?;
-    let mut devices: Vec<MemberDevice> = member.devices.iter().copied().collect();
+    let (version, mut devices) = if membership.identities().next().is_none() {
+        (1, Vec::new())
+    } else {
+        let member = require_member(&membership, identity, pod)?;
+        if member.devices.contains(&device) {
+            return Ok(());
+        }
+        let version = member
+            .statement_version
+            .checked_add(1)
+            .context("device statement version exhausted")?;
+        (version, member.devices.iter().copied().collect())
+    };
     devices.push(device);
     let key = MembershipKey::Devices {
         member: identity,
@@ -865,15 +907,19 @@ async fn register_device(state: &State, identity: PdnId, pod: PodId) -> Result<(
             &key.to_bytes(),
             &keys.device_statement(&pod, version, devices).encode(),
         )
-        .await
+        .await?;
+    // Its announcement reaches only the swarm's neighbors of the moment.
+    let _dialed = state.node.flush_pod(identity, pod).await?;
+    Ok(())
 }
 
-/// Open every pod `identity`'s PMS holds that this device does not,
-/// from the tickets beside its record; open the tombstone of every pod it
-/// departed that this device holds nothing of, and forget the record store
-/// of every one this device still holds. The sweep after a restart
-/// re-derives the hosted pods so. A pod whose join is in flight here is
-/// the join's; one whose tickets have not arrived waits for the next sweep.
+/// Settle every pod `identity`'s PMS records whose record this device's
+/// holding does not match ([`settle_pod`]): a pod held by its record opened
+/// from the tickets beside it, a departed one's tombstone opened, or its
+/// record store forgotten unless the membership view here shows the
+/// departure reversed. The sweep after a restart re-derives the hosted pods
+/// so. A pod whose join is in flight here is the join's; one whose tickets
+/// have not arrived waits for the next sweep.
 pub(crate) async fn arm_pods(state: &State, identity: PdnId) {
     let Ok(hosted) = state.hosted(identity) else {
         return;
@@ -892,26 +938,18 @@ pub(crate) async fn arm_pods(state: &State, identity: PdnId) {
             .find(|(holding, _records)| holding == pod)
             .map(|(_holding, records)| *records)
     };
-    let joining = |pod: &PodId| state.joining_in_flight.contains(&(identity, *pod));
-    for pod in held {
-        if records_held(&pod) == Some(true) || joining(&pod) {
+    let recorded = held
+        .into_iter()
+        .map(|pod| (pod, true))
+        .chain(departed.into_iter().map(|pod| (pod, false)));
+    for (pod, by_record) in recorded {
+        if records_held(&pod) == Some(by_record)
+            || state.joining_in_flight.contains(&(identity, pod))
+        {
             continue;
         }
-        if let Err(err) = open_pod(state, identity, pod).await {
-            tracing::warn!(%identity, %pod, "opening the pod from the PMS failed: {err:#}");
-        }
-    }
-    for pod in departed {
-        if joining(&pod) {
-            continue;
-        }
-        let armed = match records_held(&pod) {
-            Some(true) => state.node.forget_pod(identity, pod).await,
-            Some(false) => Ok(()),
-            None => open_tombstone(state, identity, pod).await,
-        };
-        if let Err(err) = armed {
-            tracing::warn!(%identity, %pod, "keeping the departed pod's tombstone failed: {err:#}");
+        if let Err(err) = settle_pod(state, identity, pod).await {
+            tracing::warn!(%identity, %pod, "settling the pod from the PMS failed: {err:#}");
         }
     }
 }
@@ -1173,18 +1211,41 @@ async fn join_in_process(
         let state = Arc::clone(state);
         tokio::spawn(async move {
             let _permit = permit;
-            serve_join(&state, &mut serve_send, &mut serve_recv)
-                .await
-                .is_some()
+            serve_join(&state, &mut serve_send, &mut serve_recv).await
         })
     };
     let joined = run_joiner(&mut dial_send, &mut dial_recv, request, accept).await;
     drop((dial_send, dial_recv));
     // The serving half's own outcome decides: a read that failed because it
-    // declined must not read as a broken pipe.
+    // declined must not read as a broken pipe. Its storage failure is this
+    // node's own, so nothing hides it from the caller.
     match served.await {
-        Ok(true) => joined.context(JoinRefused),
-        _ => Err(JoinRefused.into()),
+        Ok(Ok(())) => joined.context(JoinRefused),
+        Ok(Err(JoinUnserved::Failed(err))) => Err(err),
+        Ok(Err(JoinUnserved::Refused)) | Err(_) => Err(JoinRefused.into()),
+    }
+}
+
+/// Why the inviter's half of a join handed over no tickets.
+#[derive(Debug)]
+pub(crate) enum JoinUnserved {
+    /// By the dialogue's rules, or over a transport that failed: the one
+    /// uniform refusal.
+    Refused,
+    /// This device's storage, once the secret burned; logged where it
+    /// failed, and a remote newcomer is refused all the same.
+    Failed(anyhow::Error),
+}
+
+impl JoinUnserved {
+    /// `err`, met at `step` once the secret burned: a refusal when the pod
+    /// is no longer held here, a logged failure otherwise.
+    fn after_burn(identity: PdnId, pod: PodId, step: &str, err: anyhow::Error) -> Self {
+        if err.downcast_ref::<UnknownPod>().is_some() {
+            return Self::Refused;
+        }
+        tracing::error!(%identity, %pod, "join failed after invite burn while {step}: {err:#}");
+        Self::Failed(err)
     }
 }
 
@@ -1193,37 +1254,43 @@ async fn join_in_process(
 /// sequence and the pod's created event, write its joined event — or, for
 /// a member already, the statement listing a device no statement lists yet
 /// — into the replica of the identity the secret was minted for, then hand
-/// over both tickets. `None` is a refusal, any reason at all.
+/// over both tickets.
 #[allow(clippy::too_many_lines)] // one dialogue, each refusal beside the step it guards
 pub(crate) async fn serve_join<R, W>(
     state: &Arc<Mutex<State>>,
     send: &mut W,
     recv: &mut R,
-) -> Option<()>
+) -> Result<(), JoinUnserved>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let request: JoinRequest = read_message(recv).await.ok()?;
+    use JoinUnserved::Refused;
+    let request: JoinRequest = read_message(recv).await.map_err(|_| Refused)?;
     if request.version != POD_INVITE_FORMAT_VERSION
         || pdn_id_of(&request.identity_key) != request.joiner
     {
-        return None;
+        return Err(Refused);
     }
     let (node, identity, pod) = {
         let mut state = state.lock().await;
         // Before any state change.
         let (identity, pod) = state
             .pending_pod_invites
-            .verify_and_burn(&request.secret, Instant::now())?;
+            .verify_and_burn(&request.secret, Instant::now())
+            .ok_or(Refused)?;
         (Arc::clone(&state.node), identity, pod)
     };
+    let failed = |step: &'static str| move |err| JoinUnserved::after_burn(identity, pod, step, err);
     #[cfg(feature = "test-util")]
     let forged = state.lock().await.forged_join.take();
-    let membership = node.pod_membership_view(identity, pod).await.ok()?;
-    let inviter = membership.member(&identity)?;
+    let membership = node
+        .pod_membership_view(identity, pod)
+        .await
+        .map_err(failed("reading the membership"))?;
+    let inviter = membership.member(&identity).ok_or(Refused)?;
     if !inviter.state.member {
-        return None;
+        return Err(Refused);
     }
     let actor_seq = inviter.run();
     let known = membership.member(&request.joiner);
@@ -1232,14 +1299,22 @@ where
         known.map_or(0, Member::run),
         request.run,
     );
-    let creation = node.pod_creation(identity, pod).await.ok()??;
+    let creation = node
+        .pod_creation(identity, pod)
+        .await
+        .map_err(failed("reading the created event"))?
+        .ok_or(Refused)?;
     #[cfg(feature = "test-util")]
     let (seq, write_joined, creation) = match forged {
         Some(ForgedJoin::Seq(forged)) => (forged, true, creation),
         Some(ForgedJoin::CreationOf(other)) => (
             seq,
             write_joined,
-            node.pod_creation(identity, other).await.ok()??,
+            node.pod_creation(identity, other)
+                .await
+                .ok()
+                .flatten()
+                .ok_or(Refused)?,
         ),
         _ => (seq, write_joined, creation),
     };
@@ -1248,15 +1323,19 @@ where
         write_joined,
         creation: creation.encode(),
     };
-    write_message(send, &offer).await.ok()?;
-    let acceptance: JoinAcceptance = read_message(recv).await.ok()?;
+    write_message(send, &offer).await.map_err(|_| Refused)?;
+    let acceptance: JoinAcceptance = read_message(recv).await.map_err(|_| Refused)?;
 
     if write_joined {
-        let joined = JoinedPayload::decode(acceptance.join_statement.as_deref()?)?;
+        let joined = acceptance
+            .join_statement
+            .as_deref()
+            .and_then(JoinedPayload::decode)
+            .ok_or(Refused)?;
         if joined.identity_key != request.identity_key
             || !join_verifies(&request.joiner, &pod, Seq::new(seq), &joined)
         {
-            return None;
+            return Err(Refused);
         }
         let key = MembershipKey::Event {
             subject: request.joiner,
@@ -1265,6 +1344,11 @@ where
             actor: identity,
             actor_seq: Seq::new(actor_seq),
         };
+        #[cfg(feature = "test-util")]
+        if std::mem::take(&mut state.lock().await.fail_next_joined_write) {
+            let err = anyhow::anyhow!("the joined event's write failed for test");
+            return Err(failed("writing the joined event")(err));
+        }
         node.write_pod_entry(
             identity,
             pod,
@@ -1273,14 +1357,18 @@ where
             &joined.encode(),
         )
         .await
-        .ok()?;
+        .map_err(failed("writing the joined event"))?;
     } else {
-        let statement = DevicesPayload::decode(acceptance.device_statement.as_deref()?)?;
+        let statement = acceptance
+            .device_statement
+            .as_deref()
+            .and_then(DevicesPayload::decode)
+            .ok_or(Refused)?;
         let [device] = statement.devices.as_slice() else {
-            return None;
+            return Err(Refused);
         };
         if !devices_verify(&request.identity_key, &pod, &request.joiner, 0, &statement) {
-            return None;
+            return Err(Refused);
         }
         if !known.is_some_and(|member| member.devices.contains(device)) {
             let key = MembershipKey::Devices {
@@ -1295,12 +1383,12 @@ where
                 &statement.encode(),
             )
             .await
-            .ok()?;
+            .map_err(failed("writing the device statement"))?;
         }
     }
     #[cfg(feature = "test-util")]
     if std::mem::take(&mut state.lock().await.drop_next_join_reply) {
-        return None;
+        return Err(Refused);
     }
     // Written before the reply: a lost reply leaves the newcomer listed,
     // and a second invite hands the tickets over again.
@@ -1312,7 +1400,7 @@ where
     let tickets = node
         .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
         .await
-        .ok()?;
+        .map_err(failed("minting the tickets"))?;
     write_message(
         send,
         &JoinTickets {
@@ -1321,8 +1409,7 @@ where
         },
     )
     .await
-    .ok()?;
-    Some(())
+    .map_err(|_| Refused)
 }
 
 /// The identity holds `pod` from `seq` of its chain on: both stores' write
@@ -1384,7 +1471,7 @@ impl JoinHandler {
     async fn serve(&self, connection: &Connection) -> Option<()> {
         let (mut send, mut recv) = connection.accept_bi().await.ok()?;
         let state = self.state.get()?.upgrade()?;
-        serve_join(&state, &mut send, &mut recv).await?;
+        serve_join(&state, &mut send, &mut recv).await.ok()?;
         send.finish().ok()?;
         // Held until the joiner closes, so the tickets are not cut off.
         connection.closed().await;

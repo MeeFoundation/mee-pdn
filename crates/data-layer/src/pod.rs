@@ -16,9 +16,9 @@ use pdn_types::{PdnId, PodId};
 
 pub use keys::{record_prefix, EventKind, MembershipKey, OpId, RecordKey, Seq};
 pub use membership_view::{
-    Awaiting, ForNothing, HeldEntry, Member, MemberState, MembershipView, Verdict,
+    Awaiting, ForNothing, HeldEntry, HeldPayload, Member, MemberState, MembershipView, Verdict,
 };
-pub(crate) use past::{departure_past, PastEntry};
+pub(crate) use past::{departure_past, PastEntry, Rests};
 pub(crate) use payloads::encode_devices;
 pub use payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice, ACT_PAYLOAD};
 pub use record_view::{Operation, RecordEntry, RecordView};
@@ -49,7 +49,8 @@ pub struct PodVerdicts {
 }
 
 /// Every entry of `doc`, one per author and key as the store keeps them,
-/// each with its payload once the bytes have arrived.
+/// each with the payload the membership view reads once its bytes have
+/// arrived ([`HeldPayload::unread`]): no other payload is read into memory.
 pub(crate) async fn held_entries(
     doc: &Doc,
     blobs: &iroh_blobs::api::Store,
@@ -59,10 +60,12 @@ pub(crate) async fn held_entries(
     while let Some(entry) = stream.next().await {
         let entry = entry?;
         let hash = entry.content_hash();
-        let payload = if blobs.has(hash).await? {
-            Some(blobs.get_bytes(hash).await?.to_vec())
-        } else {
-            None
+        let payload = match HeldPayload::unread(entry.key(), entry.content_len()) {
+            Some(unread) => unread,
+            None if blobs.has(hash).await? => {
+                HeldPayload::Read(blobs.get_bytes(hash).await?.to_vec())
+            }
+            None => HeldPayload::Awaited,
         };
         held.push(HeldEntry {
             key: entry.key().to_vec(),
@@ -127,20 +130,27 @@ pub(crate) async fn unknown_entries(doc: &Doc, store: PodStore) -> Result<Vec<Un
     Ok(unknown)
 }
 
-/// What a derivation of a pod's contacts finds for the runtime to act on
-/// while the identity's device still holds the pod's record store, from
-/// [`SyncNode::take_pod_notices`](crate::SyncNode::take_pod_notices).
+/// What a derivation of a pod's contacts finds for the runtime to act on,
+/// from [`SyncNode::take_pod_notices`](crate::SyncNode::take_pod_notices):
+/// [`Reinstated`](Self::Reinstated) while the identity's device holds the
+/// pod's tombstone, the others while it holds the record store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodNotice {
-    /// `identity`'s chain in `pod` ends in a counted left or removed event
-    /// at `seq`.
+    /// `identity` is no member of `pod`, its membership ended by its
+    /// counted left or removed event at `seq`.
     Departed {
         identity: PdnId,
         pod: PodId,
         seq: Seq,
     },
-    /// `identity` is a member of `pod`, and none of its counted device
-    /// statements lists this device with the author it writes with here.
+    /// `identity` is a member of `pod` by the membership view of the
+    /// tombstone this device holds: a later event reversed the departure,
+    /// or a join after it has arrived.
+    Reinstated { identity: PdnId, pod: PodId },
+    /// `identity` is a member of `pod` and none of its counted device
+    /// statements lists this device with the author it writes with here,
+    /// or two runs in a row of the pod stores' pass found the membership
+    /// view listing nobody.
     Unlisted { identity: PdnId, pod: PodId },
 }
 
@@ -166,6 +176,16 @@ impl PodCatchUp {
             .wait(deadline.saturating_duration_since(std::time::Instant::now()))
             .await
     }
+}
+
+/// What one identity holds of a pod here, from
+/// [`SyncNode::pod_holding`](crate::SyncNode::pod_holding).
+#[derive(Debug, Clone)]
+pub struct PodHolding {
+    /// Over its replica of the membership store, a tombstone's included.
+    pub membership: MembershipView,
+    /// `false` for a tombstone.
+    pub records: bool,
 }
 
 /// The write tickets to a pod's two stores.

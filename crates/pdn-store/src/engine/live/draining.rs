@@ -10,13 +10,11 @@
 use std::{collections::VecDeque, future::Future, num::NonZeroU64};
 
 use anyhow::Result;
-use irpc::channel::mpsc;
 
 use crate::{
     actor::{OpenOpts, SyncHandle},
-    api::RpcResult,
-    store::{DownloadPolicy, Query, Store},
-    AuthorHeads, Event, NamespaceId, PeerIdBytes, SignedEntry,
+    store::Store,
+    AuthorHeads, Event, NamespaceId, PeerIdBytes,
 };
 
 /// Events the channel holds before the sync actor waits.
@@ -78,11 +76,6 @@ impl DrainingSync {
         }
     }
 
-    /// Waits for `reply` while taking replica events.
-    pub(super) async fn wait<T>(&mut self, reply: impl Future<Output = T>) -> T {
-        self.events.during(reply).await
-    }
-
     /// Opens `namespace` for sync, its events delivered to the live actor.
     pub(super) async fn open(&mut self, namespace: NamespaceId) -> Result<()> {
         let opts = OpenOpts::default().sync().subscribe(self.events.tx.clone());
@@ -120,27 +113,6 @@ impl DrainingSync {
     ) -> Result<()> {
         self.events
             .during(self.sync.register_useful_peer(namespace, peer))
-            .await
-    }
-
-    pub(super) async fn get_download_policy(
-        &mut self,
-        namespace: NamespaceId,
-    ) -> Result<DownloadPolicy> {
-        self.events
-            .during(self.sync.get_download_policy(namespace))
-            .await
-    }
-
-    /// The entries arrive on `reply`; wait on it through [`Self::wait`].
-    pub(super) async fn get_many(
-        &mut self,
-        namespace: NamespaceId,
-        query: Query,
-        reply: mpsc::Sender<RpcResult<SignedEntry>>,
-    ) -> Result<()> {
-        self.events
-            .during(self.sync.get_many(namespace, query, reply))
             .await
     }
 

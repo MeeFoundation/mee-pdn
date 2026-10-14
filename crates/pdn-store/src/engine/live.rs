@@ -156,6 +156,12 @@ pub enum ToLiveActor {
         #[debug("SessionOpening")]
         opening: SessionOpening<InProcessRecv, InProcessSend>,
     },
+    /// The content `namespace`'s entries lack, as the scan its first
+    /// `start_sync` started read it off the loop.
+    ContentScanned {
+        namespace: NamespaceId,
+        missing: Vec<Hash>,
+    },
     /// A dial the remote aborted as already syncing, asked for again.
     Redial {
         namespace: NamespaceId,
@@ -380,6 +386,10 @@ pub struct LiveActor {
     /// keyed by the namespace whose entry wants them (the namespace drives retries on
     /// sync-finished and keeps `PendingContentReady` attribution correct).
     missing_hashes: HashSet<(NamespaceId, Hash)>,
+    /// Per namespace whose content scan runs, the peer of the last session
+    /// that went through meanwhile: its retry of parked content ran before
+    /// the scan parked anything.
+    content_scans: HashMap<NamespaceId, Option<PublicKey>>,
     /// Queued content whose running download should be retried once if it fails: a fresh
     /// provider was registered (through a finished sync) after the running download had
     /// already snapshotted its provider set, so the provider is only reachable by a new
@@ -467,6 +477,7 @@ impl LiveActor {
             download_tasks: Default::default(),
             state: Default::default(),
             missing_hashes: Default::default(),
+            content_scans: Default::default(),
             retry_after_failure: Default::default(),
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
@@ -625,6 +636,9 @@ impl LiveActor {
             }
             ToLiveActor::AcceptInProcess { opening } => {
                 self.accept_in_process(opening);
+            }
+            ToLiveActor::ContentScanned { namespace, missing } => {
+                self.on_content_scanned(namespace, missing).await;
             }
             ToLiveActor::Redial {
                 namespace,
@@ -951,13 +965,7 @@ impl LiveActor {
         if !self.state.is_syncing(&namespace) {
             self.sync.open(namespace).await?;
             self.state.insert(namespace);
-            // Before the first dial, so the first finished session retries it.
-            if let Err(err) = self.park_missing_content(namespace).await {
-                warn!(
-                    ?namespace,
-                    "parking the content its entries lack failed: {err:#}"
-                );
-            }
+            self.scan_missing_content(namespace);
         }
         if let Some(handed) = handed {
             self.join_peers(namespace, peers, handed, join_gossip)
@@ -996,29 +1004,46 @@ impl LiveActor {
         Ok(())
     }
 
-    /// Park the content of every entry of `namespace` the download policy
-    /// wants and the blob store does not hold whole, as a remote insert
-    /// parks it. The parked set lives in memory: without this, content whose
-    /// download a restart cut short is never asked for again, since a
-    /// session after the restart finds no entry to exchange.
-    async fn park_missing_content(&mut self, namespace: NamespaceId) -> Result<()> {
-        let policy = self.sync.get_download_policy(namespace).await?;
-        let (tx, mut rx) = irpc::channel::mpsc::channel(64);
-        self.sync
-            .get_many(namespace, crate::store::Query::all().into(), tx)
-            .await?;
-        while let Some(entry) = self.sync.wait(rx.recv()).await? {
-            let entry = entry?;
-            if entry.content_len() == 0 || !policy.matches(entry.entry()) {
-                continue;
-            }
-            let hash = entry.content_hash();
-            let status = self.bao_store.blobs().status(hash).await;
-            if !matches!(status, Ok(BlobStatus::Complete { .. })) {
-                self.missing_hashes.insert((namespace, hash));
+    /// Find, off the loop, the content of every entry of `namespace` the
+    /// download policy wants and the blob store does not hold whole, and
+    /// park it as a remote insert parks it ([`ToLiveActor::ContentScanned`]).
+    /// The parked set lives in memory: without this, content whose download
+    /// a restart cut short is never asked for again, since a session after
+    /// the restart finds no entry to exchange. Off the loop, since the scan
+    /// reads every entry and asks the blob store about each.
+    fn scan_missing_content(&mut self, namespace: NamespaceId) {
+        self.content_scans.insert(namespace, None);
+        let sync = self.sync.handle().clone();
+        let blobs = self.bao_store.clone();
+        let to_self = self.sync_actor_tx.clone();
+        n0_future::task::spawn(async move {
+            let missing = missing_content(&sync, &blobs, namespace)
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(
+                        ?namespace,
+                        "finding the content its entries lack failed: {err:#}"
+                    );
+                    Vec::new()
+                });
+            to_self
+                .send(ToLiveActor::ContentScanned { namespace, missing })
+                .await
+                .ok();
+        });
+    }
+
+    async fn on_content_scanned(&mut self, namespace: NamespaceId, missing: Vec<Hash>) {
+        let met = self.content_scans.remove(&namespace).flatten();
+        if !self.state.is_syncing(&namespace) {
+            return;
+        }
+        for hash in missing {
+            self.missing_hashes.insert((namespace, hash));
+            if let Some(peer) = met {
+                self.start_download(namespace, hash, peer, true).await;
             }
         }
-        Ok(())
     }
 
     async fn leave(
@@ -1359,6 +1384,9 @@ impl LiveActor {
                 for hash in parked {
                     debug!(peer=%peer.fmt_short(), %hash, "retrying parked content");
                     self.start_download(namespace, hash, peer, true).await;
+                }
+                if let Some(met) = self.content_scans.get_mut(&namespace) {
+                    *met = Some(peer);
                 }
                 for hash in queued {
                     debug!(peer=%peer.fmt_short(), %hash, "registering sync peer for queued content");
@@ -1926,6 +1954,32 @@ impl QueuedHashes {
     fn contains_namespace(&self, namespace: &NamespaceId) -> bool {
         self.by_namespace.contains_key(namespace)
     }
+}
+
+/// The content of every entry of `namespace` the download policy wants and
+/// `blobs` does not hold whole.
+async fn missing_content(
+    sync: &SyncHandle,
+    blobs: &Store,
+    namespace: NamespaceId,
+) -> Result<Vec<Hash>> {
+    let policy = sync.get_download_policy(namespace).await?;
+    let (tx, mut rx) = irpc::channel::mpsc::channel(64);
+    sync.get_many(namespace, crate::store::Query::all().into(), tx)
+        .await?;
+    let mut missing = Vec::new();
+    while let Some(entry) = rx.recv().await? {
+        let entry = entry?;
+        if entry.content_len() == 0 || !policy.matches(entry.entry()) {
+            continue;
+        }
+        let hash = entry.content_hash();
+        let status = blobs.blobs().status(hash).await;
+        if !matches!(status, Ok(BlobStatus::Complete { .. })) {
+            missing.push(hash);
+        }
+    }
+    Ok(missing)
 }
 
 fn fmt_accept_peer(res: &Result<SyncFinished, AcceptError>) -> String {

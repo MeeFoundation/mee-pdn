@@ -24,7 +24,8 @@ use crate::{
     connection_metadata::GrantRecord,
     grant::{claim_id_of_key, GrantedClaim, ReadGrant},
     pod::{
-        departure_past, held_entries, HeldEntry, MembershipKey, MembershipView, PastEntry, PodStore,
+        departure_past, held_entries, HeldEntry, HeldPayload, Member, MembershipKey,
+        MembershipView, PastEntry, PodStore, Rests,
     },
     registry::{Registry, ServingPosture},
 };
@@ -86,13 +87,12 @@ enum WriteAdmission {
     /// Nothing: no session vouched for the writer.
     Nothing,
     /// Exactly these entries of a pod's membership store, by key and
-    /// author — a departure's past — and, where `rejoin` names the departed
-    /// member and its departure's sequence, every event of that member's
-    /// chain after it, so a device holding its tombstone takes its new join.
-    Past {
-        entries: Arc<HashSet<PastEntry>>,
-        rejoin: Option<(PdnId, u64)>,
-    },
+    /// author: a former member's departure's past, what a member device
+    /// takes from that member's device.
+    Past(Arc<HashSet<PastEntry>>),
+    /// What a replica whose own identity departed takes from a member
+    /// device, a new join or an event reversing the departure included.
+    Rests(Arc<Rests>),
     /// Exactly the entries these authors signed and the device statements
     /// of `statements_of`, on a pod's store: what a dial takes from a callee
     /// it serves nothing. A statement carries its member's signature, which
@@ -677,8 +677,9 @@ impl AccessBook {
     /// A pod's membership store, served whole to a device of the member
     /// the caller names — a sibling by this identity's own PMS,
     /// another member by the device statements this identity's membership
-    /// view counts — and to nobody else, by the pod stores spec. The record
-    /// store serves no session.
+    /// view counts — and to nobody else, by the pod stores spec, though a
+    /// node no statement of a current member lists is taken that member's
+    /// statements alone. The record store serves no session.
     async fn classify_pod(
         &self,
         registry: &Arc<Registry>,
@@ -731,21 +732,57 @@ impl AccessBook {
         // payloads after the session that brought their entries, so the
         // session after it would refuse the newcomer for their absence, so
         // the newcomer is judged again once they are here.
-        if !self.await_payloads_of(&held.membership, &caller).await? {
-            return Ok(self.refused(registry, role, || self.unserved(&read, &caller)));
+        let read = if self.await_payloads_of(&held.membership, &caller).await? {
+            match self
+                .serve_pod(registry, pod, store, &held.membership, caller, peer)
+                .await?
+            {
+                Ok(access) => return Ok(access),
+                Err(read) => read,
+            }
+        } else {
+            read
+        };
+        if matches!(role, SessionRole::Accept) && self.takes_statements_of(store, &read, &caller) {
+            return Ok(SessionAccess::Allow {
+                egress: Some(closed_egress()),
+                ingest: Some(self.ingest(
+                    registry,
+                    WriteAdmission::Signed {
+                        authors: Arc::default(),
+                        statements_of: Some(caller),
+                    },
+                )),
+                rests_on: RestsOn::Nothing,
+            });
         }
-        match self
-            .serve_pod(registry, pod, store, &held.membership, caller, peer)
-            .await?
-        {
-            Ok(access) => Ok(access),
-            Err(read) => Ok(self.refused(registry, role, || self.unserved(&read, &caller))),
-        }
+        Ok(self.refused(registry, role, || self.unserved(&read, &caller)))
+    }
+
+    /// Whether a session on `store` from a node no statement of `caller`
+    /// lists is still taken `caller`'s device statements: on the membership
+    /// store, by a replica whose own identity has not departed, when
+    /// `caller` is a current member — so a device whose siblings are gone
+    /// reaches a member device with the statement that lists it.
+    fn takes_statements_of(
+        &self,
+        store: PodStore,
+        (view, _entries): &Read,
+        caller: &PdnId,
+    ) -> bool {
+        store == PodStore::Membership
+            && view
+                .member(&self.identity)
+                .and_then(Member::departed_at)
+                .is_none()
+            && view
+                .member(caller)
+                .is_some_and(|member| member.state.member)
     }
 
     /// A pod session served nothing: denied when accepting, whatever
-    /// `unserved` would say; when dialing, nothing served and what it
-    /// admits taken.
+    /// `unserved` would say; when dialing, nothing served but the replica's
+    /// own statements while it lists nobody, and what it admits taken.
     fn refused(
         &self,
         registry: &Arc<Registry>,
@@ -755,31 +792,54 @@ impl AccessBook {
         if matches!(role, SessionRole::Accept) {
             return SessionAccess::Deny;
         }
-        let admission = match unserved() {
-            Unserved::Unresolved => WriteAdmission::Whole,
+        let (admission, egress) = match unserved() {
+            // A replica that lists nobody yet sends its own statements, so a
+            // device whose siblings are gone reaches a member device.
+            Unserved::Unresolved => (WriteAdmission::Whole, self.own_statements()),
             Unserved::Members {
                 authors,
                 statements_of,
-            } => WriteAdmission::Signed {
-                authors,
-                statements_of,
-            },
-            Unserved::Nothing => WriteAdmission::Signed {
-                authors: Arc::default(),
-                statements_of: None,
-            },
+            } => (
+                WriteAdmission::Signed {
+                    authors,
+                    statements_of,
+                },
+                closed_egress(),
+            ),
+            Unserved::Nothing => (
+                WriteAdmission::Signed {
+                    authors: Arc::default(),
+                    statements_of: None,
+                },
+                closed_egress(),
+            ),
         };
         SessionAccess::Allow {
-            egress: Some(closed_egress()),
+            egress: Some(egress),
             ingest: Some(self.ingest(registry, admission)),
             rests_on: RestsOn::Nothing,
         }
     }
 
+    /// This identity's own device statements, and nothing else.
+    fn own_statements(&self) -> EntryFilter {
+        let own = self.identity;
+        Arc::new(move |entry: &pdn_store::SignedEntry| {
+            matches!(
+                MembershipKey::parse(entry.key()),
+                Some(MembershipKey::Devices { member, .. }) if member == own
+            )
+        })
+    }
+
     /// What a dial takes from `caller` when this replica, having `read` its
     /// membership store, serves it nothing.
-    fn unserved(&self, (view, entries): &Read, caller: &PdnId) -> Unserved {
-        if departure_past(view, entries, &self.identity).is_some() {
+    fn unserved(&self, (view, _entries): &Read, caller: &PdnId) -> Unserved {
+        if view
+            .member(&self.identity)
+            .and_then(Member::departed_at)
+            .is_some()
+        {
             return Unserved::Nothing;
         }
         let current = || view.identities().filter(|(_, member)| member.state.member);
@@ -799,8 +859,8 @@ impl AccessBook {
     /// How a session naming `caller` from `peer` is served, or what it read
     /// to refuse it: a current member's device whole, and a former member's device on
     /// the membership store over its departure's past alone, both ways; a
-    /// replica whose own identity departed serves any member over its own
-    /// departure's past alone.
+    /// replica whose own identity departed sends any member its own
+    /// departure's past alone and takes what its [`Rests`] admit.
     async fn serve_pod(
         &self,
         registry: &Arc<Registry>,
@@ -812,7 +872,9 @@ impl AccessBook {
     ) -> Result<std::result::Result<SessionAccess, Read>> {
         let (view, entries) = self.membership_view_and_entries(pod, membership).await?;
         // A payload arriving moves the membership view and no write count.
-        let unread = entries.iter().any(|entry| entry.payload.is_none());
+        let unread = entries
+            .iter()
+            .any(|entry| entry.payload == HeldPayload::Awaited);
         let rested = |access: SessionAccess| {
             if unread {
                 resting_on(access, RestsOn::Unknown)
@@ -826,36 +888,31 @@ impl AccessBook {
         let Some(member) = view.member(&caller).filter(|_| listed) else {
             return Ok(Err((view, entries)));
         };
-        let (departure, rejoin) = if member.state.member {
+        let (past, admission) = if member.state.member {
             match departure_past(&view, &entries, &self.identity) {
                 None => return Ok(Ok(rested(self.whole(registry)))),
                 Some(own) => {
-                    let rejoin = Some((self.identity, own.seq));
-                    (own, rejoin)
+                    let rests = Rests::of(&entries, &self.identity);
+                    (Arc::new(own), WriteAdmission::Rests(Arc::new(rests)))
                 }
             }
         } else {
             match departure_past(&view, &entries, &caller) {
                 None => return Ok(Err((view, entries))),
-                Some(theirs) => (theirs, None),
+                Some(theirs) => {
+                    let past = Arc::new(theirs);
+                    (Arc::clone(&past), WriteAdmission::Past(past))
+                }
             }
         };
         if store == PodStore::Records {
             return Ok(Err((view, entries)));
         }
-        let past = Arc::new(departure.past);
-        let served = Arc::clone(&past);
         Ok(Ok(rested(SessionAccess::Allow {
             egress: Some(Arc::new(move |entry: &pdn_store::SignedEntry| {
-                served.contains(&(entry.key().to_vec(), entry.author()))
+                past.contains(&(entry.key().to_vec(), entry.author()))
             })),
-            ingest: Some(self.ingest(
-                registry,
-                WriteAdmission::Past {
-                    entries: past,
-                    rejoin,
-                },
-            )),
+            ingest: Some(self.ingest(registry, admission)),
             rests_on: RestsOn::Nothing,
         })))
     }
@@ -1090,18 +1147,18 @@ impl AccessBook {
                     ValidateOutcome::Drop
                 };
             }
-            if let WriteAdmission::Past { entries, rejoin } = &admission {
-                let id = entry.id();
-                let later_in_own_chain = rejoin.is_some_and(|(member, departed)| {
-                    matches!(
-                        MembershipKey::parse(id.key()),
-                        Some(MembershipKey::Event { subject, seq, .. })
-                            if subject == member && seq.get() > departed
-                    )
-                });
-                return if later_in_own_chain
-                    || entries.contains(&(id.key().to_vec(), entry.author()))
-                {
+            let pod_admits = match &admission {
+                WriteAdmission::Past(entries) => {
+                    Some(entries.contains(&(entry.id().key().to_vec(), entry.author())))
+                }
+                WriteAdmission::Rests(rests) => Some(rests.admits(entry.id().key())),
+                WriteAdmission::Whole
+                | WriteAdmission::Claims(_)
+                | WriteAdmission::Nothing
+                | WriteAdmission::Signed { .. } => None,
+            };
+            if let Some(admits) = pod_admits {
+                return if admits {
                     ValidateOutcome::Accept
                 } else {
                     ValidateOutcome::Drop
@@ -1141,7 +1198,8 @@ impl AccessBook {
                 // and a set of authors bound only a pod's store, which
                 // returned above.
                 WriteAdmission::Nothing
-                | WriteAdmission::Past { .. }
+                | WriteAdmission::Past(_)
+                | WriteAdmission::Rests(_)
                 | WriteAdmission::Signed { .. } => ValidateOutcome::Drop,
             }
         })

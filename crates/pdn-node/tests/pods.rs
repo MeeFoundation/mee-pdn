@@ -407,6 +407,43 @@ async fn two_members_on_one_node_write_converge_and_part_each_as_itself() -> Res
     Ok(())
 }
 
+/// A join between two identities of one node whose inviter's storage fails
+/// once the secret burned answers its caller with that failure, and a
+/// later invite joins. Denied: the same failure reaches a newcomer on
+/// another node as the uniform refusal alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_failure_after_the_burn_reaches_the_caller_on_the_inviters_node() -> Result<()> {
+    let (tablet, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice_work = tablet.identity().create().await?;
+    let alice_leisure = tablet.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = tablet.pods().create(alice_work).await?;
+
+    let invite = tablet.pods().invite(alice_work, pod, None).await?;
+    tablet.fail_next_joined_write_for_test().await;
+    let joined = tablet.pods().join(alice_leisure, invite).await;
+    assert!(
+        joined.is_err_and(|err| !is::<JoinRefused>(&err)
+            && format!("{err:#}").contains("the joined event's write failed")),
+        "the inviter's storage failure reached its own caller as a refusal"
+    );
+    // Denied: the newcomer on another node learns nothing of the cause.
+    let invite = tablet.pods().invite(alice_work, pod, None).await?;
+    tablet.fail_next_joined_write_for_test().await;
+    let joined = bob_phone.pods().join(bob, invite).await;
+    assert!(joined.is_err_and(|err| is::<JoinRefused>(&err)));
+
+    let invite = tablet.pods().invite(alice_work, pod, None).await?;
+    tablet.pods().join(alice_leisure, invite).await?;
+    let both = vec![member(alice_work, true), member(alice_leisure, false)];
+    assert!(lists_members(&tablet, alice_leisure, pod, both).await?);
+
+    for runtime in [tablet, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A newcomer whose join lost the inviter's reply, after its joined event
 /// was written, joins through a second invite that writes no second joined
 /// event, and catches up.
@@ -1222,6 +1259,195 @@ async fn a_former_owner_removed_and_invited_again_is_a_plain_member() -> Result<
     Ok(())
 }
 
+/// A removed member invited again by a member promoted after the removal
+/// joins again, its device taking the inviter's chain up to the point the
+/// joined event names, and reads the record placed while it was out.
+/// Denied: that read while the member was out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_member_joins_again_through_an_inviter_whose_chain_ran_on() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        memory_runtime().await?,
+        memory_runtime().await?,
+        memory_runtime().await?,
+    );
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let pod = pod_of_three(
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    )
+    .await?;
+    alice_phone
+        .pods()
+        .act(alice, pod, PodAct::Remove(carol))
+        .await?;
+    assert!(lists_pod(&carol_phone, carol, pod, false).await?);
+    alice_phone
+        .pods()
+        .act(alice, pod, PodAct::Promote(bob))
+        .await?;
+    let owners = vec![member(alice, true), member(bob, true)];
+    assert!(lists_members(&bob_phone, bob, pod, owners).await?);
+    let meanwhile = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"meanwhile")
+        .await?;
+    // Denied: the read while out.
+    let read = carol_phone.pods().read(carol, pod, meanwhile).await;
+    assert!(read.is_err_and(|err| is::<UnknownPod>(&err)));
+
+    let invite = bob_phone.pods().invite(bob, pod, None).await?;
+    carol_phone.pods().join(carol, invite).await?;
+    let all = vec![member(alice, true), member(bob, true), member(carol, false)];
+    for (runtime, holder) in [(&alice_phone, alice), (&carol_phone, carol)] {
+        assert!(lists_members(runtime, holder, pod, all.clone()).await?);
+    }
+    assert!(reads(&carol_phone, carol, pod, meanwhile, b"meanwhile").await?);
+
+    for runtime in [alice_phone, bob_phone, carol_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A pod stores' pass short enough that a scenario waits a few runs at
+/// most.
+const POD_PASS: Duration = Duration::from_millis(500);
+
+async fn passing_runtime() -> Result<Runtime> {
+    Runtime::spawn(SpawnOptions {
+        pod_reconcile_interval: POD_PASS,
+        ..SpawnOptions::memory()
+    })
+    .await
+}
+
+/// A member whose removal stops counting — a concurrent removal of its
+/// remover outranks the promotion the removal rests on — holds the pod
+/// again on the device that departed, without a new invite: it reads the
+/// record placed meanwhile and places one every member reads. Denied: the
+/// remover, out of the pod, lists it on no device.
+///
+/// Every device refuses pod sessions while Carol removes Bob, and her
+/// device stops before any session, so the removal reaches nobody until
+/// her device starts again.
+#[allow(clippy::too_many_lines)] // one scenario: the two removals, the departure and the return
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_whose_removal_stops_counting_holds_the_pod_again() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let carol_on = |dir: &std::path::Path| {
+        Runtime::spawn(SpawnOptions {
+            pod_reconcile_interval: POD_PASS,
+            ..SpawnOptions::on_directory(dir)
+        })
+    };
+    let (alice_phone, bob_phone, dave_phone) = (
+        passing_runtime().await?,
+        passing_runtime().await?,
+        passing_runtime().await?,
+    );
+    let carol_phone = carol_on(dir.path()).await?;
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let dave = dave_phone.identity().create().await?;
+    let pod = pod_of_three(
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+    )
+    .await?;
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    dave_phone.pods().join(dave, invite).await?;
+    alice_phone
+        .pods()
+        .act(alice, pod, PodAct::Promote(carol))
+        .await?;
+    let four = vec![
+        member(alice, true),
+        member(bob, false),
+        member(carol, true),
+        member(dave, false),
+    ];
+    for (runtime, holder) in [(&carol_phone, carol), (&dave_phone, dave)] {
+        assert!(lists_members(runtime, holder, pod, four.clone()).await?);
+    }
+
+    let devices = [
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&carol_phone, carol),
+        (&dave_phone, dave),
+    ];
+    for (runtime, holder) in devices {
+        runtime.refuse_pod_sessions_for_test(holder, true).await?;
+    }
+    carol_phone
+        .pods()
+        .act(carol, pod, PodAct::Remove(bob))
+        .await?;
+    carol_phone.shutdown().await?;
+    drop(carol_phone);
+    for (runtime, holder) in [
+        (&alice_phone, alice),
+        (&bob_phone, bob),
+        (&dave_phone, dave),
+    ] {
+        runtime.refuse_pod_sessions_for_test(holder, false).await?;
+    }
+    alice_phone
+        .pods()
+        .act(alice, pod, PodAct::Promote(bob))
+        .await?;
+    let promoted = vec![
+        member(alice, true),
+        member(bob, true),
+        member(carol, true),
+        member(dave, false),
+    ];
+    assert!(lists_members(&bob_phone, bob, pod, promoted).await?);
+    bob_phone.pods().act(bob, pod, PodAct::Remove(dave)).await?;
+    assert!(lists_pod(&dave_phone, dave, pod, false).await?);
+    assert_eq!(
+        dave_phone.pod_holdings_for_test(dave).await?,
+        [(pod, false)]
+    );
+    let meanwhile = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"meanwhile")
+        .await?;
+
+    let carol_phone = carol_on(dir.path()).await?;
+    let three = vec![
+        member(alice, true),
+        member(carol, true),
+        member(dave, false),
+    ];
+    assert!(lists_members(&alice_phone, alice, pod, three.clone()).await?);
+    assert!(
+        lists_pod(&dave_phone, dave, pod, true).await?,
+        "the device that departed did not take the pod back"
+    );
+    assert!(lists_members(&dave_phone, dave, pod, three).await?);
+    assert!(reads(&dave_phone, dave, pod, meanwhile, b"meanwhile").await?);
+    let back = dave_phone
+        .pods()
+        .put_record(dave, pod, RecordKind::Claim, b"back")
+        .await?;
+    for (runtime, holder) in [(&alice_phone, alice), (&carol_phone, carol)] {
+        assert!(reads(runtime, holder, pod, back, b"back").await?);
+    }
+    // Denied: the remover, out.
+    assert!(lists_pod(&bob_phone, bob, pod, false).await?);
+
+    for runtime in [alice_phone, bob_phone, carol_phone, dave_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// An owner's removal of a plain member reaches the remaining member, the two
 /// still syncing, and the removed member's device stops listing the pod.
 /// Denied: the removed member's removal of the remaining one, refused while it
@@ -1584,6 +1810,64 @@ async fn a_member_reaches_the_pod_from_an_unlisted_device_through_an_invite() ->
     assert!(reads(&bob_laptop, bob, pod, lease, b"lease").await?);
 
     for runtime in [alice_phone, bob_laptop] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A member's device whose sibling is gone before any member device took
+/// its statement reaches the pod through a member device it dials, and
+/// reads what was placed after. Denied: until it writes the statement, the
+/// member device lists the sibling alone among the member's devices.
+///
+/// The new device's statement write fails while its sibling is up, and it
+/// writes the statement after a restart, once the sibling has stopped, so
+/// no device but itself ever holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_device_whose_sibling_is_gone_reaches_the_pod() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let laptop_on = |dir: &std::path::Path| {
+        Runtime::spawn(SpawnOptions {
+            pod_reconcile_interval: POD_PASS,
+            ..SpawnOptions::on_directory(dir)
+        })
+    };
+    let alice_phone = passing_runtime().await?;
+    let carol_phone = memory_runtime().await?;
+    let carol_laptop = laptop_on(dir.path()).await?;
+    let alice = alice_phone.identity().create().await?;
+    let carol = carol_phone.identity().create().await?;
+    let pod = pod_of_two(&alice_phone, alice, &carol_phone, carol).await?;
+    carol_laptop.fail_device_statements_for_test(pod).await;
+    link_patiently(&carol_laptop, &carol_phone, carol).await?;
+    let before = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"before")
+        .await?;
+    assert!(reads(&carol_laptop, carol, pod, before, b"before").await?);
+    carol_phone.shutdown().await?;
+    // Denied: the member device lists the phone alone.
+    let carols: Vec<_> = alice_phone
+        .pod_membership_view_for_test(alice, pod)
+        .await?
+        .member(&carol)
+        .map(|member| member.devices.iter().map(|device| device.node).collect())
+        .unwrap_or_default();
+    assert_eq!(carols, [carol_phone.node_id()]);
+
+    carol_laptop.shutdown().await?;
+    drop(carol_laptop);
+    let after = alice_phone
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"after")
+        .await?;
+    let carol_laptop = laptop_on(dir.path()).await?;
+    assert!(
+        reads(&carol_laptop, carol, pod, after, b"after").await?,
+        "the device whose sibling is gone did not reach the pod"
+    );
+
+    for runtime in [alice_phone, carol_laptop] {
         runtime.shutdown().await?;
     }
     Ok(())

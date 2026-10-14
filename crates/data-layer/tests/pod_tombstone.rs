@@ -348,9 +348,10 @@ async fn an_accept_decided_before_a_removal_takes_nothing_placed_after_it() -> R
 
 /// A device offline while its member is removed learns of the removal at its
 /// first session with a member device, taking the removal and what it rests
-/// on. Denied: a membership event outside the removal's past and a record
-/// placed after it reach the device from no member device, the record
-/// store refused to it.
+/// on, though an entry counting for nothing sits at its member's next
+/// sequence. Denied: a membership event outside the removal's past and a
+/// record placed after it reach the device from no member device, the
+/// record store refused to it.
 #[allow(clippy::too_many_lines)] // one scenario: the removal while offline, the return and each denial
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_nothing_after(
@@ -382,6 +383,9 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     drop(carol_phone);
 
     depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 2).await?;
+    // A second removal, as a device of an owner that has not seen the first
+    // writes it.
+    depart(&alice_phone, &carol, pod, EventKind::Removed, &alice, 3).await?;
     let dave = Person::generate();
     invite(&bob_phone, &bob, pod, &dave, vec![nowhere(0xd0)]).await?;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
@@ -441,6 +445,180 @@ async fn a_device_offline_during_its_members_removal_learns_of_the_removal_and_n
     );
 
     for node in [alice_phone, bob_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+const OWNER: MemberState = MemberState {
+    member: true,
+    owner: true,
+};
+
+/// The state the membership view of `holder`'s replica on `node`, a
+/// tombstone's included, shows `member` in.
+async fn standing(node: &SyncNode, holder: &Person, pod: PodId, member: &Person) -> MemberState {
+    match node.pod_holding(holder.id, pod).await {
+        Ok(Some(holding)) => holding
+            .membership
+            .member(&member.id)
+            .map(|member| member.state)
+            .unwrap_or_default(),
+        Ok(None) | Err(_) => MemberState::default(),
+    }
+}
+
+/// A tombstone whose departure a later event reverses takes that event
+/// from one dial, and what the event rests on in the sessions it dials
+/// again at once, until its membership view shows its member back. Paired
+/// denial: a tombstone whose departure stands takes no event of a
+/// newcomer's chain from a member device that serves it whole.
+///
+/// No pass runs and both tombstones are out of their swarm, so the sessions
+/// after each dial are the tombstone's own. Carol's promotion is written
+/// once Dave's replica is a tombstone, so the removal of Bob that reverses
+/// Dave's removal rests on a point of Carol's chain the tombstone does not
+/// hold. Carol's device serves Frank's tombstone whole, as a modified device
+/// that judges no caller does, so the tombstone's own admission is the one
+/// that holds. Sentinel: Alice's second statement, which Frank's tombstone
+/// takes from the session that offers the newcomer's join beside it.
+#[allow(clippy::too_many_lines)] // one scenario: the removals, the reversal and the two dials
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_takes_what_reverses_its_departure_layer_after_layer() -> Result<()> {
+    let (alice_phone, bob_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let (carol_phone, dave_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let frank_phone = node(QUIET).await?;
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let (dave, _) = host(&dave_phone).await?;
+    let (frank, _) = host(&frank_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    let members = [
+        (&bob_phone, &bob),
+        (&carol_phone, &carol),
+        (&dave_phone, &dave),
+        (&frank_phone, &frank),
+    ];
+    for (phone, member) in members {
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for (phone, holder) in members {
+        phone.import_pod(holder.id, pod, tickets.clone()).await?;
+    }
+    for (phone, holder) in members {
+        for (_, other) in members {
+            assert!(lists(phone, holder.id, pod, other.id, PLAIN).await?);
+        }
+    }
+
+    depart(&alice_phone, &frank, pod, EventKind::Removed, &alice, 2).await?;
+    assert!(lists(&frank_phone, frank.id, pod, frank.id, OUT).await?);
+    frank_phone.forget_pod(frank.id, pod).await?;
+    let promotion = |subject: &Person, seq| MembershipKey::Event {
+        subject: subject.id,
+        seq: Seq::new(seq),
+        kind: EventKind::Promoted,
+        actor: alice.id,
+        actor_seq: Seq::FIRST,
+    };
+    write(&alice_phone, &alice, pod, promotion(&bob, 2), vec![0]).await?;
+    assert!(lists(&bob_phone, bob.id, pod, bob.id, OWNER).await?);
+    let removal = MembershipKey::Event {
+        subject: dave.id,
+        seq: Seq::new(2),
+        kind: EventKind::Removed,
+        actor: bob.id,
+        actor_seq: Seq::new(2),
+    };
+    write(&bob_phone, &bob, pod, removal, vec![0]).await?;
+    assert!(lists(&dave_phone, dave.id, pod, dave.id, OUT).await?);
+    dave_phone.forget_pod(dave.id, pod).await?;
+
+    write(&alice_phone, &alice, pod, promotion(&carol, 2), vec![0]).await?;
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, OWNER).await?);
+    let erin = Person::generate();
+    invite(&alice_phone, &alice, pod, &erin, vec![nowhere(0xe0)]).await?;
+    let second = nowhere(0xa2);
+    let alices = vec![device_of(&alice_phone, &alice)?, second];
+    let statement = alice.keys.device_statement(&pod, 2, alices).encode();
+    let alices_second = MembershipKey::Devices {
+        member: alice.id,
+        version: 2,
+    };
+    write(&alice_phone, &alice, pod, alices_second, statement).await?;
+    let reversal = MembershipKey::Event {
+        subject: bob.id,
+        seq: Seq::new(2),
+        kind: EventKind::Removed,
+        actor: carol.id,
+        actor_seq: Seq::new(2),
+    };
+    write(&carol_phone, &carol, pod, reversal, vec![0]).await?;
+    assert!(lists(&carol_phone, carol.id, pod, dave.id, PLAIN).await?);
+    assert!(lists(&carol_phone, carol.id, pod, erin.id, PLAIN).await?);
+    assert!(lists_device(&carol_phone, carol.id, pod, alice.id, second).await?);
+    assert_eq!(standing(&dave_phone, &dave, pod, &dave).await, OUT);
+
+    dial(
+        &dave_phone,
+        &dave,
+        pod,
+        PodStore::Membership,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    let back = test_utils::eventually(|| async {
+        Ok(standing(&dave_phone, &dave, pod, &dave).await == PLAIN)
+    })
+    .await?;
+    assert!(
+        back,
+        "the tombstone did not take what the reversal rests on"
+    );
+    assert_eq!(standing(&dave_phone, &dave, pod, &bob).await, OUT);
+
+    // Denied: the newcomer's join, to the tombstone whose departure stands.
+    carol_phone.serve_pod_sessions_whole_for_test(carol.id, true)?;
+    dial(
+        &frank_phone,
+        &frank,
+        pod,
+        PodStore::Membership,
+        &carol_phone,
+        &carol,
+    )
+    .await?;
+    let sentinel = test_utils::eventually(|| async {
+        Ok(frank_phone
+            .pod_holding(frank.id, pod)
+            .await?
+            .and_then(|holding| {
+                holding
+                    .membership
+                    .member(&alice.id)
+                    .map(|member| member.devices.contains(&second))
+            })
+            .unwrap_or(false))
+    })
+    .await?;
+    assert!(
+        sentinel,
+        "the standing tombstone took nothing from the dial"
+    );
+    assert_eq!(frank_phone.pod_chain_run(frank.id, pod, erin.id).await?, 0);
+    assert_eq!(standing(&frank_phone, &frank, pod, &frank).await, OUT);
+
+    for node in [alice_phone, bob_phone, carol_phone, dave_phone, frank_phone] {
         node.shutdown().await?;
     }
     Ok(())
