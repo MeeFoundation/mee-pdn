@@ -31,6 +31,15 @@ pdn-store = { path = "crates/pdn-store" }
 # and when it goes: UPSTREAM.md in the fork.
 iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
 
+# Full debug info is copied into every test binary and build variant, and on
+# macOS into object files beside them: tens of gigabytes of target/. Backtraces
+# keep file and line in our crates and function names in dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
