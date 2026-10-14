@@ -10,7 +10,7 @@
 # different tools and produce two different images.
 # rust-toolchain.toml is outside the build context (.dockerignore), so this
 # tag alone picks the image's compiler: keep its minor with the file's.
-FROM rust:1.99-bookworm AS chef
+FROM rust:1.99-trixie AS chef
 # A caller behind a TLS-intercepting proxy hands its CA bundle in as the
 # `ca-bundle` secret and points this at it (scripts/build-image.sh). Unset,
 # cargo trusts the image's own roots.
@@ -33,7 +33,8 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p pdn-node-http
 
-FROM debian:bookworm-slim AS runtime
+# Same Debian release as the builder: the binary links against its glibc.
+FROM debian:trixie-slim AS runtime
 # The state directory is created for the non-root user the binary runs as,
 # and the image declares no VOLUME over it: an image-declared volume is
 # created anonymously for every container that ever runs, so what is
