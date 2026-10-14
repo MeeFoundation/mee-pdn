@@ -212,7 +212,7 @@ mod tests {
         );
 
         std::fs::write(dir.path().join(ADDRESS_BOOK_FILE), b"not a book")?;
-        assert!(held(&AddressBook::open(dir.path()))?.is_empty());
+        assert_eq!(held(&AddressBook::open(dir.path()))?, BTreeMap::new());
         write(dir.path(), &entries)?;
         assert_eq!(held(&AddressBook::open(dir.path()))?, entries);
         Ok(())

@@ -102,7 +102,7 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
     );
 
     // Cutoff below the marker's write time (now == 0) spares it.
-    assert!(pms.prune_aged_retractions(0, u64::MAX).await?.is_empty());
+    assert_eq!(pms.prune_aged_retractions(0, u64::MAX).await?, []);
     assert_eq!(
         pms.list_retractions().await?.len(),
         1,
@@ -119,7 +119,7 @@ async fn aged_markers_are_pruned_by_the_retention_window() -> Result<()> {
             .as_micros(),
     )?;
     let hour = 60 * 60 * 1_000_000;
-    assert!(pms.prune_aged_retractions(now, hour).await?.is_empty());
+    assert_eq!(pms.prune_aged_retractions(now, hour).await?, []);
     assert_eq!(
         pms.list_retractions().await?.len(),
         1,

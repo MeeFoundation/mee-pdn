@@ -173,7 +173,7 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         .get(&format!("/debug/identities/{carol}/connections"))
         .await?
         .json()?;
-    assert!(replayer_recorded.connections.is_empty());
+    assert_eq!(replayer_recorded.connections, []);
 
     // Allowed, then denied on the same claim: the grant covers it read-only,
     // and the prior value still reads back on both sides.

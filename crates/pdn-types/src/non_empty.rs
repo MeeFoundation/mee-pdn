@@ -321,7 +321,7 @@ mod tests {
         let removed = ne.try_remove(|x| *x == 10).unwrap();
         assert_eq!(removed, 10);
         assert_eq!(ne.head, 20);
-        assert!(ne.tail.is_empty());
+        assert_eq!(ne.tail, Vec::<i32>::new());
         assert_eq!(ne.len(), 1);
     }
 }

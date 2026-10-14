@@ -628,8 +628,8 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         rt_b.connections().establish(y, expired).await.is_err(),
         "an expired secret must be refused"
     );
-    assert!(rt_a.connections().list(x).await?.is_empty());
-    assert!(rt_b.connections().list(y).await?.is_empty());
+    assert_eq!(rt_a.connections().list(x).await?, []);
+    assert_eq!(rt_b.connections().list(y).await?, []);
     assert!(wait_kinds_exactly(&probe_pms, &baseline).await?);
 
     // Unknown identity: an invite mints nothing, an establish refuses before
@@ -657,7 +657,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         rt_c.connections().establish(z, forged).await.is_err(),
         "a never-minted secret must be refused"
     );
-    assert!(rt_a.connections().list(x).await?.is_empty());
+    assert_eq!(rt_a.connections().list(x).await?, []);
     assert!(wait_kinds_exactly(&probe_pms, &baseline).await?);
 
     // ...and an unknown payload version refuses before dialing, typed.
@@ -693,7 +693,7 @@ async fn refusals_are_uniform_and_leave_no_state_on_the_inviter() -> Result<()> 
         "a replayed secret must be refused"
     );
     assert_eq!(rt_a.connections().list(x).await?, vec![y]);
-    assert!(rt_c.connections().list(z).await?.is_empty());
+    assert_eq!(rt_c.connections().list(z).await?, []);
     assert!(wait_kinds_exactly(&probe_pms, &established).await?);
 
     probe_node.shutdown().await?;

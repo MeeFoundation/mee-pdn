@@ -78,7 +78,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 default = ["metrics", "rpc", "fs-store", "redb-v2-migration"]
 metrics = ["iroh-metrics/metrics", "iroh/metrics"]
 rpc = ["dep:noq", "irpc/rpc", "iroh-blobs/rpc"]
-fs-store = ["iroh-blobs/fs-store"]
+# iroh-blobs 0.103.1's fs-store calls tokio's `block_in_place` without enabling the feature it sits behind.
+fs-store = ["iroh-blobs/fs-store", "tokio/rt-multi-thread"]
 redb-v2-migration = ["dep:redb_v3"]
 
 [lints.rust]

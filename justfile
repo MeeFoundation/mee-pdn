@@ -203,8 +203,9 @@ check: _check-devcontainer-tools
 check-fix:
   #!/bin/sh
   set -eux
-  cargo fmt --all
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh) --fix --allow-dirty --allow-staged
+  # After the fixes: clippy writes them unformatted.
+  cargo fmt --all
   # Both configurations: the product build first — a break there is invisible
   # to a run that only ever enables the dev feature. Product targets only:
   # `--all-targets` builds the dev targets, and a dev-dependency on

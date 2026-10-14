@@ -67,6 +67,16 @@ Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/te
 
 Strict safety-first linting, configured in the workspace `Cargo.toml`, `clippy.toml` and `rustfmt.toml`, enforced by `just check`. Prefer `.get()` and `TryFrom`/`TryInto` over indexing and `as`.
 
+An emptiness assert compares the value with an empty one, so that a failure prints what the value held:
+
+- `assert_eq!(listed, [])`, and `assert_ne!(listed, [])` for a value that must hold something.
+- Never `assert!(listed.is_empty())`: clippy's `assert_is_empty` flags it.
+- Never `[] as [T; 0]`: it is the fix `assert_is_empty` suggests and `just check-fix` applies, and `as_conversions` flags it; replace the cast with a bare `[]`.
+- A turbofish where a bare `[]` does not compile. That happens when the element compares with more than one type, as `i32` does once `serde_json` is in scope: `assert_eq!(tail, Vec::<i32>::new())`.
+- A map or a set compares with its own empty value: `assert_eq!(held, BTreeMap::new())`.
+
+`crates/pdn-store` keeps upstream's asserts; the workspace lints do not reach it.
+
 ## Scripts
 
 A recipe in the `justfile` is an interface — its doc line, its parameters, how to call it — over a flat list of commands. Anything beyond that — a `case`, a loop, a `trap`, output parsed with awk, sed or Python — lives in its own file under [`scripts/`](scripts/) that the recipe calls, with the comment that explains the mechanism, never as a heredoc or a `python3 -c`: embedded code gets no syntax highlighting and no linting, and it cannot run on its own. A script finds the repository root from its own location, and the caller names the interpreter — `sh scripts/<name>.sh`, `python3 -I scripts/<name>.py` — since nothing relies on the executable bit.

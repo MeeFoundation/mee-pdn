@@ -177,7 +177,7 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
         .await?
         .granted()
         .is_none());
-    assert!(b_peer_a.list_grants().await?.is_empty());
+    assert_eq!(b_peer_a.list_grants().await?, []);
 
     // Alice grants her data store toward Bob and a second one toward Carol.
     let ticket_for_bob = data_ticket(&mut alice, ids::ALICE, ids::ALICE).await?;
@@ -214,7 +214,7 @@ async fn dedicated_replicas_own_peer_flip_and_isolation() -> Result<()> {
         .granted()
         .is_none());
     assert_eq!(b_peer_a.list_grants().await?, vec![ids::ALICE]);
-    assert!(b_own_a.list_grants().await?.is_empty());
+    assert_eq!(b_own_a.list_grants().await?, []);
 
     alice.shutdown().await?;
     bob.shutdown().await?;
@@ -659,7 +659,7 @@ async fn a_withdrawn_device_record_is_not_resurrected_by_pair_opening() -> Resul
 
     // Withdrawn, then re-opened: the tombstone holds.
     own.withdraw_device(device).await?;
-    assert!(own.published_devices().await?.is_empty());
+    assert_eq!(own.published_devices().await?, []);
     own.ensure_device_published(device).await?;
     assert!(
         own.published_devices().await?.is_empty(),
@@ -1007,10 +1007,10 @@ async fn a_sibling_session_keeps_scope_withdrawal_and_audience() -> Result<()> {
         .read(ids::ALICE_AT_LEISURE, ids::BOB, &email)
         .await?
         .is_none());
-    assert!(intruder
-        .list(ids::ALICE_AT_LEISURE, ids::BOB, None)
-        .await?
-        .is_empty());
+    assert_eq!(
+        intruder.list(ids::ALICE_AT_LEISURE, ids::BOB, None).await?,
+        []
+    );
 
     // Withdrawal: neither device advances past what it was delivered.
     b_own.withdraw_grant(ids::BOB).await?;

@@ -48,7 +48,7 @@ RUN curl -fsSL https://chatgpt.com/codex/install.sh | \
 # cannot read it, so `just check` compares the two. The tools go outside the
 # home volume, so a rebuild upgrades them.
 ARG JUST_VERSION=1.58.0
-ARG CARGO_NEXTEST_VERSION=0.9.146
+ARG CARGO_NEXTEST_VERSION=0.9.148
 ARG CARGO_DENY_VERSION=0.20.2
 ARG CARGO_WATCH_VERSION=8.5.3
 
