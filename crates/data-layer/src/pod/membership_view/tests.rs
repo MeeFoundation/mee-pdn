@@ -28,6 +28,19 @@ fn verdict(membership: &MembershipView, entry: usize) -> Verdict {
     membership.verdicts()[entry]
 }
 
+thread_local! {
+    pub(super) static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static LOOP_BREAKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn count(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+    counter.with(|count| count.set(count.get() + 1));
+}
+
+fn taken(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) -> usize {
+    counter.with(std::cell::Cell::take)
+}
+
 fn nothing(why: ForNothing) -> Verdict {
     Verdict::CountedForNothing(why)
 }
@@ -600,7 +613,7 @@ fn an_entry_waits_for_its_payload_and_a_statement_for_its_key() {
     let joined = store.invite(&cast.alice, 1, &cast.bob);
     let statement = store.statement(&cast.bob, 1, &[cast.bob.device], cast.alice.author());
     let mut early = store.clone();
-    early.entries[joined].payload = None;
+    early.entries[joined].payload = HeldPayload::Awaited;
     let membership = early.membership_view();
     assert_eq!(
         verdict(&membership, joined),
@@ -732,6 +745,29 @@ fn two_owners_demoting_each_other_leave_one_owner() {
     assert_eq!(state(&membership, demoted), PLAIN);
 }
 
+/// The two owners removing each other while out of reach of each other
+/// both count, and the pod is left without an owner: the guard over the
+/// last owner reads demotions alone. Denied: the plain member's promotion
+/// of itself.
+#[test]
+fn two_owners_removing_each_other_leave_no_owner() {
+    let cast = Cast::new();
+    let mut store = two_owners(&cast);
+    let alice_removes_carol = store.act(EventKind::Removed, &cast.carol, 3, &cast.alice, 1);
+    let carol_removes_alice = store.act(EventKind::Removed, &cast.alice, 2, &cast.carol, 2);
+    let own_promotion = store.act(EventKind::Promoted, &cast.bob, 2, &cast.bob, 1);
+    let membership = store.membership_view();
+    assert_eq!(verdict(&membership, alice_removes_carol), Verdict::Counted);
+    assert_eq!(verdict(&membership, carol_removes_alice), Verdict::Counted);
+    assert_eq!(state(&membership, &cast.alice), OUT);
+    assert_eq!(state(&membership, &cast.carol), OUT);
+    assert_eq!(
+        verdict(&membership, own_promotion),
+        nothing(ForNothing::ActorLacksState)
+    );
+    assert_eq!(state(&membership, &cast.bob), PLAIN);
+}
+
 /// A chain past sequence 9 is walked in number order, whatever order its
 /// entries arrive in: the demotion at 10 applies after the promotion at 9.
 #[test]
@@ -793,7 +829,7 @@ fn an_entry_outside_the_layout_changes_no_member() {
         )
         .into_bytes(),
         author: cast.alice.author(),
-        payload: Some(vec![1]),
+        payload: HeldPayload::Unread,
     });
     let membership = store.membership_view();
     assert_eq!(membership.verdicts().last(), Some(&Verdict::OutsideLayout));
@@ -1174,4 +1210,133 @@ fn wrongly_left_uncounted_without_anchoring_d23() {
         Verdict::NotYet(Awaiting::ActorChain)
     );
     assert_eq!(state(&membership, dave), OWNER);
+}
+
+fn devices(count: u16) -> Vec<MemberDevice> {
+    (0..count)
+        .map(|index| {
+            let mut bytes = [0xdd; 32];
+            bytes[..2].copy_from_slice(&index.to_be_bytes());
+            MemberDevice {
+                node: pdn_types::NodeId::from_bytes(bytes),
+                author: AuthorId::from(&bytes),
+            }
+        })
+        .collect()
+}
+
+/// A device statement of 1,023 devices counts, and one of 1,024 — longer
+/// than any statement the membership view reads — counts for nothing, its
+/// member's signature notwithstanding. Denied: none of the longer one's
+/// devices is listed.
+#[test]
+fn a_statement_past_its_longest_counts_for_nothing() {
+    let cast = Cast::new();
+    let mut store = Store::created_by(&cast.alice);
+    store.invite(&cast.alice, 1, &cast.bob);
+    let most = devices(1_023);
+    let fits = store.statement(&cast.bob, 1, &most, cast.bob.author());
+    let too_many = devices(1_024);
+    let past = store.statement(&cast.bob, 2, &too_many, cast.bob.author());
+    let membership = store.membership_view();
+    assert_eq!(verdict(&membership, fits), Verdict::Counted);
+    assert_eq!(
+        verdict(&membership, past),
+        Verdict::CountedForNothing(ForNothing::Malformed)
+    );
+    let listed = &membership
+        .member(&cast.bob.id())
+        .expect("Bob is held")
+        .devices;
+    assert!(most.iter().all(|device| listed.contains(device)));
+    assert!(too_many
+        .last()
+        .is_some_and(|device| !listed.contains(device)));
+}
+
+/// The membership view reads a payload only for a created or joined event
+/// of its one length and a device statement up to its longest, decided by
+/// the key and the signed length alone: an act's, a key's outside the
+/// layout and an over-long one's bytes are never read.
+#[test]
+fn only_the_payloads_a_verdict_rests_on_are_read() {
+    let cast = Cast::new();
+    let alice = cast.alice.id();
+    let created = MembershipKey::created(alice).to_bytes();
+    let joined = event(cast.bob.id(), 1, EventKind::Joined, alice, 1).to_bytes();
+    let removed = event(cast.bob.id(), 2, EventKind::Removed, alice, 1).to_bytes();
+    let statement = MembershipKey::Devices {
+        member: alice,
+        version: 1,
+    }
+    .to_bytes();
+    let unread = |key: &[u8], len| HeldPayload::unread(key, len);
+    assert_eq!(unread(&created, CREATED_LEN), None);
+    assert_eq!(
+        unread(&created, CREATED_LEN + 1),
+        Some(HeldPayload::OutOfBounds)
+    );
+    assert_eq!(unread(&joined, JOINED_LEN), None);
+    assert_eq!(unread(&joined, 1 << 30), Some(HeldPayload::OutOfBounds));
+    assert_eq!(unread(&statement, STATEMENT_MAX_LEN), None);
+    assert_eq!(
+        unread(&statement, STATEMENT_MAX_LEN + 1),
+        Some(HeldPayload::OutOfBounds)
+    );
+    assert_eq!(unread(&removed, 1 << 30), Some(HeldPayload::Unread));
+    assert_eq!(unread(b"ext/x", 1 << 30), Some(HeldPayload::Unread));
+}
+
+/// An owner's 1,000 demotions of another owner at consecutive sequences,
+/// written before a leave that leaves the other the last owner, take the
+/// guard over the last owner its bounded passes alone, and the last of
+/// them stands: no owner.
+#[test]
+fn consecutive_demotions_take_the_guard_its_bounded_passes() {
+    let cast = Cast::new();
+    let (alice, bob) = (&cast.alice, &cast.bob);
+    let mut store = Store::created_by(alice);
+    store.invite(alice, 1, bob);
+    store.act(EventKind::Promoted, bob, 2, alice, 1);
+    for seq in 3..1_003 {
+        store.act(EventKind::Demoted, bob, seq, alice, 1);
+    }
+    store.act(EventKind::Left, alice, 2, alice, 1);
+    taken(&PASSES);
+    let membership = store.membership_view();
+    assert_eq!(taken(&PASSES), GUARD_PASSES);
+    assert_eq!(state(&membership, alice), OUT);
+    assert_eq!(state(&membership, bob), PLAIN);
+}
+
+/// A member's 1,000 loops — each a newcomer whose join names the member's
+/// next sequence and a promotion of the member there by that newcomer — take
+/// the evaluation its bounded rounds of loop-breaking alone, and every loop
+/// counts for nothing as an unbounded evaluation counts it: no newcomer is a
+/// member and the member is no owner.
+#[test]
+fn loops_take_the_evaluation_its_bounded_rounds() {
+    let cast = Cast::new();
+    let (alice, bob) = (&cast.alice, &cast.bob);
+    let mut store = Store::created_by(alice);
+    store.invite(alice, 1, bob);
+    let mut newcomers = Vec::new();
+    for index in 1..=1_000_u64 {
+        let mut secret = [0x6c; 32];
+        secret[..8].copy_from_slice(&index.to_be_bytes());
+        let newcomer = Person {
+            keys: crate::identity_key::IdentityKeyPair::from_secret_bytes(&secret),
+            device: bob.device,
+        };
+        store.join(bob, index + 1, &newcomer, 1);
+        store.act(EventKind::Promoted, bob, index + 1, &newcomer, 1);
+        newcomers.push(newcomer);
+    }
+    taken(&LOOP_BREAKS);
+    let membership = store.membership_view();
+    assert!(taken(&LOOP_BREAKS) <= LOOP_ROUNDS);
+    assert_eq!(state(&membership, bob), PLAIN);
+    assert!(newcomers
+        .iter()
+        .all(|newcomer| state(&membership, newcomer) == OUT));
 }

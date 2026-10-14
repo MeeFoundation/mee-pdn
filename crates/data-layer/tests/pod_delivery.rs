@@ -325,7 +325,7 @@ async fn a_pod_pass_run_reaches_at_most_five_peers_of_the_contacts_the_membershi
                 continue;
             }
             assert_eq!(contacts, expected, "the contacts the membership derives");
-            assert!(draw.drawn.len() + draw.recorded.len() <= 5);
+            assert!(draw.drawn.len() <= 5);
             for contact in &draw.drawn {
                 assert!(contacts.contains(&(contact.addr.id, contact.identity)));
                 reached.insert((contact.addr.id, contact.identity));
@@ -558,81 +558,6 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     assert!(
         reads(&bob_phone, bob.id, pod, claim).await?,
         "the record store started with the contacts derived after its membership store's start"
-    );
-
-    for node in [alice_phone, bob_phone] {
-        node.shutdown().await?;
-    }
-    Ok(())
-}
-
-/// A newcomer sharing its own tickets reaches its inviter as the inviter,
-/// while the contacts its membership derives still leave the inviter's
-/// device out: the share restarts each store's sync, which dials the peers
-/// the store recorded as the identity whose ticket the store came from.
-/// Alice's statement lists another node here, as a membership view lists
-/// none while the payloads are still on their way; the newcomer is out of
-/// the record store's swarm while Alice writes, so the share's dial is the
-/// only way the write reaches it.
-#[allow(clippy::too_many_lines)] // one scenario: the arrangement, the write and the share
-#[tokio::test(flavor = "multi_thread")]
-async fn a_newcomers_share_reaches_its_inviter_as_the_inviter() -> Result<()> {
-    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, QUIET).await?);
-    let (alice, _) = host(&alice_phone).await?;
-    let (bob, _) = host(&bob_phone).await?;
-    let pod = pod_id_of(&alice.id, &alice.keys.public_key(), &[0xa1; 16]);
-    alice_phone.create_pod(alice.id, pod).await?;
-    let (membership_store, record_store) = alice_phone.pod_stores(alice.id, pod)?;
-    let creation = alice
-        .keys
-        .creation([0xa1; 16], membership_store, record_store);
-    write(
-        &alice_phone,
-        &alice,
-        pod,
-        MembershipKey::created(alice.id),
-        creation.encode(),
-    )
-    .await?;
-    let elsewhere = MemberDevice {
-        node: nowhere(0xa1).node,
-        author: alice_phone.default_author(alice.id)?,
-    };
-    statement(&alice_phone, &alice, pod, &alice, vec![elsewhere]).await?;
-    invite(
-        &alice_phone,
-        &alice,
-        pod,
-        &bob,
-        vec![device_of(&bob_phone, &bob)?],
-    )
-    .await?;
-    let first = place_claim(&alice_phone, &alice, pod, 1).await?;
-    let alices = tickets(&alice_phone, &alice, pod).await?;
-    let records = alices.records.capability.id();
-    bob_phone.import_pod(bob.id, pod, alices).await?;
-    // The record store's session with Alice's phone went through, so the
-    // store recorded it.
-    assert!(reads(&bob_phone, bob.id, pod, first).await?);
-    assert!(
-        eventually(|| async {
-            let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, PodStore::Records)?;
-            Ok(contacts.len() == 1
-                && contacts
-                    .iter()
-                    .all(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes()))
-        })
-        .await?,
-        "the contacts the membership derives still name the inviter's device"
-    );
-    bob_phone.leave_swarm_for_test(bob.id, records).await?;
-    assert!(settle(&[&alice_phone, &bob_phone], pod).await?);
-
-    let second = place_claim(&alice_phone, &alice, pod, 2).await?;
-    tickets(&bob_phone, &bob, pod).await?;
-    assert!(
-        reads(&bob_phone, bob.id, pod, second).await?,
-        "the share dialed the inviter's device as another identity than the inviter"
     );
 
     for node in [alice_phone, bob_phone] {

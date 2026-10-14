@@ -236,6 +236,9 @@ pub struct ShareRequest {
     pub doc_id: NamespaceId,
     pub mode: ShareMode,
     pub addr_options: AddrInfoOptions,
+    /// Restart the document's sync, as upstream's share does: every peer
+    /// the store recorded is dialed again.
+    pub restart_sync: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

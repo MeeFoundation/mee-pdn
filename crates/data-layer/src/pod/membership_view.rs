@@ -10,17 +10,62 @@ use pdn_types::{PdnId, PodId};
 
 use super::{
     keys::{EventKind, MembershipKey, Seq},
-    payloads::{CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice},
+    payloads::{
+        CreatedPayload, DevicesPayload, JoinedPayload, MemberDevice, CREATED_LEN, JOINED_LEN,
+        STATEMENT_MAX_LEN,
+    },
 };
 use crate::identity_key::{creation_verifies, devices_verify, join_verifies, pdn_id_of, pod_id_of};
 
-/// One entry of a membership store as a device holds it; `payload` is
-/// `None` until its bytes have arrived.
+/// One entry of a membership store as a device holds it.
 #[derive(Clone, Debug)]
 pub struct HeldEntry {
     pub key: Vec<u8>,
     pub author: AuthorId,
-    pub payload: Option<Vec<u8>>,
+    pub payload: HeldPayload,
+}
+
+/// An entry's payload as the membership view takes it, decided by the
+/// entry's key and its signed length alone, which every device sees alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeldPayload {
+    /// The bytes of a created or joined event or a device statement.
+    Read(Vec<u8>),
+    /// Such an entry's bytes have not arrived.
+    Awaited,
+    /// No verdict rests on its bytes — an act, a key outside the layout —
+    /// so they are not read.
+    Unread,
+    /// A created or joined event at any length but its one, or a device
+    /// statement past 65,536 bytes: never read, and counted for nothing.
+    OutOfBounds,
+}
+
+impl HeldPayload {
+    /// What the membership view takes of the payload of an entry at `key`,
+    /// `len` bytes long, without reading it; `None` when it reads the bytes.
+    pub fn unread(key: &[u8], len: u64) -> Option<Self> {
+        let bounded = |fits: bool| (!fits).then_some(Self::OutOfBounds);
+        match MembershipKey::parse(key) {
+            Some(MembershipKey::Event {
+                kind: EventKind::Created,
+                ..
+            }) => bounded(len == CREATED_LEN),
+            Some(MembershipKey::Event {
+                kind: EventKind::Joined,
+                ..
+            }) => bounded(len == JOINED_LEN),
+            Some(MembershipKey::Devices { .. }) => bounded(len <= STATEMENT_MAX_LEN),
+            Some(MembershipKey::Event { .. }) | None => Some(Self::Unread),
+        }
+    }
+
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Read(bytes) => Some(bytes),
+            Self::Awaited | Self::Unread | Self::OutOfBounds => None,
+        }
+    }
 }
 
 /// What one held entry counts for, over everything the device holds: in the
@@ -37,7 +82,8 @@ pub enum Verdict {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForNothing {
-    /// The payload does not decode.
+    /// The payload does not decode, or its length is one its kind cannot
+    /// have.
     Malformed,
     /// A created event anywhere but the creator's sequence 1 naming its
     /// creator at 0, or an event at sequence 0.
@@ -122,6 +168,19 @@ impl Member {
             .find(|seq| !self.state_at(seq - 1).is_some_and(|before| before.member))
     }
 
+    /// The sequence of the departure that ended the member's latest
+    /// membership — its counted left or removed event — while it is no
+    /// member; `None` for a member, and for an identity never one.
+    pub fn departed_at(&self) -> Option<u64> {
+        if self.state.member {
+            return None;
+        }
+        (1..=self.run()).rev().find(|seq| {
+            self.state_at(seq - 1).is_some_and(|before| before.member)
+                && self.state_at(*seq).is_some_and(|after| !after.member)
+        })
+    }
+
     /// `None` past the run of sequences the device holds.
     pub fn state_at(&self, seq: u64) -> Option<MemberState> {
         if seq == 0 {
@@ -144,11 +203,16 @@ impl MembershipView {
     /// `store` being that store's namespace.
     pub fn new(pod: &PodId, store: &NamespaceId, entries: &[HeldEntry]) -> Self {
         let parsed = Parsed::of(entries);
+        let alone = Alone::of(pod, store, entries, &parsed);
         let mut set_aside = BTreeSet::new();
+        let mut passes = 0;
         loop {
-            let pass = Pass::run(pod, store, entries, &parsed, &set_aside);
+            passes += 1;
+            #[cfg(test)]
+            tests::count(&tests::PASSES);
+            let pass = Pass::run(&alone, &set_aside);
             let more = pass.demotions_to_set_aside();
-            if more.is_subset(&set_aside) {
+            if more.is_subset(&set_aside) || passes == GUARD_PASSES {
                 return pass.into_view();
             }
             set_aside.extend(more);
@@ -261,56 +325,57 @@ struct Winner {
     events: Vec<(usize, PdnId)>,
 }
 
-/// One evaluation of every entry, with `set_aside` the demotions the guard
-/// over the last owner ignores.
-struct Pass<'a> {
+/// Every check that reads no member's state, once per membership view:
+/// the identity keys, the counted statements and the devices they list,
+/// the verdicts these decide, and the events that pass them all.
+struct Alone<'a> {
     pod: &'a PodId,
     store: &'a NamespaceId,
     entries: &'a [HeldEntry],
     parsed: &'a Parsed,
-    set_aside: &'a BTreeSet<usize>,
     keys: HashMap<PdnId, [u8; 32]>,
     devices: HashMap<PdnId, BTreeSet<MemberDevice>>,
     statement_versions: HashMap<PdnId, u64>,
     authors: HashMap<PdnId, HashSet<AuthorId>>,
     verdicts: Vec<Verdict>,
-    winners: HashMap<PdnId, BTreeMap<u64, Winner>>,
-    /// The state after each sequence of each chain's run, once judged.
-    states: HashMap<(PdnId, u64), MemberState>,
+    candidates: Vec<Event>,
 }
 
-impl<'a> Pass<'a> {
-    fn run(
+impl<'a> Alone<'a> {
+    fn of(
         pod: &'a PodId,
         store: &'a NamespaceId,
         entries: &'a [HeldEntry],
         parsed: &'a Parsed,
-        set_aside: &'a BTreeSet<usize>,
     ) -> Self {
-        let mut pass = Self {
+        let mut alone = Self {
             pod,
             store,
             entries,
             parsed,
-            set_aside,
             keys: HashMap::new(),
             devices: HashMap::new(),
             statement_versions: HashMap::new(),
             authors: HashMap::new(),
             verdicts: vec![Verdict::OutsideLayout; entries.len()],
-            winners: HashMap::new(),
-            states: HashMap::new(),
+            candidates: Vec::new(),
         };
-        pass.find_keys();
-        pass.count_statements();
-        pass.count_joining_devices();
-        let candidates = pass.check_alone();
-        pass.evaluate(&candidates);
-        pass
+        alone.find_keys();
+        alone.count_statements();
+        alone.count_joining_devices();
+        alone.candidates = alone.check_alone();
+        alone
     }
 
-    fn payload(&self, entry: usize) -> Option<&[u8]> {
-        self.entries.get(entry)?.payload.as_deref()
+    /// An entry's bytes, or the verdict their absence gives it.
+    fn payload(&self, entry: usize) -> Result<&[u8], Verdict> {
+        match self.entries.get(entry).map(|held| &held.payload) {
+            Some(HeldPayload::Read(bytes)) => Ok(bytes),
+            Some(HeldPayload::Awaited) => Err(Verdict::NotYet(Awaiting::Payload)),
+            Some(HeldPayload::Unread | HeldPayload::OutOfBounds) | None => {
+                Err(Verdict::CountedForNothing(ForNothing::Malformed))
+            }
+        }
     }
 
     fn author(&self, entry: usize) -> Option<AuthorId> {
@@ -327,7 +392,7 @@ impl<'a> Pass<'a> {
     /// event in its chain carries that derives the member's `PdnId`.
     fn find_keys(&mut self) {
         for event in &self.parsed.events {
-            let Some(payload) = self.payload(event.entry) else {
+            let Ok(payload) = self.payload(event.entry) else {
                 continue;
             };
             let key = match event.kind {
@@ -347,6 +412,7 @@ impl<'a> Pass<'a> {
             if verdict == Verdict::Counted {
                 if let Some(payload) = self
                     .payload(statement.entry)
+                    .ok()
                     .and_then(DevicesPayload::decode)
                 {
                     self.authors
@@ -373,7 +439,11 @@ impl<'a> Pass<'a> {
             if event.kind != EventKind::Joined {
                 continue;
             }
-            let Some(statement) = self.payload(event.entry).and_then(JoinedPayload::decode) else {
+            let Some(statement) = self
+                .payload(event.entry)
+                .ok()
+                .and_then(JoinedPayload::decode)
+            else {
                 continue;
             };
             if pdn_id_of(&statement.identity_key) != event.subject
@@ -393,8 +463,9 @@ impl<'a> Pass<'a> {
     }
 
     fn statement_verdict(&self, statement: &Statement) -> Verdict {
-        let Some(payload) = self.payload(statement.entry) else {
-            return Verdict::NotYet(Awaiting::Payload);
+        let payload = match self.payload(statement.entry) {
+            Ok(payload) => payload,
+            Err(verdict) => return verdict,
         };
         let Some(payload) = DevicesPayload::decode(payload) else {
             return Verdict::CountedForNothing(ForNothing::Malformed);
@@ -466,9 +537,7 @@ impl<'a> Pass<'a> {
         if event.seq != 1 || event.actor != event.subject || event.actor_seq != 0 {
             return nothing(ForNothing::Misplaced);
         }
-        let Some(payload) = self.payload(event.entry) else {
-            return Err(Verdict::NotYet(Awaiting::Payload));
-        };
+        let payload = self.payload(event.entry)?;
         let Some(creation) = CreatedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
@@ -492,9 +561,7 @@ impl<'a> Pass<'a> {
         if event.actor == event.subject {
             return nothing(ForNothing::WrongActor);
         }
-        let Some(payload) = self.payload(event.entry) else {
-            return Err(Verdict::NotYet(Awaiting::Payload));
-        };
+        let payload = self.payload(event.entry)?;
         let Some(statement) = JoinedPayload::decode(payload) else {
             return nothing(ForNothing::Malformed);
         };
@@ -505,6 +572,39 @@ impl<'a> Pass<'a> {
             return nothing(ForNothing::BadSignature);
         }
         Ok(())
+    }
+}
+
+/// One evaluation of every candidate, with `set_aside` the demotions the
+/// guard over the last owner ignores.
+struct Pass<'a> {
+    parsed: &'a Parsed,
+    alone: &'a Alone<'a>,
+    set_aside: &'a BTreeSet<usize>,
+    verdicts: Vec<Verdict>,
+    winners: HashMap<PdnId, BTreeMap<u64, Winner>>,
+    /// The state after each sequence of each chain's run, once judged.
+    states: HashMap<(PdnId, u64), MemberState>,
+}
+
+impl<'a> Pass<'a> {
+    fn run(alone: &'a Alone<'a>, set_aside: &'a BTreeSet<usize>) -> Self {
+        let mut pass = Self {
+            parsed: alone.parsed,
+            alone,
+            set_aside,
+            verdicts: alone.verdicts.clone(),
+            winners: HashMap::new(),
+            states: HashMap::new(),
+        };
+        pass.evaluate(&alone.candidates);
+        pass
+    }
+
+    fn set(&mut self, entry: usize, verdict: Verdict) {
+        if let Some(slot) = self.verdicts.get_mut(entry) {
+            *slot = verdict;
+        }
     }
 
     /// The state-reading checks, each event once the states it reads are
@@ -527,6 +627,7 @@ impl<'a> Pass<'a> {
                 settling.open.push((*member, 1));
             }
         }
+        let mut rounds = 0;
         loop {
             if let Some((member, seq)) = settling.close.pop() {
                 self.close_sequence(candidates, &mut settling, member, seq);
@@ -534,9 +635,28 @@ impl<'a> Pass<'a> {
                 self.open_sequence(candidates, &mut settling, member, seq);
             } else if settling.awaited.is_empty() {
                 return;
-            } else {
+            } else if rounds < LOOP_ROUNDS {
+                rounds += 1;
+                #[cfg(test)]
+                tests::count(&tests::LOOP_BREAKS);
                 self.break_loops(candidates, &mut settling);
+            } else {
+                self.give_up(candidates, &mut settling);
             }
+        }
+    }
+
+    /// Past [`LOOP_ROUNDS`], every event still waiting counts for nothing at
+    /// once.
+    fn give_up(&mut self, candidates: &[Event], settling: &mut Settling) {
+        settling.waiting.clear();
+        let waiting: Vec<usize> = settling.awaited.drain().map(|(index, _)| index).collect();
+        for index in waiting {
+            let Some(event) = candidates.get(index).copied() else {
+                continue;
+            };
+            self.decide(&event, Verdict::CountedForNothing(ForNothing::Cyclic));
+            settling.one_less_pending(event.subject, event.seq);
         }
     }
 
@@ -801,9 +921,9 @@ impl<'a> Pass<'a> {
                 let chain = (1..=run).map(|seq| (seq, self.state(&id, seq))).collect();
                 let member = Member {
                     state: self.state(&id, run),
-                    identity_key: self.keys.get(&id).copied(),
-                    devices: self.devices.get(&id).cloned().unwrap_or_default(),
-                    statement_version: self.statement_versions.get(&id).copied().unwrap_or(0),
+                    identity_key: self.alone.keys.get(&id).copied(),
+                    devices: self.alone.devices.get(&id).cloned().unwrap_or_default(),
+                    statement_version: self.alone.statement_versions.get(&id).copied().unwrap_or(0),
                     chain,
                 };
                 (id, member)
@@ -845,6 +965,15 @@ impl Settling {
         }
     }
 }
+
+/// The passes the guard over the last owner takes at most: honest owners'
+/// concurrent demotions settle in two, and a store that needs more is one
+/// only modified devices write, where the last pass stands.
+const GUARD_PASSES: usize = 4;
+
+/// The rounds of loop-breaking one pass takes at most: only a modified
+/// device closes a loop.
+const LOOP_ROUNDS: usize = 4;
 
 /// Whether the state before a sequence allows the event's transition.
 fn allows(before: MemberState, kind: EventKind) -> bool {

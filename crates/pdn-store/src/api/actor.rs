@@ -408,6 +408,7 @@ impl RpcActor {
             doc_id,
             mode,
             addr_options,
+            restart_sync,
         } = req;
         let me = self.endpoint.addr();
         let me = addr_options.apply(&me);
@@ -423,11 +424,13 @@ impl RpcActor {
                 crate::Capability::Write(secret)
             }
         };
-        // Keeps whom unnamed peers are dialed as: a pod's store is shared
-        // while its default still names the member whose ticket it came from.
-        self.start_sync_keeping_default(doc_id)
-            .await
-            .map_err(|e| RpcError::new(&*e))?;
+        // Keeps whom unnamed peers are dialed as: an earlier start stated
+        // it, and a share names no one.
+        if restart_sync {
+            self.start_sync_keeping_default(doc_id)
+                .await
+                .map_err(|e| RpcError::new(&*e))?;
+        }
 
         Ok(ShareResponse(DocTicket {
             capability,

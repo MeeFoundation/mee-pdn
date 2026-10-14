@@ -456,6 +456,25 @@ impl Doc {
 
     /// Shares this document with peers over a ticket.
     pub async fn share(&self, mode: ShareMode, addr_options: AddrInfoOptions) -> Result<DocTicket> {
+        self.mint(mode, addr_options, true).await
+    }
+
+    /// The ticket [`Self::share`] mints, leaving this document's sync as
+    /// it is: a share's restart dials every peer the store recorded.
+    pub async fn ticket(
+        &self,
+        mode: ShareMode,
+        addr_options: AddrInfoOptions,
+    ) -> Result<DocTicket> {
+        self.mint(mode, addr_options, false).await
+    }
+
+    async fn mint(
+        &self,
+        mode: ShareMode,
+        addr_options: AddrInfoOptions,
+        restart_sync: bool,
+    ) -> Result<DocTicket> {
         self.ensure_open()?;
         let response = self
             .inner
@@ -463,6 +482,7 @@ impl Doc {
                 doc_id: self.namespace_id,
                 mode,
                 addr_options,
+                restart_sync,
             })
             .await??;
         Ok(response.0)

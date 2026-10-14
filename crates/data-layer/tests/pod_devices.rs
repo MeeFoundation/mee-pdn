@@ -8,8 +8,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, MemberDevice, MembershipKey, PodStore,
-    PodVerdicts, RecordKey, Seq, ShareMode, SpawnOptions, SyncNode, Verdict,
+    PodVerdicts, RecordKey, Seq, ShareMode, SpawnOptions, SyncNode, Traced, Verdict,
 };
+use pdn_store::SessionRole;
 use pdn_types::{NodeId, PodId, RecordId};
 use test_utils::{
     eventually, join_identity,
@@ -171,6 +172,141 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
         eventually(|| async { Ok(!lists_nobody(&bob_laptop, bob.id, pod).await?) }).await?,
         "the phone did not dial the laptop its PMS came to list"
     );
+    Ok(())
+}
+
+/// A member's device whose statement only it holds, its sibling gone,
+/// reaches a member device by dialing it: that device takes the statement
+/// listing it, and serves it whole from the next session on. Denied: the
+/// session the member device serves the device it does not list yet admits
+/// the statement alone, though the device offers an entry of its own beside
+/// it, and sends nothing.
+///
+/// Both replicas are out of their swarm and every pass out of reach, so the
+/// two dials named are the only sessions between them.
+#[allow(clippy::too_many_lines)] // one scenario: the sibling gone, the first dial and the second
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_statement() -> Result<()> {
+    let (alice_phone, bob_phone, bob_laptop) = (node().await?, node().await?, node().await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    let phones = device_of(&bob_phone, &bob)?;
+    invite(&alice_phone, &alice, pod, &bob, vec![phones]).await?;
+    bob_phone
+        .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+        .await?;
+    assert!(eventually(|| async { Ok(!lists_nobody(&bob_phone, bob.id, pod).await?) }).await?);
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    let ticket = bob_pms
+        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
+    let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
+    assert!(wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?);
+    let alices = device_of(&alice_phone, &alice)?;
+    bob_laptop
+        .import_pod(bob.id, pod, tickets(&bob_phone, &bob, pod).await?)
+        .await?;
+    assert!(lists_device(&bob_laptop, bob.id, pod, alice.id, alices).await?);
+    bob_phone.shutdown().await?;
+
+    let membership = tickets(&alice_phone, &alice, pod)
+        .await?
+        .membership
+        .capability
+        .id();
+    alice_phone
+        .leave_swarm_for_test(alice.id, membership)
+        .await?;
+    bob_laptop.leave_swarm_for_test(bob.id, membership).await?;
+    let laptops = device_of(&bob_laptop, &bob)?;
+    let listing = statement(
+        &bob_laptop,
+        &bob,
+        &bob,
+        pod,
+        2,
+        vec![phones, laptops],
+        laptops.author,
+    )
+    .await?;
+    bob_laptop
+        .write_pod_entry(bob.id, pod, PodStore::Membership, b"ext/laptop", b"x")
+        .await?;
+    let elsewhere = nowhere(0xa2, alices.author);
+    statement(
+        &alice_phone,
+        &alice,
+        &alice,
+        pod,
+        2,
+        vec![alices, elsewhere],
+        alices.author,
+    )
+    .await?;
+    let mut traces = alice_phone.take_session_traces().context("taken once")?;
+
+    dial(
+        &bob_laptop,
+        &bob,
+        pod,
+        PodStore::Membership,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    assert!(
+        lists_device(&alice_phone, alice.id, pod, bob.id, laptops).await?,
+        "the member device did not take the unlisted device's statement"
+    );
+    // Denied: the first session admits the statement alone and sends nothing.
+    let laptop_node = bob_laptop.node_id();
+    let mut first = Vec::new();
+    let mut opened = false;
+    while let Ok(trace) = traces.try_recv() {
+        if trace.namespace != membership {
+            continue;
+        }
+        match trace.traced {
+            Traced::Admitted { key, .. } if opened => first.push(key),
+            Traced::AllowedFiltered
+                if !opened && trace.peer == laptop_node && trace.role == SessionRole::Accept =>
+            {
+                opened = true;
+            }
+            Traced::Denied | Traced::AllowedWhole | Traced::AllowedFiltered if opened => break,
+            _ => {}
+        }
+    }
+    assert!(opened, "the member device refused the unlisted device");
+    assert_eq!(first, [listing]);
+    let sent = bob_laptop
+        .pod_membership_view(bob.id, pod)
+        .await?
+        .member(&alice.id)
+        .is_some_and(|member| member.devices.contains(&elsewhere));
+    assert!(
+        !sent,
+        "the member device sent the device it does not list an entry"
+    );
+
+    dial(
+        &bob_laptop,
+        &bob,
+        pod,
+        PodStore::Membership,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    assert!(
+        lists_device(&bob_laptop, bob.id, pod, alice.id, elsewhere).await?,
+        "the member device did not serve the device it lists"
+    );
+
+    for node in [alice_phone, bob_laptop] {
+        node.shutdown().await?;
+    }
     Ok(())
 }
 

@@ -422,9 +422,10 @@ async fn a_co_located_non_member_is_refused_where_its_node_mate_is_served() -> R
 
 /// A freshly linked device is served by its sibling at once, by its
 /// identity's PMS, and by another member once the statement it wrote
-/// reaches that member. Paired denials: the same device refused by the other
-/// member before that statement exists, and by the sibling a device naming
-/// the identity that the identity's PMS does not list.
+/// reaches that member. Paired denials: the same device refused the record
+/// store by the other member before that statement exists, and by the
+/// sibling a device naming the identity that the identity's PMS does not
+/// list.
 #[allow(clippy::too_many_lines)] // one scenario: the linking, the refusal and the statement that ends it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> {
@@ -448,6 +449,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
     )
     .await?;
     let membership = tickets.membership.capability.id();
+    let records = tickets.records.capability.id();
     bob_phone.import_pod(bob.id, pod, tickets.clone()).await?;
     session(
         &bob_phone,
@@ -477,15 +479,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
 
     // Denied: the laptop, before any statement lists it.
     assert!(refused(
-        session(
-            &bob_laptop,
-            bob.id,
-            membership,
-            &alice_phone,
-            alice.id,
-            bob.id
-        )
-        .await
+        session(&bob_laptop, bob.id, records, &alice_phone, alice.id, bob.id).await
     ));
     session(&bob_laptop, bob.id, membership, &bob_phone, bob.id, bob.id).await?;
     // Denied: a device naming Bob that Bob's PMS does not list.
@@ -508,16 +502,11 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
     .await?;
     assert!(
         eventually(|| async {
-            Ok(session(
-                &bob_laptop,
-                bob.id,
-                membership,
-                &alice_phone,
-                alice.id,
-                bob.id,
+            Ok(
+                session(&bob_laptop, bob.id, records, &alice_phone, alice.id, bob.id)
+                    .await
+                    .is_ok(),
             )
-            .await
-            .is_ok())
         })
         .await?,
         "the other member never served the laptop its statement lists"

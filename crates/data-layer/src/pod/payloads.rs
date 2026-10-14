@@ -9,6 +9,14 @@ use pdn_types::NodeId;
 /// all of the event, and an empty entry is a tombstone.
 pub const ACT_PAYLOAD: [u8; 1] = [0];
 
+/// The one length a created event's payload decodes at.
+pub(crate) const CREATED_LEN: u64 = 16 + 32 + 32 + 32 + 64;
+/// The one length a joined event's payload decodes at.
+pub(crate) const JOINED_LEN: u64 = 32 + 32 + 32 + 64;
+/// The longest device statement the membership view reads: 1,023 devices
+/// and the signature, so one statement holds every device of a member.
+pub(crate) const STATEMENT_MAX_LEN: u64 = 65_536;
+
 /// A device of a member: the node sessions are classified and contacts
 /// dialed by, and the author the member writes with there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -3,7 +3,7 @@
 use pdn_store::{AuthorId, NamespaceId};
 use pdn_types::{NodeId, PdnId, PodId};
 
-use super::{EventKind, HeldEntry, MemberDevice, MembershipKey, MembershipView, Seq};
+use super::{EventKind, HeldEntry, HeldPayload, MemberDevice, MembershipKey, MembershipView, Seq};
 use crate::identity_key::{pod_id_of, IdentityKeyPair};
 
 pub(super) struct Person {
@@ -99,10 +99,13 @@ impl Store {
         author: AuthorId,
         payload: Vec<u8>,
     ) -> usize {
+        let key = key.to_bytes();
+        let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let payload = HeldPayload::unread(&key, len).unwrap_or(HeldPayload::Read(payload));
         self.entries.push(HeldEntry {
-            key: key.to_bytes(),
+            key,
             author,
-            payload: Some(payload),
+            payload,
         });
         self.entries.len() - 1
     }

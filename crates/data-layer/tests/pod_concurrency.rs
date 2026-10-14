@@ -412,6 +412,60 @@ async fn the_last_two_owners_leaving_at_once_leave_the_pod_without_an_owner() ->
     Ok(())
 }
 
+/// The last two owners removing each other while out of reach of each other
+/// leave the pod without an owner, as two leaves do: the plain member that
+/// remains lists neither. Denied: its own promotion of itself, held and
+/// counted for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_two_owners_removing_each_other_leave_the_pod_without_an_owner() -> Result<()> {
+    let phones = [node().await?, node().await?, node().await?];
+    let [alice_phone, bob_phone, carol_phone] = &phones;
+    let mut bobs = bob_phone.take_pod_verdicts().context("taken once")?;
+    let all = [alice_phone, bob_phone, carol_phone];
+    let (people, pod, tickets) = pod_on(&all).await?;
+    let [alice, bob, carol] = people.as_slice() else {
+        anyhow::bail!("three members expected");
+    };
+    act(alice_phone, alice, 1, EventKind::Promoted, carol, 2, pod).await?;
+    dial(carol_phone, carol, pod, alice_phone, alice).await?;
+    assert!(lists(carol_phone, carol.id, pod, carol.id, OWNER).await?);
+    out_of_reach(&all, &people, pod, &tickets).await?;
+
+    act(alice_phone, alice, 1, EventKind::Removed, carol, 3, pod).await?;
+    act(carol_phone, carol, 2, EventKind::Removed, alice, 2, pod).await?;
+    dial(bob_phone, bob, pod, alice_phone, alice).await?;
+    dial(bob_phone, bob, pod, carol_phone, carol).await?;
+    for (member, want) in [(alice, OUT), (carol, OUT), (bob, PLAIN)] {
+        assert!(lists(bob_phone, bob.id, pod, member.id, want).await?);
+    }
+    let owners = bob_phone
+        .pod_membership_view(bob.id, pod)
+        .await?
+        .identities()
+        .filter(|(_id, member)| member.state.owner)
+        .count();
+    assert_eq!(
+        owners, 0,
+        "the pod kept an owner after its owners removed each other"
+    );
+    // Denied: the plain member's promotion of itself.
+    let promoted = act(bob_phone, bob, 1, EventKind::Promoted, bob, 2, pod).await?;
+    assert!(
+        verdicts_come_to(bob_phone, &mut bobs, bob, pod, |held| {
+            held.iter().any(|(key, verdict)| {
+                *key == promoted && matches!(verdict, Verdict::CountedForNothing(_))
+            })
+        })
+        .await?
+    );
+    assert!(lists(bob_phone, bob.id, pod, bob.id, PLAIN).await?);
+
+    for phone in phones {
+        phone.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A member's promotion, demotion and second promotion reaching a device in
 /// the order 4, 2, 3 resolve by sequence: the member stays a plain member
 /// while the promotion at 4 waits for the sequences below it, is an owner
