@@ -367,6 +367,23 @@ impl PrivateMetadataStore {
         Ok(())
     }
 
+    /// When `device`'s pending record was written, once its payload is
+    /// here; `None` while the payload has not arrived or reads as no time.
+    #[cfg(feature = "test-util")]
+    pub async fn pending_device_written_at_for_test(
+        &self,
+        device: NodeId,
+    ) -> Result<Option<SystemTime>> {
+        let key = pending_device_key(&device);
+        let marker = read_payload(&self.doc, &self.blobs, key.as_bytes()).await?;
+        Ok(
+            marker.and_then(|marker| match pending_device_marker(&marker) {
+                PendingMarker::Timestamp(written_at) => Some(written_at),
+                _ => None,
+            }),
+        )
+    }
+
     #[cfg(feature = "test-util")]
     pub async fn cleanup_pending_devices_at_for_test(&self, now: SystemTime) -> Result<()> {
         self.cleanup_pending_devices_at(now).await

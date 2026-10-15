@@ -275,9 +275,15 @@ async fn a_pending_device_expired_after_a_restart_stays_absent() -> Result<()> {
     pms.add_device(sibling.node_id()).await?;
     sibling_pms.add_device(sibling.node_id()).await?;
     sibling_pms.add_pending_device(abandoned).await?;
+    // Its payload too: the cleanup reads a record's age from it, and once
+    // the sibling is gone nothing else holds it.
     assert!(
         test_utils::eventually(|| async {
-            Ok(pms.list_pending_devices().await?.contains(&abandoned))
+            Ok(pms.list_pending_devices().await?.contains(&abandoned)
+                && pms
+                    .pending_device_written_at_for_test(abandoned)
+                    .await?
+                    .is_some())
         })
         .await?,
         "the sibling's record never reached this replica"
