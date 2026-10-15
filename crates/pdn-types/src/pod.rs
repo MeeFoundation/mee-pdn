@@ -9,7 +9,7 @@ use crate::PdnId;
 
 crate::define_byte_id_16! {
     /// A pod's one address, carrying no key material and never equal to
-    /// either of its stores' namespace ids (Invariant 3).
+    /// either of its stores' namespace ids: knowing it gives no access.
     pub struct PodId;
 }
 

@@ -928,16 +928,29 @@ async fn a_write_whose_announcement_was_lost_arrives_at_the_next_run() -> Result
 }
 
 /// The pass over every other store leaves a pod's stores to their own
-/// interval: a write whose announcement a member device missed stays
-/// missing through runs of that pass while the pod pass is out of reach.
+/// interval: through runs of that pass a write into the PMS reaches the
+/// device from its sibling, while a write into a pod's store whose
+/// announcement the device missed stays missing with the pod pass out of
+/// reach.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
-    let (alice_phone, bob_phone) = (
+    let (alice_phone, bob_phone, bob_laptop) = (
         node(QUIET, QUIET).await?,
         node(Duration::from_millis(100), QUIET).await?,
+        node(QUIET, QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, _) = host(&bob_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
+    let laptop_pms = join_identity(
+        &bob_laptop,
+        bob.id,
+        bob_pms
+            .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+            .await?,
+    )
+    .await?;
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    laptop_pms.add_device(bob_laptop.node_id()).await?;
     let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
@@ -957,6 +970,18 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
 
     let erin = Person::generate();
     invite(&alice_phone, &alice, pod, &erin, vec![nowhere(0xe0)]).await?;
+    // Out of the swarm, with no pass of its own, the laptop announces
+    // nothing: the write reaches the phone through the phone's pass alone.
+    bob_laptop
+        .leave_swarm_for_test(bob.id, laptop_pms.namespace())
+        .await?;
+    let wedding = PodId::from_bytes([0xf9; 16]);
+    laptop_pms.record_pod(wedding, Seq::FIRST).await?;
+    assert!(
+        eventually(|| async { Ok(bob_pms.pod_record(wedding).await? == Some((Seq::FIRST, true))) })
+            .await?,
+        "the pass did not reconcile the PMS"
+    );
     // Sentinel: ten runs of the other pass after the write.
     let after_write = bob_phone.reconcile_passes();
     assert!(eventually(|| async { Ok(bob_phone.reconcile_passes() >= after_write + 10) }).await?);
@@ -966,7 +991,7 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
         "the pass over other stores reconciled a pod store"
     );
 
-    for node in [alice_phone, bob_phone] {
+    for node in [alice_phone, bob_phone, bob_laptop] {
         node.shutdown().await?;
     }
     Ok(())
@@ -1836,24 +1861,42 @@ async fn two_nodes_sharing_sixty_pods_keep_live_delivery_in_each() -> Result<()>
             vec![device_of(&bob_phone, &bob)?],
         )
         .await?;
+        // As a join does: caught up, and Alice listed, before Bob writes;
+        // a write ahead of that meets a pull Bob refuses for a member it
+        // does not know yet, and nothing pulls again with the passes off.
         bob_phone
             .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+            .await?
+            .wait(TIMEOUT)
             .await?;
+        assert!(lists(&bob_phone, bob.id, pod, alice.id, OWNER).await?);
         pods.push(pod);
     }
 
-    let ends = [pods.first().copied(), pods.last().copied()];
-    for pod in ends.into_iter().flatten() {
+    let ends = [
+        (0, pods.first().copied()),
+        (SHARED - 1, pods.last().copied()),
+    ];
+    for (index, pod) in ends {
+        let pod = pod.expect("sixty pods");
         let from_alice = place_claim(&alice_phone, &alice, pod, 1).await?;
         let from_bob = place_claim(&bob_phone, &bob, pod, 2).await?;
         assert!(
             reads(&bob_phone, bob.id, pod, from_alice).await?,
-            "Alice's claim did not reach Bob's node over the swarm"
+            "Alice's claim did not reach Bob's node over the swarm in pod {index}"
         );
-        assert!(
-            reads(&alice_phone, alice.id, pod, from_bob).await?,
-            "Bob's claim did not reach Alice's node over the swarm"
-        );
+        if !reads(&alice_phone, alice.id, pod, from_bob).await? {
+            let owner = alice_phone.pod_record_view(alice.id, pod).await;
+            let writer = bob_phone.pod_record_view(bob.id, pod).await;
+            let in_flight = (
+                alice_phone.pod_syncs_in_flight_for_test(pod).await,
+                bob_phone.pod_syncs_in_flight_for_test(pod).await,
+            );
+            anyhow::bail!(
+                "Bob's claim did not reach Alice's node over the swarm in pod {index}\nAlice: \
+                 {owner:#?}\nBob: {writer:#?}\nexchanges in flight (Alice, Bob): {in_flight:?}"
+            );
+        }
     }
     let last = pods.last().copied().expect("sixty pods");
     for seed in 3..=202 {
@@ -1864,6 +1907,67 @@ async fn two_nodes_sharing_sixty_pods_keep_live_delivery_in_each() -> Result<()>
         .map_err(|_| anyhow::anyhow!("the node stopped answering after a burst of writes"))??;
 
     for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A departed member's tombstone of a pod's membership store is out of the
+/// store's swarm: an event a current member writes afterwards reaches the
+/// other current member over its announcement and does not reach the
+/// tombstone, which no pass dials either.
+///
+/// Every pass is out of reach, so an entry crosses only on an announcement
+/// or on a session one opens; the departed member's own view still lists
+/// it as a member, so a session would have served it the event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_is_out_of_its_pods_swarm() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        phone.import_pod(member.id, pod, tickets.clone()).await?;
+        assert!(lists(phone, member.id, pod, carol.id, PLAIN).await?);
+    }
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+
+    bob_phone.forget_pod(bob.id, pod).await?;
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    let erin = Person::generate();
+    invite(&alice_phone, &alice, pod, &erin, vec![nowhere(0xe1)]).await?;
+    assert!(
+        lists(&carol_phone, carol.id, pod, erin.id, PLAIN).await?,
+        "a current member missed the event's announcement"
+    );
+    // Sentinel: the sessions the announcement opened have settled.
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    let tombstone = bob_phone
+        .held_pod_membership_view_for_test(bob.id, pod)
+        .await?;
+    assert_eq!(
+        tombstone.member(&erin.id).map(|member| member.state),
+        None,
+        "the tombstone took an event over the swarm"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone] {
         node.shutdown().await?;
     }
     Ok(())

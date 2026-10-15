@@ -26,19 +26,11 @@ pub trait RangeEntry: Debug + Clone {
     /// See [`RangeValue`] for details.
     type Value: RangeValue;
 
-    /// The identity echoed back to the sender when this entry is refused at
-    /// ingest ([`ValidateOutcome::Reject`]) — enough for the sender to name
-    /// the entry, no full re-send.
-    type RejectId: Debug + Clone + PartialEq;
-
     /// Get the key for this entry.
     fn key(&self) -> &Self::Key;
 
     /// Get the value for this entry.
     fn value(&self) -> &Self::Value;
-
-    /// The [`RejectId`](Self::RejectId) of this entry.
-    fn reject_id(&self) -> Self::RejectId;
 
     /// Get the fingerprint for this entry.
     fn as_fingerprint(&self) -> Fingerprint;
@@ -49,13 +41,9 @@ pub trait RangeEntry: Debug + Clone {
 pub enum ValidateOutcome {
     /// Store the entry.
     Accept,
-    /// Drop the entry silently — a transient failure (bad signature, clock skew).
+    /// Keep the entry out in silence: the sender keeps its copy and offers
+    /// it again in a later session.
     Drop,
-    /// Drop the entry and return its id to the sender — a capability refusal.
-    /// The id travels only for an entry the store would have taken in, so a
-    /// rejection the sender receives states that this store does not hold
-    /// the named entry.
-    Reject,
 }
 
 /// A trait constraining types that are valid entry keys.
@@ -188,14 +176,6 @@ pub enum MessagePart<E: RangeEntry> {
         deserialize = "RangeItem<E>: Deserialize<'de>"
     ))]
     RangeItem(RangeItem<E>),
-    /// An entry the receiver refused at ingest for lack of a write capability,
-    /// echoed back so the sender can retract it. Carries only the entry's id
-    /// ([`RangeEntry::reject_id`]), never the entry.
-    #[serde(bound(
-        serialize = "E::RejectId: Serialize",
-        deserialize = "E::RejectId: Deserialize<'de>"
-    ))]
-    Rejected(E::RejectId),
 }
 
 impl<E: RangeEntry> MessagePart<E> {
@@ -213,15 +193,6 @@ impl<E: RangeEntry> MessagePart<E> {
         match self {
             MessagePart::RangeFingerprint(_) => None,
             MessagePart::RangeItem(RangeItem { values, .. }) => Some(values),
-            MessagePart::Rejected(_) => None,
-        }
-    }
-
-    /// The rejected-entry id this part carries, if it is a [`Rejected`](Self::Rejected).
-    pub(crate) fn rejected(&self) -> Option<&E::RejectId> {
-        match self {
-            MessagePart::Rejected(id) => Some(id),
-            _ => None,
         }
     }
 }
@@ -370,9 +341,6 @@ pub trait Store<E: RangeEntry>: Sized {
                 MessagePart::RangeFingerprint(fp) => {
                     fingerprints.push(fp);
                 }
-                // Rejections of our own entries: not range data. The caller
-                // surfaces them off the incoming message before processing.
-                MessagePart::Rejected(_) => {}
             }
         }
 
@@ -417,7 +385,7 @@ pub trait Store<E: RangeEntry>: Sized {
 
             // Store incoming values
             for (entry, content_status) in values {
-                // here: accept / drop / reject-and-notify
+                // here: accept or drop
                 let outcome = validate_cb(self, &entry, content_status);
                 match outcome {
                     ValidateOutcome::Accept => {
@@ -428,16 +396,6 @@ pub trait Store<E: RangeEntry>: Sized {
                         }
                     }
                     ValidateOutcome::Drop => {}
-                    // Echo the id back so the sender can retract it (in-band
-                    // nack) — only for an entry this store would have taken
-                    // in. One it already holds entered under the capability
-                    // that stood when it arrived, and a refusal the sender
-                    // acts on destructively must never name data kept here.
-                    ValidateOutcome::Reject => {
-                        if self.would_insert(&entry)? {
-                            out.push(MessagePart::Rejected(entry.reject_id()));
-                        }
-                    }
                 }
             }
 
@@ -605,14 +563,6 @@ pub trait Store<E: RangeEntry>: Sized {
             removed: usize::from(previous.is_some()),
         })
     }
-
-    /// Whether [`put`](Self::put) would take `entry` in — the entry at its
-    /// key, an empty one included, does not already supersede it.
-    fn would_insert(&mut self, entry: &E) -> Result<bool, Self::Error> {
-        Ok(self
-            .entry_get(entry.key())?
-            .is_none_or(|existing| entry.value() > existing.value()))
-    }
 }
 
 impl<E: RangeEntry, S: Store<E>> Store<E> for &mut S {
@@ -742,7 +692,6 @@ mod tests {
     {
         type Key = K;
         type Value = V;
-        type RejectId = ();
 
         fn key(&self) -> &Self::Key {
             &self.0
@@ -751,8 +700,6 @@ mod tests {
         fn value(&self) -> &Self::Value {
             &self.1
         }
-
-        fn reject_id(&self) {}
 
         fn as_fingerprint(&self) -> Fingerprint {
             let mut hasher = blake3::Hasher::new();
@@ -1246,9 +1193,6 @@ mod tests {
                         have_local,
                         values,
                     );
-                }
-                MessagePart::Rejected(id) => {
-                    println!("  Rejected({id:?})");
                 }
             }
         }

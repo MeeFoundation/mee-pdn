@@ -7,21 +7,43 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use data_layer::{
-    pod_inviter_ticket_kind, pod_ticket_kind, MemberDevice, MemberState, PodStore, RecordKey,
-    Verdict,
+    pod_inviter_ticket_kind, pod_ticket_kind, Contact, DocTicket, MemberDevice, MemberState,
+    PodStore, PodTickets, PrivateMetadataStore, RecordKey, SyncNode, Verdict,
 };
 use pdn_node::{
-    ActRefusal, ActRefused, ConnectionsService as _, ForgedJoin, IdentityService as _, JoinRefused,
-    PodAct, PodInvite, PodMember, PodsService as _, RecordPlacedOnce, Runtime, SpawnOptions,
-    UnknownIdentity, UnknownPod, UnknownRecord, UnsupportedPodInviteVersion, WrongRecordKind,
+    ActRefusal, ActRefused, ForgedJoin, IdentityService as _, JoinInProgress, JoinRefused,
+    JoinTimeout, PodAct, PodInvite, PodMember, PodsService as _, RecordPlacedOnce, Runtime,
+    SpawnOptions, UnknownIdentity, UnknownPod, UnknownRecord, UnsupportedPodInviteVersion,
+    WrongRecordKind, JOIN_DIALOGUE_TIMEOUT, POD_INVITE_FORMAT_VERSION,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
-use test_utils::{eventually, ids};
+use test_utils::{
+    eventually, host_identity, ids, memory_node,
+    pod::{held_records, lists_nobody},
+    TIMEOUT,
+};
 
 mod common;
-use common::{link_patiently, link_probe, memory_runtime};
+use common::{link_patiently, link_probe, memory_runtime, HungInviter, POD_JOIN_ALPN};
+
+/// `pod`'s ticket to `store` as the PMS of a device of the identity holds
+/// it, once its payload has arrived.
+async fn ticket_of(pms: &PrivateMetadataStore, pod: PodId, store: PodStore) -> Result<DocTicket> {
+    let kind = pod_ticket_kind(&pod, store);
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if let Some(ticket) = pms.get_ticket(&kind).await? {
+            return Ok(ticket);
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the PMS never held {kind}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 fn member(id: PdnId, owner: bool) -> PodMember {
     PodMember { id, owner }
@@ -249,13 +271,22 @@ async fn an_invited_member_invites_in_turn() -> Result<()> {
 
 /// The pending invite's real secret joins after a secret never minted and
 /// an expired invite were refused with no observable state; an invite of a
-/// version the runtime does not know is refused before any dial.
+/// version the runtime does not know is refused before any dial, and an
+/// invite lifetime no clock can hold is an error, not a panic.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_secret_burns_nothing() -> Result<()> {
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
     let pod = alice_phone.pods().create(alice).await?;
+    assert!(
+        alice_phone
+            .pods()
+            .invite(alice, pod, Some(Duration::MAX))
+            .await
+            .is_err(),
+        "an invite lifetime out of range must be refused"
+    );
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
 
     let wrong = PodInvite {
@@ -974,13 +1005,12 @@ async fn any_member_edits_another_members_mergeable_document() -> Result<()> {
     Ok(())
 }
 
-/// Three identities with no connection to one another share through one
-/// pod: a claim one invited member places reads on the other's device, and
-/// none of the three lists a connection. Denied: an identity on that
-/// device's node holding a connection with the claim's author and no
-/// membership lists no such pod and reads nothing of it.
+/// Three identities share through one pod: a claim one invited member
+/// places reads on the other's device. Denied: an identity on that
+/// device's node that is no member lists no such pod and reads nothing of
+/// it, although the node holds the pod for the member beside it.
 #[tokio::test(flavor = "multi_thread")]
-async fn three_identities_share_through_a_pod_with_no_connections() -> Result<()> {
+async fn three_identities_share_through_a_pod() -> Result<()> {
     let (alice_phone, bob_phone, carol_phone) = (
         memory_runtime().await?,
         memory_runtime().await?,
@@ -1000,19 +1030,9 @@ async fn three_identities_share_through_a_pod_with_no_connections() -> Result<()
         .put_record(bob, pod, RecordKind::Claim, b"lease scan")
         .await?;
     assert!(reads(&carol_phone, carol, pod, claim, b"lease scan").await?);
-    for (runtime, holder) in [
-        (&alice_phone, alice),
-        (&bob_phone, bob),
-        (&carol_phone, carol),
-    ] {
-        assert_eq!(runtime.connections().list(holder).await?, []);
-    }
 
-    // Denied: a connection with the author, no membership.
+    // Denied: a co-located identity that is no member.
     let erin = carol_phone.identity().create().await?;
-    let invite = bob_phone.connections().invite(bob, None).await?;
-    carol_phone.connections().establish(erin, invite).await?;
-    assert_eq!(carol_phone.connections().list(erin).await?, [bob]);
     assert_eq!(carol_phone.pods().list(erin).await?, []);
     let refused = carol_phone.pods().read(erin, pod, claim).await;
     assert!(refused.is_err_and(|err| is::<UnknownPod>(&err)));
@@ -1877,8 +1897,13 @@ async fn a_linked_device_whose_sibling_is_gone_reaches_the_pod() -> Result<()> {
 /// from the identity's PMS, read it, and register themselves, so the
 /// owner's device reads what they write and serves one of them with every
 /// other device of the member gone. Denied: a co-located identity that is
-/// no member lists no such pod and reads nothing of it.
+/// no member lists no such pod and reads nothing of it, and a node holding
+/// both stores' tickets for an identity that is no member is refused by
+/// the owner's device and holds nothing. The tickets reach that node by
+/// hand, out of Alice's PMS through a probe: no product path hands a pod's
+/// tickets to a non-member.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, its two denials beside it
 async fn devices_linked_before_and_after_the_join_reach_the_pod() -> Result<()> {
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
     let (bob_laptop, bob_tablet) = (memory_runtime().await?, memory_runtime().await?);
@@ -1912,16 +1937,63 @@ async fn devices_linked_before_and_after_the_join_reach_the_pod() -> Result<()> 
     let asked = bob_laptop.pods().read(dave, pod, before).await;
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
 
+    // Denied (a ticket holder that is no member).
+    let (probe, probe_pms) = link_probe(&alice_phone, alice).await?;
+    let tickets = PodTickets {
+        membership: ticket_of(&probe_pms, pod, PodStore::Membership).await?,
+        records: ticket_of(&probe_pms, pod, PodStore::Records).await?,
+    };
+    let holder = memory_node().await?;
+    let _holder_pms = host_identity(&holder, ids::CAROL).await?;
+    let _catch_up = holder.import_pod(ids::CAROL, pod, tickets).await?;
+    let mut sessions = holder
+        .watch_pod_sessions(ids::CAROL, pod, PodStore::Membership)
+        .await?;
+    let owner_device = alice_phone.sync().dial_handle_for_test().await.addr();
+    holder
+        .sync_pod_with_for_test(
+            ids::CAROL,
+            pod,
+            PodStore::Membership,
+            Contact {
+                addr: owner_device,
+                identity: data_layer::identity_of(alice),
+            },
+        )
+        .await?;
+    let refused = sessions
+        .next_with(alice_phone.node_id(), true, TIMEOUT)
+        .await?
+        .context("the holder's dial must end within the budget")?;
+    assert!(
+        refused.exchanged.is_err(),
+        "the owner's device served a ticket holder that is no member: {:?}",
+        refused.exchanged
+    );
+    assert_eq!(
+        held_records(&holder, ids::CAROL, pod).await?,
+        Vec::<String>::new()
+    );
+    assert!(lists_nobody(&holder, ids::CAROL, pod).await?);
+    holder.shutdown().await?;
+    probe.shutdown().await?;
+
     bob_phone.shutdown().await?;
     bob_tablet.shutdown().await?;
     let after = alice_phone
         .pods()
         .put_record(alice, pod, RecordKind::Claim, b"after")
         .await?;
-    assert!(
-        reads(&bob_laptop, bob, pod, after, b"after").await?,
-        "the owner's device did not serve the linked device"
-    );
+    if !reads(&bob_laptop, bob, pod, after, b"after").await? {
+        let laptop = bob_laptop.pod_record_view_for_test(bob, pod).await;
+        let owner = alice_phone.pod_record_view_for_test(alice, pod).await;
+        anyhow::bail!(
+            "the owner's device did not serve the linked device\nlaptop {}: {laptop:#?}\nowner \
+             {}: {owner:#?}",
+            bob_laptop.node_id(),
+            alice_phone.node_id()
+        );
+    }
 
     for runtime in [alice_phone, bob_laptop] {
         runtime.shutdown().await?;
@@ -2622,6 +2694,375 @@ async fn a_device_linked_after_the_departure_takes_the_tombstone_from_a_sibling(
     assert!(asked.is_err_and(|err| is::<UnknownPod>(&err)));
 
     for runtime in [alice_phone, bob_phone, bob_laptop] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Shutdown waits for a join's serving half in flight and stops waiting
+/// once it returns: a raw dialer leaves the inviter's serving half parked
+/// mid-request, shutdown is still running against that, and returns once
+/// the dialer goes away — well inside the shutdown's budget, so the
+/// serving half finishing is what ended the wait.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_an_accept_in_flight_and_no_longer() -> Result<()> {
+    use anyhow::Context as _;
+
+    let rt = memory_runtime().await?;
+    let alice = rt.identity().create().await?;
+    let pod = rt.pods().create(alice).await?;
+    // Minted for its address alone — the dialogue below is never completed,
+    // so the secret is spent on nothing.
+    let invite = rt.pods().invite(alice, pod, None).await?;
+
+    // The dialer parks the serving half: a frame header promising more
+    // bytes than it sends leaves the inviter blocked reading the rest, with
+    // the handler's permit held for as long as the connection lives.
+    let dialer = test_utils::memory_node().await?;
+    let connection = dialer
+        .dial_handle()
+        .connect(invite.inviter_addr.clone(), common::POD_JOIN_ALPN)
+        .await?;
+    let (mut send, _recv) = connection.open_bi().await?;
+    send.write_all(&64u32.to_le_bytes()).await?;
+    send.write_all(b"partial").await?;
+    tokio::time::timeout(test_utils::TIMEOUT, async {
+        while !rt.serving_half_in_flight_for_test().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the inviter never dispatched the parked serving half")?;
+
+    let started = std::time::Instant::now();
+    let mut shutting_down = tokio::spawn(async move { rt.shutdown().await });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !shutting_down.is_finished(),
+        "shutdown must wait for the serving half in flight rather than abort it"
+    );
+
+    // The serving half returns the moment its connection goes away, and
+    // shutdown with it.
+    connection.close(0u32.into(), b"");
+    let waited = tokio::time::timeout(test_utils::TIMEOUT, &mut shutting_down).await;
+    let elapsed = started.elapsed();
+    waited
+        .context("shutdown never returned after the serving half it waited for finished")?
+        .context("the shutdown task panicked")??;
+    assert!(
+        elapsed < pdn_node::runtime::SHUTDOWN_SERVING_BUDGET,
+        "shutdown took {elapsed:?} — its budget elapsing, not the serving half finishing, ended the wait"
+    );
+
+    dialer.shutdown().await?;
+    Ok(())
+}
+
+/// A stop that begins while two identities of one node are mid-join waits
+/// for the serving half, and its commit outlives the stop: the pod lists the
+/// newcomer once the runtime is back on its directory. The pause parks the
+/// serving half after it read the request and before it takes the state
+/// lock, the point a stop could otherwise overtake it; the hold sits well
+/// inside the shutdown budget.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_waits_for_the_serving_half_of_a_co_located_dialogue() -> Result<()> {
+    use anyhow::Context as _;
+
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let rt = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let work = rt.identity().create().await?;
+    let leisure = rt.identity().create().await?;
+    let pod = rt.pods().create(work).await?;
+    let invite = rt.pods().invite(work, pod, None).await?;
+    let pause = rt.pause_next_join_serve().await;
+    let joining = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.pods().join(leisure, invite).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !shutting_down.is_finished(),
+        "the stop must wait for the co-located serving half in flight"
+    );
+    pause.release();
+    tokio::time::timeout(test_utils::TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    // The joining half meets a stopping node: its outcome is not what this
+    // scenario is about.
+    let _joined = joining.await?;
+    drop(rt);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert!(
+        lists_members(
+            &restarted,
+            work,
+            pod,
+            vec![member(work, true), member(leisure, false)]
+        )
+        .await?,
+        "the serving half's commit did not survive the stop"
+    );
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+/// The same stop on a join from another node: the inviter's serving half
+/// finishes under the stop, and the pod lists the newcomer on the inviter
+/// once it is back on its directory. Paused and held as the co-located case
+/// is.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_waits_for_the_serving_half_of_a_dialogue_from_another_node() -> Result<()> {
+    use anyhow::Context as _;
+
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let inviter = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let joiner = Arc::new(memory_runtime().await?);
+    let alice = inviter.identity().create().await?;
+    let bob = joiner.identity().create().await?;
+    let pod = inviter.pods().create(alice).await?;
+    let invite = inviter.pods().invite(alice, pod, None).await?;
+    let pause = inviter.pause_next_join_serve().await;
+    let joining = {
+        let joiner = Arc::clone(&joiner);
+        tokio::spawn(async move { joiner.pods().join(bob, invite).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let inviter = Arc::clone(&inviter);
+        tokio::spawn(async move { inviter.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !shutting_down.is_finished(),
+        "the stop must wait for the serving half in flight"
+    );
+    pause.release();
+    tokio::time::timeout(test_utils::TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    // The joining half waits for a catch-up from a node that stopped.
+    joining.abort();
+    drop(inviter);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert!(
+        lists_members(
+            &restarted,
+            alice,
+            pod,
+            vec![member(alice, true), member(bob, false)]
+        )
+        .await?,
+        "the serving half's commit did not survive the stop"
+    );
+    restarted.shutdown().await?;
+    joiner.shutdown().await?;
+    Ok(())
+}
+
+/// A join whose serving half would begin once the stop has waited for the
+/// one in flight is refused before its secret is verified, and the inviter
+/// writes nothing for it: back on its directory, the pod lists the member
+/// whose serving half the stop waited for and not the late one.
+///
+/// The late join enters while the stop waits, so it is decided after the
+/// wait; the hold before the release gives it the time to queue there.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dialogue_arriving_after_the_wait_writes_nothing() -> Result<()> {
+    use anyhow::Context as _;
+
+    const HOLD: Duration = Duration::from_secs(1);
+    let dir = tempfile::tempdir()?;
+    let rt = Arc::new(Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?);
+    let work = rt.identity().create().await?;
+    let leisure = rt.identity().create().await?;
+    let erin = rt.identity().create().await?;
+    let pod = rt.pods().create(work).await?;
+    let first = rt.pods().invite(work, pod, None).await?;
+    let late = rt.pods().invite(work, pod, None).await?;
+    let pause = rt.pause_next_join_serve().await;
+    let joining = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.pods().join(leisure, first).await })
+    };
+    pause.wait_until_reached().await;
+
+    let shutting_down = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.shutdown().await })
+    };
+    tokio::time::sleep(HOLD).await;
+    let late_joining = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.pods().join(erin, late).await })
+    };
+    tokio::time::sleep(HOLD).await;
+    pause.release();
+    tokio::time::timeout(test_utils::TIMEOUT, shutting_down)
+        .await
+        .context("the stop never returned after the serving half finished")???;
+    let refused = tokio::time::timeout(test_utils::TIMEOUT, late_joining)
+        .await
+        .context("the late join never returned")??;
+    assert!(
+        refused.is_err_and(|err| is::<JoinRefused>(&err)),
+        "a join beginning after the stop's wait was not refused"
+    );
+    let _joined = joining.await?;
+    drop(rt);
+
+    let restarted = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert!(
+        lists_members(
+            &restarted,
+            work,
+            pod,
+            vec![member(work, true), member(leisure, false)]
+        )
+        .await?,
+        "the inviter wrote for a join that began after the stop's wait"
+    );
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+/// A join toward an inviter that never answers costs the dialogue ceiling
+/// and nothing more — the typed join timeout, not a refusal, within the
+/// ceiling rather than the transport's idle timeout — and a second join of
+/// the same pod by the same identity meanwhile is refused at once as one in
+/// progress.
+///
+/// The two secrets differ, so what refuses the second is the reservation,
+/// not a burnt secret; which of the two holds it is the scheduler's choice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_inviter_costs_a_join_its_ceiling_and_a_second_join_meets_the_reservation(
+) -> Result<()> {
+    let hung = SyncNode::spawn_with(
+        vec![(POD_JOIN_ALPN.to_vec(), Box::new(HungInviter))],
+        SpawnOptions::memory(),
+    )
+    .await?;
+    let bob_phone = memory_runtime().await?;
+    let bob = bob_phone.identity().create().await?;
+    let invite = |secret| PodInvite {
+        version: POD_INVITE_FORMAT_VERSION,
+        inviter_addr: hung.dial_handle().addr(),
+        secret,
+        pod: PodId::from_bytes([0x5d; 16]),
+    };
+
+    let pods = bob_phone.pods();
+    let started = std::time::Instant::now();
+    let (first, second) = tokio::join!(
+        pods.join(bob, invite([0x55; 32])),
+        pods.join(bob, invite([0x66; 32]))
+    );
+    let elapsed = started.elapsed();
+    let errors = [first.unwrap_err(), second.unwrap_err()];
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|err| is::<JoinInProgress>(err))
+            .count(),
+        1,
+        "exactly one of two concurrent joins of one pod must meet the reservation: {errors:#?}"
+    );
+    assert_eq!(
+        errors.iter().filter(|err| is::<JoinTimeout>(err)).count(),
+        1,
+        "the join holding the reservation must end at the dialogue ceiling: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(is::<JoinRefused>),
+        "a dialogue that never ended must not read as a refusal: {errors:#?}"
+    );
+    // The ceiling plus slack; the transport's idle timeout is what a wait
+    // far beyond it would mean.
+    assert!(
+        elapsed < JOIN_DIALOGUE_TIMEOUT + Duration::from_secs(10),
+        "the join took {elapsed:?} against the dialogue ceiling"
+    );
+    assert_eq!(bob_phone.pods().list(bob).await?, []);
+
+    hung.shutdown().await?;
+    bob_phone.shutdown().await?;
+    Ok(())
+}
+
+/// A joiner reaches the inviter's other device once the inviting device is
+/// gone: the tickets a join hands over name every device of the inviter the
+/// inviting device knows how to reach, not that device alone.
+///
+/// The memory runtimes resolve no node id by lookup, so without the
+/// laptop's address in the handed tickets Bob knows it by node id alone;
+/// the ticket is asserted beside the read, since a swarm that met the
+/// laptop before the stop would deliver the read without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_reaches_the_inviters_other_device_once_the_inviting_device_is_gone() -> Result<()>
+{
+    let (alice_phone, alice_laptop) = (memory_runtime().await?, memory_runtime().await?);
+    let bob_phone = memory_runtime().await?;
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = alice_phone.pods().create(alice).await?;
+    link_patiently(&alice_laptop, &alice_phone, alice).await?;
+    let laptop = alice_laptop.node_id();
+    // Alice's PMS on the phone lists the laptop, as the probe syncing from
+    // it shows; the pod's own statements may not name it yet.
+    let (alice_probe, alice_probe_pms) = link_probe(&alice_phone, alice).await?;
+    assert!(
+        eventually(|| async { Ok(alice_probe_pms.list_devices().await?.contains(&laptop)) })
+            .await?,
+        "the inviting device's PMS never listed the laptop"
+    );
+    alice_probe.shutdown().await?;
+
+    let invite = alice_phone.pods().invite(alice, pod, None).await?;
+    bob_phone.pods().join(bob, invite).await?;
+    let (probe, probe_pms) = link_probe(&bob_phone, bob).await?;
+    let kind = pod_inviter_ticket_kind(&pod, PodStore::Records);
+    assert!(
+        eventually(|| async {
+            Ok(probe_pms.get_ticket(&kind).await?.is_some_and(|ticket| {
+                ticket
+                    .nodes
+                    .iter()
+                    .any(|addr| addr.id.as_bytes() == laptop.as_bytes())
+            }))
+        })
+        .await?,
+        "the handed tickets did not name the inviter's other device"
+    );
+    probe.shutdown().await?;
+
+    alice_phone.shutdown().await?;
+    let after = alice_laptop
+        .pods()
+        .put_record(alice, pod, RecordKind::Claim, b"after the phone")
+        .await?;
+    assert!(
+        reads(&bob_phone, bob, pod, after, b"after the phone").await?,
+        "the joiner did not reach the inviter's other device"
+    );
+
+    for runtime in [alice_laptop, bob_phone] {
         runtime.shutdown().await?;
     }
     Ok(())

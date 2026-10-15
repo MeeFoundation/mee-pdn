@@ -74,14 +74,6 @@ link_device() { # identity from to label
   fact "$4"
 }
 
-hosts() { # url identity label persona
-  HOSTED=$(call GET "$1/debug/identities") || exit 1
-  case "$HOSTED" in
-    *"$2"*) shown "$3 hosts " "$4" ;;
-    *) echo "  $3 does not host $4" >&2; exit 1 ;;
-  esac
-}
-
 node_id() { # url
   STATUS=$(call GET "$1/debug/status") || exit 1
   printf '%s\n' "$STATUS" | sed -n 's/^node //p'

@@ -542,6 +542,25 @@ async fn a_tombstone_takes_what_reverses_its_departure_layer_after_layer() -> Re
     write(&bob_phone, &bob, pod, removal, vec![0]).await?;
     assert!(lists(&dave_phone, dave.id, pod, dave.id, OUT).await?);
     dave_phone.forget_pod(dave.id, pod).await?;
+    // Settled, so the tombstone's own dials after the session that brought
+    // its removal end before the writes below: otherwise they take the
+    // promotion and the reversal ahead of the dial under test.
+    let everyone = [
+        &alice_phone,
+        &bob_phone,
+        &carol_phone,
+        &dave_phone,
+        &frank_phone,
+    ];
+    if !settle(&everyone, pod).await? {
+        let mut in_flight = Vec::new();
+        for node in everyone {
+            in_flight.push(node.pod_syncs_in_flight_report_for_test(pod).await?);
+        }
+        anyhow::bail!(
+            "the pod never settled; in flight on Alice, Bob, Carol, Dave, Frank: {in_flight:?}"
+        );
+    }
 
     write(&alice_phone, &alice, pod, promotion(&carol, 2), vec![0]).await?;
     assert!(lists(&carol_phone, carol.id, pod, carol.id, OWNER).await?);

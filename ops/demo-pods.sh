@@ -40,8 +40,8 @@ bytes_of() {
   printf '%s' "$1" | od -An -tu1 -v | tr -s ' \n' '\n\n' | grep . | paste -sd, -
 }
 
-# The reads below poll as the connections demo's do: repeating the read is
-# the only wait the surface offers. 409 is "no member here yet" — a device
+# The reads below poll: repeating the read is the only wait the surface
+# offers. 409 is "no member here yet" — a device
 # that has not taken the pod in — and 404 a record not arrived yet.
 
 members_are() { # url reader pod label id:owner|plain:name...
@@ -190,7 +190,7 @@ FAMILY=$(printf '%s' "$CREATED" | sed -E 's/.*"pod":"([^"]+)".*/\1/')
 fact "pod $FAMILY"
 members_are "$ALICE_PHONE" "$ALICE" "$FAMILY" "Alice's phone" "$ALICE:owner:Alice"
 
-say "Alice invites Bob. The invite carries a one-time secret, and Bob's phone joins with it — no connection between them, now or later."
+say "Alice invites Bob. The invite carries a one-time secret, and Bob's phone joins with it."
 INVITE=$(call POST "$(pod_route "$ALICE_PHONE" "$ALICE" "$FAMILY")/invites?lifetime_secs=300")
 call POST "$BOB_PHONE/debug/identities/$BOB/pods/join" --data-raw "$INVITE" >/dev/null
 fact "Bob joined on his phone"

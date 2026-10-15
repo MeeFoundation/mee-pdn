@@ -1,14 +1,13 @@
 //! The request and response bodies of the debug surface: JSON built from
-//! types the runtime already serializes. Entry payloads travel as raw
-//! bodies, and ceremony payloads pass through as whole values the host
-//! never names. Scaffolding — unpinned, and no contract for anything
+//! types the runtime already serializes. Record and operation payloads
+//! travel as raw bodies, and ceremony payloads pass through as whole values
+//! the host never names. Scaffolding — unpinned, and no contract for anything
 //! outside this repository.
 
 use std::time::Duration;
 
 use pdn_node::{
-    EntryInfo, GrantedClaim, Operation, PdnId, PodAct, PodId, PodMember, PodStore, ReadGrant,
-    RecordKind, RecordRef, UnknownEntry,
+    Operation, PdnId, PodAct, PodId, PodMember, PodStore, RecordKind, RecordRef, UnknownEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,11 +45,6 @@ pub struct HostedIdentities {
     pub identities: Vec<PdnId>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Connections {
-    pub connections: Vec<PdnId>,
-}
-
 /// Unknown parameters are refused rather than ignored: a mistyped
 /// `lifetime_secs` that fell back to the default would mint an invite with
 /// a lifetime nobody asked for, and nothing in the answer would say so.
@@ -79,75 +73,6 @@ impl LinkBudget {
         self.timeout_secs
             .map_or(Ok(DEFAULT_LINK_BUDGET), duration_in_range)
     }
-}
-
-/// An empty claim set is malformed. See [`Lifetime`] for
-/// `deny_unknown_fields`.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GrantPublication {
-    pub issuer: PdnId,
-    pub claims: Vec<GrantedPath>,
-}
-
-/// One claim, named by its path: the host derives the claim identity, so a
-/// caller need not reproduce a rule of the product to talk to it.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GrantedPath {
-    pub path: String,
-    pub write: bool,
-}
-
-/// One grant's capability without its ticket — deliberately distinct from
-/// [`ReadGrant`]: `deny_unknown_fields` here rejects a field the surface
-/// never promised, ticket included, whereas `ReadGrant` is the wire format
-/// the store replicates and must keep decoding past records after a field
-/// is added.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GrantCapability {
-    pub issuer: PdnId,
-    pub audience: PdnId,
-    pub claims: Vec<GrantedClaim>,
-}
-
-impl From<ReadGrant> for GrantCapability {
-    fn from(grant: ReadGrant) -> Self {
-        Self {
-            issuer: grant.issuer,
-            audience: grant.audience,
-            claims: grant.claims.into_iter().collect(),
-        }
-    }
-}
-
-/// The capabilities alone: a ticket handed over here would let a test
-/// arrange a granted namespace by importing it, and such a test keeps
-/// passing after the grant binder breaks.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PeerGrants {
-    pub grants: Vec<GrantCapability>,
-}
-
-/// This device's answer, capability alone: it says the record is readable
-/// here, never that it reached a sibling or the peer.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OwnGrant {
-    pub grant: Option<GrantCapability>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Entries {
-    pub entries: Vec<EntryInfo>,
-}
-
-/// A mistyped parameter would silently widen a listing to the whole
-/// namespace.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ListingPrefix {
-    pub prefix: Option<String>,
 }
 
 /// For a route with no parameters of its own, so an unknown one is refused

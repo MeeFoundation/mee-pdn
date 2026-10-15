@@ -8,15 +8,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use pdn_node::{
-    ConnectionsService as _, DataService as _, IdentityService as _, Runtime, ShareMode,
-    SpawnOptions, SyncService as _,
-};
-use pdn_types::EntryPath;
-use test_utils::{eventually, ids};
+use pdn_node::{IdentityService as _, PodsService as _, Runtime, SpawnOptions, SyncService as _};
+use test_utils::eventually;
 
 mod common;
-use common::{claims_on, establish_patiently, granted_patiently};
+use common::{link_patiently, link_probe};
 
 const RECONCILE: Duration = Duration::from_millis(500);
 
@@ -79,29 +75,6 @@ async fn runtime_on(dir: &std::path::Path) -> Result<Runtime> {
     .await
 }
 
-/// A node holding `ticket` and nothing else, pointed at `target`'s address:
-/// the bare ticket holder the denials probe with. It holds the ticket for
-/// [`PROBE`], an identity of its own, because every replica sits in one.
-/// Its import fires a sync attempt now and every interval after.
-async fn ticket_holder_dialing(
-    target: &Runtime,
-    issuer: pdn_types::PdnId,
-    mut ticket: data_layer::DocTicket,
-) -> Result<data_layer::SyncNode> {
-    let probe = data_layer::SyncNode::spawn(data_layer::SpawnOptions {
-        reconcile_interval: RECONCILE,
-        ..data_layer::SpawnOptions::memory()
-    })
-    .await?;
-    probe.provision_identity(PROBE).await?;
-    ticket.nodes = vec![target.sync().dial_handle_for_test().await.addr()];
-    probe.import_namespace_scoped(PROBE, issuer, ticket).await?;
-    Ok(probe)
-}
-
-/// The identity the bare ticket holder acts as.
-const PROBE: pdn_types::PdnId = ids::DAVE;
-
 /// Where `identity`'s subdirectory lands under `dir`.
 fn subdirectory_of(dir: &std::path::Path, identity: pdn_types::PdnId) -> std::path::PathBuf {
     dir.join("identities").join(identity.to_string())
@@ -125,6 +98,41 @@ fn copy_subdirectory(from: &std::path::Path, to: &std::path::Path) -> Result<()>
     Ok(())
 }
 
+/// `identity`'s pod of one and the claim placed in it.
+async fn pod_with_claim(
+    runtime: &Runtime,
+    identity: pdn_types::PdnId,
+) -> Result<(pdn_types::PodId, pdn_types::RecordRef)> {
+    let pod = runtime.pods().create(identity).await?;
+    let record = runtime
+        .pods()
+        .put_record(
+            identity,
+            pod,
+            pdn_types::RecordKind::Claim,
+            b"written before",
+        )
+        .await?;
+    Ok((pod, record))
+}
+
+/// Whether `identity` on `runtime` comes to read the claim
+/// [`pod_with_claim`] placed, its pod opened again or not yet.
+async fn reads_claim(
+    runtime: &Runtime,
+    identity: pdn_types::PdnId,
+    pod: pdn_types::PodId,
+    record: pdn_types::RecordRef,
+) -> Result<bool> {
+    eventually(|| async {
+        match runtime.pods().read(identity, pod, record).await {
+            Ok(payload) => Ok(payload.as_deref() == Some(b"written before".as_slice())),
+            Err(_not_reopened_yet) => Ok(false),
+        }
+    })
+    .await
+}
+
 /// An identity created before the restart is hosted after it, with no peer
 /// and no ceremony repeated. Denied: with its hosting record removed, the
 /// same directory hosts nothing; with the record unreadable, the start
@@ -132,15 +140,11 @@ fn copy_subdirectory(from: &std::path::Path, to: &std::path::Path) -> Result<()>
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
 
     let first = runtime_on(dir.path()).await?;
     let node_id = first.node_id();
     let alice = first.identity().create().await?;
-    first
-        .data()
-        .write(alice, alice, &path, b"written before")
-        .await?;
+    let (pod, record) = pod_with_claim(&first, alice).await?;
     first.shutdown().await?;
     drop(first);
 
@@ -151,17 +155,11 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
         vec![alice],
         "the recorded identity must be hosted again"
     );
-    // The data namespace re-binds from the PMS's `data` ticket on the
-    // armer's first sweep; the payload is local.
+    // The pod reopens from the PMS's tickets on the armer's first sweep;
+    // the payload is local.
     assert!(
-        eventually(|| async {
-            match second.data().read(alice, alice, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"written before".as_slice())),
-                Err(_not_rebound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the entry written before the restart must read back"
+        reads_claim(&second, alice, pod, record).await?,
+        "the record placed before the restart must read back"
     );
     second.shutdown().await?;
     drop(second);
@@ -174,7 +172,7 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
         "a directory with no hosting record must host nothing"
     );
     assert!(
-        third.data().read(alice, alice, &path).await.is_err(),
+        third.pods().read(alice, pod, record).await.is_err(),
         "a read addressed to the unrecorded identity must be refused"
     );
     third.shutdown().await?;
@@ -193,10 +191,10 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     Ok(())
 }
 
-/// Several identities on one node each come back, each listing its own
-/// connections only.
+/// Several identities on one node each come back, each holding its own
+/// pods only, reopened by the armer.
 #[tokio::test(flavor = "multi_thread")]
-async fn two_identities_each_recover_their_own_connections() -> Result<()> {
+async fn two_identities_each_recover_their_own_pods() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let host = runtime_on(dir.path()).await?;
     let bob_rt = memory_rt().await?;
@@ -207,10 +205,12 @@ async fn two_identities_each_recover_their_own_connections() -> Result<()> {
     let bob = bob_rt.identity().create().await?;
     let carol = carol_rt.identity().create().await?;
 
-    let invite = host.connections().invite(at_work, None).await?;
-    establish_patiently(&bob_rt, bob, &host, at_work, invite).await?;
-    let invite = host.connections().invite(at_leisure, None).await?;
-    establish_patiently(&carol_rt, carol, &host, at_leisure, invite).await?;
+    let work_pod = bob_rt.pods().create(bob).await?;
+    let invite = bob_rt.pods().invite(bob, work_pod, None).await?;
+    host.pods().join(at_work, invite).await?;
+    let leisure_pod = carol_rt.pods().create(carol).await?;
+    let invite = carol_rt.pods().invite(carol, leisure_pod, None).await?;
+    host.pods().join(at_leisure, invite).await?;
 
     host.shutdown().await?;
     drop(host);
@@ -221,113 +221,41 @@ async fn two_identities_each_recover_their_own_connections() -> Result<()> {
         hosted.contains(&at_work) && hosted.contains(&at_leisure) && hosted.len() == 2,
         "both identities must be hosted again: {hosted:?}"
     );
-    let work_side = recovered.connections().list(at_work).await?;
-    assert!(
-        work_side.contains(&bob) && !work_side.contains(&carol),
-        "the work persona must list its own connection and no other: {work_side:?}"
-    );
-    let leisure_side = recovered.connections().list(at_leisure).await?;
-    assert!(
-        leisure_side.contains(&carol) && !leisure_side.contains(&bob),
-        "the leisure persona must list its own connection and no other: {leisure_side:?}"
-    );
-    recovered.shutdown().await?;
-    Ok(())
-}
-
-/// Two identities of one node, granted a different claim each of one
-/// issuer, come back after a restart reading each its own and neither
-/// the other's: every identity is restored with stores of its own, its
-/// PMS opened there and its granted namespace imported there.
-///
-/// Denied: neither identity reads the claim granted to its co-located
-/// sibling, before the restart or after it.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one scenario, both identities before and after the restart
-async fn two_identities_recover_each_its_own_granted_claim() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let host = runtime_on(dir.path()).await?;
-    let issuer_rt = memory_rt().await?;
-    let issuer = issuer_rt.identity().create().await?;
-    let at_work = host.identity().create().await?;
-    let at_leisure = host.identity().create().await?;
-
-    let work_claim = EntryPath::new("contact/email")?;
-    let leisure_claim = EntryPath::new("contact/phone")?;
-    issuer_rt
-        .data()
-        .write(issuer, issuer, &work_claim, b"issuer@example.org")
-        .await?;
-    issuer_rt
-        .data()
-        .write(issuer, issuer, &leisure_claim, b"+1-555-0100")
-        .await?;
-
-    for (identity, claim) in [(at_work, &work_claim), (at_leisure, &leisure_claim)] {
-        let invite = issuer_rt.connections().invite(issuer, None).await?;
-        establish_patiently(&host, identity, &issuer_rt, issuer, invite).await?;
-        granted_patiently(
-            &issuer_rt,
-            issuer,
-            &host,
-            identity,
-            issuer,
-            claims_on(issuer, claim, false),
-        )
-        .await?;
-    }
-
-    // Each reads its own before the restart — the premise, not the
-    // subject.
-    for (identity, claim, payload) in [
-        (at_work, &work_claim, b"issuer@example.org".as_slice()),
-        (at_leisure, &leisure_claim, b"+1-555-0100".as_slice()),
+    for (identity, own, other, with) in [
+        (at_work, work_pod, leisure_pod, bob),
+        (at_leisure, leisure_pod, work_pod, carol),
     ] {
-        assert!(
-            eventually(|| async {
-                match host.data().read(identity, issuer, claim).await {
-                    Ok(value) => Ok(value.as_deref() == Some(payload)),
-                    Err(_not_bound_yet) => Ok(false),
-                }
-            })
-            .await?,
-            "the granted claim never reached {identity} — the premise of this test"
-        );
-    }
-
-    host.shutdown().await?;
-    drop(host);
-    let recovered = runtime_on(dir.path()).await?;
-
-    // Allowed: each identity comes back holding its own replica.
-    for (identity, claim, payload) in [
-        (at_work, &work_claim, b"issuer@example.org".as_slice()),
-        (at_leisure, &leisure_claim, b"+1-555-0100".as_slice()),
-    ] {
-        assert!(
-            eventually(|| async {
-                match recovered.data().read(identity, issuer, claim).await {
-                    Ok(value) => Ok(value.as_deref() == Some(payload)),
-                    Err(_not_rebound_yet) => Ok(false),
-                }
-            })
-            .await?,
-            "{identity} did not come back reading its own granted claim"
-        );
-    }
-
-    // Denied: neither reads the other's claim, ordered after both came
-    // back so the absence is the grant's doing and not a slow recovery.
-    for (identity, other) in [(at_work, &leisure_claim), (at_leisure, &work_claim)] {
+        let listed: Vec<_> = recovered
+            .pods()
+            .list(identity)
+            .await?
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
         assert_eq!(
-            recovered.data().read(identity, issuer, other).await?,
-            None,
-            "{identity} read the claim granted to its co-located sibling"
+            listed,
+            vec![own],
+            "an identity must list its own pod and no other"
+        );
+        assert!(
+            eventually(|| async {
+                Ok(recovered
+                    .pods()
+                    .members(identity, own)
+                    .await
+                    .is_ok_and(|members| members.iter().any(|member| member.id == with)))
+            })
+            .await?,
+            "an identity's pod did not reopen after the restart"
+        );
+        assert!(
+            recovered.pods().members(identity, other).await.is_err(),
+            "an identity reached its co-located sibling's pod"
         );
     }
-
     recovered.shutdown().await?;
-    issuer_rt.shutdown().await?;
+    bob_rt.shutdown().await?;
+    carol_rt.shutdown().await?;
     Ok(())
 }
 
@@ -374,162 +302,6 @@ async fn a_refused_hosting_record_fails_the_create_and_keeps_the_first() -> Resu
     Ok(())
 }
 
-/// A withdrawal during an outage is honoured after the restart — the
-/// evidence is the counterparty's replica, not the memo the restart
-/// cleared. The re-grant imports again with no ceremony, and a withdrawal
-/// after the restart removes exactly that binding. Denied throughout: a
-/// bare holder of the read ticket, pointed at the restarted runtime by
-/// hand, obtains nothing.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one outage, its denial and its re-grant in the same place
-async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
-
-    let issuer_rt = memory_rt().await?;
-    let audience_rt = runtime_on(dir.path()).await?;
-    let issuer = issuer_rt.identity().create().await?;
-    let audience = audience_rt.identity().create().await?;
-
-    let invite = issuer_rt.connections().invite(issuer, None).await?;
-    establish_patiently(&audience_rt, audience, &issuer_rt, issuer, invite).await?;
-    issuer_rt
-        .data()
-        .write(issuer, issuer, &path, b"granted")
-        .await?;
-    common::granted_patiently(
-        &issuer_rt,
-        issuer,
-        &audience_rt,
-        audience,
-        issuer,
-        claims_on(issuer, &path, false),
-    )
-    .await?;
-    assert!(
-        eventually(|| async {
-            match audience_rt.data().read(audience, issuer, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"granted".as_slice())),
-                Err(_not_bound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the audience never read the granted entry before the stop"
-    );
-
-    // The ticket the denial presents, captured while the grant is live.
-    let leaked_ticket = issuer_rt
-        .data()
-        .share(issuer, issuer, ShareMode::Read)
-        .await?;
-
-    // The outage, and the withdrawal inside it.
-    audience_rt.shutdown().await?;
-    drop(audience_rt);
-    issuer_rt
-        .connections()
-        .withdraw_grant(issuer, audience, issuer)
-        .await?;
-
-    // The local grant record is stale — still live on this disk — so the
-    // refusal is asserted only once the counterparty's replica has
-    // demonstrably spoken and a sweep has run against that state.
-    let recovered = runtime_on(dir.path()).await?;
-    assert!(
-        eventually(|| async {
-            let devices = recovered
-                .connections()
-                .published_devices_of(audience, issuer)
-                .await?;
-            if devices.is_empty() {
-                return Ok(false);
-            }
-            if !recovered
-                .connections()
-                .read_grants(audience, issuer)
-                .await?
-                .is_empty()
-            {
-                return Ok(false);
-            }
-            recovered
-                .connections()
-                .sweep_pair_now(audience, issuer)
-                .await?;
-            Ok(recovered
-                .data()
-                .read(audience, issuer, &path)
-                .await
-                .is_err())
-        })
-        .await?,
-        "the withdrawal written during the outage must close the replica"
-    );
-
-    // Denial: the ticket holder, dialing the restarted runtime itself;
-    // asserted below, after a proven wave.
-    let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
-
-    // The re-grant: imported again with no ceremony.
-    issuer_rt
-        .data()
-        .write(issuer, issuer, &path, b"re-granted")
-        .await?;
-    common::granted_patiently(
-        &issuer_rt,
-        issuer,
-        &recovered,
-        audience,
-        issuer,
-        claims_on(issuer, &path, false),
-    )
-    .await?;
-    assert!(
-        eventually(|| async {
-            match recovered.data().read(audience, issuer, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"re-granted".as_slice())),
-                Err(_not_rebound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the re-granted namespace must import again with no ceremony"
-    );
-
-    // Three more of the probe's intervals after the proven wave.
-    tokio::time::sleep(RECONCILE * 3).await;
-    assert!(
-        probe.read(PROBE, issuer, &path).await?.is_none(),
-        "a ticket identity with no grant must obtain nothing from the restarted node"
-    );
-    assert!(
-        probe.list(PROBE, issuer, None).await?.is_empty(),
-        "a ticket identity with no grant must not even list the namespace"
-    );
-
-    // The withdrawal with the runtime on removes the binding the re-import
-    // recorded.
-    issuer_rt
-        .connections()
-        .withdraw_grant(issuer, audience, issuer)
-        .await?;
-    assert!(
-        eventually(|| async {
-            Ok(recovered
-                .data()
-                .read(audience, issuer, &path)
-                .await
-                .is_err())
-        })
-        .await?,
-        "a withdrawal after the restart must remove the re-imported binding"
-    );
-
-    probe.shutdown().await?;
-    recovered.shutdown().await?;
-    issuer_rt.shutdown().await?;
-    Ok(())
-}
-
 /// A hosting record whose PMS replica the store does not hold is
 /// skipped: the start succeeds, that identity is not hosted, and every
 /// healthy identity beside it comes back — whether the replica store is
@@ -541,8 +313,6 @@ async fn a_withdrawal_during_an_outage_closes_the_replica() -> Result<()> {
 /// and a create after the start leaves both records as they were.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_record_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -> Result<()> {
-    let path = EntryPath::new("contact/email")?;
-
     // Real subdirectories, written by real creates on a disk this test
     // leaves behind.
     let elsewhere = tempfile::tempdir()?;
@@ -555,10 +325,7 @@ async fn a_record_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -
     let dir = tempfile::tempdir()?;
     let first = runtime_on(dir.path()).await?;
     let alice = first.identity().create().await?;
-    first
-        .data()
-        .write(alice, alice, &path, b"written before")
-        .await?;
+    let (pod, record) = pod_with_claim(&first, alice).await?;
     first.shutdown().await?;
     drop(first);
 
@@ -589,18 +356,12 @@ async fn a_record_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -
         "the healthy identity must come back and both others must be skipped"
     );
     assert!(
-        eventually(|| async {
-            match second.data().read(alice, alice, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"written before".as_slice())),
-                Err(_not_rebound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the healthy identity's entry must read back across the skip"
+        reads_claim(&second, alice, pod, record).await?,
+        "the healthy identity's record must read back across the skip"
     );
     for skipped in [storeless, mismatched] {
         assert!(
-            second.data().read(skipped, skipped, &path).await.is_err(),
+            second.pods().list(skipped).await.is_err(),
             "a skipped identity must be refused, not hosted from a fresh replica"
         );
     }
@@ -662,234 +423,6 @@ async fn a_failed_start_leaves_the_directory_reusable() -> Result<()> {
         "the retry must host what the record names"
     );
     retried.shutdown().await?;
-    Ok(())
-}
-
-/// A connection and its grant come back after a restart from the durable
-/// records alone — listed, readable, the granted entries readable once the
-/// pair's first sweep has run — and an entry the issuer writes afterwards
-/// arrives, so what came back is a live replica. Denied: a bare holder of
-/// the read ticket pointed at the restarted runtime obtains nothing.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one restart, its liveness and its denial in the same place
-async fn a_connection_and_its_live_grant_come_back() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
-
-    let issuer_rt = memory_rt().await?;
-    let audience_rt = runtime_on(dir.path()).await?;
-    let issuer = issuer_rt.identity().create().await?;
-    let audience = audience_rt.identity().create().await?;
-
-    let invite = issuer_rt.connections().invite(issuer, None).await?;
-    establish_patiently(&audience_rt, audience, &issuer_rt, issuer, invite).await?;
-    issuer_rt
-        .data()
-        .write(issuer, issuer, &path, b"granted")
-        .await?;
-    common::granted_patiently(
-        &issuer_rt,
-        issuer,
-        &audience_rt,
-        audience,
-        issuer,
-        claims_on(issuer, &path, false),
-    )
-    .await?;
-    assert!(
-        eventually(|| async {
-            match audience_rt.data().read(audience, issuer, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"granted".as_slice())),
-                Err(_not_bound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the audience never read the granted entry before the restart"
-    );
-
-    // The ticket the denial presents, captured while the grant is live.
-    let leaked_ticket = issuer_rt
-        .data()
-        .share(issuer, issuer, ShareMode::Read)
-        .await?;
-
-    // The outage; nothing withdrawn, nothing re-granted.
-    audience_rt.shutdown().await?;
-    drop(audience_rt);
-    let recovered = runtime_on(dir.path()).await?;
-
-    assert!(
-        recovered
-            .connections()
-            .list(audience)
-            .await?
-            .contains(&issuer),
-        "the connection must be listed again after the restart"
-    );
-    assert!(
-        eventually(|| async {
-            Ok(!recovered
-                .connections()
-                .read_grants(audience, issuer)
-                .await?
-                .is_empty())
-        })
-        .await?,
-        "the grant must be readable from the pair after the restart"
-    );
-    assert!(
-        eventually(|| async {
-            match recovered.data().read(audience, issuer, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"granted".as_slice())),
-                Err(_not_rebound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the granted namespace must read again after the restart"
-    );
-
-    // The probe, asserted below after a proven wave.
-    let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
-
-    // A live replica, not the bytes the outage left. The rewrite stays
-    // inside the granted claim.
-    issuer_rt
-        .data()
-        .write(issuer, issuer, &path, b"after")
-        .await?;
-    assert!(
-        eventually(|| async {
-            match recovered.data().read(audience, issuer, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"after".as_slice())),
-                Err(_not_rebound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "a rewrite after the restart must reach the audience over the recovered binding"
-    );
-
-    // Three more of the probe's intervals after the proven wave.
-    tokio::time::sleep(RECONCILE * 3).await;
-    assert!(
-        probe.read(PROBE, issuer, &path).await?.is_none(),
-        "a ticket identity with no grant must obtain nothing from the restarted node"
-    );
-    assert!(
-        probe.list(PROBE, issuer, None).await?.is_empty(),
-        "a ticket identity with no grant must not even list the namespace"
-    );
-
-    probe.shutdown().await?;
-    recovered.shutdown().await?;
-    issuer_rt.shutdown().await?;
-    Ok(())
-}
-
-/// A grant published from a device that is then lost reaches the issuer's
-/// other device from the audience's, the only live holder of the record;
-/// without it the sibling would refuse the audience fail-closed while the
-/// issuer believes the grant published. Denied: a bare holder of the read
-/// ticket obtains nothing from the recovered device.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one scenario, the loss and the recovery in one place
-async fn a_grant_published_by_a_lost_device_reaches_the_sibling_from_the_audience() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
-
-    let publisher_rt = memory_rt().await?;
-    let sibling_rt = runtime_on(dir.path()).await?;
-    let audience_rt = memory_rt().await?;
-
-    let issuer = publisher_rt.identity().create().await?;
-    common::link_patiently(&sibling_rt, &publisher_rt, issuer).await?;
-    let audience = audience_rt.identity().create().await?;
-    let invite = publisher_rt.connections().invite(issuer, None).await?;
-    establish_patiently(&audience_rt, audience, &publisher_rt, issuer, invite).await?;
-    publisher_rt
-        .data()
-        .write(issuer, issuer, &path, b"before")
-        .await?;
-
-    // The ticket the denial presents, minted while the publisher is up.
-    let leaked_ticket = publisher_rt
-        .data()
-        .share(issuer, issuer, ShareMode::Read)
-        .await?;
-
-    // The pair is open on the sibling before it goes down: the connection
-    // record alone leaves the pair's tickets payload-waiting, and the only
-    // device holding those payloads is the publisher this scenario takes
-    // away for good.
-    assert!(
-        eventually(|| async {
-            let (own, _peer) = sibling_rt
-                .connections()
-                .pair_contacts(issuer, audience)
-                .await?;
-            Ok(!own.is_empty())
-        })
-        .await?,
-        "the pair never opened on the sibling"
-    );
-    sibling_rt.shutdown().await?;
-    drop(sibling_rt);
-
-    // Published while the sibling is away and read by the audience.
-    common::granted_patiently(
-        &publisher_rt,
-        issuer,
-        &audience_rt,
-        audience,
-        issuer,
-        claims_on(issuer, &path, false),
-    )
-    .await?;
-    publisher_rt.shutdown().await?;
-
-    let recovered = runtime_on(dir.path()).await?;
-    assert!(
-        eventually(|| async {
-            Ok(recovered
-                .connections()
-                .read_own_grants(issuer, audience)
-                .await?
-                .is_some_and(|grant| grant.issuer == issuer))
-        })
-        .await?,
-        "the grant record never reached the device that has to serve by it"
-    );
-
-    // Not merely present: the recovered device serves by it.
-    recovered
-        .data()
-        .write(issuer, issuer, &path, b"after")
-        .await?;
-    assert!(
-        eventually(|| async {
-            match audience_rt.data().read(audience, issuer, &path).await {
-                Ok(payload) => Ok(payload.as_deref() == Some(b"after".as_slice())),
-                Err(_not_bound_yet) => Ok(false),
-            }
-        })
-        .await?,
-        "the audience never converged on the recovered device's write"
-    );
-
-    // The probe, after the proven wave and three of its own intervals.
-    let probe = ticket_holder_dialing(&recovered, issuer, leaked_ticket).await?;
-    tokio::time::sleep(RECONCILE * 3).await;
-    assert!(
-        probe.read(PROBE, issuer, &path).await?.is_none(),
-        "a ticket identity with no grant must obtain nothing from the recovered device"
-    );
-    assert!(
-        probe.list(PROBE, issuer, None).await?.is_empty(),
-        "a ticket identity with no grant must not even list the namespace"
-    );
-
-    probe.shutdown().await?;
-    recovered.shutdown().await?;
-    audience_rt.shutdown().await?;
     Ok(())
 }
 
@@ -1076,5 +609,34 @@ async fn a_runtime_dropped_without_shutdown_releases_its_directory() -> Result<(
         "the respawned runtime must host what the dropped one hosted"
     );
     second.shutdown().await?;
+    Ok(())
+}
+
+/// A device that linked before a restart is still a device of the identity
+/// after it, under the node id it registered with: a device linked into the
+/// restarted runtime afterwards reads both devices out of the identity's
+/// PMS.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_that_linked_before_the_restart_is_still_a_device() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = memory_rt().await?;
+    let x = first.identity().create().await?;
+    let linked = runtime_on(dir.path()).await?;
+    link_patiently(&linked, &first, x).await?;
+    let linked_id = linked.node_id();
+    linked.shutdown().await?;
+    drop(linked);
+
+    let restarted = runtime_on(dir.path()).await?;
+    assert_eq!(restarted.node_id(), linked_id, "the node id must survive");
+    let (probe_node, probe_pms) = link_probe(&restarted, x).await?;
+    assert!(
+        test_utils::wait_devices(&probe_pms, &[first.node_id(), linked_id]).await?,
+        "a device linked before the restart is no device after it"
+    );
+
+    probe_node.shutdown().await?;
+    restarted.shutdown().await?;
+    first.shutdown().await?;
     Ok(())
 }

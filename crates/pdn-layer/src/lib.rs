@@ -1,46 +1,17 @@
 //! The PDN layer: the platform surface products consume.
 //!
 //! Pure domain — no transport, no storage backend. The domain model
-//! (claims, connections, delegation), the operation AST ([`PdnOp`]), and
-//! the [`uwill`] capability-token module live here. A draft: nothing in the
-//! workspace consumes it, and nothing executes a [`PdnOp`].
+//! (claims and their attributes) and the operation AST ([`PdnOp`]) live
+//! here. A draft: nothing in the workspace consumes it, and nothing
+//! executes a [`PdnOp`].
 
 use std::collections::BTreeMap;
 
 use pdn_types::{ClaimId, OperationalKey, PdnId, PdnIdentityProof};
 use serde::{Deserialize, Serialize};
 
-pub mod uwill;
-
 // ---------------------------------------------------------------------------
-// Supporting types
-// ---------------------------------------------------------------------------
-
-/// What a peer receives when accepting an invite. Carries only the issuing
-/// identity — no transport hints, signature, or expiry.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Invite {
-    pub from: PdnId,
-}
-
-/// Public view of a connection with a peer.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Connection {
-    pub id: ConnectionId,
-    pub peer: PdnId,
-    pub alias: Option<String>,
-    /// Peer's device operational keys that we know about.
-    pub peer_devices: Vec<OperationalKey>,
-    /// Claims associated with this connection.
-    pub claim_ids: Vec<ClaimId>,
-}
-
-pdn_types::define_byte_id_32! {
-    pub struct ConnectionId;
-}
-
-// ---------------------------------------------------------------------------
-// Domain-model types: Attribute, Capability, Claim, DelegatedClaim
+// Domain-model types: Attribute, Claim
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -61,38 +32,14 @@ pub struct Attribute {
     pub value: AttributeValue,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AccessMode {
-    Read,
-    Write,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Capability {
-    /// Whom the capability is granted to. Not the party that ends up
-    /// holding a ticket for it: a ticket travels, the audience does not.
-    pub audience: Vec<PdnId>,
-    pub access: AccessMode,
-    /// Wall-clock expiry, unix ms. `None` = no explicit expiry
-    pub expires_at: Option<u64>,
-}
-
-/// An assertion about a Subject by a Subject. Inseparable bundle of
-/// data (`Attribute`) and access semantics (`Capability`).
+/// An assertion about a Subject by a Subject, carrying its data
+/// (`Attribute`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Claim {
     pub about: PdnId,
     pub issued_by: PdnId,
     pub proof_of_issued_by: PdnIdentityProof,
     pub attribute: Attribute,
-    pub capability: Capability,
-}
-
-/// A `Claim` conditionally shared into another Identity Context.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DelegatedClaim {
-    pub source: ClaimId,
-    pub conditions: Capability,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,33 +74,13 @@ pub enum PdnOp {
     /// is marked as compromised.
     RotateKey { compromised: bool },
 
-    /// List keys currently active under my `PdnId`. -> `NonEmpty`<OperationalKey>
+    /// List keys currently active under my `PdnId`, never none.
+    /// -> Vec<OperationalKey>
     ActiveDevices,
-
-    // --- Connections -----------------------------------------------------
-    /// Create an invite for a peer. -> Invite
-    CreateInvite,
-
-    /// Accept an invite. -> Connection
-    AcceptInvite { invite: Invite },
-
-    /// List my connections. -> Vec<Connection>
-    ListConnections,
-
-    /// Get details of a specific connection. -> Option<Connection>
-    GetConnection { peer: PdnId },
-
-    /// Deactivate a connection. -> ()
-    ///
-    /// Side effect: all delegated claims involving this peer are revoked.
-    DeactivateConnection { peer: PdnId },
 
     // --- Claims ----------------------------------------------------------
     /// Write a claim (addressed by its `ClaimId`). -> ()
-    WriteClaim {
-        connection_id: ConnectionId,
-        claim: Claim,
-    },
+    WriteClaim { claim: Claim },
 
     /// Get a claim by id. -> Option<Claim>
     GetClaim { claim_id: ClaimId },
@@ -164,24 +91,4 @@ pub enum PdnOp {
 
     /// Enumerate all claims I have authored. -> Vec<ClaimId>
     ListMyClaims,
-
-    // --- Delegation ------------------------------------------------------
-    /// Delegate a claim into another Identity Context under conditions.
-    /// -> `DelegatedClaim`
-    DelegateClaim {
-        claim_id: ClaimId,
-        capability: Capability,
-    },
-
-    /// List my outgoing delegations to a specific identity context.
-    /// -> Vec<DelegatedClaim>
-    ListDelegationsTo,
-
-    /// List delegations others have made into my contexts.
-    /// -> Vec<DelegatedClaim>
-    ListIncomingDelegations,
-
-    // --- Discovery / sync (candidate ops) --------------------------------
-    /// Sync an issuer's data once with reachable peers. -> ()
-    SyncOnce { issuer: PdnId },
 }

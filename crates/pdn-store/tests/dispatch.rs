@@ -277,7 +277,7 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
         serving_addr.clone(),
         None,
         None,
-        None,
+        pdn_store::admit_all(),
     )
     .await
     .expect_err("a identity the node does not host must be refused");
@@ -290,7 +290,7 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
         serving_addr.clone(),
         None,
         None,
-        None,
+        pdn_store::admit_all(),
     )
     .await
     .expect_err("a replica the addressed identity does not hold must be refused");
@@ -349,7 +349,7 @@ async fn a_session_handed_to_another_identitys_engine_is_refused() -> Result<()>
         serving_addr,
         None,
         None,
-        None,
+        pdn_store::admit_all(),
     )
     .await
     .expect_err("a session handed to another identity's engine must be refused");
@@ -464,6 +464,307 @@ async fn a_remote_always_syncing_is_redialed_a_bounded_number_of_times() -> Resu
     assert_eq!(refused(), 4, "the remote was dialed past the bound");
 
     busy_router.shutdown().await?;
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A dial that cannot connect to a peer that is no gossip neighbor of the
+/// node is not tried again: once it fails, nothing the engine started stays
+/// in flight, past the wait a retry would take.
+///
+/// The contact names no address, so the dial fails at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_toward_a_peer_that_is_no_neighbor_is_not_tried_again() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let doc = dialing.docs.api().create().await?;
+    let gone = iroh::SecretKey::from_bytes(&[0x9d; 32]).public();
+    doc.start_sync_scoped(
+        vec![Contact::new(iroh::EndpointAddr::new(gone), WORK)],
+        CALLER,
+    )
+    .await?;
+
+    let in_flight = || dialing.docs.engine().syncs_in_flight(vec![doc.id()]);
+    assert!(
+        eventually(|| async { Ok(in_flight().await? == 0) }).await?,
+        "the failed dial never left the engine"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        in_flight().await?,
+        0,
+        "a dial toward a gone peer was tried again"
+    );
+
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A dial that cannot connect to a peer that is a gossip neighbor of the
+/// replica is tried again while it stays one, and the tries stop once it
+/// leaves.
+///
+/// The peer runs gossip alone, subscribed to the replica's topic, so every
+/// sync dial toward it fails at the handshake while its gossip connection
+/// stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_toward_a_neighbor_it_cannot_reach_is_tried_again() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let endpoint = loopback_endpoint().await?;
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let neighbor = Router::builder(endpoint)
+        .accept(iroh_gossip::ALPN, gossip.clone())
+        .spawn();
+    let doc = dialing.docs.api().create().await?;
+    let topic = iroh_gossip::TopicId::from_bytes(*doc.id().as_bytes());
+    let _subscribed = gossip.subscribe(topic, vec![]).await?;
+    doc.start_sync(vec![Contact::new(neighbor.endpoint().addr(), WORK)], CALLER)
+        .await?;
+
+    let in_flight = || dialing.docs.engine().syncs_in_flight(vec![doc.id()]);
+    // Past the first failure and the first try's wait: a try is still due.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        in_flight().await? > 0,
+        "a dial toward a neighbor it cannot reach was not tried again"
+    );
+
+    // A try already due when the neighbor leaves dials once more and waits
+    // out the handshake against the closed endpoint; then nothing is due.
+    neighbor.shutdown().await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while in_flight().await? > 0 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the tries went on after the neighbor left"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A dial toward a neighbor it cannot reach, failing again while a try of
+/// its series is armed, arms no try of its own: dials from other triggers
+/// leave one try due, not one each.
+///
+/// The neighbor runs gossip alone, as in the test above; the replica's
+/// sync is started again five times once the series has a try armed, each
+/// start dialing the neighbor at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_series_toward_a_neighbor_keeps_one_try_armed() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let endpoint = loopback_endpoint().await?;
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let neighbor = Router::builder(endpoint)
+        .accept(iroh_gossip::ALPN, gossip.clone())
+        .spawn();
+    let doc = dialing.docs.api().create().await?;
+    let topic = iroh_gossip::TopicId::from_bytes(*doc.id().as_bytes());
+    let _subscribed = gossip.subscribe(topic, vec![]).await?;
+    let contact = Contact::new(neighbor.endpoint().addr(), WORK);
+    doc.start_sync(vec![contact.clone()], CALLER).await?;
+
+    let in_flight = || dialing.docs.engine().syncs_in_flight(vec![doc.id()]);
+    // Past the first try at 1 s: the next is armed for 3 s.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    for _ in 0..5 {
+        doc.start_sync(vec![contact.clone()], CALLER).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // One try armed, at most one dial running.
+    let due = in_flight().await?;
+    assert!(
+        due <= 2,
+        "dials from other triggers armed tries of their own: {due} in flight"
+    );
+
+    neighbor.shutdown().await?;
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A node whose blob protocol takes every request and answers none, so a
+/// download from it fails while its gossip and sync serve.
+#[derive(Debug, Clone, Default)]
+struct WithheldBlobs {
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl iroh::protocol::ProtocolHandler for WithheldBlobs {
+    async fn accept(
+        &self,
+        _connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct Withholding {
+    router: Router,
+    docs: Docs,
+    blobs: WithheldBlobs,
+}
+
+/// A node hosting [`WORK`] that syncs and gossips but withholds every
+/// payload.
+async fn withholding_node() -> Result<Withholding> {
+    let endpoint = loopback_endpoint().await?;
+    let store = MemStore::new();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let (provider, _log) = recording();
+    let docs = Docs::memory(WORK, provider)
+        .spawn(endpoint.clone(), (*store).clone(), gossip.clone())
+        .await?;
+    let resolve: IdentityResolver = {
+        let docs = docs.clone();
+        Arc::new(move |identity| (identity == WORK).then(|| docs.clone()))
+    };
+    let blobs = WithheldBlobs::default();
+    let router = Router::builder(endpoint)
+        .accept(iroh_blobs::ALPN, blobs.clone())
+        .accept(iroh_gossip::ALPN, gossip)
+        .accept(pdn_store::ALPN, DocsDispatch::new(resolve))
+        .spawn();
+    Ok(Withholding {
+        router,
+        docs,
+        blobs,
+    })
+}
+
+/// A payload download that fails from a provider that is a gossip neighbor
+/// is tried again, and a try armed when the replica is left fetches
+/// nothing for it.
+///
+/// The leave is followed for longer than the longest wait between tries,
+/// 16 s, so a try armed before it has fired by the last read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_from_a_neighbor_is_tried_again_until_the_replica_is_left() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let holder = withholding_node().await?;
+    let (theirs, ours) = namespace_with(holder.docs.api(), dialing.docs.api(), WORK_VALUE).await?;
+    theirs
+        .start_sync(
+            vec![Contact::new(dialing.router.endpoint().addr(), CALLER)],
+            WORK,
+        )
+        .await?;
+    ours.start_sync(
+        vec![Contact::new(holder.router.endpoint().addr(), WORK)],
+        CALLER,
+    )
+    .await?;
+
+    let asked = || holder.blobs.asked.load(std::sync::atomic::Ordering::SeqCst);
+    // The sync's own triggers ask first; only a try asks once they settled.
+    assert!(
+        eventually(|| async { Ok(asked() > 0) }).await?,
+        "no download reached the provider"
+    );
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let settled = asked();
+    assert!(
+        eventually(|| async { Ok(asked() > settled) }).await?,
+        "the download was not tried again"
+    );
+
+    ours.leave().await?;
+    let at_leave = asked();
+    tokio::time::sleep(Duration::from_secs(17)).await;
+    assert_eq!(
+        asked(),
+        at_leave,
+        "a try armed before the leave fetched for it"
+    );
+
+    holder.router.shutdown().await?;
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A session refused when its decision is asked again, once the pair's
+/// slot is taken, frees the slot: the same caller's next session goes
+/// through rather than meeting an exchange that never ends.
+///
+/// The provider admits on a decision resting on what no write count shows,
+/// refuses when asked again, and admits from then on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_refused_when_asked_again_frees_the_pairs_slot() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let endpoint = loopback_endpoint().await?;
+    let store = MemStore::new();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: SessionAccessProvider = {
+        let asked = Arc::clone(&asked);
+        Arc::new(move |_namespace, _identity, _caller, _peer, _role| {
+            let call = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                match call {
+                    0 => SessionAccess::Allow {
+                        egress: None,
+                        ingest: pdn_store::admit_all(),
+                        rests_on: pdn_store::RestsOn::Unknown,
+                    },
+                    1 => SessionAccess::Deny,
+                    _ => SessionAccess::whole(),
+                }
+            })
+        })
+    };
+    let docs = Docs::memory(WORK, provider)
+        .spawn(endpoint.clone(), (*store).clone(), gossip.clone())
+        .await?;
+    let resolve: IdentityResolver = {
+        let docs = docs.clone();
+        Arc::new(move |identity| (identity == WORK).then(|| docs.clone()))
+    };
+    let serving = Router::builder(endpoint)
+        .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+        .accept(iroh_gossip::ALPN, gossip)
+        .accept(pdn_store::ALPN, DocsDispatch::new(resolve))
+        .spawn();
+    let (theirs, ours) = namespace_with(docs.api(), dialing.docs.api(), WORK_VALUE).await?;
+    theirs.start_sync(vec![], WORK).await?;
+    ours.start_sync(vec![], CALLER).await?;
+    let dial = || {
+        connect_and_sync(
+            dialing.router.endpoint(),
+            &dialing.docs.engine().sync,
+            ours.id(),
+            WORK,
+            CALLER,
+            serving.endpoint().addr(),
+            None,
+            None,
+            pdn_store::admit_all(),
+        )
+    };
+
+    let refused = dial().await.expect_err("the decision asked again refuses");
+    assert!(
+        matches!(refused, ConnectError::RemoteAbort(AbortReason::NotFound)),
+        "the refusal was not the uniform one: {refused:?}"
+    );
+    // The engine frees the slot when it hears the session ended, a moment
+    // after the dialer does.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let last = loop {
+        let result = dial().await;
+        if result.is_ok() || std::time::Instant::now() >= deadline {
+            break result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        last.is_ok(),
+        "the pair's slot stayed taken after the refusal: {last:?}"
+    );
+
+    serving.shutdown().await?;
     dialing.router.shutdown().await?;
     Ok(())
 }

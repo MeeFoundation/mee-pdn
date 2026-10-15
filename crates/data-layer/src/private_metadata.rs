@@ -1,10 +1,9 @@
 //! The private metadata store (PMS): the one device-replicated store of an
 //! identity's own state, device-internal by ticket alone (Invariant 1).
-//! Five record families under disjoint prefixes: `devices/`,
-//! `pending-devices/`, `tickets/`, `connections/`, `retractions/`, and the
-//! identity key pair at `identity-key`. Device and connection
-//! records are record-level; ticket, marker and key payloads are blobs, so
-//! their reads wait for content.
+//! Four record families under disjoint prefixes: `devices/`,
+//! `pending-devices/`, `tickets/` and `pods/`, and the identity key pair at
+//! `identity-key`. Device and pod records are record-level; ticket and key
+//! payloads are blobs, so their reads wait for content.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,7 +25,6 @@ use pdn_store::{
     AuthorId, DocTicket, NamespaceId,
 };
 use pdn_types::{NodeId, PdnId, PodId};
-use serde::{Deserialize, Serialize};
 
 use crate::{
     identity_key::IdentityKeyPair,
@@ -94,21 +92,18 @@ impl CatchUpWatch {
     }
 }
 
-/// The one key shape shared by the PMS's device set, the connection
-/// metadata store's published device sets, and the access book's probe:
-/// it decides who counts as an identity's own device, so a drifted copy
-/// would be an access-control bug. A record here is a *confirmed* device,
+/// The one key shape shared by the PMS's device set and the access book's
+/// probe: it decides who counts as an identity's own device, so a drifted
+/// copy would be an access-control bug. A record here is a *confirmed* device,
 /// one holding this PMS's write ticket.
 pub(crate) const DEVICES_PREFIX: &str = "devices/";
 /// Disjoint from [`DEVICES_PREFIX`] on purpose: the access book probes that
-/// prefix alone, so a pending record grants nothing until the newcomer
+/// prefix alone, so a pending record confers nothing until the newcomer
 /// confirms itself.
 const PENDING_DEVICES_PREFIX: &str = "pending-devices/";
 const PENDING_DEVICE_MARKER_VERSION: u8 = 1;
 pub const PENDING_DEVICE_TTL: Duration = Duration::from_hours(24);
 const TICKETS_PREFIX: &str = "tickets/";
-const CONNECTIONS_PREFIX: &str = "connections/";
-const RETRACTIONS_PREFIX: &str = "retractions/";
 const IDENTITY_KEY_PATH: &str = "identity-key";
 const PODS_PREFIX: &str = "pods/";
 
@@ -156,10 +151,6 @@ fn pending_device_key(device: &NodeId) -> String {
 
 fn ticket_key(kind: &str) -> String {
     format!("{TICKETS_PREFIX}{kind}")
-}
-
-fn connection_key(peer: &PdnId) -> String {
-    format!("{CONNECTIONS_PREFIX}{peer}")
 }
 
 /// The confirmed devices a PMS replica lists, record-level.
@@ -214,60 +205,6 @@ fn pending_device_marker(marker: &[u8]) -> PendingMarker {
     UNIX_EPOCH
         .checked_add(Duration::from_secs(u64::from_be_bytes(timestamp)))
         .map_or(PendingMarker::Malformed, PendingMarker::Timestamp)
-}
-
-fn connection_peer_of(key: &[u8]) -> Option<PdnId> {
-    std::str::from_utf8(key)
-        .ok()?
-        .strip_prefix(CONNECTIONS_PREFIX)?
-        .parse()
-        .ok()
-}
-
-/// `retractions/<issuer-hex>/<author-hex>/<path>`.
-fn retraction_key(issuer: &PdnId, author: &AuthorId, path: &str) -> String {
-    format!("{RETRACTIONS_PREFIX}{issuer}/{author}/{path}")
-}
-
-fn retraction_of(key: &[u8]) -> Option<(PdnId, AuthorId, String)> {
-    let rest = std::str::from_utf8(key)
-        .ok()?
-        .strip_prefix(RETRACTIONS_PREFIX)?;
-    let (issuer, rest) = rest.split_once('/')?;
-    let (author, path) = rest.split_once('/')?;
-    if path.is_empty() {
-        return None;
-    }
-    Some((issuer.parse().ok()?, author.parse().ok()?, path.to_owned()))
-}
-
-/// One listed marker: the addressed entry (issuer, author, path) and the
-/// decoded marker.
-pub type ListedRetraction = (PdnId, AuthorId, String, RetractionMarker);
-
-/// A marker as its entry lists it, payload unread: `marker` is the entry's
-/// content hash, which names the version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetractionHead {
-    pub issuer: PdnId,
-    pub author: AuthorId,
-    pub path: String,
-    pub marker: [u8; 32],
-}
-
-/// The payload of a retraction marker; the addressed entry lives in the
-/// key. JSON; a payload this build cannot decode reads as no marker
-/// (fail-closed: nothing is removed on its word).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetractionMarker {
-    /// Entries of the marker's author and path with a timestamp at or below
-    /// this are retracted.
-    pub bound: u64,
-    pub decided_by: NodeId,
-    /// The address of what was lost, recoverable from the blob store while
-    /// the blob lives.
-    pub content_hash: [u8; 32],
-    pub timestamp: u64,
 }
 
 /// The owning identity is not kept here — the handle's identity knows which
@@ -494,42 +431,6 @@ impl PrivateMetadataStore {
         Ok(devices.into_iter().collect())
     }
 
-    /// Record a live connection to `peer`; the payload is an opaque marker.
-    pub async fn connect(&self, peer: PdnId) -> Result<()> {
-        self.doc
-            .set_bytes(self.author, connection_key(&peer).into_bytes(), vec![1u8])
-            .await?;
-        Ok(())
-    }
-
-    /// Tombstone the connection to `peer`.
-    pub async fn disconnect(&self, peer: PdnId) -> Result<()> {
-        self.doc
-            .del(self.author, connection_key(&peer).into_bytes())
-            .await?;
-        Ok(())
-    }
-
-    /// Record-level: `true` as soon as the connect entry is present; a
-    /// tombstone reads as not connected.
-    pub async fn is_connected(&self, peer: PdnId) -> Result<bool> {
-        let query = Query::single_latest_per_key().key_exact(connection_key(&peer).as_bytes());
-        Ok(self.doc.get_one(query).await?.is_some())
-    }
-
-    /// Live connections, record-level.
-    pub async fn list_connections(&self) -> Result<Vec<PdnId>> {
-        let query = Query::single_latest_per_key().key_prefix(CONNECTIONS_PREFIX.as_bytes());
-        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        let mut peers = Vec::new();
-        while let Some(entry) = stream.next().await {
-            if let Some(peer) = connection_peer_of(entry?.key()) {
-                peers.push(peer);
-            }
-        }
-        Ok(peers)
-    }
-
     /// Record that the identity's membership event at `seq` of its chain in
     /// `pod` — its created or joined event — holds the pod.
     pub async fn record_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
@@ -611,118 +512,6 @@ impl PrivateMetadataStore {
         Ok(highest)
     }
 
-    /// Record a write-retraction verdict, replacing any previous marker for
-    /// the same entry address — the widest bound wins at the consumer, so a
-    /// replacement never un-retracts.
-    pub async fn record_retraction(
-        &self,
-        issuer: PdnId,
-        author: AuthorId,
-        path: &str,
-        marker: &RetractionMarker,
-    ) -> Result<()> {
-        self.doc
-            .set_bytes(
-                self.author,
-                retraction_key(&issuer, &author, path).into_bytes(),
-                serde_json::to_vec(marker)?,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// The recorded markers whose payload is readable; an undecodable
-    /// payload is skipped (fail-closed).
-    pub async fn list_retractions(&self) -> Result<Vec<ListedRetraction>> {
-        let mut markers = Vec::new();
-        for head in self.list_retraction_heads().await? {
-            if let Some(marker) = self.read_retraction(&head).await? {
-                markers.push((head.issuer, head.author, head.path, marker));
-            }
-        }
-        Ok(markers)
-    }
-
-    /// The recorded markers from their entries alone, no payload read.
-    pub async fn list_retraction_heads(&self) -> Result<Vec<RetractionHead>> {
-        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
-        let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-        let mut heads = Vec::new();
-        while let Some(entry) = stream.next().await {
-            let entry = entry?;
-            if let Some((issuer, author, path)) = retraction_of(entry.key()) {
-                heads.push(RetractionHead {
-                    issuer,
-                    author,
-                    path,
-                    marker: *entry.content_hash().as_bytes(),
-                });
-            }
-        }
-        Ok(heads)
-    }
-
-    /// The version `head` names; `None` while its payload has not arrived or
-    /// when it does not decode (fail-closed).
-    pub async fn read_retraction(&self, head: &RetractionHead) -> Result<Option<RetractionMarker>> {
-        let hash = iroh_blobs::Hash::from_bytes(head.marker);
-        if !self.blobs.has(hash).await? {
-            return Ok(None);
-        }
-        let bytes = self.blobs.get_bytes(hash).await?;
-        Ok(serde_json::from_slice::<RetractionMarker>(&bytes).ok())
-    }
-
-    /// Drop every marker this device recorded for `issuer` — with the
-    /// granted namespace binding. Only own-author markers, since deletion is
-    /// per PMS author; each sibling prunes its own at its unbind.
-    pub async fn prune_retractions(&self, issuer: PdnId) -> Result<()> {
-        let query = Query::author(self.author)
-            .key_prefix(format!("{RETRACTIONS_PREFIX}{issuer}/").into_bytes());
-        let mut keys = Vec::new();
-        {
-            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-            while let Some(entry) = stream.next().await {
-                keys.push(entry?.key().to_vec());
-            }
-        }
-        for key in keys {
-            self.doc.del(self.author, key).await?;
-        }
-        Ok(())
-    }
-
-    /// Drop the markers this device recorded whose entry aged past
-    /// `retention` (microseconds, like entry timestamps). Only own-author
-    /// markers, since deletion is per PMS author. Returns the dropped
-    /// addresses so the caller can disarm what each one armed.
-    pub async fn prune_aged_retractions(
-        &self,
-        now: u64,
-        retention: u64,
-    ) -> Result<Vec<(PdnId, AuthorId, String)>> {
-        let cutoff = now.saturating_sub(retention);
-        let query = Query::single_latest_per_key().key_prefix(RETRACTIONS_PREFIX.as_bytes());
-        let mut aged = Vec::new();
-        {
-            let mut stream = std::pin::pin!(self.doc.get_many(query).await?);
-            while let Some(entry) = stream.next().await {
-                let entry = entry?;
-                if entry.author() == self.author && entry.timestamp() <= cutoff {
-                    aged.push(entry.key().to_vec());
-                }
-            }
-        }
-        let mut dropped = Vec::new();
-        for key in aged {
-            if let Some(address) = retraction_of(&key) {
-                dropped.push(address);
-            }
-            self.doc.del(self.author, key).await?;
-        }
-        Ok(dropped)
-    }
-
     pub async fn put_ticket(&self, kind: &str, ticket: &DocTicket) -> Result<()> {
         self.doc
             .set_bytes(
@@ -776,16 +565,7 @@ impl PrivateMetadataStore {
     /// with the node.
     pub async fn changes(&self) -> Result<impl Stream<Item = Result<()>> + Send + Unpin + 'static> {
         let events = self.events().await?;
-        Ok(events.filter_map(|event| match event {
-            Ok(
-                LiveEvent::InsertLocal { .. }
-                | LiveEvent::InsertRemote { .. }
-                | LiveEvent::ContentReady { .. }
-                | LiveEvent::Lagged,
-            ) => Some(Ok(())),
-            Ok(_) => None,
-            Err(err) => Some(Err(err)),
-        }))
+        Ok(events.filter_map(change_of))
     }
 
     pub fn namespace(&self) -> NamespaceId {
@@ -818,9 +598,7 @@ impl PrivateMetadataStore {
 
     /// `Ok(None)` while the payload is still syncing. A payload that does
     /// not decode is an error, not an absence: only the identity's own
-    /// devices write here, so garbage is this implementation's own bug —
-    /// unlike the counterparty-written grants of
-    /// [`ConnectionMetadataStore::read_grant`](crate::ConnectionMetadataStore::read_grant).
+    /// devices write here, so garbage is this implementation's own bug.
     pub async fn get_ticket(&self, kind: &str) -> Result<Option<DocTicket>> {
         let Some(bytes) = read_payload(&self.doc, &self.blobs, ticket_key(kind).as_bytes()).await?
         else {
@@ -831,9 +609,32 @@ impl PrivateMetadataStore {
     }
 }
 
+/// The item [`PrivateMetadataStore::changes`] yields for `event`: a lag
+/// notice stands for the changes it dropped, so it reads as one.
+fn change_of(event: Result<LiveEvent>) -> Option<Result<()>> {
+    match event {
+        Ok(
+            LiveEvent::InsertLocal { .. }
+            | LiveEvent::InsertRemote { .. }
+            | LiveEvent::ContentReady { .. }
+            | LiveEvent::Lagged,
+        ) => Some(Ok(())),
+        Ok(_) => None,
+        Err(err) => Some(Err(err)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lag notice on the PMS's events is an item of its change stream,
+    /// as an insert is; an event that changes nothing is none.
+    #[test]
+    fn a_lag_notice_reads_as_a_change() {
+        assert!(matches!(change_of(Ok(LiveEvent::Lagged)), Some(Ok(()))));
+        assert!(change_of(Ok(LiveEvent::PendingContentReady)).is_none());
+    }
 
     #[test]
     fn pending_marker_rejects_overflow_and_preserves_unknown_versions() {

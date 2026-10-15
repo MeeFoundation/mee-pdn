@@ -21,6 +21,7 @@ use crate::NamespaceId;
 struct ActiveState {
     sender: GossipSender,
     abort_handle: AbortHandle,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -28,7 +29,10 @@ pub struct GossipState {
     gossip: Gossip,
     to_live_actor: mpsc::Sender<ToLiveActor>,
     active: HashMap<NamespaceId, ActiveState>,
-    active_tasks: JoinSet<(NamespaceId, Result<()>)>,
+    active_tasks: JoinSet<(NamespaceId, u64, Result<()>)>,
+    /// Names the next subscription, so an event its receive loop sent
+    /// before a quit is told from one of a later join of the same topic.
+    next_generation: u64,
 }
 
 impl GossipState {
@@ -38,6 +42,7 @@ impl GossipState {
             to_live_actor,
             active: Default::default(),
             active_tasks: Default::default(),
+            next_generation: 0,
         }
     }
 
@@ -56,18 +61,28 @@ impl GossipState {
 
                 let (sender, stream) = sub.split();
                 let to_live_actor = self.to_live_actor.clone();
+                let generation = self.next_generation;
+                self.next_generation = generation.wrapping_add(1);
                 let abort_handle = self.active_tasks.spawn(async move {
-                    let res = receive_loop(namespace, stream, to_live_actor).await;
+                    let res = receive_loop(namespace, generation, stream, to_live_actor).await;
 
-                    (namespace, res)
+                    (namespace, generation, res)
                 });
                 entry.insert(ActiveState {
                     sender,
                     abort_handle,
+                    generation,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Whether `generation` names the subscription `namespace` holds now.
+    pub fn is_current(&self, namespace: &NamespaceId, generation: u64) -> bool {
+        self.active
+            .get(namespace)
+            .is_some_and(|state| state.generation == generation)
     }
 
     pub fn quit(&mut self, topic: &NamespaceId) {
@@ -97,39 +112,53 @@ impl GossipState {
         self.active.is_empty()
     }
 
-    /// Progress the internal task queues.
-    ///
-    /// Returns an error if any of the active tasks panic.
+    /// Waits for every receive loop to end.
+    pub async fn progress(&mut self) -> Result<()> {
+        while self.next_ended().await?.is_some() {}
+        Ok(())
+    }
+
+    /// The topic whose current receive loop ended on its own, now out of
+    /// the active set; `None` once no loop is left. Returns an error if a
+    /// loop panicked.
     ///
     /// ## Cancel safety
     ///
     /// This function is fully cancel-safe.
-    pub async fn progress(&mut self) -> Result<()> {
+    pub async fn next_ended(&mut self) -> Result<Option<NamespaceId>> {
         while let Some(res) = self.active_tasks.join_next().await {
             match res {
                 Err(err) if err.is_cancelled() => continue,
                 Err(err) => return Err(err).context("gossip receive loop panicked"),
-                Ok((namespace, res)) => {
-                    self.active.remove(&namespace);
+                Ok((namespace, generation, res)) => {
                     if let Err(err) = res {
                         warn!(?err, ?namespace, "gossip receive loop failed")
+                    }
+                    if self.is_current(&namespace, generation) {
+                        self.active.remove(&namespace);
+                        return Ok(Some(namespace));
                     }
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
 #[instrument("gossip-recv", skip_all, fields(namespace=%namespace.fmt_short()))]
 async fn receive_loop(
     namespace: NamespaceId,
+    generation: u64,
     mut recv: GossipReceiver,
     to_sync_actor: mpsc::Sender<ToLiveActor>,
 ) -> Result<()> {
     for peer in recv.neighbors() {
         to_sync_actor
-            .send(ToLiveActor::NeighborUp { namespace, peer })
+            .send(ToLiveActor::NeighborUp {
+                namespace,
+                peer,
+                generation,
+            })
             .await?;
     }
     while let Some(event) = recv.try_next().await? {
@@ -187,12 +216,20 @@ async fn receive_loop(
             }
             Event::NeighborUp(peer) => {
                 to_sync_actor
-                    .send(ToLiveActor::NeighborUp { namespace, peer })
+                    .send(ToLiveActor::NeighborUp {
+                        namespace,
+                        peer,
+                        generation,
+                    })
                     .await?;
             }
             Event::NeighborDown(peer) => {
                 to_sync_actor
-                    .send(ToLiveActor::NeighborDown { namespace, peer })
+                    .send(ToLiveActor::NeighborDown {
+                        namespace,
+                        peer,
+                        generation,
+                    })
                     .await?;
             }
         }

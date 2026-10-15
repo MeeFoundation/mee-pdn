@@ -1,11 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-mod data;
-mod non_empty;
 mod pod;
-pub use data::{EntryInfo, EntryPath, NamespaceRole, NodeAddr, PathValidationError};
-pub use non_empty::NonEmpty;
 pub use pod::{PodId, RecordId, RecordKind, RecordRef, UnknownRecordKind};
 
 // ---------------------------------------------------------------------------
@@ -173,9 +169,9 @@ define_byte_id_32! {
 define_byte_id_32! {
     /// Stable identifier of a participant on the PDN.
     ///
-    /// Used at the PDN domain layer (claims, connections, delegation) so
-    /// that higher-level code does not depend on identity-implementation
-    /// details such as KERI `Aid`.
+    /// Used at the PDN domain layer (claims, pods) so that higher-level
+    /// code does not depend on identity-implementation details such as a
+    /// KERI autonomic identifier.
     pub struct PdnId;
 }
 
@@ -186,26 +182,13 @@ pub struct PdnIdentityProof {}
 // -- KERI identity types ----------------------------------------------------
 
 define_byte_id_32! {
-    /// KERI Autonomic Identifier (ed25519 inception public key, 32 bytes).
-    ///
-    /// A self-certifying root identifier that never changes even as
-    /// operational keys rotate. Derived from the ed25519 public key
-    /// present in the KERI inception event.
-    pub struct Aid;
-}
-
-define_byte_id_32! {
     /// Current ed25519 operational signing key from the latest KEL event.
     ///
-    /// Changes on key rotation (unlike `Aid`, which is permanent).
+    /// Changes on key rotation, unlike the identity's root identifier.
     pub struct OperationalKey;
 }
 
 define_byte_id_32! {
     /// Stable identifier of a claim in the PDN domain layer.
-    ///
-    /// Used as the resource in `UWill` capability tokens (`res`), so that
-    /// capabilities reference domain-level claims rather than
-    /// storage-level locations.
     pub struct ClaimId;
 }

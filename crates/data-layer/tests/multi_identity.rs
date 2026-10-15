@@ -1,172 +1,139 @@
 //! One pair of devices hosts two identities side by side — Alice-at-work
-//! and Alice-at-leisure, each a `PdnId` with its own store set. The phone
-//! brings up both; the laptop joins each by a separate import of that
-//! identity's PMS ticket.
+//! and Alice-at-leisure, each a `PdnId` with its own PMS. The phone brings
+//! up both; the laptop joins each by a separate import of that identity's
+//! PMS ticket.
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, AuthorId, DocTicket, NamespaceImport, PrivateMetadataStore, ShareMode,
-    SyncNode, UnknownIssuer,
+    AddrInfoOptions, DocTicket, IdentityNotProvisioned, PrivateMetadataStore, Seq, ShareMode,
+    SyncNode,
 };
-use pdn_types::{EntryPath, PdnId};
-use test_utils::{
-    host_identity, ids, join_identity, memory_node, wait_connected, wait_devices, wait_entry_is,
-};
+use pdn_types::{PdnId, PodId};
+use test_utils::{eventually, host_identity, ids, join_identity, memory_node, wait_devices};
 
-/// Bring one identity up on `node` and lay down its test fixtures: a
-/// PMS with the node registered and a connection to `peer`, and a data
-/// namespace of `issuer` with `value` written at `path`. Returns the
-/// phone-side PMS handle, the author for further data writes, the
-/// PMS's write ticket, and the data-namespace ticket.
-async fn provision_identity_with_data(
-    node: &mut SyncNode,
-    issuer: PdnId,
-    peer: PdnId,
-    path: &EntryPath,
-    value: &[u8],
-) -> Result<(PrivateMetadataStore, AuthorId, DocTicket, DocTicket)> {
-    let pms = host_identity(node, issuer).await?;
-    pms.connect(peer).await?;
-    let ticket = pms
+/// Bring one identity up on `node` with its fixtures: a PMS with the node
+/// registered, a record of `pod`, and `ticket` published under `KIND`.
+/// Returns the PMS and its write ticket.
+async fn provision_identity_with_records(
+    node: &SyncNode,
+    identity: PdnId,
+    pod: PodId,
+    ticket: &DocTicket,
+) -> Result<(PrivateMetadataStore, DocTicket)> {
+    let pms = host_identity(node, identity).await?;
+    pms.record_pod(pod, Seq::FIRST).await?;
+    pms.put_ticket(KIND, ticket).await?;
+    let write = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
-
-    let author = node.default_author(issuer)?;
-    node.create_namespace(issuer, issuer).await?;
-    node.write(issuer, issuer, author, path, value).await?;
-    let data_ticket = node
-        .share_ticket(
-            issuer,
-            issuer,
-            ShareMode::Write,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-
-    Ok((pms, author, ticket, data_ticket))
+    Ok((pms, write))
 }
 
-/// Both identities' store sets replicate to the laptop, each by its own
-/// import; joining the first brings nothing of the second, the two stay
-/// isolated, and the first keeps operating after the second joins.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one scenario, both identities' whole lifetime in one place
-async fn multi_identity_two_devices() -> Result<()> {
-    // The same path in both data namespaces, a different value in each —
-    // mixed-up stores would surface as the wrong value.
-    let path = EntryPath::new("affiliation/group")?;
+/// Ticket kinds, pod records: the same kind in both identities' PMSs with
+/// a different ticket in each — mixed-up stores would surface as the
+/// wrong ticket.
+const KIND: &str = "affiliation";
+const WORK_POD: PodId = PodId::from_bytes([0xa2; 16]);
+const LEISURE_POD: PodId = PodId::from_bytes([0xa3; 16]);
 
-    // Phone hosts both identities' store sets side by side.
-    let mut phone = memory_node().await?;
+/// Whether `pms` comes to read `want` under [`KIND`].
+async fn wait_kind_is(pms: &PrivateMetadataStore, want: &DocTicket) -> Result<bool> {
+    eventually(|| async {
+        Ok(pms
+            .get_ticket(KIND)
+            .await?
+            .is_some_and(|got| got.to_string() == want.to_string()))
+    })
+    .await
+}
+
+/// A ticket of its own replica, so each identity's fixture differs.
+async fn fresh_ticket(node: &SyncNode, identity: PdnId) -> Result<DocTicket> {
+    PrivateMetadataStore::create(node, identity)
+        .await?
+        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await
+}
+
+/// Both identities' PMSs replicate to the laptop, each by its own import;
+/// joining the first brings nothing of the second, the two stay isolated,
+/// and the first keeps operating after the second joins.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_identity_two_devices() -> Result<()> {
+    // Phone hosts both identities side by side.
+    let phone = memory_node().await?;
     let laptop = memory_node().await?;
     let phone_id = phone.node_id();
     let laptop_id = laptop.node_id();
-    let (work_phone_pms, work_author, work_ticket, work_data) = provision_identity_with_data(
-        &mut phone,
-        ids::ALICE_AT_WORK,
-        ids::BOB,
-        &path,
-        b"Acme Engineering",
+    phone.provision_identity(ids::ALICE_AT_WORK).await?;
+    phone.provision_identity(ids::ALICE_AT_LEISURE).await?;
+    let work_fixture = fresh_ticket(&phone, ids::ALICE_AT_WORK).await?;
+    let leisure_fixture = fresh_ticket(&phone, ids::ALICE_AT_LEISURE).await?;
+    let (work_phone_pms, work_ticket) =
+        provision_identity_with_records(&phone, ids::ALICE_AT_WORK, WORK_POD, &work_fixture)
+            .await?;
+    let (_leisure_phone_pms, leisure_ticket) = provision_identity_with_records(
+        &phone,
+        ids::ALICE_AT_LEISURE,
+        LEISURE_POD,
+        &leisure_fixture,
     )
     .await?;
-    let (_leisure_phone_pms, _leisure_author, leisure_ticket, leisure_data) =
-        provision_identity_with_data(
-            &mut phone,
-            ids::ALICE_AT_LEISURE,
-            ids::CAROL,
-            &path,
-            b"Boston Bridge Club",
-        )
-        .await?;
 
     // Join the laptop into the work identity only.
     let laptop_work_pms = join_identity(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
     laptop_work_pms.add_device(laptop.node_id()).await?;
     assert!(
-        wait_connected(&laptop_work_pms, ids::BOB, true).await?,
-        "work connections did not replicate to laptop"
+        wait_kind_is(&laptop_work_pms, &work_fixture).await?,
+        "work records did not replicate to laptop"
     );
 
     // Isolation: nothing of the leisure identity arrived through that act —
-    // its peer is not in the work PMS, and its namespace is unknown
-    // here (specifically unknown, not just any error).
-    assert!(!laptop_work_pms.is_connected(ids::CAROL).await?);
+    // its pod is not in the work PMS, and the identity is unknown here
+    // (specifically unknown, not just any error).
+    assert_eq!(laptop_work_pms.pod_record(LEISURE_POD).await?, None);
     let err = laptop
-        .read(ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE, &path)
-        .await
+        .pod_stores(ids::ALICE_AT_LEISURE, LEISURE_POD)
         .unwrap_err();
-    assert!(err.downcast_ref::<UnknownIssuer>().is_some());
+    assert!(err.downcast_ref::<IdentityNotProvisioned>().is_some());
 
     // Second identity joins the already-joined node by its own act.
     let laptop_leisure_pms = join_identity(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
     laptop_leisure_pms.add_device(laptop.node_id()).await?;
     assert!(
-        wait_connected(&laptop_leisure_pms, ids::CAROL, true).await?,
-        "leisure connections did not replicate to laptop"
+        wait_kind_is(&laptop_leisure_pms, &leisure_fixture).await?,
+        "leisure records did not replicate to laptop"
     );
-    assert!(!laptop_leisure_pms.is_connected(ids::BOB).await?);
+    assert_eq!(laptop_leisure_pms.pod_record(WORK_POD).await?, None);
+    assert_eq!(
+        laptop_leisure_pms.pod_record(LEISURE_POD).await?,
+        Some((Seq::FIRST, true))
+    );
     assert!(
         wait_devices(&laptop_leisure_pms, &[phone_id, laptop_id]).await?,
         "leisure device set did not converge on laptop"
     );
 
-    // Both identities' data namespaces replicate, each under its own issuer.
-    laptop
-        .import_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, work_data)
-        .await?;
-    laptop
-        .import_namespace(ids::ALICE_AT_LEISURE, ids::ALICE_AT_LEISURE, leisure_data)
-        .await?;
-    assert!(
-        wait_entry_is(
-            &laptop,
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            &path,
-            b"Acme Engineering"
-        )
-        .await?,
-        "work data did not replicate to laptop"
-    );
-    assert!(
-        wait_entry_is(
-            &laptop,
-            ids::ALICE_AT_LEISURE,
-            ids::ALICE_AT_LEISURE,
-            &path,
-            b"Boston Bridge Club"
-        )
-        .await?,
-        "leisure data did not replicate to laptop"
-    );
-
     // The first identity keeps operating after the second joined: a fresh
-    // connection and a fresh data write (an LWW overwrite of the same path)
+    // pod record and a fresh ticket (an LWW overwrite of the same kind)
     // both still reach the laptop.
-    work_phone_pms.connect(ids::DAVE).await?;
+    work_phone_pms.record_pod(FAMILY, Seq::FIRST).await?;
     assert!(
-        wait_connected(&laptop_work_pms, ids::DAVE, true).await?,
-        "work connections stopped replicating after the second identity joined"
-    );
-    phone
-        .write(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            work_author,
-            &path,
-            b"Acme Research",
-        )
-        .await?;
-    assert!(
-        wait_entry_is(
-            &laptop,
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            &path,
-            b"Acme Research"
-        )
+        eventually(|| async {
+            Ok(laptop_work_pms.pod_record(FAMILY).await? == Some((Seq::FIRST, true)))
+        })
         .await?,
-        "work data stopped replicating after the second identity joined"
+        "work records stopped replicating after the second identity joined"
+    );
+    let rewritten = fresh_ticket(&phone, ids::ALICE_AT_WORK).await?;
+    work_phone_pms.put_ticket(KIND, &rewritten).await?;
+    assert!(
+        wait_kind_is(&laptop_work_pms, &rewritten).await?,
+        "work tickets stopped replicating after the second identity joined"
+    );
+    assert!(
+        wait_kind_is(&laptop_leisure_pms, &leisure_fixture).await?,
+        "the work rewrite reached the leisure PMS"
     );
 
     phone.shutdown().await?;
@@ -174,205 +141,4 @@ async fn multi_identity_two_devices() -> Result<()> {
     Ok(())
 }
 
-/// Forgetting an imported data namespace makes its issuer unknown again —
-/// the distinguishable refusal, not a storage error against a dropped
-/// replica — while the co-located identity's own replica stays
-/// addressable.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one scenario, the forget and the co-hosted identity in one place
-async fn forgetting_a_namespace_unregisters_its_issuer() -> Result<()> {
-    let path = EntryPath::new("affiliation/group")?;
-
-    // Phone issues both namespaces; the laptop imports both.
-    let mut phone = memory_node().await?;
-    let laptop = memory_node().await?;
-    let (work_pms, _work_author, work_ticket, work_data) = provision_identity_with_data(
-        &mut phone,
-        ids::ALICE_AT_WORK,
-        ids::BOB,
-        &path,
-        b"Acme Engineering",
-    )
-    .await?;
-    let (leisure_pms, _leisure_author, leisure_ticket, leisure_data) =
-        provision_identity_with_data(
-            &mut phone,
-            ids::ALICE_AT_LEISURE,
-            ids::CAROL,
-            &path,
-            b"Boston Bridge Club",
-        )
-        .await?;
-    // The laptop is a device of both identities, so the phone serves it
-    // both replicas: the product's own way to a device replication.
-    let _laptop_work_pms = join_identity(&laptop, ids::ALICE_AT_WORK, work_ticket).await?;
-    let _laptop_leisure_pms = join_identity(&laptop, ids::ALICE_AT_LEISURE, leisure_ticket).await?;
-    work_pms.add_device(laptop.node_id()).await?;
-    leisure_pms.add_device(laptop.node_id()).await?;
-    laptop
-        .import_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, work_data)
-        .await?;
-    laptop
-        .import_namespace(ids::ALICE_AT_LEISURE, ids::ALICE_AT_LEISURE, leisure_data)
-        .await?;
-    assert!(
-        wait_entry_is(
-            &laptop,
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            &path,
-            b"Acme Engineering"
-        )
-        .await?,
-        "work data did not replicate before the forget"
-    );
-
-    // Forget one issuer: reads, writes, and lists under it refuse as
-    // specifically unknown — exactly as before the import.
-    laptop
-        .forget_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
-        .await?;
-    let author = laptop.default_author(ids::ALICE_AT_WORK)?;
-    let read_err = laptop
-        .read(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, &path)
-        .await
-        .unwrap_err();
-    assert!(read_err.downcast_ref::<UnknownIssuer>().is_some());
-    let write_err = laptop
-        .write(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            author,
-            &path,
-            b"residue",
-        )
-        .await
-        .unwrap_err();
-    assert!(write_err.downcast_ref::<UnknownIssuer>().is_some());
-    let list_err = laptop
-        .list(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, None)
-        .await
-        .unwrap_err();
-    assert!(list_err.downcast_ref::<UnknownIssuer>().is_some());
-
-    // Forgetting an issuer that is (now) unknown refuses the same way.
-    let again = laptop
-        .forget_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
-        .await
-        .unwrap_err();
-    assert!(again.downcast_ref::<UnknownIssuer>().is_some());
-
-    // The co-hosted identity is untouched: its entries remain readable.
-    assert!(
-        wait_entry_is(
-            &laptop,
-            ids::ALICE_AT_LEISURE,
-            ids::ALICE_AT_LEISURE,
-            &path,
-            b"Boston Bridge Club"
-        )
-        .await?,
-        "the co-hosted identity must stay addressable after the forget"
-    );
-
-    phone.shutdown().await?;
-    laptop.shutdown().await?;
-    Ok(())
-}
-
-/// The grantee import when `scoped`, the device-replication one otherwise.
-async fn import_under(
-    node: &SyncNode,
-    holder: PdnId,
-    issuer: PdnId,
-    ticket: DocTicket,
-    scoped: bool,
-) -> Result<NamespaceImport> {
-    if scoped {
-        node.import_namespace_scoped(holder, issuer, ticket).await
-    } else {
-        node.import_namespace(holder, issuer, ticket).await
-    }
-}
-
-/// An import that moves an issuer onto another replica forgets the one it
-/// replaced, on the device-replication and the grantee path alike: the
-/// issuer resolves to the new replica, and the old one is neither held nor
-/// reconciled. Both namespaces belong to identities of the same node, so
-/// the registration under test needs no session.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_import_onto_another_replica_forgets_the_one_it_replaced() -> Result<()> {
-    let node = memory_node().await?;
-    for identity in [ids::ALICE, ids::BOB, ids::CAROL, ids::DAVE] {
-        node.provision_identity(identity).await?;
-    }
-    let mut namespaces = Vec::new();
-    for owner in [ids::CAROL, ids::DAVE] {
-        node.create_namespace(owner, owner).await?;
-        namespaces.push(
-            node.share_ticket(owner, owner, ShareMode::Read, AddrInfoOptions::Addresses)
-                .await?,
-        );
-    }
-    let [first, second] = namespaces.as_slice() else {
-        anyhow::bail!("two namespaces were minted");
-    };
-
-    for (holder, scoped) in [(ids::ALICE, false), (ids::BOB, true)] {
-        let _first = import_under(&node, holder, ids::CAROL, first.clone(), scoped).await?;
-        assert!(node.holds_replica(holder, first.capability.id()).await?);
-        let _second = import_under(&node, holder, ids::CAROL, second.clone(), scoped).await?;
-
-        assert_eq!(
-            node.data_namespace_of(holder, ids::CAROL)?,
-            Some(second.capability.id()),
-            "the issuer must resolve to the replica the import moved it to (scoped: {scoped})"
-        );
-        assert!(
-            !node.holds_replica(holder, first.capability.id()).await?,
-            "the replica the import moved the issuer away from is still held (scoped: {scoped})"
-        );
-    }
-
-    node.shutdown().await?;
-    Ok(())
-}
-
-/// An import onto the replica its issuer already resolves to binds
-/// nothing, on the device-replication and the grantee path alike:
-/// undoing it leaves the issuer bound and the replica held.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_import_onto_the_replica_its_issuer_resolves_to_binds_nothing() -> Result<()> {
-    let node = memory_node().await?;
-    for identity in [ids::ALICE, ids::BOB, ids::CAROL] {
-        node.provision_identity(identity).await?;
-    }
-    node.create_namespace(ids::CAROL, ids::CAROL).await?;
-    let ticket = node
-        .share_ticket(
-            ids::CAROL,
-            ids::CAROL,
-            ShareMode::Read,
-            AddrInfoOptions::Addresses,
-        )
-        .await?;
-    let namespace = ticket.capability.id();
-
-    for (holder, scoped) in [(ids::ALICE, false), (ids::BOB, true)] {
-        let _first = import_under(&node, holder, ids::CAROL, ticket.clone(), scoped).await?;
-        let again = import_under(&node, holder, ids::CAROL, ticket.clone(), scoped).await?;
-        node.undo_import_namespace(again).await?;
-        assert_eq!(
-            node.data_namespace_of(holder, ids::CAROL)?,
-            Some(namespace),
-            "undoing the re-import unbound the issuer (scoped: {scoped})"
-        );
-        assert!(
-            node.holds_replica(holder, namespace).await?,
-            "undoing the re-import dropped the replica (scoped: {scoped})"
-        );
-    }
-
-    node.shutdown().await?;
-    Ok(())
-}
+const FAMILY: PodId = PodId::from_bytes([0xfa; 16]);

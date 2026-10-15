@@ -518,43 +518,6 @@ impl Store {
         )
     }
 
-    /// Physically remove the record of `author` at `key` in `namespace`, if
-    /// its timestamp is at or below `up_to_timestamp` — the local retraction
-    /// of a provisional write. Removal only: nothing is inserted, so no
-    /// tombstone replicates and the set simply shrinks; a matching entry
-    /// can re-arrive over a later sync session unless its ingest is
-    /// refused. The `latest_per_author` hint is deliberately left in place:
-    /// a head pointing at a removed record costs at most one no-news
-    /// reconciliation round. Returns whether a record was removed.
-    pub fn retract_entry(
-        &mut self,
-        namespace: NamespaceId,
-        author: AuthorId,
-        key: &[u8],
-        up_to_timestamp: u64,
-    ) -> Result<bool> {
-        self.modify(|tables| {
-            let records_id = (&namespace.to_bytes(), &author.to_bytes(), key);
-            let timestamp = match tables.records.get(records_id)? {
-                Some(value) => value.value().0,
-                None => return Ok(false),
-            };
-            if timestamp > up_to_timestamp {
-                return Ok(false);
-            }
-            tables.records.remove(records_id)?;
-            tables
-                .records_by_key
-                .remove((&namespace.to_bytes(), key, &author.to_bytes()))?;
-            Ok(true)
-        })
-        .inspect(|removed| {
-            if *removed {
-                self.wrote(namespace);
-            }
-        })
-    }
-
     /// Get all content hashes of all replicas in the store.
     pub fn content_hashes(&mut self) -> Result<ContentHashesIterator> {
         let tables = self.snapshot_owned()?;
@@ -738,13 +701,10 @@ pub struct StoreInstance<'a> {
     /// and the fingerprints computed from them — come from this snapshot,
     /// so the served view is stable for the whole session while writes
     /// continue on the live store. Ingest stays live: `entry_get` and
-    /// `entry_put` always operate on the current state. Two things ride on
-    /// that. The newer-than comparison of `ranger::Store::put` — judged
-    /// against a stale snapshot, an older entry could overwrite a
-    /// concurrent session's insert. And `ranger::Store::would_insert`, the
-    /// gate on the rejection echoed to a sender: judged against the
-    /// snapshot it would name an entry the store took in after session
-    /// setup, and the sender retracts its own copy on that word.
+    /// `entry_put` always operate on the current state, so the newer-than
+    /// comparison of `ranger::Store::put` is not judged against a stale
+    /// snapshot, where an older entry could overwrite a concurrent
+    /// session's insert.
     pub(crate) session_snapshot: Option<&'a ReadOnlyTables>,
 }
 

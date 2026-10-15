@@ -162,12 +162,22 @@ pub enum ToLiveActor {
         namespace: NamespaceId,
         missing: Vec<Hash>,
     },
-    /// A dial the remote aborted as already syncing, asked for again.
+    /// A dial the remote aborted as already syncing, or one that could not
+    /// reach a gossip neighbor, asked for again; `retry` names the latter's
+    /// series.
     Redial {
         namespace: NamespaceId,
         peer: PublicKey,
         callee: Identity,
         reason: SyncReason,
+        retry: Option<u64>,
+    },
+    /// A download that failed toward a provider that is a gossip neighbor,
+    /// asked for again by the try of series `series`.
+    RetryDownload {
+        namespace: NamespaceId,
+        hash: Hash,
+        series: u64,
     },
     /// The exchanges of `namespaces` running, held behind another's, or
     /// waiting to redial.
@@ -175,6 +185,12 @@ pub enum ToLiveActor {
         namespaces: Vec<NamespaceId>,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<usize>,
+    },
+    /// What [`ToLiveActor::SyncsInFlight`] counts, each item named.
+    SyncsInFlightReport {
+        namespaces: Vec<NamespaceId>,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<String>,
     },
     /// Whom each peer of `namespace` is dialed as, replacing what contacts
     /// stated before; dials nothing.
@@ -220,13 +236,18 @@ pub enum ToLiveActor {
         node: PublicKey,
         hash: Hash,
     },
+    /// `generation` names the subscription whose receive loop saw it: one
+    /// sent before a quit is read after it, and must not make a neighbor of
+    /// a topic no longer joined.
     NeighborUp {
         namespace: NamespaceId,
         peer: PublicKey,
+        generation: u64,
     },
     NeighborDown {
         namespace: NamespaceId,
         peer: PublicKey,
+        generation: u64,
     },
 }
 
@@ -338,6 +359,66 @@ const REDIAL_AFTER_ABORT: Duration = Duration::from_millis(500);
 /// remote answering every dial as already syncing keeps one going forever.
 const MAX_REDIALS: u32 = 3;
 
+/// The wait before a dial or a download that failed toward a gossip
+/// neighbor is tried again; each further wait doubles, up to
+/// [`UNREACHED_RETRY_MAX`].
+const UNREACHED_RETRY_FIRST: Duration = Duration::from_secs(1);
+const UNREACHED_RETRY_MAX: Duration = Duration::from_secs(16);
+
+/// How long after its first failure such a dial or download is still tried:
+/// past the minute in which a peer restarted on a new port opens another
+/// connection here, which is when iroh selects its path again.
+const UNREACHED_RETRY_FOR: Duration = Duration::from_secs(120);
+
+/// The tries of one dial or download toward a gossip neighbor. It arms one
+/// timer at a time, and once run out it stays until what ends it, so a
+/// failure from another trigger neither adds a timer nor starts it again.
+#[derive(Debug)]
+struct RetrySeries {
+    /// Names the series in its timer's message: a timer outliving its
+    /// series must not disarm the next one.
+    id: u64,
+    since: n0_future::time::Instant,
+    wait: Duration,
+    armed: bool,
+    exhausted: bool,
+}
+
+impl RetrySeries {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            since: n0_future::time::Instant::now(),
+            wait: UNREACHED_RETRY_FIRST,
+            armed: false,
+            exhausted: false,
+        }
+    }
+
+    /// The wait before the next try, arming the series; `None` while a try
+    /// is armed, and once the series has run its span.
+    fn arm(&mut self) -> Option<Duration> {
+        if self.armed || self.exhausted {
+            return None;
+        }
+        if self.since.elapsed() >= UNREACHED_RETRY_FOR {
+            self.exhausted = true;
+            return None;
+        }
+        let wait = self.wait;
+        self.wait = self.wait.saturating_mul(2).min(UNREACHED_RETRY_MAX);
+        self.armed = true;
+        Some(wait)
+    }
+
+    /// The armed try of series `id` has fired.
+    fn fired(&mut self, id: u64) {
+        if self.id == id {
+            self.armed = false;
+        }
+    }
+}
+
 /// A dial held until the exchange it follows finishes.
 enum HeldDial {
     Network {
@@ -431,6 +512,19 @@ pub struct LiveActor {
     /// Aborts as already syncing in a row per pair, cleared by an exchange
     /// that finishes.
     redial_streaks: HashMap<(NamespaceId, PublicKey, Identity), u32>,
+    /// Dials that failed to connect to a gossip neighbor, until an exchange
+    /// with the pair ends any other way or the neighbor leaves; a series
+    /// run out stays until then.
+    unreached_dials: HashMap<(NamespaceId, PublicKey, Identity), RetrySeries>,
+    /// Downloads that failed toward a provider that is a gossip neighbor,
+    /// until one succeeds or no provider is a neighbor; a series run out
+    /// stays until then.
+    unreached_downloads: HashMap<(NamespaceId, Hash), RetrySeries>,
+    /// The id the next [`RetrySeries`] takes.
+    next_retry_series: u64,
+    /// The topics each peer is a gossip neighbor in: a connection with a
+    /// neighbor stands, so it is up.
+    neighbors: HashMap<PublicKey, HashSet<NamespaceId>>,
     /// In-process sessions opened, so a pass over a quiet pair can be
     /// shown to open none.
     in_process_sessions: Arc<AtomicU64>,
@@ -489,6 +583,10 @@ impl LiveActor {
             held_dials: Default::default(),
             redials_due: Default::default(),
             redial_streaks: Default::default(),
+            unreached_dials: Default::default(),
+            unreached_downloads: Default::default(),
+            next_retry_series: 0,
+            neighbors: Default::default(),
             in_process_sessions,
             co_located,
             metrics,
@@ -568,9 +666,11 @@ impl LiveActor {
                     let (namespace, hash, res) = res.context("pending_downloads closed")?;
                     self.on_download_ready(namespace, hash, res).await;
                 }
-                res = self.gossip.progress(), if !self.gossip.is_empty() => {
-                    if let Err(error) = res {
-                        warn!(?error, "gossip state failed");
+                res = self.gossip.next_ended(), if !self.gossip.is_empty() => {
+                    match res {
+                        Ok(Some(namespace)) => self.forget_topic_neighbors(namespace),
+                        Ok(None) => {}
+                        Err(error) => warn!(?error, "gossip state failed"),
                     }
                 }
             }
@@ -585,15 +685,32 @@ impl LiveActor {
             ToLiveActor::IncomingSyncReport { from, report } => {
                 self.on_sync_report(from, report).await
             }
-            ToLiveActor::NeighborUp { namespace, peer } => {
+            ToLiveActor::NeighborUp {
+                namespace,
+                peer,
+                generation,
+            } => {
+                if !self.gossip.is_current(&namespace, generation) {
+                    debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor up from a subscription gone");
+                    return Ok(true);
+                }
                 debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor up");
+                self.neighbors.entry(peer).or_default().insert(namespace);
                 self.sync_with_peer(namespace, peer, SyncReason::NewNeighbor);
                 self.subscribers
                     .send(&namespace, Event::NeighborUp(peer))
                     .await;
             }
-            ToLiveActor::NeighborDown { namespace, peer } => {
+            ToLiveActor::NeighborDown {
+                namespace,
+                peer,
+                generation,
+            } => {
+                if !self.gossip.is_current(&namespace, generation) {
+                    return Ok(true);
+                }
                 debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor down");
+                self.forget_neighbor(namespace, peer);
                 self.subscribers
                     .send(&namespace, Event::NeighborDown(peer))
                     .await;
@@ -645,14 +762,36 @@ impl LiveActor {
                 peer,
                 callee,
                 reason,
+                retry,
             } => {
                 if let Some(due) = self.redials_due.get_mut(&namespace) {
                     *due = due.saturating_sub(1);
                 }
+                if let Some(id) = retry {
+                    if let Some(series) = self.unreached_dials.get_mut(&(namespace, peer, callee)) {
+                        series.fired(id);
+                    }
+                }
                 self.sync_with_identity(namespace, peer, callee, reason);
+            }
+            ToLiveActor::RetryDownload {
+                namespace,
+                hash,
+                series,
+            } => {
+                if let Some(tries) = self.unreached_downloads.get_mut(&(namespace, hash)) {
+                    tries.fired(series);
+                }
+                // A try armed before a leave fetches nothing for it.
+                if self.state.is_syncing(&namespace) {
+                    self.queue_download(namespace, hash, true).await;
+                }
             }
             ToLiveActor::SyncsInFlight { namespaces, reply } => {
                 reply.send(self.syncs_in_flight(&namespaces)).ok();
+            }
+            ToLiveActor::SyncsInFlightReport { namespaces, reply } => {
+                reply.send(self.syncs_in_flight_report(&namespaces)).ok();
             }
             ToLiveActor::StateContacts {
                 namespace,
@@ -1067,10 +1206,16 @@ impl LiveActor {
                 .retain(|(tracked, _peer), _identities| *tracked != namespace);
             self.redial_streaks
                 .retain(|(tracked, _peer, _callee), _streak| *tracked != namespace);
+            self.unreached_dials
+                .retain(|(tracked, _peer, _callee), _series| *tracked != namespace);
+            self.unreached_downloads
+                .retain(|(tracked, _hash), _series| *tracked != namespace);
+            self.missing_hashes
+                .retain(|(tracked, _hash)| *tracked != namespace);
             self.sync.set_sync(namespace, false).await?;
             self.sync.unsubscribe(namespace).await?;
             self.sync.close(namespace).await?;
-            self.gossip.quit(&namespace);
+            self.leave_gossip(namespace);
         }
         if kill_subscribers {
             self.subscribers.remove(&namespace);
@@ -1107,6 +1252,33 @@ impl LiveActor {
             .filter_map(|namespace| self.redials_due.get(namespace))
             .sum();
         running.saturating_add(held).saturating_add(due)
+    }
+
+    fn syncs_in_flight_report(&self, namespaces: &[NamespaceId]) -> String {
+        let mut lines = Vec::new();
+        for namespace in namespaces {
+            for running in self.state.running_described(namespace) {
+                lines.push(format!("{} running: {running}", namespace.fmt_short()));
+            }
+            if let Some(due) = self.redials_due.get(namespace).filter(|due| **due > 0) {
+                lines.push(format!("{} redials due: {due}", namespace.fmt_short()));
+            }
+        }
+        for ((first, peer, counterpart), dials) in &self.held_dials {
+            for dial in dials {
+                let held = dial.namespace();
+                if namespaces.contains(first) || namespaces.contains(&held) {
+                    lines.push(format!(
+                        "{} held behind {} with {} as {}",
+                        held.fmt_short(),
+                        first.fmt_short(),
+                        peer.fmt_short(),
+                        counterpart.fmt_short()
+                    ));
+                }
+            }
+        }
+        lines.join("; ")
     }
 
     fn state_contacts(&mut self, namespace: NamespaceId, contacts: Vec<Contact>) {
@@ -1163,6 +1335,14 @@ impl LiveActor {
     /// never joined does nothing.
     fn leave_gossip(&mut self, namespace: NamespaceId) {
         self.gossip.quit(&namespace);
+        self.forget_topic_neighbors(namespace);
+    }
+
+    fn forget_topic_neighbors(&mut self, namespace: NamespaceId) {
+        let peers: Vec<PublicKey> = self.neighbors.keys().copied().collect();
+        for peer in peers {
+            self.forget_neighbor(namespace, peer);
+        }
     }
 
     async fn join_peers(
@@ -1225,6 +1405,7 @@ impl LiveActor {
         match result {
             Err(ConnectError::RemoteAbort(AbortReason::AlreadySyncing)) => {
                 debug!(?reason, "remote abort, already syncing");
+                self.unreached_dials.remove(&(namespace, peer, callee));
                 // The remote refused our dial because it sees an exchange with us already
                 // running. Nothing else will finish the dial recorded in our state, so clear
                 // it — otherwise this (namespace, peer) pair stays `Running` forever and every
@@ -1254,21 +1435,14 @@ impl LiveActor {
                         .checked_shl(streak.saturating_sub(1))
                         .unwrap_or(u32::MAX),
                 );
-                let redial = ToLiveActor::Redial {
-                    namespace,
-                    peer,
-                    callee,
-                    reason,
-                };
-                let due = self.redials_due.entry(namespace).or_default();
-                *due = due.saturating_add(1);
-                let to_self = self.sync_actor_tx.clone();
-                n0_future::task::spawn(async move {
-                    n0_future::time::sleep(delay).await;
-                    to_self.send(redial).await.ok();
-                });
+                self.redial_after(namespace, peer, callee, reason, delay, None);
             }
             res => {
+                let unreached = matches!(res, Err(ConnectError::Connect { .. }));
+                if !unreached {
+                    // The pair was reached, whatever the exchange came to.
+                    self.unreached_dials.remove(&(namespace, peer, callee));
+                }
                 self.on_sync_finished(
                     namespace,
                     peer,
@@ -1276,9 +1450,151 @@ impl LiveActor {
                     Origin::Connect(reason),
                     res.map_err(Into::into),
                 )
-                .await
+                .await;
+                if unreached {
+                    self.retry_unreached_dial(namespace, peer, callee, reason)
+                        .await;
+                }
             }
         }
+    }
+
+    fn redial_after(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        callee: Identity,
+        reason: SyncReason,
+        delay: Duration,
+        retry: Option<u64>,
+    ) {
+        let redial = ToLiveActor::Redial {
+            namespace,
+            peer,
+            callee,
+            reason,
+            retry,
+        };
+        let due = self.redials_due.entry(namespace).or_default();
+        *due = due.saturating_add(1);
+        let to_self = self.sync_actor_tx.clone();
+        n0_future::task::spawn(async move {
+            n0_future::time::sleep(delay).await;
+            to_self.send(redial).await.ok();
+        });
+    }
+
+    fn forget_neighbor(&mut self, namespace: NamespaceId, peer: PublicKey) {
+        if let Some(topics) = self.neighbors.get_mut(&peer) {
+            topics.remove(&namespace);
+            if topics.is_empty() {
+                self.neighbors.remove(&peer);
+                self.end_retries_toward(peer);
+            }
+        }
+    }
+
+    /// A peer that is no neighbor any more ends the series toward it, so its
+    /// next arrival starts a fresh one.
+    fn end_retries_toward(&mut self, peer: PublicKey) {
+        self.unreached_dials
+            .retain(|(_namespace, toward, _callee), _series| *toward != peer);
+        let neighbors = &self.neighbors;
+        let providers = self.hash_providers.0.lock().expect("poisoned");
+        self.unreached_downloads
+            .retain(|(_namespace, hash), _series| {
+                providers.get(hash).is_some_and(|nodes| {
+                    nodes
+                        .iter()
+                        .any(|provider| neighbors.contains_key(provider))
+                })
+            });
+    }
+
+    fn new_retry_series(&mut self) -> RetrySeries {
+        let id = self.next_retry_series;
+        self.next_retry_series = id.wrapping_add(1);
+        RetrySeries::new(id)
+    }
+
+    /// Whether `peer` is a gossip neighbor in some topic of this engine: a
+    /// connection with it stands, so it is up, and a dial toward it that
+    /// cannot connect is going to a path iroh has yet to select again.
+    fn is_neighbor(&self, peer: PublicKey) -> bool {
+        self.neighbors.contains_key(&peer)
+    }
+
+    /// A dial that failed to connect, tried again while the peer is a
+    /// neighbor and the series lasts: iroh keeps a restarted peer's old path
+    /// selected until the peer opens another connection here.
+    async fn retry_unreached_dial(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        callee: Identity,
+        reason: SyncReason,
+    ) {
+        let key = (namespace, peer, callee);
+        if !self.is_neighbor(peer) {
+            self.unreached_dials.remove(&key);
+            return;
+        }
+        let fresh = self.new_retry_series();
+        let series = self.unreached_dials.entry(key).or_insert(fresh);
+        let was_exhausted = series.exhausted;
+        let Some(delay) = series.arm() else {
+            if series.exhausted && !was_exhausted {
+                info!(?reason, "dial tries toward a neighbor exhausted");
+            }
+            return;
+        };
+        let id = series.id;
+        debug!(?delay, "dial could not reach a neighbor: trying again");
+        self.redial_after(namespace, peer, callee, reason, delay, Some(id));
+    }
+
+    /// [`Self::retry_unreached_dial`] for a payload download: tried again
+    /// while one of the hash's providers is a neighbor.
+    async fn retry_unreached_download(&mut self, namespace: NamespaceId, hash: Hash) {
+        let providers: Vec<PublicKey> = self
+            .hash_providers
+            .0
+            .lock()
+            .expect("poisoned")
+            .get(&hash)
+            .map(|nodes| nodes.iter().copied().collect())
+            .unwrap_or_default();
+        let reached = providers
+            .into_iter()
+            .any(|provider| self.is_neighbor(provider));
+        let key = (namespace, hash);
+        if !reached {
+            self.unreached_downloads.remove(&key);
+            return;
+        }
+        let fresh = self.new_retry_series();
+        let tries = self.unreached_downloads.entry(key).or_insert(fresh);
+        let was_exhausted = tries.exhausted;
+        let Some(delay) = tries.arm() else {
+            if tries.exhausted && !was_exhausted {
+                info!(%hash, namespace = %namespace.fmt_short(), "download tries toward a neighbor exhausted");
+            }
+            return;
+        };
+        let series = tries.id;
+        debug!(%hash, ?delay, "download could not reach a neighbor: trying again");
+        let to_self = self.sync_actor_tx.clone();
+        n0_future::task::spawn(async move {
+            n0_future::time::sleep(delay).await;
+            to_self
+                .send(ToLiveActor::RetryDownload {
+                    namespace,
+                    hash,
+                    series,
+                })
+                .await
+                .ok();
+        });
     }
 
     #[instrument("accept", skip_all, fields(peer = %fmt_accept_peer(&res), namespace = %fmt_accept_namespace(&res)))]
@@ -1305,6 +1621,8 @@ impl LiveActor {
             }
             Err(err) => {
                 if let (Some(peer), Some(namespace)) = (err.peer(), err.namespace()) {
+                    // The pair reached us, whatever the exchange came to.
+                    self.unreached_dials.remove(&(namespace, peer, caller));
                     self.on_sync_finished(
                         namespace,
                         peer,
@@ -1334,6 +1652,7 @@ impl LiveActor {
             }
             Ok(ref details) => {
                 self.redial_streaks.remove(&(namespace, peer, counterpart));
+                self.unreached_dials.remove(&(namespace, peer, counterpart));
                 info!(
                     sent = %details.outcome.num_sent,
                     recv = %details.outcome.num_recv,
@@ -1521,6 +1840,8 @@ impl LiveActor {
         debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
         if res.is_ok() {
             self.retry_after_failure.retain(|(_, h)| *h != hash);
+            self.unreached_downloads
+                .retain(|(_, h), _series| *h != hash);
             self.subscribers
                 .send(&namespace, Event::ContentReady { hash })
                 .await;
@@ -1528,13 +1849,21 @@ impl LiveActor {
             self.broadcast_neighbors(namespace, &Op::ContentReady(hash))
                 .await;
         } else {
-            self.missing_hashes.insert((namespace, hash));
-            if self.retry_after_failure.remove(&(namespace, hash)) {
-                // A provider was registered while the failed download was already
-                // running with an older provider snapshot: retry once with the
-                // enriched set.
-                debug!(%hash, "retrying failed download with providers registered meanwhile");
-                self.queue_download(namespace, hash, true).await;
+            if let Err(error) = &res {
+                debug!(%hash, "download failed: {error:#}");
+            }
+            // A download that outlived a leave parks nothing for it.
+            if self.state.is_syncing(&namespace) {
+                self.missing_hashes.insert((namespace, hash));
+                if self.retry_after_failure.remove(&(namespace, hash)) {
+                    // A provider was registered while the failed download was already
+                    // running with an older provider snapshot: retry once with the
+                    // enriched set.
+                    debug!(%hash, "retrying failed download with providers registered meanwhile");
+                    self.queue_download(namespace, hash, true).await;
+                } else {
+                    self.retry_unreached_download(namespace, hash).await;
+                }
             }
         }
         for namespace in completed_namespaces.iter() {

@@ -8,14 +8,12 @@
 
 use anyhow::{ensure, Context, Result};
 use data_layer::{
-    Connection, DialHandle, DocTicket, PrivateMetadataStore, RecvStream, SendStream, SyncNode,
+    AcceptError, Connection, DialHandle, DocTicket, PrivateMetadataStore, ProtocolHandler,
+    RecvStream, SendStream, SyncNode,
 };
-use pdn_node::{
-    ConnectionsService as _, DataService as _, GrantedClaim, IdentityService as _, InvitePayload,
-    LinkingPayload, Runtime, SpawnOptions,
-};
-use pdn_types::{EntryPath, NonEmpty, PdnId};
-use test_utils::{eventually, memory_node, TIMEOUT};
+use pdn_node::{IdentityService as _, LinkingPayload, Runtime, SpawnOptions};
+use pdn_types::PdnId;
+use test_utils::{memory_node, TIMEOUT};
 
 /// A runtime on memory storage.
 pub async fn memory_runtime() -> Result<Runtime> {
@@ -25,8 +23,25 @@ pub async fn memory_runtime() -> Result<Runtime> {
 /// The linking ALPN, pinned by the tests on purpose (ADR-0012).
 pub const LINKING_ALPN: &[u8] = b"/pdn/linking/0";
 
-/// The pairing ALPN, pinned by the tests on purpose (ADR-0011).
-pub const PAIRING_ALPN: &[u8] = b"/pdn/pairing/0";
+/// The pod join ALPN, pinned by the tests on purpose.
+pub const POD_JOIN_ALPN: &[u8] = b"/pdn/pod-join/0";
+
+/// An inviter of either ceremony that reads the request and never
+/// answers; without a ceiling over the dialogue a dialer waits for the
+/// transport's idle timeout.
+#[derive(Debug)]
+pub struct HungInviter;
+
+impl ProtocolHandler for HungInviter {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if let Ok((_send, mut recv)) = connection.accept_bi().await {
+            let _request = read_frame(&mut recv).await;
+            // Never answer; hold until the dialer closes or gives up.
+            connection.closed().await;
+        }
+        Ok(())
+    }
+}
 
 /// Ceiling on one linking wire frame — mirrors the protocol's own bound.
 const MAX_FRAME_LEN: u32 = 64 * 1024;
@@ -53,11 +68,8 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 
 /// Run the linking dialogue raw from a bare node. The request mirrors the
 /// protocol's `{version, secret}` message (postcard encodes the struct
-/// exactly as this tuple), the reply its `{pms, data}`.
-pub async fn dial_linking(
-    node: &SyncNode,
-    payload: &LinkingPayload,
-) -> Result<(DocTicket, DocTicket)> {
+/// exactly as this tuple), the reply its `{pms}`.
+pub async fn dial_linking(node: &SyncNode, payload: &LinkingPayload) -> Result<DocTicket> {
     let connection = node
         .dial_handle()
         .connect(payload.inviter_addr.clone(), LINKING_ALPN)
@@ -72,9 +84,9 @@ pub async fn dial_linking(
     let reply = read_frame(&mut recv)
         .await
         .context("linking refused by the inviter")?;
-    let (pms, data): (DocTicket, DocTicket) = postcard::from_bytes(&reply)?;
+    let pms: DocTicket = postcard::from_bytes(&reply)?;
     connection.close(0u32.into(), b"done");
-    Ok((pms, data))
+    Ok(pms)
 }
 
 /// Present `payload`'s secret and never read the reply. The connection is
@@ -114,7 +126,7 @@ pub async fn link_probe(
     let node = memory_node().await?;
     node.provision_identity(identity).await?;
     let payload = runtime.identity().linking_invite(identity, None).await?;
-    let (pms_ticket, _data_ticket) = dial_linking(&node, &payload).await?;
+    let pms_ticket = dial_linking(&node, &payload).await?;
     let pms = PrivateMetadataStore::import(&node, identity, pms_ticket).await?;
     // Armed as any device of the identity is: an identity's replicas are
     // judged by its own records, and a probe that armed nothing would
@@ -129,80 +141,4 @@ pub async fn link_probe(
 pub async fn link_patiently(linker: &Runtime, inviter: &Runtime, identity: PdnId) -> Result<()> {
     let payload = inviter.identity().linking_invite(identity, None).await?;
     linker.identity().link(payload, TIMEOUT).await
-}
-
-/// `_inviter`/`_inviter_id` are unused, kept for call-site symmetry with
-/// the linking helper.
-pub async fn establish_patiently(
-    scanner: &Runtime,
-    scanner_id: PdnId,
-    _inviter: &Runtime,
-    _inviter_id: PdnId,
-    invite: InvitePayload,
-) -> Result<()> {
-    scanner.connections().establish(scanner_id, invite).await
-}
-
-/// A claim set for a scenario about the record crossing rather than about
-/// what it covers.
-// clippy.toml's expect relaxation reaches `#[test]` bodies only.
-#[allow(clippy::expect_used)]
-pub fn nominal_claims(issuer: PdnId) -> NonEmpty<GrantedClaim> {
-    claims_on(
-        issuer,
-        &EntryPath::new("contact/email").expect("a valid path"),
-        false,
-    )
-}
-
-/// The claim set covering exactly `path` — read always, write when `write`.
-pub fn claims_on(issuer: PdnId, path: &EntryPath, write: bool) -> NonEmpty<GrantedClaim> {
-    NonEmpty::new(GrantedClaim {
-        claim: pdn_node::claim_id_of(&issuer, path),
-        write,
-    })
-}
-
-/// Publish a grant and return once the receiver reads it whole over the
-/// pair and holds the issuer's namespace. A caller that needs the grant's
-/// value reads it inside its own poll, since a second read after this one
-/// is not the same read.
-pub async fn granted_patiently(
-    gives: &Runtime,
-    gives_id: PdnId,
-    receives: &Runtime,
-    receives_id: PdnId,
-    issuer: PdnId,
-    claims: NonEmpty<GrantedClaim>,
-) -> Result<()> {
-    gives
-        .connections()
-        .publish_grant(gives_id, receives_id, issuer, claims)
-        .await?;
-    let crossed = eventually(|| async {
-        Ok(receives
-            .connections()
-            .read_grants(receives_id, gives_id)
-            .await?
-            .into_iter()
-            .any(|peer_grant| peer_grant.grant.issuer == issuer))
-    })
-    .await?;
-    ensure!(crossed, "the grant did not reach the peer over the pair");
-    // The binder imports after the record lands; a read before it names an
-    // issuer the receiver does not hold yet.
-    let probe = EntryPath::new("probe")?;
-    let held = eventually(|| async {
-        Ok(receives
-            .data()
-            .read(receives_id, issuer, &probe)
-            .await
-            .is_ok())
-    })
-    .await?;
-    ensure!(
-        held,
-        "the receiver never came to hold the issuer's namespace"
-    );
-    Ok(())
 }

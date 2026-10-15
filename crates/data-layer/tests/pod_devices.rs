@@ -405,6 +405,9 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
         b1.author,
     )
     .await?;
+    let mut alices_records = alice_phone
+        .watch_pod_sessions(alice.id, pod, PodStore::Records)
+        .await?;
     for device in [&bob_phone, &bob_laptop] {
         for store in [PodStore::Membership, PodStore::Records] {
             dial(&alice_phone, &alice, pod, store, device, &bob).await?;
@@ -416,10 +419,28 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
             "a device a statement lists dropped out of the union"
         );
     }
-    assert!(
-        reads(&alice_phone, alice.id, pod, claim.record()).await?,
-        "the claim of a device a later version missed did not read"
-    );
+    if !reads(&alice_phone, alice.id, pod, claim.record()).await? {
+        let owner = alice_phone.pod_record_view(alice.id, pod).await;
+        let laptop = bob_laptop.pod_record_view(bob.id, pod).await;
+        let in_flight = alice_phone.pod_syncs_in_flight_for_test(pod).await;
+        let mut sessions = Vec::new();
+        while let Some(session) = alices_records
+            .next_with(bob_laptop.node_id(), true, Duration::from_millis(50))
+            .await?
+        {
+            sessions.push(session);
+        }
+        let owner_on_laptop = bob_laptop
+            .pod_holding(bob.id, pod)
+            .await
+            .map(|holding| holding.and_then(|held| held.membership.member(&alice.id).cloned()));
+        anyhow::bail!(
+            "the claim of a device a later version missed did not read\nowner: {owner:#?}\n\
+             laptop: {laptop:#?}\nowner's exchanges in flight: {in_flight:?}\nowner's \
+             record-store sessions dialed to the laptop: {sessions:#?}\nthe owner as the \
+             laptop's membership view has her: {owner_on_laptop:#?}"
+        );
+    }
 
     // The laptop, lagging at version 2 and its own version 3, writes
     // version 2 again, and the session after it brings that entry.

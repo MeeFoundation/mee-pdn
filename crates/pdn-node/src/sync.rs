@@ -47,7 +47,7 @@ impl SyncService for RuntimeSyncService<'_> {
             let state = self.runtime.state.lock().await;
             std::sync::Arc::clone(&state.node)
         };
-        node.check_replica_store().await
+        node.check_stores().await
     }
 }
 
@@ -57,29 +57,13 @@ impl RuntimeSyncService<'_> {
         self.runtime.state.lock().await.node.dial_handle()
     }
 
-    /// The only anchor for a cancelled establishment: its own-replica has
-    /// no handle a scenario can check by. Counted for the identity the
-    /// establishment was run as, since every replica sits in one.
+    /// The replicas `identity`'s registry tracks: what a create provisioned
+    /// and what a cancelled link left, neither of which has a handle a
+    /// scenario can check by.
     #[cfg(feature = "test-util")]
     pub async fn tracked_doc_count(&self, identity: PdnId) -> Result<usize> {
         let state = self.runtime.state.lock().await;
         state.node.tracked_doc_count(identity)
-    }
-
-    /// The issuer and path of every retraction marker in `identity`'s own
-    /// PMS — what shows a verdict was recorded there and in no
-    /// co-located identity's.
-    #[cfg(feature = "test-util")]
-    pub async fn retraction_markers(&self, identity: PdnId) -> Result<Vec<(PdnId, String)>> {
-        let state = self.runtime.state.lock().await;
-        Ok(state
-            .hosted(identity)?
-            .pms
-            .list_retractions()
-            .await?
-            .into_iter()
-            .map(|(issuer, _author, path, _marker)| (issuer, path))
-            .collect())
     }
 
     #[cfg(feature = "test-util")]
