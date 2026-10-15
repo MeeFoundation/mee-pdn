@@ -217,6 +217,17 @@ async fn two_identities_of_one_node_write_as_two_authors() -> Result<()> {
     Ok(())
 }
 
+/// Whether `node`'s pass over the co-located pairs comes to open no session
+/// on `namespace` across two of its intervals.
+async fn pass_goes_quiet(node: &SyncNode, namespace: NamespaceId) -> Result<bool> {
+    eventually(|| async {
+        let before = node.co_located_pass_sessions_of(namespace);
+        tokio::time::sleep(RECONCILE * 2).await;
+        Ok(node.co_located_pass_sessions_of(namespace) == before)
+    })
+    .await
+}
+
 /// A record that reaches one co-located member from another node reaches
 /// the other co-located member on the periodic pass, and a pod that has
 /// gone quiet is left alone: the other member is out of the pod's swarms
@@ -265,12 +276,19 @@ async fn the_periodic_pass_catches_up_a_co_located_pair_and_leaves_a_quiet_one_a
         tablet.leave_swarm_for_test(leisure.id, namespace).await?;
     }
 
+    // Counted from before the claim, once the pass has gone quiet: the pass
+    // can carry the claim across the moment it reaches the member in the
+    // swarm, ahead of any read here.
+    assert!(
+        pass_goes_quiet(&tablet, records).await?,
+        "the pass never went quiet before the claim"
+    );
+    let healed = tablet.co_located_pass_sessions_of(records);
     let claim = c::place_claim(&phone, &erin, pod, 0x01).await?;
     assert!(
         c::reads(&tablet, work.id, pod, claim).await?,
         "the claim did not reach the member in the swarm"
     );
-    let healed = tablet.co_located_pass_sessions_of(records);
     assert!(
         c::reads(&tablet, leisure.id, pod, claim).await?,
         "the periodic pass did not catch the co-located pair up"
@@ -285,12 +303,7 @@ async fn the_periodic_pass_catches_up_a_co_located_pair_and_leaves_a_quiet_one_a
     // nothing moved after it. Wait for that to settle, then hold the pod
     // to silence.
     assert!(
-        eventually(|| async {
-            let before = tablet.co_located_pass_sessions_of(records);
-            tokio::time::sleep(RECONCILE * 2).await;
-            Ok(tablet.co_located_pass_sessions_of(records) == before)
-        })
-        .await?,
+        pass_goes_quiet(&tablet, records).await?,
         "the pass never stopped reconciling the pair"
     );
     let before = tablet.co_located_pass_sessions_of(records);
