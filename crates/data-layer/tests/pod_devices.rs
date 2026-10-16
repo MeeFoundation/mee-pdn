@@ -222,6 +222,9 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
     // Taken before the statement: the laptop's redials of sessions from
     // before can bring it ahead of the dial below.
     let mut traces = alice_phone.take_session_traces().context("taken once")?;
+    let mut laptops_sessions = bob_laptop
+        .watch_pod_sessions(bob.id, pod, PodStore::Membership)
+        .await?;
     let laptops = device_of(&bob_laptop, &bob)?;
     let listing = statement(
         &bob_laptop,
@@ -285,13 +288,25 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
     }
     assert!(opened, "the member device refused the unlisted device");
     assert_eq!(first, [listing]);
-    let sent = bob_laptop
-        .pod_membership_view(bob.id, pod)
-        .await?
-        .member(&alice.id)
-        .is_some_and(|member| member.devices.contains(&elsewhere));
-    assert!(
-        !sent,
+    // The session that carried the statement, as the laptop saw it: later
+    // ones, served whole, may already have run.
+    let alice_node = alice_phone.node_id();
+    let carrying = loop {
+        let session = laptops_sessions
+            .next_served_with(alice_node, TIMEOUT)
+            .await?
+            .context("no session with the member device went through")?;
+        if session
+            .exchanged
+            .as_ref()
+            .is_ok_and(|(_received, sent)| *sent > 0)
+        {
+            break session;
+        }
+    };
+    assert_eq!(
+        carrying.exchanged.map(|(received, _sent)| received),
+        Ok(0),
         "the member device sent the device it does not list an entry"
     );
 
