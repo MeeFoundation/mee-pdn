@@ -13,8 +13,8 @@
 //! Two limits the table respects. Where the runtime does not separate two
 //! outcomes the table follows the runtime rather than promise a distinction
 //! that does not exist. And the kinds the runtime has no error for at all
-//! — an empty payload, a malformed path, a grant naming no claim, a call
-//! before bring-up — are the host's own and are named as such
+//! — an empty payload, an oversized one, a call before bring-up — are the
+//! host's own and are named as such
 //! ([`PdnError::MalformedInput`], [`PdnError::NodeNotUp`]).
 //!
 //! An unrecognized failure keeps its cause chain in the platform log and
@@ -23,27 +23,17 @@
 //! paired denial vacuous.
 
 use pdn_node::{
-    ActRefusal, ActRefused, CatchUpTimeout, DelegationUnsupported, DialogueTimeout, DirectoryHeld,
-    EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, IdentityAlreadyHosted,
+    ActRefusal, ActRefused, CatchUpTimeout, DialogueTimeout, DirectoryHeld, IdentityAlreadyHosted,
     IdentityKeyPending, InviterUnreachable, JoinInProgress, JoinRefused, JoinTimeout,
-    LinkingInProgress, LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownIdentity,
-    UnknownIssuer, UnknownPod, UnknownRecord, UnsupportedInviteVersion, UnsupportedLinkingVersion,
-    UnsupportedPodInviteVersion, WriteNotGranted, WrongRecordKind,
+    LinkingInProgress, LinkingRefused, RecordPlacedOnce, UnknownIdentity, UnknownPod,
+    UnknownRecord, UnsupportedLinkingVersion, UnsupportedPodInviteVersion, WrongRecordKind,
 };
 
-/// Every way an exported call fails. Identities and paths travel as the
+/// Every way an exported call fails. Identities and record ids travel as the
 /// text a screen shows, so a refusal names what was refused rather than
 /// leaving a screen to say that something went wrong.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum PdnError {
-    /// The local grant record covers this claim read-only.
-    #[error("writing {path} of {issuer} is not granted")]
-    WriteNotGranted { issuer: String, path: String },
-
-    /// A grant named an issuer other than the granting identity.
-    #[error("{identity} cannot grant the data of {issuer}")]
-    DelegationUnsupported { identity: String, issuer: String },
-
     /// The counterparty ran the dialogue and refused it. Which of wrong,
     /// expired or already burnt applied is uniform by design.
     #[error("the counterparty refused the ceremony")]
@@ -52,15 +42,6 @@ pub enum PdnError {
     /// This node hosts no such identity.
     #[error("this node does not host {identity}")]
     UnknownIdentity { identity: String },
-
-    /// This node holds nothing of that issuer's data — not an empty
-    /// namespace, no namespace.
-    #[error("this node holds nothing of issuer {issuer}")]
-    UnknownIssuer { issuer: String },
-
-    /// The identity has no connection to that peer.
-    #[error("{identity} has no connection to {peer}")]
-    PeerNotConnected { identity: String, peer: String },
 
     /// An act of this kind is already committed or in flight for this
     /// identity: the identity is hosted already, or a ceremony of its own
@@ -174,55 +155,24 @@ impl PdnError {
 /// The table. Downcasting reaches through `anyhow`'s context layers, so a
 /// service error wrapped on its way out still maps.
 pub(crate) fn table(err: &anyhow::Error) -> PdnError {
-    if let Some(refused) = err.downcast_ref::<WriteNotGranted>() {
-        return PdnError::WriteNotGranted {
-            issuer: refused.issuer.to_string(),
-            path: refused.path.as_str().to_owned(),
-        };
-    }
-    if let Some(refused) = err.downcast_ref::<DelegationUnsupported>() {
-        return PdnError::DelegationUnsupported {
-            identity: refused.identity.to_string(),
-            issuer: refused.issuer.to_string(),
-        };
-    }
     if let Some(unknown) = err.downcast_ref::<UnknownIdentity>() {
         return PdnError::UnknownIdentity {
             identity: unknown.identity.to_string(),
         };
     }
-    if let Some(unknown) = err.downcast_ref::<UnknownIssuer>() {
-        return PdnError::UnknownIssuer {
-            issuer: unknown.issuer.to_string(),
-        };
-    }
-    if let Some(unconnected) = err.downcast_ref::<PeerNotConnected>() {
-        return PdnError::PeerNotConnected {
-            identity: unconnected.identity.to_string(),
-            peer: unconnected.peer.to_string(),
-        };
-    }
     if let Some(kind) = pod_refusal(err) {
         return kind;
-    }
-    if let Some(unspoken) = err.downcast_ref::<UnsupportedInviteVersion>() {
-        return PdnError::UnsupportedPayloadVersion {
-            version: unspoken.version,
-        };
     }
     if let Some(unspoken) = err.downcast_ref::<UnsupportedLinkingVersion>() {
         return PdnError::UnsupportedPayloadVersion {
             version: unspoken.version,
         };
     }
-    if err.downcast_ref::<EstablishmentRefused>().is_some()
-        || err.downcast_ref::<LinkingRefused>().is_some()
-    {
+    if err.downcast_ref::<LinkingRefused>().is_some() {
         return PdnError::CeremonyRefused;
     }
     if err.downcast_ref::<IdentityAlreadyHosted>().is_some()
         || err.downcast_ref::<LinkingInProgress>().is_some()
-        || err.downcast_ref::<EstablishmentInProgress>().is_some()
     {
         return PdnError::ActAlreadyUnderway;
     }
@@ -231,9 +181,7 @@ pub(crate) fn table(err: &anyhow::Error) -> PdnError {
     }
     // The runtime reports a dial still in flight when its bound expires as
     // the dialogue's own timeout, and the table follows it.
-    if err.downcast_ref::<EstablishmentTimeout>().is_some()
-        || err.downcast_ref::<DialogueTimeout>().is_some()
-    {
+    if err.downcast_ref::<DialogueTimeout>().is_some() {
         return PdnError::DialogueTimedOut;
     }
     if err.downcast_ref::<CatchUpTimeout>().is_some() {
@@ -247,7 +195,7 @@ pub(crate) fn table(err: &anyhow::Error) -> PdnError {
 }
 
 /// The pods service's refusals; its ceremony outcomes fold into the kinds
-/// pairing and linking report.
+/// linking reports.
 fn pod_refusal(err: &anyhow::Error) -> Option<PdnError> {
     if let Some(unknown) = err.downcast_ref::<UnknownPod>() {
         return Some(PdnError::UnknownPod {
@@ -303,7 +251,7 @@ fn record_text(record: &pdn_node::RecordRef) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context as _};
-    use pdn_node::{EntryPath, PdnId};
+    use pdn_node::PdnId;
 
     use super::*;
 
@@ -314,28 +262,9 @@ mod tests {
         table(&err.into())
     }
 
-    /// The refusals the runtime's rules produce, each its own kind.
+    /// A ceremony the counterparty refused is its own kind.
     #[test]
     fn refusals_keep_their_kinds() {
-        let path = EntryPath::new("contact/email").unwrap();
-        assert!(matches!(
-            kind(WriteNotGranted {
-                issuer: ISSUER,
-                path,
-            }),
-            PdnError::WriteNotGranted { .. }
-        ));
-        assert!(matches!(
-            kind(DelegationUnsupported {
-                identity: PEER,
-                issuer: ISSUER,
-            }),
-            PdnError::DelegationUnsupported { .. }
-        ));
-        assert!(matches!(
-            kind(EstablishmentRefused),
-            PdnError::CeremonyRefused
-        ));
         assert!(matches!(kind(LinkingRefused), PdnError::CeremonyRefused));
     }
 
@@ -347,29 +276,11 @@ mod tests {
             PdnError::UnknownIdentity { .. }
         ));
         assert!(matches!(
-            kind(UnknownIssuer { issuer: ISSUER }),
-            PdnError::UnknownIssuer { .. }
-        ));
-        assert!(matches!(
-            kind(PeerNotConnected {
-                identity: ISSUER,
-                peer: PEER,
-            }),
-            PdnError::PeerNotConnected { .. }
-        ));
-        assert!(matches!(
             kind(IdentityAlreadyHosted { identity: ISSUER }),
             PdnError::ActAlreadyUnderway
         ));
         assert!(matches!(
             kind(LinkingInProgress { identity: ISSUER }),
-            PdnError::ActAlreadyUnderway
-        ));
-        assert!(matches!(
-            kind(EstablishmentInProgress {
-                identity: ISSUER,
-                peer: PEER,
-            }),
             PdnError::ActAlreadyUnderway
         ));
     }
@@ -383,15 +294,10 @@ mod tests {
             kind(InviterUnreachable),
             PdnError::CounterpartyUnreachable
         ));
-        assert!(matches!(
-            kind(EstablishmentTimeout),
-            PdnError::DialogueTimedOut
-        ));
         assert!(matches!(kind(DialogueTimeout), PdnError::DialogueTimedOut));
-        assert!(matches!(kind(CatchUpTimeout), PdnError::CatchUpTimedOut));
         assert!(matches!(
-            kind(UnsupportedInviteVersion { version: 9 }),
-            PdnError::UnsupportedPayloadVersion { version: 9 }
+            kind(CatchUpTimeout::default()),
+            PdnError::CatchUpTimedOut
         ));
         assert!(matches!(
             kind(UnsupportedLinkingVersion { version: 9 }),
@@ -400,7 +306,7 @@ mod tests {
     }
 
     /// A pod's refusals keep their kinds, and its ceremony outcomes fold
-    /// into the ones pairing and linking report.
+    /// into the ones linking reports.
     #[test]
     fn pod_refusals_keep_their_kinds() {
         use pdn_node::{PodAct, PodId, RecordId, RecordKind, RecordRef};

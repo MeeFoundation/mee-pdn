@@ -6,12 +6,15 @@
 //! every other suite runs on memory, named at its spawn helper.
 
 use anyhow::Result;
+use data_layer::private_metadata::PENDING_DEVICE_TTL;
 use data_layer::{
-    AddrInfoOptions, AuthorId, DirectoryHeld, OpId, PodStore, PrivateMetadataStore, RecordKey,
-    RecordedHosting, Seq, ShareMode, SpawnOptions, SyncNode,
+    pod_ticket_kind, AddrInfoOptions, AuthorId, DirectoryHeld, OpId, PodStore, PodTickets,
+    PrivateMetadataStore, RecordKey, RecordedHosting, Seq, ShareMode, SpawnOptions, SyncNode,
 };
-use pdn_types::{EntryPath, PdnId, PodId, RecordId, RecordKind, RecordRef};
+use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
 use test_utils::{host_identity, ids, pod as c};
+
+const FAMILY: PodId = PodId::from_bytes([0xfa; 16]);
 
 /// Spawn a node on `dir` — the directory-configured counterpart of the
 /// suites' `memory_node`.
@@ -19,37 +22,47 @@ async fn node_on(dir: &std::path::Path) -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions::on_directory(dir)).await
 }
 
-/// The round trip with no peer running: same node id, both stores readable,
-/// the data namespace re-imported from the PMS's own `data` ticket
-/// onto a replica the store already holds (the product path a restarted
-/// runtime walks). The denial beside it: a fresh directory is a different
-/// node holding none of it, and its reopen of a replica it never held
-/// answers absence, not a failure to open.
+/// Every entry a pod's record store holds under `key`, across authors:
+/// what a latest-wins read collapses to one.
+async fn entries_at(node: &SyncNode, holder: PdnId, pod: PodId, key: &RecordKey) -> Result<usize> {
+    let key = key.to_bytes();
+    Ok(node
+        .pod_record_view(holder, pod)
+        .await?
+        .verdicts()
+        .filter(|(entry, _verdict)| entry.key == key)
+        .count())
+}
+
+/// Both of `pod`'s tickets, as `holder`'s PMS publishes them.
+async fn publish_pod(pms: &PrivateMetadataStore, pod: PodId, tickets: &PodTickets) -> Result<()> {
+    pms.put_ticket(
+        &pod_ticket_kind(&pod, PodStore::Membership),
+        &tickets.membership,
+    )
+    .await?;
+    pms.put_ticket(&pod_ticket_kind(&pod, PodStore::Records), &tickets.records)
+        .await?;
+    pms.record_pod(pod, Seq::FIRST).await
+}
+
+/// The round trip with no peer running: same node id, the PMS and a pod's
+/// record store readable, the pod re-imported from the tickets its PMS
+/// holds onto replicas the store already holds (the product path a
+/// restarted runtime walks). The denial beside it: a fresh directory is a
+/// different node holding none of it, and its reopen of a replica it never
+/// held answers absence, not a failure to open.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
-    let payload = b"alice@example.org";
 
     let first = node_on(dir.path()).await?;
     let first_id = first.node_id();
-
-    let pms = host_identity(&first, ids::ALICE).await?;
-    let author = first.default_author(ids::ALICE)?;
+    let (alice, pms) = c::host(&first).await?;
     let pms_namespace = pms.namespace();
-    first.create_namespace(ids::ALICE, ids::ALICE).await?;
-    first
-        .write(ids::ALICE, ids::ALICE, author, &path, payload)
-        .await?;
-    let data_ticket = first
-        .share_ticket(
-            ids::ALICE,
-            ids::ALICE,
-            ShareMode::Write,
-            AddrInfoOptions::Addresses,
-        )
-        .await?;
-    pms.put_ticket("data", &data_ticket).await?;
+    let pod = c::create(&first, &alice).await?;
+    let record = c::place_claim(&first, &alice, pod, 0x01).await?;
+    publish_pod(&pms, pod, &c::tickets(&first, &alice, pod).await?).await?;
     first.shutdown().await?;
     drop(pms);
     drop(first);
@@ -60,26 +73,37 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         first_id,
         "the node id must come from the stored key"
     );
-    second.provision_identity(ids::ALICE).await?;
-    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, pms_namespace)
+    second.provision_identity(alice.id).await?;
+    let reopened = PrivateMetadataStore::open(&second, alice.id, pms_namespace)
         .await?
         .expect("the respawned store must still hold the PMS replica");
-    second.host_identity(ids::ALICE, &reopened)?;
+    second.host_identity(alice.id, &reopened)?;
     assert!(
         reopened.list_devices().await?.contains(&first_id),
         "the PMS's device set must survive the respawn"
     );
-    let stored_ticket = reopened
-        .get_ticket("data")
-        .await?
-        .expect("the data ticket and its payload are local");
-    let _rebound = second
-        .import_namespace(ids::ALICE, ids::ALICE, stored_ticket)
-        .await?;
+    assert_eq!(reopened.held_pods().await?, [pod]);
+    let ticket = |store| {
+        let reopened = &reopened;
+        async move {
+            reopened
+                .get_ticket(&pod_ticket_kind(&pod, store))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("the pod's ticket and its payload are local"))
+        }
+    };
+    let tickets = PodTickets {
+        membership: ticket(PodStore::Membership).await?,
+        records: ticket(PodStore::Records).await?,
+    };
+    second.import_pod(alice.id, pod, tickets).await?;
     assert_eq!(
-        second.read(ids::ALICE, ids::ALICE, &path).await?.as_deref(),
-        Some(payload.as_slice()),
-        "the entry and its payload must come back from the directory alone"
+        second
+            .read_pod_record(alice.id, pod, &record)
+            .await?
+            .as_deref(),
+        Some(b"claim".as_slice()),
+        "the record and its payload must come back from the directory alone"
     );
 
     // Denial: a fresh directory is a different node with none of the state.
@@ -90,13 +114,13 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         first_id,
         "a fresh directory must be a different node"
     );
-    fresh.provision_identity(ids::ALICE).await?;
+    fresh.provision_identity(alice.id).await?;
     assert!(
-        fresh.read(ids::ALICE, ids::ALICE, &path).await.is_err(),
-        "a fresh node must refuse the issuer as unknown"
+        fresh.read_pod_record(alice.id, pod, &record).await.is_err(),
+        "a fresh node must refuse the pod as unknown"
     );
     assert!(
-        PrivateMetadataStore::open(&fresh, ids::ALICE, pms_namespace)
+        PrivateMetadataStore::open(&fresh, alice.id, pms_namespace)
             .await?
             .is_none(),
         "a replica this store never held must be reported absent, not as a failure to open"
@@ -107,85 +131,74 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
 }
 
 /// One author per hosted identity, persisted with that identity's stores:
-/// a path rewritten after a restart replaces its predecessor instead of
-/// accreting beside it under a second author. Every latest-wins read hides
-/// the difference, so the assertion counts live records across authors.
+/// a pod entry rewritten after a restart replaces its predecessor instead
+/// of accreting beside it under a second author. Every latest-wins read
+/// hides the difference, so the assertion counts the entries at the key
+/// across authors.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewrite_after_a_restart_keeps_one_live_record() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
 
     let first = node_on(dir.path()).await?;
-    let pms = host_identity(&first, ids::ALICE).await?;
-    let pms_namespace = pms.namespace();
-    first.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let author = first.default_author(ids::ALICE)?;
+    let (alice, _pms) = c::host(&first).await?;
+    let pod = c::create(&first, &alice).await?;
+    let key = RecordKey::Claim {
+        member: alice.id,
+        id: RecordId::from_bytes([0x01; 16]),
+        mseq: Seq::FIRST,
+    };
     first
-        .write(ids::ALICE, ids::ALICE, author, &path, b"before")
+        .write_pod_entry(alice.id, pod, PodStore::Records, &key.to_bytes(), b"before")
         .await?;
-    let ticket = first
-        .share_ticket(
-            ids::ALICE,
-            ids::ALICE,
-            ShareMode::Write,
-            AddrInfoOptions::Addresses,
-        )
-        .await?;
-    pms.put_ticket("data", &ticket).await?;
+    let tickets = c::tickets(&first, &alice, pod).await?;
     first.shutdown().await?;
-    drop(pms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
-    second.provision_identity(ids::ALICE).await?;
-    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, pms_namespace)
-        .await?
-        .expect("the respawned store must still hold the PMS replica");
-    second.host_identity(ids::ALICE, &reopened)?;
-    let stored_ticket = reopened
-        .get_ticket("data")
-        .await?
-        .expect("the data ticket and its payload are local");
-    let _rebound = second
-        .import_namespace(ids::ALICE, ids::ALICE, stored_ticket)
-        .await?;
-    let author = second.default_author(ids::ALICE)?;
+    second.provision_identity(alice.id).await?;
+    second.import_pod(alice.id, pod, tickets).await?;
     second
-        .write(ids::ALICE, ids::ALICE, author, &path, b"after")
+        .write_pod_entry(alice.id, pod, PodStore::Records, &key.to_bytes(), b"after")
         .await?;
     assert_eq!(
-        second.read(ids::ALICE, ids::ALICE, &path).await?.as_deref(),
+        second
+            .read_pod_record(alice.id, pod, &key.record())
+            .await?
+            .as_deref(),
         Some(b"after".as_slice())
     );
     assert_eq!(
-        second
-            .live_record_count(ids::ALICE, ids::ALICE, &path)
-            .await?,
+        entries_at(&second, alice.id, pod, &key).await?,
         1,
         "a rewrite as the persisted author must replace, not accrete"
     );
 
-    // Denial: a record under a separate author accretes, so the count
+    // Denial: an entry under a separate author accretes, so the count
     // above is an instrument and not a constant.
-    let other_author = second.create_author(ids::ALICE).await?;
+    let other_author = second.create_author(alice.id).await?;
     second
-        .write(ids::ALICE, ids::ALICE, other_author, &path, b"elsewhere")
+        .write_pod_entry_as_for_test(
+            alice.id,
+            pod,
+            PodStore::Records,
+            other_author,
+            &key.to_bytes(),
+            b"elsewhere",
+        )
         .await?;
     assert_eq!(
-        second
-            .live_record_count(ids::ALICE, ids::ALICE, &path)
-            .await?,
+        entries_at(&second, alice.id, pod, &key).await?,
         2,
-        "a second author's record must be countable, or the assertion above proves nothing"
+        "a second author's entry must be countable, or the assertion above proves nothing"
     );
     second.shutdown().await?;
     Ok(())
 }
 
 /// Two identities of one node each keep their own author across a restart:
-/// what a counterparty or a pod binds to an identity on this device is
-/// that identity's author, not the node's.
+/// what a pod binds to an identity on this device is that identity's
+/// author, not the node's.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -225,28 +238,21 @@ async fn each_identity_keeps_its_own_author_across_a_restart() -> Result<()> {
     Ok(())
 }
 
-/// A device withdrawn after a restart stays absent, although the record it
-/// withdraws was written by another author: this node's tombstone leaves
-/// that record live in the replica, and the set reads the device as absent
-/// only because the latest-per-key collapse sees the tombstone before empty
-/// entries are excluded. The restart is load-bearing twice: the tombstone
-/// must be written by the author this identity had before it, and the
-/// buried record must have survived on disk.
-///
-/// The second author is a sibling device of the same identity, which is
-/// where two authors on one connection metadata store come from. Each
-/// side's counterpart half is created locally: registering the pair is
-/// what arms a connection metadata store's ticket bound (Invariant 3),
-/// and only the `own` half is this scenario's subject.
+/// A pending device record another device wrote, tombstoned by this
+/// device's cleanup after a restart, stays absent: the tombstone leaves the
+/// other author's record live in the replica, and the pending set reads the
+/// device as absent only because the latest-per-key collapse sees the
+/// tombstone before empty entries are excluded. The restart is
+/// load-bearing: the buried record has to survive on disk.
+#[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
+async fn a_pending_device_expired_after_a_restart_stays_absent() -> Result<()> {
     use std::str::FromStr as _;
 
-    use data_layer::ConnectionMetadataStore;
     let dir = tempfile::tempdir()?;
-    // A device record must resolve into an endpoint id to list, so the
-    // withdrawn device is a real key that never runs.
-    let withdrawn = pdn_types::NodeId::from_bytes(
+    // A pending record must resolve into an endpoint id to list, so the
+    // abandoned device is a real key that never runs.
+    let abandoned = pdn_types::NodeId::from_bytes(
         *iroh::PublicKey::from_str(
             "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6",
         )
@@ -257,61 +263,57 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
     let first = node_on(dir.path()).await?;
     let pms = host_identity(&first, ids::ALICE).await?;
     let own_node = first.node_id();
-    let cms = ConnectionMetadataStore::create(&first, ids::ALICE).await?;
-    let counterpart = ConnectionMetadataStore::create(&first, ids::ALICE).await?;
-    first.host_connection(ids::ALICE, ids::BOB, &cms, &counterpart)?;
-    cms.ensure_device_published(own_node).await?;
-    let ticket = cms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let pms_namespace = pms.namespace();
     let pms_ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
         .await?;
 
-    // A sibling device of the same identity writes the withdrawn device's
+    // A sibling device of the same identity writes the abandoned device's
     // record, so it stands under another author than the tombstone below.
     let sibling = test_utils::memory_node().await?;
     let sibling_pms = test_utils::join_identity(&sibling, ids::ALICE, pms_ticket).await?;
     pms.add_device(sibling.node_id()).await?;
     sibling_pms.add_device(sibling.node_id()).await?;
-    let sibling_connection =
-        ConnectionMetadataStore::import(&sibling, ids::ALICE, ticket.clone()).await?;
-    let sibling_counterpart = ConnectionMetadataStore::create(&sibling, ids::ALICE).await?;
-    sibling.host_connection(
-        ids::ALICE,
-        ids::BOB,
-        &sibling_connection,
-        &sibling_counterpart,
-    )?;
-    sibling_connection
-        .ensure_device_published(withdrawn)
-        .await?;
+    sibling_pms.add_pending_device(abandoned).await?;
+    // Its payload too: the cleanup reads a record's age from it, and once
+    // the sibling is gone nothing else holds it.
     assert!(
         test_utils::eventually(|| async {
-            Ok(cms.published_devices().await?.contains(&withdrawn))
+            Ok(pms.list_pending_devices().await?.contains(&abandoned)
+                && pms
+                    .pending_device_written_at_for_test(abandoned)
+                    .await?
+                    .is_some())
         })
         .await?,
         "the sibling's record never reached this replica"
     );
     sibling.shutdown().await?;
-    drop(sibling_connection);
+    drop(sibling_pms);
     drop(sibling);
     first.shutdown().await?;
-    drop(cms);
+    drop(pms);
     drop(first);
 
     let second = node_on(dir.path()).await?;
     second.provision_identity(ids::ALICE).await?;
-    let cms = ConnectionMetadataStore::import(&second, ids::ALICE, ticket).await?;
-    cms.withdraw_device(withdrawn).await?;
-    let published = cms.published_devices().await?;
+    let reopened = PrivateMetadataStore::open(&second, ids::ALICE, pms_namespace)
+        .await?
+        .expect("the respawned store must still hold the PMS replica");
+    second.host_identity(ids::ALICE, &reopened)?;
+    let a_day_later = std::time::SystemTime::now() + PENDING_DEVICE_TTL;
+    reopened
+        .cleanup_pending_devices_at_for_test(a_day_later)
+        .await?;
+    let pending = reopened.list_pending_devices().await?;
     assert!(
-        published.contains(&own_node),
-        "the surviving device record must still read: {published:?}"
+        !pending.contains(&abandoned),
+        "a pending record expired after the restart must be absent: {pending:?}"
     );
+    let devices = reopened.list_devices().await?;
     assert!(
-        !published.contains(&withdrawn),
-        "a device withdrawn after the restart must be absent from the set"
+        devices.contains(&own_node),
+        "the surviving device record must still read: {devices:?}"
     );
     second.shutdown().await?;
     Ok(())
@@ -324,12 +326,9 @@ async fn a_device_withdrawn_after_a_restart_stays_absent() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_node_on_a_held_directory_is_refused_by_name() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = EntryPath::new("contact/email")?;
 
     let running = node_on(dir.path()).await?;
-    let _pms = host_identity(&running, ids::ALICE).await?;
-    running.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let author = running.default_author(ids::ALICE)?;
+    let pms = host_identity(&running, ids::ALICE).await?;
 
     let err = node_on(dir.path())
         .await
@@ -340,16 +339,8 @@ async fn a_second_node_on_a_held_directory_is_refused_by_name() -> Result<()> {
     assert_eq!(held.directory, dir.path());
 
     // The running node is unaffected by the refused start.
-    running
-        .write(ids::ALICE, ids::ALICE, author, &path, b"still mine")
-        .await?;
-    assert_eq!(
-        running
-            .read(ids::ALICE, ids::ALICE, &path)
-            .await?
-            .as_deref(),
-        Some(b"still mine".as_slice())
-    );
+    pms.record_pod(FAMILY, Seq::FIRST).await?;
+    assert_eq!(pms.pod_record(FAMILY).await?, Some((Seq::FIRST, true)));
     running.shutdown().await?;
     Ok(())
 }

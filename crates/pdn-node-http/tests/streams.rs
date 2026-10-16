@@ -199,6 +199,9 @@ async fn a_stop_ends_open_streams_within_the_drain() -> Result<()> {
             .await
         }
     });
+    // Under iroh's `rustls-no-provider` the client takes only a process-wide
+    // provider (`plain_http_tls` in `tests/common/mod.rs`).
+    let _already = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::new();
     let mut streams = Vec::new();
     for _ in 0..2 {

@@ -363,8 +363,15 @@ async fn the_last_two_owners_leaving_at_once_leave_the_pod_without_an_owner() ->
     act(carol_phone, carol, 2, EventKind::Left, carol, 3, pod).await?;
     dial(bob_phone, bob, pod, alice_phone, alice).await?;
     dial(bob_phone, bob, pod, carol_phone, carol).await?;
-    for (member, want) in [(alice, OUT), (carol, OUT), (bob, PLAIN)] {
-        assert!(lists(bob_phone, bob.id, pod, member.id, want).await?);
+    for (name, member, want) in [
+        ("alice", alice, OUT),
+        ("carol", carol, OUT),
+        ("bob", bob, PLAIN),
+    ] {
+        if !lists(bob_phone, bob.id, pod, member.id, want).await? {
+            let view = bob_phone.pod_membership_view(bob.id, pod).await;
+            anyhow::bail!("Bob's view does not show {name} as {want:?}: {view:#?}");
+        }
     }
     let owners = bob_phone
         .pod_membership_view(bob.id, pod)
@@ -416,6 +423,11 @@ async fn the_last_two_owners_leaving_at_once_leave_the_pod_without_an_owner() ->
 /// leave the pod without an owner, as two leaves do: the plain member that
 /// remains lists neither. Denied: its own promotion of itself, held and
 /// counted for nothing.
+///
+/// Both of the plain member's sessions are decided before either removal
+/// counts there: once one does, the other owner is a former member whose
+/// device it takes the departure's past alone from, and the act that owner
+/// wrote at the same time lies outside it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_last_two_owners_removing_each_other_leave_the_pod_without_an_owner() -> Result<()> {
     let phones = [node().await?, node().await?, node().await?];
@@ -433,10 +445,22 @@ async fn the_last_two_owners_removing_each_other_leave_the_pod_without_an_owner(
 
     act(alice_phone, alice, 1, EventKind::Removed, carol, 3, pod).await?;
     act(carol_phone, carol, 2, EventKind::Removed, alice, 2, pod).await?;
+    let membership = tickets.membership.capability.id();
+    let held = bob_phone.pause_next_dial_for_test(bob.id, membership, alice_phone.node_id())?;
     dial(bob_phone, bob, pod, alice_phone, alice).await?;
+    held.reached.notified().await;
     dial(bob_phone, bob, pod, carol_phone, carol).await?;
-    for (member, want) in [(alice, OUT), (carol, OUT), (bob, PLAIN)] {
-        assert!(lists(bob_phone, bob.id, pod, member.id, want).await?);
+    assert!(lists(bob_phone, bob.id, pod, alice.id, OUT).await?);
+    held.release.notify_one();
+    for (name, member, want) in [
+        ("alice", alice, OUT),
+        ("carol", carol, OUT),
+        ("bob", bob, PLAIN),
+    ] {
+        if !lists(bob_phone, bob.id, pod, member.id, want).await? {
+            let view = bob_phone.pod_membership_view(bob.id, pod).await;
+            anyhow::bail!("Bob's view does not show {name} as {want:?}: {view:#?}");
+        }
     }
     let owners = bob_phone
         .pod_membership_view(bob.id, pod)

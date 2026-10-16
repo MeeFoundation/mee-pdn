@@ -109,16 +109,10 @@ run-image:
   BIND=${BIND:-127.0.0.1}
   docker run --rm -e PDN_DEBUG=1 -p "${BIND}:${PORT}:3011" {{ image }}
 
-# The live demos: several nodes on one network, driven through their debug
+# The live demo: several nodes on one network, driven through their debug
 # surfaces while everything between them runs over the runtimes' own
-# protocols. Connections: Alice with two personas on a phone plus a laptop,
-# Bob and Carol with a phone and a laptop each, sharing through grants.
-[doc("Run the connections demo across containers (needs docker)")]
-demo-connections:
-  @sh scripts/run-demo.sh connections
-
-# Pods: Alice, Bob, Carol and Dave in one pod, which carries on while its
-# creator's devices are offline.
+# protocols. Alice, Bob, Carol and Dave in one pod, which carries on while
+# its creator's devices are offline.
 [doc("Run the pods demo across containers (needs docker)")]
 demo-pods:
   @sh scripts/run-demo.sh pods
@@ -219,8 +213,9 @@ check: _check-devcontainer-tools
 check-fix:
   #!/bin/sh
   set -eux
-  cargo fmt --all
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh) --fix --allow-dirty --allow-staged
+  # After the fixes: clippy writes them unformatted.
+  cargo fmt --all
   # Both configurations: the product build first — a break there is invisible
   # to a run that only ever enables the dev feature. Product targets only:
   # `--all-targets` builds the dev targets, and a dev-dependency on

@@ -653,3 +653,218 @@ async fn co_located_members_converge_and_a_co_located_ticket_holder_takes_nothin
     tablet.shutdown().await?;
     Ok(())
 }
+
+/// A pod pass short enough that a refusal is waited out over several runs.
+const POD_RUN: Duration = Duration::from_millis(200);
+
+async fn pod_pass_node() -> Result<SyncNode> {
+    SyncNode::spawn(SpawnOptions {
+        reconcile_interval: QUIET,
+        pod_reconcile_interval: POD_RUN,
+        ..SpawnOptions::memory()
+    })
+    .await
+}
+
+/// A device its identity's PMS lists as pending is served nothing of a
+/// pod's record store by its sibling, while a confirmed device of the
+/// identity is served the store whole, and the pending device is served
+/// once it is confirmed.
+///
+/// Denied: the pending device takes nothing over several of its pod passes,
+/// ordered after the confirmed device has taken the record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_device_registration_confers_nothing() -> Result<()> {
+    use test_utils::pod as c;
+
+    let phone = pod_pass_node().await?;
+    let tablet = pod_pass_node().await?;
+    let laptop = pod_pass_node().await?;
+    let (bob, phone_pms) = c::host(&phone).await?;
+    let pod = c::create(&phone, &bob).await?;
+    let record = c::place_claim(&phone, &bob, pod, 0x01).await?;
+    let pms_ticket = phone_pms
+        .share_ticket(data_layer::ShareMode::Write, AddrInfoOptions::Addresses)
+        .await?;
+    let _tablet_pms = join_identity(&tablet, bob.id, pms_ticket.clone()).await?;
+    let _laptop_pms = join_identity(&laptop, bob.id, pms_ticket).await?;
+    phone_pms.add_device(tablet.node_id()).await?;
+    // The registration a linking dialogue leaves on the inviter.
+    phone_pms.add_pending_device(laptop.node_id()).await?;
+    let tickets = c::tickets(&phone, &bob, pod).await?;
+    for device in [&tablet, &laptop] {
+        device.import_pod(bob.id, pod, tickets.clone()).await?;
+    }
+
+    assert!(
+        c::reads(&tablet, bob.id, pod, record).await?,
+        "a confirmed device of the identity was not served the record store"
+    );
+    // Denied: pending is not a device, waited out over several pod passes.
+    tokio::time::sleep(POD_RUN * 5).await;
+    assert_eq!(
+        c::held_records(&laptop, bob.id, pod).await?,
+        Vec::<String>::new(),
+        "a pending registration was served the record store"
+    );
+
+    phone_pms.confirm_device(laptop.node_id()).await?;
+    assert!(
+        c::reads(&laptop, bob.id, pod, record).await?,
+        "the device was not served once confirmed"
+    );
+
+    for node in [phone, tablet, laptop] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A caller is admitted for the member it names only where that member's
+/// device statement lists the caller's node: Alice's own node, which her
+/// join statement names, is served a pod's record store, and a node that
+/// names her identity without being one of her devices is refused as if
+/// the replica were not hosted.
+///
+/// Denied: the impersonating node's session is refused and its replica of
+/// the record store stays empty, beside the identical session from Alice's
+/// node that succeeds. Both sessions name the identities themselves,
+/// through the fixture that lets a caller choose them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_is_admitted_only_where_the_named_identity_lists_its_node() -> Result<()> {
+    use test_utils::pod as c;
+
+    let bob_phone = node(QUIET).await?;
+    let alice_phone = node(QUIET).await?;
+    let mallory = node(QUIET).await?;
+    let (bob, _) = c::host(&bob_phone).await?;
+    let (alice, _) = c::host(&alice_phone).await?;
+    let (dave, _) = c::host(&mallory).await?;
+    let pod = c::create(&bob_phone, &bob).await?;
+    c::invite(
+        &bob_phone,
+        &bob,
+        pod,
+        &alice,
+        vec![c::device_of(&alice_phone, &alice)?],
+    )
+    .await?;
+    let record = c::place_claim(&bob_phone, &bob, pod, 0x01).await?;
+    let tickets = c::tickets(&bob_phone, &bob, pod).await?;
+    let records = tickets.records.capability.id();
+    alice_phone
+        .import_pod(alice.id, pod, tickets.clone())
+        .await?;
+    mallory.import_pod(dave.id, pod, tickets).await?;
+
+    let toward_bob = Contact::new(bob_phone.dial_handle().addr(), identity_of(bob.id));
+    alice_phone
+        .sync_namespace_as_for_test(alice.id, records, toward_bob.clone(), identity_of(alice.id))
+        .await?;
+    assert!(
+        c::reads(&alice_phone, alice.id, pod, record).await?,
+        "a device of the named member must be served"
+    );
+
+    // Denied: a node Alice's statements do not list, claiming her identity.
+    let refused = mallory
+        .sync_namespace_as_for_test(dave.id, records, toward_bob, identity_of(alice.id))
+        .await
+        .expect_err("a caller the named member's statements do not list must be refused");
+    assert!(
+        format!("{refused:#}").contains("NotFound"),
+        "the refusal must be the not-hosted abort, got: {refused:#}"
+    );
+    assert_eq!(
+        c::held_records(&mallory, dave.id, pod).await?,
+        Vec::<String>::new(),
+        "an impersonating caller obtained records"
+    );
+
+    for node in [bob_phone, alice_phone, mallory] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Three refusals are one answer: a session for a namespace the node does
+/// not host, one naming an identity the node does not host, and one from a
+/// caller that is no member of the pod whose store it names are each
+/// aborted as not found, which the codec writes as one frame
+/// (`a_refusal_is_six_bytes_on_the_wire` in pdn-store's `net/codec.rs`).
+///
+/// Allowed beside them: the member's own session on the same store.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_refusal_is_the_frame_an_unhosted_replica_produces() -> Result<()> {
+    use test_utils::pod as c;
+
+    let bob_phone = node(QUIET).await?;
+    let dialer = node(QUIET).await?;
+    let (bob, _) = c::host(&bob_phone).await?;
+    let (alice, _) = c::host(&dialer).await?;
+    let (dave, _) = c::host(&dialer).await?;
+    let pod = c::create(&bob_phone, &bob).await?;
+    c::invite(
+        &bob_phone,
+        &bob,
+        pod,
+        &alice,
+        vec![c::device_of(&dialer, &alice)?],
+    )
+    .await?;
+    let tickets = c::tickets(&bob_phone, &bob, pod).await?;
+    let records = tickets.records.capability.id();
+    dialer.import_pod(alice.id, pod, tickets.clone()).await?;
+    dialer.import_pod(dave.id, pod, tickets).await?;
+    let elsewhere = c::create_at(&dialer, &dave, [0x0e; 16]).await?;
+    let (_membership, unhosted_namespace) = dialer.pod_stores(dave.id, elsewhere)?;
+
+    let addr = bob_phone.dial_handle().addr();
+    let as_bob = Contact::new(addr.clone(), identity_of(bob.id));
+    let as_nobody = Contact::new(addr, identity_of(PdnId::from_bytes([0x5f; 32])));
+    for (what, refused) in [
+        (
+            "a namespace the node does not host",
+            dialer
+                .sync_namespace_as_for_test(
+                    dave.id,
+                    unhosted_namespace,
+                    as_bob.clone(),
+                    identity_of(dave.id),
+                )
+                .await,
+        ),
+        (
+            "an identity the node does not host",
+            dialer
+                .sync_namespace_as_for_test(dave.id, records, as_nobody, identity_of(dave.id))
+                .await,
+        ),
+        (
+            "a caller that is no member",
+            dialer
+                .sync_namespace_as_for_test(dave.id, records, as_bob.clone(), identity_of(dave.id))
+                .await,
+        ),
+    ] {
+        let refused = refused.expect_err(what);
+        assert!(
+            matches!(
+                refused.downcast_ref::<pdn_store::net::ConnectError>(),
+                Some(pdn_store::net::ConnectError::RemoteAbort(
+                    pdn_store::net::AbortReason::NotFound
+                ))
+            ),
+            "{what} was refused otherwise: {refused:#}"
+        );
+    }
+    // Allowed: the member's own session on the same store.
+    dialer
+        .sync_namespace_as_for_test(alice.id, records, as_bob, identity_of(alice.id))
+        .await?;
+
+    for node in [bob_phone, dialer] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

@@ -5,11 +5,11 @@
 //! event, writes the joined event the newcomer signs, and only then hands
 //! over both stores' write tickets —
 //! the membership acts, and placing, editing and reading records. The join's
-//! refusals are uniform, as pairing's are. The stores underneath are the
+//! refusals are uniform, as linking's are. The stores underneath are the
 //! data layer's pod stores.
 
 use std::{
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -30,8 +30,8 @@ use tokio::{
 };
 
 use crate::{
-    pairing::{
-        read_message, write_message, InviterUnreachable, DEFAULT_INVITE_LIFETIME,
+    ceremony::{
+        read_message, write_message, InviterUnreachable, StateSlot, DEFAULT_INVITE_LIFETIME,
         MAX_WIRE_MESSAGE_LEN,
     },
     runtime::{CleanupSupervisor, Runtime, ServingHalves, State},
@@ -92,7 +92,7 @@ pub struct UnsupportedPodInviteVersion {
 /// The dialogue reached the inviter and ended without the tickets, or with
 /// an offer the joiner refuses: another pod's created event, a sequence past
 /// the joiner's own history, tickets to stores the created event does not
-/// name. Reasonless by design, as [`crate::EstablishmentRefused`] is.
+/// name. Reasonless by design, as [`crate::LinkingRefused`] is.
 /// Downcast from the `anyhow::Error` of `join`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("join refused by the inviter")]
@@ -1303,6 +1303,14 @@ where
     {
         return Err(Refused);
     }
+    #[cfg(feature = "test-util")]
+    {
+        let pause = state.lock().await.join_serve_pause.take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
     let (node, identity, pod) = {
         let mut state = state.lock().await;
         // Before any state change.
@@ -1323,6 +1331,19 @@ where
     if !inviter.state.member {
         return Err(Refused);
     }
+    // The PMS lists a device linked a moment ago, which the pod's
+    // statements may not name yet.
+    let mut inviter_devices: Vec<pdn_types::NodeId> = {
+        let state = state.lock().await;
+        state
+            .hosted(identity)
+            .map_err(|_unhosted| Refused)?
+            .pms
+            .list_devices()
+            .await
+            .map_err(failed("listing the inviter's devices"))?
+    };
+    inviter_devices.extend(inviter.devices.iter().map(|device| device.node));
     let actor_seq = inviter.run();
     let known = membership.member(&request.joiner);
     let (seq, write_joined) = offered_seq(
@@ -1428,10 +1449,17 @@ where
         Some(ForgedJoin::TicketsOf(other)) => other,
         _ => pod,
     };
-    let tickets = node
+    let mut tickets = node
         .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
         .await
         .map_err(failed("minting the tickets"))?;
+    // The inviter's other devices this node knows how to reach: without an
+    // address lookup, a joiner whose inviting device goes away knows the
+    // others by node id alone and could never reach them.
+    let siblings = node.known_addrs(&inviter_devices).await;
+    for ticket in [&mut tickets.membership, &mut tickets.records] {
+        ticket.nodes.extend(siblings.iter().cloned());
+    }
     write_message(
         send,
         &JoinTickets {
@@ -1475,10 +1503,6 @@ async fn record_pod(
     }
     pms.record_pod(pod, seq).await
 }
-
-/// Filled once, right after the node spawns, and held weakly, as pairing's
-/// slot is.
-pub(crate) type StateSlot = Arc<OnceLock<Weak<Mutex<State>>>>;
 
 /// The accept side of the join dialogue.
 #[derive(Debug, Clone)]

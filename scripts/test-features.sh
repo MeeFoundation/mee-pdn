@@ -1,10 +1,9 @@
 #!/bin/sh
 # The dev feature flags for a cargo arg list. `pdn-node/test-util` enables
-# the write-retraction scenario tests' courtesy-bypass surface and turns on
-# `data-layer/test-util` under it; `data-layer/test-util` is the same
-# observation surface reached directly; `pdn-node-http/observation` serves it
-# over HTTP, and `pdn-mobile/observation` serves it on a phone's loopback. A
-# selection gets the flag of the package it names, because cargo
+# the runtime's fault and pause hooks and turns on `data-layer/test-util`,
+# data-layer's observation surface, under it; `pdn-node-http/observation`
+# serves that surface over HTTP, and `pdn-mobile/observation` on a phone's
+# loopback. A selection gets the flag of the package it names, because cargo
 # rejects a feature of a package it leaves out; one naming none of them gets
 # nothing. Dev builds only — never a product build.
 set -eu

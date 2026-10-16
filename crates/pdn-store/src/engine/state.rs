@@ -79,6 +79,27 @@ impl NamespaceStates {
             .is_some_and(|peer| matches!(peer.state, SyncState::Running { .. }))
     }
 
+    /// The counterparts of `namespace`'s running exchanges, each with how
+    /// it began.
+    pub fn running_described(&self, namespace: &NamespaceId) -> Vec<String> {
+        self.0.get(namespace).map_or_else(Vec::new, |state| {
+            state
+                .nodes
+                .iter()
+                .filter_map(
+                    |((peer, counterpart), peer_state)| match &peer_state.state {
+                        SyncState::Running { origin, .. } => Some(format!(
+                            "{} as {} ({origin:?})",
+                            peer.fmt_short(),
+                            counterpart.fmt_short()
+                        )),
+                        SyncState::Idle => None,
+                    },
+                )
+                .collect()
+        })
+    }
+
     /// The exchanges of `namespace` running, dialed or accepted.
     pub fn running(&self, namespace: &NamespaceId) -> usize {
         self.0.get(namespace).map_or(0, |state| {
@@ -302,7 +323,7 @@ impl PeerState {
         let outcome = match &self.state {
             SyncState::Idle => AcceptOutcome::Allow {
                 filter: None,
-                ingest: None,
+                ingest: crate::filter::admit_all(),
                 recheck: None,
             },
             SyncState::Running { origin, .. } => match origin {
@@ -314,7 +335,7 @@ impl PeerState {
                     match expected_sync_direction((me, own_identity), (node, caller)) {
                         SyncDirection::Accept => AcceptOutcome::Allow {
                             filter: None,
-                            ingest: None,
+                            ingest: crate::filter::admit_all(),
                             recheck: None,
                         },
                         SyncDirection::Connect => {

@@ -2,9 +2,17 @@
 # laptop each, Carol and Dave with a phone — enough for a pod to outlive its
 # creator's devices going offline while its other members carry on.
 #
-# One network, loopback-published HTTP and a named volume per node, for the
-# reasons `compose-connections.yml` gives. The ports sit apart from that
-# demo's, so the two shows can run side by side.
+# One network: between the nodes everything runs over the runtimes' own
+# protocols on it. The HTTP surface of each node is published on loopback,
+# where the narration drives it. Loopback because the debug surface is
+# unauthenticated and mints live ceremony secrets, so a wider bind is never
+# the default.
+#
+# Each node keeps its state on a named volume of its own, mounted over the
+# image's state directory (the image's PDN_DATA_DIR already points there) —
+# a stopped node started again mid-show is the same node. The demo recipe
+# removes the volumes with the containers on every exit, so a run never
+# meets the previous run's state.
 
 name: pdn-demo-pods
 

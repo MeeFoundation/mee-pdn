@@ -11,7 +11,7 @@ use anyhow::Result;
 use data_layer::{DocTicket, PrivateMetadataStore, SpawnOptions, SyncNode};
 
 pub mod pod;
-use pdn_types::{EntryPath, NodeId, PdnId};
+use pdn_types::{NodeId, PdnId};
 
 /// A node on memory storage — what the in-process suites run on.
 pub async fn memory_node() -> Result<SyncNode> {
@@ -77,26 +77,6 @@ where
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-/// Wait until `is_connected(peer)` on the PMS `pms` equals `want`.
-pub async fn wait_connected(pms: &PrivateMetadataStore, peer: PdnId, want: bool) -> Result<bool> {
-    eventually(|| async { Ok(pms.is_connected(peer).await? == want) }).await
-}
-
-/// Wait until the entry at `path` under `issuer`, as `identity` holds it,
-/// reads as exactly `expected`.
-pub async fn wait_entry_is(
-    node: &SyncNode,
-    identity: PdnId,
-    issuer: PdnId,
-    path: &EntryPath,
-    expected: &[u8],
-) -> Result<bool> {
-    eventually(|| async {
-        Ok(node.read(identity, issuer, path).await?.as_deref() == Some(expected))
-    })
-    .await
 }
 
 /// Wait until the device set of `pms` contains every id in `want`.

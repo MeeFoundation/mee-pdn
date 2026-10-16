@@ -13,7 +13,7 @@ observation = ["pdn-node/test-util", "dep:futures-lite"]
 [dependencies]
 anyhow = "1"
 futures-lite = { version = "2", optional = true }
-# `json` for the structured response bodies; entry payloads travel raw.
+# `json` for the structured response bodies; record payloads travel raw.
 axum = { version = "0.8", features = ["json"] }
 pdn-node = { path = "../pdn-node" }
 serde = { version = "1", features = ["derive"] }
@@ -27,10 +27,12 @@ tracing-subscriber = "0.3"
 
 [dev-dependencies]
 pdn-node = { path = "../pdn-node", features = ["test-util"] }
-percent-encoding = "2"
-# The stand's transport: a client over a container's published port. No TLS
-# backend — the stand speaks plain HTTP to loopback and nothing else.
-reqwest = { version = "0.12", default-features = false }
+# The stand's transport: a client over a container's published port, plain
+# HTTP to loopback. iroh 1.3 turns on this reqwest's `rustls-no-provider`, so
+# the client takes a TLS configuration of its own: `plain_http_tls`.
+reqwest = { version = "0.13", default-features = false }
+# Only for `plain_http_tls`, which iroh 1.3 forces on the stand's client.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 testcontainers = "0.28"
 # `io-util` for the stand's log follower, which re-attaches a container's
 # log capture after a restart; the crate's own build needs no reader.

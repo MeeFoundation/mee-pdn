@@ -12,8 +12,6 @@
 //! HTTP travels.
 
 mod bind;
-mod connections;
-mod data;
 mod error;
 mod identity;
 #[cfg(feature = "observation")]
@@ -29,7 +27,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse as _, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post},
     Router,
 };
 use pdn_node::{Runtime, SyncService as _};
@@ -47,7 +45,7 @@ pub use crate::{
 };
 
 /// Replaces axum's undocumented 2 MB default: comfortably above a demo
-/// entry, far short of `pdn-store`'s 1 GB wire ceiling. Past it, axum
+/// record, far short of `pdn-store`'s 1 GB wire ceiling. Past it, axum
 /// answers 413 directly, outside the error table.
 pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Requests the `/debug/` subtree serves at once; past it, 503.
@@ -149,8 +147,8 @@ async fn live(State(_runtime): State<Arc<Runtime>>) -> &'static str {
 }
 
 /// The storage read is the half that can say no: a full disk leaves the
-/// replica store refusing every operation while the in-memory bookkeeping
-/// keeps reporting a healthy node.
+/// replica and blob stores refusing every operation while the in-memory
+/// bookkeeping keeps reporting a healthy node.
 async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, HostError> {
     with_runtime_budget(runtime.sync().hosted_identities()).await?;
     with_runtime_budget(runtime.sync().check_storage()).await?;
@@ -183,13 +181,10 @@ async fn permit_any_origin(request: Request, next: Next) -> Response {
 }
 
 /// One route to one service call. Deliberately absent, and to stay absent:
-/// any namespace ticket handover (a harness that arranged a granted
-/// namespace by importing its ticket would keep passing after the grant
-/// binder broke), a pod store's ticket or a raw entry written into it (a
-/// path the runtime's own callers lack; forgeries are the data layer's
-/// tests), anything that forces a reconciliation (waiting is repeating the
-/// read), anything that resets state, and any handler addressing another
-/// host.
+/// a pod store's ticket or a raw entry written into it (a path the
+/// runtime's own callers lack; forgeries are the data layer's tests),
+/// anything that forces a reconciliation (waiting is repeating the read),
+/// anything that resets state, and any handler addressing another host.
 fn debug_routes() -> Router<Arc<Runtime>> {
     Router::new()
         .route("/debug/status", get(debug_status))
@@ -202,36 +197,6 @@ fn debug_routes() -> Router<Arc<Runtime>> {
             post(identity::linking_invite),
         )
         .route("/debug/link", post(identity::link))
-        .route(
-            "/debug/identities/{identity}/invite",
-            post(connections::invite),
-        )
-        .route(
-            "/debug/identities/{identity}/establish",
-            post(connections::establish),
-        )
-        .route(
-            "/debug/identities/{identity}/connections",
-            get(connections::list),
-        )
-        .route(
-            "/debug/identities/{identity}/grants/{peer}",
-            post(connections::publish_grant).get(connections::read_grants),
-        )
-        .route(
-            "/debug/identities/{identity}/own-grants/{peer}",
-            get(connections::read_own_grants),
-        )
-        .route(
-            "/debug/identities/{identity}/grants/{peer}/{issuer}",
-            delete(connections::withdraw_grant),
-        )
-        .route("/debug/claim-id/{issuer}/{*path}", get(data::claim_id))
-        .route("/debug/data/{identity}/{issuer}", get(data::list))
-        .route(
-            "/debug/data/{identity}/{issuer}/{*path}",
-            put(data::write).get(data::read),
-        )
         .route(
             "/debug/identities/{identity}/pods",
             post(pods::create).get(pods::list),

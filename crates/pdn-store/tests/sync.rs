@@ -258,6 +258,127 @@ async fn sync_continues_after_invalid_gossip_message() -> Result<()> {
     Ok(())
 }
 
+/// An entry broadcast on the replica's gossip topic is dropped, never
+/// inserted, while the replica keeps converging over the reconciliation an
+/// announcement triggers.
+///
+/// The broadcast entry is valid for the namespace — signed with its secret,
+/// by an author the writer never used — so only the rule that content does
+/// not ride the topic keeps it out; a write announced afterwards orders the
+/// absence, and no node holds the entry for a session to carry.
+#[tokio::test]
+#[traced_test]
+async fn an_entry_broadcast_on_the_topic_is_dropped() -> Result<()> {
+    let mut rng = test_rng(b"an_entry_broadcast_on_the_topic_is_dropped");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let author0 = clients[0].docs().author_create().await?;
+    let doc0 = clients[0].docs().create().await?;
+    let hash_k1 = doc0
+        .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
+        .await?;
+    let writer_ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    let doc1 = clients[1].docs().import(writer_ticket.clone()).await?;
+    let mut events1 = doc1.subscribe().await?;
+    next_event_matching(
+        &mut events1,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == hash_k1),
+    )
+    .await;
+
+    let subscriber_ticket = doc1
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let namespace = writer_ticket.capability.id();
+    let sender_endpoint = Endpoint::builder(presets::Minimal).bind().await?;
+    let lookup = MemoryLookup::new();
+    sender_endpoint.address_lookup()?.add(lookup.clone());
+    let mut bootstrap = Vec::new();
+    for addr in writer_ticket
+        .nodes
+        .iter()
+        .chain(subscriber_ticket.nodes.iter())
+    {
+        bootstrap.push(addr.id);
+        if !addr.is_empty() {
+            lookup.add_endpoint_info(addr.clone());
+        }
+    }
+    let sender_gossip = Gossip::builder().spawn(sender_endpoint.clone());
+    let sender_router = Router::builder(sender_endpoint.clone())
+        .accept(iroh_gossip::ALPN, sender_gossip.clone())
+        .spawn();
+    let topic = sender_gossip
+        .subscribe(TopicId::from(namespace.to_bytes()), bootstrap)
+        .await?;
+    let (sender, mut sender_events) = topic.split();
+    let subscriber = nodes[1].id();
+    loop {
+        let event = sender_events
+            .try_next()
+            .await?
+            .context("gossip stream ended")?;
+        if matches!(event, GossipEvent::NeighborUp(peer) if peer == subscriber) {
+            break;
+        }
+    }
+
+    let pdn_store::Capability::Write(secret) = &writer_ticket.capability else {
+        bail!("a write ticket carries the namespace secret");
+    };
+    let pusher = pdn_store::Author::new(&mut rng);
+    let pushed = pdn_store::SignedEntry::from_parts(
+        secret,
+        &pusher,
+        b"pushed",
+        pdn_store::Record::new_current(Hash::new(b"pushed"), 6),
+    );
+    /// The engine's gossip message as it reads on the wire: postcard numbers
+    /// the variants, and `Put` is the first.
+    #[derive(serde::Serialize)]
+    enum Op {
+        Put(pdn_store::SignedEntry),
+    }
+    sender
+        .broadcast_neighbors(Bytes::from(postcard::to_stdvec(&Op::Put(pushed))?))
+        .await?;
+    drop((sender, sender_events));
+    let sender_id = sender_endpoint.id();
+    next_event_matching(
+        &mut events1,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::NeighborDown(peer) if *peer == sender_id),
+    )
+    .await;
+
+    let hash_k2 = doc0
+        .set_bytes(author0, b"k2".to_vec(), b"v2".to_vec())
+        .await?;
+    next_event_matching(
+        &mut events1,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == hash_k2),
+    )
+    .await;
+    assert!(
+        doc1.get_exact(pusher.id(), b"pushed", true)
+            .await?
+            .is_none(),
+        "an entry broadcast on the topic was inserted"
+    );
+
+    sender_router.shutdown().await?;
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// Test subscribing to replica events (without sync)
 #[tokio::test]
 #[traced_test]
@@ -1745,7 +1866,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
                         });
                         SessionAccess::Allow {
                             egress: Some(reached),
-                            ingest: None,
+                            ingest: pdn_store::admit_all(),
                             rests_on: RestsOn::Nothing,
                         }
                     }
@@ -1765,7 +1886,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
                 });
                 SessionAccess::Allow {
                     egress: Some(slow_egress),
-                    ingest: None,
+                    ingest: pdn_store::admit_all(),
                     rests_on: RestsOn::Nothing,
                 }
             } else {

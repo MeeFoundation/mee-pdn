@@ -1,48 +1,79 @@
-//! Two devices of one identity (Alice) replicate her stores: the PMS
-//! and the data namespace she issues. Both nodes host Alice the way the
-//! product does — her own stores, her PMS naming the device — so a
-//! session is judged by her records rather than by ticket possession.
+//! Two devices of one identity (Alice) replicate her PMS. Both nodes host
+//! Alice the way the product does — her PMS naming the device — though a
+//! PMS session is served on its ticket alone (Invariant 1).
 
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, CatchUpTimeout, PrivateMetadataStore, ShareMode};
-use pdn_types::EntryPath;
-use test_utils::{
-    eventually, host_identity, ids, join_identity, memory_node, wait_connected, wait_entry_is,
-    TIMEOUT,
+use data_layer::{
+    pod_ticket_kind, AddrInfoOptions, CatchUpTimeout, DocTicket, PodStore, PrivateMetadataStore,
+    RecordKey, Seq, ShareMode, SyncNode,
 };
+use pdn_types::{PodId, RecordId};
+use test_utils::{eventually, host_identity, ids, join_identity, memory_node, TIMEOUT};
 
-/// Both stores replicate to the laptop: the connection and the data entry
-/// written before the import arrive as catch-up, a disconnect and a data
-/// write made after the swarm is joined arrive live.
-///
-/// Denied: the laptop is served only once Alice's PMS lists it, so
-/// the assertion rests on her device set and not on the ticket it holds.
+const FAMILY: PodId = PodId::from_bytes([0xfa; 16]);
+
+/// Whether `pms` comes to read `want` as `pod`'s record.
+async fn wait_pod_record(
+    pms: &PrivateMetadataStore,
+    pod: PodId,
+    want: Option<(Seq, bool)>,
+) -> Result<bool> {
+    eventually(|| async { Ok(pms.pod_record(pod).await? == want) }).await
+}
+
+/// Whether `pms` comes to read `want` under `kind`.
+async fn wait_ticket(pms: &PrivateMetadataStore, kind: &str, want: &DocTicket) -> Result<bool> {
+    eventually(|| async {
+        Ok(pms
+            .get_ticket(kind)
+            .await?
+            .is_some_and(|got| got.to_string() == want.to_string()))
+    })
+    .await
+}
+
+/// A ticket of its own replica, so each write of a test carries a payload
+/// no other write does.
+async fn fresh_ticket(node: &SyncNode) -> Result<DocTicket> {
+    PrivateMetadataStore::create(node, ids::ALICE)
+        .await?
+        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await
+}
+
+/// Alice's phone and laptop, each hosting her and listing the laptop as her
+/// device, as linking leaves them.
+async fn two_devices() -> Result<(
+    SyncNode,
+    PrivateMetadataStore,
+    SyncNode,
+    PrivateMetadataStore,
+)> {
+    let phone = memory_node().await?;
+    let laptop = memory_node().await?;
+    let phone_pms = host_identity(&phone, ids::ALICE).await?;
+    let ticket = phone_pms
+        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
+    phone_pms.add_device(laptop.node_id()).await?;
+    laptop_pms.add_device(laptop.node_id()).await?;
+    Ok((phone, phone_pms, laptop, laptop_pms))
+}
+
+/// Alice's PMS replicates to the laptop: a pod record written before the
+/// import arrives as catch-up, and the pod's tombstone and a ticket written
+/// after it arrive live.
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_two_devices() -> Result<()> {
-    // Two devices of Alice
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
-    // Phone owns the PMS and already has a connection to Bob recorded
-    // before the laptop imports — so the laptop must catch this up via the
-    // initial set-reconciliation when it imports.
     let phone_pms = host_identity(&phone, ids::ALICE).await?;
-    phone_pms.connect(ids::BOB).await?;
+    phone_pms.record_pod(FAMILY, Seq::FIRST).await?;
 
-    // Phone also issues Alice's data namespace, with one entry written
-    // before the laptop imports — same catch-up path, data-namespace store.
-    let author = phone.default_author(ids::ALICE)?;
-    phone.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let name = EntryPath::new("contact/name")?;
-    phone
-        .write(ids::ALICE, ids::ALICE, author, &name, b"Alice")
-        .await?;
-
-    // The laptop joins Alice, and the phone's PMS records it as one
-    // of her devices — the product's own order, and what makes the phone
-    // serve the laptop at all.
     let pms_ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -50,53 +81,23 @@ async fn sync_two_devices() -> Result<()> {
     phone_pms.add_device(laptop.node_id()).await?;
     laptop_pms.add_device(laptop.node_id()).await?;
 
-    let data_ticket = phone
-        .share_ticket(
-            ids::ALICE,
-            ids::ALICE,
-            ShareMode::Write,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    laptop
-        .import_namespace(ids::ALICE, ids::ALICE, data_ticket)
-        .await?;
-
-    // Catch-up: Bob replicates to laptop (reconciliation on import).
     assert!(
-        wait_connected(&laptop_pms, ids::BOB, true).await?,
-        "laptop did not catch up connect(bob) from phone"
+        wait_pod_record(&laptop_pms, FAMILY, Some((Seq::FIRST, true))).await?,
+        "laptop did not catch up the pod record from phone"
     );
 
-    // Catch-up: the pre-import data entry replicates to laptop.
+    phone_pms.tombstone_pod(FAMILY, Seq::new(2)).await?;
     assert!(
-        wait_entry_is(&laptop, ids::ALICE, ids::ALICE, &name, b"Alice").await?,
-        "laptop did not catch up the contact/name entry from phone"
+        wait_pod_record(&laptop_pms, FAMILY, Some((Seq::new(2), false))).await?,
+        "laptop did not observe the pod's tombstone from phone"
     );
 
-    // Live update: a fresh disconnect on phone propagates to laptop (the
-    // swarm is joined by now), and the tombstone flips Bob to not-live.
-    phone_pms.disconnect(ids::BOB).await?;
+    let kind = pod_ticket_kind(&FAMILY, PodStore::Records);
+    let ticket = fresh_ticket(&phone).await?;
+    phone_pms.put_ticket(&kind, &ticket).await?;
     assert!(
-        wait_connected(&laptop_pms, ids::BOB, false).await?,
-        "laptop did not observe disconnect(bob) from phone"
-    );
-
-    // Live update: a fresh data write on phone reaches laptop the same way.
-    let email = EntryPath::new("contact/email")?;
-    phone
-        .write(ids::ALICE, ids::ALICE, author, &email, b"alice@example.org")
-        .await?;
-    assert!(
-        wait_entry_is(
-            &laptop,
-            ids::ALICE,
-            ids::ALICE,
-            &email,
-            b"alice@example.org"
-        )
-        .await?,
-        "laptop did not observe the live contact/email write from phone"
+        wait_ticket(&laptop_pms, &kind, &ticket).await?,
+        "laptop did not observe the live ticket from phone"
     );
 
     phone.shutdown().await?;
@@ -104,93 +105,47 @@ async fn sync_two_devices() -> Result<()> {
     Ok(())
 }
 
-/// Concurrent writes to the same key on both devices converge: both replicas
-/// end up holding the same value. Which write wins is decided by timestamps
-/// and is deliberately not asserted — only that the devices agree.
+/// Concurrent ticket updates of one kind on both devices converge: both
+/// replicas end up reading the same ticket, one of the two written. Which
+/// write wins is decided by timestamps and is not asserted.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_converge() -> Result<()> {
-    let phone = memory_node().await?;
-    let laptop = memory_node().await?;
+    let (phone, phone_pms, laptop, laptop_pms) = two_devices().await?;
+    let kind = pod_ticket_kind(&FAMILY, PodStore::Membership);
+    let from_phone = fresh_ticket(&phone).await?;
+    let from_laptop = fresh_ticket(&laptop).await?;
 
-    let phone_pms = host_identity(&phone, ids::ALICE).await?;
-    phone.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let phone_author = phone.default_author(ids::ALICE)?;
+    phone_pms.put_ticket(&kind, &from_phone).await?;
+    laptop_pms.put_ticket(&kind, &from_laptop).await?;
 
-    let pms_ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-    let laptop_pms = join_identity(&laptop, ids::ALICE, pms_ticket).await?;
-    phone_pms.add_device(laptop.node_id()).await?;
-    laptop_pms.add_device(laptop.node_id()).await?;
-    let laptop_author = laptop.default_author(ids::ALICE)?;
-
-    let ticket = phone
-        .share_ticket(
-            ids::ALICE,
-            ids::ALICE,
-            ShareMode::Write,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    laptop
-        .import_namespace(ids::ALICE, ids::ALICE, ticket)
-        .await?;
-
-    // Both devices write the contested key with no coordination.
-    let contested = EntryPath::new("contact/nickname")?;
-    phone
-        .write(
-            ids::ALICE,
-            ids::ALICE,
-            phone_author,
-            &contested,
-            b"from-phone",
-        )
-        .await?;
-    laptop
-        .write(
-            ids::ALICE,
-            ids::ALICE,
-            laptop_author,
-            &contested,
-            b"from-laptop",
-        )
-        .await?;
-
-    // Fences: once each side sees the other's fence, sync sessions have run
-    // in both directions and had the chance to carry the contested key too.
-    let phone_fence = EntryPath::new("fence/phone")?;
-    let laptop_fence = EntryPath::new("fence/laptop")?;
-    phone
-        .write(ids::ALICE, ids::ALICE, phone_author, &phone_fence, b"1")
-        .await?;
-    laptop
-        .write(ids::ALICE, ids::ALICE, laptop_author, &laptop_fence, b"1")
-        .await?;
+    // Fences: once each side reads the other's fence, sessions have run in
+    // both directions and had the chance to carry the contested kind too.
+    phone_pms.put_ticket("fence/phone", &from_phone).await?;
+    laptop_pms.put_ticket("fence/laptop", &from_laptop).await?;
     assert!(
-        wait_entry_is(&laptop, ids::ALICE, ids::ALICE, &phone_fence, b"1").await?,
+        wait_ticket(&laptop_pms, "fence/phone", &from_phone).await?,
         "phone's fence did not reach laptop"
     );
     assert!(
-        wait_entry_is(&phone, ids::ALICE, ids::ALICE, &laptop_fence, b"1").await?,
+        wait_ticket(&phone_pms, "fence/laptop", &from_laptop).await?,
         "laptop's fence did not reach phone"
     );
 
-    // Both replicas must now agree on the contested key.
     let converged = eventually(|| async {
-        let on_phone = phone.read(ids::ALICE, ids::ALICE, &contested).await?;
-        let on_laptop = laptop.read(ids::ALICE, ids::ALICE, &contested).await?;
+        let on_phone = phone_pms.get_ticket(&kind).await?.map(|t| t.to_string());
+        let on_laptop = laptop_pms.get_ticket(&kind).await?.map(|t| t.to_string());
         Ok(on_phone.is_some() && on_phone == on_laptop)
     })
     .await?;
-    assert!(converged, "replicas did not converge on the contested key");
-    let value = phone
-        .read(ids::ALICE, ids::ALICE, &contested)
+    assert!(converged, "replicas did not converge on the contested kind");
+    let value = phone_pms
+        .get_ticket(&kind)
         .await?
-        .expect("converged");
+        .expect("converged")
+        .to_string();
     assert!(
-        value == b"from-phone" || value == b"from-laptop",
-        "converged to a value neither device wrote"
+        value == from_phone.to_string() || value == from_laptop.to_string(),
+        "converged to a ticket neither device wrote"
     );
 
     phone.shutdown().await?;
@@ -198,73 +153,29 @@ async fn concurrent_writes_converge() -> Result<()> {
     Ok(())
 }
 
-/// A write at a shorter path leaves the entries at longer paths sharing its
+/// A write at a shorter key leaves the entries at longer keys sharing its
 /// components or its bytes standing, on the writing device and on its
 /// sibling.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_write_at_a_shorter_path_leaves_the_longer_ones_standing() -> Result<()> {
-    let phone = memory_node().await?;
-    let laptop = memory_node().await?;
+async fn a_write_at_a_shorter_key_leaves_the_longer_ones_standing() -> Result<()> {
+    let (phone, phone_pms, laptop, laptop_pms) = two_devices().await?;
 
-    let phone_pms = host_identity(&phone, ids::ALICE).await?;
-    phone.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let author = phone.default_author(ids::ALICE)?;
-
-    let pms_ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-    let laptop_pms = join_identity(&laptop, ids::ALICE, pms_ticket).await?;
-    phone_pms.add_device(laptop.node_id()).await?;
-    laptop_pms.add_device(laptop.node_id()).await?;
-    let ticket = phone
-        .share_ticket(
-            ids::ALICE,
-            ids::ALICE,
-            ShareMode::Write,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    laptop
-        .import_namespace(ids::ALICE, ids::ALICE, ticket)
-        .await?;
-
-    let written: [(&str, &[u8]); 3] = [
-        ("contact/email", b"email"),
-        ("contacts/emergency", b"emergency"),
-        ("contact", b"contact"),
-    ];
-    for (path, payload) in written {
-        phone
-            .write(
-                ids::ALICE,
-                ids::ALICE,
-                author,
-                &EntryPath::new(path)?,
-                payload,
-            )
-            .await?;
+    let mut written = Vec::new();
+    for kind in ["contact/email", "contacts/emergency", "contact"] {
+        let ticket = fresh_ticket(&phone).await?;
+        phone_pms.put_ticket(kind, &ticket).await?;
+        written.push((kind, ticket));
     }
 
-    for node in [&phone, &laptop] {
-        for (path, payload) in written {
+    for pms in [&phone_pms, &laptop_pms] {
+        for (kind, ticket) in &written {
             assert!(
-                wait_entry_is(
-                    node,
-                    ids::ALICE,
-                    ids::ALICE,
-                    &EntryPath::new(path)?,
-                    payload
-                )
-                .await?,
-                "{path} does not read what was written at it"
+                wait_ticket(pms, kind, ticket).await?,
+                "{kind} does not read what was written at it"
             );
         }
-        let mut listed: Vec<String> = node
-            .list(ids::ALICE, ids::ALICE, None)
-            .await?
-            .into_iter()
-            .map(|entry| entry.path.as_str().to_owned())
-            .collect();
+        let mut listed = pms.list_ticket_kinds().await?;
+        listed.retain(|kind| kind.starts_with("contact"));
         listed.sort_unstable();
         assert_eq!(listed, ["contact", "contact/email", "contacts/emergency"]);
     }
@@ -274,22 +185,18 @@ async fn a_write_at_a_shorter_path_leaves_the_longer_ones_standing() -> Result<(
     Ok(())
 }
 
-/// The PMS carries tickets of any kind: published on one device, a
-/// ticket becomes readable on another once its payload arrives (`get_ticket`
-/// is `None` on the record alone). `data` is the kind creation actually
-/// publishes — the identity's own data-namespace ticket.
+/// A ticket published on one device becomes readable on another once its
+/// payload arrives, equal to the one published (`get_ticket` is `None` on
+/// the record alone).
 #[tokio::test(flavor = "multi_thread")]
 async fn pms_carries_arbitrary_tickets() -> Result<()> {
     let phone = memory_node().await?;
     let laptop = memory_node().await?;
 
     let phone_pms = host_identity(&phone, ids::ALICE).await?;
-    // Any ticket serves as payload — here, another fresh replica's.
-    let payload_ticket = PrivateMetadataStore::create(&phone, ids::ALICE)
-        .await?
-        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-    phone_pms.put_ticket("data", &payload_ticket).await?;
+    let kind = pod_ticket_kind(&FAMILY, PodStore::Records);
+    let payload_ticket = fresh_ticket(&phone).await?;
+    phone_pms.put_ticket(&kind, &payload_ticket).await?;
 
     let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -298,9 +205,9 @@ async fn pms_carries_arbitrary_tickets() -> Result<()> {
     phone_pms.add_device(laptop.node_id()).await?;
 
     let arrived =
-        eventually(|| async { Ok(laptop_pms.get_ticket("data").await?.is_some()) }).await?;
+        eventually(|| async { Ok(laptop_pms.get_ticket(&kind).await?.is_some()) }).await?;
     assert!(arrived, "the published ticket did not become readable");
-    let got = laptop_pms.get_ticket("data").await?.expect("just observed");
+    let got = laptop_pms.get_ticket(&kind).await?.expect("just observed");
     assert_eq!(
         got.to_string(),
         payload_ticket.to_string(),
@@ -325,7 +232,7 @@ async fn pms_wait_returns_on_a_session_not_on_content() -> Result<()> {
     let laptop = memory_node().await?;
 
     let phone_pms = host_identity(&phone, ids::ALICE).await?;
-    phone_pms.connect(ids::BOB).await?;
+    phone_pms.record_pod(FAMILY, Seq::FIRST).await?;
     let ticket = phone_pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
@@ -336,8 +243,9 @@ async fn pms_wait_returns_on_a_session_not_on_content() -> Result<()> {
     laptop.host_identity(ids::ALICE, &laptop_pms)?;
     catch_up.wait(TIMEOUT).await?;
     // The session that returned the wait carried the pre-import record.
-    assert!(
-        laptop_pms.is_connected(ids::BOB).await?,
+    assert_eq!(
+        laptop_pms.pod_record(FAMILY).await?,
+        Some((Seq::FIRST, true)),
         "a successful catch-up session must have carried the existing records"
     );
 
@@ -379,33 +287,39 @@ async fn pms_wait_times_out_without_a_reachable_peer() -> Result<()> {
 }
 
 /// An empty payload is not a storable value: zero-length entries are the
-/// underlying deletion marker, and writing one is rejected — it neither
-/// stores an "empty file" nor deletes the previous value.
+/// store's deletion marker, and writing one into a pod's record store is
+/// refused — it neither stores an empty value nor deletes the previous one.
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_payload_write_is_rejected() -> Result<()> {
     let node = memory_node().await?;
-    let _pms = host_identity(&node, ids::ALICE).await?;
-    let author = node.default_author(ids::ALICE)?;
-    node.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let path = EntryPath::new("contact/email")?;
+    let (alice, _pms) = test_utils::pod::host(&node).await?;
+    let pod = test_utils::pod::create(&node, &alice).await?;
+    let key = RecordKey::Claim {
+        member: alice.id,
+        id: RecordId::from_bytes([0x07; 16]),
+        mseq: Seq::FIRST,
+    };
+    let record = key.record();
 
-    // On a fresh path: rejected, nothing stored.
+    // On a fresh key: refused, nothing stored.
     assert!(node
-        .write(ids::ALICE, ids::ALICE, author, &path, b"")
+        .write_pod_entry(alice.id, pod, PodStore::Records, &key.to_bytes(), b"")
         .await
         .is_err());
-    assert_eq!(node.read(ids::ALICE, ids::ALICE, &path).await?, None);
+    assert_eq!(node.read_pod_record(alice.id, pod, &record).await?, None);
 
-    // Over an existing value: rejected, the previous value survives.
-    node.write(ids::ALICE, ids::ALICE, author, &path, b"value")
+    // Over an existing value: refused, the previous value survives.
+    node.write_pod_entry(alice.id, pod, PodStore::Records, &key.to_bytes(), b"claim")
         .await?;
     assert!(node
-        .write(ids::ALICE, ids::ALICE, author, &path, b"")
+        .write_pod_entry(alice.id, pod, PodStore::Records, &key.to_bytes(), b"")
         .await
         .is_err());
     assert_eq!(
-        node.read(ids::ALICE, ids::ALICE, &path).await?.as_deref(),
-        Some(b"value".as_ref())
+        node.read_pod_record(alice.id, pod, &record)
+            .await?
+            .as_deref(),
+        Some(b"claim".as_ref())
     );
 
     node.shutdown().await?;
@@ -425,37 +339,28 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
     const RECORDS: u16 = 600;
-    let phone = memory_node().await?;
-    let laptop = memory_node().await?;
-
-    let phone_pms = host_identity(&phone, ids::ALICE).await?;
-    let ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-    let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
-    phone_pms.add_device(laptop.node_id()).await?;
-    laptop_pms.add_device(laptop.node_id()).await?;
+    let (phone, phone_pms, laptop, laptop_pms) = two_devices().await?;
 
     let mut unread = laptop_pms.changes().await?;
-    let peer = |n: u16| {
-        let mut bytes = [0x5e; 32];
+    let pod = |n: u16| {
+        let mut bytes = [0x5e; 16];
         bytes[..2].copy_from_slice(&n.to_be_bytes());
-        pdn_types::PdnId::from_bytes(bytes)
+        PodId::from_bytes(bytes)
     };
     for n in 0..RECORDS {
-        phone_pms.connect(peer(n)).await?;
+        phone_pms.record_pod(pod(n), Seq::FIRST).await?;
     }
     assert!(
         eventually(|| async {
-            let listed = tokio::time::timeout(TIMEOUT, laptop_pms.list_connections())
+            let held = tokio::time::timeout(TIMEOUT, laptop_pms.held_pods())
                 .await
                 .map_err(|_| anyhow::anyhow!("the laptop's store stopped answering"))??;
-            Ok(listed.len() >= usize::from(RECORDS))
+            Ok(held.len() >= usize::from(RECORDS))
         })
         .await?,
         "the laptop did not take in every record past its unread subscription"
     );
-    tokio::time::timeout(TIMEOUT, laptop_pms.connect(ids::BOB))
+    tokio::time::timeout(TIMEOUT, laptop_pms.record_pod(FAMILY, Seq::FIRST))
         .await
         .map_err(|_| anyhow::anyhow!("a local write waited on the unread subscription"))??;
 

@@ -1,27 +1,20 @@
-//! The embeddable node runtime: identity, connections, data, and sync
-//! services as thin glue over `data-layer`, plus the runtime's two
-//! protocols — the linking dialogue ([`linking`], ADR-0012) and the
-//! establishment dialogue ([`pairing`], ADR-0011) — riding the data-layer
-//! assembly slot. The runtime adds no sync or authorization mechanics of
-//! its own: it registers what it hosts with data-layer's access book.
+//! The embeddable node runtime: identity, pods and sync services as thin
+//! glue over `data-layer`, plus the runtime's two protocols — the linking
+//! dialogue ([`linking`], ADR-0012) and a pod's join ([`pods`], ADR-0015) —
+//! riding the data-layer assembly slot. The runtime adds no sync or
+//! authorization mechanics of its own: it registers what it hosts with
+//! data-layer's access book.
 
-pub mod connections;
-pub mod data;
+mod armer;
+mod ceremony;
 pub mod identity;
 pub mod linking;
 #[cfg(feature = "test-util")]
 pub mod observation;
-pub mod pairing;
 pub mod pods;
-pub mod retraction;
 pub mod runtime;
 pub mod sync;
 
-pub use connections::{
-    ConnectionsService, DelegationUnsupported, PeerGrant, PeerNotConnected,
-    RuntimeConnectionsService,
-};
-pub use data::{DataService, RuntimeDataService, WriteNotGranted};
 #[cfg(feature = "test-util")]
 pub use pods::ForgedJoin;
 pub use pods::{
@@ -31,23 +24,16 @@ pub use pods::{
     JOIN_DIALOGUE_TIMEOUT, LEAVE_FLUSH_TIMEOUT, POD_INVITE_FORMAT_VERSION,
 };
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
+pub use ceremony::InviterUnreachable;
 pub use data_layer::{
-    claim_id_of, CatchUpTimeout, Connectivity, DirectoryHeld, DocTicket, GrantedClaim,
-    GranteeCannotShare, OpId, Operation, PodStore, ReadGrant, ShareMode, SpawnOptions,
-    StorageConfig, UnknownEntry, UnknownIssuer, UnknownPod,
+    CatchUpTimeout, Connectivity, DirectoryHeld, OpId, Operation, PodStore, SpawnOptions,
+    StorageConfig, UnknownEntry, UnknownPod,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{
     DialogueTimeout, IdentityAlreadyHosted, LinkingInProgress, LinkingLocalFailure, LinkingPayload,
     LinkingRefused, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
-pub use pairing::{
-    EstablishmentInProgress, EstablishmentRefused, EstablishmentTimeout, InvitePayload,
-    InviterUnreachable, UnsupportedInviteVersion, INVITE_FORMAT_VERSION,
-};
-pub use pdn_types::{
-    ClaimId, EntryInfo, EntryPath, NodeId, NonEmpty, PdnId, PodId, RecordId, RecordKind, RecordRef,
-};
-pub use retraction::RetractionEvent;
+pub use pdn_types::{NodeId, PdnId, PodId, RecordId, RecordKind, RecordRef};
 pub use runtime::{Runtime, UnknownIdentity};
 pub use sync::{RuntimeSyncService, SyncService};

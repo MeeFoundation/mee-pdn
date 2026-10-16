@@ -1,8 +1,8 @@
 //! The stand's restart scenarios: a node's container stopped — cleanly and
 //! by a kill with no grace — and started again on its own state directory,
 //! asserted to come back as the same node; a kill landing in the middle of
-//! a stream of acknowledged writes; a state directory that fills; and a
-//! member's node coming back with its pod, a pod it left staying left.
+//! a stream of acknowledged placements; a state directory that fills; and
+//! a member's node coming back with its pod, a pod it left staying left.
 //!
 //! A restart is asserted here and nowhere else: an in-process respawn
 //! proves nothing about a process that exits, and only a container carries
@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Context as _, Result};
 use axum::http::StatusCode;
-use pdn_node::{PdnId, RecordKind};
-use pdn_node_http::shapes::{Act, Connections, HeldPods, HostedIdentities, Member, PeerGrants};
+use pdn_node::{PdnId, PodId, RecordKind, RecordRef};
+use pdn_node_http::shapes::{Act, HeldPods, HostedIdentities, Member, Records};
 
 mod common;
 use common::{
-    body, entry_reads, eventually, grant_on, members_read, pod_listed, pod_route, record_reads,
-    Host, Stand,
+    body, eventually, members_read, pod_listed, pod_route, record_reads, record_reads_within,
+    record_route, Host, Stand, POD_PASS_BUDGET,
 };
 
 /// This node's wire id, read from the debug status page — the first line
@@ -38,164 +38,153 @@ async fn node_id(host: &Host) -> Result<String> {
 /// The recovery assertion set, identical for the clean-stop arm and the
 /// kill arm on purpose: recovery that differed by the manner of stopping
 /// would depend on the previous process having said goodbye, which a kill
-/// does not provide. Same node id, the identity hosted, the connection
-/// listed, `previous` — written and acknowledged before the stop — still
-/// readable, and the counterparty converging on `sentinel`, written after
-/// the restart with no invite minted and no linking performed.
+/// does not provide. Same node id, the identity hosted, the pod listed,
+/// `previous` — placed and acknowledged before the stop — still readable,
+/// the other member still listing the identity, and that member converging
+/// on `sentinel`, placed after the restart with no invite minted and no
+/// linking performed. Returns the sentinel's record.
+#[allow(clippy::too_many_arguments)] // the two nodes, their two identities, the pod and both records
 async fn assert_recovered(
-    issuer: &Host,
+    member: &Host,
     id_before: &str,
     alice: PdnId,
     bob: PdnId,
-    audience: &Host,
-    previous: &'static [u8],
+    other: &Host,
+    family: PodId,
+    previous: (RecordRef, &'static [u8]),
     sentinel: &'static [u8],
-) -> Result<()> {
+) -> Result<RecordRef> {
     ensure!(
-        node_id(issuer).await? == id_before,
+        node_id(member).await? == id_before,
         "the node id must survive the restart"
     );
-    let hosted: HostedIdentities = issuer.get("/debug/identities").await?.json()?;
+    let hosted: HostedIdentities = member.get("/debug/identities").await?.json()?;
     ensure!(
         hosted.identities.contains(&alice),
         "the identity must be hosted again: {hosted:?}"
     );
-    let connections: Connections = issuer
-        .get(&format!("/debug/identities/{alice}/connections"))
-        .await?
-        .json()?;
-    ensure!(
-        connections.connections.contains(&bob),
-        "the connection must be listed again: {connections:?}"
-    );
+    pod_listed(member, alice, family, true)
+        .await
+        .context("the pod must be listed again")?;
     // What was acknowledged before the stop reads back — polled, because
-    // the data namespace re-binds on the armer's first sweep.
-    entry_reads(issuer, alice, alice, "contact/email", previous)
+    // the pod reopens on the armer's first sweep.
+    let (record, payload) = previous;
+    record_reads(member, alice, family, record, payload)
         .await
-        .context("the entry acknowledged before the stop did not read back")?;
-    // The recovered connection carries a fresh write to the counterparty —
-    // no ceremony was repeated: nothing since the restart minted an invite
-    // or linked a device.
-    issuer
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(sentinel),
-        )
-        .await?
-        .ok()?;
-    entry_reads(audience, bob, alice, "contact/email", sentinel)
+        .context("the record acknowledged before the stop did not read back")?;
+    members_read(
+        other,
+        bob,
+        family,
+        &[
+            Member {
+                id: alice,
+                owner: true,
+            },
+            Member {
+                id: bob,
+                owner: false,
+            },
+        ],
+    )
+    .await
+    .context("the other member must still list the restarted node's identity")?;
+    // The recovered pod carries a fresh record to the other member — no
+    // ceremony was repeated: nothing since the restart minted an invite or
+    // linked a device. Placed this soon after the start, it can be announced
+    // before the restarted node's swarm forms, and then the pod pass brings
+    // it.
+    let placed = member
+        .place_record(alice, family, RecordKind::Claim, sentinel)
+        .await?;
+    record_reads_within(other, bob, family, placed, sentinel, POD_PASS_BUDGET)
         .await
-        .context("the counterparty did not converge with the restarted node")?;
-    // The grant published before the stop still stands on the audience.
-    let grants: PeerGrants = audience
-        .get(&format!("/debug/identities/{bob}/grants/{alice}"))
-        .await?
-        .json()?;
-    ensure!(
-        grants.grants.iter().any(|grant| grant.issuer == alice),
-        "the grant must still be readable: {grants:?}"
-    );
-    Ok(())
+        .context("the other member did not converge with the restarted node")?;
+    Ok(placed)
 }
 
-/// The restart scenario with both arms and its denial: a node holding an
-/// identity, a connection and a grant is stopped cleanly and started again,
-/// then killed with no grace and started again — the same assertions both
-/// times — and a node started from the same image on an empty state
-/// directory holds none of it. Without that last arm the scenario would
-/// pass just as well against a node that quietly re-created everything.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-#[allow(clippy::too_many_lines)] // one scenario: both arms and the denial in the same place
-async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Result<()> {
+/// How a restart scenario stops its node.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    /// The daemon's stop: the process leaves by its own shutdown path.
+    Clean,
+    /// `SIGKILL`, no grace: a process that ends without warning.
+    Kill,
+}
+
+/// The restart scenario of either arm, with its denial: a node holding an
+/// identity that is a member of a pod is stopped and started again, the
+/// recovery asserted the same way for both, and a node started from the
+/// same image on an empty state directory holds none of it. Without that
+/// last arm the scenario would pass just as well against a node that
+/// quietly re-created everything.
+async fn restart_scenario(stop: Stop) -> Result<()> {
     let stand = Stand::new();
-    let issuer = stand.spawn("issuer").await?;
-    let audience = stand.spawn("audience").await?;
+    let alice_node = stand.spawn("alice").await?;
+    let bob_node = stand.spawn("bob").await?;
 
-    let alice = issuer.create_identity().await?;
-    let bob = audience.create_identity().await?;
-    let payload = issuer
-        .post(
-            &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
-            axum::body::Bytes::new(),
-        )
-        .await?
-        .ok()?;
-    audience
-        .post(&format!("/debug/identities/{bob}/establish"), payload)
-        .await?
-        .ok()?;
-    issuer
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"before the stop"),
-        )
-        .await?
-        .ok()?;
-    issuer
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
-        .await?
-        .ok()?;
-    entry_reads(&audience, bob, alice, "contact/email", b"before the stop")
+    let alice = alice_node.create_identity().await?;
+    let bob = bob_node.create_identity().await?;
+    let family = alice_node.create_pod(alice).await?;
+    let invite = alice_node.invite_to_pod(alice, family).await?;
+    bob_node.join_pod(bob, invite).await?.ok()?;
+    let before = alice_node
+        .place_record(alice, family, RecordKind::Claim, b"before the stop")
+        .await?;
+    record_reads(&bob_node, bob, family, before, b"before the stop")
         .await
-        .context("the audience never read the granted entry before the stop")?;
-    let id_before = node_id(&issuer).await?;
+        .context("the other member never read the record before the stop")?;
+    let id_before = node_id(&alice_node).await?;
 
-    // Arm one: the clean stop, asserted as clean — only the exit code and
-    // the time it took tell the graceful path from one the daemon cut short.
-    let stopping = std::time::Instant::now();
-    issuer.stop().await?;
-    let stop_took = stopping.elapsed();
-    ensure!(
-        !issuer.is_running().await?,
-        "the stopped container must be down before the start"
-    );
-    let exit_code = issuer.exit_code()?;
-    ensure!(
-        exit_code == 0,
-        "the clean stop must end the process by its own shutdown path; \
-         it exited {exit_code} (137 is the daemon's kill after the grace)"
-    );
-    ensure!(
-        stop_took < CLEAN_STOP_BUDGET,
-        "the clean stop took {stop_took:?}, which leaves no room inside the \
-         daemon's ten-second grace: the drain and the runtime's own cleanup \
-         together have to finish well inside it"
-    );
-    issuer.start().await?;
+    match stop {
+        Stop::Clean => {
+            // Asserted as clean: only the exit code and the time it took tell
+            // the graceful path from one the daemon cut short.
+            let stopping = std::time::Instant::now();
+            alice_node.stop().await?;
+            let stop_took = stopping.elapsed();
+            ensure!(
+                !alice_node.is_running().await?,
+                "the stopped container must be down before the start"
+            );
+            let exit_code = alice_node.exit_code()?;
+            ensure!(
+                exit_code == 0,
+                "the clean stop must end the process by its own shutdown path; \
+                 it exited {exit_code} (137 is the daemon's kill after the grace)"
+            );
+            ensure!(
+                stop_took < CLEAN_STOP_BUDGET,
+                "the clean stop took {stop_took:?}, which leaves no room inside the \
+                 daemon's ten-second grace: the drain and the runtime's own cleanup \
+                 together have to finish well inside it"
+            );
+        }
+        Stop::Kill => {
+            // The settle window and the address book's first write first; the
+            // mid-stream scenario below is where the window itself is the
+            // subject.
+            tokio::time::sleep(SETTLE_WINDOW.max(ADDRESS_BOOK_WRITTEN)).await;
+            alice_node.kill()?;
+            ensure!(
+                !alice_node.is_running().await?,
+                "the killed container must be down before the start"
+            );
+        }
+    }
+    alice_node.start().await?;
     assert_recovered(
-        &issuer,
+        &alice_node,
         &id_before,
         alice,
         bob,
-        &audience,
-        b"before the stop",
-        b"after the stop",
+        &bob_node,
+        family,
+        (before, b"before the stop"),
+        b"after the restart",
     )
     .await
-    .context("recovery after the clean stop")?;
-
-    // Arm two: the kill, with the same assertions. It waits out the settle
-    // window first; the mid-stream scenario below is where that window
-    // itself is the subject.
-    tokio::time::sleep(SETTLE_WINDOW).await;
-    issuer.kill()?;
-    ensure!(
-        !issuer.is_running().await?,
-        "the killed container must be down before the start"
-    );
-    issuer.start().await?;
-    assert_recovered(
-        &issuer,
-        &id_before,
-        alice,
-        bob,
-        &audience,
-        b"after the stop",
-        b"after the kill",
-    )
-    .await
-    .context("recovery after the kill")?;
+    .with_context(|| format!("recovery after the {stop:?} stop"))?;
 
     // Denial: the same image on an empty state directory has a node id of
     // its own, hosts nothing, and refuses reads addressed to the restarted
@@ -210,9 +199,7 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
         hosted.identities.is_empty(),
         "a fresh node must host nothing: {hosted:?}"
     );
-    let refused = fresh
-        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
-        .await?;
+    let refused = fresh.get(&record_route(alice, family, before)).await?;
     ensure!(
         refused.status == StatusCode::CONFLICT,
         "a fresh node must refuse the identity as unknown, got {}: {}",
@@ -220,6 +207,24 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
         refused.text()
     );
     Ok(())
+}
+
+/// A node holding an identity that is a member of a pod, stopped cleanly
+/// and started again, comes back as the same node; a fresh one holds
+/// nothing of it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+async fn a_stopped_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Result<()> {
+    restart_scenario(Stop::Clean).await
+}
+
+/// The same node killed with no grace comes back the same way: recovery
+/// that differed by the manner of stopping would depend on a goodbye a
+/// kill does not provide.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+async fn a_killed_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Result<()> {
+    restart_scenario(Stop::Kill).await
 }
 
 /// How long after its acknowledgement a write is committed for certain:
@@ -230,8 +235,13 @@ async fn a_restarted_node_is_the_same_node_and_a_fresh_one_holds_nothing() -> Re
 /// catch a store whose commit cadence regressed.
 const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The replica store commits on a timer, so it meets the full filesystem a
-/// moment after the blob store refused the write.
+/// A node writes its address book every 10 s, and a shutdown writes it last:
+/// killed before the first write, a node on direct connectivity comes back
+/// knowing no peer's address, and its peers dial its old port.
+const ADDRESS_BOOK_WRITTEN: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Readiness meets the blob store the refused placement stopped at its next
+/// poll; the margin covers a poll waiting out the host's runtime budget.
 const FULL_STORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The daemon kills what is still running about ten seconds after its stop
@@ -241,23 +251,24 @@ const CLEAN_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(8)
 /// Ten acknowledged writes take well under a second on a node that answers.
 const STREAM_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
 
-/// A kill mid-stream: every write acknowledged before the settle window
-/// reads back whole, and a write cut inside it is absent or whole, never
-/// torn and never a read error — durability starts one window after the
-/// acknowledgement.
+/// A kill mid-stream: every record whose placement was acknowledged before
+/// the settle window reads back whole, and a record cut inside it is absent
+/// or whole, never torn and never a read error — durability starts one
+/// window after the acknowledgement.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-#[allow(clippy::too_many_lines)] // one kill, the settled and the cut writes in the same place
+#[allow(clippy::too_many_lines)] // one kill, the settled and the cut placements in the same place
 async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
     let stand = Stand::new();
     let node = Arc::new(stand.spawn("writer").await?);
     let alice = node.create_identity().await?;
+    let stream = node.create_pod(alice).await?;
 
-    // The writer streams entries and records each acknowledgement's
-    // instant until a write fails under it — the kill below lands while it
-    // runs. Values differ per path, so a torn value cannot borrow a
-    // neighbour's bytes.
-    let acked: Arc<std::sync::Mutex<Vec<std::time::Instant>>> =
+    // The writer places records and logs each acknowledgement's instant
+    // until a placement fails under it — the kill below lands while it runs.
+    // Values differ per record, so a torn value cannot borrow a neighbour's
+    // bytes.
+    let acked: Arc<std::sync::Mutex<Vec<(std::time::Instant, RecordRef)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let writer = {
         let node = Arc::clone(&node);
@@ -265,31 +276,33 @@ async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
         tokio::spawn(async move {
             let mut index = 0usize;
             loop {
-                let put = node
-                    .put(
-                        &format!("/debug/data/{alice}/{alice}/stream/{index:04}"),
-                        format!("value-{index:04}").into_bytes(),
+                let placed = node
+                    .place_record(
+                        alice,
+                        stream,
+                        RecordKind::Claim,
+                        format!("value-{index:04}").as_bytes(),
                     )
                     .await;
-                match put {
-                    Ok(answer) if answer.status.is_success() => {
-                        if let Ok(mut times) = acked.lock() {
-                            times.push(std::time::Instant::now());
+                match placed {
+                    Ok(record) => {
+                        if let Ok(mut log) = acked.lock() {
+                            log.push((std::time::Instant::now(), record));
                         }
                         index += 1;
                     }
-                    // The kill cut this write before its acknowledgement.
-                    Ok(_) | Err(_) => return index,
+                    // The kill cut this placement before its acknowledgement.
+                    Err(_) => return index,
                 }
             }
         })
     };
 
     // The kill lands once the stream has flowed for longer than the settle
-    // window, so writes older than the window demonstrably exist. The wait
-    // is bounded: the writer stops at its first failed write, so a stream
-    // that dies early stops the counter for good, and without a deadline
-    // this loop would spin forever rather than report what it saw.
+    // window, so placements older than the window demonstrably exist. The
+    // wait is bounded: the writer stops at its first failed placement, so a
+    // stream that dies early stops the counter for good, and without a
+    // deadline this loop would spin forever rather than report what it saw.
     let streaming_since = std::time::Instant::now();
     loop {
         let count = acked
@@ -301,7 +314,7 @@ async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
         }
         ensure!(
             streaming_since.elapsed() < STREAM_BUDGET,
-            "the write stream never reached ten acknowledgements: {count} in {:?}",
+            "the stream never reached ten acknowledgements: {count} in {:?}",
             streaming_since.elapsed()
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -314,87 +327,113 @@ async fn a_kill_mid_stream_loses_nothing_settled() -> Result<()> {
     let cut_at = tokio::time::timeout(STREAM_BUDGET, writer)
         .await
         .context("the writer never returned after the kill")??;
-    let ack_times = acked
+    let log = acked
         .lock()
         .map_err(|_poisoned| anyhow::anyhow!("ack log poisoned"))?
         .clone();
-    let settled = ack_times
+    let settled = log
         .iter()
-        .filter(|instant| killed_at.duration_since(**instant) > SETTLE_WINDOW)
+        .filter(|(instant, _record)| killed_at.duration_since(*instant) > SETTLE_WINDOW)
         .count();
     ensure!(
         settled >= 1,
-        "at least one write must have settled before the kill"
+        "at least one placement must have settled before the kill"
     );
 
     node.start().await?;
-    // Every settled write reads back whole. The first read waits out the
-    // data namespace re-binding; the rest are local.
-    for index in 0..settled {
-        entry_reads(
+    // Every settled record reads back whole. The first read waits out the
+    // pod reopening; the rest are local.
+    for (index, (_instant, record)) in log.iter().enumerate().take(settled) {
+        record_reads(
             &node,
             alice,
-            alice,
-            &format!("stream/{index:04}"),
+            stream,
+            *record,
             format!("value-{index:04}").as_bytes(),
         )
         .await
-        .with_context(|| format!("entry {index} settled before the kill and must read"))?;
+        .with_context(|| format!("record {index} settled before the kill and must read"))?;
     }
-    // Everything the kill cut inside the window — acknowledged writes
-    // younger than it, and the one in flight — is absent or whole, never
-    // partial and never an error the surface cannot name.
-    for index in settled..=cut_at {
-        let cut = node
-            .get(&format!("/debug/data/{alice}/{alice}/stream/{index:04}"))
-            .await?;
-        let whole =
-            cut.status == StatusCode::OK && cut.body == format!("value-{index:04}").as_bytes();
-        let absent = cut.status == StatusCode::NOT_FOUND;
+    // Everything the kill cut inside the window — acknowledged records
+    // younger than it, and the one in flight, which only a listing can name
+    // — is absent or whole, never partial and never an error the surface
+    // cannot name.
+    let listed: Records = node
+        .get(&format!("{}/records", pod_route(alice, stream)))
+        .await?
+        .json()?;
+    let acknowledged: Vec<RecordRef> = log.iter().map(|(_instant, record)| *record).collect();
+    let cut = log
+        .iter()
+        .enumerate()
+        .skip(settled)
+        .map(|(index, (_instant, record))| (*record, Some(index)))
+        .chain(
+            listed
+                .records
+                .iter()
+                .filter(|record| !acknowledged.contains(record))
+                .map(|record| (*record, None)),
+        );
+    for (record, index) in cut {
+        let answer = node.get(&record_route(alice, stream, record)).await?;
+        let whole = answer.status == StatusCode::OK
+            && index.map_or(
+                answer.body == format!("value-{cut_at:04}").as_bytes(),
+                |index| answer.body == format!("value-{index:04}").as_bytes(),
+            );
+        let absent = answer.status == StatusCode::NOT_FOUND;
         ensure!(
             whole || absent,
-            "a write cut inside the settle window must be absent or whole, \
-             got {} for {index}: {}",
-            cut.status,
-            cut.text()
+            "a record cut inside the settle window must be absent or whole, \
+             got {} for {record:?}: {}",
+            answer.status,
+            answer.text()
         );
     }
     Ok(())
 }
 
 /// A storage failure arrives as a failure: a node whose state directory is
-/// a size-bounded filesystem refuses a write once the store is full — as a
-/// failed request, not a success — and a read of that path does not report
-/// the value as stored. On an in-memory node a full disk is invisible; on
-/// a device it is the ordinary way storage fails.
+/// a size-bounded filesystem refuses a placement once the store is full —
+/// as a failed request, not a success — and no record the pod lists holds
+/// the refused value. On an in-memory node a full disk is invisible; on a
+/// device it is the ordinary way storage fails.
+///
+/// The pod is shared with a member on another node, as a pod is: the
+/// placement fails at the blob store, which stops, while the replica store
+/// keeps answering until a commit of its own meets the full disk —
+/// readiness reads both.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+#[allow(clippy::too_many_lines)] // one fill, the refusal, the store's failure and the probes
 async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
     let stand = Stand::new();
-    // Room for the stores to provision and a handful of entries, small
+    // Room for the stores to provision and a handful of records, small
     // enough that the fill below overruns it several times over.
     let node = stand
         .spawn_with_bounded_state("bounded", 16 * 1024 * 1024)
         .await?;
+    let bob_node = stand.spawn("bob").await?;
     let alice = node.create_identity().await?;
+    let bob = bob_node.create_identity().await?;
+    let family = node.create_pod(alice).await?;
+    let invite = node.invite_to_pod(alice, family).await?;
+    bob_node.join_pod(bob, invite).await?.ok()?;
+    let records = format!("{}/records?kind=claim", pod_route(alice, family));
 
     // Each payload is distinct — the blob store is content-addressed, and
-    // one payload written 256 times is one blob, which no bound ever meets.
+    // one payload placed 256 times is one blob, which no bound ever meets.
     let payload_for = |index: usize| {
         let mut payload = vec![0xa5u8; 256 * 1024];
         payload.splice(..8, index.to_be_bytes());
         payload
     };
     let mut refused = None;
-    // 256 writes of 256 KiB is four times the mount: the loop must meet
+    // 256 placements of 256 KiB is four times the mount: the loop must meet
     // the refusal long before it runs out.
     for index in 0..256usize {
-        let answer = node
-            .put(
-                &format!("/debug/data/{alice}/{alice}/fill/{index:04}"),
-                payload_for(index),
-            )
-            .await?;
+        let answer = node.post(&records, payload_for(index)).await?;
         if !answer.status.is_success() {
             refused = Some((index, answer));
             break;
@@ -409,17 +448,21 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
         answer.status
     );
 
-    // The refused write is not stored: reading it back must not answer the
-    // payload as if it were.
-    let read = node
-        .get(&format!(
-            "/debug/data/{alice}/{alice}/fill/{refused_index:04}"
-        ))
+    // The refused placement is not stored: no record the pod lists reads
+    // its payload as if it were.
+    let listed = node
+        .get(&format!("{}/records", pod_route(alice, family)))
         .await?;
-    ensure!(
-        !(read.status == StatusCode::OK && read.body == payload_for(refused_index)),
-        "a refused write must not read back as stored"
-    );
+    if listed.status == StatusCode::OK {
+        let listed: Records = listed.json()?;
+        for record in listed.records {
+            let read = node.get(&record_route(alice, family, record)).await?;
+            ensure!(
+                !(read.status == StatusCode::OK && read.body == payload_for(refused_index)),
+                "a refused placement must not read back as stored"
+            );
+        }
+    }
 
     // What the full filesystem does to the node as a whole shows on the next
     // operation the replica store has to commit; the store then refuses
@@ -431,12 +474,22 @@ async fn a_full_state_directory_refuses_writes_loudly() -> Result<()> {
         created.status
     );
 
-    // Readiness reads the store, turning a silent zombie into an outage a
-    // platform can restart. Polled: the store fails on a commit of its own
-    // timing, not on the request that filled the disk.
-    let unready = eventually(FULL_STORE_BUDGET, || async {
-        let answer = node.get("/ready").await?;
-        Ok((!answer.status.is_success()).then_some(answer.status))
+    // Readiness reads both stores, turning a silent zombie into an outage a
+    // platform can restart; the stopped blob store answers for the full disk
+    // while the replica store may still read. Bob keeps placing records, so
+    // the full node meets the pod's traffic while it is polled.
+    let mut placed = 0u32;
+    let unready = eventually(FULL_STORE_BUDGET, || {
+        placed += 1;
+        let claim = format!("placed by Bob, {placed}");
+        let (bob_node, node) = (&bob_node, &node);
+        async move {
+            let _record = bob_node
+                .place_record(bob, family, RecordKind::Claim, claim.as_bytes())
+                .await?;
+            let answer = node.get("/ready").await?;
+            Ok((!answer.status.is_success()).then_some(answer.status))
+        }
     })
     .await?;
     ensure!(

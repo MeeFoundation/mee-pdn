@@ -8,9 +8,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use data_layer::{
-    AuthorId, ConnectionMetadata, NamespaceId, PrivateMetadataStore, SpawnOptions, SyncNode,
-};
+use data_layer::{AuthorId, NamespaceId, PrivateMetadataStore, SpawnOptions, SyncNode};
 use pdn_types::{NodeId, PdnId};
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
@@ -72,12 +70,15 @@ impl ServingHalves {
     }
 
     async fn drain(&self) {
-        let _ = tokio::time::timeout(
-            SHUTDOWN_SERVING_BUDGET,
-            self.0.acquire_many(MAX_SERVING_HALVES_U32),
-        )
-        .await;
+        // Permits taken — all of them, or what a timed-out wait gathered —
+        // are released only into the closed semaphore: released first, they
+        // would go to a dialogue queued during the wait, which would burn
+        // its secret on a stopping node.
+        let acquire = self.0.acquire_many(MAX_SERVING_HALVES_U32);
+        tokio::pin!(acquire);
+        let held = tokio::time::timeout(SHUTDOWN_SERVING_BUDGET, &mut acquire).await;
         self.0.close();
+        drop(held);
     }
 
     #[cfg(feature = "test-util")]
@@ -105,23 +106,17 @@ impl CeremonyPause {
 
 use crate::linking::LinkingLocalFailure;
 use crate::{
-    connections::RuntimeConnectionsService,
-    data::RuntimeDataService,
+    ceremony::PendingInvites,
     identity::RuntimeIdentityService,
     linking::{LinkingHandler, LINKING_ALPN},
-    pairing::{PairingHandler, PendingInvites, PAIRING_ALPN},
     pods::{JoinHandler, RuntimePodsService, POD_JOIN_ALPN},
-    retraction::{spawn_retraction_consumer, RetractionEvent},
     sync::RuntimeSyncService,
 };
 
-/// A slow subscriber past this loses the oldest events.
-const RETRACTION_EVENTS_CAPACITY: usize = 64;
 const LINKING_FAILURES_CAPACITY: usize = 16;
 
 /// `identity` was neither created nor linked here. Downcast from the
-/// `anyhow::Error` of identity-addressed operations; data-namespace
-/// operations report [`data_layer::UnknownIssuer`] instead.
+/// `anyhow::Error` of identity-addressed operations.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("identity not hosted on this runtime: {identity}")]
 pub struct UnknownIdentity {
@@ -149,30 +144,17 @@ pub(crate) struct State {
     /// Exactly the identities created or linked here.
     pub(crate) identities: HashMap<PdnId, HostedIdentity>,
     /// In memory on purpose: an invite does not survive a restart.
-    pub(crate) pending_invites: PendingInvites,
-    /// Separate from pairing's: a secret minted for one ceremony must never
-    /// verify in the other.
     pub(crate) pending_linking_invites: PendingInvites,
     /// The pod join dialogue's, each secret minted for an identity and a
-    /// pod.
+    /// pod. Separate from linking's: a secret minted for one ceremony must
+    /// never verify in the other.
     pub(crate) pending_pod_invites: PendingInvites<(PdnId, pdn_types::PodId)>,
     /// Keyed by `(joining identity, pod)`.
     pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::PodId)>,
-    /// A cache keyed by `(hosted identity, counterparty)`; the PMS is
-    /// the durable lookup.
-    pub(crate) metadata_pairs: HashMap<(PdnId, PdnId), ConnectionMetadata>,
-    /// One binder per pair: the sweep inserts before spawning and the
-    /// binder removes itself as it exits.
-    pub(crate) grant_binders: HashSet<(PdnId, PdnId)>,
-    /// What each binder imported, keyed by `(hosted identity, counterparty,
-    /// issuer)`: bounds the unbind to what a binder itself brought in.
-    pub(crate) bound_grants: HashMap<(PdnId, PdnId, PdnId), NamespaceId>,
     /// Reserved in the same lock scope as the already-hosted check, so a
     /// concurrent `link` toward the same identity refuses instead of racing
     /// the first to commit.
     pub(crate) linking_in_flight: HashSet<PdnId>,
-    /// Keyed by `(scanning identity, inviter)`.
-    pub(crate) establishing_in_flight: HashSet<(PdnId, PdnId)>,
     /// Work a cancellation must not cut short — rollbacks, and a pod's
     /// create; shutdown joins it before stopping the node.
     pub(crate) cleanup_tasks: CleanupSupervisor,
@@ -181,10 +163,10 @@ pub(crate) struct State {
     pub(crate) serving_halves: ServingHalves,
     #[cfg(feature = "test-util")]
     pub(crate) link_after_import_pause: Option<Arc<CeremonyPause>>,
-    /// A pause of the pairing dialogue's serving half, after it read the
+    /// A pause of the join dialogue's serving half, after it read the
     /// request and before it takes the state lock to verify and burn.
     #[cfg(feature = "test-util")]
-    pub(crate) pairing_serve_pause: Option<Arc<CeremonyPause>>,
+    pub(crate) join_serve_pause: Option<Arc<CeremonyPause>>,
     /// A pause just before the linking commit point, where a scenario reads
     /// what a link has published before it commits — nothing.
     #[cfg(feature = "test-util")]
@@ -224,47 +206,33 @@ pub(crate) struct State {
     /// refuses there.
     #[cfg(feature = "test-util")]
     pub(crate) fail_next_hosting_record: bool,
-    /// `Some(n)` fails every pair arming and counts the failures. Sticky:
-    /// the armer retries every sweep, and the count is the positive control
-    /// for "repeated attempts leave nothing open".
-    #[cfg(feature = "test-util")]
-    pub(crate) pair_arm_failures: Option<usize>,
-    /// How long a connection armer waits for a PMS change before
-    /// sweeping anyway — the spawn's reconcile interval.
+    /// How long the armer waits for a PMS change before sweeping anyway —
+    /// the spawn's reconcile interval.
     pub(crate) sweep_interval: std::time::Duration,
-    pub(crate) retraction_events: tokio::sync::broadcast::Sender<RetractionEvent>,
 }
 
 impl State {
     fn new(
         node: SyncNode,
-        identities: HashMap<PdnId, HostedIdentity>,
         serving_halves: ServingHalves,
         sweep_interval: std::time::Duration,
     ) -> Self {
-        let (retraction_events, _no_subscribers_yet) =
-            tokio::sync::broadcast::channel(RETRACTION_EVENTS_CAPACITY);
         let (linking_failures, _no_failure_subscribers_yet) =
             tokio::sync::broadcast::channel(LINKING_FAILURES_CAPACITY);
         Self {
             node: Arc::new(node),
-            identities,
-            pending_invites: PendingInvites::default(),
+            identities: HashMap::new(),
             pending_linking_invites: PendingInvites::default(),
             pending_pod_invites: PendingInvites::default(),
             joining_in_flight: HashSet::new(),
-            metadata_pairs: HashMap::new(),
-            grant_binders: HashSet::new(),
-            bound_grants: HashMap::new(),
             linking_in_flight: HashSet::new(),
-            establishing_in_flight: HashSet::new(),
             cleanup_tasks: CleanupSupervisor::new(),
             linking_failures,
             serving_halves,
             #[cfg(feature = "test-util")]
             link_after_import_pause: None,
             #[cfg(feature = "test-util")]
-            pairing_serve_pause: None,
+            join_serve_pause: None,
             #[cfg(feature = "test-util")]
             link_before_commit_pause: None,
             #[cfg(feature = "test-util")]
@@ -285,9 +253,6 @@ impl State {
             fail_next_pms_create: false,
             #[cfg(feature = "test-util")]
             fail_next_hosting_record: false,
-            #[cfg(feature = "test-util")]
-            pair_arm_failures: None,
-            retraction_events,
             sweep_interval,
         }
     }
@@ -330,21 +295,18 @@ impl Runtime {
     /// On a directory-configured runtime, every identity whose subdirectory
     /// records its hosting is hosted again before the spawn returns, through
     /// the same tail `create` runs: the PMS opens from the replica the
-    /// node holds, arms classification, and its connection armer's sweeps
-    /// bring the rest back. No ceremony, no dial; an unreadable record stops
+    /// node holds, arms classification, and its armer's sweeps bring the
+    /// rest back. No ceremony, no dial; an unreadable record stops
     /// the spawn, and a directory with none is a first start.
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
         let sweep_interval = options.reconcile_interval;
         let serving_halves = ServingHalves::new();
-        let pairing = PairingHandler::new(serving_halves.clone());
-        let pairing_slot = pairing.slot();
         let linking = LinkingHandler::new(serving_halves.clone());
         let linking_slot = linking.slot();
         let join = JoinHandler::new(serving_halves.clone());
         let join_slot = join.slot();
         let node = SyncNode::spawn_with(
             vec![
-                (PAIRING_ALPN.to_vec(), Box::new(pairing)),
                 (LINKING_ALPN.to_vec(), Box::new(linking)),
                 (POD_JOIN_ALPN.to_vec(), Box::new(join)),
             ],
@@ -356,17 +318,14 @@ impl Runtime {
         // before the error leaves, or a retry on the same directory in this
         // process would meet its open databases.
         let prepared = async {
-            let verdicts = node
-                .take_retraction_verdicts()
-                .ok_or_else(|| anyhow::anyhow!("retraction verdict stream taken twice"))?;
             let notices = node
                 .take_pod_notices()
                 .ok_or_else(|| anyhow::anyhow!("pod notice stream taken twice"))?;
-            let (identities, armers) = recover_hosted_identities(&node).await?;
-            anyhow::Ok((verdicts, notices, identities, armers))
+            let recovered = recover_hosted_identities(&node).await?;
+            anyhow::Ok((notices, recovered))
         }
         .await;
-        let (verdicts, notices, identities, armers) = match prepared {
+        let (notices, recovered) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = node.shutdown().await;
@@ -374,22 +333,16 @@ impl Runtime {
             }
         };
 
-        let state = Arc::new(Mutex::new(State::new(
-            node,
-            identities,
-            serving_halves,
-            sweep_interval,
-        )));
-        for (identity, changes) in armers {
-            crate::connections::spawn_connection_armer(Arc::downgrade(&state), identity, changes);
+        let state = Arc::new(Mutex::new(State::new(node, serving_halves, sweep_interval)));
+        {
+            let mut guard = state.lock().await;
+            for (identity, hosted, changes) in recovered {
+                admit_hosted(&state, &mut guard, identity, hosted, changes);
+            }
+            // Every identity the directory records is hosted again by now.
+            guard.node.start_blob_collection();
         }
-        // Every identity the directory records is hosted again by now.
-        state.lock().await.node.start_blob_collection();
-        spawn_retraction_consumer(Arc::downgrade(&state), verdicts, node_id);
         crate::pods::spawn_pod_notice_consumer(Arc::downgrade(&state), notices);
-        pairing_slot
-            .set(Arc::downgrade(&state))
-            .map_err(|_already_filled| anyhow::anyhow!("pairing state slot filled twice"))?;
         linking_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("linking state slot filled twice"))?;
@@ -412,27 +365,12 @@ impl Runtime {
         RuntimeIdentityService::new(self)
     }
 
-    pub fn connections(&self) -> RuntimeConnectionsService<'_> {
-        RuntimeConnectionsService::new(self)
-    }
-
-    pub fn data(&self) -> RuntimeDataService<'_> {
-        RuntimeDataService::new(self)
-    }
-
     pub fn sync(&self) -> RuntimeSyncService<'_> {
         RuntimeSyncService::new(self)
     }
 
     pub fn pods(&self) -> RuntimePodsService<'_> {
         RuntimePodsService::new(self)
-    }
-
-    /// One event per retracted entry — the host's hook for user-facing
-    /// surfacing. A lagging subscriber loses the oldest events, never
-    /// blocks the runtime.
-    pub async fn subscribe_retractions(&self) -> tokio::sync::broadcast::Receiver<RetractionEvent> {
-        self.state.lock().await.retraction_events.subscribe()
     }
 
     pub async fn subscribe_linking_failures(
@@ -652,6 +590,17 @@ impl Runtime {
         self.state.lock().await.node.pod_holdings(identity)
     }
 
+    /// Every exchange of `pod`'s stores this node has running, held behind
+    /// another's or due to redial, each named, for a failure message.
+    #[cfg(feature = "test-util")]
+    pub async fn pod_syncs_in_flight_report_for_test(
+        &self,
+        pod: pdn_types::PodId,
+    ) -> anyhow::Result<String> {
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.pod_syncs_in_flight_report_for_test(pod).await
+    }
+
     /// The replicas `identity`'s store holds, tracked or not.
     #[cfg(feature = "test-util")]
     pub async fn held_replica_count_for_test(
@@ -693,20 +642,8 @@ impl Runtime {
         Ok(key.map(|key| key.public_key()))
     }
 
-    /// Fail every pair arming from now on.
     #[cfg(feature = "test-util")]
-    pub async fn fail_pair_arm_for_test(&self) {
-        self.state.lock().await.pair_arm_failures = Some(0);
-    }
-
-    /// The positive control for "nothing accumulated".
-    #[cfg(feature = "test-util")]
-    pub async fn pair_arm_failures_for_test(&self) -> usize {
-        self.state.lock().await.pair_arm_failures.unwrap_or(0)
-    }
-
-    #[cfg(feature = "test-util")]
-    pub async fn pairing_accept_in_flight_for_test(&self) -> bool {
+    pub async fn serving_half_in_flight_for_test(&self) -> bool {
         self.state.lock().await.serving_halves.any_in_flight()
     }
 
@@ -732,12 +669,12 @@ impl Runtime {
     }
 
     #[cfg(feature = "test-util")]
-    pub async fn pause_next_pairing_serve(&self) -> Arc<CeremonyPause> {
+    pub async fn pause_next_join_serve(&self) -> Arc<CeremonyPause> {
         let pause = Arc::new(CeremonyPause {
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
-        self.state.lock().await.pairing_serve_pause = Some(Arc::clone(&pause));
+        self.state.lock().await.join_serve_pause = Some(Arc::clone(&pause));
         pause
     }
 
@@ -763,8 +700,8 @@ impl Runtime {
 
     /// Idempotent. The state lock is dropped before the drain: a serving
     /// half in flight may be waiting for that very lock. The host's own
-    /// calls in flight — an `establish`, a `link` — are not waited for: a
-    /// host awaits them before it stops the runtime.
+    /// calls in flight — a `link`, a `join` — are not waited for: a host
+    /// awaits them before it stops the runtime.
     pub async fn shutdown(&self) -> Result<()> {
         const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         #[cfg(feature = "test-util")]
@@ -787,6 +724,20 @@ impl Runtime {
 
 type PmsChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static>;
 
+/// The one step every path hosting an identity takes: it enters the hosted
+/// set and its armer starts, so no hosted identity serves its PMS while
+/// nothing opens its pods on this device.
+pub(crate) fn admit_hosted(
+    state: &Arc<Mutex<State>>,
+    guard: &mut State,
+    identity: PdnId,
+    hosted: HostedIdentity,
+    changes: impl futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static,
+) {
+    guard.identities.insert(identity, hosted);
+    crate::armer::spawn_identity_armer(Arc::downgrade(state), identity, changes);
+}
+
 /// Host every identity whose subdirectory records its hosting. An
 /// identity whose record names a PMS replica the store does not hold
 /// is skipped, loudly, and the rest come back; one the store holds but
@@ -794,9 +745,8 @@ type PmsChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin
 /// records name would look healthy while refusing everything.
 async fn recover_hosted_identities(
     node: &SyncNode,
-) -> Result<(HashMap<PdnId, HostedIdentity>, Vec<(PdnId, PmsChanges)>)> {
-    let mut identities = HashMap::new();
-    let mut armers: Vec<(PdnId, PmsChanges)> = Vec::new();
+) -> Result<Vec<(PdnId, HostedIdentity, PmsChanges)>> {
+    let mut recovered: Vec<(PdnId, HostedIdentity, PmsChanges)> = Vec::new();
     // Each skip leaves its record where it is, so it repeats on every start
     // rather than being erased by one.
     for record in node.recorded_hosting()? {
@@ -831,8 +781,11 @@ async fn recover_hosted_identities(
         let changes = pms.changes().await?;
         let author = node.default_author(record.identity)?;
         node.host_identity(record.identity, &pms)?;
-        identities.insert(record.identity, HostedIdentity { pms, author });
-        armers.push((record.identity, Box::new(changes)));
+        recovered.push((
+            record.identity,
+            HostedIdentity { pms, author },
+            Box::new(changes),
+        ));
     }
-    Ok((identities, armers))
+    Ok(recovered)
 }

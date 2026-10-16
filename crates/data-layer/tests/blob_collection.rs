@@ -6,12 +6,12 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{PodStore, SpawnOptions, SyncNode};
+use data_layer::{identity_of, Contact, PodStore, SpawnOptions, SyncNode};
 use iroh_blobs::Hash;
-use pdn_types::{EntryPath, RecordId, RecordRef};
+use pdn_types::{RecordId, RecordRef};
 use test_utils::{
     eventually,
-    pod::{create, device_of, host, invite, place_claim, reads, tickets, Person},
+    pod::{create, create_at, device_of, host, invite, place_claim, reads, tickets, Person},
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -47,8 +47,8 @@ async fn claim(
 }
 
 /// The payloads a forgotten record store alone referenced leave the node at
-/// the next run. Denied: one the identity's own data namespace references
-/// too stays, and reads.
+/// the next run. Denied: one the record store of the identity's other pod
+/// references too stays, and reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payload_no_replica_references_is_removed() -> Result<()> {
     let phone = node().await?;
@@ -56,17 +56,8 @@ async fn a_payload_no_replica_references_is_removed() -> Result<()> {
     let pod = create(&phone, &carol).await?;
     claim(&phone, &carol, pod, 1, b"lease scan").await?;
     claim(&phone, &carol, pod, 2, b"photo").await?;
-    phone.create_namespace(carol.id, carol.id).await?;
-    let photo = EntryPath::new("photos/beach")?;
-    phone
-        .write(
-            carol.id,
-            carol.id,
-            phone.default_author(carol.id)?,
-            &photo,
-            b"photo",
-        )
-        .await?;
+    let own = create_at(&phone, &carol, [0x0c; 16]).await?;
+    let kept = claim(&phone, &carol, own, 3, b"photo").await?;
     let (scan, picture) = (Hash::new(b"lease scan"), Hash::new(b"photo"));
     for hash in [scan, picture] {
         assert!(phone.holds_payload(hash).await?);
@@ -77,10 +68,13 @@ async fn a_payload_no_replica_references_is_removed() -> Result<()> {
         eventually(|| async { Ok(!phone.holds_payload(scan).await?) }).await?,
         "the payload no replica references stayed"
     );
-    // Denied: the payload Carol's data namespace references.
+    // Denied: the payload Carol's other pod references.
     assert!(phone.holds_payload(picture).await?);
     assert_eq!(
-        phone.read(carol.id, carol.id, &photo).await?.as_deref(),
+        phone
+            .read_pod_record(carol.id, own, &kept)
+            .await?
+            .as_deref(),
         Some(&b"photo"[..])
     );
 
@@ -91,9 +85,9 @@ async fn a_payload_no_replica_references_is_removed() -> Result<()> {
 /// A payload a co-located identity's replica still references stays when
 /// the other identity forgets its replica, and that identity reads it.
 ///
-/// A payload only the forgetting identity's data namespace referenced,
-/// forgotten beside the pod, orders the assertion after a run that
-/// removed something.
+/// A payload only the forgetting identity's own pod referenced, forgotten
+/// beside the shared one, orders the assertion after a run that removed
+/// something.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payload_a_co_located_identity_references_stays() -> Result<()> {
     let tablet = node().await?;
@@ -113,21 +107,12 @@ async fn a_payload_a_co_located_identity_references_stays() -> Result<()> {
         .await?;
     let shared = place_claim(&tablet, &leisure, pod, 1).await?;
     assert!(reads(&tablet, work.id, pod, shared).await?);
-    tablet.create_namespace(work.id, work.id).await?;
-    let notes = EntryPath::new("notes/today")?;
-    tablet
-        .write(
-            work.id,
-            work.id,
-            tablet.default_author(work.id)?,
-            &notes,
-            b"only work's",
-        )
-        .await?;
+    let own = create_at(&tablet, &work, [0x0c; 16]).await?;
+    claim(&tablet, &work, own, 2, b"only work's").await?;
     let (sentinel, claim) = (Hash::new(b"only work's"), Hash::new(b"claim"));
 
     tablet.forget_pod(work.id, pod).await?;
-    tablet.forget_namespace(work.id, work.id).await?;
+    tablet.forget_pod(work.id, own).await?;
     assert!(eventually(|| async { Ok(!tablet.holds_payload(sentinel).await?) }).await?);
     assert!(
         tablet.holds_payload(claim).await?,
@@ -160,17 +145,8 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
     let carol = Person::generate();
     let pms = test_utils::host_identity(&first, carol.id).await?;
     first.record_hosting(carol.id, pms.namespace()).await?;
-    first.create_namespace(carol.id, carol.id).await?;
-    let photo = EntryPath::new("photos/beach")?;
-    first
-        .write(
-            carol.id,
-            carol.id,
-            first.default_author(carol.id)?,
-            &photo,
-            b"photo",
-        )
-        .await?;
+    let pod = create(&first, &carol).await?;
+    claim(&first, &carol, pod, 1, b"photo").await?;
     first.shutdown().await?;
     drop(first);
 
@@ -205,20 +181,11 @@ async fn a_restart_removes_nothing_before_its_host_lets_collection_start() -> Re
 async fn a_payload_written_while_a_run_is_under_way_stays() -> Result<()> {
     let phone = node().await?;
     let (carol, _) = host(&phone).await?;
-    phone.create_namespace(carol.id, carol.id).await?;
-    let photo = EntryPath::new("photos/beach")?;
+    let pod = create(&phone, &carol).await?;
 
     let run = phone.pause_next_collection_for_test();
     run.reached.notified().await;
-    phone
-        .write(
-            carol.id,
-            carol.id,
-            phone.default_author(carol.id)?,
-            &photo,
-            b"photo",
-        )
-        .await?;
+    let photo = claim(&phone, &carol, pod, 1, b"photo").await?;
     let stray = phone.add_stray_payload_for_test(b"stray").await?;
     run.release.notify_one();
     let next = phone.pause_next_collection_for_test();
@@ -227,7 +194,10 @@ async fn a_payload_written_while_a_run_is_under_way_stays() -> Result<()> {
 
     assert!(!phone.holds_payload(stray).await?);
     assert_eq!(
-        phone.read(carol.id, carol.id, &photo).await?.as_deref(),
+        phone
+            .read_pod_record(carol.id, pod, &photo)
+            .await?
+            .as_deref(),
         Some(&b"photo"[..]),
         "a payload written during a run was removed"
     );
@@ -240,7 +210,9 @@ async fn a_payload_written_while_a_run_is_under_way_stays() -> Result<()> {
 /// under way stays through that run, and reads.
 ///
 /// Held as the scenario above: the record arrives and its payload is fetched
-/// in the hold, and a stray payload leaves in the same run.
+/// in the hold, and a stray payload leaves in the same run. The record
+/// arrives by a dial rather than the swarm, which may not have formed yet
+/// with every pass out of reach.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
     let (alice_phone, bob_phone) = (node().await?, node().await?);
@@ -262,6 +234,10 @@ async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
     let run = bob_phone.pause_next_collection_for_test();
     run.reached.notified().await;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
+    let alices = Contact::new(alice_phone.dial_handle().addr(), identity_of(alice.id));
+    bob_phone
+        .sync_pod_with_for_test(bob.id, pod, PodStore::Records, alices)
+        .await?;
     assert!(reads(&bob_phone, bob.id, pod, claim).await?);
     let stray = bob_phone.add_stray_payload_for_test(b"stray").await?;
     run.release.notify_one();

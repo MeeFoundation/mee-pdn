@@ -2,20 +2,17 @@
 //! second host of the same shape as `pdn-node-http`.
 //!
 //! One exported call per service call of the runtime, and no orchestration
-//! of the facade's own: it retries no ceremony, caches no grant, remembers
-//! no result, and holds no rule about what a peer may read. An application
+//! of the facade's own: it retries no ceremony, remembers no result, and
+//! holds no rule about what a member may read. An application
 //! and a facade that each kept a view of the same thing would drift, and
 //! the drift would show as a screen contradicting the node it sits on.
 //!
 //! # What is deliberately absent
 //!
-//! No exported call hands over or accepts a namespace ticket. A grant read
-//! reports the capability alone — issuer, audience, claims, commands — and
-//! the ticket the runtime's read of a peer's grant carries beside it is
-//! dropped here. The sanctioned way a granted namespace arrives is that the
-//! runtime binds what the grant names, so an application able to import a
-//! ticket would keep showing data after that binding broke, with nothing in
-//! the result revealing it.
+//! No exported call hands over or accepts a namespace ticket. A pod's
+//! tickets cross only inside the join dialogue, so an application able to
+//! import a ticket would hold a pod's stores the membership never admitted
+//! it to.
 //!
 //! No exported call shares or imports a namespace, forces a
 //! reconciliation, resets state, drops a replica, or reaches a store
@@ -44,9 +41,9 @@
 //! another.
 //!
 //! An identity is a placeholder value the runtime mints, with no key
-//! material behind it, so nothing here proves who a peer is. A connection
-//! is evidence that 2 devices ran a ceremony with the same one-time secret,
-//! and nothing more.
+//! material behind it, so nothing here proves who a peer is. A pod's
+//! membership is evidence that a device ran a join with the same one-time
+//! secret, and nothing more.
 //!
 //! A peer is reached only in one local network: the runtime's endpoint binds
 //! with no relay and no discovery configured, so a peer is reached at an
@@ -71,28 +68,12 @@ mod test_surface;
 pub use error::{PdnError, PodActRefusal};
 pub use node::PdnNode;
 pub use shapes::{
-    EntryListing, GrantCapability, GrantedClaimId, GrantedPath, PodMemberInfo, PodMembershipAct,
-    PodOperation, PodRecord, PodRecordKind, MAX_ENTRY_PAYLOAD,
+    PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind, MAX_ENTRY_PAYLOAD,
 };
 
 uniffi::setup_scaffolding!();
 
-/// The claim identity of `path` in `issuer`'s data — the derivation a grant
-/// carries, exported so a caller can join a grant read against paths it
-/// knows or has listed.
-///
-/// The derivation is one-way: nothing recovers a path from a claim
-/// identity. A screen that wants to show which fields are shared derives
-/// the identities of the paths it knows and compares, and never invents a
-/// name for one it cannot account for.
-#[uniffi::export]
-pub fn claim_id(issuer: &str, path: &str) -> Result<String, PdnError> {
-    let issuer = shapes::identity(issuer, "issuer")?;
-    let path = shapes::entry_path(path)?;
-    Ok(pdn_node::claim_id_of(&issuer, &path).to_string())
-}
-
-/// The ceiling on one entry payload, in bytes — the same value
+/// The ceiling on one record payload, in bytes — the same value
 /// [`MAX_ENTRY_PAYLOAD`] states, reachable from a screen that wants to
 /// refuse before it calls.
 #[uniffi::export]

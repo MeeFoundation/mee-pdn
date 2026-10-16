@@ -14,8 +14,6 @@ use iroh_blobs::Hash;
 use n0_future::time::SystemTime;
 use rand::CryptoRng;
 use redb::{Database, ReadableDatabase, ReadableMultimapTable, ReadableTable};
-#[cfg(all(feature = "fs-store", feature = "redb-v2-migration"))]
-use tracing::info;
 use tracing::warn;
 
 use super::{
@@ -32,8 +30,6 @@ use crate::{
 };
 
 mod bounds;
-#[cfg(all(feature = "fs-store", feature = "redb-v2-migration"))]
-mod migrate_redb_v2_tuples;
 mod migrations;
 mod query;
 mod ranges;
@@ -108,16 +104,6 @@ fn open_database(path: &std::path::Path, cache_bytes: usize) -> Result<Database>
     }
 }
 
-#[cfg(feature = "fs-store")]
-fn is_redb_v2_tuple_mismatch(err: &anyhow::Error) -> bool {
-    err.chain().any(|e| {
-        matches!(
-            e.downcast_ref::<redb::TableError>(),
-            Some(redb::TableError::TableTypeMismatch { .. })
-        )
-    })
-}
-
 impl Store {
     /// Create a new store in memory.
     pub fn memory() -> Self {
@@ -139,27 +125,7 @@ impl Store {
     /// share before opening any of them.
     #[cfg(feature = "fs-store")]
     pub fn persistent(path: impl AsRef<std::path::Path>, cache_bytes: usize) -> Result<Self> {
-        let path = path.as_ref();
-        let db = open_database(path, cache_bytes)?;
-        match Self::new_impl(db) {
-            Ok(store) => Ok(store),
-            Err(err) if is_redb_v2_tuple_mismatch(&err) => {
-                #[cfg(feature = "redb-v2-migration")]
-                {
-                    info!("redb 2.x tuple format detected, running migration");
-                    migrate_redb_v2_tuples::run(path)?;
-                    Self::new_impl(open_database(path, cache_bytes)?)
-                }
-                #[cfg(not(feature = "redb-v2-migration"))]
-                {
-                    let _ = err;
-                    Err(anyhow!(
-                        "Opening the database failed: this store was written by iroh-docs 0.94..=0.98 (redb 2.x) and needs migration. Enable the `redb-v2-migration` feature on pdn-store and re-open to migrate."
-                    ))
-                }
-            }
-            Err(err) => Err(err),
-        }
+        Self::new_impl(open_database(path.as_ref(), cache_bytes)?)
     }
 
     fn new_impl(db: redb::Database) -> Result<Self> {
@@ -552,43 +518,6 @@ impl Store {
         )
     }
 
-    /// Physically remove the record of `author` at `key` in `namespace`, if
-    /// its timestamp is at or below `up_to_timestamp` — the local retraction
-    /// of a provisional write. Removal only: nothing is inserted, so no
-    /// tombstone replicates and the set simply shrinks; a matching entry
-    /// can re-arrive over a later sync session unless its ingest is
-    /// refused. The `latest_per_author` hint is deliberately left in place:
-    /// a head pointing at a removed record costs at most one no-news
-    /// reconciliation round. Returns whether a record was removed.
-    pub fn retract_entry(
-        &mut self,
-        namespace: NamespaceId,
-        author: AuthorId,
-        key: &[u8],
-        up_to_timestamp: u64,
-    ) -> Result<bool> {
-        self.modify(|tables| {
-            let records_id = (&namespace.to_bytes(), &author.to_bytes(), key);
-            let timestamp = match tables.records.get(records_id)? {
-                Some(value) => value.value().0,
-                None => return Ok(false),
-            };
-            if timestamp > up_to_timestamp {
-                return Ok(false);
-            }
-            tables.records.remove(records_id)?;
-            tables
-                .records_by_key
-                .remove((&namespace.to_bytes(), key, &author.to_bytes()))?;
-            Ok(true)
-        })
-        .inspect(|removed| {
-            if *removed {
-                self.wrote(namespace);
-            }
-        })
-    }
-
     /// Get all content hashes of all replicas in the store.
     pub fn content_hashes(&mut self) -> Result<ContentHashesIterator> {
         let tables = self.snapshot_owned()?;
@@ -772,13 +701,10 @@ pub struct StoreInstance<'a> {
     /// and the fingerprints computed from them — come from this snapshot,
     /// so the served view is stable for the whole session while writes
     /// continue on the live store. Ingest stays live: `entry_get` and
-    /// `entry_put` always operate on the current state. Two things ride on
-    /// that. The newer-than comparison of `ranger::Store::put` — judged
-    /// against a stale snapshot, an older entry could overwrite a
-    /// concurrent session's insert. And `ranger::Store::would_insert`, the
-    /// gate on the rejection echoed to a sender: judged against the
-    /// snapshot it would name an entry the store took in after session
-    /// setup, and the sender retracts its own copy on that word.
+    /// `entry_put` always operate on the current state, so the newer-than
+    /// comparison of `ranger::Store::put` is not judged against a stale
+    /// snapshot, where an older entry could overwrite a concurrent
+    /// session's insert.
     pub(crate) session_snapshot: Option<&'a ReadOnlyTables>,
 }
 
@@ -1348,113 +1274,6 @@ mod tests {
         }
 
         // TODO: write test checking that the indexing is done correctly
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(all(feature = "fs-store", feature = "redb-v2-migration"))]
-    fn test_migration_redb_v2_tuples() -> Result<()> {
-        use migrate_redb_v2_tuples::old;
-
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let path = dbfile.path().to_path_buf();
-
-        let ns = [1u8; 32];
-        let author = [2u8; 32];
-        let key: &[u8] = b"hello";
-        let ns_sig = [3u8; 64];
-        let auth_sig = [4u8; 64];
-        let hash = [5u8; 32];
-
-        {
-            let db = redb_v3::Database::create(&path)?;
-            let tx = db.begin_write()?;
-            {
-                let mut records = tx.open_table(old::RECORDS_TABLE)?;
-                let mut latest = tx.open_table(old::LATEST_PER_AUTHOR_TABLE)?;
-                let mut by_key = tx.open_table(old::RECORDS_BY_KEY_TABLE)?;
-                records.insert(
-                    (&ns, &author, key),
-                    (42u64, &ns_sig, &auth_sig, 7u64, &hash),
-                )?;
-                latest.insert((&ns, &author), (42u64, key))?;
-                by_key.insert((&ns, key, &author), ())?;
-            }
-            tx.commit()?;
-        }
-
-        // Confirm redb 4 rejects the file before migration.
-        {
-            let db = redb::Database::create(&path)?;
-            let tx = db.begin_write()?;
-            let err = Tables::new(&tx).unwrap_err();
-            assert!(
-                matches!(err, redb::TableError::TableTypeMismatch { .. }),
-                "expected TableTypeMismatch, got {err:?}",
-            );
-        }
-
-        let store = Store::persistent(&path, TEST_CACHE_BYTES)?;
-        drop(store);
-
-        let backup: std::path::PathBuf = {
-            let mut p = path.clone().into_os_string();
-            p.push(".backup-redb-v2-tuples");
-            p.into()
-        };
-        assert!(
-            backup.exists(),
-            "missing backup file at {}",
-            backup.display()
-        );
-
-        // After migration redb 4 can open the affected tables and the rows survive.
-        {
-            let db = redb::Database::create(&path)?;
-            let tx = db.begin_read()?;
-            let records = tx.open_table(tables::RECORDS_TABLE)?;
-            let entries: Vec<_> = records.iter()?.collect::<std::result::Result<_, _>>()?;
-            assert_eq!(entries.len(), 1);
-            let (k, v) = &entries[0];
-            assert_eq!(k.value(), (&ns, &author, key));
-            assert_eq!(v.value(), (42u64, &ns_sig, &auth_sig, 7u64, &hash));
-
-            let latest = tx.open_table(tables::LATEST_PER_AUTHOR_TABLE)?;
-            let entries: Vec<_> = latest.iter()?.collect::<std::result::Result<_, _>>()?;
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].0.value(), (&ns, &author));
-            assert_eq!(entries[0].1.value(), (42u64, key));
-
-            let by_key = tx.open_table(tables::RECORDS_BY_KEY_TABLE)?;
-            let entries: Vec<_> = by_key.iter()?.collect::<std::result::Result<_, _>>()?;
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].0.value(), (&ns, key, &author));
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "fs-store")]
-    fn test_no_migration_on_fresh_store() -> Result<()> {
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let path = dbfile.path().to_path_buf();
-        let store = Store::persistent(&path, TEST_CACHE_BYTES)?;
-        drop(store);
-
-        let backup: std::path::PathBuf = {
-            let mut p = path.clone().into_os_string();
-            p.push(".backup-redb-v2-tuples");
-            p.into()
-        };
-        assert!(
-            !backup.exists(),
-            "unexpected backup file at {}",
-            backup.display()
-        );
-
-        let _store = Store::persistent(&path, TEST_CACHE_BYTES)?;
-        assert!(!backup.exists());
         Ok(())
     }
 }

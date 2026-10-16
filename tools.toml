@@ -4,6 +4,6 @@
 # builds without the workspace and repeats them, which `just check` compares.
 # One `name = "version"` per line: both readers take it apart with awk.
 just = "1.58.0"
-cargo-nextest = "0.9.146"
+cargo-nextest = "0.9.148"
 cargo-deny = "0.20.2"
 cargo-watch = "8.5.3"

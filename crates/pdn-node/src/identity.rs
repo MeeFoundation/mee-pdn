@@ -7,21 +7,16 @@ use std::{
 };
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, IdentityKeyPair, PrivateMetadataStore, ShareMode};
+use data_layer::{IdentityKeyPair, PrivateMetadataStore};
 use pdn_types::PdnId;
 
 use crate::{
+    ceremony::DEFAULT_INVITE_LIFETIME,
     linking::{
         link_via_dialogue, LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
     },
-    pairing::DEFAULT_INVITE_LIFETIME,
     runtime::{HostedIdentity, Runtime},
 };
-
-/// The PMS kind of the identity's own data-namespace ticket. The
-/// linking critical path never reads it (the reply hands the tickets over
-/// directly); restart recovery re-binds the data namespace from it.
-pub(crate) const DATA_TICKET_KIND: &str = "data";
 
 /// The undo of a create that fails or is dropped before it returns. A guard
 /// rather than a helper because a create can also end by its future being
@@ -100,16 +95,15 @@ impl Drop for CreateRollback {
 }
 
 /// Best effort: the caller is already receiving an error. Dropping the
-/// identity's half of the node takes its replicas with it, so the two
-/// stores this create brought up need no separate undo — they are named
-/// for the case where the identity stays.
+/// identity's half of the node takes its replicas with it, so the PMS this
+/// create brought up needs no separate undo — it is named for the case
+/// where the identity stays.
 async fn undo_create(
     node: &data_layer::SyncNode,
     identity: PdnId,
     pms_namespace: Option<data_layer::NamespaceId>,
     _hosting_armed: bool,
 ) {
-    let _ = node.forget_namespace(identity, identity).await;
     if let Some(pms) = pms_namespace {
         let _ = node.forget_doc(identity, pms).await;
     }
@@ -120,8 +114,8 @@ async fn undo_create(
 #[allow(async_fn_in_trait)]
 pub trait IdentityService {
     /// Create an identity on its first device: its identity key pair,
-    /// the [`PdnId`] that pair's public key derives, and its store set
-    /// provisioned, the pair kept in its PMS.
+    /// the [`PdnId`] that pair's public key derives, and its PMS, which
+    /// keeps the pair.
     async fn create(&self) -> Result<PdnId>;
 
     /// Mint a linking invite for hosted `identity`; `lifetime` overrides
@@ -199,16 +193,6 @@ impl IdentityService for RuntimeIdentityService<'_> {
             // written here can reach anyone.
             pms.add_device(node.node_id()).await?;
             pms.put_identity_key(&identity_key).await?;
-            node.create_namespace(identity, identity).await?;
-            let data_ticket = node
-                .share_ticket(
-                    identity,
-                    identity,
-                    ShareMode::Write,
-                    AddrInfoOptions::RelayAndAddresses,
-                )
-                .await?;
-            pms.put_ticket(DATA_TICKET_KIND, &data_ticket).await?;
             // The armer's subscription, taken before the handle moves into
             // the hosted set.
             let changes = pms.changes().await?;
@@ -236,15 +220,14 @@ impl IdentityService for RuntimeIdentityService<'_> {
             return Err(err);
         }
         let author = node.default_author(identity)?;
-        state
-            .identities
-            .insert(identity, HostedIdentity { pms, author });
-        drop(state);
-        crate::connections::spawn_connection_armer(
-            Arc::downgrade(&self.runtime.state),
+        crate::runtime::admit_hosted(
+            &self.runtime.state,
+            &mut state,
             identity,
+            HostedIdentity { pms, author },
             changes,
         );
+        drop(state);
         rollback.disarm();
         Ok(identity)
     }

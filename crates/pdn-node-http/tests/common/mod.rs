@@ -21,10 +21,7 @@ use pdn_node::{
     observation::{ListedEntry, PodRecord},
     PdnId, PodId, RecordKind, RecordRef,
 };
-use pdn_node_http::shapes::{
-    Act, CreatedIdentity, GrantPublication, GrantedPath, HeldPod, HeldPods, Member, Members,
-    Operations, OwnGrant,
-};
+use pdn_node_http::shapes::{Act, CreatedIdentity, HeldPod, HeldPods, Member, Members, Operations};
 use serde::de::DeserializeOwned;
 use testcontainers::{
     core::{logs::LogFrame, ContainerPort, ExecCommand, Mount, WaitFor},
@@ -110,6 +107,11 @@ const NODE_LOG_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/stand-logs");
 /// Several of the runtime's reconciliation periods, since nothing here
 /// shortens that cadence.
 pub const CONVERGENCE_BUDGET: Duration = Duration::from_mins(2);
+
+/// A pod store's pass, every 300 s, with a margin: what a node announced to
+/// no neighbor — a record placed before a restarted node's swarm formed —
+/// reaches another member at its next pass.
+pub const POD_PASS_BUDGET: Duration = Duration::from_mins(6);
 
 const LOG_TAIL_BYTES: usize = 4 * 1024;
 
@@ -336,14 +338,6 @@ impl Host {
         self.request(Method::Post, path, body.into()).await
     }
 
-    pub async fn put(&self, path: &str, body: impl Into<Bytes>) -> Result<Answer> {
-        self.request(Method::Put, path, body.into()).await
-    }
-
-    pub async fn delete(&self, path: &str) -> Result<Answer> {
-        self.request(Method::Delete, path, Bytes::new()).await
-    }
-
     pub async fn create_identity(&self) -> Result<PdnId> {
         let created: CreatedIdentity =
             self.post("/debug/identities", Bytes::new()).await?.json()?;
@@ -414,19 +408,6 @@ impl Host {
         self.post(
             &format!("{}/ops", record_route(identity, pod, record)),
             body(op),
-        )
-        .await
-    }
-
-    pub async fn publish_grant(
-        &self,
-        identity: PdnId,
-        peer: PdnId,
-        publication: &GrantPublication,
-    ) -> Result<Answer> {
-        self.post(
-            &format!("/debug/identities/{identity}/grants/{peer}"),
-            serde_json::to_vec(publication)?,
         )
         .await
     }
@@ -751,9 +732,27 @@ async fn log_tail(container: &ContainerAsync<GenericImage>, label: &str) -> Stri
 /// [`REQUEST_BUDGET`].
 fn stand_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        .tls_backend_preconfigured(plain_http_tls()?)
         .timeout(REQUEST_BUDGET)
         .build()
         .context("building the stand's HTTP client")
+}
+
+/// iroh 1.3 turns on reqwest's `rustls-no-provider`, and cargo unifies it into the stand's client:
+/// without a TLS configuration of its own the client panics, plain HTTP included, although `ring`
+/// is the one provider in the build — under that feature reqwest takes only a provider installed
+/// process-wide, never the one rustls's own features name. iroh keeps the feature on purpose and
+/// configures each of its own clients instead, and its maintainers decline to change that:
+/// <https://github.com/n0-computer/iroh/issues/4442#issuecomment-5089223911>. This configuration
+/// is the one iroh's relay tests build; its empty root store trusts no server.
+fn plain_http_tls() -> Result<rustls::ClientConfig> {
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("ring's default protocol versions")?
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth())
 }
 
 /// Re-attach log capture after a restart: the capture installed at creation
@@ -916,8 +915,6 @@ async fn wait_live(
 pub enum Method {
     Get,
     Post,
-    Put,
-    Delete,
 }
 
 impl Method {
@@ -925,8 +922,6 @@ impl Method {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Delete => "DELETE",
         }
     }
 }
@@ -945,21 +940,6 @@ async fn base_url(container: &ContainerAsync<GenericImage>) -> Result<String> {
         host
     };
     Ok(format!("http://{host}:{port}"))
-}
-
-/// The claim set covering exactly `path` — read always, write when `write`.
-pub fn claims_on(path: &str, write: bool) -> Vec<GrantedPath> {
-    vec![GrantedPath {
-        path: path.to_owned(),
-        write,
-    }]
-}
-
-pub fn grant_on(issuer: PdnId, path: &str, write: bool) -> GrantPublication {
-    GrantPublication {
-        issuer,
-        claims: claims_on(path, write),
-    }
 }
 
 pub fn body(payload: &[u8]) -> Bytes {
@@ -991,75 +971,6 @@ where
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-/// Poll until reading `path` answers exactly `expected`; the failure names
-/// the last answer, since a bare timeout would collapse "not yet" and
-/// "refused".
-pub async fn entry_reads(
-    host: &Host,
-    acting: PdnId,
-    issuer: PdnId,
-    path: &str,
-    expected: &[u8],
-) -> Result<()> {
-    poll_read(host, acting, issuer, path, |answer| {
-        answer.status == StatusCode::OK && answer.body == expected
-    })
-    .await
-    .with_context(|| format!("{path} under {issuer} never read back as expected for {acting}"))
-}
-
-/// The wait for a read to stop working, as after a withdrawal.
-pub async fn entry_answers(
-    host: &Host,
-    acting: PdnId,
-    issuer: PdnId,
-    path: &str,
-    status: StatusCode,
-) -> Result<()> {
-    poll_read(host, acting, issuer, path, |answer| answer.status == status)
-        .await
-        .with_context(|| {
-            format!("reading {path} under {issuer} as {acting} never answered {status}")
-        })
-}
-
-/// Poll until this host reads back the grant it serves the audience by;
-/// nothing is readable before the pair opens, so the wait covers that too.
-pub async fn own_grant_reads(
-    host: &Host,
-    identity: PdnId,
-    peer: PdnId,
-    issuer: PdnId,
-) -> Result<()> {
-    let route = format!("/debug/identities/{identity}/own-grants/{peer}");
-    let found = eventually(CONVERGENCE_BUDGET, || async {
-        let own: OwnGrant = host.get(&route).await?.json()?;
-        Ok(own
-            .grant
-            .is_some_and(|grant| grant.issuer == issuer)
-            .then_some(()))
-    })
-    .await?;
-    if found.is_none() {
-        let diagnostics = host.diagnostics().await;
-        anyhow::bail!(
-            "{identity} never read back its grant of {issuer}'s data toward {peer}\n{diagnostics}"
-        );
-    }
-    Ok(())
-}
-
-async fn poll_read(
-    host: &Host,
-    acting: PdnId,
-    issuer: PdnId,
-    path: &str,
-    holds: impl Fn(&Answer) -> bool,
-) -> Result<()> {
-    let route = format!("/debug/data/{acting}/{issuer}/{}", encode_path(path));
-    poll_route(host, &route, holds).await
 }
 
 pub fn pod_route(identity: PdnId, pod: PodId) -> String {
@@ -1105,9 +1016,24 @@ pub async fn record_reads(
     record: RecordRef,
     expected: &[u8],
 ) -> Result<()> {
-    poll_route(host, &record_route(identity, pod, record), |answer| {
-        answer.status == StatusCode::OK && answer.body == expected
-    })
+    record_reads_within(host, identity, pod, record, expected, CONVERGENCE_BUDGET).await
+}
+
+/// [`record_reads`] polled for `budget`.
+pub async fn record_reads_within(
+    host: &Host,
+    identity: PdnId,
+    pod: PodId,
+    record: RecordRef,
+    expected: &[u8],
+    budget: Duration,
+) -> Result<()> {
+    poll_route_within(
+        host,
+        &record_route(identity, pod, record),
+        budget,
+        |answer| answer.status == StatusCode::OK && answer.body == expected,
+    )
     .await
     .with_context(|| format!("{record:?} never read back as expected for {identity}"))
 }
@@ -1158,7 +1084,16 @@ pub async fn pod_listed(host: &Host, identity: PdnId, pod: PodId, held: bool) ->
 /// Repeat a read of `route` until `holds`, carrying the last answer into the
 /// error: "no answer at all" and "the wrong answer" are different diagnoses.
 async fn poll_route(host: &Host, route: &str, holds: impl Fn(&Answer) -> bool) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + CONVERGENCE_BUDGET;
+    poll_route_within(host, route, CONVERGENCE_BUDGET, holds).await
+}
+
+async fn poll_route_within(
+    host: &Host,
+    route: &str,
+    budget: Duration,
+    holds: impl Fn(&Answer) -> bool,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut last: Option<Answer> = None;
     loop {
         let cut_mid_request = match tokio::time::timeout_at(deadline, host.get(route)).await {
@@ -1181,21 +1116,10 @@ async fn poll_route(host: &Host, route: &str, holds: impl Fn(&Answer) -> bool) -
                     answer.text()
                 ),
                 None => {
-                    anyhow::anyhow!("no answer at all within {CONVERGENCE_BUDGET:?}\n{diagnostics}")
+                    anyhow::anyhow!("no answer at all within {budget:?}\n{diagnostics}")
                 }
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-/// Every component percent-encoded, the separators kept.
-pub fn encode_path(path: &str) -> String {
-    path.split('/')
-        .map(|component| {
-            percent_encoding::utf8_percent_encode(component, percent_encoding::NON_ALPHANUMERIC)
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }

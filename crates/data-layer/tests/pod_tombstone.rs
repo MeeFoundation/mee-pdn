@@ -542,6 +542,25 @@ async fn a_tombstone_takes_what_reverses_its_departure_layer_after_layer() -> Re
     write(&bob_phone, &bob, pod, removal, vec![0]).await?;
     assert!(lists(&dave_phone, dave.id, pod, dave.id, OUT).await?);
     dave_phone.forget_pod(dave.id, pod).await?;
+    // Settled, so the tombstone's own dials after the session that brought
+    // its removal end before the writes below: otherwise they take the
+    // promotion and the reversal ahead of the dial under test.
+    let everyone = [
+        &alice_phone,
+        &bob_phone,
+        &carol_phone,
+        &dave_phone,
+        &frank_phone,
+    ];
+    if !settle(&everyone, pod).await? {
+        let mut in_flight = Vec::new();
+        for node in everyone {
+            in_flight.push(node.pod_syncs_in_flight_report_for_test(pod).await?);
+        }
+        anyhow::bail!(
+            "the pod never settled; in flight on Alice, Bob, Carol, Dave, Frank: {in_flight:?}"
+        );
+    }
 
     write(&alice_phone, &alice, pod, promotion(&carol, 2), vec![0]).await?;
     assert!(lists(&carol_phone, carol.id, pod, carol.id, OWNER).await?);
@@ -852,7 +871,10 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
 ///
 /// The member's own pass is out of reach, and the act waits for the
 /// tombstone to converge and then for a second in which no session with the
-/// departed device starts, so only the mint can dial it after.
+/// departed device starts and for nothing of the member's to be in flight,
+/// its redials after an already-syncing abort included, so only the mint can
+/// dial it after; the departed device's own redials, up to 2 s apart, can
+/// still reach the member, so only the member's dials count.
 #[tokio::test(flavor = "multi_thread")]
 async fn minting_a_pods_tickets_dials_no_former_members_device() -> Result<()> {
     let (alice_phone, carol_phone) = (node(QUIET).await?, node(POD_RUN).await?);
@@ -902,14 +924,20 @@ async fn minting_a_pods_tickets_dials_no_former_members_device() -> Result<()> {
         matches!(quiet, Ok(Ok(()))),
         "sessions with the departed device went on"
     );
+    assert!(settle(&[&alice_phone], pod).await?);
 
     let since = std::time::SystemTime::now();
     alice_phone
         .share_pod_tickets(alice.id, pod, AddrInfoOptions::RelayAndAddresses)
         .await?;
-    let reached = sessions
-        .next_started_with(c1, since, Duration::from_secs(2))
-        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let reached = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match sessions.next_started_with(c1, since, left).await? {
+            Some(session) if !session.dialed => {}
+            reached => break reached,
+        }
+    };
     assert!(
         reached.is_none(),
         "minting the pod's tickets dialed the former member's device: {reached:?}"

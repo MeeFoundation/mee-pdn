@@ -1,8 +1,8 @@
 # The stand's node: one `pdn-node-http` binary, one embedded runtime.
 #
 # The build is release — the stand's subject is sync under real timing, and a
-# debug node under that timing is a different animal from the one the demos
-# show. Dependencies are compiled in their own layer (cargo-chef), so a
+# debug node under that timing is a different animal from the one the demo
+# shows. Dependencies are compiled in their own layer (cargo-chef), so a
 # source edit rebuilds the workspace alone.
 
 # The recipe tool is pinned to a release, not a range: it decides how the
@@ -10,13 +10,13 @@
 # different tools and produce two different images.
 # rust-toolchain.toml is outside the build context (.dockerignore), so this
 # tag alone picks the image's compiler: keep its minor with the file's.
-FROM rust:1.98-bookworm AS chef
+FROM rust:1.99-trixie AS chef
 # A caller behind a TLS-intercepting proxy hands its CA bundle in as the
 # `ca-bundle` secret and points this at it (scripts/build-image.sh). Unset,
 # cargo trusts the image's own roots.
 ARG CARGO_HTTP_CAINFO
 RUN --mount=type=secret,id=ca-bundle,required=false \
-    cargo install cargo-chef --locked --version 0.1.77
+    cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /app
 
 FROM chef AS planner
@@ -36,12 +36,13 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p pdn-node-http --features "$FEATURES"
 
-FROM debian:bookworm-slim AS runtime
+# Same Debian release as the builder: the binary links against its glibc.
+FROM debian:trixie-slim AS runtime
 # The state directory is created for the non-root user the binary runs as,
 # and the image declares no VOLUME over it: an image-declared volume is
 # created anonymously for every container that ever runs, so what is
-# mounted over the directory stays the caller's decision (the demos'
-# compose files mount a named volume per node; the test stand mounts
+# mounted over the directory stays the caller's decision (the demo's
+# compose file mounts a named volume per node; the test stand mounts
 # nothing and the state lives and dies with the container).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

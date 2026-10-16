@@ -23,17 +23,14 @@ use std::{
 };
 
 use pdn_node::{
-    ConnectionsService as _, DataService as _, IdentityService as _, InvitePayload, LinkingPayload,
-    PodInvite, PodsService as _, Runtime, SpawnOptions, SyncService as _,
+    IdentityService as _, LinkingPayload, PodInvite, PodsService as _, Runtime, SpawnOptions,
+    SyncService as _,
 };
 
 use crate::{
     error::{self, PdnError},
     payload,
-    shapes::{
-        self, EntryListing, GrantCapability, GrantedPath, PodMemberInfo, PodMembershipAct,
-        PodOperation, PodRecord, PodRecordKind,
-    },
+    shapes::{self, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind},
 };
 
 /// What a handle holds. `ComingUp` is a state of its own so 2 concurrent
@@ -121,10 +118,8 @@ impl PdnNode {
     ///
     /// The interval is named rather than defaulted, because a short one
     /// costs radio wakeups and battery and the choice belongs to a host
-    /// that knows what it is running. It bounds a published grant reaching
-    /// the peer, a write reaching another device of the same identity, and
-    /// a linking catch-up — not the grantee's read of a granted claim,
-    /// which nudges its own reconciliation.
+    /// that knows what it is running. It bounds a write reaching another
+    /// device of the same identity and a linking catch-up.
     ///
     /// Installing the node is the spawn's own last act rather than this
     /// call's, so a caller that abandons the call — a cancelled coroutine,
@@ -163,8 +158,7 @@ impl PdnNode {
     ///
     /// What a stop costs is availability, not what the node holds. A peer
     /// that needed data while the node was down did not get it, and the
-    /// identities, connections and entries are found again on the next
-    /// bring-up. What does not come back is work in flight — an invite
+    /// identities and pods are found again on the next bring-up. What does not come back is work in flight — an invite
     /// minted and not consumed, a ceremony interrupted.
     pub async fn stop(&self) -> Result<(), PdnError> {
         let runtime = {
@@ -191,9 +185,7 @@ impl PdnNode {
     /// Create an identity on this node — its first device.
     ///
     /// An identity is a placeholder value with no key material behind it,
-    /// so nothing binds one to a person. A connection is evidence that 2
-    /// devices ran a ceremony with the same one-time secret, and nothing
-    /// more.
+    /// so nothing binds one to a person.
     pub async fn create_identity(&self) -> Result<String, PdnError> {
         let runtime = self.runtime()?;
         self.on_node(async move { Ok(runtime.identity().create().await?.to_string()) })
@@ -245,218 +237,6 @@ impl PdnNode {
         let runtime = self.runtime()?;
         self.on_node(async move { runtime.identity().link(payload, budget).await })
             .await
-    }
-
-    /// Mint an invitation for another identity to connect to `identity`.
-    /// The exposure is the one [`Self::mint_linking_payload`] describes.
-    pub async fn mint_invite(
-        &self,
-        identity: String,
-        lifetime_secs: Option<u64>,
-    ) -> Result<String, PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let lifetime = shapes::lifetime(lifetime_secs)?;
-        let runtime = self.runtime()?;
-        let minted = self
-            .on_node(async move { runtime.connections().invite(identity, lifetime).await })
-            .await?;
-        payload::encode(&minted)
-    }
-
-    /// Establish a connection for `identity` from an invitation.
-    ///
-    /// A code read for the wrong act reaches the runtime and comes back as
-    /// the runtime's refusal: nothing above the facade parses a payload to
-    /// tell an invitation from a device joining an identity.
-    pub async fn consume_invite(&self, identity: String, code: String) -> Result<(), PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let payload: InvitePayload = payload::decode(&code)?;
-        let runtime = self.runtime()?;
-        self.on_node(async move { runtime.connections().establish(identity, payload).await })
-            .await
-    }
-
-    /// The current connections of `identity`.
-    pub async fn connections(&self, identity: String) -> Result<Vec<String>, PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            let peers = runtime.connections().list(identity).await?;
-            Ok(peers.iter().map(ToString::to_string).collect())
-        })
-        .await
-    }
-
-    /// Publish a grant: `identity` grants `peer` read — and, per claim,
-    /// write — on exactly these paths of `issuer`'s data.
-    ///
-    /// The issuer must be the granting identity itself; anything else is
-    /// the runtime's refusal. One grant record exists per granted issuer
-    /// toward a peer, so publishing again replaces the previous record.
-    pub async fn publish_grant(
-        &self,
-        identity: String,
-        peer: String,
-        issuer: String,
-        claims: Vec<GrantedPath>,
-    ) -> Result<(), PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let peer = shapes::identity(&peer, "peer")?;
-        let issuer = shapes::identity(&issuer, "issuer")?;
-        let claims = shapes::granted_claims(issuer, &claims)?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            runtime
-                .connections()
-                .publish_grant(identity, peer, issuer, claims)
-                .await
-        })
-        .await
-    }
-
-    /// What `peer` granted `identity` — the capability alone, with the
-    /// replica's ticket dropped here and reaching nothing above.
-    ///
-    /// The read reports what is readable now and never waits, so a grant
-    /// that has not replicated in reads as no grant. An empty answer is
-    /// therefore not evidence that the peer granted nothing.
-    pub async fn read_peer_grants(
-        &self,
-        identity: String,
-        peer: String,
-    ) -> Result<Vec<GrantCapability>, PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let peer = shapes::identity(&peer, "peer")?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            let grants = runtime.connections().read_grants(identity, peer).await?;
-            Ok(grants
-                .into_iter()
-                .map(|held| GrantCapability::from(held.grant))
-                .collect())
-        })
-        .await
-    }
-
-    /// What `identity` granted `peer`, read from this node rather than
-    /// remembered.
-    ///
-    /// The answer is this device's: it says the record is here, never that
-    /// it reached a sibling device or the peer. An empty answer covers no
-    /// connection, a pair whose tickets have not replicated here, and
-    /// nothing granted.
-    pub async fn read_own_grants(
-        &self,
-        identity: String,
-        peer: String,
-    ) -> Result<Option<GrantCapability>, PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let peer = shapes::identity(&peer, "peer")?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            Ok(runtime
-                .connections()
-                .read_own_grants(identity, peer)
-                .await?
-                .map(GrantCapability::from))
-        })
-        .await
-    }
-
-    /// Withdraw the grant of `issuer`'s data toward `peer` — one act.
-    ///
-    /// The grantee's node unbinds the namespace once the tombstone
-    /// replicates, so its later reads of that issuer are refused rather
-    /// than answered empty. What was already delivered is not recalled:
-    /// nothing compels a node that received data to forget it.
-    pub async fn withdraw_grant(
-        &self,
-        identity: String,
-        peer: String,
-        issuer: String,
-    ) -> Result<(), PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let peer = shapes::identity(&peer, "peer")?;
-        let issuer = shapes::identity(&issuer, "issuer")?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            runtime
-                .connections()
-                .withdraw_grant(identity, peer, issuer)
-                .await
-        })
-        .await
-    }
-
-    /// Write `payload` at `path` of `issuer`'s data.
-    ///
-    /// A write into a namespace received under a grant is admitted locally
-    /// against the grant record this node has read; the issuer's own gate
-    /// decides afterwards, and a claim its record does not cover is
-    /// retracted there with no answer here carrying that verdict.
-    pub async fn write_entry(
-        &self,
-        identity: String,
-        issuer: String,
-        path: String,
-        payload: Vec<u8>,
-    ) -> Result<(), PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let issuer = shapes::identity(&issuer, "issuer")?;
-        let path = shapes::entry_path(&path)?;
-        shapes::entry_payload(&payload)?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            runtime
-                .data()
-                .write(identity, issuer, &path, &payload)
-                .await
-        })
-        .await
-    }
-
-    /// Read the entry at `path` of `issuer`'s data.
-    ///
-    /// No value covers 2 situations the runtime does not distinguish: no
-    /// entry exists, and an entry's record has arrived while its payload
-    /// has not. Records and payloads travel independently, so an empty read
-    /// is not proof of absence and a caller reads again rather than
-    /// concluding.
-    pub async fn read_entry(
-        &self,
-        identity: String,
-        issuer: String,
-        path: String,
-    ) -> Result<Option<Vec<u8>>, PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let issuer = shapes::identity(&issuer, "issuer")?;
-        let path = shapes::entry_path(&path)?;
-        let runtime = self.runtime()?;
-        self.on_node(async move { runtime.data().read(identity, issuer, &path).await })
-            .await
-    }
-
-    /// List the entries of `issuer`'s data, with no payloads fetched. A
-    /// prefix restricts the listing, matching whole path components rather
-    /// than characters.
-    pub async fn list_entries(
-        &self,
-        identity: String,
-        issuer: String,
-        path_prefix: Option<String>,
-    ) -> Result<Vec<EntryListing>, PdnError> {
-        let identity = shapes::identity(&identity, "identity")?;
-        let issuer = shapes::identity(&issuer, "issuer")?;
-        let prefix = path_prefix.as_deref().map(shapes::entry_path).transpose()?;
-        let runtime = self.runtime()?;
-        self.on_node(async move {
-            let entries = runtime
-                .data()
-                .list(identity, issuer, prefix.as_ref())
-                .await?;
-            Ok(entries.into_iter().map(EntryListing::from).collect())
-        })
-        .await
     }
 
     /// Create a pod with `identity` as its first owner.

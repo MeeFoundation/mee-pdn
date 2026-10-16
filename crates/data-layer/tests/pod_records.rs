@@ -464,7 +464,7 @@ async fn an_unknown_entry_from_a_member_converges_and_changes_nothing() -> Resul
         }
     }
     // Denied: the ticket holder that is no member.
-    assert!(dave_phone.list_pod_unknown(dave.id, pod).await?.is_empty());
+    assert_eq!(dave_phone.list_pod_unknown(dave.id, pod).await?, []);
 
     for node in [alice_phone, bob_phone, carol_phone, dave_phone] {
         node.shutdown().await?;

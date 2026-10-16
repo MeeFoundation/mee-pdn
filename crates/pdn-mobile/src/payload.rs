@@ -45,7 +45,7 @@ pub(crate) fn decode<T: DeserializeOwned>(text: &str) -> Result<T, PdnError> {
 
 #[cfg(test)]
 mod tests {
-    use pdn_node::InvitePayload;
+    use pdn_node::PodInvite;
 
     use super::*;
 
@@ -58,15 +58,15 @@ mod tests {
     #[test]
     fn a_text_that_carries_no_payload_is_the_hosts_refusal() {
         assert!(matches!(
-            decode::<InvitePayload>("not a code").unwrap_err(),
+            decode::<PodInvite>("not a code").unwrap_err(),
             PdnError::MalformedInput { .. }
         ));
         assert!(matches!(
-            decode::<InvitePayload>(&URL_SAFE_NO_PAD.encode(b"{}")).unwrap_err(),
+            decode::<PodInvite>(&URL_SAFE_NO_PAD.encode(b"{}")).unwrap_err(),
             PdnError::MalformedInput { .. }
         ));
         assert!(matches!(
-            decode::<InvitePayload>("").unwrap_err(),
+            decode::<PodInvite>("").unwrap_err(),
             PdnError::MalformedInput { .. }
         ));
     }

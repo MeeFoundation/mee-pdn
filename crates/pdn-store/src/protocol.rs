@@ -12,7 +12,7 @@ use crate::{
     engine::{DefaultAuthorStorage, Engine, ProtectCallbackHandler},
     net::{accept_session, refuse_session, AbortReason},
     store::Store,
-    CapabilityValidator, Identity,
+    Identity,
 };
 
 #[derive(Default, Debug)]
@@ -52,8 +52,6 @@ impl Docs {
         Builder {
             storage: Storage::Memory,
             protect_cb: None,
-            capability_validator: None,
-            rejection_observer: None,
             identity,
             session_access_provider,
             co_located: None,
@@ -76,8 +74,6 @@ impl Docs {
         Builder {
             storage: Storage::Persistent { path, cache_bytes },
             protect_cb: None,
-            capability_validator: None,
-            rejection_observer: None,
             identity,
             session_access_provider,
             co_located: None,
@@ -145,10 +141,6 @@ impl ProtocolHandler for Docs {
 pub struct Builder {
     storage: Storage,
     protect_cb: Option<ProtectCallbackHandler>,
-    #[debug("CapabilityValidator")]
-    capability_validator: Option<CapabilityValidator>,
-    #[debug("RejectionObserver")]
-    rejection_observer: Option<crate::RejectionObserver>,
     identity: Identity,
     #[debug("SessionAccessProvider")]
     session_access_provider: crate::filter::SessionAccessProvider,
@@ -161,26 +153,6 @@ impl Builder {
     /// See [`ProtectCallbackHandler::new`] for details.
     pub fn protect_handler(mut self, protect_handler: ProtectCallbackHandler) -> Self {
         self.protect_cb = Some(protect_handler);
-        self
-    }
-
-    /// Set a capability validator consulted for every incoming (non-local) entry
-    /// before it is persisted. Returning `false` drops the entry.
-    ///
-    /// This is the injection point for PdnId / UWill capability checks. If
-    /// unset, all entries are accepted (vanilla iroh-docs behaviour).
-    pub fn capability_validator(mut self, validator: CapabilityValidator) -> Self {
-        self.capability_validator = Some(validator);
-        self
-    }
-
-    /// Set an observer called for every rejection a replica on this node
-    /// receives — an own entry a peer refused at its ingest gate, echoed back
-    /// in-band on the reconciliation reply.
-    ///
-    /// If unset, nothing is observed.
-    pub fn rejection_observer(mut self, observer: crate::RejectionObserver) -> Self {
-        self.rejection_observer = Some(observer);
         self
     }
 
@@ -223,8 +195,6 @@ impl Builder {
             downloader,
             author_store,
             self.protect_cb,
-            self.capability_validator,
-            self.rejection_observer,
             self.session_access_provider,
             self.identity,
             self.co_located,
