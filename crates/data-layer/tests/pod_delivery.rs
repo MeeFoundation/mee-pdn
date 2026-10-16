@@ -15,7 +15,7 @@ use data_layer::{
     MemberState, MembershipKey, PodStore, Seq, SessionTrace, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_store::SessionRole;
-use pdn_types::{NodeId, PodId};
+use pdn_types::{NodeId, PdnId, PodId};
 use test_utils::{
     eventually, host_identity, join_identity,
     pod::{
@@ -57,6 +57,21 @@ fn nowhere(seed: u8) -> MemberDevice {
         node: NodeId::from_bytes(*key.as_bytes()),
         author: AuthorId::from([seed; 32]),
     }
+}
+
+/// `member`'s device statement at version 2, written from its own device.
+async fn second_statement(
+    node: &SyncNode,
+    member: &Person,
+    pod: PodId,
+    devices: Vec<MemberDevice>,
+) -> Result<()> {
+    let key = MembershipKey::Devices {
+        member: member.id,
+        version: 2,
+    };
+    let payload = member.keys.device_statement(&pod, 2, devices).encode();
+    write(node, member, pod, key, payload).await
 }
 
 /// A dial of one of `pod`'s stores from `holder`'s replica on `from` to
@@ -420,6 +435,98 @@ async fn an_invited_device_is_a_contact_once_the_invite_is_written() -> Result<(
     Ok(())
 }
 
+/// A device a member's ticket names is a contact, as that member, through
+/// every derivation while no statement lists it, and keeps the ticket's
+/// addresses once one does. Paired denial: a ticket naming the same device
+/// as an identity that is no member makes it no contact as that identity.
+///
+/// The derivation is forced by a local write after the import, since one
+/// the import's own entries start may run before or after the assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_a_members_ticket_names_stays_a_contact_until_a_statement_lists_it() -> Result<()>
+{
+    let (alice_phone, alice_laptop, bob_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let dave = Person::generate();
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    let laptop = alice_laptop.dial_handle().addr();
+    let mut handed = tickets(&alice_phone, &alice, pod).await?;
+    for ticket in [&mut handed.membership, &mut handed.records] {
+        ticket.nodes.push(laptop.clone());
+    }
+    let mut as_dave = handed.clone();
+    for ticket in [&mut as_dave.membership, &mut as_dave.records] {
+        ticket.nodes = vec![laptop.clone()];
+        ticket.identity = identity_of(dave.id);
+    }
+    bob_phone
+        .import_pod_with(bob.id, pod, handed, &[as_dave])
+        .await?;
+    assert!(lists(&bob_phone, bob.id, pod, alice.id, OWNER).await?);
+    second_statement(&bob_phone, &bob, pod, vec![device_of(&bob_phone, &bob)?]).await?;
+    let named = |contacts: &[Contact], as_whom: PdnId| {
+        contacts
+            .iter()
+            .find(|contact| {
+                contact.addr.id == laptop.id && contact.identity == identity_of(as_whom)
+            })
+            .map(|contact| contact.addr.clone())
+    };
+    for store in [PodStore::Membership, PodStore::Records] {
+        let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, store)?;
+        assert_eq!(
+            named(&contacts, alice.id),
+            Some(laptop.clone()),
+            "{store:?}: the device the member's ticket names is no contact"
+        );
+        // Denied: the same device as no member.
+        assert_eq!(named(&contacts, dave.id), None);
+    }
+
+    let laptops = MemberDevice {
+        node: NodeId::from_bytes(*laptop.id.as_bytes()),
+        author: AuthorId::from([0xa2; 32]),
+    };
+    let alices = vec![device_of(&alice_phone, &alice)?, laptops];
+    second_statement(&alice_phone, &alice, pod, alices).await?;
+    dial(
+        &bob_phone,
+        &bob,
+        pod,
+        PodStore::Membership,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    assert!(lists_device(&bob_phone, bob.id, pod, alice.id, laptops).await?);
+    for store in [PodStore::Membership, PodStore::Records] {
+        let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, store)?;
+        assert_eq!(
+            named(&contacts, alice.id),
+            Some(laptop.clone()),
+            "{store:?}: the listed device lost the ticket's addresses"
+        );
+    }
+
+    for node in [alice_phone, alice_laptop, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A device another member's invite lists is a contact, as the newcomer,
 /// once the session that brings the invite ends, with no quiet wait before
 /// it: the newcomer's first announcement can come at once. Paired: before
@@ -491,8 +598,8 @@ async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> 
 }
 
 /// A newcomer's record store reaches the inviter by its ticket, and the
-/// inviter's claim reads, though the membership store's first session
-/// derives contacts that leave the inviter's device out. Alice's statement
+/// inviter's claim reads, though no statement lists the inviter's device
+/// when the membership store's first session derives contacts. Alice's statement
 /// lists another node here, as a membership view lists none while the
 /// payloads are still on their way; the start is held between the two stores
 /// until that derivation lands, which the stress pass meets only now and
@@ -534,17 +641,16 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let tickets = tickets(&alice_phone, &alice, pod).await?;
 
     let pause = bob_phone.pause_next_pod_start_for_test();
-    let only_elsewhere = |contacts: Vec<Contact>| {
-        contacts.len() == 1
-            && contacts
-                .iter()
-                .all(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes())
+    let lists_elsewhere = |contacts: Vec<Contact>| {
+        contacts
+            .iter()
+            .any(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes())
     };
     let (imported, derived) = tokio::join!(bob_phone.import_pod(bob.id, pod, tickets), async {
         pause.reached.notified().await;
         let derived = eventually(|| async {
             let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, PodStore::Records)?;
-            Ok(only_elsewhere(contacts))
+            Ok(lists_elsewhere(contacts))
         })
         .await;
         pause.release.notify_one();

@@ -337,6 +337,9 @@ enum SyncStrategy {
 struct TrackedDoc {
     doc: Doc,
     contacts: Vec<Contact>,
+    /// The contacts the store's tickets named when it was tracked, which
+    /// replacing `contacts` keeps.
+    ticketed: Vec<Contact>,
     strategy: SyncStrategy,
     /// Whom a peer of this replica is dialed as when no contact names one:
     /// the identity for a store its devices share, the member whose ticket
@@ -432,6 +435,7 @@ impl HostedStack {
             doc.id(),
             TrackedDoc {
                 doc: doc.clone(),
+                ticketed: contacts.clone(),
                 contacts,
                 strategy,
                 default_identity,
@@ -3553,6 +3557,9 @@ async fn pod_contacts(
         })
         .collect();
     devices.extend(own_devices.into_iter().map(|device| (device, own)));
+    if !converged {
+        devices.extend(ticketed_unlisted(stack, held, &view)?);
+    }
     let known = known_addresses(stack, membership)?;
     let mut seen = HashSet::new();
     let mut contacts = Vec::new();
@@ -3575,6 +3582,36 @@ async fn pod_contacts(
         member,
         unlisted,
     })
+}
+
+/// The devices `held`'s tickets name as a current member that no statement
+/// lists yet: the inviter's other device, reached before its statement is.
+fn ticketed_unlisted(
+    stack: &HostedStack,
+    held: &PodBinding,
+    view: &MembershipView,
+) -> Result<Vec<(NodeId, Identity)>> {
+    let listed: HashSet<NodeId> = view
+        .identities()
+        .flat_map(|(_id, member)| member.devices.iter().map(|device| device.node))
+        .collect();
+    let mut devices = Vec::new();
+    for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+        for contact in stack
+            .tracked(doc.id())?
+            .map(|tracked| tracked.ticketed)
+            .unwrap_or_default()
+        {
+            let device = NodeId::from_bytes(*contact.addr.id.as_bytes());
+            let current = view
+                .member(&PdnId::from_bytes(*contact.identity.as_bytes()))
+                .is_some_and(|member| member.state.member);
+            if current && !listed.contains(&device) {
+                devices.push((device, contact.identity));
+            }
+        }
+    }
+    Ok(devices)
 }
 
 /// The contacts of `ticket` and of `others`, tickets to the same store,
@@ -3611,8 +3648,9 @@ fn known_addresses(stack: &HostedStack, store: &Doc) -> Result<HashMap<EndpointI
         .tracked(store.id())?
         .map(|tracked| {
             tracked
-                .contacts
+                .ticketed
                 .into_iter()
+                .chain(tracked.contacts)
                 .map(|contact| (contact.addr.id, contact.addr))
                 .collect()
         })

@@ -219,6 +219,9 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         .leave_swarm_for_test(alice.id, membership)
         .await?;
     bob_laptop.leave_swarm_for_test(bob.id, membership).await?;
+    // Taken before the statement: the laptop's redials of sessions from
+    // before can bring it ahead of the dial below.
+    let mut traces = alice_phone.take_session_traces().context("taken once")?;
     let laptops = device_of(&bob_laptop, &bob)?;
     let listing = statement(
         &bob_laptop,
@@ -244,7 +247,6 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         alices.author,
     )
     .await?;
-    let mut traces = alice_phone.take_session_traces().context("taken once")?;
 
     dial(
         &bob_laptop,
@@ -267,14 +269,17 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         if trace.namespace != membership {
             continue;
         }
+        let laptops = trace.peer == laptop_node && trace.role == SessionRole::Accept;
         match trace.traced {
             Traced::Admitted { key, .. } if opened => first.push(key),
-            Traced::AllowedFiltered
-                if !opened && trace.peer == laptop_node && trace.role == SessionRole::Accept =>
+            // A session that admitted nothing yet is reopened: a redial from
+            // before the statement, or the decision asked again.
+            Traced::AllowedFiltered if laptops && first.is_empty() => opened = true,
+            Traced::Denied | Traced::AllowedWhole | Traced::AllowedFiltered
+                if opened && !first.is_empty() =>
             {
-                opened = true;
+                break
             }
-            Traced::Denied | Traced::AllowedWhole | Traced::AllowedFiltered if opened => break,
             _ => {}
         }
     }
@@ -360,6 +365,13 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
     )
     .await?;
     assert!(lists_device(&alice_phone, alice.id, pod, bob.id, b2).await?);
+    // Both of Bob's devices list Alice's own device before the stores leave
+    // their swarms: one that holds her entries without their payloads yet
+    // refuses her sessions, and nothing dials it again with the passes off.
+    let a1 = device_of(&alice_phone, &alice)?;
+    for device in [&bob_phone, &bob_laptop] {
+        assert!(lists_device(device, bob.id, pod, alice.id, a1).await?);
+    }
     for (device, holder) in [
         (&alice_phone, &alice),
         (&bob_phone, &bob),

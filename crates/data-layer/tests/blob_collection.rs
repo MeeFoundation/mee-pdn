@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use data_layer::{PodStore, SpawnOptions, SyncNode};
+use data_layer::{identity_of, Contact, PodStore, SpawnOptions, SyncNode};
 use iroh_blobs::Hash;
 use pdn_types::{RecordId, RecordRef};
 use test_utils::{
@@ -210,7 +210,9 @@ async fn a_payload_written_while_a_run_is_under_way_stays() -> Result<()> {
 /// under way stays through that run, and reads.
 ///
 /// Held as the scenario above: the record arrives and its payload is fetched
-/// in the hold, and a stray payload leaves in the same run.
+/// in the hold, and a stray payload leaves in the same run. The record
+/// arrives by a dial rather than the swarm, which may not have formed yet
+/// with every pass out of reach.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
     let (alice_phone, bob_phone) = (node().await?, node().await?);
@@ -232,6 +234,10 @@ async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
     let run = bob_phone.pause_next_collection_for_test();
     run.reached.notified().await;
     let claim = place_claim(&alice_phone, &alice, pod, 1).await?;
+    let alices = Contact::new(alice_phone.dial_handle().addr(), identity_of(alice.id));
+    bob_phone
+        .sync_pod_with_for_test(bob.id, pod, PodStore::Records, alices)
+        .await?;
     assert!(reads(&bob_phone, bob.id, pod, claim).await?);
     let stray = bob_phone.add_stray_payload_for_test(b"stray").await?;
     run.release.notify_one();
