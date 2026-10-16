@@ -871,8 +871,9 @@ async fn a_tombstone_is_reconciled_with_its_siblings_alone_once_it_reached_a_mem
 ///
 /// The member's own pass is out of reach, and the act waits for the
 /// tombstone to converge and then for a second in which no session with the
-/// departed device starts, so only the mint can dial it after; the departed
-/// device's own redials after an already-syncing abort, up to 2 s apart, can
+/// departed device starts and for nothing of the member's to be in flight,
+/// its redials after an already-syncing abort included, so only the mint can
+/// dial it after; the departed device's own redials, up to 2 s apart, can
 /// still reach the member, so only the member's dials count.
 #[tokio::test(flavor = "multi_thread")]
 async fn minting_a_pods_tickets_dials_no_former_members_device() -> Result<()> {
@@ -923,6 +924,7 @@ async fn minting_a_pods_tickets_dials_no_former_members_device() -> Result<()> {
         matches!(quiet, Ok(Ok(()))),
         "sessions with the departed device went on"
     );
+    assert!(settle(&[&alice_phone], pod).await?);
 
     let since = std::time::SystemTime::now();
     alice_phone

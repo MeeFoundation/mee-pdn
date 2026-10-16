@@ -1595,7 +1595,7 @@ impl SyncNode {
             match tokio::time::timeout_at(deadline, changes.next()).await {
                 Ok(Some(_change)) => {}
                 Ok(None) => anyhow::bail!("the membership store's change stream ended"),
-                Err(_elapsed) => return Err(crate::CatchUpTimeout.into()),
+                Err(_elapsed) => return Err(crate::CatchUpTimeout::default().into()),
             }
             // A burst — a session's entries, their payloads — is read once.
             while let Some(Some(_change)) = futures_lite::future::poll_once(changes.next()).await {}

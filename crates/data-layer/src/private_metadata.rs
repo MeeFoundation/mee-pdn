@@ -32,12 +32,27 @@ use crate::{
     pod::{PodStore, Seq},
 };
 
-/// The wait of [`CatchUpWatch::wait`] elapsed. Downcast
-/// from its `anyhow::Error` to tell "did not catch up in time" from this
-/// node's own failures.
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("no successful sync session of the replica within the wait")]
-pub struct CatchUpTimeout;
+/// The wait of [`CatchUpWatch::wait`] elapsed, naming the sessions that
+/// ended in it. Downcast from its `anyhow::Error` to tell "did not catch up
+/// in time" from this node's own failures.
+#[derive(Debug, Clone, Default, thiserror::Error)]
+#[error("no successful sync session of the replica within the wait; ended in it: {}", ended_in_wait(.ended, *.unnamed))]
+pub struct CatchUpTimeout {
+    /// The first [`ENDED_NAMED`] of them.
+    ended: Vec<String>,
+    unnamed: usize,
+}
+
+/// Sessions a timeout names; a pair redialed as already syncing ends more.
+const ENDED_NAMED: usize = 10;
+
+fn ended_in_wait(ended: &[String], unnamed: usize) -> String {
+    match (ended.is_empty(), unnamed) {
+        (true, _) => "nothing".to_owned(),
+        (false, 0) => ended.join("; "),
+        (false, more) => format!("{} and {more} more", ended.join("; ")),
+    }
+}
 
 /// A subscription to one replica's sync sessions, from
 /// [`PrivateMetadataStore::watch_catch_up`]. Unread past its buffer it drops
@@ -73,13 +88,14 @@ impl CatchUpWatch {
     /// that never synced read the same.
     pub async fn wait(mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
+        let mut timeout_error = CatchUpTimeout::default();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(CatchUpTimeout.into());
+                return Err(timeout_error.into());
             }
             let Ok(event) = tokio::time::timeout(remaining, self.events.next()).await else {
-                return Err(CatchUpTimeout.into());
+                return Err(timeout_error.into());
             };
             let event =
                 event.context("replica event stream ended while waiting for a sync session")??;
@@ -87,6 +103,22 @@ impl CatchUpWatch {
                 if sync.result.is_ok() && sync.started >= self.since {
                     return Ok(());
                 }
+                let before = if sync.started < self.since {
+                    ", begun before the watch"
+                } else {
+                    ""
+                };
+                if timeout_error.ended.len() == ENDED_NAMED {
+                    timeout_error.unnamed = timeout_error.unnamed.saturating_add(1);
+                    continue;
+                }
+                timeout_error.ended.push(format!(
+                    "{} as {} ({:?}{before}): {:?}",
+                    sync.peer.fmt_short(),
+                    sync.counterpart.fmt_short(),
+                    sync.origin,
+                    sync.result,
+                ));
             }
         }
     }

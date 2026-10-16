@@ -363,8 +363,15 @@ async fn the_last_two_owners_leaving_at_once_leave_the_pod_without_an_owner() ->
     act(carol_phone, carol, 2, EventKind::Left, carol, 3, pod).await?;
     dial(bob_phone, bob, pod, alice_phone, alice).await?;
     dial(bob_phone, bob, pod, carol_phone, carol).await?;
-    for (member, want) in [(alice, OUT), (carol, OUT), (bob, PLAIN)] {
-        assert!(lists(bob_phone, bob.id, pod, member.id, want).await?);
+    for (name, member, want) in [
+        ("alice", alice, OUT),
+        ("carol", carol, OUT),
+        ("bob", bob, PLAIN),
+    ] {
+        if !lists(bob_phone, bob.id, pod, member.id, want).await? {
+            let view = bob_phone.pod_membership_view(bob.id, pod).await;
+            anyhow::bail!("Bob's view does not show {name} as {want:?}: {view:#?}");
+        }
     }
     let owners = bob_phone
         .pod_membership_view(bob.id, pod)
@@ -435,8 +442,15 @@ async fn the_last_two_owners_removing_each_other_leave_the_pod_without_an_owner(
     act(carol_phone, carol, 2, EventKind::Removed, alice, 2, pod).await?;
     dial(bob_phone, bob, pod, alice_phone, alice).await?;
     dial(bob_phone, bob, pod, carol_phone, carol).await?;
-    for (member, want) in [(alice, OUT), (carol, OUT), (bob, PLAIN)] {
-        assert!(lists(bob_phone, bob.id, pod, member.id, want).await?);
+    for (name, member, want) in [
+        ("alice", alice, OUT),
+        ("carol", carol, OUT),
+        ("bob", bob, PLAIN),
+    ] {
+        if !lists(bob_phone, bob.id, pod, member.id, want).await? {
+            let view = bob_phone.pod_membership_view(bob.id, pod).await;
+            anyhow::bail!("Bob's view does not show {name} as {want:?}: {view:#?}");
+        }
     }
     let owners = bob_phone
         .pod_membership_view(bob.id, pod)
