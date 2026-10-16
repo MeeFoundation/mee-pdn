@@ -7,9 +7,13 @@
 # platforms `xcrun` finds it, on Android `cc-rs` looks for a bare
 # `aarch64-linux-android-clang` and the NDK ships only API-level-suffixed
 # wrappers, so the caller names one. TARGET_API selects it.
+#
+# The second argument names the crate's features, empty for a release:
+# `observation` is the sync tests' test build.
 set -eux
 cd "$(dirname "$0")/.."
 target="${1:-aarch64-linux-android}"
+features="${2:-}"
 case "$target" in
   *android*)
     : "${ANDROID_NDK_HOME:?set it to the NDK the build compiles ring with}"
@@ -29,4 +33,4 @@ case "$target" in
   *apple*) kind=staticlib ;;
   *) echo "not a mobile target: $target"; exit 1 ;;
 esac
-cargo rustc -p pdn-mobile --release --target "$target" --crate-type "$kind"
+cargo rustc -p pdn-mobile --release --target "$target" ${features:+--features "$features"} --crate-type "$kind"

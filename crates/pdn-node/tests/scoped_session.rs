@@ -3,16 +3,16 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use pdn_node::{
     ConnectionsService as _, DataService as _, GrantedClaim, IdentityService as _, Runtime,
     SpawnOptions,
 };
-use pdn_types::{EntryPath, NonEmpty};
+use pdn_types::{EntryPath, NonEmpty, PdnId};
 use test_utils::eventually;
 
 mod common;
-use common::{establish_patiently, granted_patiently};
+use common::establish_patiently;
 
 const RECONCILE: Duration = Duration::from_secs(3600);
 
@@ -22,6 +22,35 @@ async fn spawn_runtime() -> Result<Runtime> {
         ..SpawnOptions::memory()
     })
     .await
+}
+
+/// `common::granted_patiently` with the namespace polled unnudged: a nudged
+/// read leaves a scoped session in flight that races the writes below.
+async fn granted_unnudged(
+    gives: &Runtime,
+    gives_id: PdnId,
+    receives: &Runtime,
+    receives_id: PdnId,
+    claims: NonEmpty<GrantedClaim>,
+) -> Result<()> {
+    gives
+        .connections()
+        .publish_grant(gives_id, receives_id, gives_id, claims)
+        .await?;
+    let probe = EntryPath::new("probe")?;
+    let held = eventually(|| async {
+        Ok(receives
+            .data()
+            .read_unnudged(receives_id, gives_id, &probe)
+            .await
+            .is_ok())
+    })
+    .await?;
+    ensure!(
+        held,
+        "the receiver never came to hold the issuer's namespace"
+    );
+    Ok(())
 }
 
 /// One scoped session delivers every covered entry the issuer wrote before
@@ -58,7 +87,7 @@ async fn one_scoped_session_delivers_every_covered_entry_written_before_it() -> 
             .collect(),
     )
     .context("the claim set is not empty")?;
-    granted_patiently(&rt_w, x, &rt_r, y, x, claims).await?;
+    granted_unnudged(&rt_w, x, &rt_r, y, claims).await?;
     rt_r.connections().sweep_pair_now(y, x).await?;
     assert!(
         eventually(|| async {

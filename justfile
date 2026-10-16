@@ -39,9 +39,9 @@ openspec-skills:
   @python3 -I scripts/openspec-skills.py
 
 # Build the mobile facade for one target — what `pdn-sdk` packages (see scripts/build-mobile.sh)
-[doc("Build the mobile facade for one target (positional; TARGET_API picks the NDK wrapper)")]
-build-mobile target="aarch64-linux-android":
-  @sh scripts/build-mobile.sh {{ target }}
+[doc("Build the mobile facade for one target, with the crate features named (positional; TARGET_API picks the NDK wrapper)")]
+build-mobile target="aarch64-linux-android" features="":
+  @sh scripts/build-mobile.sh {{ target }} "{{ features }}"
 
 # Run workspace tests via nextest — extra args forwarded; a run with no selection ends with the workspace doctests, a `-p` or `-E` selection skips them
 test *args: _need-nextest
@@ -211,6 +211,7 @@ check: _check-devcontainer-tools
   cargo clippy --workspace --lib --bins
   # The observation build is a release build: checked in that profile.
   cargo clippy -p pdn-node-http --release --features observation --lib --bins
+  cargo clippy -p pdn-mobile --release --features observation --lib
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh)
   cargo check --workspace --all-targets $(sh scripts/test-features.sh)
 

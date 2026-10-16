@@ -45,7 +45,7 @@ async fn place(runtime: &Runtime, identity: PdnId, pod: PodId, payload: &[u8]) -
         .put_record(identity, pod, RecordKind::ImmutableDocument, payload)
         .await?;
     runtime
-        .pod_record_listing_for_test(identity, pod)
+        .pod_record_listing_for_test(identity, pod, true)
         .await?
         .into_iter()
         .find(|entry| entry.payload.as_deref() == Some(payload))
@@ -173,7 +173,7 @@ async fn a_consumer_that_reads_late_receives_the_time_of_production() -> Result<
     assert!(
         eventually(|| async {
             Ok(alice_phone
-                .pod_record_listing_for_test(alice, pod)
+                .pod_record_listing_for_test(alice, pod, true)
                 .await
                 .is_ok_and(|listing| listing.len() == RECORDS))
         })
@@ -407,7 +407,9 @@ async fn a_departure_closes_the_record_stream(departure: Departure) -> Result<()
     read_until(&mut subscription, is_closed_records).await?;
     let later = place(&alice_phone, alice, pod, b"after the departure").await?;
     join_again(&alice_phone, alice, &bob_phone, bob, pod).await?;
-    let listing = bob_phone.pod_record_listing_for_test(bob, pod).await?;
+    let listing = bob_phone
+        .pod_record_listing_for_test(bob, pod, true)
+        .await?;
     assert!(
         listing.iter().any(|entry| entry.key == later),
         "the later record did not reach the member's node"
@@ -532,7 +534,9 @@ async fn the_listing_holds_a_placed_record_beside_a_forged_entry_at_its_key() ->
         .await?;
     assert!(
         eventually(|| async {
-            let listing = bob_phone.pod_record_listing_for_test(bob, pod).await?;
+            let listing = bob_phone
+                .pod_record_listing_for_test(bob, pod, true)
+                .await?;
             Ok(listing
                 .iter()
                 .filter(|entry| entry.key == key && entry.present)
@@ -542,7 +546,9 @@ async fn the_listing_holds_a_placed_record_beside_a_forged_entry_at_its_key() ->
         .await?,
         "both entries did not reach the reader"
     );
-    let listing = bob_phone.pod_record_listing_for_test(bob, pod).await?;
+    let listing = bob_phone
+        .pod_record_listing_for_test(bob, pod, true)
+        .await?;
     let at_key = |verdict: &str| {
         listing
             .iter()
@@ -555,7 +561,9 @@ async fn the_listing_holds_a_placed_record_beside_a_forged_entry_at_its_key() ->
         Some((Some(&b"forged"[..]), Some("author_not_actor_device")))
     );
     // Denied (co-located, no store of the pod).
-    let refused = bob_phone.pod_record_listing_for_test(carol, pod).await;
+    let refused = bob_phone
+        .pod_record_listing_for_test(carol, pod, true)
+        .await;
     assert!(refused.is_err_and(|err| is::<UnknownPod>(&err)));
 
     alice_phone
@@ -565,7 +573,7 @@ async fn the_listing_holds_a_placed_record_beside_a_forged_entry_at_its_key() ->
     // Denied (removed).
     assert!(
         eventually(|| async {
-            let refused = bob_phone.pod_record_listing_for_test(bob, pod).await;
+            let refused = bob_phone.pod_record_listing_for_test(bob, pod, true).await;
             Ok(refused.is_err_and(|err| is::<UnknownPod>(&err)))
         })
         .await?,
@@ -600,7 +608,9 @@ async fn the_listing_starts_no_session() -> Result<()> {
     // The join's own sessions end before the window opens.
     read_until_quiet(&mut subscription, Duration::from_secs(3)).await;
 
-    let listing = alice_phone.pod_record_listing_for_test(alice, pod).await?;
+    let listing = alice_phone
+        .pod_record_listing_for_test(alice, pod, true)
+        .await?;
     assert_eq!(listing.len(), 1);
     let window = read_until_quiet(&mut subscription, WINDOW).await;
     assert!(
@@ -653,7 +663,7 @@ async fn pod_holding_records(
             .await?;
     }
     let keys: HashSet<String> = alice_phone
-        .pod_record_listing_for_test(alice, pod)
+        .pod_record_listing_for_test(alice, pod, true)
         .await?
         .into_iter()
         .map(|entry| entry.key)

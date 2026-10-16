@@ -19,6 +19,17 @@ name = "pdn_mobile"
 # nothing a device installs. Behind a feature so the product build carries
 # neither the generator nor its argument parser.
 cli = ["uniffi/cli", "uniffi/cargo-metadata"]
+# The sync tests' test build (`pdn-sdk`'s test artifact, never a release):
+# the laptop host's debug and observation routes on the phone's loopback.
+observation = [
+  "pdn-node/test-util",
+  "dep:pdn-node-http",
+  "pdn-node-http/observation",
+  "dep:axum",
+  "dep:tower",
+  "tokio/net",
+  "tokio/time",
+]
 
 [[bin]]
 name = "uniffi-bindgen"
@@ -27,16 +38,21 @@ required-features = ["cli"]
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", features = ["json"], optional = true }
 # The textual form of a ceremony payload: the runtime type's own serde bytes
 # in an alphabet a code renders and a scan recovers.
 base64 = "0.22"
 pdn-node = { path = "../pdn-node" }
+# Only the test build links the laptop host, for its router: what ships keeps
+# its host dependency pointing toward the runtime alone.
+pdn-node-http = { path = "../pdn-node-http", optional = true }
 serde = "1"
 serde_json = "1"
 thiserror = "2"
 # The facade owns the asynchronous runtime the operations need; a foreign
 # caller brings none.
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"], optional = true }
 tracing = { workspace = true }
 # The unrecognized failure carries no cause across the binding boundary: the
 # cause chain stays in the log, which is nothing at all on a phone unless
@@ -45,6 +61,8 @@ tracing-subscriber = "0.3"
 uniffi = { version = "0.32", default-features = false }
 
 [dev-dependencies]
+# The test surface's tests speak HTTP to it as a coordinator does.
+reqwest = { version = "0.12", default-features = false }
 tempfile = "3"
 # The surface tests assert a payload minted here parses as the encoding the
 # other host over the same runtime takes, which is the runtime type's own.

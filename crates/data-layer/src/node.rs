@@ -1284,10 +1284,10 @@ impl SyncNode {
     /// One reconciliation of `issuer`'s grant-imported replica through the
     /// product's scoped path — the nudge's `start_sync_scoped` with the
     /// tracked contacts, judged by the session access provider — answered
-    /// with the count of entries the dialed session received. A start
-    /// dropped because an older session of the pair still runs is issued
-    /// again once that one finishes. `Err` on a failed session, or on none
-    /// within the wait.
+    /// with the count of entries the dialed session received: the first one
+    /// started after the call, since a start asked for while an exchange of
+    /// the pair runs is run again once it ends. `Err` on a failed session,
+    /// or on none within the wait.
     #[cfg(feature = "test-util")]
     pub async fn sync_scoped_once_for_test(&self, identity: PdnId, issuer: PdnId) -> Result<usize> {
         use pdn_store::engine::{LiveEvent, Origin};
@@ -1308,26 +1308,20 @@ impl SyncNode {
         );
         let mut events = tracked.doc.subscribe().await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let since = std::time::SystemTime::now();
+        tracked
+            .doc
+            .start_sync_scoped(tracked.contacts, tracked.default_identity)
+            .await?;
         loop {
-            let since = std::time::SystemTime::now();
-            tracked
-                .doc
-                .start_sync_scoped(tracked.contacts.clone(), tracked.default_identity)
-                .await?;
-            loop {
-                let event = tokio::time::timeout_at(deadline, events.next())
-                    .await
-                    .context("no scoped session finished within the wait")?
-                    .context("replica event stream ended")??;
-                let LiveEvent::SyncFinished(sync) = event else {
-                    continue;
-                };
-                if !matches!(sync.origin, Origin::Connect(_)) {
-                    continue;
-                }
-                if sync.started < since {
-                    break;
-                }
+            let event = tokio::time::timeout_at(deadline, events.next())
+                .await
+                .context("no scoped session finished within the wait")?
+                .context("replica event stream ended")??;
+            let LiveEvent::SyncFinished(sync) = event else {
+                continue;
+            };
+            if matches!(sync.origin, Origin::Connect(_)) && sync.started >= since {
                 return sync
                     .result
                     .map(|details| details.entries_received)
@@ -2236,19 +2230,21 @@ impl SyncNode {
     }
 
     /// Every entry of [`pod_record_view`](Self::pod_record_view) with its
-    /// verdict and, when it has arrived, its payload.
+    /// verdict and, when it has arrived and `payloads` asks for it, its
+    /// payload; without `payloads` no blob is read.
     #[cfg(feature = "test-util")]
     pub async fn pod_record_listing_for_test(
         &self,
         identity: PdnId,
         pod: PodId,
+        payloads: bool,
     ) -> Result<Vec<(crate::RecordEntry, crate::Verdict, Option<Vec<u8>>)>> {
         let view = self.pod_record_view(identity, pod).await?;
         let mut listing = Vec::new();
         for (entry, verdict) in view.verdicts() {
             let payload = match entry.payload {
-                Some(hash) => Some(self.blobs.get_bytes(hash).await?.to_vec()),
-                None => None,
+                Some(hash) if payloads => Some(self.blobs.get_bytes(hash).await?.to_vec()),
+                _ => None,
             };
             listing.push((entry.clone(), verdict, payload));
         }

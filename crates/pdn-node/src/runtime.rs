@@ -554,13 +554,15 @@ impl Runtime {
     }
 
     /// Every entry of `identity`'s record store of `pod` as the record view
-    /// holds it, with its verdict and its payload when present. Starts no
-    /// session; refused as the record view refuses, a tombstone included.
+    /// holds it, with its verdict and, with `payloads`, its payload when
+    /// present. Starts no session; refused as the record view refuses, a
+    /// tombstone included.
     #[cfg(feature = "test-util")]
     pub async fn pod_record_listing_for_test(
         &self,
         identity: pdn_types::PdnId,
         pod: pdn_types::PodId,
+        payloads: bool,
     ) -> anyhow::Result<Vec<crate::observation::ListedEntry>> {
         let node = {
             let state = self.state.lock().await;
@@ -568,7 +570,7 @@ impl Runtime {
             Arc::clone(&state.node)
         };
         Ok(node
-            .pod_record_listing_for_test(identity, pod)
+            .pod_record_listing_for_test(identity, pod, payloads)
             .await?
             .into_iter()
             .map(|(entry, verdict, payload)| {

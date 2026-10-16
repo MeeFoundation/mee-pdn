@@ -18,6 +18,10 @@ One entry payload is bounded (`MAX_ENTRY_PAYLOAD`, 1 MiB): a payload crosses as 
 
 Bring-up and stop are the 2 calls with a race between them, and both hazards are handled where the state lives rather than in the caller: the node is installed by the spawn's own task, so a cancelled call cannot strand the handle mid-transition, and a stop that overtakes a bring-up shuts the new node down and leaves the bring-up reporting the node as not up. `tests/surface.rs` holds both. A handle dropped without a stop tears down on a thread of its own, because the store's handle joins its actor thread as it is dropped.
 
+The runtime's threads are named `pdn-node` in every build: the sync tests' sampler tells the node's CPU by that prefix (beside the store's `sync-actor`), and the name changes nothing else.
+
+The `observation` feature is the sync tests' test build, packaged by `pdn-sdk` as a test artifact and never a release. `src/test_surface.rs` serves the laptop host's debug router — `pdn-node-http`'s, linked by this feature alone — on `127.0.0.1` only, beside a reset that brings a node up at the pod interval and the connectivity a coordinator names, the device samples the native module hands over, and the device's clock. The coordinator reaches it through the cable's usbmux tunnel, and the server runs on the facade's runtime, so its work counts in the node's share as the laptop host's does in a laptop node's process. It is the one exception to the absences above; `tests/test_surface.rs` drives it over HTTP. Its contract is the `pdn-mobile/host` and `mobile-common/sync-test-agent` specs.
+
 `src/bin/uniffi-bindgen.rs` sits behind the `cli` feature and is what `pdn-sdk`'s packaging recipes run; nothing a device installs contains it.
 
 A stress pass names its own width: each surface scenario spawns 3 nodes, so the runner's default parallelism puts tens of them in flight and the runtime's ceremony bounds are what expire first — `just stress -p pdn-mobile --stress-count 50 --test-threads 3` is green where the default width fails on starvation.

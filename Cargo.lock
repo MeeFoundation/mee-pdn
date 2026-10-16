@@ -3569,14 +3569,18 @@ name = "pdn-mobile"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "pdn-node",
+ "pdn-node-http",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
  "test-utils",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uniffi",

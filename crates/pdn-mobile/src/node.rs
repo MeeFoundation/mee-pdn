@@ -38,7 +38,7 @@ use crate::{
 
 /// What a handle holds. `ComingUp` is a state of its own so 2 concurrent
 /// bring-ups cannot both reach the spawn.
-enum State {
+pub(crate) enum State {
     Down,
     ComingUp,
     Up(Arc<Runtime>),
@@ -61,6 +61,9 @@ pub struct PdnNode {
     /// abandoned task — cannot leave the state mid-transition, because the
     /// transition does not belong to the caller's future.
     state: Arc<Mutex<State>>,
+    /// The test build's surface, served or not (`test_surface`).
+    #[cfg(feature = "observation")]
+    surface: Arc<crate::test_surface::Shared>,
 }
 
 /// Routes the runtime's diagnostics to the platform's log, once.
@@ -88,7 +91,11 @@ impl PdnNode {
     #[uniffi::constructor]
     pub fn new() -> Result<Arc<Self>, PdnError> {
         install_log();
+        // The prefix is what a sampler in the same process tells the node's
+        // threads by (the `sync-observation` change's test build); the name
+        // changes nothing else, so every build carries it.
         let tokio = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("pdn-node")
             .enable_all()
             .build()
             .map_err(|err| {
@@ -98,6 +105,8 @@ impl PdnNode {
         Ok(Arc::new(Self {
             tokio: Mutex::new(Some(tokio)),
             state: Arc::new(Mutex::new(State::Down)),
+            #[cfg(feature = "observation")]
+            surface: Arc::default(),
         }))
     }
 
@@ -623,6 +632,38 @@ impl PdnNode {
     }
 }
 
+/// The test build's 2 calls (the `pdn-mobile/host` spec): absent from what
+/// ships.
+#[cfg(feature = "observation")]
+#[uniffi::export]
+impl PdnNode {
+    /// Serve the test surface on the loopback address at `port` (`0` picks
+    /// one), its reset bringing nodes up on `storage_dir`; answers the port
+    /// bound. A second call answers the port already bound.
+    pub async fn serve_test_surface(
+        &self,
+        storage_dir: String,
+        port: u16,
+    ) -> Result<u16, PdnError> {
+        let shared = Arc::clone(&self.surface);
+        let state = Arc::clone(&self.state);
+        self.on_node(
+            async move { crate::test_surface::serve(shared, state, storage_dir.into(), port) },
+        )
+        .await
+    }
+
+    /// Keep one device sample for the surface's samples route; refused as
+    /// malformed unless it is JSON.
+    pub fn report_device_sample(&self, sample: &str) -> Result<(), PdnError> {
+        self.surface
+            .report(sample)
+            .map_err(|err| PdnError::MalformedInput {
+                what: format!("a device sample is one JSON value: {err}"),
+            })
+    }
+}
+
 impl PdnNode {
     /// The state lock. A poisoned lock means a panic ran while it was held,
     /// which is a defect rather than a refusal.
@@ -690,7 +731,10 @@ impl PdnNode {
 /// what shuts the node down again — otherwise a node nobody holds would
 /// keep its endpoint bound and its directory held, and the next bring-up
 /// would be refused by a node the caller had already stopped.
-async fn install(state: &Mutex<State>, spawned: anyhow::Result<Runtime>) -> anyhow::Result<bool> {
+pub(crate) async fn install(
+    state: &Mutex<State>,
+    spawned: anyhow::Result<Runtime>,
+) -> anyhow::Result<bool> {
     let runtime = match spawned {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -752,5 +796,32 @@ impl Drop for PdnNode {
         if let Err(err) = teardown {
             tracing::error!("a released handle's teardown thread did not start: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PdnNode;
+
+    /// Every thread the facade's runtime starts, a worker and a blocking one,
+    /// carries the `pdn-node` prefix. The naming sits behind no feature, so
+    /// the test build's run of this test speaks for the product build too.
+    #[test]
+    fn the_runtimes_threads_carry_the_prefix() -> anyhow::Result<()> {
+        let node = PdnNode::new()?;
+        let held = node.tokio.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+        let tokio = held.as_ref().ok_or_else(|| anyhow::anyhow!("no runtime"))?;
+        let name = || std::thread::current().name().map(str::to_owned);
+        let worker = tokio.block_on(tokio.spawn(async move { name() }))?;
+        let blocking = tokio.block_on(tokio.spawn_blocking(name))?;
+        for thread in [worker, blocking] {
+            assert!(
+                thread
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("pdn-node")),
+                "{thread:?}"
+            );
+        }
+        Ok(())
     }
 }

@@ -26,7 +26,8 @@
 //! None of the runtime's test-only surface is reachable, and the facade is
 //! built with that feature off, so a forced write and an observation of a
 //! replica's contact set are absent from the binary rather than merely
-//! unexported.
+//! unexported. The one exception is the sync tests' build behind the
+//! `observation` feature, which `pdn-sdk` never packages as a release.
 //!
 //! The facade authorizes nothing: no credential, token or permission of its
 //! own on any exported call. Reaching the facade is reaching the node, and
@@ -64,6 +65,8 @@ mod error;
 mod node;
 mod payload;
 mod shapes;
+#[cfg(feature = "observation")]
+mod test_surface;
 
 pub use error::{PdnError, PodActRefusal};
 pub use node::PdnNode;

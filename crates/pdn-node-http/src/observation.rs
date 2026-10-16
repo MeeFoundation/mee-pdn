@@ -18,6 +18,7 @@ use pdn_node::{
     observation::{ListedEntry, PodSubscription},
     PodId, PodInvite, Runtime,
 };
+use serde::Deserialize;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::{error::HostError, parse, shapes::NoQuery, POD_HEADER};
@@ -98,18 +99,26 @@ async fn join_observed(
     Ok(response)
 }
 
+/// `?payloads=false` lists without the payloads: a phone's listing of
+/// large records would otherwise hold every payload in memory at once.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListingQuery {
+    payloads: Option<bool>,
+}
+
 /// `GET /debug/identities/{identity}/pods/{pod}/listing`.
 async fn listing(
     State(observation): State<Observation>,
     Path((identity, pod)): Path<(String, String)>,
-    Query(NoQuery {}): Query<NoQuery>,
+    Query(ListingQuery { payloads }): Query<ListingQuery>,
 ) -> Result<Json<Vec<ListedEntry>>, HostError> {
     let identity = parse::segment(&identity, "identity")?;
     let pod = parse::segment(&pod, "pod")?;
     Ok(Json(
         observation
             .runtime
-            .pod_record_listing_for_test(identity, pod)
+            .pod_record_listing_for_test(identity, pod, payloads.unwrap_or(true))
             .await?,
     ))
 }
