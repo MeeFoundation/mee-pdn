@@ -13,7 +13,7 @@ use data_layer::{
 };
 use pdn_node::{IdentityService as _, LinkingPayload, Runtime, SpawnOptions};
 use pdn_types::PdnId;
-use test_utils::{memory_node, TIMEOUT};
+use test_utils::{eventually, memory_node, TIMEOUT};
 
 /// A runtime on memory storage.
 pub async fn memory_runtime() -> Result<Runtime> {
@@ -136,9 +136,23 @@ pub async fn link_probe(
     Ok((node, pms))
 }
 
-/// Mint a fresh invite on `inviter` and link once. Assertions about one
-/// specific invite call `link` directly instead.
+/// Mint a fresh invite on `inviter` and link once, returning once the
+/// identity key has reached the linked device too: a link returns with the
+/// PMS caught up while the key's payload may still be on its way, and the
+/// device signs nothing until it lands. Assertions about one specific
+/// invite call `link` directly instead.
 pub async fn link_patiently(linker: &Runtime, inviter: &Runtime, identity: PdnId) -> Result<()> {
     let payload = inviter.identity().linking_invite(identity, None).await?;
-    linker.identity().link(payload, TIMEOUT).await
+    linker.identity().link(payload, TIMEOUT).await?;
+    ensure!(
+        eventually(|| async {
+            Ok(linker
+                .identity_public_key_for_test(identity)
+                .await?
+                .is_some())
+        })
+        .await?,
+        "the identity key never reached the linked device"
+    );
+    Ok(())
 }

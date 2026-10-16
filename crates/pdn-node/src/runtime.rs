@@ -462,6 +462,17 @@ impl Runtime {
         self.state.lock().await.node.pod_holdings(identity)
     }
 
+    /// Every exchange of `pod`'s stores this node has running, held behind
+    /// another's or due to redial, each named, for a failure message.
+    #[cfg(feature = "test-util")]
+    pub async fn pod_syncs_in_flight_report_for_test(
+        &self,
+        pod: pdn_types::PodId,
+    ) -> anyhow::Result<String> {
+        let node = Arc::clone(&self.state.lock().await.node);
+        node.pod_syncs_in_flight_report_for_test(pod).await
+    }
+
     /// The replicas `identity`'s store holds, tracked or not.
     #[cfg(feature = "test-util")]
     pub async fn held_replica_count_for_test(

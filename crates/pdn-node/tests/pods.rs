@@ -834,7 +834,7 @@ async fn pod_of_two(
 ) -> Result<PodId> {
     let pod = owner_runtime.pods().create(owner).await?;
     let invite = owner_runtime.pods().invite(owner, pod, None).await?;
-    member_runtime.pods().join(member, invite).await?;
+    join_reporting(member_runtime, member, invite, owner_runtime).await?;
     Ok(pod)
 }
 
@@ -1095,8 +1095,27 @@ async fn pod_of_three(
 ) -> Result<PodId> {
     let pod = pod_of_two(alice_phone, alice, bob_phone, bob).await?;
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
-    carol_phone.pods().join(carol, invite).await?;
+    join_reporting(carol_phone, carol, invite, alice_phone).await?;
     Ok(pod)
+}
+
+/// `identity` on `joiner` joins with `invite`, `inviter` the runtime that
+/// minted it; a failed join says what either side still has in flight.
+async fn join_reporting(
+    joiner: &Runtime,
+    identity: PdnId,
+    invite: PodInvite,
+    inviter: &Runtime,
+) -> Result<()> {
+    let pod = invite.pod;
+    if let Err(err) = joiner.pods().join(identity, invite).await {
+        let joining = joiner.pod_syncs_in_flight_report_for_test(pod).await;
+        let inviting = inviter.pod_syncs_in_flight_report_for_test(pod).await;
+        return Err(err.context(format!(
+            "{identity} joining; in flight on the joiner: {joining:?}; on the inviter: {inviting:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn refused(acted: Result<()>, reason: ActRefusal) -> bool {
@@ -1380,7 +1399,7 @@ async fn a_member_whose_removal_stops_counting_holds_the_pod_again() -> Result<(
     )
     .await?;
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
-    dave_phone.pods().join(dave, invite).await?;
+    join_reporting(&dave_phone, dave, invite, &alice_phone).await?;
     alice_phone
         .pods()
         .act(alice, pod, PodAct::Promote(carol))
