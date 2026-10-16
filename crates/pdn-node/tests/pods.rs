@@ -809,7 +809,21 @@ async fn a_former_member_whose_departure_reached_the_device_through_its_pms_alon
         .pods()
         .put_record(alice, pod, RecordKind::Claim, b"after")
         .await?;
-    assert!(reads(&carol_laptop, carol, pod, after, b"after").await?);
+    if !reads(&carol_laptop, carol, pod, after, b"after").await? {
+        let laptop = carol_laptop.pod_syncs_in_flight_report_for_test(pod).await;
+        let inviter = alice_phone.pod_syncs_in_flight_report_for_test(pod).await;
+        let holdings = carol_laptop.pod_holdings_for_test(carol).await;
+        let records = carol_laptop.pod_record_view_for_test(carol, pod).await;
+        let standing = carol_laptop
+            .pod_membership_view_for_test(carol, pod)
+            .await
+            .map(|view| view.member(&carol).cloned());
+        anyhow::bail!(
+            "the claim after the rejoin did not read; in flight on the laptop: {laptop:?}; \
+             on the inviter: {inviter:?}; holdings: {holdings:?}; Carol as the laptop's view \
+             has her: {standing:#?}; laptop's records: {records:#?}"
+        );
+    }
     assert_eq!(
         carol_laptop.pod_holdings_for_test(carol).await?,
         [(pod, true)]
