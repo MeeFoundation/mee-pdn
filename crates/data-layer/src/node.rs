@@ -1,7 +1,7 @@
 //! The assembled sync stack: endpoint + gossip + blobs + docs, addressed in
-//! domain terms. Externally supplied protocols — pdn-node's pairing and
-//! linking dialogues (ADR-0011, ADR-0012) — register on the same endpoint at
-//! spawn; a narrow dial handle serves their dial sides. The registration
+//! domain terms. Externally supplied protocols — pdn-node's linking
+//! dialogue and a pod's join (ADR-0012, ADR-0015) — register on the same
+//! endpoint at spawn; a narrow dial handle serves their dial sides. The registration
 //! point is protocol-agnostic: the ceremonies' semantics live in pdn-node.
 
 use std::{
@@ -33,47 +33,24 @@ use pdn_store::{
     store::Query,
     AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
 };
-use pdn_types::{EntryInfo, EntryPath, NodeId, PdnId, PodId, RecordRef};
+use pdn_types::{NodeId, PdnId, PodId, RecordRef};
 use rand::seq::SliceRandom as _;
 use tokio::sync::watch;
 
 use crate::{
-    access::{capability_ingest_validator, session_access_provider, AccessBook},
+    access::{session_access_provider, AccessBook},
     address_book::{AddressBook, ADDRESS_BOOK_INTERVAL},
-    connection_metadata::ConnectionMetadataStore,
     pod::{
         record_entries, record_prefix, unknown_entries, CreatedPayload, EventKind, Member,
         MemberDevice, MembershipKey, MembershipView, Operation, PodCatchUp, PodHolding, PodNotice,
         PodStore, PodTickets, RecordView, Seq, UnknownEntry, UnknownPod, Verdict,
     },
     private_metadata::PrivateMetadataStore,
-    registry::{PodBinding, Registry, ServingPosture},
-    retraction::{RetractionTracker, RetractionVerdict},
+    registry::{PodBinding, Registry},
 };
 
-/// `issuer` has no created or imported data namespace here. Downcast from
-/// the `anyhow::Error` of the issuer-addressed operations.
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("data namespace not bound on this node: {issuer}")]
-pub struct UnknownIssuer {
-    pub issuer: PdnId,
-}
-
-/// `identity` holds `issuer`'s namespace as a grantee and mints no ticket
-/// on it: the store's share would rejoin the swarm and dial recorded peers
-/// as the identity. Downcast from the `anyhow::Error` of
-/// [`SyncNode::share_ticket`].
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error(
-    "identity {identity} holds the data namespace of {issuer} as a grantee and cannot share it"
-)]
-pub struct GranteeCannotShare {
-    pub identity: PdnId,
-    pub issuer: PdnId,
-}
-
-/// The namespace was forgotten, or never imported here. Downcast from the
-/// `anyhow::Error` of [`SyncNode::set_doc_contacts`].
+/// The namespace was forgotten, or never imported here: a pod store's
+/// contacts derived for a replica no longer tracked.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("namespace not tracked on this node: {namespace}")]
 pub struct UntrackedNamespace {
@@ -282,10 +259,10 @@ impl SpawnOptions {
 
 /// One running node: iroh endpoint, gossip and blob store, under one
 /// half per hosted identity — that identity's own docs engine, replica
-/// store, registry and access book (ADR-0013). Data replicas are
-/// addressed by issuer [`PdnId`] within the identity that holds them, and
-/// entries by [`EntryPath`]. Every doc an identity opens joins the
-/// periodic reconcile pass.
+/// store, registry and access book (ADR-0013). A pod's stores are
+/// addressed by [`PodId`] within the identity that holds them. Every doc
+/// an identity opens joins a reconcile pass: a pod's stores the pod pass,
+/// every other the periodic one.
 #[derive(Debug)]
 pub struct SyncNode {
     router: Router,
@@ -327,9 +304,6 @@ pub struct SyncNode {
     #[cfg(feature = "test-util")]
     pass_probes: Arc<PassProbes>,
     storage: StorageConfig,
-    retraction: Arc<RetractionTracker>,
-    /// Taken once, by the runtime's consumer.
-    retraction_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>>>,
     /// Handed to every hosted identity's half; filled once, by the
     /// runtime's take.
     pod_notices: crate::pod::PodNoticeSink,
@@ -346,10 +320,9 @@ pub struct SyncNode {
     address_book: Option<Arc<AddressBook>>,
 }
 
-/// How a tracked doc re-syncs, independent of the binding's serving
-/// posture. `ContactsOnly` never joins the gossip swarm — every grantee
-/// import: reconciliation is a grantee's only data path, and the swarm of a
-/// data namespace is its issuer's device set.
+/// How a tracked doc re-syncs. `ContactsOnly` never joins the gossip
+/// swarm — a pod's tombstone, reconciled with the contacts its membership
+/// derives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncStrategy {
     Swarm,
@@ -364,22 +337,14 @@ enum SyncStrategy {
 struct TrackedDoc {
     doc: Doc,
     contacts: Vec<Contact>,
+    /// The contacts the store's tickets named when it was tracked, which
+    /// replacing `contacts` keeps.
+    ticketed: Vec<Contact>,
     strategy: SyncStrategy,
-    /// Whom a peer of this replica is dialed as when no contact names one
-    /// — the swarm's own identity: the issuer for a data namespace, the
-    /// identity for a store its devices share.
+    /// Whom a peer of this replica is dialed as when no contact names one:
+    /// the identity for a store its devices share, the member whose ticket
+    /// it was imported from for a pod's store.
     default_identity: Identity,
-}
-
-/// What one [`SyncNode::import_namespace`] did, so that
-/// [`SyncNode::undo_import_namespace`] undoes exactly that.
-#[derive(Debug)]
-pub struct NamespaceImport {
-    identity: PdnId,
-    issuer: PdnId,
-    /// False for an import onto the replica the issuer already resolved
-    /// to: it bound nothing, so undoing it forgets nothing.
-    bound: bool,
 }
 
 /// An identity whose subdirectory records its hosting, as a start finds it.
@@ -397,8 +362,8 @@ pub struct RecordedHosting {
 type Identities = Arc<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>;
 
 /// One hosted identity's half of the node: its own docs engine and
-/// replica store, the registry its data namespaces resolve through, the
-/// book that judges its sessions, and the author its writes carry.
+/// replica store, the registry its pods resolve through, the book that
+/// judges its sessions, and the author its writes carry.
 #[derive(Debug)]
 struct HostedStack {
     identity: PdnId,
@@ -410,9 +375,6 @@ struct HostedStack {
     /// Keyed by namespace, so a re-import replaces its entry rather than
     /// accreting a second one.
     tracked_docs: Mutex<HashMap<NamespaceId, TrackedDoc>>,
-    /// At most one nudge in flight per namespace, so a tight poll loop
-    /// cannot pile up attempts against one replica.
-    nudges_in_flight: Mutex<HashSet<NamespaceId>>,
     /// Requests to reconcile with a co-located identity — a write's
     /// announcement or a contact naming this node — each held from when the
     /// node takes it up until the callee has read the session's first
@@ -473,32 +435,12 @@ impl HostedStack {
             doc.id(),
             TrackedDoc {
                 doc: doc.clone(),
+                ticketed: contacts.clone(),
                 contacts,
                 strategy,
                 default_identity,
             },
         );
-        Ok(())
-    }
-
-    /// Add `contacts` to a tracked store's, keeping those it has: one naming
-    /// an endpoint and identity already listed is left as it was.
-    fn add_contacts(&self, namespace: NamespaceId, contacts: Vec<Contact>) -> Result<()> {
-        let mut docs = self
-            .tracked_docs
-            .lock()
-            .map_err(|_poisoned| anyhow::anyhow!("reconcile tracking lock poisoned"))?;
-        let Some(entry) = docs.get_mut(&namespace) else {
-            return Ok(());
-        };
-        for contact in contacts {
-            let listed = entry.contacts.iter().any(|known| {
-                known.addr.id == contact.addr.id && known.identity == contact.identity
-            });
-            if !listed {
-                entry.contacts.push(contact);
-            }
-        }
         Ok(())
     }
 
@@ -568,12 +510,6 @@ impl HostedStack {
             Err(_poisoned) => Vec::new(),
         }
     }
-
-    fn doc(&self, issuer: PdnId) -> Result<Doc> {
-        self.registry
-            .data_doc(issuer)?
-            .ok_or_else(|| UnknownIssuer { issuer }.into())
-    }
 }
 
 /// A node dropped without [`shutdown`](SyncNode::shutdown) still lets go of
@@ -621,7 +557,7 @@ impl SyncNode {
     }
 
     /// Extra protocols are served on the same endpoint next to the built-in
-    /// ones (ADR-0011, ADR-0012), each dispatched as a raw bidirectional
+    /// ones (ADR-0012, ADR-0015), each dispatched as a raw bidirectional
     /// connection. An ALPN collision fails the spawn with [`AlpnTaken`]
     /// before anything binds. A handler's `accept` should return
     /// `Err(AcceptError)` rather than panic: a panic is contained per
@@ -665,9 +601,6 @@ impl SyncNode {
         )
         .await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
-
-        let (retraction, retraction_verdicts) = RetractionTracker::new();
-        let retraction = Arc::new(retraction);
 
         let resolver: pdn_store::protocol::IdentityResolver = {
             let identities = Arc::clone(&identities);
@@ -740,8 +673,6 @@ impl SyncNode {
             pass_probes,
             collecting,
             storage: options.storage,
-            retraction,
-            retraction_verdicts: Mutex::new(Some(retraction_verdicts)),
             pod_notices: Arc::default(),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
             co_located_requests,
@@ -769,13 +700,8 @@ impl SyncNode {
         access.set_pod_verdicts(Arc::clone(&self.pod_verdicts));
         #[cfg(feature = "test-util")]
         access.set_session_traces(Arc::clone(&self.session_traces));
-        let observer_tracker = Arc::clone(&self.retraction);
         let docs = self
             .docs_builder(identity, &access, &registry)?
-            .capability_validator(capability_ingest_validator(&access, &registry))
-            .rejection_observer(Arc::new(move |namespace, reject, peer| {
-                observer_tracker.record_rejection(identity, namespace, reject, peer);
-            }))
             .co_located_requests(self.co_located_requests.clone())
             .spawn(
                 self.router.endpoint().clone(),
@@ -787,7 +713,6 @@ impl SyncNode {
         access.set_sync(docs.engine().sync.clone());
         let api = docs.api().clone();
         let author = api.author_default().await?;
-        self.retraction.track_author(identity, author);
         let stack = Arc::new(HostedStack {
             identity,
             docs,
@@ -796,7 +721,6 @@ impl SyncNode {
             access,
             author,
             tracked_docs: Mutex::new(HashMap::new()),
-            nudges_in_flight: Mutex::new(HashSet::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
             converged_tombstones: Mutex::new(HashSet::new()),
             found_empty: Mutex::new(HashSet::new()),
@@ -811,20 +735,8 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Sessions the periodic pass over the co-located pairs has opened —
-    /// what shows that a pass over a quiet pair opens none. Counted
-    /// per namespace, because a pair holds its data replica and its two
-    /// connection stores alike, and a scenario about one of them cannot be
-    /// read off a total the other two move.
-    #[cfg(feature = "test-util")]
-    pub fn co_located_pass_sessions(&self) -> u64 {
-        self.co_located_sessions
-            .lock()
-            .map(|opened| opened.values().sum())
-            .unwrap_or_default()
-    }
-
-    /// The same count for one namespace alone.
+    /// Sessions the periodic pass over the co-located pairs has opened for
+    /// `namespace` — what shows that a pass over a quiet pair opens none.
     #[cfg(feature = "test-util")]
     pub fn co_located_pass_sessions_of(&self, namespace: NamespaceId) -> u64 {
         self.co_located_sessions
@@ -928,7 +840,7 @@ impl SyncNode {
     }
 
     /// Arm `identity`'s PMS for session classification: its device
-    /// records decide who is one of its devices, and its data namespaces
+    /// records decide who is one of its devices, and its pods' stores
     /// serve fail-closed from here on. The PMS's sync starts here,
     /// after the arming, so its first session is one the book can judge.
     pub fn host_identity(&self, identity: PdnId, pms: &PrivateMetadataStore) -> Result<()> {
@@ -955,250 +867,8 @@ impl SyncNode {
             return Ok(());
         };
         stack.access.disarm_pms()?;
-        for tracked in stack.tracked_snapshot() {
-            self.retraction
-                .untrack_namespace(identity, tracked.doc.id());
-        }
         stack.docs.engine().shutdown().await?;
         Ok(())
-    }
-
-    /// Register a connection for session classification: `own` carries the
-    /// grants this identity issued, `peer_store` the counterparty's
-    /// published device set.
-    pub fn host_connection(
-        &self,
-        identity: PdnId,
-        peer: PdnId,
-        own: &ConnectionMetadataStore,
-        peer_store: &ConnectionMetadataStore,
-    ) -> Result<()> {
-        let stack = self.require(identity)?;
-        stack
-            .access
-            .host_connection(peer, own.doc_handle(), peer_store.doc_handle())?;
-        // The devices that hold one half hold the other, under the same
-        // identity each: pointed at them too, `own` is dialed from here, so
-        // the side that arms second reaches the first over both halves.
-        if let Some(peer_half) = stack.tracked(peer_store.namespace())? {
-            stack.add_contacts(own.namespace(), peer_half.contacts)?;
-        }
-        // After the arming, as `host_identity` starts the PMS's.
-        stack.start_armed(own.namespace())?;
-        stack.start_armed(peer_store.namespace())
-    }
-
-    /// Create a fresh doc and register it as `issuer`'s data namespace,
-    /// held for `identity`.
-    pub async fn create_namespace(&self, identity: PdnId, issuer: PdnId) -> Result<()> {
-        let stack = self.require(identity)?;
-        let doc = self.new_doc(identity).await?;
-        // `issuer` is minted fresh by the caller: nothing to displace.
-        let _displaced = stack
-            .registry
-            .register_data(issuer, doc, ServingPosture::Serve)?;
-        Ok(())
-    }
-
-    /// The device-replication import: a device of `identity` brings its
-    /// own data replica up this way, joining its swarm. A namespace
-    /// reached through a grant uses
-    /// [`import_namespace_scoped`](Self::import_namespace_scoped). Binds
-    /// nothing when the issuer already resolves to the ticket's replica.
-    pub async fn import_namespace(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        ticket: DocTicket,
-    ) -> Result<NamespaceImport> {
-        let stack = self.require(identity)?;
-        let namespace = ticket.capability.id();
-        Self::guard_data_import(&stack, issuer, namespace)?;
-        let current = stack.registry.data_doc(issuer)?.map(|doc| doc.id());
-        if current == Some(namespace) {
-            return Ok(NamespaceImport {
-                identity,
-                issuer,
-                bound: false,
-            });
-        }
-        let contacts = ticket.contacts();
-        let doc = stack.api.import_namespace(ticket.capability).await?;
-        stack.track(
-            &doc,
-            contacts.clone(),
-            SyncStrategy::Swarm,
-            crate::access::identity_of(issuer),
-        )?;
-        if let Some(previous) = current {
-            self.forget_rebound(&stack, identity, previous).await;
-        }
-        let _displaced =
-            stack
-                .registry
-                .register_data(issuer, doc.clone(), ServingPosture::Serve)?;
-        let import = NamespaceImport {
-            identity,
-            issuer,
-            bound: true,
-        };
-        if let Err(err) = doc
-            .start_sync(contacts, crate::access::identity_of(issuer))
-            .await
-        {
-            let _ = self.undo_import_namespace(import).await;
-            return Err(err);
-        }
-        Ok(import)
-    }
-
-    /// The same grantee import as
-    /// [`import_namespace_scoped`](Self::import_namespace_scoped); what the
-    /// grant covers lives in the issuer's book, not in the import.
-    pub async fn import_namespace_granted(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        ticket: DocTicket,
-    ) -> Result<NamespaceImport> {
-        self.import_grantee_namespace(identity, issuer, ticket)
-            .await
-    }
-
-    /// The grantee import: never joins the replica's gossip swarm, and
-    /// re-serves it only to the issuer's published devices, whole, and to
-    /// the audience identity's own devices per the locally replicated grant
-    /// record.
-    pub async fn import_namespace_scoped(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        ticket: DocTicket,
-    ) -> Result<NamespaceImport> {
-        self.import_grantee_namespace(identity, issuer, ticket)
-            .await
-    }
-
-    /// Refuses a ticket naming a tracked but not data-bound replica: honoring
-    /// it would downgrade that store's sync strategy — leaving the gossip
-    /// swarm, cutting its live path — on the word of whoever minted the
-    /// ticket. Refuses any ticket under the identity's own id, and binds
-    /// nothing when the issuer already resolves to the ticket's replica.
-    async fn import_grantee_namespace(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        ticket: DocTicket,
-    ) -> Result<NamespaceImport> {
-        // An identity holds its own data as its issuer: a grantee binding
-        // under its own id would demote that replica, or drop it for another.
-        if issuer == identity {
-            return Err(anyhow::anyhow!(
-                "{identity} cannot hold its own data under a grant"
-            ));
-        }
-        let stack = self.require(identity)?;
-        let contacts = ticket.contacts();
-        let namespace = ticket.capability.id();
-        Self::guard_data_import(&stack, issuer, namespace)?;
-        let current = stack.registry.data_doc(issuer)?.map(|doc| doc.id());
-        if current == Some(namespace) {
-            return Ok(NamespaceImport {
-                identity,
-                issuer,
-                bound: false,
-            });
-        }
-        // The capability only — no `start_sync`, which would join the
-        // swarm. The binding registers before the first sync, so even that
-        // session is judged under the grantee rules.
-        let doc = stack.api.import_namespace(ticket.capability).await?;
-        stack.track(
-            &doc,
-            contacts.clone(),
-            SyncStrategy::ContactsOnly,
-            crate::access::identity_of(issuer),
-        )?;
-        if let Some(previous) = current {
-            self.forget_rebound(&stack, identity, previous).await;
-        }
-        let _displaced =
-            stack
-                .registry
-                .register_data(issuer, doc.clone(), ServingPosture::AudienceDevices)?;
-        let import = NamespaceImport {
-            identity,
-            issuer,
-            bound: true,
-        };
-        // A grantee binding stays outside the swarm, whatever joined the
-        // replica before.
-        if let Err(err) = doc.leave_gossip().await {
-            let _ = self.undo_import_namespace(import).await;
-            return Err(err);
-        }
-        if let Err(err) = doc
-            .start_sync_scoped(contacts, crate::access::identity_of(issuer))
-            .await
-        {
-            let _ = self.undo_import_namespace(import).await;
-            return Err(err);
-        }
-        Ok(import)
-    }
-
-    /// Replace the reconciliation contacts of `issuer`'s data namespace —
-    /// replacement is what lets a withdrawn device stop being dialed. Each
-    /// contact names the identity it is dialed as.
-    /// Refuses with [`UnknownIssuer`] whether the issuer was never bound or
-    /// is bound but untracked: silently dropping the set would starve the
-    /// replica unattributably.
-    pub fn set_namespace_contacts(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        contacts: Vec<Contact>,
-    ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let doc = stack
-            .registry
-            .data_doc(issuer)?
-            .ok_or(UnknownIssuer { issuer })?;
-        self.set_doc_contacts(identity, doc.id(), contacts)
-            .map_err(|err| match err.downcast_ref::<UntrackedNamespace>() {
-                Some(_untracked) => UnknownIssuer { issuer }.into(),
-                None => err,
-            })
-    }
-
-    /// Replace the reconciliation contacts of a device-shared store's doc: a
-    /// ticket names only the devices of the side that minted it, so the
-    /// caller records the devices it knows hold the replica. Refuses with
-    /// [`UntrackedNamespace`] rather than dropping the set silently.
-    pub fn set_doc_contacts(
-        &self,
-        identity: PdnId,
-        namespace: NamespaceId,
-        contacts: Vec<Contact>,
-    ) -> Result<()> {
-        self.require(identity)?.set_contacts(namespace, contacts)
-    }
-
-    /// The observation side of
-    /// [`set_namespace_contacts`](Self::set_namespace_contacts). Empty when
-    /// the issuer resolves to no tracked replica.
-    #[cfg(feature = "test-util")]
-    pub fn namespace_contacts(&self, identity: PdnId, issuer: PdnId) -> Result<Vec<Contact>> {
-        let Some(stack) = self.stack(identity)? else {
-            return Ok(Vec::new());
-        };
-        let Some(doc) = stack.registry.data_doc(issuer)? else {
-            return Ok(Vec::new());
-        };
-        Ok(stack
-            .tracked(doc.id())?
-            .map(|tracked| tracked.contacts)
-            .unwrap_or_default())
     }
 
     /// The docs under the reconcile pass — the only anchor a scenario has
@@ -1227,66 +897,6 @@ impl SyncNode {
         Ok(held)
     }
 
-    /// Live records at `path` across authors — what every latest-wins read
-    /// collapses, so this is the only way to assert one author per
-    /// identity.
-    #[cfg(feature = "test-util")]
-    pub async fn live_record_count(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        path: &EntryPath,
-    ) -> Result<usize> {
-        let doc = self.require(identity)?.doc(issuer)?;
-        let query = Query::all().key_exact(path.as_str().as_bytes());
-        let mut stream = std::pin::pin!(doc.get_many(query).await?);
-        let mut count = 0usize;
-        while let Some(entry) = stream.next().await {
-            let _live = entry?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// What the replica holds at `path`, without the nudge every product
-    /// read makes: a scoped replica has no gossip path, so a read pokes a
-    /// reconciliation, and an assertion that an entry arrived unasked has
-    /// to observe the replica without asking.
-    #[cfg(feature = "test-util")]
-    pub async fn read_unnudged(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        path: &EntryPath,
-    ) -> Result<Option<Vec<u8>>> {
-        let doc = self.require(identity)?.doc(issuer)?;
-        read_payload(&doc, &self.blobs, path.as_str().as_bytes()).await
-    }
-
-    /// Open one session for `issuer`'s replica against `contact`, naming
-    /// `caller` as the identity this side acts for — whoever this node
-    /// hosts. The session a caller that claims an identity it does not
-    /// hold produces, as [`write`](Self::write) past a grant produces an
-    /// entry the issuer's gate refuses. `Err` is the peer's refusal.
-    #[cfg(feature = "test-util")]
-    pub async fn sync_as_for_test(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        contact: Contact,
-        caller: Identity,
-    ) -> Result<()> {
-        let namespace = self
-            .require(identity)?
-            .registry
-            .binding(issuer)?
-            .ok_or(UnknownIssuer { issuer })?
-            .doc
-            .id();
-        self.sync_namespace_as_for_test(identity, namespace, contact, caller)
-            .await
-    }
-
     /// Take `identity`'s replica of `namespace` out of its gossip swarm,
     /// its reconciliation left running: no announcement reaches it. It holds
     /// until this node's next reconcile pass, which re-joins the swarm and
@@ -1304,10 +914,12 @@ impl SyncNode {
         tracked.doc.leave_gossip().await
     }
 
-    /// [`sync_as_for_test`](Self::sync_as_for_test) for any replica
-    /// `identity` holds, named by its namespace — a PMS or a
-    /// connection metadata store as well as a data replica. No session
-    /// access is asked on the dialing side, so it serves its replica whole.
+    /// Open one session for `identity`'s replica of `namespace` against
+    /// `contact`, naming `caller` as the identity this side acts for —
+    /// whoever this node hosts: the session a caller that claims an
+    /// identity it does not hold produces. No session access is asked on
+    /// the dialing side, so it serves its replica whole. `Err` is the
+    /// peer's refusal.
     #[cfg(feature = "test-util")]
     pub async fn sync_namespace_as_for_test(
         &self,
@@ -1332,7 +944,7 @@ impl SyncNode {
                 contact.addr.clone(),
                 None,
                 None,
-                None,
+                pdn_store::admit_all(),
             )
             .await;
             match outcome {
@@ -1374,16 +986,13 @@ impl SyncNode {
     }
 
     /// Refuses a ticket naming a namespace this identity already holds in
-    /// another role: its data replica, its PMS, a store of one of
-    /// its connections. A device-shared store is classified on its ticket
-    /// alone (Invariants 1 and 3), so a namespace that took that role by
-    /// a counterparty's word would be served whole, past the grant that
-    /// bounds it. The mirror of `guard_data_import` and of `open_doc`'s
-    /// guard, on the path a counterparty's ticket takes.
+    /// another role: a store of one of its pods, or its PMS. A
+    /// device-shared store is classified on its ticket alone (Invariant 1),
+    /// so a pod's store that took that role by a ticket's word would be
+    /// served whole, past the membership that bounds it. The mirror of
+    /// `open_doc`'s guard, on the path a ticket takes.
     fn guard_shared_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
-        let role = if stack.registry.binding_of(namespace)?.is_some() {
-            "a data replica of this identity"
-        } else if stack.registry.pod_of(namespace)?.is_some() {
+        let role = if stack.registry.pod_of(namespace)?.is_some() {
             "a store of a pod this identity holds"
         } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
             role
@@ -1393,91 +1002,6 @@ impl SyncNode {
         Err(anyhow::anyhow!(
             "namespace {namespace} is {role}; a device-shared import must not repurpose it"
         ))
-    }
-
-    /// Refuses a ticket that would repurpose a namespace this identity
-    /// already holds: a device-shared store taken as a data replica, or a
-    /// replica taken for an issuer other than the one it is bound to.
-    /// Both stand before the import writes anything, because the tracking
-    /// entry is keyed by namespace and overwritten blind, while the
-    /// registry's own refusal of a second issuer comes after that write
-    /// and restores nothing.
-    fn guard_data_import(stack: &HostedStack, issuer: PdnId, namespace: NamespaceId) -> Result<()> {
-        if let Some((bound, _posture)) = stack.registry.binding_of(namespace)? {
-            if bound != issuer {
-                return Err(anyhow::anyhow!(
-                    "namespace {namespace} is already bound to issuer {bound}; \
-                     one namespace binds one issuer"
-                ));
-            }
-        } else if let Some((pod, _store)) = stack.registry.pod_of(namespace)? {
-            return Err(anyhow::anyhow!(
-                "namespace {namespace} is a store of pod {pod}; \
-                 a data import must not repurpose it"
-            ));
-        } else if stack.tracked(namespace)?.is_some() {
-            return Err(anyhow::anyhow!(
-                "namespace {namespace} is a device-shared replica of this identity; \
-                 a data import must not repurpose it"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Drop the replica an import rebinds its issuer away from, while that
-    /// binding still stands — the order `forget_namespace` keeps — so an
-    /// issuer keeps one data binding and nothing outlives it. The import
-    /// goes on whatever this answers: a replica that would not drop is
-    /// already off the reconcile pass.
-    async fn forget_rebound(&self, stack: &HostedStack, identity: PdnId, namespace: NamespaceId) {
-        if let Err(err) = self.forget_doc(identity, namespace).await {
-            tracing::warn!(%namespace, "a replica its issuer was rebound away from stayed in the store: {err:#}");
-        }
-        let _disarmed = stack.access.disarm_retractions(namespace);
-        self.retraction.untrack_namespace(identity, namespace);
-    }
-
-    /// Leave exactly the state that preceded the import.
-    pub async fn undo_import_namespace(&self, import: NamespaceImport) -> Result<()> {
-        let NamespaceImport {
-            identity,
-            issuer,
-            bound,
-        } = import;
-        if !bound {
-            return Ok(());
-        }
-        self.forget_namespace(identity, issuer).await
-    }
-
-    /// Stop reconciling `issuer`'s replica in `identity`, drop it, and
-    /// unregister the issuer, as one act — so operations afterwards fail
-    /// with [`UnknownIssuer`] rather than as storage errors against a
-    /// dropped replica.
-    pub async fn forget_namespace(&self, identity: PdnId, issuer: PdnId) -> Result<()> {
-        let stack = self.require(identity)?;
-        // Drop first: a failed drop leaves the registration in place, so a
-        // retry still resolves the issuer.
-        let binding = stack
-            .registry
-            .binding(issuer)?
-            .ok_or(UnknownIssuer { issuer })?;
-        let namespace = binding.doc.id();
-        self.forget_doc(identity, namespace).await?;
-        let _unregistered = stack.registry.unregister_data(issuer)?;
-        stack.access.disarm_retractions(namespace)?;
-        self.retraction.untrack_namespace(identity, namespace);
-        Ok(())
-    }
-
-    /// The registration probe for importers that memoize their imports:
-    /// each import holds one more open handle on the replica, and the drop
-    /// at the end of its life must find exactly one.
-    pub fn data_namespace_of(&self, identity: PdnId, issuer: PdnId) -> Result<Option<NamespaceId>> {
-        let Some(stack) = self.stack(identity)? else {
-            return Ok(None);
-        };
-        Ok(stack.registry.data_doc(issuer)?.map(|doc| doc.id()))
     }
 
     /// Create both stores of `pod` for `identity`, both or neither: they
@@ -1869,9 +1393,7 @@ impl SyncNode {
     /// any role: whatever bounded that replica's sessions before would stop
     /// bounding them once a ticket's word made it a pod's store.
     fn guard_pod_import(stack: &HostedStack, namespace: NamespaceId) -> Result<()> {
-        let role = if stack.registry.binding_of(namespace)?.is_some() {
-            "a data replica of this identity".to_owned()
-        } else if let Some((other, _store)) = stack.registry.pod_of(namespace)? {
+        let role = if let Some((other, _store)) = stack.registry.pod_of(namespace)? {
             format!("a store of pod {other}")
         } else if let Some(role) = stack.access.ticket_bound_role(namespace)? {
             role.to_owned()
@@ -2073,7 +1595,7 @@ impl SyncNode {
             match tokio::time::timeout_at(deadline, changes.next()).await {
                 Ok(Some(_change)) => {}
                 Ok(None) => anyhow::bail!("the membership store's change stream ended"),
-                Err(_elapsed) => return Err(crate::CatchUpTimeout.into()),
+                Err(_elapsed) => return Err(crate::CatchUpTimeout::default().into()),
             }
             // A burst — a session's entries, their payloads — is read once.
             while let Some(Some(_change)) = futures_lite::future::poll_once(changes.next()).await {}
@@ -2337,6 +1859,35 @@ impl SyncNode {
         Ok(in_flight)
     }
 
+    /// What [`Self::pod_syncs_in_flight_for_test`] counts, each item named.
+    #[cfg(feature = "test-util")]
+    pub async fn pod_syncs_in_flight_report_for_test(&self, pod: PodId) -> Result<String> {
+        let stacks: Vec<Arc<HostedStack>> = self
+            .identities
+            .read()
+            .map_err(|_poisoned| anyhow::anyhow!("identities lock poisoned"))?
+            .values()
+            .cloned()
+            .collect();
+        let mut report = Vec::new();
+        for stack in stacks {
+            let Some(held) = stack.registry.pod(pod)? else {
+                continue;
+            };
+            let namespaces = std::iter::once(held.membership.id())
+                .chain(held.records.as_ref().map(Doc::id))
+                .collect();
+            report.push(
+                stack
+                    .docs
+                    .engine()
+                    .syncs_in_flight_report(namespaces)
+                    .await?,
+            );
+        }
+        Ok(report.join("; "))
+    }
+
     /// While `refuse`, every session on a pod's store that `identity` is
     /// asked to serve is refused, as by a device out of reach; its own dials
     /// go on.
@@ -2488,6 +2039,31 @@ impl SyncNode {
         })
     }
 
+    /// The addresses this node's endpoint knows for `nodes`, each as a ticket
+    /// names a node; this node, and a node it knows no address of, left out.
+    pub async fn known_addrs(&self, nodes: &[NodeId]) -> Vec<EndpointAddr> {
+        let endpoint = self.router.endpoint();
+        let mut known = Vec::new();
+        for node in nodes {
+            let Ok(id) = EndpointId::from_bytes(node.as_bytes()) else {
+                continue;
+            };
+            if id == endpoint.id() || known.iter().any(|addr: &EndpointAddr| addr.id == id) {
+                continue;
+            }
+            if let Some(info) = endpoint.remote_info(id).await {
+                let addrs: Vec<iroh::TransportAddr> = info.into_addrs().map(Into::into).collect();
+                if !addrs.is_empty() {
+                    known.push(
+                        AddrInfoOptions::RelayAndAddresses
+                            .apply(&EndpointAddr::from_parts(id, addrs)),
+                    );
+                }
+            }
+        }
+        known
+    }
+
     /// `identity`'s own write tickets to the two stores `tickets` name, this
     /// device their one node as a share would name it, minted with no replica
     /// held: a join records them before it imports the stores.
@@ -2505,24 +2081,6 @@ impl SyncNode {
         })
     }
 
-    /// Set exactly `devices` as the issuer's device set for retraction
-    /// verdicts on `issuer`'s granted namespace.
-    pub fn track_retraction_peers(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        devices: Vec<NodeId>,
-    ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let doc = stack
-            .registry
-            .data_doc(issuer)?
-            .ok_or(UnknownIssuer { issuer })?;
-        self.retraction
-            .track_namespace(identity, doc.id(), devices.into_iter().collect());
-        Ok(())
-    }
-
     /// Once; a second take yields `None`. From the take on, every
     /// derivation of a pod's contacts — at each change to its membership
     /// store and each run of the pod stores' pass, ahead of its dials —
@@ -2535,146 +2093,6 @@ impl SyncNode {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *sender = Some(tx);
         Some(rx)
-    }
-
-    /// Once; a second take yields `None`.
-    pub fn take_retraction_verdicts(
-        &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<RetractionVerdict>> {
-        self.retraction_verdicts
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-    }
-
-    /// Physically remove `author`'s record at `key` if its timestamp is at
-    /// or below `bound` — no tombstone, which the gate would refuse and
-    /// which would shadow the issuer's entries locally. Returns whether a
-    /// record was removed.
-    pub async fn retract_entry(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        author: AuthorId,
-        key: &[u8],
-        bound: u64,
-    ) -> Result<bool> {
-        let doc = self.require(identity)?.doc(issuer)?;
-        doc.retract(author, key.to_vec(), bound).await
-    }
-
-    /// The marker's in-memory half: refuse re-ingest of `author`'s entries
-    /// at `key` up to `bound`.
-    pub fn arm_retraction(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        author: AuthorId,
-        key: Vec<u8>,
-        bound: u64,
-    ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let doc = stack
-            .registry
-            .data_doc(issuer)?
-            .ok_or(UnknownIssuer { issuer })?;
-        stack.access.arm_retraction(doc.id(), author, key, bound)
-    }
-
-    /// Whether `marker`'s version is armed on `issuer`'s replica and its
-    /// removal ran. `None` when the issuer resolves to no replica here.
-    pub fn retraction_applied(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        author: AuthorId,
-        key: &[u8],
-        marker: [u8; 32],
-    ) -> Result<Option<bool>> {
-        let Some(stack) = self.stack(identity)? else {
-            return Ok(None);
-        };
-        let Some(doc) = stack.registry.data_doc(issuer)? else {
-            return Ok(None);
-        };
-        stack
-            .access
-            .retraction_applied(doc.id(), author, key, marker)
-            .map(Some)
-    }
-
-    /// Record that `marker`'s removal ran after its arming, so a sweep
-    /// skips it until a disarm.
-    pub fn mark_retraction_applied(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        author: AuthorId,
-        key: &[u8],
-        marker: [u8; 32],
-    ) -> Result<()> {
-        let stack = self.require(identity)?;
-        let doc = stack
-            .registry
-            .data_doc(issuer)?
-            .ok_or(UnknownIssuer { issuer })?;
-        stack
-            .access
-            .mark_retraction_applied(doc.id(), author, key, marker)
-    }
-
-    /// Whether this identity holds exactly the entry `verdict` names —
-    /// author, key, timestamp, content hash. A verdict's fields are the
-    /// refusing peer's word and retraction is destructive; a version a
-    /// newer own write already superseded must not be undone by a
-    /// rejection still in flight for it.
-    pub async fn holds_rejected_entry(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        verdict: &RetractionVerdict,
-    ) -> Result<bool> {
-        let doc = self.require(identity)?.doc(issuer)?;
-        let query = Query::author(verdict.author).key_exact(&verdict.key);
-        let Some(entry) = doc.get_one(query).await? else {
-            return Ok(false);
-        };
-        Ok(entry.timestamp() == verdict.timestamp && entry.content_hash() == verdict.content_hash)
-    }
-
-    /// Take down what a dropped marker armed. An issuer resolving to no
-    /// replica has nothing armed; not an error.
-    pub fn disarm_retraction(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        author: AuthorId,
-        key: &[u8],
-    ) -> Result<()> {
-        let Some(stack) = self.stack(identity)? else {
-            return Ok(());
-        };
-        let Some(doc) = stack.registry.data_doc(issuer)? else {
-            return Ok(());
-        };
-        stack.access.disarm_retraction(doc.id(), author, key)
-    }
-
-    /// The reverse resolution a verdict consumer needs: whose data
-    /// `namespace` is, as `identity` holds it. `None` when this identity
-    /// holds no such replica — the verdict then addresses nothing here.
-    pub fn issuer_of_held_namespace(
-        &self,
-        identity: PdnId,
-        namespace: NamespaceId,
-    ) -> Result<Option<PdnId>> {
-        let Some(stack) = self.stack(identity)? else {
-            return Ok(None);
-        };
-        Ok(stack
-            .registry
-            .binding_of(namespace)?
-            .map(|(issuer, _posture)| issuer))
     }
 
     /// A fresh doc of `identity`'s for a device-shared store, tracked.
@@ -2694,14 +2112,6 @@ impl SyncNode {
         namespace: NamespaceId,
     ) -> Result<Option<Doc>> {
         let stack = self.require(identity)?;
-        // The mirror of `guard_data_import`: tracking here is `Swarm`, so a
-        // grantee import opened by mistake would be pulled into the swarm.
-        if stack.registry.binding_of(namespace)?.is_some() {
-            return Err(anyhow::anyhow!(
-                "namespace {namespace} is a data replica of this identity; \
-                 it cannot be opened as a device-shared store"
-            ));
-        }
         if let Some((pod, _store)) = stack.registry.pod_of(namespace)? {
             return Err(anyhow::anyhow!(
                 "namespace {namespace} is a store of pod {pod}; \
@@ -2723,12 +2133,16 @@ impl SyncNode {
         Ok(Some(doc))
     }
 
-    /// Read the replica store, to tell a store that still answers from one
-    /// a full filesystem left refusing everything. The read asks one
-    /// replica for its sync peers because that reaches the tables; the
-    /// namespace listing and an empty entry query both keep answering long
-    /// after the database has refused everything else.
-    pub async fn check_replica_store(&self) -> Result<()> {
+    /// Read both stores, to tell stores that still answer from one a full
+    /// filesystem left refusing everything. The replica store is asked one
+    /// replica's sync peers because that reaches the tables; the namespace
+    /// listing and an empty entry query both keep answering long after the
+    /// database has refused everything else. The blob store is asked for a
+    /// hash other than the empty one, which it answers without asking its
+    /// metadata actor: a placement that meets the full disk stops that
+    /// actor and leaves the replica store answering.
+    pub async fn check_stores(&self) -> Result<()> {
+        let _held = self.blobs.has(Hash::from_bytes([0; 32])).await?;
         for stack in self.stacks()? {
             if let Some(tracked) = stack.tracked_snapshot().first() {
                 let _peers = tracked.doc.get_sync_peers().await?;
@@ -2751,17 +2165,15 @@ impl SyncNode {
         let minted_by = ticket.identity;
         // The capability only: a session started before the store is armed
         // is refused by this identity's own book, and nothing retries it
-        // before the next pass. `host_identity` or `host_connection` starts
-        // the sync once the store is armed.
+        // before the next pass. `host_identity` starts the sync once the
+        // store is armed.
         let doc = stack.api.import_namespace(ticket.capability).await?;
         stack.track(&doc, contacts, SyncStrategy::Swarm, minted_by)?;
         Ok(doc)
     }
 
-    /// Untrack and drop a device-shared store's doc. Data namespaces go
-    /// through [`forget_namespace`](Self::forget_namespace), which also
-    /// unregisters the issuer, and a pod's stores through
-    /// [`forget_pod`](Self::forget_pod).
+    /// Untrack and drop a device-shared store's doc. A pod's stores go
+    /// through [`forget_pod`](Self::forget_pod).
     pub async fn forget_doc(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
         let Some(stack) = self.stack(identity)? else {
             return Ok(());
@@ -2795,25 +2207,6 @@ impl SyncNode {
         self.blobs.clone()
     }
 
-    pub async fn share_ticket(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        mode: ShareMode,
-        addr_options: AddrInfoOptions,
-    ) -> Result<DocTicket> {
-        let binding = self
-            .require(identity)?
-            .registry
-            .binding(issuer)?
-            .ok_or(UnknownIssuer { issuer })?;
-        if binding.posture == ServingPosture::AudienceDevices {
-            return Err(GranteeCannotShare { identity, issuer }.into());
-        }
-        let ticket = binding.doc.share(mode, addr_options).await?;
-        Ok(ticket)
-    }
-
     /// A standalone author; an identity's own stores write with
     /// [`default_author`](Self::default_author) instead.
     pub async fn create_author(&self, identity: PdnId) -> Result<AuthorId> {
@@ -2838,119 +2231,6 @@ impl SyncNode {
         DialHandle {
             endpoint: self.router.endpoint().clone(),
         }
-    }
-
-    pub async fn write(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        author: AuthorId,
-        path: &EntryPath,
-        payload: &[u8],
-    ) -> Result<()> {
-        let doc = self.require(identity)?.doc(issuer)?;
-        doc.set_bytes(author, path.as_str().as_bytes().to_vec(), payload.to_vec())
-            .await?;
-        Ok(())
-    }
-
-    /// `Ok(None)` both when no entry exists and when its payload has not
-    /// been fetched yet — poll again. A grant-imported namespace is nudged
-    /// first (non-blocking): the answer comes from the local replica at once.
-    pub async fn read(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        path: &EntryPath,
-    ) -> Result<Option<Vec<u8>>> {
-        let stack = self.require(identity)?;
-        Self::nudge_scoped(&stack, issuer);
-        let doc = stack.doc(issuer)?;
-        read_payload(&doc, &self.blobs, path.as_str().as_bytes()).await
-    }
-
-    /// Fire-and-forget a filtered reconciliation of a `ContactsOnly`
-    /// namespace; no-op otherwise. Debounced to one attempt in flight per
-    /// namespace, or a tight poll loop piles up tasks against one replica.
-    fn nudge_scoped(stack: &Arc<HostedStack>, issuer: PdnId) {
-        let Ok(Some(binding)) = stack.registry.binding(issuer) else {
-            return;
-        };
-        let namespace = binding.doc.id();
-        let Ok(Some(tracked)) = stack.tracked(namespace) else {
-            return;
-        };
-        if tracked.strategy != SyncStrategy::ContactsOnly {
-            return;
-        }
-        {
-            let Ok(mut in_flight) = stack.nudges_in_flight.lock() else {
-                return;
-            };
-            if !in_flight.insert(namespace) {
-                return;
-            }
-        }
-        let stack = Arc::clone(stack);
-        let _detached = tokio::spawn(async move {
-            let _ = tracked
-                .doc
-                .start_sync_scoped(tracked.contacts, tracked.default_identity)
-                .await;
-            if let Ok(mut in_flight) = stack.nudges_in_flight.lock() {
-                in_flight.remove(&namespace);
-            }
-        });
-    }
-
-    /// Entry metadata, record-level, optionally narrowed to `path_prefix`
-    /// matching whole components (`contacts` matches `contacts/a`, not
-    /// `contactsx/c`).
-    pub async fn list(
-        &self,
-        identity: PdnId,
-        issuer: PdnId,
-        path_prefix: Option<&EntryPath>,
-    ) -> Result<Vec<EntryInfo>> {
-        let stack = self.require(identity)?;
-        Self::nudge_scoped(&stack, issuer);
-        let doc = stack.doc(issuer)?;
-        // Byte prefix as the coarse cut; component semantics per entry below.
-        let query = Query::single_latest_per_key();
-        let query = match path_prefix {
-            Some(prefix) => query.key_prefix(prefix.as_str().as_bytes()),
-            None => query,
-        };
-        let mut stream = std::pin::pin!(doc.get_many(query).await?);
-        let mut entries = Vec::new();
-        while let Some(entry) = stream.next().await {
-            let entry = entry?;
-            let Some(path) = path_of(entry.key()) else {
-                continue;
-            };
-            if path_prefix.is_some_and(|prefix| !starts_with_components(&path, prefix)) {
-                continue;
-            }
-            entries.push(EntryInfo {
-                issuer,
-                path,
-                payload_len: entry.content_len(),
-            });
-        }
-        Ok(entries)
-    }
-
-    /// The observation side of [`set_doc_contacts`](Self::set_doc_contacts).
-    /// Empty when the namespace resolves to no tracked doc.
-    #[cfg(feature = "test-util")]
-    pub fn doc_contacts(&self, identity: PdnId, namespace: NamespaceId) -> Result<Vec<Contact>> {
-        let Some(stack) = self.stack(identity)? else {
-            return Ok(Vec::new());
-        };
-        Ok(stack
-            .tracked(namespace)?
-            .map(|tracked| tracked.contacts)
-            .unwrap_or_default())
     }
 
     /// Whether `identity` still holds `namespace` in its replica store or
@@ -3741,20 +3021,10 @@ async fn reconcile_pass(
                 if matches!(stack.registry.pod_of(tracked.doc.id()), Ok(Some(_))) {
                     continue;
                 }
-                let _ = match tracked.strategy {
-                    SyncStrategy::ContactsOnly => {
-                        tracked
-                            .doc
-                            .start_sync_scoped(tracked.contacts, tracked.default_identity)
-                            .await
-                    }
-                    SyncStrategy::Swarm => {
-                        tracked
-                            .doc
-                            .start_sync(tracked.contacts, tracked.default_identity)
-                            .await
-                    }
-                };
+                let _ = tracked
+                    .doc
+                    .start_sync(tracked.contacts, tracked.default_identity)
+                    .await;
             }
         }
         reconcile_co_located(&stacks, &co_located_sessions, &mut reconciled).await;
@@ -4287,6 +3557,9 @@ async fn pod_contacts(
         })
         .collect();
     devices.extend(own_devices.into_iter().map(|device| (device, own)));
+    if !converged {
+        devices.extend(ticketed_unlisted(stack, held, &view)?);
+    }
     let known = known_addresses(stack, membership)?;
     let mut seen = HashSet::new();
     let mut contacts = Vec::new();
@@ -4309,6 +3582,36 @@ async fn pod_contacts(
         member,
         unlisted,
     })
+}
+
+/// The devices `held`'s tickets name as a current member that no statement
+/// lists yet: the inviter's other device, reached before its statement is.
+fn ticketed_unlisted(
+    stack: &HostedStack,
+    held: &PodBinding,
+    view: &MembershipView,
+) -> Result<Vec<(NodeId, Identity)>> {
+    let listed: HashSet<NodeId> = view
+        .identities()
+        .flat_map(|(_id, member)| member.devices.iter().map(|device| device.node))
+        .collect();
+    let mut devices = Vec::new();
+    for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
+        for contact in stack
+            .tracked(doc.id())?
+            .map(|tracked| tracked.ticketed)
+            .unwrap_or_default()
+        {
+            let device = NodeId::from_bytes(*contact.addr.id.as_bytes());
+            let current = view
+                .member(&PdnId::from_bytes(*contact.identity.as_bytes()))
+                .is_some_and(|member| member.state.member);
+            if current && !listed.contains(&device) {
+                devices.push((device, contact.identity));
+            }
+        }
+    }
+    Ok(devices)
 }
 
 /// The contacts of `ticket` and of `others`, tickets to the same store,
@@ -4345,8 +3648,9 @@ fn known_addresses(stack: &HostedStack, store: &Doc) -> Result<HashMap<EndpointI
         .tracked(store.id())?
         .map(|tracked| {
             tracked
-                .contacts
+                .ticketed
                 .into_iter()
+                .chain(tracked.contacts)
                 .map(|contact| (contact.addr.id, contact.addr))
                 .collect()
         })
@@ -4735,43 +4039,22 @@ impl PassProbes {
     }
 }
 
-/// Sessions the pass has opened, per namespace: a pair holds its data
-/// replica and its two connection stores, and each is reconciled on its
-/// own.
+/// Sessions the pass has opened, per namespace: a pair holds a pod's two
+/// stores, and a scenario reads each apart.
 type CoLocatedPassSessions = Arc<Mutex<HashMap<NamespaceId, u64>>>;
 
 /// What a co-located pair looked like before its last successful pass
-/// session: how many writes each side's replica had taken, and how many
-/// each side's connection stores had, both sides in the pair's canonical
-/// order. A pass skips the pair only while all four stand still.
-///
-/// The two replicas are not compared: one held under a claim-scoped grant
-/// lacks for good what the grant withholds, and the grant lives in the
-/// connection stores, where it changes with no write to the namespace.
+/// session: how many writes each side's replica had taken, both sides in
+/// the pair's canonical order. A pass skips the pair only while every count
+/// stands still.
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct PairReading {
     source_writes: u64,
     target_writes: u64,
-    source_rights: u64,
-    target_rights: u64,
     /// A pod's record store beside its membership store, the two read as
     /// one pair.
     source_records: u64,
     target_records: u64,
-}
-
-/// The writes taken by the connection stores this identity holds toward
-/// `peer` — where a grant between the two is written and where it arrives.
-/// `0` when the two are not connected: then no grant binds them.
-async fn rights_writes(stack: &Arc<HostedStack>, peer: PdnId) -> u64 {
-    let Ok(Some((own, peer_doc))) = stack.access.connection_stores(peer) else {
-        return 0;
-    };
-    let sync = &stack.docs.engine().sync;
-    let (Ok(own), Ok(peer_doc)) = (sync.writes(own).await, sync.writes(peer_doc).await) else {
-        return 0;
-    };
-    own.saturating_add(peer_doc)
 }
 
 /// The pair in a fixed order, so the memo reads the same whichever side
@@ -4795,21 +4078,6 @@ async fn pair_reading(
     namespace: NamespaceId,
 ) -> Option<PairReading> {
     let (first, second) = ordered(source, target);
-    // The grant is read only for a data replica: a device-shared store is
-    // served on its ticket (Invariants 1 and 3), so no grant governs what
-    // flows through it. Reading the connection stores for one of those
-    // would read them for themselves, and their own reconciliation would
-    // then keep invalidating their own memo.
-    let governed = matches!(first.registry.binding_of(namespace), Ok(Some(_)))
-        || matches!(second.registry.binding_of(namespace), Ok(Some(_)));
-    let (source_rights, target_rights) = if governed {
-        (
-            rights_writes(first, second.identity).await,
-            rights_writes(second, first.identity).await,
-        )
-    } else {
-        (0, 0)
-    };
     let (source_records, target_records) = match pod_records(first, namespace) {
         Some(records) => (
             first.docs.engine().sync.writes(records).await.ok()?,
@@ -4820,8 +4088,6 @@ async fn pair_reading(
     Some(PairReading {
         source_writes: first.docs.engine().sync.writes(namespace).await.ok()?,
         target_writes: second.docs.engine().sync.writes(namespace).await.ok()?,
-        source_rights,
-        target_rights,
         source_records,
         target_records,
     })
@@ -4904,20 +4170,6 @@ async fn reconcile_co_located(
     });
 }
 
-fn path_of(key: &[u8]) -> Option<EntryPath> {
-    let s = std::str::from_utf8(key).ok()?;
-    EntryPath::new(s).ok()
-}
-
-/// Both are validated paths, so a byte prefix plus a component boundary is
-/// exactly component semantics.
-fn starts_with_components(path: &EntryPath, prefix: &EntryPath) -> bool {
-    match path.as_str().strip_prefix(prefix.as_str()) {
-        Some(rest) => rest.is_empty() || rest.starts_with('/'),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4974,5 +4226,30 @@ mod tests {
 
         let on_memory = annotate_store_error(anyhow::anyhow!("boom"), &StorageConfig::Memory);
         assert_eq!(format!("{on_memory:#}"), "boom");
+    }
+
+    /// A stopped blob store fails the storage check while the replica store
+    /// still answers, as a placement on a full disk leaves the two.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_blob_store_fails_the_storage_check() -> Result<()> {
+        let node = SyncNode::spawn(SpawnOptions::memory()).await?;
+        let alice = PdnId::from_bytes([0xa1; 32]);
+        node.provision_identity(alice).await?;
+        let _pms = crate::PrivateMetadataStore::create(&node, alice).await?;
+        node.check_stores().await?;
+
+        node.blobs().shutdown().await?;
+        assert!(
+            node.check_stores().await.is_err(),
+            "a stopped blob store must fail the storage check"
+        );
+        for stack in node.stacks()? {
+            if let Some(tracked) = stack.tracked_snapshot().first() {
+                let _peers = tracked.doc.get_sync_peers().await?;
+            }
+        }
+
+        node.shutdown().await?;
+        Ok(())
     }
 }

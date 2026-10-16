@@ -2,7 +2,7 @@
 name = "pdn-types"
 version = "0.1.0"
 edition = "2021"
-description = "Shared platform primitives and the data vocabulary"
+description = "Shared platform primitives and the record vocabulary"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

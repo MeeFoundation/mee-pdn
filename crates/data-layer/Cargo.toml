@@ -3,7 +3,7 @@ name = "data-layer"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Data layer: capability-gated document sync over our iroh-docs variant"
+description = "Data layer: document sync over our iroh-docs variant, every session judged by its access book"
 
 [features]
 # Extra observation surface for scenario tests, never the product: the read

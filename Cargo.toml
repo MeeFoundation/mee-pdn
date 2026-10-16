@@ -1,9 +1,9 @@
 [workspace]
 members = [
   "crates/pdn-types",     # platform primitives + the data vocabulary
-  "crates/pdn-store",     # our iroh-docs variant: document sync with capability-gated ingest
+  "crates/pdn-store",     # our iroh-docs variant: document sync whose sessions the embedder judges
   "crates/data-layer",    # document sync over our iroh-docs variant
-  "crates/pdn-layer",     # platform surface: domain model + PdnOp AST + uwill tokens
+  "crates/pdn-layer",     # platform surface: domain model + PdnOp AST
   "crates/pdn-node",      # embeddable node runtime: service glue over data-layer
   "crates/pdn-node-http", # thin HTTP host embedding one runtime
   "crates/test-utils",    # shared scenario-test plumbing (dev-dependency only)
@@ -22,7 +22,7 @@ iroh = "1.3"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 tracing = "0.1"
-# `pdn-store` is our iroh-docs variant (capability-gated ingest).
+# `pdn-store` is our iroh-docs variant, every session judged by the embedder.
 pdn-store = { path = "crates/pdn-store" }
 
 [patch.crates-io]

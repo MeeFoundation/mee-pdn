@@ -52,46 +52,9 @@ pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_
 /// its first key, twice — stays under the ceiling a peer reads it with.
 pub const MAX_KEY_BYTES: usize = 8 * 1024;
 
-/// How many in-band rejections one message may surface to the rejection
-/// observer. A message is bounded only by the frame size, and each rejection
-/// is a claim about an entry the receiver holds, so an unbounded reply would
-/// let one peer hand the observer millions of them. Rejections past the bound
-/// are ignored, which costs nothing lasting: an entry whose rejection is lost
-/// stays in the set difference and draws it again next session.
-pub const MAX_REJECTIONS_PER_MESSAGE: usize = 1024;
-
 /// Callback that may be set on a replica to determine the availability status for a content hash.
 pub type ContentStatusCallback =
     Arc<dyn Fn(Hash) -> n0_future::boxed::BoxFuture<ContentStatus> + Send + Sync + 'static>;
-
-/// Callback that decides whether an incoming entry may be persisted.
-///
-/// Receives the entry and the transmitting peer ([`PeerIdBytes`], the
-/// transport-authenticated sender of the sync session the entry arrived
-/// over). [`ValidateOutcome::Accept`] stores the entry; both other outcomes
-/// keep it out of the store and differ only in what the sender learns —
-/// [`ValidateOutcome::Reject`] is a capability verdict on the sender, and on
-/// the set-reconciliation path it echoes the entry's [`RejectId`] back so the
-/// sender can act on it, while [`ValidateOutcome::Drop`] is silent and is the
-/// outcome for everything the policy cannot decide (its own state unavailable,
-/// no session to judge against): the sender re-offers, which self-heals.
-///
-/// It is consulted for every non-local entry at the `validate_entry`
-/// chokepoint — i.e. for both set-reconciliation and live-gossip ingest — and
-/// is the injection point for PdnId / UWill capability checks; local inserts
-/// are never gated. `None` keeps vanilla accept-all behaviour.
-pub type CapabilityValidator =
-    Arc<dyn Fn(&SignedEntry, &PeerIdBytes) -> ValidateOutcome + Send + Sync + 'static>;
-
-/// Callback invoked for each rejection this replica *receives* — the id of an
-/// own entry a peer refused at its ingest gate ([`RejectId`]), with the
-/// refusing peer.
-///
-/// It fires as the reply carrying the rejection is processed, does not alter
-/// session state, and lets the embedder retract the refused entry. `None`
-/// observes nothing.
-pub type RejectionObserver =
-    Arc<dyn Fn(NamespaceId, &RejectId, &PeerIdBytes) + Send + Sync + 'static>;
 
 /// Event emitted by sync when entries are added.
 #[derive(derive_more::Debug, Clone)]
@@ -292,10 +255,6 @@ pub struct ReplicaInfo {
     subscribers: Subscribers<Event>,
     #[debug("ContentStatusCallback")]
     content_status_cb: Option<ContentStatusCallback>,
-    #[debug("CapabilityValidator")]
-    capability_validator: Option<CapabilityValidator>,
-    #[debug("RejectionObserver")]
-    rejection_observer: Option<RejectionObserver>,
     closed: bool,
 }
 
@@ -307,8 +266,6 @@ impl ReplicaInfo {
             subscribers: Default::default(),
             // on_insert_sender: RwLock::new(None),
             content_status_cb: None,
-            capability_validator: None,
-            rejection_observer: None,
             closed: false,
         }
     }
@@ -353,33 +310,6 @@ impl ReplicaInfo {
             false
         } else {
             self.content_status_cb = Some(cb);
-            true
-        }
-    }
-
-    /// Set the capability validator run on every incoming (non-local) entry.
-    ///
-    /// Only one validator can be active at a time. If a previous one was
-    /// registered, this returns `false` and keeps the existing validator.
-    pub fn set_capability_validator(&mut self, validator: CapabilityValidator) -> bool {
-        if self.capability_validator.is_some() {
-            false
-        } else {
-            self.capability_validator = Some(validator);
-            true
-        }
-    }
-
-    /// Set the observer called for every rejection this replica receives — an
-    /// own entry a peer refused at its ingest gate.
-    ///
-    /// Only one observer can be active at a time. If a previous one was
-    /// registered, this returns `false` and keeps the existing observer.
-    pub fn set_rejection_observer(&mut self, observer: RejectionObserver) -> bool {
-        if self.rejection_observer.is_some() {
-            false
-        } else {
-            self.rejection_observer = Some(observer);
             true
         }
     }
@@ -503,16 +433,7 @@ where
         let namespace = self.id();
 
         let store = &self.store;
-        // here: same gate (validate_entry) — pass the injected capability validator
-        validate_entry(
-            system_time_now(),
-            store,
-            namespace,
-            &entry,
-            &origin,
-            self.info.capability_validator.as_ref(),
-            None,
-        )?;
+        validate_entry(system_time_now(), store, namespace, &entry, &origin, None)?;
 
         let outcome = self.store.put(entry.clone()).map_err(InsertError::Store)?;
         tracing::debug!(?origin, hash = %entry.content_hash(), ?outcome, "insert");
@@ -614,26 +535,10 @@ where
         // let subscribers = std::rc::Rc::new(&mut self.subscribers);
         // l
         let cb = self.info.content_status_cb.clone();
-        let capability_validator = self.info.capability_validator.clone();
-        let rejection_observer = self.info.rejection_observer.clone();
         let download_policy = self
             .store
             .get_download_policy(&my_namespace)
             .unwrap_or_default();
-
-        // here: in-band rejections — own entries a peer refused at its gate,
-        // echoed back on this reply; surfaced before the message is consumed,
-        // and no more than `MAX_REJECTIONS_PER_MESSAGE` of them.
-        if let Some(observer) = rejection_observer.as_ref() {
-            for id in message
-                .parts()
-                .iter()
-                .filter_map(|part| part.rejected())
-                .take(MAX_REJECTIONS_PER_MESSAGE)
-            {
-                observer(my_namespace, id, &from_peer);
-            }
-        }
 
         let mut session_store = crate::filter::SessionStore::new(&mut self.store, filter);
         let reply = session_store
@@ -646,22 +551,12 @@ where
                         from: from_peer,
                         remote_content_status: content_status,
                     };
-                    // here: injected capability validator (set-reconciliation ingest
-                    // path). Only a capability refusal (`Unauthorized`) is echoed back
-                    // to the sender in-band so it can retract; every other failure —
-                    // intrinsic (signature, clock skew) or the validator's own silent
-                    // refusal — stays quiet, and the sender re-offers, which self-heals.
-                    match validate_entry(
-                        now,
-                        store,
-                        my_namespace,
-                        entry,
-                        &origin,
-                        capability_validator.as_ref(),
-                        ingest.as_ref(),
-                    ) {
+                    // here: the session's ingest verdict. Every failure — intrinsic
+                    // (signature, clock skew) or the verdict's own — stays quiet, and
+                    // the sender offers the entry again in a later session.
+                    match validate_entry(now, store, my_namespace, entry, &origin, ingest.as_ref())
+                    {
                         Ok(()) => ValidateOutcome::Accept,
-                        Err(ValidationFailure::Unauthorized) => ValidateOutcome::Reject,
                         Err(_) => ValidateOutcome::Drop,
                     }
                 },
@@ -737,7 +632,6 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     expected_namespace: NamespaceId,
     entry: &SignedEntry,
     origin: &InsertOrigin,
-    validator: Option<&CapabilityValidator>,
     ingest: Option<&crate::filter::SessionIngest>,
 ) -> Result<(), ValidationFailure> {
     // Verify the namespace
@@ -759,24 +653,12 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
         return Err(ValidationFailure::TooFarInTheFuture);
     }
 
-    // here: capability-chain check — gate only remote entries, mirroring
-    // the signature check above. The session's own verdict decides where
-    // there is a session: the write set was frozen at its setup and holds
-    // for it alone. Without one — an insert outside any session — the
-    // consumer's standing validator decides, and `None` keeps vanilla
-    // accept-all.
-    if let InsertOrigin::Sync { from, .. } = origin {
-        let outcome = match ingest {
-            Some(ingest) => ingest(entry),
-            None => match validator {
-                Some(validate) => validate(entry, from),
-                None => ValidateOutcome::Accept,
-            },
-        };
-        match outcome {
-            ValidateOutcome::Accept => {}
-            ValidateOutcome::Drop => return Err(ValidationFailure::NotAdmitted),
-            ValidateOutcome::Reject => return Err(ValidationFailure::Unauthorized),
+    // here: the session's ingest verdict — remote entries only, mirroring
+    // the signature check above; decided at the session's setup, it holds
+    // for that session alone. An insert outside any session takes none.
+    if let (InsertOrigin::Sync { .. }, Some(ingest)) = (origin, ingest) {
+        if ingest(entry) == ValidateOutcome::Drop {
+            return Err(ValidationFailure::NotAdmitted);
         }
     }
     Ok(())
@@ -835,11 +717,8 @@ pub enum ValidationFailure {
     /// Entry has length 0 but not the empty hash, or the empty hash but not length 0.
     #[error("Entry has length 0 but not the empty hash, or the empty hash but not length 0")]
     InvalidEmptyEntry,
-    /// Entry author is not authorized to write to this namespace (capability check failed).
-    #[error("Entry author is not authorized")]
-    Unauthorized,
-    /// The injected validator kept the entry out without judging its author's
-    /// authority, so the sender is not told (see [`CapabilityValidator`]).
+    /// The session's ingest verdict kept the entry out; the sender is not
+    /// told.
     #[error("Entry was not admitted")]
     NotAdmitted,
 }
@@ -960,31 +839,9 @@ impl SignedEntry {
     }
 }
 
-/// The identity of a refused entry, echoed to its sender in a rejection
-/// reconciliation part — enough to name the entry (author, key, timestamp)
-/// without re-sending it. The timestamp lets the sender retract exactly the
-/// refused version and spare a newer own write at the same key.
-///
-/// A rejection names an entry the refusing replica does not hold: an entry
-/// already stored there is never rejected, whatever the gate says about it
-/// now ([`ValidateOutcome::Reject`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RejectId {
-    /// The refused entry's author.
-    pub author: AuthorId,
-    /// The refused entry's key.
-    pub key: Bytes,
-    /// The refused entry's timestamp.
-    pub timestamp: u64,
-    /// The refused entry's content hash — provenance for the sender's
-    /// retraction marker and event (the address of what was lost).
-    pub content_hash: Hash,
-}
-
 impl RangeEntry for SignedEntry {
     type Key = RecordIdentifier;
     type Value = Record;
-    type RejectId = RejectId;
 
     fn key(&self) -> &Self::Key {
         &self.entry.id
@@ -992,15 +849,6 @@ impl RangeEntry for SignedEntry {
 
     fn value(&self) -> &Self::Value {
         &self.entry.record
-    }
-
-    fn reject_id(&self) -> RejectId {
-        RejectId {
-            author: self.author_bytes(),
-            key: Bytes::copy_from_slice(self.key()),
-            timestamp: self.timestamp(),
-            content_hash: self.content_hash(),
-        }
     }
 
     fn as_fingerprint(&self) -> crate::ranger::Fingerprint {
@@ -3079,7 +2927,7 @@ mod tests {
         // test with actor
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
         let author = Author::new(&mut rng);
-        let handle = SyncHandle::spawn(store, None, None, None, "test".into());
+        let handle = SyncHandle::spawn(store, None, "test".into());
         let author = handle.import_author(author).await?;
         let namespace = NamespaceSecret::new(&mut rng);
         let id = namespace.id();
@@ -3115,137 +2963,11 @@ mod tests {
         Ok(())
     }
 
-    /// The injected validator receives the transmitting peer next to the
-    /// entry and gates ingest per entry: a rejected entry is dropped before
-    /// the store, an accepted one persists, and local inserts are never
-    /// gated.
+    /// A dropped entry is offered again: the session's ingest verdict keeps
+    /// it out of the receiving store, the sender keeps its copy, and the
+    /// sender's next session delivers it once no verdict drops it.
     #[tokio::test]
-    async fn capability_validator_gates_ingest_and_receives_the_transmitting_peer() -> Result<()> {
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let mut store1 = store::Store::memory();
-        let mut store2 = store::Store::memory();
-        let author = Author::new(&mut rng);
-        let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
-
-        let mut alice = store1.new_replica(namespace.clone())?;
-        alice
-            .hash_and_insert("blocked", &author, b"payload")
-            .await?;
-        alice.hash_and_insert("ok", &author, b"payload").await?;
-
-        let mut bob = store2.new_replica(namespace.clone())?;
-        let seen_peers: Arc<std::sync::Mutex<Vec<PeerIdBytes>>> = Default::default();
-        let validator: CapabilityValidator = {
-            let seen = Arc::clone(&seen_peers);
-            Arc::new(move |entry, from| {
-                seen.lock().unwrap().push(*from);
-                if entry.key() == b"blocked" {
-                    ValidateOutcome::Reject
-                } else {
-                    ValidateOutcome::Accept
-                }
-            })
-        };
-        assert!(bob.info.set_capability_validator(validator));
-
-        sync(&mut alice, &mut bob).await?;
-
-        // `sync` names alice's peer id [1u8; 32]; every validated entry
-        // reported exactly that transmitting peer.
-        let seen = seen_peers.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2);
-        assert!(seen.iter().all(|peer| *peer == [1u8; 32]));
-
-        assert!(store2.get_exact(id, author.id(), b"ok", false)?.is_some());
-        assert!(store2
-            .get_exact(id, author.id(), b"blocked", false)?
-            .is_none());
-
-        // A local insert on the gated replica is never gated.
-        let mut bob = store2.new_replica(namespace.clone())?;
-        let rejecting: CapabilityValidator = Arc::new(|_entry, _from| ValidateOutcome::Reject);
-        let _second_stays = bob.info.set_capability_validator(rejecting);
-        bob.hash_and_insert("local", &author, b"payload").await?;
-        assert!(store2
-            .get_exact(id, author.id(), b"local", false)?
-            .is_some());
-        Ok(())
-    }
-
-    /// A capability refusal rides the reply in-band: when the receiver's
-    /// validator refuses an entry (`Unauthorized`), the sender's rejection
-    /// observer sees exactly that entry's id — author, key, timestamp — with
-    /// no re-send of the entry, and nothing for an accepted entry.
-    #[tokio::test]
-    async fn a_capability_refusal_notifies_the_sender_in_band() -> Result<()> {
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let mut store1 = store::Store::memory();
-        let mut store2 = store::Store::memory();
-        let author = Author::new(&mut rng);
-        let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
-
-        let mut alice = store1.new_replica(namespace.clone())?;
-        alice
-            .hash_and_insert("blocked", &author, b"payload")
-            .await?;
-        alice.hash_and_insert("ok", &author, b"payload").await?;
-
-        // Bob's gate refuses "blocked" (a capability refusal → `Unauthorized`).
-        let mut bob = store2.new_replica(namespace.clone())?;
-        let validator: CapabilityValidator = Arc::new(|entry, _from| {
-            if entry.key() == b"blocked" {
-                ValidateOutcome::Reject
-            } else {
-                ValidateOutcome::Accept
-            }
-        });
-        assert!(bob.info.set_capability_validator(validator));
-
-        // Alice observes the rejections her own entries draw.
-        let rejections: Arc<std::sync::Mutex<Vec<(NamespaceId, RejectId, PeerIdBytes)>>> =
-            Default::default();
-        let observer: RejectionObserver = {
-            let sink = Arc::clone(&rejections);
-            Arc::new(move |ns: NamespaceId, id: &RejectId, from: &PeerIdBytes| {
-                sink.lock().unwrap().push((ns, id.clone(), *from));
-            })
-        };
-        assert!(alice.info.set_rejection_observer(observer));
-
-        sync(&mut alice, &mut bob).await?;
-
-        // Bob kept "ok", refused "blocked".
-        assert!(store2.get_exact(id, author.id(), b"ok", false)?.is_some());
-        assert!(store2
-            .get_exact(id, author.id(), b"blocked", false)?
-            .is_none());
-
-        // Alice still holds "blocked" (she authored it; bob just refused it).
-        let blocked_ts = store1
-            .get_exact(id, author.id(), b"blocked", false)?
-            .expect("alice keeps her own entry")
-            .timestamp();
-
-        // Alice received exactly one rejection — the "blocked" entry's id,
-        // from bob's peer ([2u8; 32]) — and nothing for "ok".
-        let seen = rejections.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "exactly one in-band rejection");
-        let (ns, rejected, from) = &seen[0];
-        assert_eq!(*ns, id);
-        assert_eq!(rejected.author, author.id());
-        assert_eq!(&rejected.key[..], b"blocked");
-        assert_eq!(rejected.timestamp, blocked_ts);
-        assert_eq!(*from, [2u8; 32]);
-        Ok(())
-    }
-
-    /// A silent refusal ([`ValidateOutcome::Drop`]) keeps the entry out of the
-    /// store exactly as a rejection does, but tells the sender nothing: only
-    /// the rejected entry reaches the sender's rejection observer.
-    #[tokio::test]
-    async fn a_silent_refusal_tells_the_sender_nothing() -> Result<()> {
+    async fn a_dropped_entry_is_offered_again() -> Result<()> {
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
         let mut store1 = store::Store::memory();
         let mut store2 = store::Store::memory();
@@ -3257,249 +2979,159 @@ mod tests {
         alice
             .hash_and_insert("dropped", &author, b"payload")
             .await?;
-        alice
-            .hash_and_insert("blocked", &author, b"payload")
-            .await?;
         alice.hash_and_insert("ok", &author, b"payload").await?;
-
-        // Bob's gate drops one entry silently and refuses another as a
-        // capability verdict.
         let mut bob = store2.new_replica(namespace.clone())?;
-        let validator: CapabilityValidator = Arc::new(|entry, _from| match entry.key() {
-            b"dropped" => ValidateOutcome::Drop,
-            b"blocked" => ValidateOutcome::Reject,
-            _ => ValidateOutcome::Accept,
+
+        let drop_one: crate::filter::SessionIngest = Arc::new(|entry: &SignedEntry| {
+            if entry.key() == b"dropped" {
+                ValidateOutcome::Drop
+            } else {
+                ValidateOutcome::Accept
+            }
         });
-        assert!(bob.info.set_capability_validator(validator));
-
-        let rejections: Arc<std::sync::Mutex<Vec<RejectId>>> = Default::default();
-        let observer: RejectionObserver = {
-            let sink = Arc::clone(&rejections);
-            Arc::new(
-                move |_ns: NamespaceId, id: &RejectId, _from: &PeerIdBytes| {
-                    sink.lock().unwrap().push(id.clone());
-                },
-            )
-        };
-        assert!(alice.info.set_rejection_observer(observer));
-
-        sync(&mut alice, &mut bob).await?;
-
-        // Both refusals kept their entry out; only the capability verdict
-        // travelled back.
+        let first = alice.sync_initial_message(None)?;
+        sync_transcript(&mut alice, &mut bob, first, None, Some(drop_one)).await?;
         assert!(store2.get_exact(id, author.id(), b"ok", false)?.is_some());
         assert!(store2
             .get_exact(id, author.id(), b"dropped", false)?
             .is_none());
-        assert!(store2
-            .get_exact(id, author.id(), b"blocked", false)?
-            .is_none());
+        assert!(store1
+            .get_exact(id, author.id(), b"dropped", false)?
+            .is_some());
 
-        let seen = rejections.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "the dropped entry draws no rejection");
-        assert_eq!(&seen[0].key[..], b"blocked");
-        Ok(())
-    }
-
-    /// A gate that refuses an entry the store already holds sends no
-    /// rejection: the entry entered under the capability that stood when it
-    /// arrived, and the sender acts on a rejection by destroying its own
-    /// copy. Only an entry that would newly enter the store is named back.
-    ///
-    /// The narrowed egress is what makes the sender re-offer at all: with
-    /// `held` out of the receiver's session view the two sets read as
-    /// divergent, so the sender transmits an entry the receiver keeps.
-    #[tokio::test]
-    async fn a_rejection_never_names_an_entry_the_store_already_holds() -> Result<()> {
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let mut store1 = store::Store::memory();
-        let mut store2 = store::Store::memory();
-        let author = Author::new(&mut rng);
-        let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
-        // The one entry both sides hold, byte for byte: bob took it in while
-        // the write was granted.
-        let held = {
-            let record = Record::new(Hash::new(b"payload"), 7, 1_700_000_000_000_000);
-            let entry = Entry::new(RecordIdentifier::new(id, author.id(), b"held"), record);
-            SignedEntry::from_entry(entry, &namespace, &author)
-        };
-
-        let mut alice = store1.new_replica(namespace.clone())?;
-        alice
-            .insert_remote_entry(held.clone(), [2u8; 32], ContentStatus::Complete)
-            .await?;
-        alice.hash_and_insert("fresh", &author, b"payload").await?;
-
-        // The grant narrows: bob's gate now refuses every incoming entry,
-        // and his egress hides the one he holds from the session.
-        let mut bob = store2.new_replica(namespace.clone())?;
-        bob.insert_remote_entry(held.clone(), [1u8; 32], ContentStatus::Complete)
-            .await?;
-        let judged: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
-        let validator: CapabilityValidator = {
-            let sink = Arc::clone(&judged);
-            Arc::new(move |entry: &SignedEntry, _from: &PeerIdBytes| {
-                sink.lock().unwrap().push(entry.key().to_vec());
-                ValidateOutcome::Reject
-            })
-        };
-        assert!(bob.info.set_capability_validator(validator));
-        let hide_held: crate::filter::EntryFilter =
-            Arc::new(|entry: &SignedEntry| entry.key() != b"held");
-
-        let rejections: Arc<std::sync::Mutex<Vec<RejectId>>> = Default::default();
-        let observer: RejectionObserver = {
-            let sink = Arc::clone(&rejections);
-            Arc::new(
-                move |_ns: NamespaceId, id: &RejectId, _from: &PeerIdBytes| {
-                    sink.lock().unwrap().push(id.clone());
-                },
-            )
-        };
-        assert!(alice.info.set_rejection_observer(observer));
-
-        sync_filtered(&mut alice, &mut bob, Some(hide_held)).await?;
-
-        // Bob's gate judged the re-offered entry and refused it, so the test
-        // is not vacuous.
-        let judged = judged.lock().unwrap().clone();
-        assert!(
-            judged.iter().any(|key| key == b"held"),
-            "the narrowed egress made alice re-offer the entry bob holds"
-        );
-
-        // Only the entry bob does not hold travelled back.
-        let seen = rejections.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "exactly one rejection");
-        assert_eq!(&seen[0].key[..], b"fresh");
-
-        // And the refusal left the stored entry alone.
-        assert_eq!(
-            store2.get_exact(id, author.id(), b"held", false)?,
-            Some(held),
-            "bob keeps the entry he refused to be told about"
-        );
-        Ok(())
-    }
-
-    /// The rejection gate reads the live store, not the session's frozen
-    /// view. An entry landing after session setup is absent from the
-    /// egress snapshot, so the sender re-offers it; judged against the
-    /// snapshot the refusal would name an entry the receiver holds, and
-    /// the sender destroys its copy on that word.
-    ///
-    /// Both sides are driven directly: the entry both hold has to be the
-    /// same bytes on both, which needs a crafted entry rather than a local
-    /// write, and the snapshot is put on the receiver here because what the
-    /// store layer does with one is the subject.
-    #[tokio::test]
-    async fn a_rejection_never_names_an_entry_that_landed_after_session_setup() -> Result<()> {
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let mut store1 = store::Store::memory();
-        let mut store2 = store::Store::memory();
-        let author = Author::new(&mut rng);
-        let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
-        // The one entry both sides hold, byte for byte.
-        let held = {
-            let record = Record::new(Hash::new(b"payload"), 7, 1_700_000_000_000_000);
-            let entry = Entry::new(RecordIdentifier::new(id, author.id(), b"held"), record);
-            SignedEntry::from_entry(entry, &namespace, &author)
-        };
-
-        let mut alice = store1.new_replica(namespace.clone())?;
-        alice
-            .insert_remote_entry(held.clone(), [2u8; 32], ContentStatus::Complete)
-            .await?;
-        alice.hash_and_insert("fresh", &author, b"payload").await?;
-
-        // Bob's snapshot predates `held`: his egress hides it, so the sets
-        // read as divergent and alice re-offers what bob already holds.
-        let snapshot = store2.snapshot_owned()?;
-        let mut bob = store2.new_replica(namespace.clone())?;
-        bob.insert_remote_entry(held.clone(), [1u8; 32], ContentStatus::Complete)
-            .await?;
-        bob.store.session_snapshot = Some(&snapshot);
-
-        let judged: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
-        let validator: CapabilityValidator = {
-            let sink = Arc::clone(&judged);
-            Arc::new(move |entry: &SignedEntry, _from: &PeerIdBytes| {
-                sink.lock().unwrap().push(entry.key().to_vec());
-                ValidateOutcome::Reject
-            })
-        };
-        assert!(bob.info.set_capability_validator(validator));
-
-        let rejections: Arc<std::sync::Mutex<Vec<RejectId>>> = Default::default();
-        let observer: RejectionObserver = {
-            let sink = Arc::clone(&rejections);
-            Arc::new(
-                move |_ns: NamespaceId, id: &RejectId, _from: &PeerIdBytes| {
-                    sink.lock().unwrap().push(id.clone());
-                },
-            )
-        };
-        assert!(alice.info.set_rejection_observer(observer));
-
+        let mut alice = store1.open_replica(&id)?;
+        let mut bob = store2.open_replica(&id)?;
         sync(&mut alice, &mut bob).await?;
-
-        // Bob's gate judged the re-offered entry, so the test is not vacuous.
-        let judged = judged.lock().unwrap().clone();
         assert!(
-            judged.iter().any(|key| key == b"held"),
-            "the frozen egress made alice re-offer the entry bob holds"
-        );
-
-        // Only the entry bob does not hold travelled back.
-        let seen = rejections.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "exactly one rejection");
-        assert_eq!(&seen[0].key[..], b"fresh");
-
-        assert_eq!(
-            store2.get_exact(id, author.id(), b"held", false)?,
-            Some(held),
-            "bob keeps the entry his snapshot cannot see"
+            store2
+                .get_exact(id, author.id(), b"dropped", false)?
+                .is_some(),
+            "the next session must offer the dropped entry again"
         );
         Ok(())
     }
 
-    /// Retraction physically removes a record at or below the timestamp
-    /// bound — no tombstone, no effect above the bound — and the key is
-    /// insertable afresh afterwards.
     #[tokio::test]
-    async fn retract_entry_removes_only_at_or_below_the_bound() -> Result<()> {
+    async fn an_egress_predicate_delivers_only_what_it_admits() -> Result<()> {
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let mut store = store::Store::memory();
+        let mut alice_store = store::Store::memory();
+        let mut bob_store = store::Store::memory();
         let author = Author::new(&mut rng);
         let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
 
-        let mut replica = store.new_replica(namespace.clone())?;
-        replica.hash_and_insert("k", &author, b"v1").await?;
-        let timestamp = store
-            .get_exact(id, author.id(), b"k", false)?
-            .expect("inserted")
-            .timestamp();
+        let mut bob = bob_store.new_replica(namespace.clone())?;
+        for key in ["ape", "bee", "cat"] {
+            bob.hash_and_insert(key, &author, key.as_bytes()).await?;
+        }
+        let mut alice = alice_store.new_replica(namespace.clone())?;
+        let only_bee: crate::filter::EntryFilter =
+            Arc::new(|entry: &SignedEntry| entry.key() == b"bee");
 
-        // Below the bound: nothing happens.
-        assert!(!store.retract_entry(id, author.id(), b"k", timestamp - 1)?);
-        assert!(store.get_exact(id, author.id(), b"k", false)?.is_some());
+        let (_, bob_state) = sync_filtered(&mut alice, &mut bob, Some(only_bee)).await?;
 
-        // At the bound: removed — and removal is not a tombstone, so even
-        // an include-empty read sees nothing.
-        assert!(store.retract_entry(id, author.id(), b"k", timestamp)?);
-        assert!(store.get_exact(id, author.id(), b"k", false)?.is_none());
-        assert!(store.get_exact(id, author.id(), b"k", true)?.is_none());
+        assert_eq!(bob_state.num_sent, 1);
+        assert_keys(&mut alice_store, namespace.id(), vec![b"bee".to_vec()]);
+        Ok(())
+    }
 
-        // Absent again: a second retraction is a no-op.
-        assert!(!store.retract_entry(id, author.id(), b"k", u64::MAX)?);
+    /// An entry the egress predicate withholds between two it admits leaves
+    /// the session's transcript exactly as it is without that entry: no
+    /// fingerprint, range boundary or item count betrays it.
+    #[tokio::test]
+    async fn a_withheld_entry_leaves_the_transcript_of_its_absence() -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let t = system_time_now();
+        let entry = |key: &str| {
+            SignedEntry::from_parts(
+                &namespace,
+                &author,
+                key.as_bytes(),
+                Record::from_data(key.as_bytes(), t),
+            )
+        };
+        let hide_bee: crate::filter::EntryFilter =
+            Arc::new(|entry: &SignedEntry| entry.key() != b"bee");
 
-        // The key is insertable afresh.
-        let mut replica = store.new_replica(namespace)?;
-        replica.hash_and_insert("k", &author, b"v2").await?;
-        assert!(store.get_exact(id, author.id(), b"k", false)?.is_some());
+        let mut transcripts = Vec::new();
+        for (held, egress) in [
+            (&["ape", "bee", "cat"][..], Some(hide_bee)),
+            (&["ape", "cat"][..], None),
+        ] {
+            let mut alice_store = store::Store::memory();
+            let mut bob_store = store::Store::memory();
+            let mut alice = alice_store.new_replica(namespace.clone())?;
+            for key in ["ape", "dog"] {
+                alice.insert_entry(entry(key), InsertOrigin::Local).await?;
+            }
+            let mut bob = bob_store.new_replica(namespace.clone())?;
+            for key in held {
+                bob.insert_entry(entry(key), InsertOrigin::Local).await?;
+            }
+            let first = alice.sync_initial_message(None)?;
+            let (_, _, transcript) =
+                sync_transcript(&mut alice, &mut bob, first, egress, None).await?;
+            transcripts.push(transcript);
+        }
+
+        assert!(transcripts[0].len() > 2, "the session ran several rounds");
+        assert_eq!(transcripts[0], transcripts[1]);
+        Ok(())
+    }
+
+    /// An entry the session's ingest verdict drops stays out of the store,
+    /// and the egress of the same session serves what it admits and nothing
+    /// more.
+    #[tokio::test]
+    async fn an_ingest_drop_leaves_egress_unchanged() -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let mut alice_store = store::Store::memory();
+        let mut bob_store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let mut alice = alice_store.new_replica(namespace.clone())?;
+        for key in ["dog", "eel"] {
+            alice.hash_and_insert(key, &author, key.as_bytes()).await?;
+        }
+        let mut bob = bob_store.new_replica(namespace.clone())?;
+        for key in ["ape", "bee", "cat"] {
+            bob.hash_and_insert(key, &author, key.as_bytes()).await?;
+        }
+        let hide_bee: crate::filter::EntryFilter =
+            Arc::new(|entry: &SignedEntry| entry.key() != b"bee");
+        let drop_dog: crate::filter::SessionIngest = Arc::new(|entry: &SignedEntry| {
+            if entry.key() == b"dog" {
+                ValidateOutcome::Drop
+            } else {
+                ValidateOutcome::Accept
+            }
+        });
+
+        let first = alice.sync_initial_message(None)?;
+        sync_transcript(&mut alice, &mut bob, first, Some(hide_bee), Some(drop_dog)).await?;
+
+        assert_keys(
+            &mut bob_store,
+            namespace.id(),
+            vec![
+                b"ape".to_vec(),
+                b"bee".to_vec(),
+                b"cat".to_vec(),
+                b"eel".to_vec(),
+            ],
+        );
+        assert_keys(
+            &mut alice_store,
+            namespace.id(),
+            vec![
+                b"ape".to_vec(),
+                b"cat".to_vec(),
+                b"dog".to_vec(),
+                b"eel".to_vec(),
+            ],
+        );
         Ok(())
     }
 
@@ -3865,10 +3497,29 @@ mod tests {
         first: crate::ranger::Message<SignedEntry>,
         bob_filter: Option<crate::filter::EntryFilter>,
     ) -> Result<(SyncOutcome, SyncOutcome)> {
+        let (alice_state, bob_state, _) =
+            sync_transcript(alice, bob, first, bob_filter, None).await?;
+        Ok((alice_state, bob_state))
+    }
+
+    /// Reconcile with `bob_filter` and `bob_ingest` as bob's session access,
+    /// returning every message of the session in the order it was sent.
+    async fn sync_transcript<'a>(
+        alice: &'a mut Replica<'a>,
+        bob: &'a mut Replica<'a>,
+        first: crate::ranger::Message<SignedEntry>,
+        bob_filter: Option<crate::filter::EntryFilter>,
+        bob_ingest: Option<crate::filter::SessionIngest>,
+    ) -> Result<(
+        SyncOutcome,
+        SyncOutcome,
+        Vec<crate::ranger::Message<SignedEntry>>,
+    )> {
         let alice_peer_id = [1u8; 32];
         let bob_peer_id = [2u8; 32];
         let mut alice_state = SyncOutcome::default();
         let mut bob_state = SyncOutcome::default();
+        let mut transcript = vec![first.clone()];
         let mut next_to_bob = Some(first);
         let mut rounds = 0;
         while let Some(msg) = next_to_bob.take() {
@@ -3876,17 +3527,25 @@ mod tests {
             rounds += 1;
             println!("round {rounds}");
             if let Some(msg) = bob
-                .sync_process_message(msg, alice_peer_id, &mut bob_state, bob_filter.clone(), None)
+                .sync_process_message(
+                    msg,
+                    alice_peer_id,
+                    &mut bob_state,
+                    bob_filter.clone(),
+                    bob_ingest.clone(),
+                )
                 .await?
             {
+                transcript.push(msg.clone());
                 next_to_bob = alice
                     .sync_process_message(msg, bob_peer_id, &mut alice_state, None, None)
-                    .await?
+                    .await?;
+                transcript.extend(next_to_bob.clone());
             }
         }
         assert_eq!(alice_state.num_sent, bob_state.num_recv);
         assert_eq!(alice_state.num_recv, bob_state.num_sent);
-        Ok((alice_state, bob_state))
+        Ok((alice_state, bob_state, transcript))
     }
 
     /// Each key of `set` holds `author`'s entry whose content is the key itself.

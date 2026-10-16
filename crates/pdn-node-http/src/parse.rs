@@ -6,7 +6,6 @@
 use std::{fmt::Display, str::FromStr};
 
 use axum::body::Bytes;
-use pdn_node::EntryPath;
 use serde::de::DeserializeOwned;
 
 use crate::error::HostError;
@@ -21,12 +20,6 @@ where
     let preview: String = raw.chars().take(64).collect();
     raw.parse()
         .map_err(|err| HostError::bad_request(format!("malformed {what} {preview:?}: {err}")))
-}
-
-pub fn entry_path(raw: &str) -> Result<EntryPath, HostError> {
-    let preview: String = raw.chars().take(64).collect();
-    EntryPath::new(raw)
-        .map_err(|err| HostError::bad_request(format!("malformed entry path {preview:?}: {err}")))
 }
 
 pub fn query<T: DeserializeOwned>(raw: Option<&str>, what: &str) -> Result<T, HostError> {
@@ -63,12 +56,6 @@ mod tests {
     #[test]
     fn an_unknown_record_kind_is_400() {
         let err = segment::<RecordKind>("Claim", "record kind").unwrap_err();
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn a_malformed_entry_path_is_400() {
-        let err = entry_path("contact//email").unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 

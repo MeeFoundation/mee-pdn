@@ -1,7 +1,7 @@
 //! The refusal and containment edges of externally supplied protocols: an
 //! unregistered ALPN, an ALPN collision at spawn, a panicking handler. The
-//! happy path is exercised by the real consumer, pdn-node's pairing
-//! protocol; these edges are what it never triggers.
+//! happy path is exercised by the real consumers, pdn-node's linking and
+//! pod join dialogues; these edges are what they never trigger.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -10,11 +10,13 @@ use std::sync::{
 
 use anyhow::Result;
 use data_layer::{
-    AcceptError, AddrInfoOptions, AlpnTaken, Connection, ProtocolHandler, ShareMode, SpawnOptions,
-    SyncNode, BUILT_IN_ALPNS,
+    AcceptError, AddrInfoOptions, AlpnTaken, Connection, ProtocolHandler, Seq, ShareMode,
+    SpawnOptions, SyncNode, BUILT_IN_ALPNS,
 };
-use pdn_types::{EntryPath, NodeId};
-use test_utils::{host_identity, ids, join_identity, memory_node, wait_entry_is};
+use pdn_types::{NodeId, PodId};
+use test_utils::{eventually, host_identity, ids, join_identity, memory_node};
+
+const FAMILY: PodId = PodId::from_bytes([0xfa; 16]);
 
 /// The test protocol's ALPN — deliberately not a built-in one.
 const ECHO_ALPN: &[u8] = b"/pdn-test/echo/0";
@@ -117,34 +119,21 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
         "the handler should have run and panicked"
     );
 
-    // The node survived: a device of Alice still catches up her data
-    // namespace from it.
+    // The node survived: a device of Alice still catches up her PMS from
+    // it.
     let pms = host_identity(&node_a, ids::ALICE).await?;
-    let author = node_a.default_author(ids::ALICE)?;
-    node_a.create_namespace(ids::ALICE, ids::ALICE).await?;
-    let name = EntryPath::new("contact/name")?;
-    node_a
-        .write(ids::ALICE, ids::ALICE, author, &name, b"Alice")
-        .await?;
+    pms.record_pod(FAMILY, Seq::FIRST).await?;
     let pms_ticket = pms
         .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
         .await?;
     let sibling_pms = join_identity(&node_b, ids::ALICE, pms_ticket).await?;
     pms.add_device(node_b.node_id()).await?;
     sibling_pms.add_device(node_b.node_id()).await?;
-    let ticket = node_a
-        .share_ticket(
-            ids::ALICE,
-            ids::ALICE,
-            ShareMode::Read,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    node_b
-        .import_namespace(ids::ALICE, ids::ALICE, ticket)
-        .await?;
     assert!(
-        wait_entry_is(&node_b, ids::ALICE, ids::ALICE, &name, b"Alice").await?,
+        eventually(|| async {
+            Ok(sibling_pms.pod_record(FAMILY).await? == Some((Seq::FIRST, true)))
+        })
+        .await?,
         "node stopped syncing after an extra handler panicked"
     );
 

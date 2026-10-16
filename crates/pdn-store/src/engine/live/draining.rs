@@ -148,7 +148,7 @@ mod tests {
     /// only once the wait has taken an event.
     #[tokio::test]
     async fn a_reply_arrives_while_the_sync_actor_waits_for_room_for_its_events() -> Result<()> {
-        let sync = SyncHandle::spawn(Store::memory(), None, None, None, "draining".into());
+        let sync = SyncHandle::spawn(Store::memory(), None, "draining".into());
         let namespace = sync
             .import_namespace(NamespaceSecret::new(&mut rand::rng()).into())
             .await?;

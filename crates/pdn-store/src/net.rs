@@ -23,7 +23,7 @@ mod codec;
 
 /// Bound on one whole sync exchange, connection establishment included —
 /// the requirement that a session is bounded in time, and what rests on it,
-/// are in the subset-reconciliation spec.
+/// are in the reconciliation sessions spec.
 ///
 /// The value carries a first sync of a large store over a slow link: about
 /// 2.8 MB, the served set of 10,000 entries in one message, from roughly 75
@@ -52,7 +52,7 @@ pub async fn connect_and_sync(
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
     filter: Option<crate::filter::EntryFilter>,
-    ingest: Option<crate::filter::SessionIngest>,
+    ingest: crate::filter::SessionIngest,
 ) -> Result<SyncFinished, ConnectError> {
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
@@ -64,7 +64,10 @@ pub async fn connect_and_sync(
             caller,
             peer,
             metrics,
-            DialAccess::Given { filter, ingest },
+            DialAccess::Given {
+                filter,
+                ingest: Some(ingest),
+            },
         ),
     )
     .await
@@ -221,9 +224,8 @@ pub enum AcceptOutcome {
         /// full view.
         filter: Option<crate::filter::EntryFilter>,
         /// This side's ingest verdict for the session: what it admits of
-        /// what the peer offers. `None` leaves that to the consumer's
-        /// validator.
-        ingest: Option<crate::filter::SessionIngest>,
+        /// what the peer offers.
+        ingest: crate::filter::SessionIngest,
         /// Checked once the session's snapshot is open; `None` holds for
         /// any snapshot.
         recheck: Option<Recheck>,
@@ -254,13 +256,11 @@ impl std::fmt::Debug for AcceptOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AcceptOutcome::Allow {
-                filter,
-                ingest,
-                recheck,
+                filter, recheck, ..
             } => f
                 .debug_struct("Allow")
                 .field("filter", &filter.as_ref().map(|_| "filtered"))
-                .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .field("ingest", &"judged")
                 .field("recheck", recheck)
                 .finish(),
             AcceptOutcome::Reject(reason) => write!(f, "Reject({reason:?})"),

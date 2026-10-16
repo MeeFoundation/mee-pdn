@@ -10,13 +10,13 @@
 # either behind has the next run meeting the last run's state, which is the
 # one thing a demo must never do.
 #
-# Usage: run-demo.sh connections|pods
+# Usage: run-demo.sh pods
 set -eu
 cd "$(dirname "$0")/.."
 demo=${1:-}
 case "$demo" in
-  connections|pods) ;;
-  *) echo "usage: run-demo.sh connections|pods" >&2; exit 2 ;;
+  pods) ;;
+  *) echo "usage: run-demo.sh pods" >&2; exit 2 ;;
 esac
 docker info >/dev/null 2>&1 || { echo "no container daemon — the demo needs one"; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "no compose plugin — the demo brings its nodes up with one"; exit 1; }

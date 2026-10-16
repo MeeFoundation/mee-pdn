@@ -49,12 +49,12 @@ git clone git@github.com:MeeFoundation/mia-ontologies.git
 
 ## Crates
 
-Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the wire). Both layers see only `pdn-types`; `pdn-node` is the embeddable runtime built over them.
+Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the wire). Both layers see only `pdn-types`; `pdn-node` is the embeddable runtime built over `data-layer`, and nothing consumes `pdn-layer`.
 
-- `crates/pdn-types`: platform primitives (`PdnId`, `Aid`, `OperationalKey`, `ClaimId`, `NodeId`, …) plus the data vocabulary (`NamespaceId`, `EntryPath`, `EntryInfo`, `NamespaceRole`)
+- `crates/pdn-types`: platform primitives (`PdnId`, `OperationalKey`, `ClaimId`, `NodeId`, …) plus the record vocabulary (`PodId`, `RecordId`, `RecordKind`, `RecordRef`)
 - `crates/pdn-store`: our iroh-docs variant — the document sync engine, diverged from upstream where PDN's access model needs it; it carries upstream's version number and is never published
-- `crates/data-layer`: the data layer over `pdn-store` — the entries-only `DataLayer` trait, node/stack assembly, and the metadata stores
-- `crates/pdn-layer`: the platform surface products consume — domain model (`Claim`, `Attribute`, `Capability`, `Connection`, `Invite`), the `PdnOp` operation AST, and the `uwill` capability-token module
-- `crates/pdn-node`: the embeddable runtime core — identity / connections / data / sync services, plus the pairing and device-linking ceremonies
+- `crates/data-layer`: the data layer over `pdn-store` — node and stack assembly, the access book that judges every session, the private metadata store, a pod's two stores with its membership view
+- `crates/pdn-layer`: the platform surface products consume — the domain model and the `PdnOp` operation AST, with no iroh dependencies
+- `crates/pdn-node`: the embeddable runtime core — identity / pods / sync services, plus the device-linking ceremony and a pod's join
 - `crates/pdn-node-http`: thin HTTP host for the demo stand — an axum binary embedding one runtime
 - `crates/test-utils`: shared test helpers

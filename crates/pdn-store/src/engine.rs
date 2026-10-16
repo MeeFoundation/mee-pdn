@@ -26,8 +26,8 @@ pub use self::{
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, Contact,
-    ContentStatus, ContentStatusCallback, Entry, Identity, NamespaceId, RejectionObserver,
+    actor::SyncHandle, metrics::Metrics, Author, AuthorId, Contact, ContentStatus,
+    ContentStatusCallback, Entry, Identity, NamespaceId,
 };
 
 mod gossip;
@@ -112,8 +112,6 @@ impl Engine {
         downloader: Downloader,
         default_author_storage: DefaultAuthorStorage,
         protect_cb: Option<ProtectCallbackHandler>,
-        capability_validator: Option<CapabilityValidator>,
-        rejection_observer: Option<RejectionObserver>,
         session_access: crate::filter::SessionAccessProvider,
         identity: Identity,
         co_located: Option<CoLocatedRequests>,
@@ -131,13 +129,7 @@ impl Engine {
                 })
             })
         };
-        let sync = SyncHandle::spawn(
-            replica_store,
-            Some(content_status_cb.clone()),
-            capability_validator,
-            rejection_observer,
-            me.clone(),
-        );
+        let sync = SyncHandle::spawn(replica_store, Some(content_status_cb.clone()), me.clone());
 
         let held_payloads = Arc::new(HeldPayloads::default());
         let sync2 = sync.clone();
@@ -333,6 +325,16 @@ impl Engine {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::SyncsInFlight { namespaces, reply })
+            .await?;
+        Ok(reply_rx.await?)
+    }
+
+    /// What [`Self::syncs_in_flight`] counts, each exchange, held dial and
+    /// due redial named, for a scenario's failure message.
+    pub async fn syncs_in_flight_report(&self, namespaces: Vec<NamespaceId>) -> Result<String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::SyncsInFlightReport { namespaces, reply })
             .await?;
         Ok(reply_rx.await?)
     }

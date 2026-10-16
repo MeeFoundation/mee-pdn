@@ -59,7 +59,7 @@ pub use net::ALPN;
 
 pub use self::{
     filter::{
-        EntryFilter, RestsOn, SessionAccess, SessionAccessFuture, SessionAccessProvider,
+        admit_all, EntryFilter, RestsOn, SessionAccess, SessionAccessFuture, SessionAccessProvider,
         SessionIngest, SessionRole,
     },
     heads::*,

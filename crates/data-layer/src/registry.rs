@@ -1,35 +1,13 @@
-//! Node-local addressing: the issuer-to-doc map data-namespace operations
-//! resolve through, and the pod-to-stores map pod operations resolve
+//! Node-local addressing: the pod-to-stores map pod operations resolve
 //! through.
 
 use std::{collections::HashMap, sync::RwLock};
 
 use anyhow::{anyhow, Result};
 use pdn_store::{api::Doc, NamespaceId};
-use pdn_types::{PdnId, PodId};
+use pdn_types::PodId;
 
 use crate::pod::PodStore;
-
-/// How an identity serves a data replica it holds. Independent of the sync
-/// strategy (swarm vs contacts-only), which lives on the tracked doc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ServingPosture {
-    /// As the issuer's own: the identity's devices see it whole, a
-    /// counterparty what the identity granted it.
-    Serve,
-    /// Grantee: the issuer's published devices see it whole, the identity's
-    /// own devices the slice its grant record covers; everyone else is
-    /// refused, their rights not being computable here.
-    AudienceDevices,
-}
-
-/// One issuer's data-namespace binding: the backing doc and the serving
-/// posture its sessions are classified under.
-#[derive(Debug, Clone)]
-pub(crate) struct DataBinding {
-    pub(crate) doc: Doc,
-    pub(crate) posture: ServingPosture,
-}
 
 /// One pod as one identity holds it. `records` is `None` once the identity
 /// departed: the membership store is then the pod's tombstone.
@@ -51,111 +29,20 @@ impl PodBinding {
     }
 }
 
-/// Node-local registry of data namespaces — issuer → backing doc — and of
-/// pods — pod id → its two stores. Lookups hand back cloned [`Doc`]s (cheap
-/// handles), so no read guard escapes. The metadata docs are not kept here —
-/// they live inside their store handles, and the access book registers the
-/// ones classification needs. Where both maps are locked, `data_docs` is
-/// taken first.
+/// Node-local registry of pods — pod id → its two stores. Lookups hand
+/// back cloned [`Doc`]s (cheap handles), so no read guard escapes. The PMS
+/// is not kept here — it lives inside its store handle, and the access book
+/// holds it for classification.
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
-    data_docs: RwLock<HashMap<PdnId, DataBinding>>,
     pods: RwLock<HashMap<PodId, PodBinding>>,
 }
 
 impl Registry {
-    /// Register the data namespace of `issuer` as backed by `doc`, handing
-    /// back the binding this replaced (`None` if the issuer was unbound).
-    /// A displaced binding is dropped with the replica it names, never put
-    /// back: what an undo restores is what the identity held before, and
-    /// this registry holds one identity's bindings alone (ADR-0013).
-    ///
-    /// One namespace binds one issuer: registering a second issuer onto a
-    /// replica another one is bound to is refused, because the reverse
-    /// lookup ([`binding_of`](Self::binding_of)) would otherwise pick between
-    /// the two arbitrarily and could answer with the wrong serving posture —
-    /// a fail-open branch.
-    pub(crate) fn register_data(
-        &self,
-        issuer: PdnId,
-        doc: Doc,
-        posture: ServingPosture,
-    ) -> Result<Option<DataBinding>> {
-        let binding = DataBinding { doc, posture };
-        let mut docs = self
-            .data_docs
-            .write()
-            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?;
-        let namespace = binding.doc.id();
-        if let Some((other, _binding)) = docs
-            .iter()
-            .find(|(other, b)| **other != issuer && b.doc.id() == namespace)
-        {
-            return Err(anyhow!(
-                "namespace {namespace} is already bound to issuer {other}; \
-                 one namespace binds one issuer"
-            ));
-        }
-        if let Some((pod, _store)) = pod_of(&*self.read_pods()?, namespace) {
-            return Err(anyhow!(
-                "namespace {namespace} is a store of pod {pod}; it binds no issuer"
-            ));
-        }
-        Ok(docs.insert(issuer, binding))
-    }
-
-    /// Remove the registration of `issuer`'s data namespace, handing back
-    /// the binding it resolved to (`None` if the issuer was not registered).
-    pub(crate) fn unregister_data(&self, issuer: PdnId) -> Result<Option<DataBinding>> {
-        Ok(self
-            .data_docs
-            .write()
-            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
-            .remove(&issuer))
-    }
-
-    pub(crate) fn data_doc(&self, issuer: PdnId) -> Result<Option<Doc>> {
-        Ok(self
-            .data_docs
-            .read()
-            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
-            .get(&issuer)
-            .map(|binding| binding.doc.clone()))
-    }
-
-    /// The full binding of `issuer` — doc plus serving posture.
-    pub(crate) fn binding(&self, issuer: PdnId) -> Result<Option<DataBinding>> {
-        Ok(self
-            .data_docs
-            .read()
-            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
-            .get(&issuer)
-            .cloned())
-    }
-
-    /// Reverse lookup for session classification: which issuer `namespace`
-    /// is bound to on this node, and under which serving posture.
-    pub(crate) fn binding_of(
-        &self,
-        namespace: NamespaceId,
-    ) -> Result<Option<(PdnId, ServingPosture)>> {
-        Ok(self
-            .data_docs
-            .read()
-            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?
-            .iter()
-            .find(|(_issuer, binding)| binding.doc.id() == namespace)
-            .map(|(issuer, binding)| (*issuer, binding.posture)))
-    }
-
     /// Register `pod` as held on `binding`'s stores. Refused for a pod
-    /// already registered, and for a store another role holds: a data
-    /// namespace, another pod's store, or the pod's other store.
+    /// already registered, and for a store another role holds: another
+    /// pod's store, or the pod's other store.
     pub(crate) fn register_pod(&self, pod: PodId, binding: PodBinding) -> Result<()> {
-        let data = self
-            .data_docs
-            .read()
-            .map_err(|_poisoned| anyhow!("data registry lock poisoned"))?;
         let mut pods = self
             .pods
             .write()
@@ -174,11 +61,6 @@ impl Registry {
             }
         }
         for namespace in namespaces {
-            if data.values().any(|bound| bound.doc.id() == namespace) {
-                return Err(anyhow!(
-                    "namespace {namespace} is a data namespace; it is no store of pod {pod}"
-                ));
-            }
             if let Some((other, _store)) = pod_of(&pods, namespace) {
                 return Err(anyhow!(
                     "namespace {namespace} is a store of pod {other}; it is no store of pod {pod}"

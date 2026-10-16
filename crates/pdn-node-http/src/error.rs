@@ -10,11 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pdn_node::{
-    ActRefused, DelegationUnsupported, EstablishmentInProgress, EstablishmentRefused,
-    IdentityAlreadyHosted, IdentityKeyPending, JoinInProgress, JoinRefused, LinkingInProgress,
-    LinkingRefused, PeerNotConnected, RecordPlacedOnce, UnknownIdentity, UnknownIssuer, UnknownPod,
-    UnknownRecord, UnsupportedInviteVersion, UnsupportedLinkingVersion,
-    UnsupportedPodInviteVersion, WriteNotGranted, WrongRecordKind,
+    ActRefused, IdentityAlreadyHosted, IdentityKeyPending, JoinInProgress, JoinRefused,
+    LinkingInProgress, LinkingRefused, RecordPlacedOnce, UnknownIdentity, UnknownPod,
+    UnknownRecord, UnsupportedLinkingVersion, UnsupportedPodInviteVersion, WrongRecordKind,
 };
 
 #[derive(Debug)]
@@ -32,9 +30,9 @@ impl HostError {
         }
     }
 
-    /// An absent entry or record alone. An identity, issuer or pod the
-    /// runtime does not know is 409, never this: route names are unpinned, so
-    /// a deny test asserting 404 would keep passing after a rename.
+    /// An absent record alone. An identity or pod the runtime does not know
+    /// is 409, never this: route names are unpinned, so a deny test asserting
+    /// 404 would keep passing after a rename.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -71,11 +69,8 @@ impl IntoResponse for HostError {
 
 /// Downcasting reaches through `anyhow`'s context layers.
 fn status_of(err: &anyhow::Error) -> StatusCode {
-    if err.downcast_ref::<EstablishmentRefused>().is_some()
-        || err.downcast_ref::<LinkingRefused>().is_some()
+    if err.downcast_ref::<LinkingRefused>().is_some()
         || err.downcast_ref::<JoinRefused>().is_some()
-        || err.downcast_ref::<WriteNotGranted>().is_some()
-        || err.downcast_ref::<DelegationUnsupported>().is_some()
         || err.downcast_ref::<ActRefused>().is_some()
         || err.downcast_ref::<RecordPlacedOnce>().is_some()
     {
@@ -83,13 +78,10 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
         // no answer came back.
         StatusCode::FORBIDDEN
     } else if err.downcast_ref::<UnknownIdentity>().is_some()
-        || err.downcast_ref::<UnknownIssuer>().is_some()
         || err.downcast_ref::<UnknownPod>().is_some()
-        || err.downcast_ref::<PeerNotConnected>().is_some()
         || err.downcast_ref::<IdentityKeyPending>().is_some()
         || err.downcast_ref::<IdentityAlreadyHosted>().is_some()
         || err.downcast_ref::<LinkingInProgress>().is_some()
-        || err.downcast_ref::<EstablishmentInProgress>().is_some()
         || err.downcast_ref::<JoinInProgress>().is_some()
     {
         // The runtime does not host what the request addressed, or already
@@ -98,8 +90,7 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
         // refusals: a test expecting a refusal by role would otherwise pass
         // when the service does not take the caller for a member at all.
         StatusCode::CONFLICT
-    } else if err.downcast_ref::<UnsupportedInviteVersion>().is_some()
-        || err.downcast_ref::<UnsupportedLinkingVersion>().is_some()
+    } else if err.downcast_ref::<UnsupportedLinkingVersion>().is_some()
         || err.downcast_ref::<UnsupportedPodInviteVersion>().is_some()
         || err.downcast_ref::<WrongRecordKind>().is_some()
     {
@@ -115,11 +106,11 @@ fn status_of(err: &anyhow::Error) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context as _};
-    use pdn_node::{ActRefusal, EntryPath, PdnId, PodAct, PodId, RecordId, RecordKind, RecordRef};
+    use pdn_node::{ActRefusal, PdnId, PodAct, PodId, RecordId, RecordKind, RecordRef};
 
     use super::*;
 
-    const ISSUER: PdnId = PdnId::from_bytes([0x11; 32]);
+    const IDENTITY: PdnId = PdnId::from_bytes([0x11; 32]);
     const PEER: PdnId = PdnId::from_bytes([0x22; 32]);
     const POD: PodId = PodId::from_bytes([0x33; 16]);
 
@@ -137,22 +128,7 @@ mod tests {
 
     #[test]
     fn refusals_are_403() {
-        assert_eq!(status(EstablishmentRefused), StatusCode::FORBIDDEN);
         assert_eq!(status(LinkingRefused), StatusCode::FORBIDDEN);
-        assert_eq!(
-            status(WriteNotGranted {
-                issuer: ISSUER,
-                path: EntryPath::new("contact/email").unwrap(),
-            }),
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            status(DelegationUnsupported {
-                identity: PEER,
-                issuer: ISSUER,
-            }),
-            StatusCode::FORBIDDEN
-        );
         assert_eq!(status(JoinRefused), StatusCode::FORBIDDEN);
         assert_eq!(
             status(ActRefused {
@@ -176,39 +152,21 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
-            status(UnknownIssuer { issuer: ISSUER }),
+            status(IdentityAlreadyHosted { identity: IDENTITY }),
             StatusCode::CONFLICT
         );
         assert_eq!(
-            status(PeerNotConnected {
-                identity: ISSUER,
-                peer: PEER,
-            }),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            status(IdentityAlreadyHosted { identity: ISSUER }),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            status(LinkingInProgress { identity: ISSUER }),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            status(EstablishmentInProgress {
-                identity: ISSUER,
-                peer: PEER,
-            }),
+            status(LinkingInProgress { identity: IDENTITY }),
             StatusCode::CONFLICT
         );
         assert_eq!(status(UnknownPod { pod: POD }), StatusCode::CONFLICT);
         assert_eq!(
-            status(IdentityKeyPending { identity: ISSUER }),
+            status(IdentityKeyPending { identity: IDENTITY }),
             StatusCode::CONFLICT
         );
         assert_eq!(
             status(JoinInProgress {
-                identity: ISSUER,
+                identity: IDENTITY,
                 pod: POD,
             }),
             StatusCode::CONFLICT
@@ -217,10 +175,6 @@ mod tests {
 
     #[test]
     fn unspoken_payload_versions_are_400() {
-        assert_eq!(
-            status(UnsupportedInviteVersion { version: 9 }),
-            StatusCode::BAD_REQUEST
-        );
         assert_eq!(
             status(UnsupportedLinkingVersion { version: 9 }),
             StatusCode::BAD_REQUEST
@@ -242,7 +196,7 @@ mod tests {
         );
     }
 
-    /// A record that reads on no entry here is absent, as an entry is.
+    /// A record that reads on no entry here is absent.
     #[test]
     fn an_absent_record_is_404() {
         assert_eq!(
@@ -294,7 +248,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            HostError::not_found("no entry").status(),
+            HostError::not_found("no record").status(),
             StatusCode::NOT_FOUND
         );
     }

@@ -219,6 +219,12 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         .leave_swarm_for_test(alice.id, membership)
         .await?;
     bob_laptop.leave_swarm_for_test(bob.id, membership).await?;
+    // Taken before the statement: the laptop's redials of sessions from
+    // before can bring it ahead of the dial below.
+    let mut traces = alice_phone.take_session_traces().context("taken once")?;
+    let mut laptops_sessions = bob_laptop
+        .watch_pod_sessions(bob.id, pod, PodStore::Membership)
+        .await?;
     let laptops = device_of(&bob_laptop, &bob)?;
     let listing = statement(
         &bob_laptop,
@@ -244,7 +250,6 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         alices.author,
     )
     .await?;
-    let mut traces = alice_phone.take_session_traces().context("taken once")?;
 
     dial(
         &bob_laptop,
@@ -267,26 +272,41 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         if trace.namespace != membership {
             continue;
         }
+        let laptops = trace.peer == laptop_node && trace.role == SessionRole::Accept;
         match trace.traced {
             Traced::Admitted { key, .. } if opened => first.push(key),
-            Traced::AllowedFiltered
-                if !opened && trace.peer == laptop_node && trace.role == SessionRole::Accept =>
+            // A session that admitted nothing yet is reopened: a redial from
+            // before the statement, or the decision asked again.
+            Traced::AllowedFiltered if laptops && first.is_empty() => opened = true,
+            Traced::Denied | Traced::AllowedWhole | Traced::AllowedFiltered
+                if opened && !first.is_empty() =>
             {
-                opened = true;
+                break
             }
-            Traced::Denied | Traced::AllowedWhole | Traced::AllowedFiltered if opened => break,
             _ => {}
         }
     }
     assert!(opened, "the member device refused the unlisted device");
     assert_eq!(first, [listing]);
-    let sent = bob_laptop
-        .pod_membership_view(bob.id, pod)
-        .await?
-        .member(&alice.id)
-        .is_some_and(|member| member.devices.contains(&elsewhere));
-    assert!(
-        !sent,
+    // The session that carried the statement, as the laptop saw it: later
+    // ones, served whole, may already have run.
+    let alice_node = alice_phone.node_id();
+    let carrying = loop {
+        let session = laptops_sessions
+            .next_served_with(alice_node, TIMEOUT)
+            .await?
+            .context("no session with the member device went through")?;
+        if session
+            .exchanged
+            .as_ref()
+            .is_ok_and(|(_received, sent)| *sent > 0)
+        {
+            break session;
+        }
+    };
+    assert_eq!(
+        carrying.exchanged.map(|(received, _sent)| received),
+        Ok(0),
         "the member device sent the device it does not list an entry"
     );
 
@@ -360,6 +380,13 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
     )
     .await?;
     assert!(lists_device(&alice_phone, alice.id, pod, bob.id, b2).await?);
+    // Both of Bob's devices list Alice's own device before the stores leave
+    // their swarms: one that holds her entries without their payloads yet
+    // refuses her sessions, and nothing dials it again with the passes off.
+    let a1 = device_of(&alice_phone, &alice)?;
+    for device in [&bob_phone, &bob_laptop] {
+        assert!(lists_device(device, bob.id, pod, alice.id, a1).await?);
+    }
     for (device, holder) in [
         (&alice_phone, &alice),
         (&bob_phone, &bob),
@@ -405,6 +432,9 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
         b1.author,
     )
     .await?;
+    let mut alices_records = alice_phone
+        .watch_pod_sessions(alice.id, pod, PodStore::Records)
+        .await?;
     for device in [&bob_phone, &bob_laptop] {
         for store in [PodStore::Membership, PodStore::Records] {
             dial(&alice_phone, &alice, pod, store, device, &bob).await?;
@@ -416,10 +446,28 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
             "a device a statement lists dropped out of the union"
         );
     }
-    assert!(
-        reads(&alice_phone, alice.id, pod, claim.record()).await?,
-        "the claim of a device a later version missed did not read"
-    );
+    if !reads(&alice_phone, alice.id, pod, claim.record()).await? {
+        let owner = alice_phone.pod_record_view(alice.id, pod).await;
+        let laptop = bob_laptop.pod_record_view(bob.id, pod).await;
+        let in_flight = alice_phone.pod_syncs_in_flight_for_test(pod).await;
+        let mut sessions = Vec::new();
+        while let Some(session) = alices_records
+            .next_with(bob_laptop.node_id(), true, Duration::from_millis(50))
+            .await?
+        {
+            sessions.push(session);
+        }
+        let owner_on_laptop = bob_laptop
+            .pod_holding(bob.id, pod)
+            .await
+            .map(|holding| holding.and_then(|held| held.membership.member(&alice.id).cloned()));
+        anyhow::bail!(
+            "the claim of a device a later version missed did not read\nowner: {owner:#?}\n\
+             laptop: {laptop:#?}\nowner's exchanges in flight: {in_flight:?}\nowner's \
+             record-store sessions dialed to the laptop: {sessions:#?}\nthe owner as the \
+             laptop's membership view has her: {owner_on_laptop:#?}"
+        );
+    }
 
     // The laptop, lagging at version 2 and its own version 3, writes
     // version 2 again, and the session after it brings that entry.

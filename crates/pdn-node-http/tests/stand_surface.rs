@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node_http::MAX_REQUEST_BODY_BYTES;
+use pdn_node_http::{shapes::Records, MAX_REQUEST_BODY_BYTES};
 
 mod common;
 use common::{Method, Stand};
@@ -19,16 +19,6 @@ const DEBUG_ROUTES: &[(Method, &str)] = &[
     (Method::Get, "/debug/identities"),
     (Method::Post, "/debug/identities/aa/linking-invite"),
     (Method::Post, "/debug/link"),
-    (Method::Post, "/debug/identities/aa/invite"),
-    (Method::Post, "/debug/identities/aa/establish"),
-    (Method::Get, "/debug/identities/aa/connections"),
-    (Method::Post, "/debug/identities/aa/grants/bb"),
-    (Method::Get, "/debug/identities/aa/grants/bb"),
-    (Method::Get, "/debug/identities/aa/own-grants/bb"),
-    (Method::Delete, "/debug/identities/aa/grants/bb/cc"),
-    (Method::Get, "/debug/data/aa/bb"),
-    (Method::Put, "/debug/data/aa/bb/contact/email"),
-    (Method::Get, "/debug/data/aa/bb/contact/email"),
     (Method::Post, "/debug/identities/aa/pods"),
     (Method::Get, "/debug/identities/aa/pods"),
     (Method::Post, "/debug/identities/aa/pods/join"),
@@ -96,21 +86,20 @@ async fn every_gated_route_exists_with_the_flag() -> Result<()> {
     Ok(())
 }
 
-/// A body past the ceiling is refused by the router, before the data service
-/// is reached — so the limit is the host's own and not the engine's.
+/// A body past the ceiling is refused by the router, before the pods
+/// service is reached — so the limit is the host's own and not the engine's.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
     let stand = Stand::new();
     let node = stand.spawn("bounded").await?;
     let alice = node.create_identity().await?;
+    let pod = node.create_pod(alice).await?;
+    let records = format!("/debug/identities/{alice}/pods/{pod}/records");
 
     let oversized = vec![b'x'; MAX_REQUEST_BODY_BYTES + 1];
     let answer = node
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            Bytes::from(oversized),
-        )
+        .post(&format!("{records}?kind=claim"), Bytes::from(oversized))
         .await?;
     assert_eq!(
         answer.status,
@@ -120,11 +109,9 @@ async fn an_oversized_body_is_refused_before_its_handler() -> Result<()> {
         answer.text()
     );
 
-    // And the entry it addressed stays absent: the refusal happened before
-    // any handler, not after a partial write.
-    let after = node
-        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
-        .await?;
-    assert_eq!(after.status, StatusCode::NOT_FOUND);
+    // And the pod holds no record: the refusal happened before any
+    // handler, not after a partial write.
+    let listed: Records = node.get(&records).await?.json()?;
+    assert_eq!(listed.records, []);
     Ok(())
 }

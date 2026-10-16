@@ -36,9 +36,8 @@ use crate::{
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
     subscribers::Delivery,
-    Author, AuthorHeads, AuthorId, Capability, CapabilityValidator, ContentStatus,
-    ContentStatusCallback, Event, NamespaceId, NamespaceSecret, PeerIdBytes, RejectionObserver,
-    Replica, ReplicaInfo, SignedEntry, SyncOutcome,
+    Author, AuthorHeads, AuthorId, Capability, ContentStatus, ContentStatusCallback, Event,
+    NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, SignedEntry, SyncOutcome,
 };
 
 const ACTION_CAP: usize = 1024;
@@ -171,13 +170,6 @@ enum ReplicaAction {
         key: Bytes,
         #[debug("reply")]
         reply: oneshot::Sender<Result<usize>>,
-    },
-    RetractEntry {
-        author: AuthorId,
-        key: Bytes,
-        up_to_timestamp: u64,
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<bool>>,
     },
     InsertRemote {
         entry: SignedEntry,
@@ -403,20 +395,11 @@ impl SyncHandle {
     pub fn spawn(
         store: Store,
         content_status_callback: Option<ContentStatusCallback>,
-        capability_validator: Option<CapabilityValidator>,
-        rejection_observer: Option<RejectionObserver>,
         me: String,
     ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
-        let actor = Actor::new(
-            store,
-            action_rx,
-            content_status_callback,
-            capability_validator,
-            rejection_observer,
-            metrics.clone(),
-        );
+        let actor = Actor::new(store, action_rx, content_status_callback, metrics.clone());
 
         let span = error_span!("sync", %me);
         #[cfg(wasm_browser)]
@@ -659,13 +642,6 @@ impl SyncHandle {
         rx.await?
     }
 
-    /// Per author, the greatest timestamp this replica holds. Equality of
-    /// two replicas' heads does not mean equal contents: a maximum cannot
-    /// show a missing entry older than itself, and a retraction leaves the
-    /// head where it was on purpose. So this answers "there may be
-    /// something new" — the question reconciliation asks, where a false
-    /// yes costs one empty round — and never "we are in sync", where a
-    /// false yes would end the exchange that was owed.
     /// How many writes this replica has taken since the store opened —
     /// what tells a caller that a replica changed without reading it. Its
     /// own earlier reading is the only thing it compares against.
@@ -717,27 +693,6 @@ impl SyncHandle {
             author,
             key,
             include_empty,
-            reply,
-        };
-        self.send_replica(namespace, action).await?;
-        rx.await?
-    }
-
-    /// Physically remove the record of `author` at `key`, if its timestamp
-    /// is at or below `up_to_timestamp` (see
-    /// [`Store::retract_entry`](crate::store::Store::retract_entry)).
-    pub async fn retract_entry(
-        &self,
-        namespace: NamespaceId,
-        author: AuthorId,
-        key: Bytes,
-        up_to_timestamp: u64,
-    ) -> Result<bool> {
-        let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::RetractEntry {
-            author,
-            key,
-            up_to_timestamp,
             reply,
         };
         self.send_replica(namespace, action).await?;
@@ -911,8 +866,6 @@ struct Actor {
     last_session_sweep: Instant,
     action_rx: async_channel::Receiver<Action>,
     content_status_callback: Option<ContentStatusCallback>,
-    capability_validator: Option<CapabilityValidator>,
-    rejection_observer: Option<RejectionObserver>,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
 }
@@ -922,8 +875,6 @@ impl Actor {
         store: Store,
         action_rx: async_channel::Receiver<Action>,
         content_status_callback: Option<ContentStatusCallback>,
-        capability_validator: Option<CapabilityValidator>,
-        rejection_observer: Option<RejectionObserver>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -935,8 +886,6 @@ impl Actor {
             last_session_sweep: Instant::now(),
             action_rx,
             content_status_callback,
-            capability_validator,
-            rejection_observer,
             tasks: Default::default(),
             metrics,
         }
@@ -1266,16 +1215,6 @@ impl Actor {
                 this.states.ensure_open(&namespace)?;
                 this.store.get_exact(namespace, author, key, include_empty)
             }),
-            ReplicaAction::RetractEntry {
-                author,
-                key,
-                up_to_timestamp,
-                reply,
-            } => send_reply_with(reply, self, move |this| {
-                this.states.ensure_open(&namespace)?;
-                this.store
-                    .retract_entry(namespace, author, &key, up_to_timestamp)
-            }),
             ReplicaAction::GetMany { query, reply } => {
                 let iter = self
                     .states
@@ -1395,12 +1334,6 @@ impl Actor {
             let mut info = self.store.load_replica_info(&namespace)?;
             if let Some(cb) = &self.content_status_callback {
                 info.set_content_status_callback(Arc::clone(cb));
-            }
-            if let Some(validator) = &self.capability_validator {
-                info.set_capability_validator(Arc::clone(validator));
-            }
-            if let Some(observer) = &self.rejection_observer {
-                info.set_rejection_observer(Arc::clone(observer));
             }
             Ok(info)
         };
@@ -1609,7 +1542,7 @@ mod tests {
     #[tokio::test]
     async fn open_close() -> anyhow::Result<()> {
         let store = store::Store::memory();
-        let sync = SyncHandle::spawn(store, None, None, None, "foo".into());
+        let sync = SyncHandle::spawn(store, None, "foo".into());
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let id = namespace.id();
         sync.import_namespace(namespace.into()).await?;
@@ -1649,8 +1582,6 @@ mod tests {
             store::Store::memory(),
             action_rx,
             None,
-            None,
-            None,
             Arc::new(Metrics::default()),
         );
         tokio::task::LocalSet::new()
@@ -1680,7 +1611,7 @@ mod tests {
     #[tokio::test]
     async fn actor_tasks_joinset_drain() -> anyhow::Result<()> {
         let store = store::Store::memory();
-        let sync = SyncHandle::spawn(store, None, None, None, "drain".into());
+        let sync = SyncHandle::spawn(store, None, "drain".into());
 
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let id = namespace.id();

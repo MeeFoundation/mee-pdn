@@ -191,7 +191,9 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             )
             .await
             {
-                crate::filter::SessionAccess::Allow { egress, ingest, .. } => (egress, ingest),
+                crate::filter::SessionAccess::Allow { egress, ingest, .. } => {
+                    (egress, Some(ingest))
+                }
                 crate::filter::SessionAccess::Deny => {
                     return Err(ConnectError::sync(anyhow!(
                         "session denied by the local access provider"
@@ -519,7 +521,7 @@ impl BobState {
             } => {
                 trace!("allow request");
                 self.filter = filter;
-                self.ingest = ingest;
+                self.ingest = Some(ingest);
                 recheck
             }
             AcceptOutcome::Reject(reason) => {
@@ -549,11 +551,23 @@ impl BobState {
                     crate::filter::SessionAccess::Allow { egress, ingest, .. } => {
                         trace!("allow request again");
                         self.filter = egress;
-                        self.ingest = ingest;
+                        self.ingest = Some(ingest);
                     }
-                    // The first decision's one uniform refusal.
+                    // The first decision's one uniform refusal on the wire;
+                    // the pair's slot is this session's by now, so it ends
+                    // as a failed exchange, which frees the slot, where a
+                    // refusal before the slot would leave it to its holder.
                     crate::filter::SessionAccess::Deny => {
-                        return Err(self.reject(writer, namespace, AbortReason::NotFound).await);
+                        return Err(
+                            match self.reject(writer, namespace, AbortReason::NotFound).await {
+                                AcceptError::Abort { .. } => AcceptError::Sync {
+                                    peer: self.peer,
+                                    namespace: Some(namespace),
+                                    error: anyhow!("refused when the decision was asked again"),
+                                },
+                                failed => failed,
+                            },
+                        );
                     }
                 }
             }
@@ -716,7 +730,7 @@ mod tests {
         let (alice, bob) = tokio::io::duplex(64);
 
         let (mut alice_reader, mut alice_writer) = tokio::io::split(alice);
-        let alice_handle = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice_handle = SyncHandle::spawn(alice_store, None, "alice".to_string());
         alice_handle
             .open(namespace.id(), OpenOpts::default().sync())
             .await?;
@@ -740,7 +754,7 @@ mod tests {
         });
 
         let (mut bob_reader, mut bob_writer) = tokio::io::split(bob);
-        let bob_handle = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        let bob_handle = SyncHandle::spawn(bob_store, None, "bob".to_string());
         bob_handle
             .open(namespace.id(), OpenOpts::default().sync())
             .await?;
@@ -753,7 +767,7 @@ mod tests {
                 |_namespace, _identity, _caller, _peer| {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
-                        ingest: None,
+                        ingest: crate::filter::admit_all(),
                         recheck: None,
                     })
                 },
@@ -916,11 +930,10 @@ mod tests {
                 // replicas can be opened only once so close the replicas before spawning the
                 // actors
                 alice_store.close_replica(namespace.id());
-                let alice_handle =
-                    SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+                let alice_handle = SyncHandle::spawn(alice_store, None, "alice".to_string());
 
                 bob_store.close_replica(namespace.id());
-                let bob_handle = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+                let bob_handle = SyncHandle::spawn(bob_store, None, "bob".to_string());
 
                 run_sync(
                     alice_handle.clone(),
@@ -963,7 +976,7 @@ mod tests {
             |_namespace, _identity, _caller, _peer| {
                 std::future::ready(AcceptOutcome::Allow {
                     filter: None,
-                    ingest: None,
+                    ingest: crate::filter::admit_all(),
                     recheck: None,
                 })
             },
@@ -1090,8 +1103,8 @@ mod tests {
         alice_store.close_replica(namespace.id());
         bob_store.close_replica(namespace.id());
 
-        let alice_handle = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
-        let bob_handle = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        let alice_handle = SyncHandle::spawn(alice_store, None, "alice".to_string());
+        let bob_handle = SyncHandle::spawn(bob_store, None, "bob".to_string());
 
         run_sync(
             alice_handle.clone(),
@@ -1125,7 +1138,7 @@ mod tests {
         let mut store = store::Store::memory();
         store.new_replica(namespace.clone())?;
         store.close_replica(namespace.id());
-        let handle = SyncHandle::spawn(store, None, None, None, me.to_string());
+        let handle = SyncHandle::spawn(store, None, me.to_string());
         Ok((handle, namespace.id()))
     }
 
@@ -1151,7 +1164,7 @@ mod tests {
             .hash_and_insert("greeting", &author, "hello")
             .await?;
         alice_store.close_replica(ns);
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
         let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
         alice.open(ns, OpenOpts::default().sync()).await?;
         bob.open(ns, OpenOpts::default().sync()).await?;
@@ -1196,7 +1209,7 @@ mod tests {
                         observed.lock().unwrap().push((identity, caller));
                         std::future::ready(AcceptOutcome::Allow {
                             filter: None,
-                            ingest: None,
+                            ingest: crate::filter::admit_all(),
                             recheck: None,
                         })
                     },
@@ -1268,7 +1281,7 @@ mod tests {
             |_namespace, _identity, _caller, _peer| {
                 std::future::ready(AcceptOutcome::Allow {
                     filter: None,
-                    ingest: None,
+                    ingest: crate::filter::admit_all(),
                     recheck: None,
                 })
             },
@@ -1316,6 +1329,243 @@ mod tests {
 
         alice_handle.shutdown().await?;
         bob_handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// A session whose peer stops answering is ended at the bound, its
+    /// snapshot released, and the pair reconciles again afterwards.
+    ///
+    /// The clock is paused once the session is registered and waits on the
+    /// silent peer, and moved past the five-minute bound by hand: paused
+    /// earlier, it would jump to the bound while the actor thread is still
+    /// registering the session.
+    #[tokio::test]
+    async fn a_stalled_session_is_ended_at_the_bound_and_its_pair_reconciles_again() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer_id = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let (alice_handle, namespace_id) = spawn_handle_with_replica(&namespace, "alice")?;
+        let (bob_handle, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice_handle
+            .open(namespace_id, OpenOpts::default().sync())
+            .await?;
+
+        // The peer end stays open and silent past the first message.
+        let (alice_end, silent_peer) = tokio::io::duplex(64 * 1024);
+        let stalled = {
+            let alice_handle = alice_handle.clone();
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(alice_end);
+                let access = crate::filter::serve_whole();
+                crate::net::sync_in_process(
+                    &alice_handle,
+                    namespace_id,
+                    TEST_HOLDER,
+                    TEST_HOLDER,
+                    bob_peer_id,
+                    &mut writer,
+                    &mut reader,
+                    None,
+                    &access,
+                )
+                .await
+            })
+        };
+        let mut registered = false;
+        for _ in 0..1000 {
+            if alice_handle.debug_session_count().await? == 1 {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(registered, "the session never registered its snapshot");
+        tokio::time::pause();
+        tokio::time::advance(crate::net::SYNC_SESSION_TIMEOUT).await;
+        let stalled = tokio::time::timeout(std::time::Duration::from_secs(1), stalled)
+            .await
+            .map_err(|_elapsed| anyhow::anyhow!("the session ran past its bound"))??;
+        tokio::time::resume();
+        assert!(
+            stalled.is_err(),
+            "a stalled session was not ended at its bound"
+        );
+        assert_eq!(alice_handle.debug_session_count().await?, 0);
+        drop(silent_peer);
+
+        let (alice, bob) = run_sync_with_acceptor(
+            alice_handle.clone(),
+            alice_peer_id,
+            bob_handle.clone(),
+            bob_peer_id,
+            namespace_id,
+            |_namespace, _identity, _caller, _peer| {
+                std::future::ready(AcceptOutcome::Allow {
+                    filter: None,
+                    ingest: crate::filter::admit_all(),
+                    recheck: None,
+                })
+            },
+        )
+        .await?;
+        alice?;
+        bob?;
+
+        alice_handle.shutdown().await?;
+        bob_handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// A session cut short at the bound keeps what it delivered: the
+    /// entries the peer's first reply carried are stored, though the peer
+    /// answers nothing after it and the session ends at the bound.
+    ///
+    /// A pipe between the two sides forwards everything the dialing side
+    /// sends and the serving side's first frame alone; the clock is paused
+    /// once the dialing side has taken the entries in, as in the stalled
+    /// session above.
+    #[tokio::test]
+    async fn a_session_cut_short_keeps_what_it_delivered() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+        async fn seeded(
+            namespace: &NamespaceSecret,
+            keys: &[&str],
+            name: &str,
+        ) -> Result<(SyncHandle, AuthorId)> {
+            let mut store = store::Store::memory();
+            let author = crate::Author::from_bytes(&[5u8; 32]);
+            let mut replica = store.new_replica(namespace.clone())?;
+            for key in keys {
+                replica.hash_and_insert(key, &author, key).await?;
+            }
+            drop(replica);
+            store.close_replica(namespace.id());
+            Ok((
+                SyncHandle::spawn(store, None, name.to_string()),
+                author.id(),
+            ))
+        }
+        let (alice, author) = seeded(&namespace, &["a"], "alice").await?;
+        let (bob, _) = seeded(&namespace, &["b1", "b2", "b3"], "bob").await?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+
+        let (alice_io, proxy_alice) = tokio::io::duplex(64 * 1024);
+        let (proxy_bob, bob_io) = tokio::io::duplex(64 * 1024);
+        let (mut from_alice, mut to_alice) = tokio::io::split(proxy_alice);
+        let (mut from_bob, mut to_bob) = tokio::io::split(proxy_bob);
+        let _upstream =
+            tokio::spawn(async move { tokio::io::copy(&mut from_alice, &mut to_bob).await });
+        let _first_reply_only = tokio::spawn(async move {
+            let mut length = [0u8; 4];
+            from_bob.read_exact(&mut length).await?;
+            let mut frame = vec![0u8; usize::try_from(u32::from_be_bytes(length))?];
+            from_bob.read_exact(&mut frame).await?;
+            to_alice.write_all(&length).await?;
+            to_alice.write_all(&frame).await?;
+            to_alice.flush().await?;
+            // Held open and silent from here on.
+            std::future::pending::<()>().await;
+            anyhow::Ok((from_bob, to_alice))
+        });
+        let served = {
+            let bob = bob.clone();
+            tokio::spawn(async move {
+                let (bob_reader, bob_writer) = tokio::io::split(bob_io);
+                let opening = SessionOpening::read(bob_writer, bob_reader, alice_peer).await?;
+                let (peer, init, mut reader, mut writer) = opening.into_parts();
+                BobState::new(peer)
+                    .run(
+                        &mut writer,
+                        &mut reader,
+                        init,
+                        bob,
+                        |_ns, _identity, _caller, _peer| {
+                            std::future::ready(AcceptOutcome::Allow {
+                                filter: None,
+                                ingest: crate::filter::admit_all(),
+                                recheck: None,
+                            })
+                        },
+                    )
+                    .await
+            })
+        };
+        let dial = {
+            let alice = alice.clone();
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(alice_io);
+                let access = crate::filter::serve_whole();
+                crate::net::sync_in_process(
+                    &alice,
+                    ns,
+                    TEST_HOLDER,
+                    TEST_HOLDER,
+                    bob_peer,
+                    &mut writer,
+                    &mut reader,
+                    None,
+                    &access,
+                )
+                .await
+            })
+        };
+
+        // The keys of the peer's entries the dialing side holds.
+        let delivered = |alice: SyncHandle| async move {
+            let mut held = Vec::new();
+            for key in ["b1", "b2", "b3"] {
+                if alice
+                    .get_exact(ns, author, bytes::Bytes::from(key), false)
+                    .await?
+                    .is_some()
+                {
+                    held.push(key);
+                }
+            }
+            anyhow::Ok(held)
+        };
+        let mut taken_in = Vec::new();
+        for _ in 0..1000 {
+            taken_in = delivered(alice.clone()).await?;
+            if !taken_in.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_ne!(
+            taken_in,
+            Vec::<&str>::new(),
+            "the first reply delivered no entry"
+        );
+        assert!(
+            !dial.is_finished(),
+            "the session finished, so nothing cut it short"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(crate::net::SYNC_SESSION_TIMEOUT).await;
+        let cut = tokio::time::timeout(std::time::Duration::from_secs(1), dial)
+            .await
+            .map_err(|_elapsed| anyhow!("the session ran past its bound"))??;
+        tokio::time::resume();
+        assert!(cut.is_err(), "the cut session reported success");
+        assert_eq!(
+            delivered(alice.clone()).await?,
+            taken_in,
+            "the entries a cut session delivered were lost"
+        );
+
+        served.abort();
+        alice.shutdown().await?;
+        bob.shutdown().await?;
         Ok(())
     }
 
@@ -1456,7 +1706,7 @@ mod tests {
         let allow = |_ns, _identity, _caller, _peer| {
             std::future::ready(AcceptOutcome::Allow {
                 filter: None,
-                ingest: None,
+                ingest: crate::filter::admit_all(),
                 recheck: None,
             })
         };
@@ -1632,7 +1882,7 @@ mod tests {
                 |_ns, _identity, _caller, _peer| {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
-                        ingest: None,
+                        ingest: crate::filter::admit_all(),
                         recheck: None,
                     })
                 },
@@ -1668,7 +1918,7 @@ mod tests {
         store.close_replica(ns1.id());
         store.new_replica(ns2.clone())?;
         store.close_replica(ns2.id());
-        let handle = SyncHandle::spawn(store, None, None, None, "node".to_string());
+        let handle = SyncHandle::spawn(store, None, "node".to_string());
 
         // Not open: no session.
         assert!(handle.sync_session_start(ns1.id()).await.is_err());
@@ -1836,7 +2086,7 @@ mod tests {
         alice_store.new_replica(namespace.clone())?;
         alice_store.close_replica(ns);
         let author = alice_store.new_author(&mut rng)?.id();
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
         let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
         alice.open(ns, OpenOpts::default().sync()).await?;
         bob.open(ns, OpenOpts::default().sync()).await?;
@@ -1963,7 +2213,7 @@ mod tests {
         bob_store.new_replica(namespace.clone())?;
         bob_store.close_replica(ns);
         let author = bob_store.new_author(&mut rng)?.id();
-        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        let bob = SyncHandle::spawn(bob_store, None, "bob".to_string());
         bob.open(ns, OpenOpts::default().sync()).await?;
         async fn write(
             handle: &SyncHandle,
@@ -2003,7 +2253,7 @@ mod tests {
                         });
                     AcceptOutcome::Allow {
                         filter: None,
-                        ingest: None,
+                        ingest: crate::filter::admit_all(),
                         recheck: Some(crate::net::Recheck {
                             rests_on: crate::filter::RestsOn::Writes(vec![(ns, writes)]),
                             ask,
@@ -2053,14 +2303,10 @@ mod tests {
             dialed.is_err(),
             "the refused session reached the dialer as served"
         );
+        // The uniform refusal went out; the accepting side ends the session
+        // as a failed exchange, its pair's slot taken by then.
         assert!(
-            matches!(
-                accepted,
-                Err(AcceptError::Abort {
-                    reason: AbortReason::NotFound,
-                    ..
-                })
-            ),
+            matches!(accepted, Err(AcceptError::Sync { .. })),
             "the session asked again was not refused: {accepted:?}"
         );
         assert!(
@@ -2124,7 +2370,7 @@ mod tests {
                 |_namespace, _identity, _caller, _peer| {
                     std::future::ready(AcceptOutcome::Allow {
                         filter: None,
-                        ingest: None,
+                        ingest: crate::filter::admit_all(),
                         recheck: None,
                     })
                 },
@@ -2165,7 +2411,7 @@ mod tests {
         bob_store.new_replica(namespace.clone())?;
         bob_store.close_replica(ns);
         let author = bob_store.new_author(&mut rng)?.id();
-        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        let bob = SyncHandle::spawn(bob_store, None, "bob".to_string());
         bob.open(ns, OpenOpts::default().sync()).await?;
         for key in ["ape", "bee", "cat"] {
             bob.insert_local(
@@ -2183,7 +2429,7 @@ mod tests {
         alice_store.new_replica(namespace.clone())?;
         alice_store.close_replica(ns);
         let alice_author = alice_store.new_author(&mut rng)?.id();
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
         alice.open(ns, OpenOpts::default().sync()).await?;
         for key in ["dog", "eel", "fox"] {
             alice
@@ -2215,7 +2461,7 @@ mod tests {
                     |_namespace, _identity, _caller, _peer| {
                         std::future::ready(AcceptOutcome::Allow {
                             filter: None,
-                            ingest: None,
+                            ingest: crate::filter::admit_all(),
                             recheck: None,
                         })
                     },
@@ -2351,110 +2597,6 @@ mod tests {
         Ok(())
     }
 
-    /// A retraction that lands inside a session is served for the rest of
-    /// it, and no later session takes it back.
-    ///
-    /// A removal replicates as absence, so the next session carries no news
-    /// of it: the peer keeps what it was handed and offers it back. What
-    /// removes it at the peer is the marker the retraction records above
-    /// this layer, which arms the peer to refuse the entry — reconciliation
-    /// alone converges on what a set gains, not on what it loses.
-    #[tokio::test]
-    async fn a_retraction_inside_a_session_is_served_for_the_rest_of_it() -> Result<()> {
-        let mut rng = rand::rng();
-        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
-        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
-        let namespace = NamespaceSecret::new(&mut rng);
-        let ns = namespace.id();
-
-        let mut alice_store = store::Store::memory();
-        alice_store.new_replica(namespace.clone())?;
-        alice_store.close_replica(ns);
-        let author = alice_store.new_author(&mut rng)?.id();
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
-        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
-        alice.open(ns, OpenOpts::default().sync()).await?;
-        bob.open(ns, OpenOpts::default().sync()).await?;
-        for key in ["ape", "bee", "cat"] {
-            alice
-                .insert_local(
-                    ns,
-                    author,
-                    key.as_bytes().to_vec().into(),
-                    Hash::new(key),
-                    key.len() as u64,
-                )
-                .await?;
-        }
-        let held = |handle: &SyncHandle, key: &'static str| {
-            let handle = handle.clone();
-            async move {
-                anyhow::Ok(
-                    handle
-                        .get_exact(ns, author, key.as_bytes().to_vec().into(), false)
-                        .await?
-                        .is_some(),
-                )
-            }
-        };
-
-        // The session's view is taken here; the retraction lands after it.
-        let alice_session = alice.sync_session_start(ns).await?;
-        let bob_session = bob.sync_session_start(ns).await?;
-        assert!(
-            alice
-                .retract_entry(ns, author, b"bee".to_vec().into(), u64::MAX)
-                .await?,
-            "the entry was not retracted"
-        );
-        assert!(
-            !held(&alice, "bee").await?,
-            "the row is gone from the store"
-        );
-
-        exchange_over_sessions(
-            &alice,
-            &alice_session,
-            alice_peer,
-            &bob,
-            &bob_session,
-            bob_peer,
-            ns,
-        )
-        .await?;
-        assert!(
-            held(&bob, "bee").await?,
-            "the frozen view was expected to serve the retracted entry"
-        );
-
-        // The next session carries no news of the removal — only the
-        // absence of what was removed, which the peer reads as a set this
-        // side is behind on.
-        drop((alice_session, bob_session));
-        let alice_session = alice.sync_session_start(ns).await?;
-        let bob_session = bob.sync_session_start(ns).await?;
-        exchange_over_sessions(
-            &alice,
-            &alice_session,
-            alice_peer,
-            &bob,
-            &bob_session,
-            bob_peer,
-            ns,
-        )
-        .await?;
-        assert!(held(&bob, "bee").await?, "the peer still holds it");
-        assert!(
-            held(&alice, "bee").await?,
-            "and hands it back, which is what the marker above this layer refuses"
-        );
-
-        drop((alice_session, bob_session));
-        alice.shutdown().await?;
-        bob.shutdown().await?;
-        Ok(())
-    }
-
     /// A delete that lands inside a session leaves the session serving the
     /// deleted entry, and the next session carries the empty entry that
     /// deletes it at the peer.
@@ -2474,7 +2616,7 @@ mod tests {
         alice_store.new_replica(namespace.clone())?;
         alice_store.close_replica(ns);
         let author = alice_store.new_author(&mut rng)?.id();
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
         let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
         alice.open(ns, OpenOpts::default().sync()).await?;
         bob.open(ns, OpenOpts::default().sync()).await?;
@@ -2597,7 +2739,7 @@ mod tests {
         store.new_replica(namespace.clone())?;
         store.close_replica(namespace.id());
         let author = store.new_author(&mut rng)?.id();
-        let handle = SyncHandle::spawn(store, None, None, None, "node".to_string());
+        let handle = SyncHandle::spawn(store, None, "node".to_string());
         let ns = namespace.id();
         let (events_tx, events_rx) = async_channel::bounded(1);
         handle
@@ -2703,11 +2845,11 @@ mod tests {
         drop(bob_store.new_replica(namespace.clone())?);
         bob_store.close_replica(namespace.id());
 
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
         alice
             .open(namespace.id(), OpenOpts::default().sync())
             .await?;
-        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        let bob = SyncHandle::spawn(bob_store, None, "bob".to_string());
         bob.open(namespace.id(), OpenOpts::default().sync()).await?;
         run_sync(
             alice.clone(),
@@ -2756,6 +2898,22 @@ mod tests {
             "the opening must be refused on its length, not wait for its body: {read:?}"
         );
         drop(their_writer);
+        Ok(())
+    }
+
+    /// The refusal of an unhosted replica is these six bytes on the wire:
+    /// the frame length, 2, then `Message::Abort` and `AbortReason::NotFound`.
+    /// Every refusal the node answers with is this frame, whatever it refused.
+    #[test]
+    fn a_refusal_is_six_bytes_on_the_wire() -> Result<()> {
+        let mut buffer = BytesMut::new();
+        SyncCodec::default().encode(
+            super::Message::Abort {
+                reason: AbortReason::NotFound,
+            },
+            &mut buffer,
+        )?;
+        assert_eq!(&buffer[..], [0x00, 0x00, 0x00, 0x02, 0x02, 0x00]);
         Ok(())
     }
 
@@ -2858,11 +3016,11 @@ mod tests {
         drop(bob_store.new_replica(namespace.clone())?);
         bob_store.close_replica(namespace.id());
 
-        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
         alice
             .open(namespace.id(), OpenOpts::default().sync())
             .await?;
-        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        let bob = SyncHandle::spawn(bob_store, None, "bob".to_string());
         bob.open(namespace.id(), OpenOpts::default().sync()).await?;
         run_sync(
             alice.clone(),

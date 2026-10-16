@@ -7,17 +7,42 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    claim_id_of, AddrInfoOptions, ConnectionMetadataStore, GrantedClaim, PrivateMetadataStore,
-    ReadGrant, ShareMode, SpawnOptions, SyncNode, DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
+    pod_ticket_kind, AddrInfoOptions, PodStore, PodTickets, PrivateMetadataStore, Seq, ShareMode,
+    SpawnOptions, SyncNode, UnknownPod, DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
 };
-use pdn_types::{EntryPath, NonEmpty, PdnId};
-use test_utils::{eventually, host_identity, ids};
+use pdn_types::{PdnId, PodId};
+use test_utils::{host_identity, ids, pod as c};
 
 /// The in-process path has no gossip, so what crosses it crosses on a
 /// pass; at this cadence a handful of passes is milliseconds.
 const RECONCILE: Duration = Duration::from_millis(500);
 
-const GRANTED: &str = "contact/email";
+const FAMILY: PodId = PodId::from_bytes([0xfa; 16]);
+
+/// Both of `pod`'s tickets in `pms`, and its record there.
+async fn publish_pod(pms: &PrivateMetadataStore, pod: PodId, tickets: &PodTickets) -> Result<()> {
+    pms.put_ticket(
+        &pod_ticket_kind(&pod, PodStore::Membership),
+        &tickets.membership,
+    )
+    .await?;
+    pms.put_ticket(&pod_ticket_kind(&pod, PodStore::Records), &tickets.records)
+        .await?;
+    pms.record_pod(pod, Seq::FIRST).await
+}
+
+/// Both of `pod`'s tickets, as [`publish_pod`] left them in `pms`.
+async fn published_pod(pms: &PrivateMetadataStore, pod: PodId) -> Result<PodTickets> {
+    let ticket = async |store| {
+        pms.get_ticket(&pod_ticket_kind(&pod, store))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("a pod's ticket and its payload are local"))
+    };
+    Ok(PodTickets {
+        membership: ticket(PodStore::Membership).await?,
+        records: ticket(PodStore::Records).await?,
+    })
+}
 
 /// Where a hosted identity's replica store lands under `dir`.
 fn store_of(dir: &std::path::Path, identity: PdnId) -> std::path::PathBuf {
@@ -177,18 +202,7 @@ async fn an_identity_created_on_a_running_node_leaves_the_open_store_alone() -> 
     .await?;
 
     let work = host_identity(&node, ids::ALICE_AT_WORK).await?;
-    node.create_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
-        .await?;
-    let author = node.default_author(ids::ALICE_AT_WORK)?;
-    let path = EntryPath::new(GRANTED)?;
-    node.write(
-        ids::ALICE_AT_WORK,
-        ids::ALICE_AT_WORK,
-        author,
-        &path,
-        b"alice@work.example",
-    )
-    .await?;
+    work.record_pod(FAMILY, Seq::FIRST).await?;
 
     let share = node.replica_cache_share_bytes(ids::ALICE_AT_WORK)?;
     node.provision_identity(ids::ALICE_AT_LEISURE).await?;
@@ -208,266 +222,93 @@ async fn an_identity_created_on_a_running_node_leaves_the_open_store_alone() -> 
         work.list_devices().await?.contains(&node.node_id()),
         "the PMS held across the act stopped answering"
     );
-    node.write(
-        ids::ALICE_AT_WORK,
-        ids::ALICE_AT_WORK,
-        author,
-        &path,
-        b"alice2@work.example",
-    )
-    .await?;
-    assert_eq!(
-        node.read(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, &path)
-            .await?
-            .as_deref(),
-        Some(b"alice2@work.example".as_ref()),
-    );
+    work.tombstone_pod(FAMILY, Seq::new(2)).await?;
+    assert_eq!(work.pod_record(FAMILY).await?, Some((Seq::new(2), false)));
 
     node.shutdown().await?;
     Ok(())
 }
 
-/// Two identities of one node that converged in the process converge
-/// again after a restart: every address they hold of each other was
-/// minted by this node before it stopped — the tickets in each
-/// identity's PMS, the device records in them — and each such dial
-/// takes the in-process path rather than failing against the node's own
-/// endpoint.
+/// Two members of one pod hosted on one node that converged in the
+/// process converge again after a restart: every address they hold of each
+/// other was minted by this node before it stopped — the pod's tickets in
+/// each identity's PMS, the device statements in its membership store —
+/// and each such dial takes the in-process path rather than failing
+/// against the node's own endpoint.
 ///
-/// Denied: nothing the grant does not cover crosses the restart either,
-/// so the replica that comes back is the scoped one and not the issuer's
-/// whole store.
+/// Denied: a co-located identity holding both tickets that is no member
+/// takes nothing across the restart either.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one scenario: the run before the restart and the run after
 async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let granted = EntryPath::new(GRANTED)?;
-    let withheld = EntryPath::new("notes/diary")?;
 
     let first = spawn_on(dir.path()).await?;
-    let work_pms = host_identity(&first, ids::ALICE_AT_WORK).await?;
-    let leisure_pms = host_identity(&first, ids::ALICE_AT_LEISURE).await?;
-    let work_namespace = work_pms.namespace();
-    let leisure_namespace = leisure_pms.namespace();
-
-    first
-        .create_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
-        .await?;
-    let work_author = first.default_author(ids::ALICE_AT_WORK)?;
-    first
-        .write(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            work_author,
-            &granted,
-            b"alice@work.example",
-        )
-        .await?;
-    first
-        .write(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            work_author,
-            &withheld,
-            b"dear diary",
-        )
-        .await?;
-
-    // The connection pair, and the grant with the ticket it carries.
-    let work_own = ConnectionMetadataStore::create(&first, ids::ALICE_AT_WORK).await?;
-    work_own.publish_device(first.node_id()).await?;
-    let leisure_own = ConnectionMetadataStore::create(&first, ids::ALICE_AT_LEISURE).await?;
-    leisure_own.publish_device(first.node_id()).await?;
-    let work_read = work_own
-        .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
-        .await?;
-    let leisure_read = leisure_own
-        .share_ticket(ShareMode::Read, AddrInfoOptions::Addresses)
-        .await?;
-    let leisure_as_work_sees =
-        ConnectionMetadataStore::import(&first, ids::ALICE_AT_WORK, leisure_read.clone()).await?;
-    let work_as_leisure_sees =
-        ConnectionMetadataStore::import(&first, ids::ALICE_AT_LEISURE, work_read.clone()).await?;
-    first.host_connection(
-        ids::ALICE_AT_WORK,
-        ids::ALICE_AT_LEISURE,
-        &work_own,
-        &leisure_as_work_sees,
-    )?;
-    first.host_connection(
-        ids::ALICE_AT_LEISURE,
-        ids::ALICE_AT_WORK,
-        &leisure_own,
-        &work_as_leisure_sees,
-    )?;
-
-    let data_read = first
-        .share_ticket(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            ShareMode::Read,
-            AddrInfoOptions::Addresses,
-        )
-        .await?;
-    let data_write = first
-        .share_ticket(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            ShareMode::Write,
-            AddrInfoOptions::Addresses,
-        )
-        .await?;
-    work_own
-        .publish_grant(
-            &ReadGrant {
-                issuer: ids::ALICE_AT_WORK,
-                audience: ids::ALICE_AT_LEISURE,
-                claims: NonEmpty::new(GrantedClaim {
-                    claim: claim_id_of(&ids::ALICE_AT_WORK, &granted),
-                    write: false,
-                }),
-            },
-            &data_read,
-        )
-        .await?;
-    first
-        .import_namespace_scoped(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, data_read.clone())
-        .await?;
+    let (work, work_pms) = c::host(&first).await?;
+    let (leisure, leisure_pms) = c::host(&first).await?;
+    let (carol, carol_pms) = c::host(&first).await?;
+    let pod = c::create(&first, &work).await?;
+    c::invite(
+        &first,
+        &work,
+        pod,
+        &leisure,
+        vec![c::device_of(&first, &leisure)?],
+    )
+    .await?;
+    let tickets = c::tickets(&first, &work, pod).await?;
+    first.import_pod(leisure.id, pod, tickets.clone()).await?;
+    first.import_pod(carol.id, pod, tickets.clone()).await?;
+    let before = c::place_claim(&first, &work, pod, 0x01).await?;
     assert!(
-        eventually(|| async {
-            Ok(first
-                .read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &granted)
-                .await?
-                .as_deref()
-                == Some(b"alice@work.example".as_ref()))
-        })
-        .await?,
-        "the granted claim did not cross before the restart"
+        c::reads(&first, leisure.id, pod, before).await?,
+        "the claim did not cross before the restart"
     );
 
     // Everything the restart needs, where recovery looks for it.
-    work_pms.put_ticket("connection", &work_read).await?;
-    work_pms.put_ticket("data", &data_write).await?;
-    leisure_pms.put_ticket("connection", &leisure_read).await?;
-    leisure_pms.put_ticket("granted", &data_read).await?;
-    first
-        .flush_replicas(ids::ALICE_AT_WORK, work_namespace)
-        .await?;
-    first
-        .flush_replicas(ids::ALICE_AT_LEISURE, leisure_namespace)
-        .await?;
+    let mut hosted = Vec::new();
+    for (identity, pms) in [
+        (work.id, &work_pms),
+        (leisure.id, &leisure_pms),
+        (carol.id, &carol_pms),
+    ] {
+        publish_pod(pms, pod, &tickets).await?;
+        first.flush_replicas(identity, pms.namespace()).await?;
+        hosted.push((identity, pms.namespace()));
+    }
     first.shutdown().await?;
-    drop(work_own);
-    drop(leisure_own);
-    drop(work_pms);
-    drop(leisure_pms);
+    drop((work_pms, leisure_pms, carol_pms));
     drop(first);
 
     // The restart. Every address below was minted by this node before it
     // stopped, so every dial it produces names this node's own endpoint.
     let second = spawn_on(dir.path()).await?;
-    second.provision_identity(ids::ALICE_AT_WORK).await?;
-    second.provision_identity(ids::ALICE_AT_LEISURE).await?;
-    let work_pms = PrivateMetadataStore::open(&second, ids::ALICE_AT_WORK, work_namespace)
-        .await?
-        .expect("the work PMS must come back");
-    let leisure_pms = PrivateMetadataStore::open(&second, ids::ALICE_AT_LEISURE, leisure_namespace)
-        .await?
-        .expect("the leisure PMS must come back");
-    second.host_identity(ids::ALICE_AT_WORK, &work_pms)?;
-    second.host_identity(ids::ALICE_AT_LEISURE, &leisure_pms)?;
-
-    let work_own = ConnectionMetadataStore::import(
-        &second,
-        ids::ALICE_AT_WORK,
-        work_pms
-            .get_ticket("connection")
+    for (identity, namespace) in hosted {
+        second.provision_identity(identity).await?;
+        let pms = PrivateMetadataStore::open(&second, identity, namespace)
             .await?
-            .expect("work's own connection ticket"),
-    )
-    .await?;
-    let leisure_own = ConnectionMetadataStore::import(
-        &second,
-        ids::ALICE_AT_LEISURE,
-        leisure_pms
-            .get_ticket("connection")
-            .await?
-            .expect("leisure's own connection ticket"),
-    )
-    .await?;
-    let leisure_as_work_sees =
-        ConnectionMetadataStore::import(&second, ids::ALICE_AT_WORK, leisure_read).await?;
-    let work_as_leisure_sees =
-        ConnectionMetadataStore::import(&second, ids::ALICE_AT_LEISURE, work_read).await?;
-    second.host_connection(
-        ids::ALICE_AT_WORK,
-        ids::ALICE_AT_LEISURE,
-        &work_own,
-        &leisure_as_work_sees,
-    )?;
-    second.host_connection(
-        ids::ALICE_AT_LEISURE,
-        ids::ALICE_AT_WORK,
-        &leisure_own,
-        &work_as_leisure_sees,
-    )?;
-    second
-        .import_namespace(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            work_pms
-                .get_ticket("data")
-                .await?
-                .expect("work's data ticket"),
-        )
-        .await?;
-    second
-        .import_namespace_scoped(
-            ids::ALICE_AT_LEISURE,
-            ids::ALICE_AT_WORK,
-            leisure_pms
-                .get_ticket("granted")
-                .await?
-                .expect("leisure's granted ticket"),
-        )
-        .await?;
+            .expect("a PMS must come back");
+        second.host_identity(identity, &pms)?;
+        second
+            .import_pod(identity, pod, published_pod(&pms, pod).await?)
+            .await?;
+    }
 
-    // A write after the restart crosses, so the dials the restored
-    // contacts produce ran in the process.
-    let work_author = second.default_author(ids::ALICE_AT_WORK)?;
-    second
-        .write(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            work_author,
-            &granted,
-            b"alice-restarted@work.example",
-        )
-        .await?;
+    let after = c::place_claim(&second, &work, pod, 0x02).await?;
     assert!(
-        eventually(|| async {
-            Ok(second
-                .read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &granted)
-                .await?
-                .as_deref()
-                == Some(b"alice-restarted@work.example".as_ref()))
-        })
-        .await?,
-        "a write did not cross between two identities of one node after a restart"
+        c::reads(&second, leisure.id, pod, after).await?,
+        "a record did not cross between two identities of one node after a restart"
     );
     assert!(
-        second.in_process_sessions(ids::ALICE_AT_LEISURE)? > 0,
+        second.in_process_sessions(leisure.id)? > 0,
         "the restored contacts dialed the node's own endpoint instead of taking the \
          in-process path"
     );
 
-    // Denied: the restart restores what the grant covers and no more.
+    // Denied: the restart restores nothing to an identity that is no member.
     assert_eq!(
-        second
-            .read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &withheld)
-            .await?,
-        None,
-        "the withheld claim crossed the restart"
+        c::held_records(&second, carol.id, pod).await?,
+        Vec::<String>::new(),
+        "the co-located ticket holder took records across the restart"
     );
 
     second.shutdown().await?;
@@ -483,38 +324,20 @@ async fn spawn_on(dir: &std::path::Path) -> Result<SyncNode> {
 }
 
 /// Every create and import names the identity whose stores hold it, and
-/// one naming an identity this node does not host is refused with
-/// nothing registered — not for the named identity, which has no stack,
-/// and not for the identity hosted beside it.
+/// one naming an identity this node does not host is refused with nothing
+/// registered — not for the named identity, which has no stack, and not
+/// for the identity hosted beside it.
 ///
-/// Denied: the PMS, the connection metadata store and the data
-/// namespace all refuse the same way, and the hosted identity's own
-/// issuer stays the only one it resolves.
+/// Denied: the PMS and a pod's stores refuse the same way, and the hosted
+/// identity's own pod stays the only one it holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_naming_an_identity_the_node_does_not_host_registers_nothing() -> Result<()> {
     let node = SyncNode::spawn(SpawnOptions::memory()).await?;
-    let work = host_identity(&node, ids::ALICE_AT_WORK).await?;
-    node.create_namespace(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK)
-        .await?;
-    let author = node.default_author(ids::ALICE_AT_WORK)?;
-    let path = EntryPath::new(GRANTED)?;
-    node.write(
-        ids::ALICE_AT_WORK,
-        ids::ALICE_AT_WORK,
-        author,
-        &path,
-        b"alice@work.example",
-    )
-    .await?;
-    let data_ticket = node
-        .share_ticket(
-            ids::ALICE_AT_WORK,
-            ids::ALICE_AT_WORK,
-            ShareMode::Read,
-            AddrInfoOptions::RelayAndAddresses,
-        )
-        .await?;
-    let pms_ticket = work
+    let (work, work_pms) = c::host(&node).await?;
+    let pod = c::create(&node, &work).await?;
+    let record = c::place_claim(&node, &work, pod, 0x01).await?;
+    let tickets = c::tickets(&node, &work, pod).await?;
+    let pms_ticket = work_pms
         .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
         .await?;
 
@@ -525,10 +348,8 @@ async fn an_import_naming_an_identity_the_node_does_not_host_registers_nothing()
         PrivateMetadataStore::import(&node, ids::ALICE_AT_LEISURE, pms_ticket)
             .await
             .err(),
-        ConnectionMetadataStore::create(&node, ids::ALICE_AT_LEISURE)
-            .await
-            .err(),
-        node.import_namespace_scoped(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, data_ticket)
+        node.create_pod(ids::ALICE_AT_LEISURE, FAMILY).await.err(),
+        node.import_pod(ids::ALICE_AT_LEISURE, pod, tickets)
             .await
             .err(),
     ] {
@@ -542,27 +363,24 @@ async fn an_import_naming_an_identity_the_node_does_not_host_registers_nothing()
     }
 
     // Nothing was registered for either identity: the named one still has
-    // no stack, and the hosted one resolves only the issuer it created.
+    // no stack, and the hosted one holds only the pod it created.
     let unhosted = node
-        .read(ids::ALICE_AT_LEISURE, ids::ALICE_AT_WORK, &path)
+        .read_pod_record(ids::ALICE_AT_LEISURE, pod, &record)
         .await
-        .expect_err("an unhosted identity must resolve nothing");
+        .expect_err("an unhosted identity must hold nothing");
     assert!(unhosted
         .downcast_ref::<data_layer::IdentityNotProvisioned>()
         .is_some());
     let unknown = node
-        .read(ids::ALICE_AT_WORK, ids::ALICE_AT_LEISURE, &path)
-        .await
-        .expect_err("the hosted identity must not have gained an issuer");
-    assert!(unknown
-        .downcast_ref::<data_layer::UnknownIssuer>()
-        .is_some());
+        .pod_stores(work.id, FAMILY)
+        .expect_err("the hosted identity must not have gained a pod");
+    assert!(unknown.downcast_ref::<UnknownPod>().is_some());
     assert_eq!(
-        node.read(ids::ALICE_AT_WORK, ids::ALICE_AT_WORK, &path)
+        node.read_pod_record(work.id, pod, &record)
             .await?
             .as_deref(),
-        Some(b"alice@work.example".as_ref()),
-        "the hosted identity's own replica must be untouched"
+        Some(b"claim".as_ref()),
+        "the hosted identity's own pod must be untouched"
     );
 
     node.shutdown().await?;

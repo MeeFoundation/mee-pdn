@@ -144,7 +144,7 @@ pub(crate) async fn list_records(
 
 /// `GET …/pods/{pod}/records/{member}/{kind}/{id}` — a claim or an
 /// immutable-document; 404 covers both "no such record" and "payload still
-/// arriving", as an entry read does.
+/// arriving".
 pub(crate) async fn read(
     State(runtime): State<Arc<Runtime>>,
     Path((identity, pod, member, kind, id)): Path<(String, String, String, String, String)>,

@@ -1,16 +1,11 @@
-//! The device-linking protocol (ADR-0012): establishment's shape on a
-//! dedicated ALPN — separate from pairing's because the stakes differ (a
-//! whole-PMS write ticket versus per-connection read tickets), so the
-//! two wire formats evolve independently. The inviter verifies-and-burns
-//! before any state change, registers the newcomer as pending under the
-//! connection's authenticated node id, and replies with fresh write tickets
-//! to the PMS and the data namespace. Pending confers nothing; the
-//! newcomer confirms itself once the tickets are in hand, since only a
-//! holder of the PMS's write ticket can, which is evidence the reply
+//! The device-linking protocol (ADR-0012): one raw exchange on its own
+//! ALPN. The inviter verifies-and-burns before any state change, registers
+//! the newcomer as pending under the connection's authenticated node id,
+//! and replies with a fresh write ticket to the PMS. Pending confers
+//! nothing; the newcomer confirms itself once the ticket is in hand, since
+//! only a holder of the PMS's write ticket can, which is evidence the reply
 //! arrived. The dial side arms classification the moment the PMS is
-//! imported — before the data namespace exists, so no serving window opens
-//! on the long-lived namespace id — and rolls everything back on any
-//! failure after the import.
+//! imported and rolls everything back on any failure after the import.
 
 use std::{
     sync::{
@@ -23,14 +18,14 @@ use std::{
 use anyhow::{Context, Result};
 use data_layer::{
     AcceptError, AddrInfoOptions, Connection, DocTicket, EndpointAddr, NamespaceId,
-    NamespaceImport, PrivateMetadataStore, ProtocolHandler, ShareMode,
+    PrivateMetadataStore, ProtocolHandler, ShareMode,
 };
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
-    pairing::{read_message, write_message, StateSlot},
+    ceremony::{read_message, write_message, InviterUnreachable, StateSlot},
     runtime::{HostedIdentity, ServingHalves, State},
 };
 
@@ -63,7 +58,7 @@ pub struct UnsupportedLinkingVersion {
 /// The dialogue reached the inviting device and ended without an answer.
 /// Reasonless by design; a connection that dies once the request is away,
 /// or a handler that fails internally, surfaces the same way. Distinct from
-/// [`InviterUnreachable`](crate::pairing::InviterUnreachable), from
+/// [`InviterUnreachable`], from
 /// [`DialogueTimeout`], and from [`data_layer::CatchUpTimeout`]. Downcast
 /// from the `anyhow::Error` of `link`.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -98,7 +93,6 @@ pub struct LinkingInProgress {
 pub enum LinkingLocalFailure {
     PendingDeviceWrite { identity: PdnId, newcomer: NodeId },
     PmsTicketMint { identity: PdnId, newcomer: NodeId },
-    DataTicketMint { identity: PdnId, newcomer: NodeId },
 }
 
 /// No node id: the inviter takes the newcomer's from the connection's
@@ -110,12 +104,11 @@ struct LinkingRequest {
     secret: [u8; 32],
 }
 
-/// Both minted fresh from local replicas: the ceremony reads nothing through
+/// Minted fresh from the local replica: the ceremony reads nothing through
 /// PMS ticket entries, so no payload wait sits in the critical path.
 #[derive(Debug, Serialize, Deserialize)]
 struct LinkingResponse {
     pms: DocTicket,
-    data: DocTicket,
 }
 
 /// The accept side of the linking dialogue.
@@ -184,7 +177,7 @@ impl LinkingHandler {
                 return None;
             }
 
-            // Every device that can mint an invite hosts both replicas —
+            // Every device that can mint an invite hosts the PMS replica —
             // the first by creation, every further one by its own reply.
             let pms_ticket = match pms
                 .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -199,29 +192,7 @@ impl LinkingHandler {
                     return None;
                 }
             };
-            let data = match state
-                .node
-                .share_ticket(
-                    identity,
-                    identity,
-                    ShareMode::Write,
-                    AddrInfoOptions::RelayAndAddresses,
-                )
-                .await
-            {
-                Ok(ticket) => ticket,
-                Err(err) => {
-                    let _ = state
-                        .linking_failures
-                        .send(LinkingLocalFailure::DataTicketMint { identity, newcomer });
-                    tracing::error!(%identity, %newcomer, "linking failed after invite burn while minting the data ticket: {err:#}");
-                    return None;
-                }
-            };
-            LinkingResponse {
-                pms: pms_ticket,
-                data,
-            }
+            LinkingResponse { pms: pms_ticket }
         };
 
         // Registration precedes the reply: a lost response leaves the
@@ -305,7 +276,9 @@ async fn link_via_dialogue_inner(
     cleanup_tasks: crate::runtime::CleanupSupervisor,
 ) -> Result<()> {
     // The dialogue spends from the budget first; the catch-up gets the rest.
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("linking budget out of range")?;
 
     // Nothing local minted yet: a failure up to the reply rolls back nothing.
     let response =
@@ -343,7 +316,7 @@ async fn link_via_dialogue_inner(
                 Ok(pms) => pms,
                 Err(err) => {
                     drop(state_guard);
-                    undo_link(state, payload.identity, None, None).await;
+                    undo_link(state, payload.identity, None).await;
                     rollback.disarm();
                     return Err(err);
                 }
@@ -354,7 +327,7 @@ async fn link_via_dialogue_inner(
             Ok(catch_up) => catch_up,
             Err(err) => {
                 drop(state_guard);
-                undo_link(state, payload.identity, Some(pms.namespace()), None).await;
+                undo_link(state, payload.identity, Some(pms.namespace())).await;
                 rollback.disarm();
                 return Err(err);
             }
@@ -363,22 +336,9 @@ async fn link_via_dialogue_inner(
         // so no serving window opens on the long-lived namespace id.
         if let Err(err) = state_guard.node.host_identity(payload.identity, &pms) {
             drop(state_guard);
-            undo_link(state, payload.identity, Some(pms.namespace()), None).await;
+            undo_link(state, payload.identity, Some(pms.namespace())).await;
             rollback.disarm();
             return Err(err);
-        }
-        let data_import = state_guard
-            .node
-            .import_namespace(payload.identity, payload.identity, response.data)
-            .await;
-        match data_import {
-            Ok(data_import) => rollback.set_data_import(data_import),
-            Err(err) => {
-                drop(state_guard);
-                undo_link(state, payload.identity, Some(pms.namespace()), None).await;
-                rollback.disarm();
-                return Err(err);
-            }
         }
         (pms, catch_up)
     };
@@ -437,14 +397,17 @@ async fn link_via_dialogue_inner(
         rollback.roll_back().await;
         return Err(err).context("the hosting record could not be written");
     }
-    guard
-        .identities
-        .insert(payload.identity, HostedIdentity { pms, author });
     // Past the commit point the link stands: a failure below does not fail
     // it, so a cancellation must not undo it either, and the armer starts
     // before the one await that could be cancelled.
     rollback.disarm();
-    crate::connections::spawn_connection_armer(Arc::downgrade(state), payload.identity, changes);
+    crate::runtime::admit_hosted(
+        state,
+        &mut guard,
+        payload.identity,
+        HostedIdentity { pms, author },
+        changes,
+    );
 
     #[cfg(feature = "test-util")]
     if let Some(pause) = guard.link_after_commit_pause.take() {
@@ -464,8 +427,7 @@ async fn link_via_dialogue_inner(
         guard.node.node_id(),
         "the dial's authenticated id is this node's own"
     );
-    if let Err(err) =
-        crate::connections::ensure_own_device_confirmed(&mut guard, payload.identity).await
+    if let Err(err) = crate::armer::ensure_own_device_confirmed(&mut guard, payload.identity).await
     {
         tracing::warn!(
             identity = %payload.identity,
@@ -539,7 +501,6 @@ struct LinkRollbackGuard {
     /// node comes up before it, and that half is the first thing a failure
     /// has to take back down.
     pms_namespace: Option<NamespaceId>,
-    data_import: Option<SelfCleaningImport>,
     owns_reservation_cleanup: Arc<AtomicBool>,
     cleanup_tasks: crate::runtime::CleanupSupervisor,
     armed: bool,
@@ -559,7 +520,6 @@ impl LinkRollbackGuard {
             state,
             identity,
             pms_namespace: None,
-            data_import: None,
             owns_reservation_cleanup,
             cleanup_tasks,
             armed: true,
@@ -570,35 +530,15 @@ impl LinkRollbackGuard {
         self.pms_namespace = Some(namespace);
     }
 
-    fn set_data_import(&mut self, data_import: NamespaceImport) {
-        self.data_import = Some(SelfCleaningImport::new(
-            Arc::clone(&self.state),
-            data_import,
-            self.cleanup_tasks.clone(),
-        ));
-    }
-
-    fn take_data_import(&mut self) -> Option<SelfCleaningImport> {
-        self.data_import.take()
-    }
-
     async fn roll_back(&mut self) {
-        let data_import = self.take_data_import();
-        undo_link(&self.state, self.identity, self.pms_namespace, data_import).await;
+        undo_link(&self.state, self.identity, self.pms_namespace).await;
         self.disarm();
     }
 
-    /// Commits any still-held `data_import` too: `Drop` on the guard does
-    /// not stop its fields from being dropped in turn, and a
-    /// `SelfCleaningImport` left in `Some` would self-undo on the success
-    /// path.
     fn disarm(&mut self) {
         self.armed = false;
         self.owns_reservation_cleanup
             .store(false, Ordering::Release);
-        if let Some(import) = self.data_import.take() {
-            import.commit();
-        }
     }
 }
 
@@ -610,71 +550,11 @@ impl Drop for LinkRollbackGuard {
         let state = Arc::clone(&self.state);
         let identity = self.identity;
         let pms_namespace = self.pms_namespace;
-        let data_import = self.data_import.take();
         let owns_reservation_cleanup = Arc::clone(&self.owns_reservation_cleanup);
         self.cleanup_tasks.spawn(async move {
-            undo_link(&state, identity, pms_namespace, data_import).await;
+            undo_link(&state, identity, pms_namespace).await;
             state.lock().await.linking_in_flight.remove(&identity);
             owns_reservation_cleanup.store(false, Ordering::Release);
-        });
-    }
-}
-
-/// A `NamespaceImport` that undoes itself if dropped before [`Self::undo`]
-/// runs: the obligation travels with the value, because a bare import moved
-/// into a local ahead of an `.await` would lose it the instant that future
-/// is dropped — a race [`LinkRollbackGuard`]'s `Drop` cannot see, its
-/// field being empty by then.
-struct SelfCleaningImport {
-    state: Arc<Mutex<State>>,
-    import: Option<NamespaceImport>,
-    cleanup_tasks: crate::runtime::CleanupSupervisor,
-}
-
-impl SelfCleaningImport {
-    fn new(
-        state: Arc<Mutex<State>>,
-        import: NamespaceImport,
-        cleanup_tasks: crate::runtime::CleanupSupervisor,
-    ) -> Self {
-        Self {
-            state,
-            import: Some(import),
-            cleanup_tasks,
-        }
-    }
-
-    /// Spawned and awaited: the undo runs to completion even if the caller
-    /// is dropped mid-await, and means "undone" for one that is not.
-    async fn undo(mut self) {
-        let Some(import) = self.import.take() else {
-            return;
-        };
-        let state = Arc::clone(&self.state);
-        let handle = self.cleanup_tasks.spawn(async move {
-            let state = state.lock().await;
-            let _ = state.node.undo_import_namespace(import).await;
-        });
-        let _ = handle.await;
-    }
-
-    /// Clearing `import` is what makes the coming `Drop` a no-op.
-    fn commit(mut self) {
-        self.import = None;
-    }
-}
-
-impl Drop for SelfCleaningImport {
-    /// Fires only when `undo` was never called — a cancellation before the
-    /// value's own cleanup started.
-    fn drop(&mut self) {
-        let Some(import) = self.import.take() else {
-            return;
-        };
-        let state = Arc::clone(&self.state);
-        self.cleanup_tasks.spawn(async move {
-            let state = state.lock().await;
-            let _ = state.node.undo_import_namespace(import).await;
         });
     }
 }
@@ -687,7 +567,7 @@ async fn run_linking_dialogue(
     let connection = dial
         .connect(payload.inviter_addr.clone(), LINKING_ALPN)
         .await
-        .context(crate::pairing::InviterUnreachable)?;
+        .context(InviterUnreachable)?;
     let response: LinkingResponse = async {
         let (mut send, mut recv) = connection.open_bi().await?;
         write_message(
@@ -707,88 +587,14 @@ async fn run_linking_dialogue(
     Ok(response)
 }
 
-/// Undo an abandoned link's local effects, best-effort: the data import,
-/// the PMS, then the identity's half of the node, whose removal
-/// disarms it. The link brought up that half, so dropping it reaches
-/// exactly what the link imported and nothing else: a namespace of the same
-/// issuer held under another identity's grant is in that identity's stores
-/// and is untouched. Locks `state` only after the
-/// import is undone — [`SelfCleaningImport::undo`] locks it itself.
-async fn undo_link(
-    state: &Arc<Mutex<State>>,
-    identity: PdnId,
-    pms_namespace: Option<NamespaceId>,
-    data_import: Option<SelfCleaningImport>,
-) {
-    if let Some(import) = data_import {
-        import.undo().await;
-    }
+/// Undo an abandoned link's local effects, best-effort: the PMS, then the
+/// identity's half of the node, whose removal disarms it. The link brought
+/// up that half, so dropping it reaches exactly what the link imported and
+/// nothing else.
+async fn undo_link(state: &Arc<Mutex<State>>, identity: PdnId, pms_namespace: Option<NamespaceId>) {
     let state = state.lock().await;
     if let Some(pms) = pms_namespace {
         let _ = state.node.forget_doc(identity, pms).await;
     }
     let _ = state.node.unhost_identity(identity).await;
-}
-
-// `tracked_doc_count` is behind `test-util`.
-#[cfg(all(test, feature = "test-util"))]
-mod tests {
-    use data_layer::SyncNode;
-    use test_utils::ids;
-
-    use super::*;
-    use crate::runtime::Runtime;
-
-    /// The one-instruction race `LinkRollbackGuard`'s `Drop` cannot see,
-    /// pinned deterministically; the cancellation sweep in
-    /// `tests/linking.rs` cannot reliably land on it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dropping_without_undo_still_undoes_the_import() -> Result<()> {
-        let rt = Runtime::spawn(data_layer::SpawnOptions::memory()).await?;
-        let state = Arc::clone(&rt.state);
-
-        let scratch = SyncNode::spawn(data_layer::SpawnOptions::memory()).await?;
-        scratch.provision_identity(ids::DAVE).await?;
-        scratch.create_namespace(ids::DAVE, ids::DAVE).await?;
-        let ticket = scratch
-            .share_ticket(
-                ids::DAVE,
-                ids::DAVE,
-                ShareMode::Write,
-                AddrInfoOptions::RelayAndAddresses,
-            )
-            .await?;
-
-        let (import, before) = {
-            let guard = state.lock().await;
-            guard.node.provision_identity(ids::ALICE).await?;
-            let import = guard
-                .node
-                .import_namespace(ids::ALICE, ids::DAVE, ticket)
-                .await?;
-            let before = guard.node.tracked_doc_count(ids::ALICE)?;
-            (import, before)
-        };
-
-        let cleanup_tasks = state.lock().await.cleanup_tasks.clone();
-        drop(SelfCleaningImport::new(
-            Arc::clone(&state),
-            import,
-            cleanup_tasks,
-        ));
-
-        let settled = test_utils::eventually(|| async {
-            let guard = state.lock().await;
-            Ok(guard.node.tracked_doc_count(ids::ALICE)? < before)
-        })
-        .await?;
-        assert!(
-            settled,
-            "dropping SelfCleaningImport without calling undo() must still undo the import"
-        );
-
-        rt.shutdown().await?;
-        scratch.shutdown().await?;
-        Ok(())
-    }
 }

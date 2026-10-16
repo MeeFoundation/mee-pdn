@@ -10,8 +10,8 @@
 //! methods (`entry_get`, `entry_put`) pass through unfiltered — ingest is
 //! the `validate_entry` hook's concern.
 //!
-//! The domain meaning of a filter (grants, identities) stays outside this
-//! crate: an embedder hands in opaque predicates over [`SignedEntry`]
+//! The domain meaning of a filter (membership, identities) stays outside
+//! this crate (ADR-0014): an embedder hands in opaque predicates over [`SignedEntry`]
 //! through a [`SessionAccessProvider`], consulted per session on both
 //! session roles — accepting an incoming sync request and dialing out —
 //! because both ends of a reconciliation serve entries. The provider sees
@@ -39,10 +39,16 @@ pub type EntryFilter = Arc<dyn Fn(&SignedEntry) -> bool + Send + Sync + 'static>
 /// entry a session carries, so it must be cheap.
 ///
 /// It rides the session the way [`EntryFilter`] does, which is what makes
-/// a write set frozen at setup hold for that session and no longer: a
-/// verdict kept beside the session instead would outlive it and admit,
-/// under a grant already withdrawn, what a later session offers.
+/// a verdict decided at setup hold for that session and no longer: one kept
+/// beside the session instead would outlive it and admit, after the caller
+/// was removed, what a later session offers.
 pub type SessionIngest = Arc<dyn Fn(&SignedEntry) -> ValidateOutcome + Send + Sync + 'static>;
+
+/// The verdict taking every entry that passed its signatures and the
+/// timestamp window.
+pub fn admit_all() -> SessionIngest {
+    Arc::new(|_| ValidateOutcome::Accept)
+}
 
 /// What one session may see of a replica and what it may put into it,
 /// decided at session setup and frozen for the session.
@@ -50,12 +56,12 @@ pub type SessionIngest = Arc<dyn Fn(&SignedEntry) -> ValidateOutcome + Send + Sy
 pub enum SessionAccess {
     /// The session proceeds. `egress` narrows what this side reveals —
     /// `None` reveals the replica whole — and `ingest` judges every entry
-    /// the peer offers; `None` leaves that to the consumer's validator.
+    /// the peer offers past its signatures and the timestamp window.
     Allow {
         /// What this side reveals; `None` reveals the replica whole.
         egress: Option<EntryFilter>,
-        /// What this side admits; `None` leaves it to the validator.
-        ingest: Option<SessionIngest>,
+        /// What this side admits; [`admit_all`] takes every entry.
+        ingest: SessionIngest,
         /// What the decision was read from; only an accepting node
         /// checks it.
         rests_on: RestsOn,
@@ -82,11 +88,11 @@ pub enum RestsOn {
 }
 
 impl SessionAccess {
-    /// The whole replica out, and the consumer's validator alone in.
+    /// The whole replica out, and every entry in.
     pub fn whole() -> Self {
         Self::Allow {
             egress: None,
-            ingest: None,
+            ingest: admit_all(),
             rests_on: RestsOn::Nothing,
         }
     }
@@ -96,13 +102,11 @@ impl std::fmt::Debug for SessionAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SessionAccess::Allow {
-                egress,
-                ingest,
-                rests_on,
+                egress, rests_on, ..
             } => f
                 .debug_struct("Allow")
                 .field("egress", &egress.as_ref().map(|_| "filtered"))
-                .field("ingest", &ingest.as_ref().map(|_| "judged"))
+                .field("ingest", &"judged")
                 .field("rests_on", rests_on)
                 .finish(),
             SessionAccess::Deny => write!(f, "Deny"),
@@ -317,12 +321,12 @@ mod tests {
     fn session_access_debug_is_opaque() {
         let access = SessionAccess::Allow {
             egress: Some(Arc::new(|_| true)),
-            ingest: None,
+            ingest: admit_all(),
             rests_on: RestsOn::Nothing,
         };
         assert_eq!(
             format!("{access:?}"),
-            r#"Allow { egress: Some("filtered"), ingest: None, rests_on: Nothing }"#
+            r#"Allow { egress: Some("filtered"), ingest: "judged", rests_on: Nothing }"#
         );
     }
 }

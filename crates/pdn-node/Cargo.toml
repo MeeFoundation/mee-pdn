@@ -3,46 +3,42 @@ name = "pdn-node"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Embeddable node runtime: identity, connections, data, and sync services over data-layer"
+description = "Embeddable node runtime: identity, pods and sync services over data-layer"
 
 [features]
 # Extra API surface that exists only to support scenario tests, never the
-# product: `RuntimeDataService::write_unguarded`, the courtesy-bypassing
-# write that lets a test deterministically produce an entry the issuer's
-# ingest gate refuses (a stale-grant race or an adversarial client in the
-# field; here, on demand). Off in every product build; the `just` dev
-# recipes turn it on. Named after tokio's `test-util` (and singular, so it
-# does not collide with the `test-utils` crate). Not `cfg(test)`:
-# integration tests compile the crate as an external dependency, where
-# `cfg(test)` is never set. Enables data-layer's observation surface too
-# (`RuntimeDataService::contacts_of` reads the tracked contact set through
-# it).
+# product: the runtime's fault and pause hooks (`fail_next_*_for_test`,
+# `pause_next_*`, `forge_next_join_for_test`), which land a failure, a
+# race or a modified inviter's offer on a chosen step, on demand. Off in
+# every product build; the `just` dev recipes turn it on. Named after
+# tokio's `test-util` (and singular, so it does not collide with the
+# `test-utils` crate). Not `cfg(test)`: integration tests compile the crate
+# as an external dependency, where `cfg(test)` is never set. Enables
+# data-layer's observation surface too (the membership and record views
+# and the replica counts the hooks hand on).
 test-util = ["data-layer/test-util"]
 
 [dependencies]
 anyhow = "1"
 data-layer = { path = "../data-layer" }
-# Consuming data-layer's PMS change stream (the connection armer).
+# Consuming data-layer's PMS change stream (the identity armer).
 futures-lite = "2"
 pdn-types = { path = "../pdn-types" }
-# Wire messages of the pairing dialogue.
+# Wire messages of the ceremonies.
 # Per-crate, matching the in-tree 1.1.3 from pdn-store
 postcard = { version = "1.1.3", features = ["use-std"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-# `rt` for the detached connection-armer task the runtime spawns per
+# `rt` for the detached identity-armer task the runtime spawns per
 # hosted identity.
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-# Retraction verdicts warn through the ecosystem's subscriber; already in
+# Background failures warn through the ecosystem's subscriber; already in
 # the graph via iroh.
 tracing = { workspace = true }
 
 [dev-dependencies]
-# The retraction event's content hash is the payload's blake3 hash, and a
-# scenario asserts it against the bytes it wrote.
-blake3 = "1.8"
 # Scenario tests probe an identity's PMS by running the linking
 # dialogue raw against a bare node — the store-level view of what the
 # ceremonies published, and the pin on the linking wire format.

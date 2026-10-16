@@ -15,7 +15,7 @@ use data_layer::{
     MemberState, MembershipKey, PodStore, Seq, SessionTrace, ShareMode, SpawnOptions, SyncNode,
 };
 use pdn_store::SessionRole;
-use pdn_types::{NodeId, PodId};
+use pdn_types::{NodeId, PdnId, PodId};
 use test_utils::{
     eventually, host_identity, join_identity,
     pod::{
@@ -57,6 +57,21 @@ fn nowhere(seed: u8) -> MemberDevice {
         node: NodeId::from_bytes(*key.as_bytes()),
         author: AuthorId::from([seed; 32]),
     }
+}
+
+/// `member`'s device statement at version 2, written from its own device.
+async fn second_statement(
+    node: &SyncNode,
+    member: &Person,
+    pod: PodId,
+    devices: Vec<MemberDevice>,
+) -> Result<()> {
+    let key = MembershipKey::Devices {
+        member: member.id,
+        version: 2,
+    };
+    let payload = member.keys.device_statement(&pod, 2, devices).encode();
+    write(node, member, pod, key, payload).await
 }
 
 /// A dial of one of `pod`'s stores from `holder`'s replica on `from` to
@@ -420,6 +435,98 @@ async fn an_invited_device_is_a_contact_once_the_invite_is_written() -> Result<(
     Ok(())
 }
 
+/// A device a member's ticket names is a contact, as that member, through
+/// every derivation while no statement lists it, and keeps the ticket's
+/// addresses once one does. Paired denial: a ticket naming the same device
+/// as an identity that is no member makes it no contact as that identity.
+///
+/// The derivation is forced by a local write after the import, since one
+/// the import's own entries start may run before or after the assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_a_members_ticket_names_stays_a_contact_until_a_statement_lists_it() -> Result<()>
+{
+    let (alice_phone, alice_laptop, bob_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let dave = Person::generate();
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    let laptop = alice_laptop.dial_handle().addr();
+    let mut handed = tickets(&alice_phone, &alice, pod).await?;
+    for ticket in [&mut handed.membership, &mut handed.records] {
+        ticket.nodes.push(laptop.clone());
+    }
+    let mut as_dave = handed.clone();
+    for ticket in [&mut as_dave.membership, &mut as_dave.records] {
+        ticket.nodes = vec![laptop.clone()];
+        ticket.identity = identity_of(dave.id);
+    }
+    bob_phone
+        .import_pod_with(bob.id, pod, handed, &[as_dave])
+        .await?;
+    assert!(lists(&bob_phone, bob.id, pod, alice.id, OWNER).await?);
+    second_statement(&bob_phone, &bob, pod, vec![device_of(&bob_phone, &bob)?]).await?;
+    let named = |contacts: &[Contact], as_whom: PdnId| {
+        contacts
+            .iter()
+            .find(|contact| {
+                contact.addr.id == laptop.id && contact.identity == identity_of(as_whom)
+            })
+            .map(|contact| contact.addr.clone())
+    };
+    for store in [PodStore::Membership, PodStore::Records] {
+        let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, store)?;
+        assert_eq!(
+            named(&contacts, alice.id),
+            Some(laptop.clone()),
+            "{store:?}: the device the member's ticket names is no contact"
+        );
+        // Denied: the same device as no member.
+        assert_eq!(named(&contacts, dave.id), None);
+    }
+
+    let laptops = MemberDevice {
+        node: NodeId::from_bytes(*laptop.id.as_bytes()),
+        author: AuthorId::from([0xa2; 32]),
+    };
+    let alices = vec![device_of(&alice_phone, &alice)?, laptops];
+    second_statement(&alice_phone, &alice, pod, alices).await?;
+    dial(
+        &bob_phone,
+        &bob,
+        pod,
+        PodStore::Membership,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    assert!(lists_device(&bob_phone, bob.id, pod, alice.id, laptops).await?);
+    for store in [PodStore::Membership, PodStore::Records] {
+        let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, store)?;
+        assert_eq!(
+            named(&contacts, alice.id),
+            Some(laptop.clone()),
+            "{store:?}: the listed device lost the ticket's addresses"
+        );
+    }
+
+    for node in [alice_phone, alice_laptop, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A device another member's invite lists is a contact, as the newcomer,
 /// once the session that brings the invite ends, with no quiet wait before
 /// it: the newcomer's first announcement can come at once. Paired: before
@@ -491,8 +598,8 @@ async fn a_device_an_arriving_invite_lists_is_a_contact_with_no_quiet_wait() -> 
 }
 
 /// A newcomer's record store reaches the inviter by its ticket, and the
-/// inviter's claim reads, though the membership store's first session
-/// derives contacts that leave the inviter's device out. Alice's statement
+/// inviter's claim reads, though no statement lists the inviter's device
+/// when the membership store's first session derives contacts. Alice's statement
 /// lists another node here, as a membership view lists none while the
 /// payloads are still on their way; the start is held between the two stores
 /// until that derivation lands, which the stress pass meets only now and
@@ -534,17 +641,16 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     let tickets = tickets(&alice_phone, &alice, pod).await?;
 
     let pause = bob_phone.pause_next_pod_start_for_test();
-    let only_elsewhere = |contacts: Vec<Contact>| {
-        contacts.len() == 1
-            && contacts
-                .iter()
-                .all(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes())
+    let lists_elsewhere = |contacts: Vec<Contact>| {
+        contacts
+            .iter()
+            .any(|contact| contact.addr.id.as_bytes() == elsewhere.node.as_bytes())
     };
     let (imported, derived) = tokio::join!(bob_phone.import_pod(bob.id, pod, tickets), async {
         pause.reached.notified().await;
         let derived = eventually(|| async {
             let contacts = bob_phone.pod_contacts_for_test(bob.id, pod, PodStore::Records)?;
-            Ok(only_elsewhere(contacts))
+            Ok(lists_elsewhere(contacts))
         })
         .await;
         pause.release.notify_one();
@@ -928,16 +1034,29 @@ async fn a_write_whose_announcement_was_lost_arrives_at_the_next_run() -> Result
 }
 
 /// The pass over every other store leaves a pod's stores to their own
-/// interval: a write whose announcement a member device missed stays
-/// missing through runs of that pass while the pod pass is out of reach.
+/// interval: through runs of that pass a write into the PMS reaches the
+/// device from its sibling, while a write into a pod's store whose
+/// announcement the device missed stays missing with the pod pass out of
+/// reach.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
-    let (alice_phone, bob_phone) = (
+    let (alice_phone, bob_phone, bob_laptop) = (
         node(QUIET, QUIET).await?,
         node(Duration::from_millis(100), QUIET).await?,
+        node(QUIET, QUIET).await?,
     );
     let (alice, _) = host(&alice_phone).await?;
-    let (bob, _) = host(&bob_phone).await?;
+    let (bob, bob_pms) = host(&bob_phone).await?;
+    let laptop_pms = join_identity(
+        &bob_laptop,
+        bob.id,
+        bob_pms
+            .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
+            .await?,
+    )
+    .await?;
+    bob_pms.add_device(bob_laptop.node_id()).await?;
+    laptop_pms.add_device(bob_laptop.node_id()).await?;
     let pod = create(&alice_phone, &alice).await?;
     invite(
         &alice_phone,
@@ -957,6 +1076,18 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
 
     let erin = Person::generate();
     invite(&alice_phone, &alice, pod, &erin, vec![nowhere(0xe0)]).await?;
+    // Out of the swarm, with no pass of its own, the laptop announces
+    // nothing: the write reaches the phone through the phone's pass alone.
+    bob_laptop
+        .leave_swarm_for_test(bob.id, laptop_pms.namespace())
+        .await?;
+    let wedding = PodId::from_bytes([0xf9; 16]);
+    laptop_pms.record_pod(wedding, Seq::FIRST).await?;
+    assert!(
+        eventually(|| async { Ok(bob_pms.pod_record(wedding).await? == Some((Seq::FIRST, true))) })
+            .await?,
+        "the pass did not reconcile the PMS"
+    );
     // Sentinel: ten runs of the other pass after the write.
     let after_write = bob_phone.reconcile_passes();
     assert!(eventually(|| async { Ok(bob_phone.reconcile_passes() >= after_write + 10) }).await?);
@@ -966,7 +1097,7 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
         "the pass over other stores reconciled a pod store"
     );
 
-    for node in [alice_phone, bob_phone] {
+    for node in [alice_phone, bob_phone, bob_laptop] {
         node.shutdown().await?;
     }
     Ok(())
@@ -1836,24 +1967,42 @@ async fn two_nodes_sharing_sixty_pods_keep_live_delivery_in_each() -> Result<()>
             vec![device_of(&bob_phone, &bob)?],
         )
         .await?;
+        // As a join does: caught up, and Alice listed, before Bob writes;
+        // a write ahead of that meets a pull Bob refuses for a member it
+        // does not know yet, and nothing pulls again with the passes off.
         bob_phone
             .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
+            .await?
+            .wait(TIMEOUT)
             .await?;
+        assert!(lists(&bob_phone, bob.id, pod, alice.id, OWNER).await?);
         pods.push(pod);
     }
 
-    let ends = [pods.first().copied(), pods.last().copied()];
-    for pod in ends.into_iter().flatten() {
+    let ends = [
+        (0, pods.first().copied()),
+        (SHARED - 1, pods.last().copied()),
+    ];
+    for (index, pod) in ends {
+        let pod = pod.expect("sixty pods");
         let from_alice = place_claim(&alice_phone, &alice, pod, 1).await?;
         let from_bob = place_claim(&bob_phone, &bob, pod, 2).await?;
         assert!(
             reads(&bob_phone, bob.id, pod, from_alice).await?,
-            "Alice's claim did not reach Bob's node over the swarm"
+            "Alice's claim did not reach Bob's node over the swarm in pod {index}"
         );
-        assert!(
-            reads(&alice_phone, alice.id, pod, from_bob).await?,
-            "Bob's claim did not reach Alice's node over the swarm"
-        );
+        if !reads(&alice_phone, alice.id, pod, from_bob).await? {
+            let owner = alice_phone.pod_record_view(alice.id, pod).await;
+            let writer = bob_phone.pod_record_view(bob.id, pod).await;
+            let in_flight = (
+                alice_phone.pod_syncs_in_flight_for_test(pod).await,
+                bob_phone.pod_syncs_in_flight_for_test(pod).await,
+            );
+            anyhow::bail!(
+                "Bob's claim did not reach Alice's node over the swarm in pod {index}\nAlice: \
+                 {owner:#?}\nBob: {writer:#?}\nexchanges in flight (Alice, Bob): {in_flight:?}"
+            );
+        }
     }
     let last = pods.last().copied().expect("sixty pods");
     for seed in 3..=202 {
@@ -1864,6 +2013,67 @@ async fn two_nodes_sharing_sixty_pods_keep_live_delivery_in_each() -> Result<()>
         .map_err(|_| anyhow::anyhow!("the node stopped answering after a burst of writes"))??;
 
     for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A departed member's tombstone of a pod's membership store is out of the
+/// store's swarm: an event a current member writes afterwards reaches the
+/// other current member over its announcement and does not reach the
+/// tombstone, which no pass dials either.
+///
+/// Every pass is out of reach, so an entry crosses only on an announcement
+/// or on a session one opens; the departed member's own view still lists
+/// it as a member, so a session would have served it the event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_is_out_of_its_pods_swarm() -> Result<()> {
+    let (alice_phone, bob_phone, carol_phone) = (
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+        node(QUIET, QUIET).await?,
+    );
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        invite(
+            &alice_phone,
+            &alice,
+            pod,
+            member,
+            vec![device_of(phone, member)?],
+        )
+        .await?;
+    }
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    for (phone, member) in [(&bob_phone, &bob), (&carol_phone, &carol)] {
+        phone.import_pod(member.id, pod, tickets.clone()).await?;
+        assert!(lists(phone, member.id, pod, carol.id, PLAIN).await?);
+    }
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+
+    bob_phone.forget_pod(bob.id, pod).await?;
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    let erin = Person::generate();
+    invite(&alice_phone, &alice, pod, &erin, vec![nowhere(0xe1)]).await?;
+    assert!(
+        lists(&carol_phone, carol.id, pod, erin.id, PLAIN).await?,
+        "a current member missed the event's announcement"
+    );
+    // Sentinel: the sessions the announcement opened have settled.
+    assert!(settle(&[&alice_phone, &bob_phone, &carol_phone], pod).await?);
+    let tombstone = bob_phone
+        .held_pod_membership_view_for_test(bob.id, pod)
+        .await?;
+    assert_eq!(
+        tombstone.member(&erin.id).map(|member| member.state),
+        None,
+        "the tombstone took an event over the swarm"
+    );
+
+    for node in [alice_phone, bob_phone, carol_phone] {
         node.shutdown().await?;
     }
     Ok(())

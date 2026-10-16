@@ -1,5 +1,5 @@
 //! The stand's scenarios across containers, reached only over the
-//! published HTTP port: no step reaches into a runtime, no namespace ticket
+//! published HTTP port: no step reaches into a runtime, no store ticket
 //! appears, and waiting for convergence is repeating the read. A ceremony
 //! payload moves between nodes through the test, as a code moves between
 //! two screens through a person. Ignored by default: `just test-docker`
@@ -7,226 +7,18 @@
 
 use anyhow::{Context as _, Result};
 use axum::{body::Bytes, http::StatusCode};
-use pdn_node_http::shapes::{
-    Connections, Entries, GrantCapability, GrantPublication, HostedIdentities, PeerGrants,
-};
+use pdn_node::RecordKind;
+use pdn_node_http::shapes::{HeldPods, HostedIdentities};
 
 mod common;
-use common::{
-    body, claims_on, entry_answers, entry_reads, eventually, grant_on, own_grant_reads, Stand,
-    CONVERGENCE_BUDGET,
-};
-
-/// The whole stand scenario with its paired denials: two identities meet,
-/// one grants a subset of its data, the grantee reads exactly that subset,
-/// an outsider is refused, and the withdrawal closes the access the grant
-/// opened.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-#[allow(clippy::too_many_lines)] // one scenario, with its denials in the same place
-async fn the_whole_scenario_runs_across_containers() -> Result<()> {
-    let stand = Stand::new();
-    let inviter = stand.spawn("inviter").await?;
-    let scanner = stand.spawn("scanner").await?;
-    let outsider = stand.spawn("outsider").await?;
-
-    let alice = inviter.create_identity().await?;
-    let bob = scanner.create_identity().await?;
-    // The outsider hosts an identity of its own: every read names the
-    // identity performing it, so a node with none asks nothing.
-    let snoop = outsider.create_identity().await?;
-
-    // The payload crosses as an opaque token, so this test never depends on
-    // its fields. The lifetime is named explicitly.
-    let payload = inviter
-        .post(
-            &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
-            Bytes::new(),
-        )
-        .await?
-        .ok()?;
-    scanner
-        .post(&format!("/debug/identities/{bob}/establish"), payload)
-        .await?
-        .ok()?;
-
-    // Both sides record the connection, each read from its own node.
-    let inviter_side: Connections = inviter
-        .get(&format!("/debug/identities/{alice}/connections"))
-        .await?
-        .json()?;
-    assert!(
-        inviter_side.connections.contains(&bob),
-        "the inviter must record the connection: {inviter_side:?}"
-    );
-    let scanner_side: Connections = scanner
-        .get(&format!("/debug/identities/{bob}/connections"))
-        .await?
-        .json()?;
-    assert!(
-        scanner_side.connections.contains(&alice),
-        "the scanner must record the connection: {scanner_side:?}"
-    );
-
-    // Alice's data: the claim the grant will name, and one it will withhold.
-    inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"alice@example.org"),
-        )
-        .await?
-        .ok()?;
-    inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/notes/diary"),
-            body(b"dear diary"),
-        )
-        .await?
-        .ok()?;
-
-    // The grant: read-only on exactly `contact/email`.
-    inviter
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
-        .await?
-        .ok()?;
-
-    // The capability comes out of the poll, since a later read is a second
-    // observation. Three guards keep a namespace ticket off this surface: a
-    // field added to `GrantCapability` stops the conversion compiling, one
-    // added and filled stops the destructuring below compiling, and
-    // `deny_unknown_fields` refuses a response some other producer built —
-    // the one that can fail at run time, with the message this decode
-    // carries.
-    let capability = eventually(CONVERGENCE_BUDGET, || async {
-        let raw = scanner
-            .get(&format!("/debug/identities/{bob}/grants/{alice}"))
-            .await?
-            .ok()?;
-        let grants: PeerGrants = serde_json::from_slice(&raw).context(
-            "the grants response carried an unexpected field — a namespace ticket, most likely",
-        )?;
-        Ok(grants
-            .grants
-            .into_iter()
-            .find(|grant| grant.issuer == alice))
-    })
-    .await?;
-    let Some(capability) = capability else {
-        anyhow::bail!(
-            "the grant did not reach the grantee over the pair\n{}",
-            scanner.diagnostics().await
-        )
-    };
-    let GrantCapability {
-        issuer: _,
-        audience,
-        claims,
-    } = &capability;
-    assert_eq!(*audience, bob);
-    assert!(
-        claims.iter().all(|claim| !claim.write),
-        "the published grant is read-only: {capability:?}"
-    );
-
-    // Allowed: the granted entry reads back through the grantee, waited for
-    // by repeating the read.
-    entry_reads(&scanner, bob, alice, "contact/email", b"alice@example.org")
-        .await
-        .context("the granted entry did not reach the grantee")?;
-
-    // Denied (outsider): refused as unknown — a refusal, not an absence, so
-    // a renamed route cannot pass.
-    let refused = outsider
-        .get(&format!("/debug/data/{snoop}/{alice}/contact/email"))
-        .await?;
-    assert_eq!(
-        refused.status,
-        StatusCode::CONFLICT,
-        "an outsider must be refused as unknown, got {}: {}",
-        refused.status,
-        refused.text()
-    );
-
-    // Sentinel: a proven second wave orders the absence assertion below.
-    inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"alice@new.example.org"),
-        )
-        .await?
-        .ok()?;
-    entry_reads(
-        &scanner,
-        bob,
-        alice,
-        "contact/email",
-        b"alice@new.example.org",
-    )
-    .await
-    .context("the sentinel update did not reach the grantee")?;
-
-    // Denied (existence hidden).
-    let listed: Entries = scanner
-        .get(&format!("/debug/data/{bob}/{alice}"))
-        .await?
-        .json()?;
-    let paths: Vec<String> = listed
-        .entries
-        .iter()
-        .map(|entry| entry.path.to_string())
-        .collect();
-    assert_eq!(
-        paths,
-        vec!["contact/email".to_owned()],
-        "the grantee's view must carry exactly the granted subset"
-    );
-    let withheld = scanner
-        .get(&format!("/debug/data/{bob}/{alice}/notes/diary"))
-        .await?;
-    assert_eq!(
-        withheld.status,
-        StatusCode::NOT_FOUND,
-        "a withheld claim must read as absent, got {}: {}",
-        withheld.status,
-        withheld.text()
-    );
-
-    // Withdrawal: the binder forgets what the grant brought in, so the
-    // issuer resolves to nothing there — a refusal, not an empty answer —
-    // while the issuer keeps its own data.
-    inviter
-        .delete(&format!("/debug/identities/{alice}/grants/{bob}/{alice}"))
-        .await?
-        .ok()?;
-    entry_answers(&scanner, bob, alice, "contact/email", StatusCode::CONFLICT)
-        .await
-        .context("the withdrawn namespace stayed bound on the grantee")?;
-    let after: PeerGrants = scanner
-        .get(&format!("/debug/identities/{bob}/grants/{alice}"))
-        .await?
-        .json()?;
-    assert!(
-        after.grants.iter().all(|grant| grant.issuer != alice),
-        "the withdrawn grant must be gone from the grantee's view: {after:?}"
-    );
-    let issuer_side = inviter
-        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
-        .await?
-        .ok()?;
-    assert_eq!(
-        issuer_side,
-        Bytes::from_static(b"alice@new.example.org"),
-        "withdrawal must leave the issuer's own entry untouched"
-    );
-    Ok(())
-}
+use common::{record_reads, record_route, Stand};
 
 /// A device joins an identity: the linking payload minted on the first
 /// device is consumed on a second, which then hosts the identity and reads
-/// what was written before it joined. Denied: the same payload presented
-/// again is refused (its secret is burnt) and the presenter hosts nothing;
-/// a node that never linked is refused as unknown — a node of its own,
-/// since the bystander's refused attempt could leave a residue.
+/// a record its identity placed before it joined. Denied: the same payload
+/// presented again is refused (its secret is burnt) and the presenter hosts
+/// nothing; a node that never linked is refused as unknown — a node of its
+/// own, since the bystander's refused attempt could leave a residue.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn a_device_joins_across_containers() -> Result<()> {
@@ -238,13 +30,10 @@ async fn a_device_joins_across_containers() -> Result<()> {
 
     let alice = first.create_identity().await?;
     let snoop = stranger.create_identity().await?;
-    first
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"written before the link"),
-        )
-        .await?
-        .ok()?;
+    let own = first.create_pod(alice).await?;
+    let before = first
+        .place_record(alice, own, RecordKind::Claim, b"written before the link")
+        .await?;
 
     let payload = first
         .post(
@@ -266,16 +55,11 @@ async fn a_device_joins_across_containers() -> Result<()> {
         "the linked node must report Alice: {hosted:?}"
     );
 
-    // And reads what the first device wrote before it joined.
-    entry_reads(
-        &second,
-        alice,
-        alice,
-        "contact/email",
-        b"written before the link",
-    )
-    .await
-    .context("the linked device did not catch up on the entry written before the link")?;
+    // And reads what the first device placed before it joined, once the
+    // armer has opened the pod.
+    record_reads(&second, alice, own, before, b"written before the link")
+        .await
+        .context("the linked device did not catch up on the record placed before the link")?;
 
     // Denied (a replayed payload): a refusal, distinguishable from a node
     // that never reached the inviter.
@@ -294,9 +78,7 @@ async fn a_device_joins_across_containers() -> Result<()> {
     );
 
     // Denied (a node that never linked).
-    let outsider = stranger
-        .get(&format!("/debug/data/{snoop}/{alice}/contact/email"))
-        .await?;
+    let outsider = stranger.get(&record_route(snoop, own, before)).await?;
     assert_eq!(
         outsider.status,
         StatusCode::CONFLICT,
@@ -307,27 +89,26 @@ async fn a_device_joins_across_containers() -> Result<()> {
     Ok(())
 }
 
-/// A granted peer keeps converging after the publishing device is stopped:
-/// the only place the issuer's whole device set is proven reachable across
-/// processes, since a contact derived from a device record carries an
-/// endpoint id alone. A failure to converge is not answered by a longer
-/// budget: the waits before the stop rule out a sibling without the grant
-/// record, and which peers the audience dialled comes out of its streamed
-/// log (`grep -o "peer=[0-9a-f]*" <log> | sort | uniq -c`). The denial
-/// beside it: the failover must not widen access.
+/// A member keeps converging after one device of another member is
+/// stopped: a sibling device of that member serves the pod, which is the
+/// only place a member's whole device set is proven reachable across
+/// processes. A failure to converge is not answered by a longer budget: the
+/// reads before the stop show the sibling holding the pod, and which peers
+/// Bob dialled comes out of his streamed log (`grep -o "peer=[0-9a-f]*" <log>
+/// | sort | uniq -c`). The denial beside it: the failover must not widen
+/// access.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-#[allow(clippy::too_many_lines)] // one failover, with its denial in the same place
-async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
+async fn a_stopped_device_does_not_stop_its_pod() -> Result<()> {
     let stand = Stand::new();
-    let publisher = stand.spawn("alice-publisher").await?;
-    let sibling = stand.spawn("alice-sibling").await?;
-    let audience = stand.spawn("audience").await?;
+    let first = stand.spawn("alice-first").await?;
+    let sibling = stand.spawn("alice-second").await?;
+    let bob_node = stand.spawn("bob").await?;
     let outsider = stand.spawn("outsider").await?;
 
     // The second device joins by linking.
-    let alice = publisher.create_identity().await?;
-    let payload = publisher
+    let alice = first.create_identity().await?;
+    let payload = first
         .post(
             &format!("/debug/identities/{alice}/linking-invite"),
             Bytes::new(),
@@ -339,99 +120,66 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
         .await?
         .ok()?;
 
-    // The connection, established from the publishing device.
-    let bob = audience.create_identity().await?;
+    // The pod, created and shared from the first device.
+    let bob = bob_node.create_identity().await?;
     let snoop = outsider.create_identity().await?;
-    let invite = publisher
-        .post(
-            &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
-            Bytes::new(),
-        )
-        .await?
-        .ok()?;
-    audience
-        .post(&format!("/debug/identities/{bob}/establish"), invite)
-        .await?
-        .ok()?;
+    let family = first.create_pod(alice).await?;
+    let invite = first.invite_to_pod(alice, family).await?;
+    bob_node.join_pod(bob, invite).await?.ok()?;
 
-    // Read by the audience, so the failover starts from a connection that
-    // demonstrably works.
-    publisher
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"published from the first device"),
+    // Read by Bob and by the sibling, so the failover starts from a pod
+    // that demonstrably reaches both.
+    let placed = first
+        .place_record(
+            alice,
+            family,
+            RecordKind::Claim,
+            b"placed from the first device",
         )
-        .await?
-        .ok()?;
-    publisher
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
-        .await?
-        .ok()?;
-    entry_reads(
-        &audience,
+        .await?;
+    record_reads(
+        &bob_node,
         bob,
-        alice,
-        "contact/email",
-        b"published from the first device",
+        family,
+        placed,
+        b"placed from the first device",
     )
     .await
-    .context("the audience never read the granted entry before the stop")?;
-
-    // Replication between the issuer's devices has run.
-    entry_reads(
+    .context("Bob never read the record before the stop")?;
+    record_reads(
         &sibling,
         alice,
-        alice,
-        "contact/email",
-        b"published from the first device",
+        family,
+        placed,
+        b"placed from the first device",
     )
     .await
-    .context("the sibling never caught up on the granted claim before the stop")?;
-
-    // And the sibling holds the grant record it serves by, which the claim
-    // above does not imply: a device that never opened the pair reads the
-    // claim while refusing the audience fail-closed.
-    own_grant_reads(&sibling, alice, bob, alice)
-        .await
-        .context("the sibling never held the grant record before the stop")?;
+    .context("the sibling never held the pod before the stop")?;
 
     // Asked of the daemon, not the network: the released port can be
     // answered by a live node given the same port afterwards.
-    publisher.stop().await?;
+    first.stop().await?;
     assert!(
-        !publisher.is_running().await?,
+        !first.is_running().await?,
         "the device this scenario stops is still running"
     );
 
-    // The audience converges on a device whose address it was never given.
-    sibling
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"served by the sibling"),
-        )
-        .await?
-        .ok()?;
-    if let Err(err) = entry_reads(
-        &audience,
-        bob,
-        alice,
-        "contact/email",
-        b"served by the sibling",
-    )
-    .await
-    {
+    // Bob converges on the device whose address the join handed him beside
+    // the stopped one's.
+    let served = sibling
+        .place_record(alice, family, RecordKind::Claim, b"placed by the sibling")
+        .await?;
+    if let Err(err) = record_reads(&bob_node, bob, family, served, b"placed by the sibling").await {
         let logs = format!(
             "{}\n{}",
-            audience.diagnostics().await,
+            bob_node.diagnostics().await,
             sibling.diagnostics().await
         );
         return Err(err.context(logs));
     }
 
     // Denied: the failover widened nothing.
-    let refused = outsider
-        .get(&format!("/debug/data/{snoop}/{alice}/contact/email"))
-        .await?;
+    let refused = outsider.get(&record_route(snoop, family, served)).await?;
     assert_eq!(
         refused.status,
         StatusCode::CONFLICT,
@@ -442,148 +190,18 @@ async fn a_stopped_device_does_not_stop_the_connection() -> Result<()> {
     Ok(())
 }
 
-/// A write grant lets the grantee write the claim it names, and the write
-/// reaches the issuer. The tightest unauthorized party is this very peer,
-/// one claim over: its write at the read-only claim of the same
-/// publication is refused. That refusal proves the grantee-side courtesy
-/// check only; the issuer's gate is proven in `pdn-node`'s
-/// `scoped_writes.rs`, where the bypass lives.
+/// Two identities of one person on one node, each a member of a pod of its
+/// own with a peer on another node: sharing a process is not sharing a pod.
+/// The shared node lists each identity's own pod and not the other's, and
+/// each peer reads the claim of the identity it shares its pod with.
+/// Denied: the identity co-located with a pod's member on Alice's node, the
+/// node that holds both pods, reads the other's pod; so, besides, do
+/// neither peer nor a node that is no member of either — ordered after both
+/// reads that prove the pods serve.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-#[allow(clippy::too_many_lines)] // one write grant, with its denial in the same place
-async fn a_write_grant_lets_the_grantee_write_what_it_names() -> Result<()> {
-    let stand = Stand::new();
-    let issuer = stand.spawn("issuer").await?;
-    let grantee = stand.spawn("grantee").await?;
-
-    let alice = issuer.create_identity().await?;
-    let bob = grantee.create_identity().await?;
-
-    let payload = issuer
-        .post(
-            &format!("/debug/identities/{alice}/invite?lifetime_secs=120"),
-            Bytes::new(),
-        )
-        .await?
-        .ok()?;
-    grantee
-        .post(&format!("/debug/identities/{bob}/establish"), payload)
-        .await?
-        .ok()?;
-
-    // Alice's data: the claim the grant makes writable, and one it keeps
-    // read-only.
-    issuer
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/phone"),
-            body(b"+1-555-0100"),
-        )
-        .await?
-        .ok()?;
-    issuer
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"alice@example.org"),
-        )
-        .await?
-        .ok()?;
-
-    // One publication, two claims, one of them writable.
-    let mut claims = claims_on("contact/phone", true);
-    claims.extend(claims_on("contact/email", false));
-    issuer
-        .publish_grant(
-            alice,
-            bob,
-            &GrantPublication {
-                issuer: alice,
-                claims,
-            },
-        )
-        .await?
-        .ok()?;
-
-    // The precondition of writing over it: the namespace is bound here.
-    entry_reads(&grantee, bob, alice, "contact/phone", b"+1-555-0100")
-        .await
-        .context("the granted entry did not reach the grantee")?;
-
-    // Allowed: the value reads back on the issuer's side, so the write
-    // crossed.
-    grantee
-        .put(
-            &format!("/debug/data/{bob}/{alice}/contact/phone"),
-            body(b"+1-555-0199"),
-        )
-        .await?
-        .ok()?;
-    entry_reads(&grantee, bob, alice, "contact/phone", b"+1-555-0199")
-        .await
-        .context("the grantee's own write did not read back on the grantee")?;
-    entry_reads(&issuer, alice, alice, "contact/phone", b"+1-555-0199")
-        .await
-        .context("the grantee's write never reached the issuer")?;
-
-    // Denied (one claim over): the same peer, under the same publication,
-    // writing the claim that publication kept read-only.
-    let refused = grantee
-        .put(
-            &format!("/debug/data/{bob}/{alice}/contact/email"),
-            body(b"bob@example.org"),
-        )
-        .await?;
-    assert_eq!(
-        refused.status,
-        StatusCode::FORBIDDEN,
-        "a write outside the grant's write set must be refused, got {}: {}",
-        refused.status,
-        refused.text()
-    );
-
-    // Sentinel: a completed session after the refusal, without which the
-    // issuer-side read below would pass either way.
-    issuer
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/phone"),
-            body(b"+1-555-0300"),
-        )
-        .await?
-        .ok()?;
-    entry_reads(&grantee, bob, alice, "contact/phone", b"+1-555-0300")
-        .await
-        .context("the sentinel did not reach the grantee")?;
-
-    let issuer_side = issuer
-        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
-        .await?
-        .ok()?;
-    assert_eq!(
-        issuer_side,
-        Bytes::from_static(b"alice@example.org"),
-        "the refused write must never reach the issuer"
-    );
-    let grantee_side = grantee
-        .get(&format!("/debug/data/{bob}/{alice}/contact/email"))
-        .await?
-        .ok()?;
-    assert_eq!(
-        grantee_side,
-        Bytes::from_static(b"alice@example.org"),
-        "the refused write must not touch the grantee's own replica"
-    );
-    Ok(())
-}
-
-/// Two personas of one person on one node, each with an audience of its
-/// own: sharing a process is not sharing an audience. The denials are read
-/// on the peers' nodes, each hosting one identity. Not asserted: that one
-/// persona cannot read the other's data on the node they share — the
-/// runtime's own refusal, proven by `an_operation_acts_for_the_identity_it_names`
-/// in `pdn-node`'s `tests/data.rs`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-#[allow(clippy::too_many_lines)] // two personas and two audiences, kept in one place
-async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
+#[allow(clippy::too_many_lines)] // two identities and two pods, kept in one place
+async fn two_identities_on_one_node_keep_separate_pods() -> Result<()> {
     let stand = Stand::new();
     let alice_node = stand.spawn("alice").await?;
     let bob_node = stand.spawn("bob").await?;
@@ -597,115 +215,106 @@ async fn two_personas_on_one_node_keep_separate_audiences() -> Result<()> {
     let hosted: HostedIdentities = alice_node.get("/debug/identities").await?.json()?;
     assert!(
         hosted.identities.contains(&at_work) && hosted.identities.contains(&at_leisure),
-        "the node must report both personas: {hosted:?}"
+        "the node must report both identities: {hosted:?}"
     );
 
     let bob = bob_node.create_identity().await?;
     let carol = carol_node.create_identity().await?;
     let outsider = outsider_node.create_identity().await?;
 
-    // Each persona meets its own peer.
-    for (persona, peer_node, peer) in [(at_work, &bob_node, bob), (at_leisure, &carol_node, carol)]
-    {
-        let payload = alice_node
-            .post(
-                &format!("/debug/identities/{persona}/invite?lifetime_secs=120"),
-                Bytes::new(),
-            )
-            .await?
-            .ok()?;
-        peer_node
-            .post(&format!("/debug/identities/{peer}/establish"), payload)
-            .await?
-            .ok()?;
-    }
-
-    // Different data under the same path, so a read that reached the wrong
-    // namespace answers the wrong bytes rather than nothing.
-    alice_node
-        .put(
-            &format!("/debug/data/{at_work}/{at_work}/contact/email"),
-            body(b"alice@acme.example"),
-        )
-        .await?
-        .ok()?;
-    alice_node
-        .put(
-            &format!("/debug/data/{at_leisure}/{at_leisure}/contact/email"),
-            body(b"alice@bridgeclub.example"),
-        )
-        .await?
-        .ok()?;
-
-    alice_node
-        .publish_grant(at_work, bob, &grant_on(at_work, "contact/email", false))
-        .await?
-        .ok()?;
-    alice_node
-        .publish_grant(
+    // Each identity shares a pod of its own with its own peer, and places a
+    // claim in it: different values, so a read that reached the wrong pod
+    // answers the wrong bytes rather than nothing.
+    let mut placed = Vec::new();
+    for (identity, peer_node, peer, value) in [
+        (at_work, &bob_node, bob, &b"alice@acme.example"[..]),
+        (
             at_leisure,
+            &carol_node,
             carol,
-            &grant_on(at_leisure, "contact/email", false),
-        )
-        .await?
-        .ok()?;
+            &b"alice@bridgeclub.example"[..],
+        ),
+    ] {
+        let pod = alice_node.create_pod(identity).await?;
+        let invite = alice_node.invite_to_pod(identity, pod).await?;
+        peer_node.join_pod(peer, invite).await?.ok()?;
+        let claim = alice_node
+            .place_record(identity, pod, RecordKind::Claim, value)
+            .await?;
+        placed.push((pod, claim));
+    }
+    let [(work_pod, work_claim), (club_pod, club_claim)] = placed[..] else {
+        anyhow::bail!("two pods were placed");
+    };
 
-    // Allowed, both ways: each peer reads its own persona's data.
-    entry_reads(
-        &bob_node,
-        bob,
-        at_work,
-        "contact/email",
-        b"alice@acme.example",
-    )
-    .await
-    .context("Bob did not read the work persona's entry")?;
-    entry_reads(
+    // Allowed, both ways: each peer reads its own identity's claim.
+    record_reads(&bob_node, bob, work_pod, work_claim, b"alice@acme.example")
+        .await
+        .context("Bob did not read the work identity's claim")?;
+    record_reads(
         &carol_node,
         carol,
-        at_leisure,
-        "contact/email",
+        club_pod,
+        club_claim,
         b"alice@bridgeclub.example",
     )
     .await
-    .context("Carol did not read the leisure persona's entry")?;
+    .context("Carol did not read the leisure identity's claim")?;
 
-    // Read on Alice's node, where the route names which persona is asked.
-    let work_side: Connections = alice_node
-        .get(&format!("/debug/identities/{at_work}/connections"))
-        .await?
-        .json()?;
-    assert!(
-        work_side.connections.contains(&bob) && !work_side.connections.contains(&carol),
-        "the work persona knows Bob and not Carol: {work_side:?}"
-    );
-    let leisure_side: Connections = alice_node
-        .get(&format!("/debug/identities/{at_leisure}/connections"))
-        .await?
-        .json()?;
-    assert!(
-        leisure_side.connections.contains(&carol) && !leisure_side.connections.contains(&bob),
-        "the leisure persona knows Carol and not Bob: {leisure_side:?}"
-    );
+    // Read on Alice's node, where the route names which identity is asked.
+    for (identity, own, other) in [
+        (at_work, work_pod, club_pod),
+        (at_leisure, club_pod, work_pod),
+    ] {
+        let held: HeldPods = alice_node
+            .get(&format!("/debug/identities/{identity}/pods"))
+            .await?
+            .json()?;
+        assert!(
+            held.pods.contains(&own) && !held.pods.contains(&other),
+            "{identity} must hold its own pod and not the other's: {held:?}"
+        );
+    }
 
     // Denied, both ways and to a third party: refused as unknown rather
-    // than answered as absent. Ordered after both reads above, so what is
-    // refused here is a namespace this stand has proven it can serve.
-    for (peer_node, acting, other_persona, who) in [
-        (&bob_node, bob, at_leisure, "Bob"),
-        (&carol_node, carol, at_work, "Carol"),
-        (&outsider_node, outsider, at_work, "the outsider"),
-        (&outsider_node, outsider, at_leisure, "the outsider"),
+    // than answered as absent.
+    for (peer_node, acting, pod, claim, who) in [
+        (
+            &alice_node,
+            at_work,
+            club_pod,
+            club_claim,
+            "the work identity",
+        ),
+        (
+            &alice_node,
+            at_leisure,
+            work_pod,
+            work_claim,
+            "the leisure identity",
+        ),
+        (&bob_node, bob, club_pod, club_claim, "Bob"),
+        (&carol_node, carol, work_pod, work_claim, "Carol"),
+        (
+            &outsider_node,
+            outsider,
+            work_pod,
+            work_claim,
+            "the outsider",
+        ),
+        (
+            &outsider_node,
+            outsider,
+            club_pod,
+            club_claim,
+            "the outsider",
+        ),
     ] {
-        let refused = peer_node
-            .get(&format!(
-                "/debug/data/{acting}/{other_persona}/contact/email"
-            ))
-            .await?;
+        let refused = peer_node.get(&record_route(acting, pod, claim)).await?;
         assert_eq!(
             refused.status,
             StatusCode::CONFLICT,
-            "{who} must be refused that persona's namespace, got {}: {}",
+            "{who} must be refused that pod, got {}: {}",
             refused.status,
             refused.text()
         );

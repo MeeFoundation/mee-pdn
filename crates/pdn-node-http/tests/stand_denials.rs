@@ -3,49 +3,39 @@
 //! unhosted identity is 409 rather than 404 on purpose: route names are
 //! unpinned, so a test asserting absence would keep passing after a rename.
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use axum::{body::Bytes, http::StatusCode};
 use pdn_node::{PdnId, RecordId, RecordKind, RecordRef};
-use pdn_node_http::shapes::{
-    Act, Connections, GrantPublication, HeldPod, HostedIdentities, Member, OwnGrant,
-};
+use pdn_node_http::shapes::{Act, HeldPod, HeldPods, HostedIdentities, Member};
 
 mod common;
-use common::{body, claims_on, entry_reads, grant_on, own_grant_reads, record_route, Stand};
+use common::{pod_route, record_route, Stand};
 
 /// An identity no runtime in this test creates or links.
 const UNHOSTED: PdnId = PdnId::from_bytes([0x77; 32]);
 
 /// Each refusal of the surface arrives with a status of its own, beside the
-/// accepted act it denies: an unhosted identity (409), a grant naming a
-/// foreign issuer or no claim, a replayed invite payload, a read-only
-/// grantee's write, an absent entry (404), a malformed identifier, an empty
-/// payload, and a mistyped query parameter (400).
+/// accepted act it denies: an unhosted identity (409), a replayed pod
+/// invite (403), a malformed identifier, an empty payload, and a mistyped
+/// query parameter (400).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 #[allow(clippy::too_many_lines)] // the denials of one surface, kept beside their positives
 async fn refusals_arrive_as_refusals() -> Result<()> {
     let stand = Stand::new();
     let inviter = stand.spawn("inviter").await?;
-    let scanner = stand.spawn("scanner").await?;
+    let joiner = stand.spawn("joiner").await?;
     let replayer = stand.spawn("replayer").await?;
 
     let alice = inviter.create_identity().await?;
-    let bob = scanner.create_identity().await?;
+    let bob = joiner.create_identity().await?;
     let carol = replayer.create_identity().await?;
-
-    inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/email"),
-            body(b"alice@example.org"),
-        )
-        .await?
-        .ok()?;
+    let family = inviter.create_pod(alice).await?;
 
     // Denied (an unhosted identity). Beside it, the same route on a hosted
     // identity answers.
     let unhosted = inviter
-        .get(&format!("/debug/identities/{UNHOSTED}/connections"))
+        .get(&format!("/debug/identities/{UNHOSTED}/pods"))
         .await?;
     assert_eq!(
         unhosted.status,
@@ -60,193 +50,50 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         unhosted.text()
     );
     inviter
-        .get(&format!("/debug/identities/{alice}/connections"))
+        .get(&format!("/debug/identities/{alice}/pods"))
         .await?
         .ok()?;
 
-    // The connection the grant denials need. The payload is kept for the
-    // replay below.
-    let payload = inviter
-        .post(&format!("/debug/identities/{alice}/invite"), Bytes::new())
-        .await?
-        .ok()?;
-    scanner
-        .post(
-            &format!("/debug/identities/{bob}/establish"),
-            payload.clone(),
-        )
-        .await?
-        .ok()?;
-
-    // Denied (a grant naming a foreign issuer): delegation is not
-    // expressible. Beside it, the same publication naming its own issuer is
-    // accepted.
-    let foreign = inviter
-        .publish_grant(
-            alice,
-            bob,
-            &GrantPublication {
-                issuer: bob,
-                claims: claims_on("contact/email", false),
-            },
-        )
-        .await?;
+    // Denied (a replayed invite payload): the secret is burnt, and the pod
+    // records no second joined event. Beside it, the first presentation
+    // joins.
+    let invite = inviter.invite_to_pod(alice, family).await?;
+    let first: HeldPod = joiner.join_pod(bob, invite.clone()).await?.json()?;
+    assert_eq!(first.pod, family);
+    let replay = replayer.join_pod(carol, invite).await?;
     assert_eq!(
-        foreign.status,
-        StatusCode::FORBIDDEN,
-        "a grant naming a foreign issuer must be refused, got {}: {}",
-        foreign.status,
-        foreign.text()
-    );
-    let mut allowed_claims = claims_on("contact/email", false);
-    allowed_claims.extend(claims_on("contact/sentinel", false));
-    inviter
-        .publish_grant(
-            alice,
-            bob,
-            &GrantPublication {
-                issuer: alice,
-                claims: allowed_claims,
-            },
-        )
-        .await?
-        .ok()?;
-    // Read from the half the refused publication writes — Alice's own. An
-    // unopened pair reads empty too, so the wait for the accepted record
-    // comes first.
-    own_grant_reads(&inviter, alice, bob, alice).await?;
-    let after_foreign: OwnGrant = inviter
-        .get(&format!("/debug/identities/{alice}/own-grants/{bob}"))
-        .await?
-        .json()?;
-    assert!(
-        after_foreign
-            .grant
-            .as_ref()
-            .is_some_and(|grant| grant.issuer == alice),
-        "the refused foreign-issuer grant displaced Alice's own: {:?}",
-        after_foreign.grant
-    );
-
-    // Denied (a grant naming no claim): every grant is claim-scoped, so an
-    // empty claim set is a malformed request rather than a refusal.
-    let claimless = inviter
-        .publish_grant(
-            alice,
-            bob,
-            &GrantPublication {
-                issuer: alice,
-                claims: Vec::new(),
-            },
-        )
-        .await?;
-    assert_eq!(
-        claimless.status,
-        StatusCode::BAD_REQUEST,
-        "a claimless grant is malformed, got {}: {}",
-        claimless.status,
-        claimless.text()
-    );
-
-    // Denied (a replayed invite payload): the secret is burnt, and the
-    // inviter records no second connection.
-    let refused_replay = replayer
-        .post(&format!("/debug/identities/{carol}/establish"), payload)
-        .await?;
-    assert_eq!(
-        refused_replay.status,
+        replay.status,
         StatusCode::FORBIDDEN,
         "a replayed invite payload must be refused, got {}: {}",
-        refused_replay.status,
-        refused_replay.text()
+        replay.status,
+        replay.text()
     );
-    let recorded: Connections = inviter
-        .get(&format!("/debug/identities/{alice}/connections"))
+    let mut members = inviter.pod_members(alice, family).await?;
+    members.sort_by_key(|member| member.id);
+    let mut expected = vec![
+        Member {
+            id: alice,
+            owner: true,
+        },
+        Member {
+            id: bob,
+            owner: false,
+        },
+    ];
+    expected.sort_by_key(|member| member.id);
+    assert_eq!(
+        members, expected,
+        "a refused join must leave no member behind"
+    );
+    let replayer_pods: HeldPods = replayer
+        .get(&format!("/debug/identities/{carol}/pods"))
         .await?
         .json()?;
-    assert_eq!(
-        recorded.connections,
-        vec![bob],
-        "a refused establishment must leave no connection behind"
-    );
-    let replayer_recorded: Connections = replayer
-        .get(&format!("/debug/identities/{carol}/connections"))
-        .await?
-        .json()?;
-    assert_eq!(replayer_recorded.connections, []);
-
-    // Allowed, then denied on the same claim: the grant covers it read-only,
-    // and the prior value still reads back on both sides.
-    entry_reads(&scanner, bob, alice, "contact/email", b"alice@example.org")
-        .await
-        .context("the granted entry did not reach the grantee")?;
-    let refused_write = scanner
-        .put(
-            &format!("/debug/data/{bob}/{alice}/contact/email"),
-            body(b"overwrite"),
-        )
-        .await?;
-    assert_eq!(
-        refused_write.status,
-        StatusCode::FORBIDDEN,
-        "a write outside the grant's write set must be refused, got {}: {}",
-        refused_write.status,
-        refused_write.text()
-    );
-    let grantee_side = scanner
-        .get(&format!("/debug/data/{bob}/{alice}/contact/email"))
-        .await?
-        .ok()?;
-    assert_eq!(
-        grantee_side,
-        Bytes::from_static(b"alice@example.org"),
-        "the refused write must not touch the grantee's own replica"
-    );
-    // Sentinel: a completed two-way session after the refusal, before the
-    // issuer-side read is trusted to say anything about delivery rather
-    // than timing.
-    inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/sentinel"),
-            body(b"alice@new.example.org"),
-        )
-        .await?
-        .ok()?;
-    entry_reads(
-        &scanner,
-        bob,
-        alice,
-        "contact/sentinel",
-        b"alice@new.example.org",
-    )
-    .await
-    .context("the sentinel update did not reach the grantee")?;
-    let issuer_side = inviter
-        .get(&format!("/debug/data/{alice}/{alice}/contact/email"))
-        .await?
-        .ok()?;
-    assert_eq!(
-        issuer_side,
-        Bytes::from_static(b"alice@example.org"),
-        "the refused write must never reach the issuer"
-    );
-
-    // Denied (an absent entry): 404, the one status reserved for nothing
-    // being there — the issuer is hosted, so this is not a refusal.
-    let absent = inviter
-        .get(&format!("/debug/data/{alice}/{alice}/contact/phone"))
-        .await?;
-    assert_eq!(
-        absent.status,
-        StatusCode::NOT_FOUND,
-        "an absent entry is 404, got {}: {}",
-        absent.status,
-        absent.text()
-    );
+    assert_eq!(replayer_pods.pods, []);
 
     // Denied (a malformed identifier): the request itself is wrong, which is
     // neither a refusal nor an absence.
-    let malformed = inviter.get("/debug/identities/not-hex/connections").await?;
+    let malformed = inviter.get("/debug/identities/not-hex/pods").await?;
     assert_eq!(
         malformed.status,
         StatusCode::BAD_REQUEST,
@@ -257,11 +104,11 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
 
     // Denied (an empty payload): the engine keeps no zero-length entry, and
     // that is the request being wrong rather than the host not knowing what
-    // happened. Beside it, one byte at the same path is accepted.
+    // happened. Beside it, one byte is accepted.
     let empty = inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/note"),
-            body(b""),
+        .post(
+            &format!("{}/records?kind=claim", pod_route(alice, family)),
+            Bytes::new(),
         )
         .await?;
     assert_eq!(
@@ -272,21 +119,15 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         empty.text()
     );
     inviter
-        .put(
-            &format!("/debug/data/{alice}/{alice}/contact/note"),
-            body(b"."),
-        )
-        .await?
-        .ok()?;
+        .place_record(alice, family, RecordKind::Claim, b".")
+        .await?;
 
     // Denied (a mistyped query parameter): refused rather than ignored, so a
     // lifetime nobody asked for cannot be minted quietly. Beside it, the
     // spelled parameter is accepted.
+    let invite_route = format!("{}/invites", pod_route(alice, family));
     let mistyped = inviter
-        .post(
-            &format!("/debug/identities/{alice}/invite?lifetime_sec=60"),
-            Bytes::new(),
-        )
+        .post(&format!("{invite_route}?lifetime_sec=60"), Bytes::new())
         .await?;
     assert_eq!(
         mistyped.status,
@@ -296,44 +137,9 @@ async fn refusals_arrive_as_refusals() -> Result<()> {
         mistyped.text()
     );
     inviter
-        .post(
-            &format!("/debug/identities/{alice}/invite?lifetime_secs=60"),
-            Bytes::new(),
-        )
+        .post(&format!("{invite_route}?lifetime_secs=60"), Bytes::new())
         .await?
         .ok()?;
-
-    Ok(())
-}
-
-/// Denied (a peer with no connection metadata pair): a grant publish toward
-/// an identity this issuer never established with, or received one from,
-/// refuses as a conflict rather than a 500 — the runtime knows exactly why
-/// (there is no pair to carry the grant), so the host must say so too.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
-async fn publishing_toward_an_unconnected_peer_is_refused_as_a_conflict() -> Result<()> {
-    let stand = Stand::new();
-    let inviter = stand.spawn("inviter").await?;
-    let bystander = stand.spawn("bystander").await?;
-    let alice = inviter.create_identity().await?;
-    let bob = bystander.create_identity().await?;
-
-    let refused = inviter
-        .publish_grant(alice, bob, &grant_on(alice, "contact/email", false))
-        .await?;
-    assert_eq!(
-        refused.status,
-        StatusCode::CONFLICT,
-        "a grant toward an unconnected peer must be refused, got {}: {}",
-        refused.status,
-        refused.text()
-    );
-    assert!(
-        refused.text().contains(&bob.to_string()),
-        "the refusal must name the unconnected peer: {}",
-        refused.text()
-    );
 
     Ok(())
 }
@@ -421,8 +227,8 @@ async fn concurrent_links_toward_the_same_identity_let_only_one_commit() -> Resu
 
 /// Each refusal of the pods routes arrives with a status of its own, beside
 /// the accepted act it denies, on one node hosting a pod's owner and a
-/// second identity: that identity while no member (409), its promotion of
-/// itself as a plain member (403), and a read of a record the pod does not
+/// second identity: that identity while no member (409), its removal of the
+/// owner as a plain member (403), and a read of a record the pod does not
 /// hold (404). The non-member shares the owner's node, so the node holds the
 /// pod and the refusal rests on the identity named alone.
 #[tokio::test(flavor = "multi_thread")]
@@ -464,35 +270,27 @@ async fn pod_refusals_arrive_as_refusals() -> Result<()> {
     let joined: HeldPod = tablet.join_pod(work, invite).await?.json()?;
     assert_eq!(joined.pod, family);
 
-    // Denied (a refusal by role): a plain member promotes itself. Beside it,
-    // the owner's promotion of the same member goes through.
-    let by_member = tablet.pod_act(work, family, Act::Promote(work)).await?;
+    // Denied (a refusal by role): a plain member removes another member.
+    // Beside it, the owner's removal of the plain member goes through, once
+    // the record reads below are done.
+    let by_member = tablet.pod_act(work, family, Act::Remove(leisure)).await?;
     assert_eq!(
         by_member.status,
         StatusCode::FORBIDDEN,
-        "a plain member's promotion must be refused, got {}: {}",
+        "a plain member's removal must be refused, got {}: {}",
         by_member.status,
         by_member.text()
     );
     let after_refusal = tablet.pod_members(leisure, family).await?;
     assert!(
         after_refusal.contains(&Member {
+            id: leisure,
+            owner: true,
+        }) && after_refusal.contains(&Member {
             id: work,
             owner: false,
         }),
-        "the refused promotion must leave a plain member: {after_refusal:?}"
-    );
-    tablet
-        .pod_act(leisure, family, Act::Promote(work))
-        .await?
-        .ok()?;
-    let after_promotion = tablet.pod_members(leisure, family).await?;
-    assert!(
-        after_promotion.contains(&Member {
-            id: work,
-            owner: true,
-        }),
-        "the owner's promotion must take effect: {after_promotion:?}"
+        "the refused removal must leave both members: {after_refusal:?}"
     );
 
     // Denied (an absent record): 404, the status reserved for nothing being
@@ -516,6 +314,19 @@ async fn pod_refusals_arrive_as_refusals() -> Result<()> {
         "an absent record is 404, got {}: {}",
         absent.status,
         absent.text()
+    );
+
+    tablet
+        .pod_act(leisure, family, Act::Remove(work))
+        .await?
+        .ok()?;
+    assert_eq!(
+        tablet.pod_members(leisure, family).await?,
+        vec![Member {
+            id: leisure,
+            owner: true,
+        }],
+        "the owner's removal must take effect"
     );
 
     Ok(())
