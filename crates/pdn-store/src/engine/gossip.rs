@@ -114,18 +114,28 @@ impl GossipState {
 
     /// Waits for every receive loop to end.
     pub async fn progress(&mut self) -> Result<()> {
-        while self.next_ended().await?.is_some() {}
+        while self.ended().await?.is_some() {}
         Ok(())
     }
 
     /// The topic whose current receive loop ended on its own, now out of
-    /// the active set; `None` once no loop is left. Returns an error if a
-    /// loop panicked.
+    /// the active set, pending while no loop is left: a topic outlives its
+    /// loop when a runtime shutting down cancels it, and a ready answer to
+    /// the live actor's `select!` there would spin it inside one poll.
+    /// Returns an error if a loop panicked.
     ///
     /// ## Cancel safety
     ///
     /// This function is fully cancel-safe.
-    pub async fn next_ended(&mut self) -> Result<Option<NamespaceId>> {
+    pub async fn next_ended(&mut self) -> Result<NamespaceId> {
+        match self.ended().await? {
+            Some(namespace) => Ok(namespace),
+            None => std::future::pending().await,
+        }
+    }
+
+    /// [`Self::next_ended`], `None` once no loop is left.
+    async fn ended(&mut self) -> Result<Option<NamespaceId>> {
         while let Some(res) = self.active_tasks.join_next().await {
             match res {
                 Err(err) if err.is_cancelled() => continue,
@@ -235,4 +245,45 @@ async fn receive_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use iroh::{endpoint::presets, Endpoint};
+
+    use super::*;
+
+    /// A topic whose receive loop was cancelled without a quit, as a runtime
+    /// shutting down cancels it, leaves the next end pending rather than
+    /// ready with nothing, and waiting for every loop still finishes.
+    #[tokio::test]
+    async fn a_topic_whose_loop_was_cancelled_leaves_the_next_end_pending() -> Result<()> {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0u16))?
+            .bind()
+            .await?;
+        let (to_live_actor, _inbox) = mpsc::channel(8);
+        let mut state = GossipState::new(Gossip::builder().spawn(endpoint.clone()), to_live_actor);
+        let namespace = NamespaceId::from(&[7; 32]);
+        state.join(namespace, Vec::new()).await?;
+        state
+            .active
+            .get(&namespace)
+            .context("the topic was joined")?
+            .abort_handle
+            .abort();
+
+        let ended = tokio::time::timeout(Duration::from_millis(200), state.next_ended()).await;
+        assert!(
+            ended.is_err(),
+            "a cancelled loop made an end ready: {ended:?}"
+        );
+        assert!(!state.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), state.progress()).await??;
+
+        endpoint.close().await;
+        Ok(())
+    }
 }

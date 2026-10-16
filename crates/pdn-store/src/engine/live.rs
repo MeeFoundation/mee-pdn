@@ -668,8 +668,7 @@ impl LiveActor {
                 }
                 res = self.gossip.next_ended(), if !self.gossip.is_empty() => {
                     match res {
-                        Ok(Some(namespace)) => self.forget_topic_neighbors(namespace),
-                        Ok(None) => {}
+                        Ok(namespace) => self.forget_topic_neighbors(namespace),
                         Err(error) => warn!(?error, "gossip state failed"),
                     }
                 }
