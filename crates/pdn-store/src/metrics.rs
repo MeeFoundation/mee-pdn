@@ -1,67 +1,19 @@
-//! Metrics for pdn-store
+//! The two values of the sync actor's session snapshots, which the codec's
+//! tests read.
 
-use iroh_metrics::{Counter, Gauge, MetricsGroup};
+use iroh_metrics::{Counter, Gauge};
 
-/// Metrics for pdn-store
-#[derive(Debug, Default, MetricsGroup)]
-pub struct Metrics {
-    /// Number of document entries added locally
-    pub new_entries_local: Counter,
-    /// Number of document entries added by peers
-    pub new_entries_remote: Counter,
-    /// Total size of entry contents added locally
-    pub new_entries_local_size: Counter,
-    /// Total size of entry contents added by peers
-    pub new_entries_remote_size: Counter,
-    /// Number of successful syncs (via accept)
-    pub sync_via_accept_success: Counter,
-    /// Number of failed syncs (via accept)
-    pub sync_via_accept_failure: Counter,
-    /// Number of successful syncs (via connect)
-    pub sync_via_connect_success: Counter,
-    /// Number of failed syncs (via connect)
-    pub sync_via_connect_failure: Counter,
-
-    /// Number of times the main actor loop ticked
-    pub actor_tick_main: Counter,
-
-    /// Sync sessions holding a store snapshot right now.
-    ///
-    /// A snapshot holds back reclamation of every store page freed while it
-    /// lives, so a value that does not fall back to zero when the node goes
-    /// quiet is the store growing for a reason no entry count explains. A
-    /// zero does not say the reverse: `get_many` and `content_hashes` hold
-    /// the same read transaction for as long as their iterator lives, and
-    /// neither is counted here.
-    pub sync_sessions_open: Gauge,
+/// What the sync actor counts of the snapshots its sessions hold.
+#[derive(Debug, Default)]
+pub(crate) struct Metrics {
+    /// Sync sessions holding a store snapshot right now. A zero does not
+    /// say that no read transaction is open: `get_many` and `content_hashes`
+    /// hold one for as long as their iterator lives, and neither is counted
+    /// here.
+    pub(crate) sync_sessions_open: Gauge,
     /// Sync session snapshots the actor reclaimed by itself, because the
-    /// handle was gone and no release message arrived.
-    ///
-    /// The ordinary path is a handle releasing its own snapshot, so this
-    /// stays at zero. Above zero it counts the two cases that path misses:
-    /// a release lost to a full actor queue, and a registration whose
-    /// handle a cancelled caller never received.
-    pub sync_sessions_reclaimed: Counter,
-
-    /// Number of times the gossip actor loop ticked
-    pub doc_gossip_tick_main: Counter,
-    /// Number of times the gossip actor processed an event
-    pub doc_gossip_tick_event: Counter,
-    /// Number of times the gossip actor processed an actor event
-    pub doc_gossip_tick_actor: Counter,
-    /// Number of times the gossip actor processed a pending join
-    pub doc_gossip_tick_pending_join: Counter,
-
-    /// Number of times the live actor loop ticked
-    pub doc_live_tick_main: Counter,
-    /// Number of times the live actor processed an actor event
-    pub doc_live_tick_actor: Counter,
-    /// Number of times the live actor processed a replica event
-    pub doc_live_tick_replica_event: Counter,
-    /// Number of times the live actor processed a running sync connect
-    pub doc_live_tick_running_sync_connect: Counter,
-    /// Number of times the live actor processed a running sync accept
-    pub doc_live_tick_running_sync_accept: Counter,
-    /// Number of times the live actor processed a pending download
-    pub doc_live_tick_pending_downloads: Counter,
+    /// handle was gone and no release message arrived: a release lost to a
+    /// full actor queue, or a registration whose handle a cancelled caller
+    /// never received.
+    pub(crate) sync_sessions_reclaimed: Counter,
 }

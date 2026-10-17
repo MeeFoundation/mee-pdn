@@ -25,7 +25,7 @@ struct ActiveState {
 }
 
 #[derive(Debug)]
-pub struct GossipState {
+pub(crate) struct GossipState {
     gossip: Gossip,
     to_live_actor: mpsc::Sender<ToLiveActor>,
     active: HashMap<NamespaceId, ActiveState>,
@@ -79,13 +79,13 @@ impl GossipState {
     }
 
     /// Whether `generation` names the subscription `namespace` holds now.
-    pub fn is_current(&self, namespace: &NamespaceId, generation: u64) -> bool {
+    pub(crate) fn is_current(&self, namespace: &NamespaceId, generation: u64) -> bool {
         self.active
             .get(namespace)
             .is_some_and(|state| state.generation == generation)
     }
 
-    pub fn quit(&mut self, topic: &NamespaceId) {
+    pub(crate) fn quit(&mut self, topic: &NamespaceId) {
         if let Some(state) = self.active.remove(topic) {
             state.abort_handle.abort();
         }
@@ -104,7 +104,7 @@ impl GossipState {
         }
     }
 
-    pub fn max_message_size(&self) -> usize {
+    pub(crate) fn max_message_size(&self) -> usize {
         self.gossip.max_message_size()
     }
 
@@ -127,7 +127,7 @@ impl GossipState {
     /// ## Cancel safety
     ///
     /// This function is fully cancel-safe.
-    pub async fn next_ended(&mut self) -> Result<NamespaceId> {
+    pub(crate) async fn next_ended(&mut self) -> Result<NamespaceId> {
         match self.ended().await? {
             Some(namespace) => Ok(namespace),
             None => std::future::pending().await,

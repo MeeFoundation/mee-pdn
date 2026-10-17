@@ -13,6 +13,20 @@ use data_layer::{DocTicket, PrivateMetadataStore, SpawnOptions, SyncNode};
 pub mod pod;
 use pdn_types::{NodeId, PdnId};
 
+/// Counts every panic in this process from here on, on any thread: one on a
+/// task the runtime catches, such as the blob store's, fails no test by
+/// itself. Nextest runs each test in a process of its own.
+pub fn count_panics() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let panics = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&panics);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        previous(info);
+    }));
+    panics
+}
+
 /// A node on memory storage — what the in-process suites run on.
 pub async fn memory_node() -> Result<SyncNode> {
     SyncNode::spawn(SpawnOptions::memory()).await

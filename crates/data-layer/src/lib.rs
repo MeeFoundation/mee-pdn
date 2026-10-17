@@ -14,6 +14,7 @@ mod access;
 mod address_book;
 mod identity_key;
 pub mod node;
+mod path_selector;
 mod pod;
 pub mod private_metadata;
 mod registry;
@@ -49,10 +50,7 @@ pub use node::{
 };
 // pdn-store vocabulary of the share and import flows, so downstream crates
 // need no direct dependency on the fork.
-pub use pdn_store::{
-    api::protocol::{AddrInfoOptions, ShareMode},
-    AuthorId, Contact, DocTicket, Identity, NamespaceId,
-};
+pub use pdn_store::{api::AddrInfoOptions, AuthorId, Contact, DocTicket, Identity, NamespaceId};
 pub use private_metadata::{
     pod_inviter_ticket_kind, pod_ticket_kind, CatchUpTimeout, CatchUpWatch, PrivateMetadataStore,
 };

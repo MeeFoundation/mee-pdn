@@ -20,15 +20,13 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
+    provider::{events::EventSender, handle_stream, StreamPair},
     store::{fs::FsStore, mem::MemStore, GcConfig, ProtectCb, ProtectOutcome},
-    BlobsProtocol, Hash, ALPN as BLOBS_ALPN,
+    Hash, ALPN as BLOBS_ALPN,
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc, DocsApi,
-    },
+    api::{AddrInfoOptions, Doc, DocsApi},
     protocol::{Docs, DocsDispatch},
     store::Query,
     AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
@@ -36,6 +34,7 @@ use pdn_store::{
 use pdn_types::{NodeId, PdnId, PodId, RecordRef};
 use rand::seq::SliceRandom as _;
 use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 use crate::{
     access::{session_access_provider, AccessBook},
@@ -106,6 +105,28 @@ impl ProtocolHandler for PanicGuarded {
     }
 }
 
+/// The blob protocol with its streams' tasks tracked and the store's closing
+/// left to the node: the router shuts its protocols down before it cancels
+/// their connections, and a stream's task outlives the router's shutdown, so
+/// a request a stream already read would reach a store that is closing,
+/// which iroh-blobs answers by panicking on its own task.
+#[derive(Debug, Clone)]
+struct BlobsServing {
+    store: iroh_blobs::api::Store,
+    streams: TaskTracker,
+}
+
+impl ProtocolHandler for BlobsServing {
+    /// `iroh_blobs::provider::handle_connection`, which spawns each stream's
+    /// task untracked, without the provider events the node takes none of.
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        while let Ok(pair) = StreamPair::accept(&connection, EventSender::DEFAULT).await {
+            self.streams.spawn(handle_stream(pair, self.store.clone()));
+        }
+        Ok(())
+    }
+}
+
 /// Default of [`SpawnOptions::reconcile_interval`]. Gossip is best-effort
 /// and the rescue triggers ride the same gossip, so without this pass a
 /// late write can starve. Each pass re-dials a doc's import-time contacts,
@@ -136,6 +157,11 @@ const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Default of [`SpawnOptions::pod_change_settle`].
 const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
+
+/// How long a stop waits for the blob protocol's streams and then the blob
+/// store to finish: a stream ends at its next read or write on the closed
+/// endpoint, and a request it left in the store at its first answer.
+const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
@@ -267,6 +293,8 @@ impl SpawnOptions {
 pub struct SyncNode {
     router: Router,
     blobs: iroh_blobs::api::Store,
+    /// The blob protocol's stream tasks, which outlive the router.
+    blob_streams: TaskTracker,
     gossip: Gossip,
     /// The half of the node each hosted identity owns.
     identities: Identities,
@@ -562,10 +590,26 @@ impl SyncNode {
     /// before anything binds. A handler's `accept` should return
     /// `Err(AcceptError)` rather than panic: a panic is contained per
     /// connection, but a `panic = "abort"` build still aborts the process.
-    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
     pub async fn spawn_with(
         extra_protocols: Vec<ExtraProtocol>,
         options: SpawnOptions,
+    ) -> Result<Self> {
+        Self::assemble(extra_protocols, options, true).await
+    }
+
+    /// A node that serves no payload: a peer's fetch of its entries'
+    /// payloads fails at the dial and is tried again, so a download stays
+    /// under way on the peer for as long as a scenario needs.
+    #[cfg(feature = "test-util")]
+    pub async fn spawn_serving_no_payloads_for_test(options: SpawnOptions) -> Result<Self> {
+        Self::assemble(Vec::new(), options, false).await
+    }
+
+    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
+    async fn assemble(
+        extra_protocols: Vec<ExtraProtocol>,
+        options: SpawnOptions,
+        serve_payloads: bool,
     ) -> Result<Self> {
         // An extra silently replacing a built-in handler would leave a node
         // that looks alive and never syncs.
@@ -613,8 +657,18 @@ impl SyncNode {
             })
         };
 
-        let mut router = Router::builder(endpoint)
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs_store, None))
+        let blob_streams = TaskTracker::new();
+        let mut router = Router::builder(endpoint);
+        if serve_payloads {
+            router = router.accept(
+                BLOBS_ALPN,
+                BlobsServing {
+                    store: blobs_store.clone(),
+                    streams: blob_streams.clone(),
+                },
+            );
+        }
+        router = router
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(DOCS_ALPN, DocsDispatch::new(resolver));
         for (alpn, handler) in extra_protocols {
@@ -653,6 +707,7 @@ impl SyncNode {
         Ok(Self {
             router,
             blobs: blobs_store,
+            blob_streams,
             gossip,
             identities,
             cache_budget_bytes: options.replica_cache_budget_bytes,
@@ -942,7 +997,6 @@ impl SyncNode {
                 contact.identity,
                 caller,
                 contact.addr.clone(),
-                None,
                 None,
                 pdn_store::admit_all(),
             )
@@ -2031,11 +2085,8 @@ impl SyncNode {
             .ok_or(UnknownPod { pod })?;
         let records = held.records.ok_or(UnknownPod { pod })?;
         Ok(PodTickets {
-            membership: held
-                .membership
-                .ticket(ShareMode::Write, addr_options)
-                .await?,
-            records: records.ticket(ShareMode::Write, addr_options).await?,
+            membership: held.membership.ticket(addr_options).await?,
+            records: records.ticket(addr_options).await?,
         })
     }
 
@@ -2117,9 +2168,6 @@ impl SyncNode {
                 "namespace {namespace} is a store of pod {pod}; \
                  it cannot be opened as a device-shared store"
             ));
-        }
-        if !holds_namespace(&stack.api, namespace).await? {
-            return Ok(None);
         }
         let Some(doc) = stack
             .api
@@ -2282,12 +2330,10 @@ impl SyncNode {
                 tracing::warn!("the address book was not saved at shutdown: {err:#}");
             }
         }
-        // Everything below runs whatever the router answers: a stop that
-        // returned early would leave every engine, the blob store and the
-        // directory lock held for the rest of the process.
-        let routed = self.router.shutdown().await;
-        // The router serves the dispatcher, not the engines, so each
-        // identity's engine is shut down by name.
+        // The engines before the router: a running engine starts downloads
+        // that read the blob store the router's shutdown closes. The router
+        // serves the dispatcher, not the engines, so each engine is shut down
+        // by name.
         let stacks: Vec<Arc<HostedStack>> = match self.identities.read() {
             Ok(hosted) => hosted.values().cloned().collect(),
             Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
@@ -2295,9 +2341,28 @@ impl SyncNode {
         for stack in stacks {
             let _ = stack.docs.engine().shutdown().await;
         }
-        // Explicit rather than on the last handle's drop: a node respawned
-        // on the same directory would meet its predecessor's database lock.
-        // Best-effort: a store already shut down answers with an error.
+        // Everything below runs whatever the router answers: a stop that
+        // returned early would leave the blob store and the directory lock
+        // held for the rest of the process.
+        let routed = self.router.shutdown().await;
+        // A request a stream read before the router's shutdown still reaches
+        // the store, and the store's shutdown closes its database beneath it
+        // at once: the read then poisons the entry and iroh-blobs panics on
+        // its own task.
+        self.blob_streams.close();
+        let finished = tokio::time::timeout(BLOB_STORE_IDLE_WAIT, async {
+            self.blob_streams.wait().await;
+            self.blobs.wait_idle().await
+        })
+        .await;
+        if finished.is_err() {
+            tracing::warn!("the blob store was still busy when the node stopped");
+        }
+        // After the router, whose shutdown awaits every connection's handler,
+        // and explicit rather than on the last handle's drop: a node
+        // respawned on the same directory would meet its predecessor's
+        // database lock. Best-effort: a store already shut down answers with
+        // an error.
         let _ = self.blobs.shutdown().await;
         // With the stores, not with this value's drop: a detached task
         // holding the node alive a moment longer must not make a spawn on
@@ -2447,8 +2512,8 @@ fn identity_directory(directory: &std::path::Path, identity: PdnId) -> std::path
         .join(encode_hex(identity.as_bytes()))
 }
 
-/// Answered from the listing: the fork reports "no such namespace" and
-/// "the store could not answer" as one error of the same shape.
+/// Answered from the listing: opening a replica holds it open.
+#[cfg(feature = "test-util")]
 async fn holds_namespace(api: &DocsApi, namespace: NamespaceId) -> Result<bool> {
     let mut listed = api.list().await?;
     while let Some(entry) = listed.next().await {
@@ -2896,12 +2961,16 @@ async fn bind_endpoint(
         }
         Connectivity::RelaysAndAddressLookup => Endpoint::builder(presets::N0),
     };
-    let builder = builder.transport_config(
-        QuicTransportConfig::builder()
-            .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
-            .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
-            .build(),
-    );
+    let builder = builder
+        .path_selector(std::sync::Arc::new(
+            crate::path_selector::ReceivingPathSelector,
+        ))
+        .transport_config(
+            QuicTransportConfig::builder()
+                .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+                .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+                .build(),
+        );
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,

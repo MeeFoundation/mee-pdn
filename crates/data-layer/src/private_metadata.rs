@@ -16,10 +16,7 @@ use anyhow::{Context, Result};
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc,
-    },
+    api::{AddrInfoOptions, Doc},
     engine::LiveEvent,
     store::Query,
     AuthorId, DocTicket, NamespaceId,
@@ -301,12 +298,8 @@ impl PrivateMetadataStore {
         }))
     }
 
-    pub async fn share_ticket(
-        &self,
-        mode: ShareMode,
-        addr_options: AddrInfoOptions,
-    ) -> Result<DocTicket> {
-        let ticket = self.doc.share(mode, addr_options).await?;
+    pub async fn share_ticket(&self, addr_options: AddrInfoOptions) -> Result<DocTicket> {
+        let ticket = self.doc.share(addr_options).await?;
         Ok(ticket)
     }
 

@@ -24,36 +24,37 @@ use iroh_blobs::Hash;
 use n0_future::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
-pub use crate::heads::AuthorHeads;
+pub(crate) use crate::heads::AuthorHeads;
 use crate::{
     keys::{Author, AuthorId, AuthorPublicKey, NamespaceId, NamespacePublicKey, NamespaceSecret},
     ranger::{
         self, Fingerprint, InsertOutcome, RangeEntry, RangeKey, RangeValue, Store, ValidateOutcome,
     },
-    store::{self, fs::StoreInstance, DownloadPolicyStore, PublicKeyStore},
+    store::{self, fs::StoreInstance, PublicKeyStore},
     subscribers::{Delivery, LagNotice, Subscribers},
 };
 
 /// Protocol message for the set reconciliation protocol.
 ///
 /// Can be serialized to bytes with [serde] to transfer between peers.
-pub type ProtocolMessage = crate::ranger::Message<SignedEntry>;
+pub(crate) type ProtocolMessage = crate::ranger::Message<SignedEntry>;
 
 /// Byte representation of an iroh `EndpointId`.
 // TODO: Consider `iroh::EndpointId` instead of raw bytes (`iroh` re-exports it from `iroh-base`).
-pub type PeerIdBytes = [u8; 32];
+pub(crate) type PeerIdBytes = [u8; 32];
 
 /// Max time in the future from our wall clock time that we accept entries for.
 /// Value is 10 minutes.
-pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_micros() as u64;
+pub(crate) const MAX_TIMESTAMP_FUTURE_SHIFT: u64 =
+    10 * 60 * Duration::from_secs(1).as_micros() as u64;
 
 /// The longest key a replica holds: a longer one is refused on a local
 /// write and dropped at ingest, so the first message a replica sends —
 /// its first key, twice — stays under the ceiling a peer reads it with.
-pub const MAX_KEY_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_KEY_BYTES: usize = 8 * 1024;
 
 /// Callback that may be set on a replica to determine the availability status for a content hash.
-pub type ContentStatusCallback =
+pub(crate) type ContentStatusCallback =
     Arc<dyn Fn(Hash) -> n0_future::boxed::BoxFuture<ContentStatus> + Send + Sync + 'static>;
 
 /// Event emitted by sync when entries are added.
@@ -76,8 +77,6 @@ pub enum Event {
         /// Debug matches [`iroh::PublicKey::fmt_short`] (first 5 bytes, lower hex).
         #[debug("{}", hex::encode(&from[..5]))]
         from: PeerIdBytes,
-        /// Whether download policies require the content to be downloaded.
-        should_download: bool,
         /// [`ContentStatus`] for this entry in the remote's replica.
         remote_content_status: ContentStatus,
     },
@@ -103,7 +102,7 @@ impl LagNotice for Event {
 
 /// Whether an entry was inserted locally or by a remote peer.
 #[derive(derive_more::Debug, Clone)]
-pub enum InsertOrigin {
+pub(crate) enum InsertOrigin {
     /// The entry was inserted locally.
     Local,
     /// The entry was received from the remote node identified by [`PeerIdBytes`].
@@ -130,13 +129,13 @@ pub enum ContentStatus {
 
 /// Outcome of a sync operation.
 #[derive(Debug, Clone, Default)]
-pub struct SyncOutcome {
+pub(crate) struct SyncOutcome {
     /// Timestamp of the latest entry for each author in the set we received.
-    pub heads_received: AuthorHeads,
+    pub(crate) heads_received: AuthorHeads,
     /// Number of entries we received.
-    pub num_recv: usize,
+    pub(crate) num_recv: usize,
     /// Number of entries we sent.
-    pub num_sent: usize,
+    pub(crate) num_sent: usize,
 }
 
 /// Kind of capability of the namespace.
@@ -155,17 +154,15 @@ pub struct SyncOutcome {
 pub enum CapabilityKind {
     /// A writable replica.
     Write = 1,
-    /// A readable replica.
-    Read = 2,
 }
 
 /// The capability of the namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, derive_more::From)]
+///
+/// An enum of one variant, so a ticket's encoding carries its variant index.
 pub enum Capability {
     /// Write access to the namespace.
     Write(NamespaceSecret),
-    /// Read only access to the namespace.
-    Read(NamespaceId),
 }
 
 impl Capability {
@@ -173,84 +170,47 @@ impl Capability {
     pub fn id(&self) -> NamespaceId {
         match self {
             Capability::Write(secret) => secret.id(),
-            Capability::Read(id) => *id,
         }
     }
 
     /// Get the [`NamespaceSecret`] of this [`Capability`].
-    /// Will fail if the [`Capability`] is read only.
-    pub fn secret_key(&self) -> Result<&NamespaceSecret, ReadOnly> {
+    pub(crate) fn secret_key(&self) -> &NamespaceSecret {
         match self {
-            Capability::Write(secret) => Ok(secret),
-            Capability::Read(_) => Err(ReadOnly),
+            Capability::Write(secret) => secret,
         }
     }
 
     /// Get the kind of capability.
-    pub fn kind(&self) -> CapabilityKind {
+    pub(crate) fn kind(&self) -> CapabilityKind {
         match self {
             Capability::Write(_) => CapabilityKind::Write,
-            Capability::Read(_) => CapabilityKind::Read,
         }
     }
 
-    /// Get the raw representation of this namespace capability.
-    pub fn raw(&self) -> (u8, [u8; 32]) {
+    /// Get the raw representation of this namespace capability: the kind
+    /// byte and the secret, as the namespaces table stores them.
+    pub(crate) fn raw(&self) -> (u8, [u8; 32]) {
         let capability_repr: u8 = self.kind().into();
         let bytes = match self {
             Capability::Write(secret) => secret.to_bytes(),
-            Capability::Read(id) => id.to_bytes(),
         };
         (capability_repr, bytes)
     }
 
-    /// Create a [`Capability`] from its raw representation.
-    pub fn from_raw(kind: u8, bytes: &[u8; 32]) -> anyhow::Result<Self> {
+    /// Create a [`Capability`] from its raw representation; a kind byte no
+    /// [`CapabilityKind`] carries is refused.
+    pub(crate) fn from_raw(kind: u8, bytes: &[u8; 32]) -> anyhow::Result<Self> {
         let kind: CapabilityKind = kind.try_into()?;
         let capability = match kind {
-            CapabilityKind::Write => {
-                let secret = NamespaceSecret::from_bytes(bytes);
-                Capability::Write(secret)
-            }
-            CapabilityKind::Read => {
-                let id = NamespaceId::from(bytes);
-                Capability::Read(id)
-            }
+            CapabilityKind::Write => Capability::Write(NamespaceSecret::from_bytes(bytes)),
         };
         Ok(capability)
     }
-
-    /// Merge this capability with another capability.
-    ///
-    /// Will return an error if `other` is not a capability for the same namespace.
-    ///
-    /// Returns `true` if the capability was changed, `false` otherwise.
-    pub fn merge(&mut self, other: Capability) -> Result<bool, CapabilityError> {
-        if other.id() != self.id() {
-            return Err(CapabilityError::NamespaceMismatch);
-        }
-
-        // the only capability upgrade is from read-only (self) to writable (other)
-        if matches!(self, Capability::Read(_)) && matches!(other, Capability::Write(_)) {
-            let _ = std::mem::replace(self, other);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-}
-
-/// Errors for capability operations
-#[derive(Debug, thiserror::Error)]
-pub enum CapabilityError {
-    /// Namespaces are not the same
-    #[error("Namespaces are not the same")]
-    NamespaceMismatch,
 }
 
 /// In memory information about an open replica.
 #[derive(derive_more::Debug)]
-pub struct ReplicaInfo {
+pub(crate) struct ReplicaInfo {
     pub(crate) capability: Capability,
     subscribers: Subscribers<Event>,
     #[debug("ContentStatusCallback")]
@@ -292,20 +252,15 @@ impl ReplicaInfo {
     /// Simply dropping the receiver is fine too. If you cloned a single sender to subscribe to
     /// multiple replicas, you can use this method to explicitly unsubscribe the sender from
     /// this replica without having to drop the receiver.
-    pub fn unsubscribe(&mut self, sender: &async_channel::Sender<Event>) {
+    pub(crate) fn unsubscribe(&mut self, sender: &async_channel::Sender<Event>) {
         self.subscribers.unsubscribe(sender)
-    }
-
-    /// Get the number of current event subscribers.
-    pub fn subscribers_count(&self) -> usize {
-        self.subscribers.len()
     }
 
     /// Set the content status callback.
     ///
     /// Only one callback can be active at a time. If a previous callback was registered, this
     /// will return `false`.
-    pub fn set_content_status_callback(&mut self, cb: ContentStatusCallback) -> bool {
+    pub(crate) fn set_content_status_callback(&mut self, cb: ContentStatusCallback) -> bool {
         if self.content_status_cb.is_some() {
             false
         } else {
@@ -330,21 +285,11 @@ impl ReplicaInfo {
     pub fn closed(&self) -> bool {
         self.closed
     }
-
-    /// Merge a capability.
-    ///
-    /// The capability must refer to the the same namespace, otherwise an error will be returned.
-    ///
-    /// This will upgrade the replica's capability when passing a `Capability::Write`.
-    /// It is a no-op if `capability` is a Capability::Read`.
-    pub fn merge_capability(&mut self, capability: Capability) -> Result<bool, CapabilityError> {
-        self.capability.merge(capability)
-    }
 }
 
 /// Local representation of a mutable, synchronizable key-value store.
 #[derive(derive_more::Debug)]
-pub struct Replica<'a, I = Box<ReplicaInfo>> {
+pub(crate) struct Replica<'a, I = Box<ReplicaInfo>> {
     pub(crate) store: StoreInstance<'a>,
     pub(crate) info: I,
 }
@@ -379,8 +324,7 @@ where
         let id = RecordIdentifier::new(self.id(), author.id(), key);
         let record = Record::new_current(hash, len);
         let entry = Entry::new(id, record);
-        let secret = self.secret_key()?;
-        let signed_entry = entry.sign(secret, author);
+        let signed_entry = entry.sign(self.secret_key(), author);
         self.insert_entry(signed_entry, InsertOrigin::Local).await
     }
 
@@ -388,7 +332,7 @@ where
     /// no other key is touched.
     ///
     /// Returns 1 when an older entry at `key` was replaced, 0 otherwise.
-    pub async fn delete(
+    pub(crate) async fn delete(
         &mut self,
         key: impl AsRef<[u8]>,
         author: &Author,
@@ -396,7 +340,7 @@ where
         self.info.ensure_open()?;
         let id = RecordIdentifier::new(self.id(), author.id(), key);
         let entry = Entry::new_empty(id);
-        let signed_entry = entry.sign(self.secret_key()?, author);
+        let signed_entry = entry.sign(self.secret_key(), author);
         self.insert_entry(signed_entry, InsertOrigin::Local).await
     }
 
@@ -407,14 +351,14 @@ where
     ///
     /// Returns the number of entries removed as a consequence of this insertion,
     /// or an error if the entry failed to validate or if a store operation failed.
-    pub async fn insert_remote_entry(
+    #[cfg(test)]
+    pub(crate) async fn insert_remote_entry(
         &mut self,
         entry: SignedEntry,
         received_from: PeerIdBytes,
         content_status: ContentStatus,
     ) -> Result<usize, InsertError> {
         self.info.ensure_open()?;
-        entry.validate_empty()?;
         let origin = InsertOrigin::Sync {
             from: received_from,
             remote_content_status: content_status,
@@ -448,20 +392,12 @@ where
             InsertOrigin::Sync {
                 from,
                 remote_content_status,
-            } => {
-                let download_policy = self
-                    .store
-                    .get_download_policy(&self.id())
-                    .unwrap_or_default();
-                let should_download = download_policy.matches(entry.entry());
-                Event::RemoteInsert {
-                    namespace,
-                    entry,
-                    from,
-                    should_download,
-                    remote_content_status,
-                }
-            }
+            } => Event::RemoteInsert {
+                namespace,
+                entry,
+                from,
+                remote_content_status,
+            },
         };
 
         self.info.subscribers.send(insert_event).await;
@@ -473,7 +409,8 @@ where
     ///
     /// This does not store the content, just the record of it.
     /// Returns the calculated hash.
-    pub async fn hash_and_insert(
+    #[cfg(test)]
+    pub(crate) async fn hash_and_insert(
         &mut self,
         key: impl AsRef<[u8]>,
         author: &Author,
@@ -486,16 +423,11 @@ where
         Ok(hash)
     }
 
-    /// Get the identifier for an entry in this replica.
-    pub fn record_id(&self, key: impl AsRef<[u8]>, author: &Author) -> RecordIdentifier {
-        RecordIdentifier::new(self.info.capability.id(), author.id(), key)
-    }
-
     /// Create the initial message for the set reconciliation flow with a remote peer.
     ///
     /// With a session `filter` set, the initial range boundary and
     /// fingerprint derive from the filtered view only.
-    pub fn sync_initial_message(
+    pub(crate) fn sync_initial_message(
         &mut self,
         filter: Option<crate::filter::EntryFilter>,
     ) -> anyhow::Result<crate::ranger::Message<SignedEntry>> {
@@ -512,7 +444,7 @@ where
     /// entries the filter admits, so nothing else is revealed to the peer.
     /// Ingest of the peer's entries is unaffected: writes pass through the
     /// session store, gated by `validate_entry` alone.
-    pub async fn sync_process_message(
+    pub(crate) async fn sync_process_message(
         &mut self,
         message: crate::ranger::Message<SignedEntry>,
         from_peer: PeerIdBytes,
@@ -535,10 +467,6 @@ where
         // let subscribers = std::rc::Rc::new(&mut self.subscribers);
         // l
         let cb = self.info.content_status_cb.clone();
-        let download_policy = self
-            .store
-            .get_download_policy(&my_namespace)
-            .unwrap_or_default();
 
         let mut session_store = crate::filter::SessionStore::new(&mut self.store, filter);
         let reply = session_store
@@ -565,15 +493,11 @@ where
                     // We use `send_with` to only clone the entry if we have active subscriptions.
                     self.info
                         .subscribers
-                        .send_with(|| {
-                            let should_download = download_policy.matches(entry.entry());
-                            Event::RemoteInsert {
-                                from: from_peer,
-                                namespace: my_namespace,
-                                entry: entry.clone(),
-                                should_download,
-                                remote_content_status: content_status,
-                            }
+                        .send_with(|| Event::RemoteInsert {
+                            from: from_peer,
+                            namespace: my_namespace,
+                            entry: entry.clone(),
+                            remote_content_status: content_status,
                         })
                         .await
                 },
@@ -601,22 +525,11 @@ where
         self.info.capability.id()
     }
 
-    /// Get the [`Capability`] of this [`Replica`].
-    pub fn capability(&self) -> &Capability {
-        &self.info.capability
-    }
-
-    /// Get the byte representation of the [`NamespaceSecret`] key for this replica. Will fail if
-    /// the replica is read only
-    pub fn secret_key(&self) -> Result<&NamespaceSecret, ReadOnly> {
+    /// Get the [`NamespaceSecret`] key for this replica.
+    pub fn secret_key(&self) -> &NamespaceSecret {
         self.info.capability.secret_key()
     }
 }
-
-/// Error that occurs trying to access the [`NamespaceSecret`] of a read-only [`Capability`].
-#[derive(Debug, thiserror::Error)]
-#[error("Replica allows read access only.")]
-pub struct ReadOnly;
 
 /// Validate a [`SignedEntry`] if it's fit to be inserted.
 ///
@@ -625,6 +538,7 @@ pub struct ReadOnly;
 /// * the entry's namespace matches the current replica
 /// * the entry's timestamp is not more than 10 minutes in the future of our system time
 /// * the entry's key is no longer than [`MAX_KEY_BYTES`]
+/// * the entry has the empty hash exactly when it has length 0
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
@@ -642,6 +556,10 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     if entry.key().len() > MAX_KEY_BYTES {
         return Err(ValidationFailure::KeyTooLong);
     }
+
+    // An empty entry is the empty hash and length 0 together: readers that
+    // judge emptiness by one of the two would otherwise read one entry two ways.
+    entry.validate_empty()?;
 
     // Verify signature for non-local entries.
     if !matches!(origin, InsertOrigin::Local) && entry.verify(store).is_err() {
@@ -665,8 +583,8 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
 }
 
 /// Error emitted when inserting entries into a [`Replica`] failed
-#[derive(thiserror::Error, derive_more::Debug, derive_more::From)]
-pub enum InsertError {
+#[derive(thiserror::Error, derive_more::Debug)]
+pub(crate) enum InsertError {
     /// Storage error
     #[error("storage error")]
     Store(anyhow::Error),
@@ -679,10 +597,6 @@ pub enum InsertError {
     /// Attempted to insert an empty entry.
     #[error("Attempted to insert an empty entry")]
     EntryIsEmpty,
-    /// Replica is read only.
-    #[error("Attempted to insert to read only replica")]
-    #[from(ReadOnly)]
-    ReadOnly,
     /// The replica is closed, no operations may be performed.
     #[error("replica is closed")]
     Closed,
@@ -690,7 +604,7 @@ pub enum InsertError {
 
 /// Reason why verifying a [`SignedEntry`] failed.
 #[derive(thiserror::Error, Debug)]
-pub enum SignedEntryVerifyError {
+pub(crate) enum SignedEntryVerifyError {
     /// One of the entry's public key bytes is not a valid ed25519 curve point.
     #[error(transparent)]
     KeyParsing(#[from] KeyParsingError),
@@ -701,7 +615,7 @@ pub enum SignedEntryVerifyError {
 
 /// Reason why entry validation failed
 #[derive(thiserror::Error, Debug)]
-pub enum ValidationFailure {
+pub(crate) enum ValidationFailure {
     /// Entry namespace does not match the current replica.
     #[error("Entry namespace does not match the current replica")]
     InvalidNamespace,
@@ -768,7 +682,7 @@ impl SignedEntry {
     }
 
     /// Create a new signed entry by signing an entry with the `namespace` and `author`.
-    pub fn from_entry(entry: Entry, namespace: &NamespaceSecret, author: &Author) -> Self {
+    pub(crate) fn from_entry(entry: Entry, namespace: &NamespaceSecret, author: &Author) -> Self {
         let signature = EntrySignature::from_entry(&entry, namespace, author);
         SignedEntry { signature, entry }
     }
@@ -786,7 +700,7 @@ impl SignedEntry {
     }
 
     /// Verify the signatures on this entry.
-    pub fn verify<S: store::PublicKeyStore>(
+    pub(crate) fn verify<S: store::PublicKeyStore>(
         &self,
         store: &S,
     ) -> Result<(), SignedEntryVerifyError> {
@@ -799,12 +713,12 @@ impl SignedEntry {
     }
 
     /// Get the signature.
-    pub fn signature(&self) -> &EntrySignature {
+    pub(crate) fn signature(&self) -> &EntrySignature {
         &self.signature
     }
 
     /// Validate that the entry has the empty hash if the length is 0, or a non-zero length.
-    pub fn validate_empty(&self) -> Result<(), ValidationFailure> {
+    pub(crate) fn validate_empty(&self) -> Result<(), ValidationFailure> {
         self.entry().validate_empty()
     }
 
@@ -824,7 +738,7 @@ impl SignedEntry {
     }
 
     /// Get the author bytes of this entry.
-    pub fn author_bytes(&self) -> AuthorId {
+    pub(crate) fn author_bytes(&self) -> AuthorId {
         self.entry().id().author()
     }
 
@@ -864,7 +778,7 @@ impl RangeEntry for SignedEntry {
 
 /// Signature over an entry.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EntrySignature {
+pub(crate) struct EntrySignature {
     author_signature: Signature,
     namespace_signature: Signature,
 }
@@ -886,7 +800,7 @@ impl Debug for EntrySignature {
 
 impl EntrySignature {
     /// Create a new signature by signing an entry with the `namespace` and `author`.
-    pub fn from_entry(entry: &Entry, namespace: &NamespaceSecret, author: &Author) -> Self {
+    pub(crate) fn from_entry(entry: &Entry, namespace: &NamespaceSecret, author: &Author) -> Self {
         // TODO: this should probably include a namespace prefix
         // namespace in the cryptographic sense.
         let bytes = entry.to_vec();
@@ -933,9 +847,9 @@ impl EntrySignature {
     }
 }
 
-/// A single entry in a [`Replica`]
+/// A single entry in a `Replica`
 ///
-/// An entry is identified by a key, its [`Author`], and the [`Replica`]'s
+/// An entry is identified by a key, its [`Author`], and the `Replica`'s
 /// [`NamespaceSecret`]. Its value is the [32-byte BLAKE3 hash](iroh_blobs::Hash)
 /// of the entry's content data, the size of this content data, and a timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -951,7 +865,7 @@ impl Entry {
     }
 
     /// Create a new empty entry with the current timestamp.
-    pub fn new_empty(id: RecordIdentifier) -> Self {
+    pub(crate) fn new_empty(id: RecordIdentifier) -> Self {
         Entry {
             id,
             record: Record::empty_current(),
@@ -959,7 +873,7 @@ impl Entry {
     }
 
     /// Validate that the entry has the empty hash if the length is 0, or a non-zero length.
-    pub fn validate_empty(&self) -> Result<(), ValidationFailure> {
+    pub(crate) fn validate_empty(&self) -> Result<(), ValidationFailure> {
         match (self.content_hash() == Hash::EMPTY, self.content_len() == 0) {
             (true, true) => Ok(()),
             (false, false) => Ok(()),
@@ -1113,7 +1027,7 @@ impl RangeKey for RecordIdentifier {
     }
 }
 
-fn system_time_now() -> u64 {
+pub(crate) fn system_time_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("time drift")
@@ -1145,7 +1059,8 @@ impl RecordIdentifier {
     }
 
     /// Get this [`RecordIdentifier`] as a tuple of byte slices.
-    pub fn as_byte_tuple(&self) -> (&[u8; 32], &[u8; 32], &[u8]) {
+    #[cfg(test)]
+    pub(crate) fn as_byte_tuple(&self) -> (&[u8; 32], &[u8; 32], &[u8]) {
         (
             self.0[NAMESPACE_BYTES].try_into().unwrap(),
             self.0[AUTHOR_BYTES].try_into().unwrap(),
@@ -1154,7 +1069,7 @@ impl RecordIdentifier {
     }
 
     /// Get this [`RecordIdentifier`] as a tuple of bytes.
-    pub fn to_byte_tuple(&self) -> ([u8; 32], [u8; 32], Bytes) {
+    pub(crate) fn to_byte_tuple(&self) -> ([u8; 32], [u8; 32], Bytes) {
         (
             self.0[NAMESPACE_BYTES].try_into().unwrap(),
             self.0[AUTHOR_BYTES].try_into().unwrap(),
@@ -1168,7 +1083,8 @@ impl RecordIdentifier {
     }
 
     /// Get the key of this record as [`Bytes`].
-    pub fn key_bytes(&self) -> Bytes {
+    #[cfg(test)]
+    pub(crate) fn key_bytes(&self) -> Bytes {
         self.0.slice(KEY_BYTES)
     }
 
@@ -1205,7 +1121,7 @@ impl Deref for Entry {
     }
 }
 
-/// The data part of an entry in a [`Replica`].
+/// The data part of an entry in a `Replica`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Record {
     /// Length of the data referenced by `hash`.
@@ -1249,13 +1165,24 @@ impl Record {
         }
     }
 
+    /// A record as stored or sent: neither a store file nor the wire checks
+    /// hash against length, and a store written before ingest checked it
+    /// can hold a record whose two disagree (`validate_entry`).
+    pub(crate) fn unchecked(hash: Hash, len: u64, timestamp: u64) -> Self {
+        Record {
+            hash,
+            len,
+            timestamp,
+        }
+    }
+
     /// Create a tombstone record (empty content)
     pub fn empty(timestamp: u64) -> Self {
         Self::new(Hash::EMPTY, 0, timestamp)
     }
 
     /// Create a tombstone record with the timestamp set to now.
-    pub fn empty_current() -> Self {
+    pub(crate) fn empty_current() -> Self {
         Self::new_current(Hash::EMPTY, 0)
     }
 
@@ -1317,12 +1244,10 @@ mod tests {
     use super::*;
 
     /// A cache big enough that nothing in a scenario evicts.
-    #[cfg(feature = "fs-store")]
     const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
     use crate::{
-        actor::SyncHandle,
         ranger::{Range, Store as _},
-        store::{OpenError, Query, SortBy, SortDirection, Store},
+        store::{OpenError, Query, Store},
     };
 
     #[tokio::test]
@@ -1334,7 +1259,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_basics_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -1524,7 +1448,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_content_hashes_iterator_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -1652,7 +1575,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_timestamps_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -1716,7 +1638,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_sync_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
         let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
@@ -1770,7 +1691,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_timestamp_sync_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
         let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
@@ -1836,7 +1756,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_session_snapshot_freezes_egress_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
         let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2059,7 +1978,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn a_session_over_an_unwritten_store_commits_nothing_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2096,7 +2014,7 @@ mod tests {
         // and a session over it commits nothing.
         let commits_before = store.debug_commit_count();
         for _ in 0..5 {
-            store.get_download_policy(&ns)?;
+            store.get_sync_peers(&ns)?;
             assert!(
                 matches!(store.debug_transaction_kind(), "write"),
                 "the read left no write transaction open, so the test proves nothing"
@@ -2129,7 +2047,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_session_snapshot_commits_pending_write_batch_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2515,7 +2432,6 @@ mod tests {
 
     /// The fs-store twin of `test_delete_touches_only_its_key_memory`.
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_delete_touches_only_its_key_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2573,7 +2489,6 @@ mod tests {
 
     /// The fs-store twin of `test_replica_sync_delete_memory`.
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_sync_delete_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
         let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2632,7 +2547,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_remove_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
         let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2689,7 +2603,6 @@ mod tests {
 
     /// The fs-store twin of `test_replica_delete_edge_cases_memory`.
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_delete_edge_cases_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2737,7 +2650,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_latest_iter_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2818,7 +2730,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_byte_keys_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -2857,109 +2768,6 @@ mod tests {
             vec![vec![1u8, 0u8], vec![1u8, 2u8], vec![0u8, 255u8]],
         );
         store.flush()?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_replica_capability_memory() -> Result<()> {
-        let store = store::Store::memory();
-        test_replica_capability(store).await
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "fs-store")]
-    async fn test_replica_capability_fs() -> Result<()> {
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-        test_replica_capability(store).await
-    }
-
-    #[allow(clippy::redundant_pattern_matching)]
-    async fn test_replica_capability(mut store: Store) -> Result<()> {
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let author = store.new_author(&mut rng)?;
-        let namespace = NamespaceSecret::new(&mut rng);
-
-        // import read capability - insert must fail
-        let capability = Capability::Read(namespace.id());
-        store.import_namespace(capability)?;
-        let mut replica = store.open_replica(&namespace.id())?;
-        let res = replica.hash_and_insert(b"foo", &author, b"bar").await;
-        assert!(matches!(res, Err(InsertError::ReadOnly)));
-
-        // import write capability - insert must succeed
-        let capability = Capability::Write(namespace.clone());
-        store.import_namespace(capability)?;
-        let mut replica = store.open_replica(&namespace.id())?;
-        let res = replica.hash_and_insert(b"foo", &author, b"bar").await;
-        assert!(matches!(res, Ok(_)));
-        store.close_replica(namespace.id());
-        let mut replica = store.open_replica(&namespace.id())?;
-        let res = replica.hash_and_insert(b"foo", &author, b"bar").await;
-        assert!(res.is_ok());
-
-        // import read capability again - insert must still succeed
-        let capability = Capability::Read(namespace.id());
-        store.import_namespace(capability)?;
-        store.close_replica(namespace.id());
-        let mut replica = store.open_replica(&namespace.id())?;
-        let res = replica.hash_and_insert(b"foo", &author, b"bar").await;
-        assert!(res.is_ok());
-        store.flush()?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_actor_capability_memory() -> Result<()> {
-        let store = store::Store::memory();
-        test_actor_capability(store).await
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "fs-store")]
-    async fn test_actor_capability_fs() -> Result<()> {
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-        test_actor_capability(store).await
-    }
-
-    async fn test_actor_capability(store: Store) -> Result<()> {
-        // test with actor
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let author = Author::new(&mut rng);
-        let handle = SyncHandle::spawn(store, None, "test".into());
-        let author = handle.import_author(author).await?;
-        let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
-
-        // import read capability - insert must fail
-        let capability = Capability::Read(namespace.id());
-        handle.import_namespace(capability).await?;
-        handle.open(namespace.id(), Default::default()).await?;
-        let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
-            .await;
-        assert!(res.is_err());
-
-        // import write capability - insert must succeed
-        let capability = Capability::Write(namespace.clone());
-        handle.import_namespace(capability).await?;
-        let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
-            .await;
-        assert!(res.is_ok());
-
-        // close and reopen - must still succeed
-        handle.close(namespace.id()).await?;
-        let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
-            .await;
-        assert!(res.is_err());
-        handle.open(namespace.id(), Default::default()).await?;
-        let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
-            .await;
-        assert!(res.is_ok());
         Ok(())
     }
 
@@ -3212,7 +3020,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "fs-store")]
     async fn test_replica_queries_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
         let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
@@ -3285,40 +3092,8 @@ mod tests {
         );
 
         qt.assert(
-            Query::single_latest_per_key().sort_direction(SortDirection::Desc),
-            vec![("hi/world", &a1), ("hi/moon", &a2), ("hi", &a3)],
-        );
-
-        qt.assert(
             Query::single_latest_per_key().key_prefix("hi/"),
             vec![("hi/moon", &a2), ("hi/world", &a1)],
-        );
-
-        qt.assert(
-            Query::single_latest_per_key()
-                .key_prefix("hi/")
-                .sort_direction(SortDirection::Desc),
-            vec![("hi/world", &a1), ("hi/moon", &a2)],
-        );
-
-        qt.assert(
-            Query::all().sort_by(SortBy::KeyAuthor, SortDirection::Asc),
-            vec![
-                ("hi", &a3),
-                ("hi/moon", &a2),
-                ("hi/world", &a1),
-                ("hi/world", &a2),
-            ],
-        );
-
-        qt.assert(
-            Query::all().sort_by(SortBy::KeyAuthor, SortDirection::Desc),
-            vec![
-                ("hi/world", &a2),
-                ("hi/world", &a1),
-                ("hi/moon", &a2),
-                ("hi", &a3),
-            ],
         );
 
         qt.assert(
@@ -3327,46 +3102,8 @@ mod tests {
         );
 
         qt.assert(
-            Query::all().key_prefix("hi/").offset(1).limit(1),
-            vec![("hi/moon", &a2)],
-        );
-
-        qt.assert(
-            Query::all()
-                .key_prefix("hi/")
-                .sort_by(SortBy::KeyAuthor, SortDirection::Desc),
-            vec![("hi/world", &a2), ("hi/world", &a1), ("hi/moon", &a2)],
-        );
-
-        qt.assert(
-            Query::all()
-                .key_prefix("hi/")
-                .sort_by(SortBy::KeyAuthor, SortDirection::Desc)
-                .offset(1)
-                .limit(1),
+            Query::all().key_prefix("hi/").limit(1),
             vec![("hi/world", &a1)],
-        );
-
-        qt.assert(
-            Query::all()
-                .key_prefix("hi/")
-                .sort_by(SortBy::AuthorKey, SortDirection::Asc),
-            vec![("hi/world", &a1), ("hi/moon", &a2), ("hi/world", &a2)],
-        );
-
-        qt.assert(
-            Query::all()
-                .key_prefix("hi/")
-                .sort_by(SortBy::AuthorKey, SortDirection::Desc),
-            vec![("hi/world", &a2), ("hi/moon", &a2), ("hi/world", &a1)],
-        );
-
-        qt.assert(
-            Query::all()
-                .sort_by(SortBy::KeyAuthor, SortDirection::Asc)
-                .limit(2)
-                .offset(1),
-            vec![("hi/moon", &a2), ("hi/world", &a1)],
         );
 
         let mut replica = store.new_replica(namespace)?;
@@ -3390,41 +3127,6 @@ mod tests {
                 ("hi", &a3),
             ],
         );
-        store.flush()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_dl_policies_mem() -> Result<()> {
-        let mut store = store::Store::memory();
-        test_dl_policies(&mut store)
-    }
-
-    #[test]
-    #[cfg(feature = "fs-store")]
-    fn test_dl_policies_fs() -> Result<()> {
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let mut store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-        test_dl_policies(&mut store)
-    }
-
-    fn test_dl_policies(store: &mut Store) -> Result<()> {
-        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let namespace = NamespaceSecret::new(&mut rng);
-        let id = namespace.id();
-
-        let filter = store::FilterKind::Exact("foo".into());
-        let policy = store::DownloadPolicy::NothingExcept(vec![filter]);
-        store
-            .set_download_policy(&id, policy.clone())
-            .expect_err("document dos not exist");
-
-        // now create the document
-        store.new_replica(namespace)?;
-
-        store.set_download_policy(&id, policy.clone())?;
-        let retrieved_policy = store.get_download_policy(&id)?;
-        assert_eq!(retrieved_policy, policy);
         store.flush()?;
         Ok(())
     }

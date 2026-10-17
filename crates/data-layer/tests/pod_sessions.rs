@@ -466,9 +466,7 @@ async fn a_freshly_linked_device_is_served_by_its_sibling_first() -> Result<()> 
     );
 
     bob_pms.add_device(bob_laptop.node_id()).await?;
-    let ticket = bob_pms
-        .share_ticket(data_layer::ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = bob_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
     assert!(
         wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?,
@@ -683,9 +681,7 @@ async fn a_pending_device_registration_confers_nothing() -> Result<()> {
     let (bob, phone_pms) = c::host(&phone).await?;
     let pod = c::create(&phone, &bob).await?;
     let record = c::place_claim(&phone, &bob, pod, 0x01).await?;
-    let pms_ticket = phone_pms
-        .share_ticket(data_layer::ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let pms_ticket = phone_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let _tablet_pms = join_identity(&tablet, bob.id, pms_ticket.clone()).await?;
     let _laptop_pms = join_identity(&laptop, bob.id, pms_ticket).await?;
     phone_pms.add_device(tablet.node_id()).await?;

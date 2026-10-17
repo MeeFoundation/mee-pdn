@@ -21,7 +21,7 @@ use pdn_node_http::shapes::{Act, HeldPods, HostedIdentities, Member, Records};
 mod common;
 use common::{
     body, eventually, members_read, pod_listed, pod_route, record_reads, record_reads_within,
-    record_route, Host, Stand, POD_PASS_BUDGET,
+    record_route, Host, Stand, CONVERGENCE_BUDGET,
 };
 
 /// This node's wire id, read from the debug status page — the first line
@@ -92,12 +92,12 @@ async fn assert_recovered(
     // The recovered pod carries a fresh record to the other member — no
     // ceremony was repeated: nothing since the restart minted an invite or
     // linked a device. Placed this soon after the start, it can be announced
-    // before the restarted node's swarm forms, and then the pod pass brings
-    // it.
+    // before the restarted node's swarm forms; the other member's dial on its
+    // new neighbor brings it then, killed or stopped, long before a pod pass.
     let placed = member
         .place_record(alice, family, RecordKind::Claim, sentinel)
         .await?;
-    record_reads_within(other, bob, family, placed, sentinel, POD_PASS_BUDGET)
+    record_reads_within(other, bob, family, placed, sentinel, CONVERGENCE_BUDGET)
         .await
         .context("the other member did not converge with the restarted node")?;
     Ok(placed)

@@ -4,8 +4,8 @@
 use bytes::Bytes;
 use n0_future::time::Instant;
 use redb::{
-    MultimapTable, MultimapTableDefinition, ReadOnlyMultimapTable, ReadOnlyTable, ReadTransaction,
-    Table, TableDefinition, WriteTransaction,
+    MultimapTable, MultimapTableDefinition, ReadOnlyTable, ReadTransaction, Table, TableDefinition,
+    WriteTransaction,
 };
 
 use crate::PeerIdBytes;
@@ -13,18 +13,13 @@ use crate::PeerIdBytes;
 /// Table: Authors
 /// Key:   `[u8; 32]` # AuthorId
 /// Value: `[u8; 32]` # Author
-pub const AUTHORS_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> = TableDefinition::new("authors-1");
-
-/// Table: Namespaces v1 (replaced by Namespaces v2 in migration )
-/// Key:   `[u8; 32]` # NamespaceId
-/// Value: `[u8; 32]` # NamespaceSecret
-pub const NAMESPACES_TABLE_V1: TableDefinition<&[u8; 32], &[u8; 32]> =
-    TableDefinition::new("namespaces-1");
+pub(crate) const AUTHORS_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
+    TableDefinition::new("authors-1");
 
 /// Table: Namespaces v2
 /// Key:   `[u8; 32]`       # NamespaceId
 /// Value: `(u8, [u8; 32])` # (CapabilityKind, Capability)
-pub const NAMESPACES_TABLE: TableDefinition<&[u8; 32], (u8, &[u8; 32])> =
+pub(crate) const NAMESPACES_TABLE: TableDefinition<&[u8; 32], (u8, &[u8; 32])> =
     TableDefinition::new("namespaces-2");
 
 /// Table: Records
@@ -32,45 +27,41 @@ pub const NAMESPACES_TABLE: TableDefinition<&[u8; 32], (u8, &[u8; 32])> =
 ///      # (NamespaceId, AuthorId, Key)
 /// Value: `(u64, [u8; 32], [u8; 32], u64, [u8; 32])`
 ///      # (timestamp, signature_namespace, signature_author, len, hash)
-pub const RECORDS_TABLE: TableDefinition<RecordsId, RecordsValue> =
+pub(crate) const RECORDS_TABLE: TableDefinition<RecordsId, RecordsValue> =
     TableDefinition::new("records-1");
-pub type RecordsId<'a> = (&'a [u8; 32], &'a [u8; 32], &'a [u8]);
-pub type RecordsIdOwned = ([u8; 32], [u8; 32], Bytes);
-pub type RecordsValue<'a> = (u64, &'a [u8; 64], &'a [u8; 64], u64, &'a [u8; 32]);
-pub type RecordsTable = ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>;
+pub(crate) type RecordsId<'a> = (&'a [u8; 32], &'a [u8; 32], &'a [u8]);
+pub(crate) type RecordsIdOwned = ([u8; 32], [u8; 32], Bytes);
+pub(crate) type RecordsValue<'a> = (u64, &'a [u8; 64], &'a [u8; 64], u64, &'a [u8; 32]);
+pub(crate) type RecordsTable = ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>;
 
 /// Table: Latest per author
 /// Key:   `([u8; 32], [u8; 32])`    # (NamespaceId, AuthorId)
 /// Value: `(u64, Vec<u8>)`          # (Timestamp, Key)
-pub const LATEST_PER_AUTHOR_TABLE: TableDefinition<LatestPerAuthorKey, LatestPerAuthorValue> =
-    TableDefinition::new("latest-by-author-1");
-pub type LatestPerAuthorKey<'a> = (&'a [u8; 32], &'a [u8; 32]);
-pub type LatestPerAuthorValue<'a> = (u64, &'a [u8]);
+pub(crate) const LATEST_PER_AUTHOR_TABLE: TableDefinition<
+    LatestPerAuthorKey,
+    LatestPerAuthorValue,
+> = TableDefinition::new("latest-by-author-1");
+pub(crate) type LatestPerAuthorKey<'a> = (&'a [u8; 32], &'a [u8; 32]);
+pub(crate) type LatestPerAuthorValue<'a> = (u64, &'a [u8]);
 
 /// Table: Records by key
 /// Key:   `([u8; 32], Vec<u8>, [u8; 32]])` # (NamespaceId, Key, AuthorId)
 /// Value: `()`
-pub const RECORDS_BY_KEY_TABLE: TableDefinition<RecordsByKeyId, ()> =
+pub(crate) const RECORDS_BY_KEY_TABLE: TableDefinition<RecordsByKeyId, ()> =
     TableDefinition::new("records-by-key-1");
-pub type RecordsByKeyId<'a> = (&'a [u8; 32], &'a [u8], &'a [u8; 32]);
-pub type RecordsByKeyIdOwned = ([u8; 32], Bytes, [u8; 32]);
+pub(crate) type RecordsByKeyId<'a> = (&'a [u8; 32], &'a [u8], &'a [u8; 32]);
+pub(crate) type RecordsByKeyIdOwned = ([u8; 32], Bytes, [u8; 32]);
 
 /// Table: Peers per document.
 /// Key:   `[u8; 32]`        # NamespaceId
 /// Value: `(u64, [u8; 32])` # ([`Nanos`], &[`PeerIdBytes`]) representing the last time a peer was used.
-pub const NAMESPACE_PEERS_TABLE: MultimapTableDefinition<&[u8; 32], (Nanos, &PeerIdBytes)> =
+pub(crate) const NAMESPACE_PEERS_TABLE: MultimapTableDefinition<&[u8; 32], (Nanos, &PeerIdBytes)> =
     MultimapTableDefinition::new("sync-peers-1");
 /// Number of seconds elapsed since [`n0_future::time::SystemTime::UNIX_EPOCH`]. Used to register the
 /// last time a peer was useful in a document.
 // NOTE: resolution is nanoseconds, stored as a u64 since this covers ~500years from unix epoch,
 // which should be more than enough
-pub type Nanos = u64;
-
-/// Table: Download policy
-/// Key:   `[u8; 32]`        # NamespaceId
-/// Value: `Vec<u8>`         # Postcard encoded download policy
-pub const DOWNLOAD_POLICY_TABLE: TableDefinition<&[u8; 32], &[u8]> =
-    TableDefinition::new("download-policy-1");
+pub(crate) type Nanos = u64;
 
 self_cell::self_cell! {
     struct TransactionAndTablesInner {
@@ -81,7 +72,7 @@ self_cell::self_cell! {
 }
 
 #[derive(derive_more::Debug)]
-pub struct TransactionAndTables {
+pub(crate) struct TransactionAndTables {
     #[debug("TransactionAndTablesInner")]
     inner: TransactionAndTablesInner,
     pub(crate) since: Instant,
@@ -106,11 +97,11 @@ impl TransactionAndTables {
     /// Mutable access is the only way to write and it runs through
     /// `with_tables_mut`, so this cannot miss a write; it does count a
     /// closure that took mutable access and wrote nothing.
-    pub fn is_dirty(&self) -> bool {
+    pub(crate) fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    pub fn with_tables_mut<T>(
+    pub(crate) fn with_tables_mut<T>(
         &mut self,
         f: impl FnOnce(&mut Tables) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
@@ -124,14 +115,15 @@ impl TransactionAndTables {
 }
 
 #[derive(derive_more::Debug)]
-pub struct Tables<'tx> {
+pub(crate) struct Tables<'tx> {
     pub records: Table<'tx, RecordsId<'static>, RecordsValue<'static>>,
-    pub records_by_key: Table<'tx, RecordsByKeyId<'static>, ()>,
+    pub(crate) records_by_key: Table<'tx, RecordsByKeyId<'static>, ()>,
     pub namespaces: Table<'tx, &'static [u8; 32], (u8, &'static [u8; 32])>,
-    pub latest_per_author: Table<'tx, LatestPerAuthorKey<'static>, LatestPerAuthorValue<'static>>,
+    pub(crate) latest_per_author:
+        Table<'tx, LatestPerAuthorKey<'static>, LatestPerAuthorValue<'static>>,
     #[debug("MultimapTable")]
-    pub namespace_peers: MultimapTable<'tx, &'static [u8; 32], (Nanos, &'static PeerIdBytes)>,
-    pub download_policy: Table<'tx, &'static [u8; 32], &'static [u8]>,
+    pub(crate) namespace_peers:
+        MultimapTable<'tx, &'static [u8; 32], (Nanos, &'static PeerIdBytes)>,
     pub authors: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
 }
 
@@ -142,7 +134,6 @@ impl<'tx> Tables<'tx> {
         let namespaces = tx.open_table(NAMESPACES_TABLE)?;
         let latest_per_author = tx.open_table(LATEST_PER_AUTHOR_TABLE)?;
         let namespace_peers = tx.open_multimap_table(NAMESPACE_PEERS_TABLE)?;
-        let download_policy = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         Ok(Self {
             records,
@@ -150,23 +141,15 @@ impl<'tx> Tables<'tx> {
             namespaces,
             latest_per_author,
             namespace_peers,
-            download_policy,
             authors,
         })
     }
 }
 #[derive(derive_more::Debug)]
-pub struct ReadOnlyTables {
+pub(crate) struct ReadOnlyTables {
     pub records: ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>,
-    pub records_by_key: ReadOnlyTable<RecordsByKeyId<'static>, ()>,
+    pub(crate) records_by_key: ReadOnlyTable<RecordsByKeyId<'static>, ()>,
     pub namespaces: ReadOnlyTable<&'static [u8; 32], (u8, &'static [u8; 32])>,
-    pub latest_per_author:
-        ReadOnlyTable<LatestPerAuthorKey<'static>, LatestPerAuthorValue<'static>>,
-    #[debug("namespace_peers")]
-    pub namespace_peers: ReadOnlyMultimapTable<&'static [u8; 32], (Nanos, &'static PeerIdBytes)>,
-    pub download_policy: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
-    pub authors: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
-    tx: ReadTransaction,
 }
 
 impl ReadOnlyTables {
@@ -174,24 +157,10 @@ impl ReadOnlyTables {
         let records = tx.open_table(RECORDS_TABLE)?;
         let records_by_key = tx.open_table(RECORDS_BY_KEY_TABLE)?;
         let namespaces = tx.open_table(NAMESPACES_TABLE)?;
-        let latest_per_author = tx.open_table(LATEST_PER_AUTHOR_TABLE)?;
-        let namespace_peers = tx.open_multimap_table(NAMESPACE_PEERS_TABLE)?;
-        let download_policy = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
-        let authors = tx.open_table(AUTHORS_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
             namespaces,
-            latest_per_author,
-            namespace_peers,
-            download_policy,
-            authors,
-            tx,
         })
-    }
-
-    /// Create a clone of the records table for use in iterators.
-    pub fn records_clone(&self) -> Result<RecordsTable, redb::TableError> {
-        self.tx.open_table(RECORDS_TABLE)
     }
 }

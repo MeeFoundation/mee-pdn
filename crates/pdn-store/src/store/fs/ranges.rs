@@ -7,10 +7,10 @@ use super::{
     into_entry,
     tables::{RecordsByKeyId, RecordsId, RecordsValue},
 };
-use crate::{store::SortDirection, SignedEntry};
+use crate::SignedEntry;
 
 /// An extension trait for [`Range`] that provides methods for mapped retrieval.
-pub trait RangeExt<K: Key, V: Value> {
+pub(crate) trait RangeExt<K: Key, V: Value> {
     /// Get the next entry and map the item with a callback function.
     fn next_map<T>(
         &mut self,
@@ -18,11 +18,8 @@ pub trait RangeExt<K: Key, V: Value> {
     ) -> Option<anyhow::Result<T>>;
 
     /// Get the next entry, but only if the callback function returns Some, otherwise continue.
-    ///
-    /// With `direction` the range can be either process in forward or backward direction.
     fn next_filter_map<T>(
         &mut self,
-        direction: &SortDirection,
         filter_map: impl for<'x> Fn(K::SelfType<'x>, V::SelfType<'x>) -> Option<T>,
     ) -> Option<anyhow::Result<T>>;
 
@@ -30,10 +27,9 @@ pub trait RangeExt<K: Key, V: Value> {
     /// flattened with the result from the range operation.
     fn next_try_filter_map<T>(
         &mut self,
-        direction: &SortDirection,
         filter_map: impl for<'x> Fn(K::SelfType<'x>, V::SelfType<'x>) -> Option<anyhow::Result<T>>,
     ) -> Option<anyhow::Result<T>> {
-        Some(self.next_filter_map(direction, filter_map)?.and_then(|r| r))
+        Some(self.next_filter_map(filter_map)?.and_then(|r| r))
     }
 }
 
@@ -48,15 +44,10 @@ impl<K: Key + 'static, V: Value + 'static> RangeExt<K, V> for Range<'_, K, V> {
 
     fn next_filter_map<T>(
         &mut self,
-        direction: &SortDirection,
         filter_map: impl for<'x> Fn(K::SelfType<'x>, V::SelfType<'x>) -> Option<T>,
     ) -> Option<anyhow::Result<T>> {
         loop {
-            let next = match direction {
-                SortDirection::Asc => self.next(),
-                SortDirection::Desc => self.next_back(),
-            };
-            match next {
+            match self.next() {
                 None => break None,
                 Some(Err(err)) => break Some(Err(err.into())),
                 Some(Ok(res)) => match filter_map(res.0.value(), res.1.value()) {
@@ -71,7 +62,7 @@ impl<K: Key + 'static, V: Value + 'static> RangeExt<K, V> for Range<'_, K, V> {
 /// An iterator over a range of entries from the records table.
 #[derive(derive_more::Debug)]
 #[debug("RecordsRange")]
-pub struct RecordsRange<'a>(Range<'a, RecordsId<'static>, RecordsValue<'static>>);
+pub(crate) struct RecordsRange<'a>(Range<'a, RecordsId<'static>, RecordsValue<'static>>);
 
 // pub type RecordsRange<'a> = Range<'a, RecordsId<'static>, RecordsValue<'static>>;
 
@@ -90,11 +81,10 @@ impl<'a> RecordsRange<'a> {
     /// Omit items for which the `matcher` function returns false.
     pub(super) fn next_filtered(
         &mut self,
-        direction: &SortDirection,
         filter: impl for<'x> Fn(RecordsId<'x>, RecordsValue<'x>) -> bool,
     ) -> Option<anyhow::Result<SignedEntry>> {
         self.0
-            .next_filter_map(direction, |k, v| filter(k, v).then(|| into_entry(k, v)))
+            .next_filter_map(|k, v| filter(k, v).then(|| into_entry(k, v)))
     }
 }
 
@@ -123,13 +113,13 @@ impl Iterator for RecordsRange<'_> {
 
 #[derive(derive_more::Debug)]
 #[debug("RecordsByKeyRange")]
-pub struct RecordsByKeyRange {
+pub(crate) struct RecordsByKeyRange {
     records_table: ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>,
     by_key_range: Range<'static, RecordsByKeyId<'static>, ()>,
 }
 
 impl RecordsByKeyRange {
-    pub fn with_bounds(
+    pub(crate) fn with_bounds(
         records_by_key_table: ReadOnlyTable<RecordsByKeyId<'static>, ()>,
         records_table: ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>,
         bounds: ByKeyBounds,
@@ -144,12 +134,11 @@ impl RecordsByKeyRange {
     /// Get the next item in the range.
     ///
     /// Omit items for which the `filter` function returns false.
-    pub fn next_filtered(
+    pub(crate) fn next_filtered(
         &mut self,
-        direction: &SortDirection,
         filter: impl for<'x> Fn(RecordsByKeyId<'x>) -> bool,
     ) -> Option<anyhow::Result<SignedEntry>> {
-        let entry = self.by_key_range.next_try_filter_map(direction, |k, _v| {
+        let entry = self.by_key_range.next_try_filter_map(|k, _v| {
             if !filter(k) {
                 return None;
             };
