@@ -1,5 +1,4 @@
 use std::{
-    collections::{BTreeSet, HashMap},
     future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -20,17 +19,13 @@ use n0_future::{
     Stream, TryStreamExt,
 };
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc,
-    },
+    api::{AddrInfoOptions, Doc},
     engine::{LiveEvent, Origin},
-    store::{DownloadPolicy, FilterKind, Query},
+    store::Query,
     AuthorId, ContentStatus, Entry, EntryFilter, NamespaceId, RestsOn, SessionAccess,
     SessionAccessProvider, SessionRole,
 };
 use rand::{CryptoRng, RngExt, SeedableRng};
-#[cfg(feature = "fs-store")]
 use tempfile::tempdir;
 use tokio::sync::Notify;
 use tracing::{debug, error_span, info, Instrument};
@@ -101,9 +96,7 @@ async fn sync_simple() -> Result<()> {
         .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
         .await?;
     assert_latest(blobs0, &doc0, b"k1", b"v1").await;
-    let ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
 
     let mut events0 = doc0.subscribe().await?;
 
@@ -111,10 +104,7 @@ async fn sync_simple() -> Result<()> {
     let peer1 = nodes[1].id();
     // Subscribed before the sync starts: the neighbor can come up before a
     // subscription made after the import.
-    let (doc1, mut events1) = clients[1]
-        .docs()
-        .import_and_subscribe(ticket.clone())
-        .await?;
+    let (doc1, mut events1) = util::import_and_subscribe(clients[1].docs(), ticket.clone()).await?;
     let blobs1 = clients[1].blobs();
     info!("node1: assert 5 events");
     assert_next_unordered(
@@ -171,11 +161,9 @@ async fn sync_continues_after_invalid_gossip_message() -> Result<()> {
     let hash_k1 = doc0
         .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
         .await?;
-    let writer_ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let writer_ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
 
-    let doc1 = clients[1].docs().import(writer_ticket.clone()).await?;
+    let doc1 = util::import(clients[1].docs(), writer_ticket.clone()).await?;
     let mut events1 = doc1.subscribe().await?;
     next_event_matching(
         &mut events1,
@@ -185,9 +173,7 @@ async fn sync_continues_after_invalid_gossip_message() -> Result<()> {
     .await;
 
     // The subscriber's own ticket carries its address; the sender bootstraps off both nodes.
-    let subscriber_ticket = doc1
-        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let subscriber_ticket = doc1.share(AddrInfoOptions::RelayAndAddresses).await?;
     let namespace = writer_ticket.capability.id();
     let sender_endpoint = Endpoint::builder(presets::Minimal).bind().await?;
     let lookup = MemoryLookup::new();
@@ -278,11 +264,9 @@ async fn an_entry_broadcast_on_the_topic_is_dropped() -> Result<()> {
     let hash_k1 = doc0
         .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
         .await?;
-    let writer_ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let writer_ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
 
-    let doc1 = clients[1].docs().import(writer_ticket.clone()).await?;
+    let doc1 = util::import(clients[1].docs(), writer_ticket.clone()).await?;
     let mut events1 = doc1.subscribe().await?;
     next_event_matching(
         &mut events1,
@@ -291,9 +275,7 @@ async fn an_entry_broadcast_on_the_topic_is_dropped() -> Result<()> {
     )
     .await;
 
-    let subscriber_ticket = doc1
-        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let subscriber_ticket = doc1.share(AddrInfoOptions::RelayAndAddresses).await?;
     let namespace = writer_ticket.capability.id();
     let sender_endpoint = Endpoint::builder(presets::Minimal).bind().await?;
     let lookup = MemoryLookup::new();
@@ -328,9 +310,7 @@ async fn an_entry_broadcast_on_the_topic_is_dropped() -> Result<()> {
         }
     }
 
-    let pdn_store::Capability::Write(secret) = &writer_ticket.capability else {
-        bail!("a write ticket carries the namespace secret");
-    };
+    let pdn_store::Capability::Write(secret) = &writer_ticket.capability;
     let pusher = pdn_store::Author::new(&mut rng);
     let pushed = pdn_store::SignedEntry::from_parts(
         secret,
@@ -366,7 +346,7 @@ async fn an_entry_broadcast_on_the_topic_is_dropped() -> Result<()> {
     )
     .await;
     assert!(
-        doc1.get_exact(pusher.id(), b"pushed", true)
+        get_exact(&doc1, pusher.id(), b"pushed", true)
             .await?
             .is_none(),
         "an entry broadcast on the topic was inserted"
@@ -413,13 +393,11 @@ async fn sync_gossip_bulk() -> Result<()> {
     let _peer0 = nodes[0].id();
     let author0 = clients[0].docs().author_create().await?;
     let doc0 = clients[0].docs().create().await?;
-    let mut ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let mut ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
     // unset peers to not yet start sync
     let peers = ticket.nodes.clone();
     ticket.nodes = vec![];
-    let doc1 = clients[1].docs().import(ticket).await?;
+    let doc1 = util::import(clients[1].docs(), ticket).await?;
     let mut events = doc1.subscribe().await?;
 
     // create entries for initial sync.
@@ -519,19 +497,14 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
         "expected LiveEvent::InsertLocal but got {e:?}",
     );
     assert_latest(blobs0, &doc0, key0, value0).await;
-    let ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
 
     info!("peer1: spawn");
     let peer1 = nodes[1].id();
     let author1 = clients[1].docs().author_create().await?;
     info!("peer1: join doc");
     // Subscribed before the sync starts, as in `sync_simple`.
-    let (doc1, mut events1) = clients[1]
-        .docs()
-        .import_and_subscribe(ticket.clone())
-        .await?;
+    let (doc1, mut events1) = util::import_and_subscribe(clients[1].docs(), ticket.clone()).await?;
     let blobs1 = clients[1].blobs();
 
     info!("peer1: wait for 4 events (for sync and join with peer0)");
@@ -601,7 +574,7 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     nodes.push(spawn_node(nodes.len(), &mut rng).await?);
     clients.push(nodes.last().unwrap().client().clone());
     // Subscribed before the sync starts, as in `sync_simple`.
-    let (doc2, mut events2) = clients[2].docs().import_and_subscribe(ticket).await?;
+    let (doc2, mut events2) = util::import_and_subscribe(clients[2].docs(), ticket).await?;
     let blobs2 = clients[2].blobs();
     let peer2 = nodes[2].id();
 
@@ -669,114 +642,58 @@ async fn sync_full_basic() -> testresult::TestResult<()> {
     Ok(())
 }
 
-#[tokio::test]
-#[traced_test]
-async fn sync_open_close() -> Result<()> {
-    let mut rng = test_rng(b"sync_subscribe_stop_close");
-    let node = spawn_node(0, &mut rng).await?;
-    let client = node.client();
-
-    let doc = client.docs().create().await?;
-    let status = doc.status().await?;
-    assert_eq!(status.handles, 1);
-
-    let doc2 = client.docs().open(doc.id()).await?.unwrap();
-    let status = doc2.status().await?;
-    assert_eq!(status.handles, 2);
-
-    doc.close().await?;
-    assert!(doc.status().await.is_err());
-
-    let status = doc2.status().await?;
-    assert_eq!(status.handles, 1);
-
-    Ok(())
-}
-
-/// `leave_gossip` is the narrow inverse of the swarm join `start_sync`
-/// performs (downgrading a replica to scoped access): it leaves the topic
-/// and touches nothing else. The live sync stays running, subscribers stay
-/// connected, the replica stays writable, a later `start_sync` re-joins —
-/// and leaving a swarm that was never joined is a no-op, so the call is
-/// idempotent.
+/// `leave_gossip` leaves the swarm `start_sync` joined and touches nothing
+/// else: a subscriber keeps receiving the replica's events, the replica
+/// stays writable, and its live sync keeps serving a peer's dial. Leaving a
+/// swarm that was never joined is a no-op, and a later `start_sync`
+/// re-joins.
 #[tokio::test]
 #[traced_test]
 async fn sync_leave_gossip_keeps_sync_running() -> Result<()> {
     let mut rng = test_rng(b"sync_leave_gossip_keeps_sync_running");
-    let node = spawn_node(0, &mut rng).await?;
-    let client = node.client();
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let (node, peer) = (&nodes[0], &nodes[1]);
 
-    let doc = client.docs().create().await?;
-    let author = client.docs().author_create().await?;
+    let doc = node.docs().create().await?;
+    let author = node.docs().author_create().await?;
 
-    // Leaving the swarm of a doc that never joined one is a no-op.
     doc.leave_gossip().await?;
 
     doc.start_sync(vec![], util::TEST_HOLDER).await?;
-    let sub = doc.subscribe().await?;
-    let status = doc.status().await?;
-    assert!(status.sync);
-    assert_eq!(status.subscribers, 2);
-
-    // Leave the swarm: the live sync keeps running and the subscribers —
-    // the internal one of `start_sync` and ours — stay connected.
+    let mut events = doc.subscribe().await?;
     doc.leave_gossip().await?;
-    let status = doc.status().await?;
-    assert!(status.sync, "leave_gossip must not stop the live sync");
-    assert_eq!(
-        status.subscribers, 2,
-        "leave_gossip must not drop subscribers"
-    );
-
-    // Idempotent, and the replica stays fully usable.
     doc.leave_gossip().await?;
     doc.set_bytes(author, b"k".to_vec(), b"v".to_vec()).await?;
+    next_event_matching(
+        &mut events,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertLocal { entry } if entry.key() == b"k"),
+    )
+    .await;
 
-    // A later gossip-joining start_sync re-subscribes without error.
+    // Out of the swarm, the live sync still serves a peer that dials it.
+    let ticket = doc.ticket(AddrInfoOptions::RelayAndAddresses).await?;
+    let theirs = peer
+        .docs()
+        .import_namespace(ticket.capability.clone())
+        .await?;
+    theirs
+        .sync_with_peers(ticket.contacts(), vec![], util::TEST_HOLDER, false)
+        .await?;
+    let deadline = Instant::now() + TIMEOUT;
+    while get_exact(&theirs, author, b"k", false).await?.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "a replica out of its swarm served no dial"
+        );
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+    }
+
     doc.start_sync(vec![], util::TEST_HOLDER).await?;
-    let status = doc.status().await?;
-    assert!(status.sync);
 
-    drop(sub);
-    Ok(())
-}
-
-#[tokio::test]
-#[traced_test]
-async fn sync_subscribe_stop_close() -> Result<()> {
-    let mut rng = test_rng(b"sync_subscribe_stop_close");
-    let node = spawn_node(0, &mut rng).await?;
-    let client = node.client();
-
-    let doc = client.docs().create().await?;
-    let author = client.docs().author_create().await?;
-
-    let status = doc.status().await?;
-    assert_eq!(status.subscribers, 0);
-    assert_eq!(status.handles, 1);
-    assert!(!status.sync);
-
-    doc.start_sync(vec![], util::TEST_HOLDER).await?;
-    let status = doc.status().await?;
-    assert!(status.sync);
-    assert_eq!(status.handles, 2);
-    assert_eq!(status.subscribers, 1);
-
-    let sub = doc.subscribe().await?;
-    let status = doc.status().await?;
-    assert_eq!(status.subscribers, 2);
-    drop(sub);
-    // trigger an event that makes the actor check if the event channels are still connected
-    doc.set_bytes(author, b"x".to_vec(), b"x".to_vec()).await?;
-    let status = doc.status().await?;
-    assert_eq!(status.subscribers, 1);
-
-    doc.leave().await?;
-    let status = doc.status().await?;
-    assert_eq!(status.subscribers, 0);
-    assert_eq!(status.handles, 1);
-    assert!(!status.sync);
-
+    for node in nodes {
+        node.shutdown().await?;
+    }
     Ok(())
 }
 
@@ -811,9 +728,7 @@ async fn test_sync_via_relay() -> Result<()> {
     let inserted_hash = doc1
         .set_bytes(author1, b"foo".to_vec(), b"bar".to_vec())
         .await?;
-    let mut ticket = doc1
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let mut ticket = doc1.share(AddrInfoOptions::RelayAndAddresses).await?;
 
     // remove direct addrs to force connect via relay
     let mut relay_ticket = ticket.nodes[0].clone();
@@ -826,7 +741,7 @@ async fn test_sync_via_relay() -> Result<()> {
     ticket.nodes[0] = relay_ticket;
     // join
     // Subscribed before the sync starts, as in `sync_simple`.
-    let (doc2, mut events) = node2.docs().import_and_subscribe(ticket).await?;
+    let (doc2, mut events) = util::import_and_subscribe(node2.docs(), ticket).await?;
     let blobs2 = node2.blobs();
 
     // An `InsertRemote`'s `content_status` is a snapshot of the local blob
@@ -853,7 +768,7 @@ async fn test_sync_via_relay() -> Result<()> {
     .await;
     let actual = blobs2
         .get_bytes(
-            doc2.get_exact(author1, b"foo", false)
+            get_exact(&doc2, author1, b"foo", false)
                 .await?
                 .expect("entry to exist")
                 .content_hash(),
@@ -884,7 +799,7 @@ async fn test_sync_via_relay() -> Result<()> {
     .await;
     let actual = blobs2
         .get_bytes(
-            doc2.get_exact(author1, b"foo", false)
+            get_exact(&doc2, author1, b"foo", false)
                 .await?
                 .expect("entry to exist")
                 .content_hash(),
@@ -896,7 +811,6 @@ async fn test_sync_via_relay() -> Result<()> {
 
 #[tokio::test]
 #[traced_test]
-#[cfg(feature = "fs-store")]
 async fn sync_restart_node() -> Result<()> {
     use crate::util::endpoint;
 
@@ -921,9 +835,7 @@ async fn sync_restart_node() -> Result<()> {
     let doc1 = node1.docs().create().await?;
     let blobs1 = node1.blobs();
     let mut events1 = doc1.subscribe().await?;
-    let ticket = doc1
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket = doc1.share(AddrInfoOptions::RelayAndAddresses).await?;
 
     // create node2
     let secret_key_2 = SecretKey::from_bytes(&rng.random());
@@ -931,7 +843,7 @@ async fn sync_restart_node() -> Result<()> {
     let node2 = Node::memory(ep).spawn().await?;
     let id2 = node2.id();
     let author2 = node2.docs().author_create().await?;
-    let doc2 = node2.docs().import(ticket.clone()).await?;
+    let doc2 = util::import(node2.docs(), ticket.clone()).await?;
     let blobs2 = node2.blobs();
 
     info!("node2 set a");
@@ -1022,156 +934,6 @@ async fn sync_restart_node() -> Result<()> {
     Ok(())
 }
 
-/// Joins two nodes that write to the same document but have differing download policies and tests
-/// that they both synced the key info but not the content.
-#[tokio::test]
-async fn test_download_policies() -> Result<()> {
-    // keys node a has
-    let star_wars_movies = &[
-        "star_wars/prequel/the_phantom_menace",
-        "star_wars/prequel/attack_of_the_clones",
-        "star_wars/prequel/revenge_of_the_sith",
-        "star_wars/og/a_new_hope",
-        "star_wars/og/the_empire_strikes_back",
-        "star_wars/og/return_of_the_jedi",
-    ];
-    // keys node b has
-    let lotr_movies = &[
-        "lotr/fellowship_of_the_ring",
-        "lotr/the_two_towers",
-        "lotr/return_of_the_king",
-    ];
-
-    // content policy for what b wants
-    let policy_b =
-        DownloadPolicy::EverythingExcept(vec![FilterKind::Prefix("star_wars/og".into())]);
-    // content policy for what a wants
-    let policy_a = DownloadPolicy::NothingExcept(vec![FilterKind::Exact(
-        "lotr/fellowship_of_the_ring".into(),
-    )]);
-
-    // a will sync all lotr keys but download a single key
-    const EXPECTED_A_SYNCED: usize = 3;
-    const EXPECTED_A_DOWNLOADED: usize = 1;
-
-    // b will sync all star wars content but download only the prequel keys
-    const EXPECTED_B_SYNCED: usize = 6;
-    const EXPECTED_B_DOWNLOADED: usize = 3;
-
-    let mut rng = test_rng(b"sync_download_policies");
-    let nodes = spawn_nodes(2, &mut rng).await?;
-    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
-
-    let doc_a = clients[0].docs().create().await?;
-    let author_a = clients[0].docs().author_create().await?;
-    let ticket = doc_a
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-
-    let doc_b = clients[1].docs().import(ticket).await?;
-    let author_b = clients[1].docs().author_create().await?;
-
-    doc_a.set_download_policy(policy_a).await?;
-    doc_b.set_download_policy(policy_b).await?;
-
-    let mut events_a = doc_a.subscribe().await?;
-    let mut events_b = doc_b.subscribe().await?;
-
-    let mut key_hashes: HashMap<iroh_blobs::Hash, &'static str> = HashMap::default();
-
-    // set content in a
-    for k in star_wars_movies.iter() {
-        let hash = doc_a
-            .set_bytes(author_a, k.to_owned(), k.to_owned())
-            .await?;
-        key_hashes.insert(hash, k);
-    }
-
-    // set content in b
-    for k in lotr_movies.iter() {
-        let hash = doc_b
-            .set_bytes(author_b, k.to_owned(), k.to_owned())
-            .await?;
-        key_hashes.insert(hash, k);
-    }
-
-    assert_eq!(key_hashes.len(), star_wars_movies.len() + lotr_movies.len());
-
-    // Every tally is a set. `ContentReady` and `InsertRemote` reach the
-    // subscriber over two channels of their own that carry no order against
-    // each other, and an `InsertRemote` already reporting `Complete` names
-    // content a `ContentReady` names too — so one downloaded entry can be
-    // counted twice. The loop below breaks on equality, and a tally that
-    // overshoots its expected total never lets it break at all.
-    let fut = async {
-        use LiveEvent::*;
-        let mut downloaded_a: BTreeSet<&'static str> = BTreeSet::new();
-        let mut downloaded_b: BTreeSet<&'static str> = BTreeSet::new();
-        let mut synced_a: BTreeSet<Hash> = BTreeSet::new();
-        let mut synced_b: BTreeSet<Hash> = BTreeSet::new();
-        loop {
-            tokio::select! {
-                Ok(Some(ev)) = events_a.try_next() => {
-                    match ev {
-                        InsertRemote { content_status, entry, .. } => {
-                            synced_a.insert(entry.content_hash());
-                            if let ContentStatus::Complete = content_status {
-                                downloaded_a.insert(key_hashes.get(&entry.content_hash()).unwrap());
-                            }
-                        },
-                        ContentReady { hash } => {
-                            downloaded_a.insert(key_hashes.get(&hash).unwrap());
-                        },
-                        _ => {}
-                    }
-                }
-                Ok(Some(ev)) = events_b.try_next() => {
-                    match ev {
-                        InsertRemote { content_status, entry, .. } => {
-                            synced_b.insert(entry.content_hash());
-                            if let ContentStatus::Complete = content_status {
-                                downloaded_b.insert(key_hashes.get(&entry.content_hash()).unwrap());
-                            }
-                        },
-                        ContentReady { hash } => {
-                            downloaded_b.insert(key_hashes.get(&hash).unwrap());
-                        },
-                        _ => {}
-                    }
-                }
-            }
-
-            if synced_a.len() == EXPECTED_A_SYNCED
-                && downloaded_a.len() == EXPECTED_A_DOWNLOADED
-                && synced_b.len() == EXPECTED_B_SYNCED
-                && downloaded_b.len() == EXPECTED_B_DOWNLOADED
-            {
-                break;
-            }
-        }
-        (downloaded_a, downloaded_b)
-    };
-
-    let (downloaded_a, downloaded_b) = n0_future::time::timeout(TIMEOUT, fut)
-        .await
-        .context("timeout elapsed")?;
-
-    assert_eq!(
-        downloaded_a.into_iter().collect::<Vec<_>>(),
-        vec!["lotr/fellowship_of_the_ring"]
-    );
-    assert_eq!(
-        downloaded_b.into_iter().collect::<Vec<_>>(),
-        vec![
-            "star_wars/prequel/attack_of_the_clones",
-            "star_wars/prequel/revenge_of_the_sith",
-            "star_wars/prequel/the_phantom_menace",
-        ]
-    );
-
-    Ok(())
-}
-
 /// Test sync between many nodes with propagation through sync reports.
 #[tokio::test(flavor = "multi_thread")]
 #[traced_test]
@@ -1197,9 +959,7 @@ async fn sync_big() -> Result<()> {
     let authors = collect_futures(clients.iter().map(|c| c.docs().author_create())).await?;
 
     let doc0 = clients[0].docs().create().await?;
-    let mut ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let mut ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
     // Imported without peer info: each node's own data is asserted before
     // any node joins.
     let peer0 = ticket.nodes[0].clone();
@@ -1211,7 +971,7 @@ async fn sync_big() -> Result<()> {
     docs.extend_from_slice(
         &collect_futures(docs_clients.into_iter().map(|c| {
             let ticket = ticket.clone();
-            async move { c.docs().import(ticket).await }
+            async move { util::import(c.docs(), ticket).await }
         }))
         .await?,
     );
@@ -1309,8 +1069,7 @@ async fn test_list_docs_stream() -> testresult::TestResult<()> {
 
     // create docs
     for _i in 0..count {
-        let doc = node.docs().create().await?;
-        doc.close().await?;
+        node.docs().create().await?;
     }
 
     // create doc stream
@@ -1333,6 +1092,21 @@ async fn test_list_docs_stream() -> testresult::TestResult<()> {
     assert_eq!(i, count);
 
     Ok(())
+}
+
+/// `author`'s entry at `key`, read as the data layer reads one entry.
+async fn get_exact(
+    doc: &Doc,
+    author: AuthorId,
+    key: impl AsRef<[u8]>,
+    include_empty: bool,
+) -> anyhow::Result<Option<Entry>> {
+    let query = Query::author(author).key_exact(key);
+    if include_empty {
+        doc.get_one(query.include_empty()).await
+    } else {
+        doc.get_one(query).await
+    }
 }
 
 /// Get all entries of a document.
@@ -1471,7 +1245,6 @@ impl PartialEq<ExpectedEntry> for (Entry, Bytes) {
 
 #[tokio::test]
 #[traced_test]
-#[cfg(feature = "fs-store")]
 async fn doc_delete() -> Result<()> {
     let tempdir = tempdir()?;
     // TODO(Frando): iroh-blobs has gc only for fs store atm, change test to test both
@@ -1492,7 +1265,7 @@ async fn doc_delete() -> Result<()> {
     let deleted = doc.del(author, b"foo".to_vec()).await?;
     assert_eq!(deleted, 1);
 
-    let entry = doc.get_exact(author, b"foo".to_vec(), false).await?;
+    let entry = get_exact(&doc, author, b"foo".to_vec(), false).await?;
     assert!(entry.is_none());
 
     // wait for gc
@@ -1521,17 +1294,43 @@ async fn sync_drop_doc() -> Result<()> {
     assert!(matches!(ev, Ok(Some(LiveEvent::InsertLocal { .. }))));
 
     client.docs().drop_doc(doc.id()).await?;
-    let res = doc.get_exact(author, b"foo".to_vec(), true).await;
+    let res = get_exact(&doc, author, b"foo".to_vec(), true).await;
     assert!(res.is_err());
     let res = doc
         .set_bytes(author, b"foo".to_vec(), b"bar".to_vec())
         .await;
     assert!(res.is_err());
-    let res = client.docs().open(doc.id()).await;
-    assert!(res.is_err());
+    assert!(client.docs().open(doc.id()).await?.is_none());
     let ev = sub.try_next().await?;
     assert!(ev.is_none());
 
+    Ok(())
+}
+
+/// A replica dropped while a start of its sync waits behind the drop is
+/// deleted, and the drop succeeds: the start finds no replica rather than
+/// reopening it between the leave and the delete. Repeated, since a start
+/// lands in that gap only some of the time.
+#[tokio::test]
+#[traced_test]
+async fn a_drop_with_a_start_of_sync_behind_it_deletes_the_replica() -> Result<()> {
+    let mut rng = test_rng(b"a_drop_with_a_start_of_sync_behind_it_deletes_the_replica");
+    let node = spawn_node(0, &mut rng).await?;
+    let docs = node.client().docs();
+    for _ in 0..20 {
+        let doc = docs.create().await?;
+        doc.start_sync(vec![], util::TEST_HOLDER).await?;
+        let (dropped, _started) = tokio::join!(
+            docs.drop_doc(doc.id()),
+            doc.start_sync(vec![], util::TEST_HOLDER)
+        );
+        dropped?;
+        let mut listed = docs.list().await?;
+        while let Some((id, _kind)) = listed.try_next().await? {
+            assert_ne!(id, doc.id(), "the dropped replica is still held");
+        }
+    }
+    node.shutdown().await?;
     Ok(())
 }
 
@@ -1788,10 +1587,9 @@ async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result
     let mut contacts = Vec::new();
     let mut imported = Vec::new();
     for doc in [&first0, &then0] {
-        doc.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
-        let ticket = doc
-            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        doc.sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
             .await?;
+        let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
         contacts = ticket.contacts();
         imported.push(nodes[1].docs().import_namespace(ticket.capability).await?);
     }
@@ -1801,8 +1599,12 @@ async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result
         .order_after(then1.id(), Some(first1.id()))
         .await?;
     // In the sync set, with no peer of its own to dial.
-    first1.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
-    then1.start_sync_scoped(contacts, util::TEST_HOLDER).await?;
+    first1
+        .sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
+        .await?;
+    then1
+        .sync_with_peers(contacts, vec![], util::TEST_HOLDER, false)
+        .await?;
 
     let first = next_event_matching(&mut first_events, TIMEOUT, move |e| {
         match_sync_finished(e, id1)
@@ -1910,9 +1712,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
     let mut x_contacts = Vec::new();
     let mut imported = Vec::new();
     for doc in [&first_x, &then_x] {
-        let ticket = doc
-            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-            .await?;
+        let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
         x_contacts = ticket.contacts();
         imported.push(y.docs().import_namespace(ticket.capability).await?);
     }
@@ -1922,7 +1722,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
         first_y.set_bytes(author_y, vec![b'y', i], vec![i]).await?;
     }
     let y_contacts = then_y
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share(AddrInfoOptions::RelayAndAddresses)
         .await?
         .contacts();
     let mut first_events = first_x.subscribe().await?;
@@ -1931,14 +1731,18 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
     x.engine()
         .order_after(then_x.id(), Some(first_x.id()))
         .await?;
-    first_x.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    first_x
+        .sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
+        .await?;
     then_x
-        .start_sync_scoped(y_contacts, util::TEST_HOLDER)
+        .sync_with_peers(y_contacts, vec![], util::TEST_HOLDER, false)
         .await?;
     n0_future::time::timeout(TIMEOUT, dial_asked.notified()).await?;
-    then_y.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
+    then_y
+        .sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
+        .await?;
     first_y
-        .start_sync_scoped(x_contacts, util::TEST_HOLDER)
+        .sync_with_peers(x_contacts, vec![], util::TEST_HOLDER, false)
         .await?;
 
     let first = next_event_matching(&mut first_events, TIMEOUT, move |e| {
@@ -1991,10 +1795,9 @@ async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
     let nodes = spawn_nodes(3, &mut rng).await?;
     let (id0, id1, id2) = (nodes[0].id(), nodes[1].id(), nodes[2].id());
     let doc0 = nodes[0].docs().create().await?;
-    doc0.start_sync_scoped(vec![], util::TEST_HOLDER).await?;
-    let ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+    doc0.sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
         .await?;
+    let ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
     let mut events0 = doc0.subscribe().await?;
     let mut events = Vec::new();
     for node in &nodes[1..] {
@@ -2003,7 +1806,7 @@ async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
             .import_namespace(ticket.capability.clone())
             .await?;
         events.push(doc.subscribe().await?);
-        doc.start_sync_scoped(ticket.contacts(), util::TEST_HOLDER)
+        doc.sync_with_peers(ticket.contacts(), vec![], util::TEST_HOLDER, false)
             .await?;
     }
     // Both first sessions finished, so node 0 recorded both peers.
@@ -2051,50 +1854,49 @@ async fn a_sync_with_handed_peers_dials_no_other_recorded_peer() -> Result<()> {
 /// waits on a best-effort gossip `ContentReady` broadcast that may never
 /// come, while sync exchanges with peers holding the bytes go on.
 ///
-/// The writer leaves the document while the receiver joins, so the record
-/// can only reach the receiver through the relay — without that, gossip
-/// may connect the receiver to the writer directly and deliver the content
-/// through an ordinary insert, masking the starvation.
+/// The writer serves no payload, so the relay's fetch from it fails, and it
+/// is gone before the receiver joins, so the record reaches the receiver
+/// through the relay alone. The bytes then come from a holder that took
+/// them outside the replica.
 #[tokio::test]
 #[traced_test]
 async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
     let mut rng = test_rng(b"sync_fetches_parked_content_from_later_sync_peer");
 
-    // Three nodes on loopback: the test drives every exchange explicitly
+    // Four nodes on loopback: the test drives every exchange explicitly
     // and must not depend on the host's external interfaces.
     let mut nodes = Vec::new();
-    for _ in 0..3 {
+    for at in 0..4 {
         let secret_key = SecretKey::from_bytes(&rng.random());
         let ep = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .bind_addr("127.0.0.1:0")?
             .bind()
             .await?;
-        nodes.push(Node::memory(ep).spawn().await?);
+        let node = Node::memory(ep);
+        let node = if at == 0 {
+            node.without_blob_serving()
+        } else {
+            node
+        };
+        nodes.push(node.spawn().await?);
     }
-    let (writer, relay, receiver) = (&nodes[0], &nodes[1], &nodes[2]);
+    let writer = nodes.remove(0);
+    let (relay, receiver, holder) = (&nodes[0], &nodes[1], &nodes[2]);
     let writer_id = writer.id();
-    let relay_id = relay.id();
+    let (relay_id, holder_id) = (relay.id(), holder.id());
 
-    // The writer holds the only copy of the content.
     let author = writer.docs().author_create().await?;
     let doc_writer = writer.docs().create().await?;
     let hash = doc_writer
         .set_bytes(author, b"k".to_vec(), b"v".to_vec())
         .await?;
-    let ticket_writer = doc_writer
-        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket_writer = doc_writer.share(AddrInfoOptions::RelayAndAddresses).await?;
 
-    // The relay receives the record but never the content: its download
-    // policy forbids fetching anything, and is set before its first sync so
-    // no download can race it.
+    // The relay receives the record but never the content.
     let doc_relay = relay
         .docs()
         .import_namespace(ticket_writer.capability.clone())
-        .await?;
-    doc_relay
-        .set_download_policy(DownloadPolicy::NothingExcept(vec![]))
         .await?;
     let mut events_relay = doc_relay.subscribe().await?;
     doc_relay
@@ -2106,24 +1908,24 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
         |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == writer_id),
     )
     .await;
+    drop(doc_writer);
+    writer.shutdown().await?;
     assert!(
         !relay.blobs().has(hash).await?,
-        "the relay's download policy must keep it content-less"
+        "a writer that serves no payload must leave the relay content-less"
     );
-
-    // The writer steps away: from here on the record can reach the receiver
-    // only through the relay.
-    doc_writer.leave().await?;
 
     // The receiver learns the record from the relay — the only live peer —
     // so the record arrives with the content missing at its sender, and the
     // content hash parks with no usable provider.
-    let ticket_relay = doc_relay
-        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-    let (doc_receiver, mut events_receiver) = receiver
+    let ticket_relay = doc_relay.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let doc_receiver = receiver
         .docs()
-        .import_and_subscribe(ticket_relay.clone())
+        .import_namespace(ticket_relay.capability.clone())
+        .await?;
+    let mut events_receiver = doc_receiver.subscribe().await?;
+    doc_receiver
+        .start_sync(ticket_relay.contacts(), util::TEST_HOLDER)
         .await?;
     next_event_matching(&mut events_receiver, TIMEOUT, |e| {
         matches!(
@@ -2138,17 +1940,28 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
         "the receiver cannot have content its only peer does not hold"
     );
 
-    // The writer returns, and the receiver completes a sync with it. The
-    // sync exchanges no records — the receiver already has them all — so
-    // before the fix nothing requested the parked content and it never
-    // arrived; now the finished sync retries the parked hash against the
-    // writer, which has the bytes.
-    doc_writer.start_sync(vec![], util::TEST_HOLDER).await?;
+    // The holder takes the bytes outside the replica, and the receiver
+    // completes a sync with it. The sync carries the record the other way
+    // alone, so nothing but the finished sync's retry of the parked hash
+    // asks the holder for the bytes.
+    let held = holder.blobs().add_bytes(b"v".to_vec()).await?;
+    assert_eq!(held.hash, hash);
+    let doc_holder = holder
+        .docs()
+        .import_namespace(ticket_writer.capability.clone())
+        .await?;
+    doc_holder.start_sync(vec![], util::TEST_HOLDER).await?;
     doc_receiver
-        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .start_sync(
+            doc_holder
+                .ticket(AddrInfoOptions::RelayAndAddresses)
+                .await?
+                .contacts(),
+            util::TEST_HOLDER,
+        )
         .await?;
     next_event_matching(&mut events_receiver, TIMEOUT, |e| {
-        match_sync_finished(e, writer_id)
+        match_sync_finished(e, holder_id)
     })
     .await;
     let deadline = Instant::now() + TIMEOUT;
@@ -2172,13 +1985,15 @@ async fn sync_fetches_parked_content_from_later_sync_peer() -> Result<()> {
 /// engine parks such content in memory, and a session after the restart
 /// exchanges no record, so nothing else asks for it again.
 ///
-/// The record reaches the receiver through a relay whose download policy
-/// keeps it content-less, as in the test above, and the writer is away
-/// until the receiver has restarted.
+/// The record reaches the receiver through a relay a writer serving no
+/// payload left content-less, as in the test above, and the holder of the
+/// bytes appears after the receiver has restarted. The receiver stops with
+/// its download of the content in flight, so a node stopping its router
+/// before its engine panics on the blob store's thread, counted here.
 #[tokio::test]
 #[traced_test]
-#[cfg(feature = "fs-store")]
 async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() -> Result<()> {
+    let panics = util::count_panics();
     let mut rng = test_rng(b"content_a_restart_left_missing_is_fetched_from_the_first_sync_peer");
     let loopback = |secret_key: SecretKey| async move {
         Endpoint::builder(presets::Minimal)
@@ -2189,9 +2004,13 @@ async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() ->
             .map_err(anyhow::Error::from)
     };
     let writer = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
+        .without_blob_serving()
         .spawn()
         .await?;
     let relay = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
+        .spawn()
+        .await?;
+    let holder = Node::memory(loopback(SecretKey::from_bytes(&rng.random())).await?)
         .spawn()
         .await?;
     let receiver_dir = tempdir()?;
@@ -2199,22 +2018,17 @@ async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() ->
     let receiver = Node::persistent(&receiver_dir, loopback(receiver_key.clone()).await?)
         .spawn()
         .await?;
-    let (writer_id, relay_id) = (writer.id(), relay.id());
+    let (writer_id, relay_id, holder_id) = (writer.id(), relay.id(), holder.id());
 
     let author = writer.docs().author_create().await?;
     let doc_writer = writer.docs().create().await?;
     let hash = doc_writer
         .set_bytes(author, b"k".to_vec(), b"v".to_vec())
         .await?;
-    let ticket_writer = doc_writer
-        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket_writer = doc_writer.share(AddrInfoOptions::RelayAndAddresses).await?;
     let doc_relay = relay
         .docs()
         .import_namespace(ticket_writer.capability.clone())
-        .await?;
-    doc_relay
-        .set_download_policy(DownloadPolicy::NothingExcept(vec![]))
         .await?;
     let mut events_relay = doc_relay.subscribe().await?;
     doc_relay
@@ -2226,13 +2040,18 @@ async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() ->
         |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == writer_id),
     )
     .await;
-    doc_writer.leave().await?;
+    drop(doc_writer);
+    writer.shutdown().await?;
 
-    let ticket_relay = doc_relay
-        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+    let ticket_relay = doc_relay.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let doc_receiver = receiver
+        .docs()
+        .import_namespace(ticket_relay.capability.clone())
         .await?;
-    let (doc_receiver, mut events_receiver) =
-        receiver.docs().import_and_subscribe(ticket_relay).await?;
+    let mut events_receiver = doc_receiver.subscribe().await?;
+    doc_receiver
+        .start_sync(ticket_relay.contacts(), util::TEST_HOLDER)
+        .await?;
     next_event_matching(&mut events_receiver, TIMEOUT, |e| {
         matches!(
             e,
@@ -2258,27 +2077,44 @@ async fn content_a_restart_left_missing_is_fetched_from_the_first_sync_peer() ->
         .await?
         .context("the receiver lost the replica in the restart")?;
     let mut events_receiver = doc_receiver.subscribe().await?;
-    doc_writer.start_sync(vec![], util::TEST_HOLDER).await?;
+    let held = holder.blobs().add_bytes(b"v".to_vec()).await?;
+    assert_eq!(held.hash, hash);
+    let doc_holder = holder
+        .docs()
+        .import_namespace(ticket_writer.capability.clone())
+        .await?;
+    doc_holder.start_sync(vec![], util::TEST_HOLDER).await?;
     doc_receiver
-        .start_sync(ticket_writer.contacts(), util::TEST_HOLDER)
+        .start_sync(
+            doc_holder
+                .ticket(AddrInfoOptions::RelayAndAddresses)
+                .await?
+                .contacts(),
+            util::TEST_HOLDER,
+        )
         .await?;
     next_event_matching(&mut events_receiver, TIMEOUT, |e| {
-        match_sync_finished(e, writer_id)
+        match_sync_finished(e, holder_id)
     })
     .await;
     let deadline = Instant::now() + TIMEOUT;
     while !receiver.blobs().has(hash).await? {
         assert!(
             Instant::now() < deadline,
-            "content the restart left missing did not arrive from the writer"
+            "content the restart left missing did not arrive from the holder"
         );
         n0_future::time::sleep(Duration::from_millis(100)).await;
     }
     assert_latest(receiver.blobs(), &doc_receiver, b"k", b"v").await;
 
-    for node in [writer, relay, receiver] {
+    for node in [relay, holder, receiver] {
         node.shutdown().await?;
     }
+    assert_eq!(
+        panics.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a thread panicked while the nodes ran or stopped"
+    );
     Ok(())
 }
 
@@ -2299,11 +2135,9 @@ async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
 
     let author0 = clients[0].docs().author_create().await?;
     let doc0 = clients[0].docs().create().await?;
-    let ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
     let writer = util::contacts(ticket.nodes.clone());
-    let doc1 = clients[1].docs().import(ticket).await?;
+    let doc1 = util::import(clients[1].docs(), ticket).await?;
     let _unread = doc1.subscribe().await?;
 
     for n in 0..ENTRIES {
@@ -2345,7 +2179,7 @@ async fn an_unread_subscription_holds_up_no_sync() -> Result<()> {
                 let key = format!("k{n:04}");
                 if get_latest(blobs1, &doc1, key.as_bytes()).await.is_ok() {
                     (entries, readable) = (entries + 1, readable + 1);
-                } else if doc1.get_exact(author0, key, false).await?.is_some() {
+                } else if get_exact(&doc1, author0, key, false).await?.is_some() {
                     entries += 1;
                 }
             }
@@ -2388,10 +2222,8 @@ async fn a_catch_up_past_the_events_channel_finishes_while_the_live_actor_asks_t
         doc0.set_bytes(author0, format!("k{n:04}"), format!("v{n:04}"))
             .await?;
     }
-    let ticket = doc0
-        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
-    let doc1 = clients[1].docs().import(ticket).await?;
+    let ticket = doc0.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let doc1 = util::import(clients[1].docs(), ticket).await?;
 
     let caught_up = async {
         while get_all(&doc1).await?.len() < ENTRIES {

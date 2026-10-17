@@ -34,7 +34,6 @@ use super::state::{NamespaceStates, Origin, SyncReason};
 use crate::{
     actor::SyncHandle,
     engine::gossip::GossipState,
-    metrics::Metrics,
     net::{
         connect_and_sync_asking, handle_in_process_session, handle_session, AbortReason,
         AcceptError, AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
@@ -47,9 +46,9 @@ mod draining;
 
 /// The stream halves an in-process session runs over: a pipe, since iroh
 /// refuses a connection to this endpoint's own id.
-pub type InProcessRecv = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+pub(crate) type InProcessRecv = tokio::io::ReadHalf<tokio::io::DuplexStream>;
 /// The writing half of an in-process session's pipe.
-pub type InProcessSend = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+pub(crate) type InProcessSend = tokio::io::WriteHalf<tokio::io::DuplexStream>;
 
 /// Bytes an in-process pipe buffers before the writer waits. One sync
 /// message is delivered whole, so the buffer only decides how far ahead
@@ -98,7 +97,7 @@ pub enum Op {
 
 /// Report of a successful sync with the new heads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncReport {
+pub(crate) struct SyncReport {
     namespace: NamespaceId,
     /// Encoded [`AuthorHeads`]
     heads: Vec<u8>,
@@ -108,7 +107,7 @@ pub struct SyncReport {
 
 /// Messages to the sync actor
 #[derive(derive_more::Debug, strum::Display)]
-pub enum ToLiveActor {
+pub(crate) enum ToLiveActor {
     StartSync {
         namespace: NamespaceId,
         peers: Vec<Contact>,
@@ -124,13 +123,12 @@ pub enum ToLiveActor {
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
     },
-    Leave {
+    LeaveGossip {
         namespace: NamespaceId,
-        kill_subscribers: bool,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
     },
-    LeaveGossip {
+    DropReplica {
         namespace: NamespaceId,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
@@ -441,7 +439,7 @@ impl HeldDial {
 }
 
 // Currently peers might double-sync in both directions.
-pub struct LiveActor {
+pub(crate) struct LiveActor {
     /// Receiver for actor messages.
     inbox: mpsc::Receiver<ToLiveActor>,
     sync: DrainingSync,
@@ -532,7 +530,6 @@ pub struct LiveActor {
     /// the node, which alone knows its other identities; `None` hands them
     /// to nobody.
     co_located: Option<crate::engine::CoLocatedRequests>,
-    metrics: Arc<Metrics>,
 }
 impl LiveActor {
     /// Create the live actor.
@@ -550,7 +547,6 @@ impl LiveActor {
         identity: Identity,
         in_process_sessions: Arc<AtomicU64>,
         co_located: Option<crate::engine::CoLocatedRequests>,
-        metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
@@ -589,7 +585,6 @@ impl LiveActor {
             neighbors: Default::default(),
             in_process_sessions,
             co_located,
-            metrics,
         })
     }
 
@@ -622,13 +617,11 @@ impl LiveActor {
         loop {
             i += 1;
             trace!(?i, "tick wait");
-            self.metrics.doc_live_tick_main.inc();
             tokio::select! {
                 biased;
                 msg = self.inbox.recv() => {
                     let msg = msg.context("to_actor closed")?;
                     trace!(?i, %msg, "tick: to_actor");
-                    self.metrics.doc_live_tick_actor.inc();
                     match msg {
                         ToLiveActor::Shutdown { reply } => {
                             break Ok(reply);
@@ -640,7 +633,6 @@ impl LiveActor {
                 }
                 event = self.sync.next_event() => {
                     trace!(?i, "tick: replica_event");
-                    self.metrics.doc_live_tick_replica_event.inc();
                     let event = event.context("replica_events closed")?;
                     if let Err(err) = self.on_replica_event(event).await {
                         error!(?err, "Failed to process replica event");
@@ -648,21 +640,18 @@ impl LiveActor {
                 }
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
-                    self.metrics.doc_live_tick_running_sync_connect.inc();
                     let (namespace, peer, callee, reason, res) = res.context("running_sync_connect closed")?;
                     self.on_sync_via_connect_finished(namespace, peer, callee, reason, res).await;
 
                 }
                 Some(res) = self.running_sync_accept.join_next(), if !self.running_sync_accept.is_empty() => {
                     trace!(?i, "tick: running_sync_accept");
-                    self.metrics.doc_live_tick_running_sync_accept.inc();
                     let (namespace, peer, caller, res) = res.context("running_sync_accept closed")?;
                     self.release_peer_identity(namespace, peer, caller);
                     self.on_sync_via_accept_finished(caller, res).await;
                 }
                 Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
                     trace!(?i, "tick: pending_downloads");
-                    self.metrics.doc_live_tick_pending_downloads.inc();
                     let (namespace, hash, res) = res.context("pending_downloads closed")?;
                     self.on_download_ready(namespace, hash, res).await;
                 }
@@ -727,17 +716,16 @@ impl LiveActor {
                     .await;
                 reply.send(res).ok();
             }
-            ToLiveActor::Leave {
-                namespace,
-                kill_subscribers,
-                reply,
-            } => {
-                let res = self.leave(namespace, kill_subscribers).await;
-                reply.send(res).ok();
-            }
             ToLiveActor::LeaveGossip { namespace, reply } => {
                 self.leave_gossip(namespace);
                 reply.send(Ok(())).ok();
+            }
+            ToLiveActor::DropReplica { namespace, reply } => {
+                let res = match self.leave(namespace, true).await {
+                    Ok(()) => self.sync.drop_replica(namespace).await,
+                    Err(err) => Err(err),
+                };
+                reply.send(res).ok();
             }
             ToLiveActor::Subscribe {
                 namespace,
@@ -979,7 +967,6 @@ impl LiveActor {
         }
         let endpoint = self.endpoint.clone();
         let sync = self.sync.handle().clone();
-        let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
         let caller = self.identity;
         let fut = async move {
@@ -994,7 +981,6 @@ impl LiveActor {
                 callee,
                 caller,
                 EndpointAddr::new(peer),
-                Some(&metrics),
                 &session_access,
             )
             .await;
@@ -1038,7 +1024,6 @@ impl LiveActor {
             return;
         }
         let sync = self.sync.handle().clone();
-        let metrics = self.metrics.clone();
         let session_access = self.session_access.clone();
         let caller = self.identity;
         self.in_process_sessions.fetch_add(1, Ordering::Relaxed);
@@ -1051,7 +1036,6 @@ impl LiveActor {
                 peer,
                 &mut send,
                 &mut recv,
-                Some(&metrics),
                 &session_access,
             )
             .await;
@@ -1143,7 +1127,7 @@ impl LiveActor {
     }
 
     /// Find, off the loop, the content of every entry of `namespace` the
-    /// download policy wants and the blob store does not hold whole, and
+    /// blob store does not hold whole, and
     /// park it as a remote insert parks it ([`ToLiveActor::ContentScanned`]).
     /// The parked set lives in memory: without this, content whose download
     /// a restart cut short is never asked for again, since a session after
@@ -1942,32 +1926,29 @@ impl LiveActor {
                 namespace,
                 entry,
                 from,
-                should_download,
                 remote_content_status,
             } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: RemoteInsert");
                 // A new entry was inserted from initial sync or gossip. Queue downloading the
                 // content.
-                if should_download {
-                    let hash = entry.content_hash();
-                    // From the insert on: a collection read that missed the
-                    // entry would sweep its payload, landed or lying orphaned.
-                    if self.held_payloads.wants(&hash) {
-                        if let Ok(tag) = self
-                            .bao_store
-                            .tags()
-                            .temp_tag(HashAndFormat::raw(hash))
-                            .await
-                        {
-                            self.held_payloads.hold(tag);
-                        }
+                let hash = entry.content_hash();
+                // From the insert on: a collection read that missed the
+                // entry would sweep its payload, landed or lying orphaned.
+                if self.held_payloads.wants(&hash) {
+                    if let Ok(tag) = self
+                        .bao_store
+                        .tags()
+                        .temp_tag(HashAndFormat::raw(hash))
+                        .await
+                    {
+                        self.held_payloads.hold(tag);
                     }
-                    if matches!(remote_content_status, ContentStatus::Complete) {
-                        let node_id = PublicKey::from_bytes(&from)?;
-                        self.start_download(namespace, hash, node_id, false).await;
-                    } else {
-                        self.missing_hashes.insert((namespace, hash));
-                    }
+                }
+                if matches!(remote_content_status, ContentStatus::Complete) {
+                    let node_id = PublicKey::from_bytes(&from)?;
+                    self.start_download(namespace, hash, node_id, false).await;
+                } else {
+                    self.missing_hashes.insert((namespace, hash));
                 }
             }
             // The live actor's subscription is `Delivery::Blocking`: nothing
@@ -2109,7 +2090,7 @@ impl LiveActor {
     #[instrument("accept", skip_all)]
     /// Serve a session whose first message named this engine's identity.
     #[instrument("accept", skip_all)]
-    pub async fn handle_session(
+    pub(crate) async fn handle_session(
         &mut self,
         conn: iroh::endpoint::Connection,
         opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
@@ -2117,10 +2098,9 @@ impl LiveActor {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
         let accept_request_cb = self.accept_callback();
         let sync = self.sync.handle().clone();
-        let metrics = self.metrics.clone();
         self.running_sync_accept.spawn(
             async move {
-                let res = handle_session(sync, opening, accept_request_cb, Some(&metrics)).await;
+                let res = handle_session(sync, opening, accept_request_cb).await;
                 // The connection outlives the session it carries: dropping
                 // it at the dispatcher would cut the streams mid-exchange.
                 drop(conn);
@@ -2136,19 +2116,16 @@ impl LiveActor {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
         let accept_request_cb = self.accept_callback();
         let sync = self.sync.handle().clone();
-        let metrics = self.metrics.clone();
         self.running_sync_accept.spawn(
             async move {
-                let res =
-                    handle_in_process_session(sync, opening, accept_request_cb, Some(&metrics))
-                        .await;
+                let res = handle_in_process_session(sync, opening, accept_request_cb).await;
                 (namespace, peer, caller, res)
             }
             .instrument(Span::current()),
         );
     }
 
-    pub fn accept_sync_request(
+    pub(crate) fn accept_sync_request(
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
@@ -2284,21 +2261,20 @@ impl QueuedHashes {
     }
 }
 
-/// The content of every entry of `namespace` the download policy wants and
-/// `blobs` does not hold whole.
+/// The content of every entry of `namespace` that `blobs` does not hold
+/// whole.
 async fn missing_content(
     sync: &SyncHandle,
     blobs: &Store,
     namespace: NamespaceId,
 ) -> Result<Vec<Hash>> {
-    let policy = sync.get_download_policy(namespace).await?;
-    let (tx, mut rx) = irpc::channel::mpsc::channel(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     sync.get_many(namespace, crate::store::Query::all().into(), tx)
         .await?;
     let mut missing = Vec::new();
-    while let Some(entry) = rx.recv().await? {
+    while let Some(entry) = rx.recv().await {
         let entry = entry?;
-        if entry.content_len() == 0 || !policy.matches(entry.entry()) {
+        if entry.content_len() == 0 {
             continue;
         }
         let hash = entry.content_hash();

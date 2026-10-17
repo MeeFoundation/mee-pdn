@@ -26,7 +26,7 @@ consumes `pdn-layer`.
 Each crate carries its own `CLAUDE.md` with its contracts and what is deliberately absent from it — read that file when working inside the crate.
 
 - [`crates/pdn-types`](crates/pdn-types/) — platform primitives and the data vocabulary. The only crate `pdn-layer` and `data-layer` share.
-- [`crates/pdn-store`](crates/pdn-store/) — our iroh-docs variant, the document sync engine under `data-layer`, diverged from upstream where PDN's access model needs it. It carries upstream's version number and is never published.
+- [`crates/pdn-store`](crates/pdn-store/) — our iroh-docs variant, the document sync engine under `data-layer`, holding what the platform uses (ADR-0016). It carries the workspace's version number and is never published. A bump of iroh, iroh-blobs or iroh-gossip owes the upstream pass its `UPSTREAM.md` describes.
 - [`crates/data-layer`](crates/data-layer/) — the data layer over `crates/pdn-store`: `SyncNode` stack assembly, the access book that judges every session, the private metadata store, a pod's two stores with its membership view, the protocol-agnostic ceremony slot.
 - [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model and the `PdnOp` operation AST. No iroh dependencies.
 - [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / pods / sync services over `data-layer`, plus the linking ceremony (ADR-0012) and a pod's join (ADR-0015). No host or HTTP dependencies.
@@ -36,7 +36,7 @@ Each crate carries its own `CLAUDE.md` with its contracts and what is deliberate
 
 Task runner is [just](https://github.com/casey/just) — `just --list` prints every recipe with its doc comment.
 
-`rust-toolchain.toml` pins the compiler, its components and the wasm targets for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
+`rust-toolchain.toml` pins the compiler and its components for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
 
 The devcontainer is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: `.devcontainer/sandcat/` is sandcat's generated setup copied unchanged, and this workspace's additions live in the files around it. [`.devcontainer/UPSTREAM.md`](.devcontainer/UPSTREAM.md) records each sync with upstream, the decisions taken in it, and how to run the next one.
 
@@ -61,7 +61,7 @@ Run a single test: `just test -E 'test(<test_name>)'`.
 
 Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/test-util`, the feature the runtime's fault and pause hooks sit behind, and a bare cargo invocation fails to build the scenarios that use them. The recipes drop the flag when the caller narrows the package selection away from `pdn-node`, because cargo rejects a feature of an unselected package.
 
-`crates/pdn-store` carries feature sets and a wasm target the workspace build never compiles: `just check-store` lints them and `just test-store` tests them, and the pipeline's `store` job runs both. Under `just test` the store's tests run like any crate's, and a run with no selection ends with the workspace doctests — the store's README is one, and nextest runs no doctests.
+`crates/pdn-store` builds in one configuration, the one the product runs, and keeps its own lints rather than the workspace's: `just check` lints it with its warnings and rustdoc's denied, and under `just test` its tests run like any crate's.
 
 ## Lint rules
 
@@ -98,6 +98,8 @@ Cross-cutting practices live in `mia-docs/openspec/specs/code-practices/`:
 ## Git
 
 All git operations that change state — `commit`, `push`, `checkout`, `add`, `rebase`, etc. — are performed **by a human, never by Claude**. Read-only commands (`status`, `diff`, `log`, `show`) are fine.
+
+The one exception is a worktree Claude created, an agent's isolated one under `.claude/worktrees/` included: once nothing in the session needs it, Claude removes it and its branch itself (`git worktree remove --force`, `git branch -D`). The human works in the main working tree alone — unstaged, staged, commits — and never cleans up after Claude's worktrees.
 
 ## Code comments
 

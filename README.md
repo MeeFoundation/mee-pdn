@@ -44,7 +44,6 @@ git clone git@github.com:MeeFoundation/mia-ontologies.git
 - `just build`: build all workspace crates
 - `just test`: run tests for all workspace crates
 - `just check`: format & lint check
-- `just check-store` / `just test-store`: the store's other feature sets, its docs, the wasm32 build, doctests
 - `just fix`: format & lint check + autofix, tests
 
 ## Crates
@@ -52,7 +51,7 @@ git clone git@github.com:MeeFoundation/mia-ontologies.git
 Layers: `pdn-layer` (domain) / `data-layer` (sync) / iroh (bytes on the wire). Both layers see only `pdn-types`; `pdn-node` is the embeddable runtime built over `data-layer`, and nothing consumes `pdn-layer`.
 
 - `crates/pdn-types`: platform primitives (`PdnId`, `OperationalKey`, `ClaimId`, `NodeId`, …) plus the record vocabulary (`PodId`, `RecordId`, `RecordKind`, `RecordRef`)
-- `crates/pdn-store`: our iroh-docs variant — the document sync engine, diverged from upstream where PDN's access model needs it; it carries upstream's version number and is never published
+- `crates/pdn-store`: our iroh-docs variant — the document sync engine, holding what the platform uses; it carries the workspace's version number and is never published
 - `crates/data-layer`: the data layer over `pdn-store` — node and stack assembly, the access book that judges every session, the private metadata store, a pod's two stores with its membership view
 - `crates/pdn-layer`: the platform surface products consume — the domain model and the `PdnOp` operation AST, with no iroh dependencies
 - `crates/pdn-node`: the embeddable runtime core — identity / pods / sync services, plus the device-linking ceremony and a pod's join

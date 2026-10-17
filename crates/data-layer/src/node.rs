@@ -25,10 +25,7 @@ use iroh_blobs::{
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc, DocsApi,
-    },
+    api::{AddrInfoOptions, Doc, DocsApi},
     protocol::{Docs, DocsDispatch},
     store::Query,
     AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
@@ -103,6 +100,19 @@ impl ProtocolHandler for PanicGuarded {
 
     async fn shutdown(&self) {
         self.inner.shutdown().await;
+    }
+}
+
+/// The blob protocol with the store's closing left to the node: the router
+/// shuts its protocols down before it cancels their connections, so a
+/// request a handler already read would reach a store that is closing,
+/// which iroh-blobs answers by panicking on its own task.
+#[derive(Debug, Clone)]
+struct BlobsServing(BlobsProtocol);
+
+impl ProtocolHandler for BlobsServing {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        ProtocolHandler::accept(&self.0, connection).await
     }
 }
 
@@ -562,10 +572,26 @@ impl SyncNode {
     /// before anything binds. A handler's `accept` should return
     /// `Err(AcceptError)` rather than panic: a panic is contained per
     /// connection, but a `panic = "abort"` build still aborts the process.
-    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
     pub async fn spawn_with(
         extra_protocols: Vec<ExtraProtocol>,
         options: SpawnOptions,
+    ) -> Result<Self> {
+        Self::assemble(extra_protocols, options, true).await
+    }
+
+    /// A node that serves no payload: a peer's fetch of its entries'
+    /// payloads fails at the dial and is tried again, so a download stays
+    /// under way on the peer for as long as a scenario needs.
+    #[cfg(feature = "test-util")]
+    pub async fn spawn_serving_no_payloads_for_test(options: SpawnOptions) -> Result<Self> {
+        Self::assemble(Vec::new(), options, false).await
+    }
+
+    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
+    async fn assemble(
+        extra_protocols: Vec<ExtraProtocol>,
+        options: SpawnOptions,
+        serve_payloads: bool,
     ) -> Result<Self> {
         // An extra silently replacing a built-in handler would leave a node
         // that looks alive and never syncs.
@@ -613,8 +639,14 @@ impl SyncNode {
             })
         };
 
-        let mut router = Router::builder(endpoint)
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs_store, None))
+        let mut router = Router::builder(endpoint);
+        if serve_payloads {
+            router = router.accept(
+                BLOBS_ALPN,
+                BlobsServing(BlobsProtocol::new(&blobs_store, None)),
+            );
+        }
+        router = router
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(DOCS_ALPN, DocsDispatch::new(resolver));
         for (alpn, handler) in extra_protocols {
@@ -942,7 +974,6 @@ impl SyncNode {
                 contact.identity,
                 caller,
                 contact.addr.clone(),
-                None,
                 None,
                 pdn_store::admit_all(),
             )
@@ -2031,11 +2062,8 @@ impl SyncNode {
             .ok_or(UnknownPod { pod })?;
         let records = held.records.ok_or(UnknownPod { pod })?;
         Ok(PodTickets {
-            membership: held
-                .membership
-                .ticket(ShareMode::Write, addr_options)
-                .await?,
-            records: records.ticket(ShareMode::Write, addr_options).await?,
+            membership: held.membership.ticket(addr_options).await?,
+            records: records.ticket(addr_options).await?,
         })
     }
 
@@ -2117,9 +2145,6 @@ impl SyncNode {
                 "namespace {namespace} is a store of pod {pod}; \
                  it cannot be opened as a device-shared store"
             ));
-        }
-        if !holds_namespace(&stack.api, namespace).await? {
-            return Ok(None);
         }
         let Some(doc) = stack
             .api
@@ -2282,12 +2307,10 @@ impl SyncNode {
                 tracing::warn!("the address book was not saved at shutdown: {err:#}");
             }
         }
-        // Everything below runs whatever the router answers: a stop that
-        // returned early would leave every engine, the blob store and the
-        // directory lock held for the rest of the process.
-        let routed = self.router.shutdown().await;
-        // The router serves the dispatcher, not the engines, so each
-        // identity's engine is shut down by name.
+        // The engines before the router: a running engine starts downloads
+        // that read the blob store the router's shutdown closes. The router
+        // serves the dispatcher, not the engines, so each engine is shut down
+        // by name.
         let stacks: Vec<Arc<HostedStack>> = match self.identities.read() {
             Ok(hosted) => hosted.values().cloned().collect(),
             Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
@@ -2295,9 +2318,15 @@ impl SyncNode {
         for stack in stacks {
             let _ = stack.docs.engine().shutdown().await;
         }
-        // Explicit rather than on the last handle's drop: a node respawned
-        // on the same directory would meet its predecessor's database lock.
-        // Best-effort: a store already shut down answers with an error.
+        // Everything below runs whatever the router answers: a stop that
+        // returned early would leave the blob store and the directory lock
+        // held for the rest of the process.
+        let routed = self.router.shutdown().await;
+        // After the router, whose shutdown awaits every connection's handler,
+        // and explicit rather than on the last handle's drop: a node
+        // respawned on the same directory would meet its predecessor's
+        // database lock. Best-effort: a store already shut down answers with
+        // an error.
         let _ = self.blobs.shutdown().await;
         // With the stores, not with this value's drop: a detached task
         // holding the node alive a moment longer must not make a spawn on
@@ -2447,8 +2476,8 @@ fn identity_directory(directory: &std::path::Path, identity: PdnId) -> std::path
         .join(encode_hex(identity.as_bytes()))
 }
 
-/// Answered from the listing: the fork reports "no such namespace" and
-/// "the store could not answer" as one error of the same shape.
+/// Answered from the listing: opening a replica holds it open.
+#[cfg(feature = "test-util")]
 async fn holds_namespace(api: &DocsApi, namespace: NamespaceId) -> Result<bool> {
     let mut listed = api.list().await?;
     while let Some(entry) = listed.next().await {
@@ -2896,12 +2925,16 @@ async fn bind_endpoint(
         }
         Connectivity::RelaysAndAddressLookup => Endpoint::builder(presets::N0),
     };
-    let builder = builder.transport_config(
-        QuicTransportConfig::builder()
-            .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
-            .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
-            .build(),
-    );
+    let builder = builder
+        .path_selector(std::sync::Arc::new(
+            crate::path_selector::ReceivingPathSelector,
+        ))
+        .transport_config(
+            QuicTransportConfig::builder()
+                .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+                .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+                .build(),
+        );
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,

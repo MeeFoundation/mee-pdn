@@ -90,11 +90,6 @@ const NODE_LOG_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/stand-logs");
 /// shortens that cadence.
 pub const CONVERGENCE_BUDGET: Duration = Duration::from_mins(2);
 
-/// A pod store's pass, every 300 s, with a margin: what a node announced to
-/// no neighbor — a record placed before a restarted node's swarm formed —
-/// reaches another member at its next pass.
-pub const POD_PASS_BUDGET: Duration = Duration::from_mins(6);
-
 const LOG_TAIL_BYTES: usize = 4 * 1024;
 
 /// One test's container network, so a container left behind by a failed

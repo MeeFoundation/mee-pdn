@@ -12,30 +12,24 @@ use anyhow::{anyhow, Result};
 use iroh::{KeyParsingError, PublicKey};
 use iroh_blobs::Hash;
 use n0_future::time::SystemTime;
-use rand::CryptoRng;
 use redb::{Database, ReadableDatabase, ReadableMultimapTable, ReadableTable};
 use tracing::warn;
 
-use super::{
-    pubkeys::MemPublicKeyStore, DownloadPolicy, ImportNamespaceOutcome, OpenError, PublicKeyStore,
-    Query,
-};
+use super::{pubkeys::MemPublicKeyStore, ImportNamespaceOutcome, OpenError, PublicKeyStore, Query};
 use crate::{
     actor::MAX_COMMIT_DELAY,
     keys::Author,
     ranger::{Fingerprint, Range, RangeEntry},
-    sync::{Entry, EntrySignature, Record, RecordIdentifier, Replica, SignedEntry},
-    AuthorHeads, AuthorId, Capability, CapabilityKind, NamespaceId, NamespaceSecret, PeerIdBytes,
-    ReplicaInfo,
+    sync::{Entry, EntrySignature, Record, RecordIdentifier, SignedEntry},
+    AuthorHeads, AuthorId, Capability, CapabilityKind, NamespaceId, PeerIdBytes, ReplicaInfo,
 };
 
 mod bounds;
-mod migrations;
 mod query;
 mod ranges;
 pub(crate) mod tables;
 
-pub use self::ranges::RecordsRange;
+pub(crate) use self::ranges::RecordsRange;
 use self::{
     bounds::{ByKeyBounds, RecordsBounds},
     query::QueryIterator,
@@ -48,7 +42,7 @@ use self::{
 
 /// Manages the replicas and authors for an instance.
 #[derive(Debug)]
-pub struct Store {
+pub(crate) struct Store {
     db: Database,
     transaction: CurrentTransaction,
     open_replicas: HashSet<NamespaceId>,
@@ -93,7 +87,6 @@ enum CurrentTransaction {
     Write(TransactionAndTables),
 }
 
-#[cfg(feature = "fs-store")]
 fn open_database(path: &std::path::Path, cache_bytes: usize) -> Result<Database> {
     match Database::builder().set_cache_size(cache_bytes).create(path) {
         Ok(db) => Ok(db),
@@ -123,7 +116,6 @@ impl Store {
     /// reserve them. The bound cannot be changed on an open store, so a
     /// consumer that divides one budget among several stores cuts the
     /// share before opening any of them.
-    #[cfg(feature = "fs-store")]
     pub fn persistent(path: impl AsRef<std::path::Path>, cache_bytes: usize) -> Result<Self> {
         Self::new_impl(open_database(path.as_ref(), cache_bytes)?)
     }
@@ -133,9 +125,6 @@ impl Store {
         let write_tx = db.begin_write()?;
         let _ = Tables::new(&write_tx)?;
         write_tx.commit()?;
-
-        // Run database migrations
-        migrations::run_migrations(&db)?;
 
         Ok(Store {
             db,
@@ -234,7 +223,7 @@ impl Store {
     ///
     /// This has the side effect of committing any open write transaction,
     /// so it can be used as a way to ensure that the data is persisted.
-    pub fn snapshot_owned(&mut self) -> Result<ReadOnlyTables> {
+    pub(crate) fn snapshot_owned(&mut self) -> Result<ReadOnlyTables> {
         // make sure the current transaction is committed
         self.flush()?;
         assert!(matches!(self.transaction, CurrentTransaction::None));
@@ -303,14 +292,19 @@ type PeersIter = std::vec::IntoIter<PeerIdBytes>;
 
 impl Store {
     /// Create a new replica for `namespace` and persist in this store.
-    pub fn new_replica(&mut self, namespace: NamespaceSecret) -> Result<Replica<'_>> {
+    #[cfg(test)]
+    pub(crate) fn new_replica(
+        &mut self,
+        namespace: crate::NamespaceSecret,
+    ) -> Result<crate::sync::Replica<'_>> {
         let id = namespace.id();
         self.import_namespace(namespace.into())?;
         self.open_replica(&id).map_err(Into::into)
     }
 
     /// Create a new author key and persist it in the store.
-    pub fn new_author<R: CryptoRng>(&mut self, rng: &mut R) -> Result<Author> {
+    #[cfg(test)]
+    pub(crate) fn new_author<R: rand::CryptoRng>(&mut self, rng: &mut R) -> Result<Author> {
         let author = Author::new(rng);
         self.import_author(author.clone())?;
         Ok(author)
@@ -319,7 +313,7 @@ impl Store {
     /// Check if a [`AuthorHeads`] contains entry timestamps that we do not have locally.
     ///
     /// Returns the number of authors that the other peer has updates for.
-    pub fn has_news_for_us(
+    pub(crate) fn has_news_for_us(
         &mut self,
         namespace: NamespaceId,
         heads: &AuthorHeads,
@@ -340,14 +334,18 @@ impl Store {
     /// Open a replica from this store.
     ///
     /// This just calls load_replica_info and then creates a new replica with the info.
-    pub fn open_replica(&mut self, namespace_id: &NamespaceId) -> Result<Replica<'_>, OpenError> {
+    #[cfg(test)]
+    pub(crate) fn open_replica(
+        &mut self,
+        namespace_id: &NamespaceId,
+    ) -> Result<crate::sync::Replica<'_>, OpenError> {
         let info = self.load_replica_info(namespace_id)?;
         let instance = StoreInstance::new(*namespace_id, self);
-        Ok(Replica::new(instance, Box::new(info)))
+        Ok(crate::sync::Replica::new(instance, Box::new(info)))
     }
 
     /// Load the replica info from the store.
-    pub fn load_replica_info(
+    pub(crate) fn load_replica_info(
         &mut self,
         namespace_id: &NamespaceId,
     ) -> Result<ReplicaInfo, OpenError> {
@@ -366,12 +364,12 @@ impl Store {
     }
 
     /// Close a replica.
-    pub fn close_replica(&mut self, id: NamespaceId) {
+    pub(crate) fn close_replica(&mut self, id: NamespaceId) {
         self.open_replicas.remove(&id);
     }
 
     /// List all replica namespaces in this store.
-    pub fn list_namespaces(
+    pub(crate) fn list_namespaces(
         &mut self,
     ) -> Result<impl Iterator<Item = Result<(NamespaceId, CapabilityKind)>>> {
         let snapshot = self.snapshot()?;
@@ -384,7 +382,7 @@ impl Store {
     }
 
     /// Get an author key from the store.
-    pub fn get_author(&mut self, author_id: &AuthorId) -> Result<Option<Author>> {
+    pub(crate) fn get_author(&mut self, author_id: &AuthorId) -> Result<Option<Author>> {
         let tables = self.tables()?;
         let Some(author) = tables.authors.get(author_id.as_bytes())? else {
             return Ok(None);
@@ -394,7 +392,7 @@ impl Store {
     }
 
     /// Import an author key pair.
-    pub fn import_author(&mut self, author: Author) -> Result<()> {
+    pub(crate) fn import_author(&mut self, author: Author) -> Result<()> {
         self.modify(|tables| {
             tables
                 .authors
@@ -403,51 +401,16 @@ impl Store {
         })
     }
 
-    /// Delete an author.
-    pub fn delete_author(&mut self, author: AuthorId) -> Result<()> {
-        self.modify(|tables| {
-            tables.authors.remove(author.as_bytes())?;
-            Ok(())
-        })
-    }
-
-    /// List all author keys in this store.
-    pub fn list_authors(&mut self) -> Result<impl Iterator<Item = Result<Author>>> {
-        let tables = self.snapshot()?;
-        let iter = tables
-            .authors
-            .range::<&'static [u8; 32]>(..)?
-            .map(|res| match res {
-                Ok((_key, value)) => Ok(Author::from_bytes(value.value())),
-                Err(err) => Err(err.into()),
-            });
-        Ok(iter)
-    }
-
     /// Import a new replica namespace.
     pub fn import_namespace(&mut self, capability: Capability) -> Result<ImportNamespaceOutcome> {
         self.modify(|tables| {
-            let outcome = {
-                let (capability, outcome) = {
-                    let existing = tables.namespaces.get(capability.id().as_bytes())?;
-                    if let Some(existing) = existing {
-                        let mut existing = parse_capability(existing.value())?;
-                        let outcome = if existing.merge(capability)? {
-                            ImportNamespaceOutcome::Upgraded
-                        } else {
-                            ImportNamespaceOutcome::NoChange
-                        };
-                        (existing, outcome)
-                    } else {
-                        (capability, ImportNamespaceOutcome::Inserted)
-                    }
-                };
-                let id = capability.id().to_bytes();
-                let (kind, bytes) = capability.raw();
-                tables.namespaces.insert(&id, (kind, &bytes))?;
-                outcome
-            };
-            Ok(outcome)
+            let id = capability.id().to_bytes();
+            if tables.namespaces.get(&id)?.is_some() {
+                return Ok(ImportNamespaceOutcome::NoChange);
+            }
+            let (kind, bytes) = capability.raw();
+            tables.namespaces.insert(&id, (kind, &bytes))?;
+            Ok(ImportNamespaceOutcome::Inserted)
         })
     }
 
@@ -462,7 +425,7 @@ impl Store {
     /// replicas of one namespace are told apart by comparing each against
     /// its own earlier reading, never against the other's: the number
     /// counts writes, not entries.
-    pub fn writes_of(&self, namespace: NamespaceId) -> u64 {
+    pub(crate) fn writes_of(&self, namespace: NamespaceId) -> u64 {
         self.writes.get(&namespace).copied().unwrap_or_default()
     }
 
@@ -473,7 +436,7 @@ impl Store {
     ///
     /// Note that a replica has to be closed before it can be removed. The store has to enforce
     /// that a replica cannot be removed while it is still open.
-    pub fn remove_replica(&mut self, namespace: &NamespaceId) -> Result<()> {
+    pub(crate) fn remove_replica(&mut self, namespace: &NamespaceId) -> Result<()> {
         if self.open_replicas.contains(namespace) {
             return Err(anyhow!("replica is not closed"));
         }
@@ -486,7 +449,6 @@ impl Store {
                 .retain_in(bounds.as_ref(), |_k, _v| false);
             tables.namespaces.remove(namespace.as_bytes())?;
             tables.namespace_peers.remove_all(namespace.as_bytes())?;
-            tables.download_policy.remove(namespace.as_bytes())?;
             Ok(())
         })
     }
@@ -519,13 +481,13 @@ impl Store {
     }
 
     /// Get all content hashes of all replicas in the store.
-    pub fn content_hashes(&mut self) -> Result<ContentHashesIterator> {
+    pub(crate) fn content_hashes(&mut self) -> Result<ContentHashesIterator> {
         let tables = self.snapshot_owned()?;
         ContentHashesIterator::all(&tables.records)
     }
 
     /// Get the latest entry for each author in a namespace.
-    pub fn get_latest_for_each_author(
+    pub(crate) fn get_latest_for_each_author(
         &mut self,
         namespace: NamespaceId,
     ) -> Result<LatestIterator<'_>> {
@@ -533,7 +495,7 @@ impl Store {
     }
 
     /// Register a peer that has been useful to sync a document.
-    pub fn register_useful_peer(
+    pub(crate) fn register_useful_peer(
         &mut self,
         namespace: NamespaceId,
         peer: crate::PeerIdBytes,
@@ -633,37 +595,6 @@ impl Store {
             Ok(Some(peers.into_iter()))
         }
     }
-
-    /// Set the download policy for a namespace.
-    pub fn set_download_policy(
-        &mut self,
-        namespace: &NamespaceId,
-        policy: DownloadPolicy,
-    ) -> Result<()> {
-        self.modify(|tables| {
-            let namespace = namespace.as_bytes();
-
-            // ensure the document exists
-            anyhow::ensure!(
-                tables.namespaces.get(&namespace)?.is_some(),
-                "document not created"
-            );
-
-            let value = postcard::to_stdvec(&policy)?;
-            tables.download_policy.insert(namespace, value.as_slice())?;
-            Ok(())
-        })
-    }
-
-    /// Get the download policy for a namespace.
-    pub fn get_download_policy(&mut self, namespace: &NamespaceId) -> Result<DownloadPolicy> {
-        let tables = self.tables()?;
-        let value = tables.download_policy.get(namespace.as_bytes())?;
-        Ok(match value {
-            None => DownloadPolicy::default(),
-            Some(value) => postcard::from_bytes(value.value())?,
-        })
-    }
 }
 
 impl PublicKeyStore for Store {
@@ -692,7 +623,7 @@ fn get_exact(
 
 /// A wrapper around [`Store`] for a specific [`NamespaceId`]
 #[derive(Debug)]
-pub struct StoreInstance<'a> {
+pub(crate) struct StoreInstance<'a> {
     namespace: NamespaceId,
     pub(crate) store: &'a mut Store,
     /// Frozen read source for one sync session's egress.
@@ -772,12 +703,6 @@ fn range_pair<'a>(
 impl PublicKeyStore for StoreInstance<'_> {
     fn public_key(&self, id: &[u8; 32]) -> std::result::Result<PublicKey, KeyParsingError> {
         self.store.public_key(id)
-    }
-}
-
-impl super::DownloadPolicyStore for StoreInstance<'_> {
-    fn get_download_policy(&mut self, namespace: &NamespaceId) -> Result<DownloadPolicy> {
-        self.store.get_download_policy(namespace)
     }
 }
 
@@ -986,7 +911,7 @@ fn chain_none<'a, I: Iterator<Item = T> + 'a, T>(
 /// Also, this represents a snapshot of the database at the time of creation.
 /// It needs a copy of a redb::ReadOnlyTable to be self-contained.
 #[derive(derive_more::Debug)]
-pub struct ContentHashesIterator {
+pub(crate) struct ContentHashesIterator {
     #[debug(skip)]
     range: RecordsRange<'static>,
 }
@@ -1011,7 +936,7 @@ impl Iterator for ContentHashesIterator {
 /// Iterator over the latest entry per author.
 #[derive(derive_more::Debug)]
 #[debug("LatestIterator")]
-pub struct LatestIterator<'a>(
+pub(crate) struct LatestIterator<'a>(
     redb::Range<'a, LatestPerAuthorKey<'static>, LatestPerAuthorValue<'static>>,
 );
 
@@ -1046,16 +971,16 @@ fn into_entry(key: RecordsId, value: RecordsValue) -> SignedEntry {
     let (namespace, author, key) = key;
     let (timestamp, namespace_sig, author_sig, len, hash) = value;
     let id = RecordIdentifier::new(namespace, author, key);
-    let record = Record::new(hash.into(), len, timestamp);
+    let record = Record::unchecked(hash.into(), len, timestamp);
     let entry = Entry::new(id, record);
     let entry_signature = EntrySignature::from_parts(namespace_sig, author_sig);
     SignedEntry::new(entry_signature, entry)
 }
 
-#[cfg(all(test, feature = "fs-store"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ranger::Store as _;
+    use crate::{ranger::Store as _, NamespaceSecret};
 
     /// A cache big enough that nothing in a scenario evicts.
     const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -1128,9 +1053,6 @@ mod tests {
         let dbfile = tempfile::NamedTempFile::new()?;
         let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
 
-        let authors: Vec<_> = store.list_authors()?.collect::<Result<_>>()?;
-        assert!(authors.is_empty());
-
         let author = store.new_author(&mut rand::rng())?;
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let _replica = store.new_replica(namespace.clone())?;
@@ -1197,83 +1119,6 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         assert_eq!(entries.len(), 0);
 
-        Ok(())
-    }
-
-    fn copy_and_modify(
-        source: &std::path::Path,
-        modify: impl Fn(&redb::WriteTransaction) -> Result<()>,
-    ) -> Result<tempfile::NamedTempFile> {
-        let dbfile = tempfile::NamedTempFile::new()?;
-        std::fs::copy(source, dbfile.path())?;
-        let db = Database::create(dbfile.path())?;
-        let write_tx = db.begin_write()?;
-        modify(&write_tx)?;
-        write_tx.commit()?;
-        drop(db);
-        Ok(dbfile)
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "fs-store")]
-    async fn test_migration_001_populate_latest_table() -> Result<()> {
-        use super::tables::LATEST_PER_AUTHOR_TABLE;
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let namespace = NamespaceSecret::new(&mut rand::rng());
-
-        // create a store and add some data
-        let expected = {
-            let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-            let author1 = store.new_author(&mut rand::rng())?;
-            let author2 = store.new_author(&mut rand::rng())?;
-            let mut replica = store.new_replica(namespace.clone())?;
-            replica.hash_and_insert(b"k1", &author1, b"v1").await?;
-            replica.hash_and_insert(b"k2", &author2, b"v1").await?;
-            replica.hash_and_insert(b"k3", &author1, b"v1").await?;
-
-            let expected = store
-                .get_latest_for_each_author(namespace.id())?
-                .collect::<Result<Vec<_>>>()?;
-            // drop everything to clear file locks.
-            store.close_replica(namespace.id());
-            // flush the store to disk
-            store.flush()?;
-            drop(store);
-            expected
-        };
-        assert_eq!(expected.len(), 2);
-
-        // create a copy of our db file with the latest table deleted.
-        let dbfile_before_migration = copy_and_modify(dbfile.path(), |tx| {
-            tx.delete_table(LATEST_PER_AUTHOR_TABLE)?;
-            Ok(())
-        })?;
-
-        // open the copied db file, which will run the migration.
-        let mut store = Store::persistent(dbfile_before_migration.path(), TEST_CACHE_BYTES)?;
-        let actual = store
-            .get_latest_for_each_author(namespace.id())?
-            .collect::<Result<Vec<_>>>()?;
-
-        assert_eq!(expected, actual);
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "fs-store")]
-    fn test_migration_004_populate_by_key_index() -> Result<()> {
-        use redb::ReadableTableMetadata;
-        let dbfile = tempfile::NamedTempFile::new()?;
-
-        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-
-        // check that the new table is there, even if empty
-        {
-            let tables = store.tables()?;
-            assert_eq!(tables.records_by_key.len()?, 0);
-        }
-
-        // TODO: write test checking that the indexing is done correctly
         Ok(())
     }
 }

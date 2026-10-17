@@ -139,7 +139,7 @@ pub type SessionAccessFuture = Pin<Box<dyn Future<Output = SessionAccess> + Send
 ///
 /// Required of every assembly: without one a consumer would serve
 /// sessions it never judged. [`serve_whole`] is what a suite names when it
-/// wants upstream's unjudged behaviour.
+/// wants every session served whole.
 pub type SessionAccessProvider = Arc<
     dyn Fn(NamespaceId, Identity, Identity, PublicKey, SessionRole) -> SessionAccessFuture
         + Send

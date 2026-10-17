@@ -5,8 +5,7 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, DocTicket, IdentityNotProvisioned, PrivateMetadataStore, Seq, ShareMode,
-    SyncNode,
+    AddrInfoOptions, DocTicket, IdentityNotProvisioned, PrivateMetadataStore, Seq, SyncNode,
 };
 use pdn_types::{PdnId, PodId};
 use test_utils::{eventually, host_identity, ids, join_identity, memory_node, wait_devices};
@@ -23,9 +22,7 @@ async fn provision_identity_with_records(
     let pms = host_identity(node, identity).await?;
     pms.record_pod(pod, Seq::FIRST).await?;
     pms.put_ticket(KIND, ticket).await?;
-    let write = pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let write = pms.share_ticket(AddrInfoOptions::RelayAndAddresses).await?;
     Ok((pms, write))
 }
 
@@ -51,7 +48,7 @@ async fn wait_kind_is(pms: &PrivateMetadataStore, want: &DocTicket) -> Result<bo
 async fn fresh_ticket(node: &SyncNode, identity: PdnId) -> Result<DocTicket> {
     PrivateMetadataStore::create(node, identity)
         .await?
-        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await
 }
 

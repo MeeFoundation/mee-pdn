@@ -97,6 +97,10 @@ impl DrainingSync {
         self.events.during(self.sync.close(namespace)).await
     }
 
+    pub(super) async fn drop_replica(&mut self, namespace: NamespaceId) -> Result<()> {
+        self.events.during(self.sync.drop_replica(namespace)).await
+    }
+
     pub(super) async fn get_sync_peers(
         &mut self,
         namespace: NamespaceId,

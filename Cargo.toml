@@ -17,7 +17,8 @@ exclude = [
 resolver = "2"
 
 [workspace.dependencies]
-# The iroh stack is pinned here so every consumer agrees.
+# The iroh stack is pinned here so every consumer agrees. A bump of any of the
+# three owes the pass of crates/pdn-store/UPSTREAM.md (ADR-0016).
 iroh = "1.3"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
@@ -30,6 +31,12 @@ pdn-store = { path = "crates/pdn-store" }
 # thread, which hangs a failed blob store open forever. What the fork carries
 # and when it goes: UPSTREAM.md in the fork.
 iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
+# Upstream's main past its 0.101.0 release, which answers a Join from a peer
+# that restarted with the same id: under 0.101.0 a node killed and started
+# again gets no neighbor from a peer that still holds its old link, and its
+# writes reach that peer only on the next pod pass. Held until a release
+# carries the fix: components/mee-pdn/iroh-defects.md in mia-docs.
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "6cbbafa865c1b60c813dd8f12f78a54a45c1ecb1" }
 
 # Full debug info is copied into every test binary and build variant, and on
 # macOS into object files beside them: tens of gigabytes of target/. Backtraces

@@ -18,7 +18,7 @@ use std::{
 use anyhow::{Context, Result};
 use data_layer::{
     AcceptError, AddrInfoOptions, Connection, DocTicket, EndpointAddr, NamespaceId,
-    PrivateMetadataStore, ProtocolHandler, ShareMode,
+    PrivateMetadataStore, ProtocolHandler,
 };
 use pdn_types::{NodeId, PdnId};
 use serde::{Deserialize, Serialize};
@@ -179,10 +179,7 @@ impl LinkingHandler {
 
             // Every device that can mint an invite hosts the PMS replica —
             // the first by creation, every further one by its own reply.
-            let pms_ticket = match pms
-                .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-                .await
-            {
+            let pms_ticket = match pms.share_ticket(AddrInfoOptions::RelayAndAddresses).await {
                 Ok(ticket) => ticket,
                 Err(err) => {
                     let _ = state

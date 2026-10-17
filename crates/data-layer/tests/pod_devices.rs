@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, MemberDevice, MembershipKey, PodStore,
-    PodVerdicts, RecordKey, Seq, ShareMode, SpawnOptions, SyncNode, Traced, Verdict,
+    PodVerdicts, RecordKey, Seq, SpawnOptions, SyncNode, Traced, Verdict,
 };
 use pdn_store::SessionRole;
 use pdn_types::{NodeId, PodId, RecordId};
@@ -141,9 +141,7 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
         .import_pod(bob.id, pod, tickets(&alice_phone, &alice, pod).await?)
         .await?;
     assert!(eventually(|| async { Ok(!lists_nobody(&bob_phone, bob.id, pod).await?) }).await?);
-    let ticket = bob_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = bob_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
     assert!(wait_devices(&laptop_pms, &[bob_phone.node_id()]).await?);
     let tickets = tickets(&bob_phone, &bob, pod).await?;
@@ -198,9 +196,7 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         .await?;
     assert!(eventually(|| async { Ok(!lists_nobody(&bob_phone, bob.id, pod).await?) }).await?);
     bob_pms.add_device(bob_laptop.node_id()).await?;
-    let ticket = bob_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = bob_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
     assert!(wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?);
     let alices = device_of(&alice_phone, &alice)?;
@@ -348,9 +344,7 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_pms) = host(&bob_phone).await?;
     bob_pms.add_device(bob_laptop.node_id()).await?;
-    let ticket = bob_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = bob_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let laptop_pms = join_identity(&bob_laptop, bob.id, ticket).await?;
     assert!(wait_devices(&laptop_pms, &[bob_phone.node_id(), bob_laptop.node_id()]).await?);
     let pod = create(&alice_phone, &alice).await?;

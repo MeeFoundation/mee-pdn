@@ -8,8 +8,8 @@
 use anyhow::Result;
 use data_layer::private_metadata::PENDING_DEVICE_TTL;
 use data_layer::{
-    pod_ticket_kind, AddrInfoOptions, AuthorId, DirectoryHeld, OpId, PodStore, PodTickets,
-    PrivateMetadataStore, RecordKey, RecordedHosting, Seq, ShareMode, SpawnOptions, SyncNode,
+    pod_ticket_kind, AddrInfoOptions, AuthorId, DirectoryHeld, NamespaceId, OpId, PodStore,
+    PodTickets, PrivateMetadataStore, RecordKey, RecordedHosting, Seq, SpawnOptions, SyncNode,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
 use test_utils::{host_identity, ids, pod as c};
@@ -126,6 +126,60 @@ async fn a_respawned_node_reads_its_own_entries_and_keeps_its_id() -> Result<()>
         "a replica this store never held must be reported absent, not as a failure to open"
     );
     fresh.shutdown().await?;
+    second.shutdown().await?;
+    Ok(())
+}
+
+/// After a restart, an identity's PMS opens beside a replica row of a
+/// capability kind this build does not read — a read capability an earlier
+/// build imported from a modified inviter's ticket. The row is written into
+/// the store file directly and sorts before the PMS's own, as a walk of the
+/// table would meet it first. Denied: the replica the row names fails to
+/// open, rather than reading as absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_row_of_an_unknown_kind_leaves_the_pms_opening() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let (alice, pms) = c::host(&first).await?;
+    let pms_namespace = pms.namespace();
+    first.shutdown().await?;
+    drop(pms);
+    drop(first);
+
+    let unread = [0u8; 32];
+    let hex = alice
+        .id
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        });
+    let file = dir.path().join("identities").join(hex).join("docs.redb");
+    {
+        let namespaces = redb::TableDefinition::<&[u8; 32], (u8, &[u8; 32])>::new("namespaces-2");
+        let db = redb::Database::open(&file)?;
+        let tx = db.begin_write()?;
+        tx.open_table(namespaces)?.insert(&unread, (2u8, &unread))?;
+        tx.commit()?;
+    }
+
+    let second = node_on(dir.path()).await?;
+    second.provision_identity(alice.id).await?;
+    assert!(
+        PrivateMetadataStore::open(&second, alice.id, pms_namespace)
+            .await?
+            .is_some(),
+        "the PMS must open beside a row it does not read"
+    );
+    // Denied: the unread row's own replica.
+    assert!(
+        PrivateMetadataStore::open(&second, alice.id, NamespaceId::from(unread))
+            .await
+            .is_err(),
+        "a held replica that cannot open must fail, not read as absent"
+    );
     second.shutdown().await?;
     Ok(())
 }
@@ -264,9 +318,7 @@ async fn a_pending_device_expired_after_a_restart_stays_absent() -> Result<()> {
     let pms = host_identity(&first, ids::ALICE).await?;
     let own_node = first.node_id();
     let pms_namespace = pms.namespace();
-    let pms_ticket = pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let pms_ticket = pms.share_ticket(AddrInfoOptions::Addresses).await?;
 
     // A sibling device of the same identity writes the abandoned device's
     // record, so it stands under another author than the tombstone below.
@@ -639,5 +691,27 @@ async fn an_operation_sequence_continues_after_a_respawn() -> Result<()> {
         (1..=4).map(|op_seq| (author, op_seq)).collect::<Vec<_>>()
     );
     second.shutdown().await?;
+    Ok(())
+}
+
+/// A node whose blob store cannot open fails its spawn with an error rather
+/// than hanging: iroh-blobs 0.103's `FsStore::load` drops its own runtime
+/// from one of the runtime's threads when opening fails, which blocks for
+/// good (`iroh-defects.md`, the workspace's iroh-blobs fork). A directory in
+/// the place of the store's database file is what fails the open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_store_that_cannot_open_fails_the_spawn() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("blobs").join("blobs.db"))?;
+    let spawned = tokio::time::timeout(std::time::Duration::from_secs(30), node_on(dir.path()))
+        .await
+        .map_err(|_elapsed| anyhow::anyhow!("the spawn hung on a blob store that cannot open"))?;
+    let Err(err) = spawned else {
+        anyhow::bail!("a node spawned on a blob store that cannot open");
+    };
+    assert!(
+        format!("{err:#}").contains("cannot open the blob store"),
+        "the spawn failed for another reason: {err:#}"
+    );
     Ok(())
 }

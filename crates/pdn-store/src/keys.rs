@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::PublicKeyStore;
 
-/// Author key to insert entries in a [`crate::Replica`]
+/// Author key to insert entries in a `Replica`
 ///
 /// Internally, an author wraps an [`iroh::SecretKey`] used to sign entries.
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ impl Author {
     }
 
     /// Get the [`AuthorPublicKey`] for this author.
-    pub fn public_key(&self) -> AuthorPublicKey {
+    pub(crate) fn public_key(&self) -> AuthorPublicKey {
         AuthorPublicKey(self.signing_key.public())
     }
 
@@ -60,7 +60,7 @@ impl Author {
 /// This is the corresponding [`iroh::PublicKey`] for an author. It is used as an identifier,
 /// and can be used to verify [`Signature`]s.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, derive_more::From)]
-pub struct AuthorPublicKey(PublicKey);
+pub(crate) struct AuthorPublicKey(PublicKey);
 
 impl AuthorPublicKey {
     /// Verify that a signature matches the `msg` bytes and was created with the [`Author`]
@@ -84,9 +84,9 @@ impl AuthorPublicKey {
     }
 }
 
-/// Namespace key of a [`crate::Replica`].
+/// Namespace key of a `Replica`.
 ///
-/// Holders of this key can insert new entries into a [`crate::Replica`].
+/// Holders of this key can insert new entries into a `Replica`.
 /// Internally, a [`NamespaceSecret`] wraps an [`iroh::SecretKey`] used to sign entries.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NamespaceSecret {
@@ -113,7 +113,7 @@ impl NamespaceSecret {
     }
 
     /// Get the [`NamespacePublicKey`] for this namespace.
-    pub fn public_key(&self) -> NamespacePublicKey {
+    pub(crate) fn public_key(&self) -> NamespacePublicKey {
         NamespacePublicKey(self.signing_key.public())
     }
 
@@ -136,7 +136,7 @@ impl NamespaceSecret {
 /// The corresponding [`iroh::PublicKey`] for a [`NamespaceSecret`].
 /// It is used as an identifier, and can be used to verify [`Signature`]s.
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, derive_more::From)]
-pub struct NamespacePublicKey(PublicKey);
+pub(crate) struct NamespacePublicKey(PublicKey);
 
 impl NamespacePublicKey {
     /// Verify that a signature matches the `msg` bytes and was created with the [`NamespaceSecret`]
@@ -330,7 +330,7 @@ impl From<&Author> for AuthorPublicKey {
     }
 }
 
-/// [`NamespacePublicKey`] in bytes
+/// `NamespacePublicKey` in bytes
 #[derive(
     Default,
     Clone,
@@ -348,7 +348,7 @@ impl From<&Author> for AuthorPublicKey {
 )]
 pub struct NamespaceId([u8; 32]);
 
-/// [`AuthorPublicKey`] in bytes
+/// `AuthorPublicKey` in bytes
 #[derive(
     Default,
     Clone,
@@ -380,18 +380,11 @@ impl AuthorId {
     /// Convert into [`AuthorPublicKey`] by fetching from a [`PublicKeyStore`].
     ///
     /// Fails if the bytes of this [`AuthorId`] are not a valid ed25519 curve point.
-    pub fn public_key<S: PublicKeyStore>(
+    pub(crate) fn public_key<S: PublicKeyStore>(
         &self,
         store: &S,
     ) -> Result<AuthorPublicKey, KeyParsingError> {
         store.author_key(self)
-    }
-
-    /// Convert into [`AuthorPublicKey`].
-    ///
-    /// Fails if the bytes of this [`AuthorId`] are not a valid ed25519 curve point.
-    pub fn into_public_key(&self) -> Result<AuthorPublicKey, KeyParsingError> {
-        AuthorPublicKey::from_bytes(&self.0)
     }
 
     /// Convert to a hex string limited to the first 10 bytes for a friendly string
@@ -415,18 +408,11 @@ impl NamespaceId {
     /// Convert into [`NamespacePublicKey`] by fetching from a [`PublicKeyStore`].
     ///
     /// Fails if the bytes of this [`NamespaceId`] are not a valid ed25519 curve point.
-    pub fn public_key<S: PublicKeyStore>(
+    pub(crate) fn public_key<S: PublicKeyStore>(
         &self,
         store: &S,
     ) -> Result<NamespacePublicKey, KeyParsingError> {
         store.namespace_key(self)
-    }
-
-    /// Convert into [`NamespacePublicKey`].
-    ///
-    /// Fails if the bytes of this [`NamespaceId`] are not a valid ed25519 curve point.
-    pub fn into_public_key(&self) -> Result<NamespacePublicKey, KeyParsingError> {
-        NamespacePublicKey::from_bytes(&self.0)
     }
 
     /// Convert to a hex string limited to the first 10 bytes for a friendly string
