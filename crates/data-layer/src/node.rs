@@ -20,8 +20,9 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
+    provider::{events::EventSender, handle_stream, StreamPair},
     store::{fs::FsStore, mem::MemStore, GcConfig, ProtectCb, ProtectOutcome},
-    BlobsProtocol, Hash, ALPN as BLOBS_ALPN,
+    Hash, ALPN as BLOBS_ALPN,
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
@@ -33,6 +34,7 @@ use pdn_store::{
 use pdn_types::{NodeId, PdnId, PodId, RecordRef};
 use rand::seq::SliceRandom as _;
 use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 use crate::{
     access::{session_access_provider, AccessBook},
@@ -103,16 +105,25 @@ impl ProtocolHandler for PanicGuarded {
     }
 }
 
-/// The blob protocol with the store's closing left to the node: the router
-/// shuts its protocols down before it cancels their connections, so a
-/// request a handler already read would reach a store that is closing,
+/// The blob protocol with its streams' tasks tracked and the store's closing
+/// left to the node: the router shuts its protocols down before it cancels
+/// their connections, and a stream's task outlives the router's shutdown, so
+/// a request a stream already read would reach a store that is closing,
 /// which iroh-blobs answers by panicking on its own task.
 #[derive(Debug, Clone)]
-struct BlobsServing(BlobsProtocol);
+struct BlobsServing {
+    store: iroh_blobs::api::Store,
+    streams: TaskTracker,
+}
 
 impl ProtocolHandler for BlobsServing {
+    /// `iroh_blobs::provider::handle_connection`, which spawns each stream's
+    /// task untracked, without the provider events the node takes none of.
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        ProtocolHandler::accept(&self.0, connection).await
+        while let Ok(pair) = StreamPair::accept(&connection, EventSender::DEFAULT).await {
+            self.streams.spawn(handle_stream(pair, self.store.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +157,11 @@ const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Default of [`SpawnOptions::pod_change_settle`].
 const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
+
+/// How long a stop waits for the blob protocol's streams and then the blob
+/// store to finish: a stream ends at its next read or write on the closed
+/// endpoint, and a request it left in the store at its first answer.
+const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
@@ -277,6 +293,8 @@ impl SpawnOptions {
 pub struct SyncNode {
     router: Router,
     blobs: iroh_blobs::api::Store,
+    /// The blob protocol's stream tasks, which outlive the router.
+    blob_streams: TaskTracker,
     gossip: Gossip,
     /// The half of the node each hosted identity owns.
     identities: Identities,
@@ -639,11 +657,15 @@ impl SyncNode {
             })
         };
 
+        let blob_streams = TaskTracker::new();
         let mut router = Router::builder(endpoint);
         if serve_payloads {
             router = router.accept(
                 BLOBS_ALPN,
-                BlobsServing(BlobsProtocol::new(&blobs_store, None)),
+                BlobsServing {
+                    store: blobs_store.clone(),
+                    streams: blob_streams.clone(),
+                },
             );
         }
         router = router
@@ -685,6 +707,7 @@ impl SyncNode {
         Ok(Self {
             router,
             blobs: blobs_store,
+            blob_streams,
             gossip,
             identities,
             cache_budget_bytes: options.replica_cache_budget_bytes,
@@ -2322,6 +2345,19 @@ impl SyncNode {
         // returned early would leave the blob store and the directory lock
         // held for the rest of the process.
         let routed = self.router.shutdown().await;
+        // A request a stream read before the router's shutdown still reaches
+        // the store, and the store's shutdown closes its database beneath it
+        // at once: the read then poisons the entry and iroh-blobs panics on
+        // its own task.
+        self.blob_streams.close();
+        let finished = tokio::time::timeout(BLOB_STORE_IDLE_WAIT, async {
+            self.blob_streams.wait().await;
+            self.blobs.wait_idle().await
+        })
+        .await;
+        if finished.is_err() {
+            tracing::warn!("the blob store was still busy when the node stopped");
+        }
         // After the router, whose shutdown awaits every connection's handler,
         // and explicit rather than on the last handle's drop: a node
         // respawned on the same directory would meet its predecessor's

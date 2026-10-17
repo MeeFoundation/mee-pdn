@@ -37,6 +37,9 @@ rand = "0.10"
 redb = "4.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+# The blob protocol's stream tasks, tracked so a stop waits for them before
+# it closes the blob store.
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
