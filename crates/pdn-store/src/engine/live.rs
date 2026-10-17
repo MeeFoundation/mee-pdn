@@ -619,6 +619,13 @@ impl LiveActor {
             trace!(?i, "tick wait");
             tokio::select! {
                 biased;
+                // First: behind a busy inbox a landed payload's ContentReady waits for seconds, and
+                // completions are bounded by the downloads this actor started.
+                Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
+                    trace!(?i, "tick: pending_downloads");
+                    let (namespace, hash, res) = res.context("pending_downloads closed")?;
+                    self.on_download_ready(namespace, hash, res).await;
+                }
                 msg = self.inbox.recv() => {
                     let msg = msg.context("to_actor closed")?;
                     trace!(?i, %msg, "tick: to_actor");
@@ -649,11 +656,6 @@ impl LiveActor {
                     let (namespace, peer, caller, res) = res.context("running_sync_accept closed")?;
                     self.release_peer_identity(namespace, peer, caller);
                     self.on_sync_via_accept_finished(caller, res).await;
-                }
-                Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
-                    trace!(?i, "tick: pending_downloads");
-                    let (namespace, hash, res) = res.context("pending_downloads closed")?;
-                    self.on_download_ready(namespace, hash, res).await;
                 }
                 res = self.gossip.next_ended(), if !self.gossip.is_empty() => {
                     match res {
@@ -1979,6 +1981,14 @@ impl LiveActor {
     /// Queue a download for `hash` from the providers registered so far, unless the
     /// content is already complete or a download is already running.
     async fn queue_download(&mut self, namespace: NamespaceId, hash: Hash, only_if_missing: bool) {
+        // Neither queued nor parked: the status read would change nothing, and a neighbor's
+        // ContentReady for content already held would wait on the blob store in the loop.
+        if only_if_missing
+            && !self.queued_hashes.contains_hash(&hash)
+            && !self.missing_hashes.contains(&(namespace, hash))
+        {
+            return;
+        }
         let entry_status = self.bao_store.blobs().status(hash).await;
         if matches!(entry_status, Ok(BlobStatus::Complete { .. })) {
             self.missing_hashes.remove(&(namespace, hash));
