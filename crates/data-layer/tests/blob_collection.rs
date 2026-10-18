@@ -11,7 +11,10 @@ use iroh_blobs::Hash;
 use pdn_types::{RecordId, RecordRef};
 use test_utils::{
     eventually,
-    pod::{create, create_at, device_of, host, invite, place_claim, reads, tickets, Person},
+    pod::{
+        create, create_at, device_of, held_records, host, invite, place_claim, reads, tickets,
+        Person,
+    },
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
@@ -317,7 +320,16 @@ async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
     bob_phone
         .sync_pod_with_for_test(bob.id, pod, PodStore::Records, alices)
         .await?;
-    assert!(reads(&bob_phone, bob.id, pod, claim).await?);
+    if !reads(&bob_phone, bob.id, pod, claim).await? {
+        anyhow::bail!(
+            "the claim never read on bob's phone: records {:?}, its payload held {}, \
+             in flight {}, holding {:?}",
+            held_records(&bob_phone, bob.id, pod).await?,
+            bob_phone.holds_payload(Hash::new(b"claim")).await?,
+            bob_phone.pod_syncs_in_flight_report_for_test(pod).await?,
+            bob_phone.pod_holding(bob.id, pod).await?,
+        );
+    }
     let stray = bob_phone.add_stray_payload_for_test(b"stray").await?;
     run.release.notify_one();
     let next = bob_phone.pause_next_collection_for_test();
