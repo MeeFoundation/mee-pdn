@@ -21,14 +21,34 @@ use test_utils::{
 /// not name.
 const QUIET: Duration = Duration::from_secs(3600);
 
-async fn node() -> Result<SyncNode> {
-    SyncNode::spawn(SpawnOptions {
+/// A node on a storage directory of its own, collecting from its spawn on.
+/// The file store, which the product collects over, keeps a payload
+/// imported between a run's mark and its sweep; the memory store sweeps it,
+/// a local write's payload included.
+struct Node {
+    node: SyncNode,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Node {
+    type Target = SyncNode;
+
+    fn deref(&self) -> &SyncNode {
+        &self.node
+    }
+}
+
+async fn node() -> Result<Node> {
+    let dir = tempfile::tempdir()?;
+    let node = SyncNode::spawn(SpawnOptions {
         reconcile_interval: QUIET,
         pod_reconcile_interval: QUIET,
         blob_collection_interval: Duration::from_millis(200),
-        ..SpawnOptions::memory()
+        ..SpawnOptions::on_directory(dir.path())
     })
-    .await
+    .await?;
+    node.start_blob_collection();
+    Ok(Node { node, _dir: dir })
 }
 
 /// `member`'s claim at the id `seed` names, its payload `payload`.
