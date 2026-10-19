@@ -38,6 +38,15 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # the graph via iroh.
 tracing = { workspace = true }
 
+# The pod member `tests/peer_restart.rs` runs as a process of its own, so
+# the scenario can kill it with no goodbye; built for the suites alone.
+[[bin]]
+name = "pdn-test-peer"
+path = "tests/support/test_peer.rs"
+required-features = ["test-util"]
+test = false
+doc = false
+
 [dev-dependencies]
 # Scenario tests probe an identity's PMS by running the linking
 # dialogue raw against a bare node — the store-level view of what the
@@ -46,7 +55,7 @@ data-layer = { path = "../data-layer" }
 postcard = { version = "1.1.3", features = ["use-std"] }
 # Scenario tests of directory-configured runtimes get a directory each.
 tempfile = "3"
-test-utils = { path = "../test-utils" }
+test-utils = { path = "../test-utils", features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]

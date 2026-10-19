@@ -8,14 +8,47 @@ use std::{
 };
 
 use anyhow::Result;
-use data_layer::{DocTicket, PrivateMetadataStore, SpawnOptions, SyncNode};
+use data_layer::{DocTicket, PrivateMetadataStore, SyncNode};
 
 pub mod pod;
 use pdn_types::{NodeId, PdnId};
 
+/// Counts every panic in this process from here on, on any thread: one on a
+/// task the runtime catches, such as the blob store's, fails no test by
+/// itself. Nextest runs each test in a process of its own.
+pub fn count_panics() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let panics = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&panics);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        previous(info);
+    }));
+    panics
+}
+
 /// A node on memory storage — what the in-process suites run on.
+#[cfg(feature = "test-util")]
 pub async fn memory_node() -> Result<SyncNode> {
-    SyncNode::spawn(SpawnOptions::memory()).await
+    SyncNode::spawn(data_layer::SpawnOptions::memory()).await
+}
+
+/// `from` copied file by file into `to` as it lies on disk at this moment:
+/// what a kill at this moment leaves for the next start, with nothing a
+/// stop would write. Read a store before it to commit the replica store's
+/// batch alone, the worst order a kill can meet.
+pub fn crash_copy(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            crash_copy(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// The cast: bare [`PdnId`] values, one byte pattern each.

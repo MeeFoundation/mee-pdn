@@ -5,27 +5,50 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use data_layer::{identity_of, Contact, PodStore, SpawnOptions, SyncNode};
 use iroh_blobs::Hash;
 use pdn_types::{RecordId, RecordRef};
 use test_utils::{
     eventually,
-    pod::{create, create_at, device_of, host, invite, place_claim, reads, tickets, Person},
+    pod::{
+        create, create_at, device_of, held_records, host, invite, place_claim, reads, tickets,
+        Person,
+    },
 };
 
 /// Out of every scenario's reach: no pass opens a session a scenario did
 /// not name.
 const QUIET: Duration = Duration::from_secs(3600);
 
-async fn node() -> Result<SyncNode> {
-    SyncNode::spawn(SpawnOptions {
+/// A node on a storage directory of its own, collecting from its spawn on.
+/// The file store, which the product collects over, keeps a payload
+/// imported between a run's mark and its sweep; the memory store sweeps it,
+/// a local write's payload included.
+struct Node {
+    node: SyncNode,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Node {
+    type Target = SyncNode;
+
+    fn deref(&self) -> &SyncNode {
+        &self.node
+    }
+}
+
+async fn node() -> Result<Node> {
+    let dir = tempfile::tempdir()?;
+    let node = SyncNode::spawn(SpawnOptions {
         reconcile_interval: QUIET,
         pod_reconcile_interval: QUIET,
         blob_collection_interval: Duration::from_millis(200),
-        ..SpawnOptions::memory()
+        ..SpawnOptions::on_directory(dir.path())
     })
-    .await
+    .await?;
+    node.start_blob_collection();
+    Ok(Node { node, _dir: dir })
 }
 
 /// `member`'s claim at the id `seed` names, its payload `payload`.
@@ -44,6 +67,38 @@ async fn claim(
     node.write_pod_entry(member.id, pod, PodStore::Records, &key.to_bytes(), payload)
         .await?;
     Ok(key.record())
+}
+
+/// Polls `member`'s write of `payload` at `key` until the store holds its
+/// entry, then drops it before polling it again: whether that happened, or
+/// the write finished first. A read is answered after every insert sent
+/// before it, and the write is not polled while the read runs.
+async fn dropped_mid_call(
+    node: &SyncNode,
+    member: &Person,
+    pod: pdn_types::PodId,
+    key: &data_layer::RecordKey,
+    payload: &[u8],
+) -> Result<bool> {
+    let record = key.record();
+    let bytes = key.to_bytes();
+    let mut write =
+        std::pin::pin!(node.write_pod_entry(member.id, pod, PodStore::Records, &bytes, payload));
+    loop {
+        let polled = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(write.as_mut(), cx))
+        })
+        .await;
+        if let std::task::Poll::Ready(written) = polled {
+            written?;
+            return Ok(false);
+        }
+        let view = node.pod_record_view_of(member.id, pod, &record).await?;
+        if view.placed(&record).is_some() {
+            return Ok(true);
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 /// The payloads a forgotten record store alone referenced leave the node at
@@ -206,6 +261,53 @@ async fn a_payload_written_while_a_run_is_under_way_stays() -> Result<()> {
     Ok(())
 }
 
+/// A payload whose write its caller dropped after the store took the entry
+/// stays through a collection run under way, and reads.
+///
+/// The run is held once it has read the replicas, and the write is dropped
+/// after its entry landed and before its call returned (`dropped_mid_call`).
+/// A write that finishes within one poll is tried again under another id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payload_whose_write_was_dropped_mid_call_stays() -> Result<()> {
+    let phone = node().await?;
+    let (carol, _) = host(&phone).await?;
+    let pod = create(&phone, &carol).await?;
+
+    let run = phone.pause_next_collection_for_test();
+    run.reached.notified().await;
+    let mut dropped = None;
+    for seed in 1..=50u8 {
+        let key = data_layer::RecordKey::Claim {
+            member: carol.id,
+            id: RecordId::from_bytes([seed; 16]),
+            mseq: data_layer::Seq::FIRST,
+        };
+        let record = key.record();
+        let payload = [b"photo ".as_slice(), &[seed]].concat();
+        if dropped_mid_call(&phone, &carol, pod, &key, &payload).await? {
+            dropped = Some((record, payload));
+            break;
+        }
+    }
+    let (record, payload) = dropped.context("every write finished within one poll")?;
+    run.release.notify_one();
+    let next = phone.pause_next_collection_for_test();
+    next.reached.notified().await;
+    next.release.notify_one();
+
+    assert!(
+        phone.holds_payload(Hash::new(&payload)).await?,
+        "the payload of a dropped write was removed"
+    );
+    assert_eq!(
+        phone.read_pod_record(carol.id, pod, &record).await?,
+        Some(payload)
+    );
+
+    phone.shutdown().await?;
+    Ok(())
+}
+
 /// A payload that arrives from a member device while a collection run is
 /// under way stays through that run, and reads.
 ///
@@ -238,7 +340,16 @@ async fn a_payload_fetched_while_a_run_is_under_way_stays() -> Result<()> {
     bob_phone
         .sync_pod_with_for_test(bob.id, pod, PodStore::Records, alices)
         .await?;
-    assert!(reads(&bob_phone, bob.id, pod, claim).await?);
+    if !reads(&bob_phone, bob.id, pod, claim).await? {
+        anyhow::bail!(
+            "the claim never read on bob's phone: records {:?}, its payload held {}, \
+             in flight {}, holding {:?}",
+            held_records(&bob_phone, bob.id, pod).await?,
+            bob_phone.holds_payload(Hash::new(b"claim")).await?,
+            bob_phone.pod_syncs_in_flight_report_for_test(pod).await?,
+            bob_phone.pod_holding(bob.id, pod).await?,
+        );
+    }
     let stray = bob_phone.add_stray_payload_for_test(b"stray").await?;
     run.release.notify_one();
     let next = bob_phone.pause_next_collection_for_test();

@@ -1,11 +1,11 @@
 //! Utilities useful across different store impls.
 
-use super::{AuthorFilter, KeyFilter, Query, QueryKind, SortBy};
+use super::{AuthorFilter, KeyFilter, Query, QueryKind};
 use crate::SignedEntry;
 
 /// A helper for stores that have by-author and by-key indexes for records.
 #[derive(Debug)]
-pub enum IndexKind {
+pub(crate) enum IndexKind {
     AuthorKey {
         range: AuthorFilter,
         key_filter: KeyFilter,
@@ -20,16 +20,9 @@ pub enum IndexKind {
 impl From<&Query> for IndexKind {
     fn from(query: &Query) -> Self {
         match &query.kind {
-            QueryKind::Flat(details) => match (&query.filter_author, details.sort_by) {
-                (AuthorFilter::Any, SortBy::KeyAuthor) => IndexKind::KeyAuthor {
-                    range: query.filter_key.clone(),
-                    author_filter: AuthorFilter::Any,
-                    latest_per_key: false,
-                },
-                _ => IndexKind::AuthorKey {
-                    range: query.filter_author.clone(),
-                    key_filter: query.filter_key.clone(),
-                },
+            QueryKind::Flat(_) => IndexKind::AuthorKey {
+                range: query.filter_author.clone(),
+                key_filter: query.filter_key.clone(),
             },
             QueryKind::SingleLatestPerKey(_) => IndexKind::KeyAuthor {
                 range: query.filter_key.clone(),
@@ -44,10 +37,10 @@ impl From<&Query> for IndexKind {
 ///
 /// Items must be pushed in key-sorted order.
 #[derive(Debug, Default)]
-pub struct LatestPerKeySelector(Option<SignedEntry>);
+pub(crate) struct LatestPerKeySelector(Option<SignedEntry>);
 
 #[allow(clippy::large_enum_variant)]
-pub enum SelectorRes {
+pub(crate) enum SelectorRes {
     /// The iterator is finished.
     Finished,
     /// The selection is not yet finished, keep pushing more items.

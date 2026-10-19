@@ -20,15 +20,16 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
-    store::{fs::FsStore, mem::MemStore, GcConfig, ProtectCb, ProtectOutcome},
-    BlobsProtocol, Hash, ALPN as BLOBS_ALPN,
+    protocol::Request,
+    provider::{
+        events::EventSender, handle_get, handle_get_many, handle_observe, handle_push, StreamPair,
+    },
+    store::{fs::FsStore, GcConfig, ProtectCb, ProtectOutcome},
+    Hash, ALPN as BLOBS_ALPN,
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc, DocsApi,
-    },
+    api::{AddrInfoOptions, Doc, DocsApi},
     protocol::{Docs, DocsDispatch},
     store::Query,
     AuthorId, Contact, DocTicket, Identity, NamespaceId, ALPN as DOCS_ALPN,
@@ -36,6 +37,7 @@ use pdn_store::{
 use pdn_types::{NodeId, PdnId, PodId, RecordRef};
 use rand::seq::SliceRandom as _;
 use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 use crate::{
     access::{session_access_provider, AccessBook},
@@ -106,6 +108,89 @@ impl ProtocolHandler for PanicGuarded {
     }
 }
 
+/// The blob protocol with its streams' tasks tracked and the store's closing
+/// left to the node: the router shuts its protocols down before it cancels
+/// their connections, and a stream's task outlives the router's shutdown, so
+/// a request a stream already read would reach a store that is closing,
+/// which iroh-blobs answers by panicking on its own task.
+#[derive(Debug, Clone)]
+struct BlobsServing {
+    store: iroh_blobs::api::Store,
+    streams: TaskTracker,
+    #[cfg(feature = "test-util")]
+    hold: BlobStreamHoldSlot,
+}
+
+impl ProtocolHandler for BlobsServing {
+    /// `iroh_blobs::provider::handle_connection`, which spawns each stream's
+    /// task untracked, without the provider events the node takes none of.
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        while let Ok(pair) = StreamPair::accept(&connection, EventSender::DEFAULT).await {
+            self.streams.spawn(serve_blob_stream(
+                pair,
+                self.store.clone(),
+                #[cfg(feature = "test-util")]
+                self.hold.clone(),
+                #[cfg(feature = "test-util")]
+                self.streams.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `iroh_blobs::provider::handle_stream`, split at the read of the request
+/// so a scenario can hold a stream between its request and the store.
+async fn serve_blob_stream(
+    mut pair: StreamPair,
+    store: iroh_blobs::api::Store,
+    #[cfg(feature = "test-util")] hold_slot: BlobStreamHoldSlot,
+    #[cfg(feature = "test-util")] streams: TaskTracker,
+) {
+    let request = match pair.read_request().await {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::debug!("blob stream failed: {err:#}");
+            return;
+        }
+    };
+    #[cfg(feature = "test-util")]
+    let held = hold_blob_stream(&hold_slot, &streams).await;
+    let served = match request {
+        Request::Get(request) => handle_get(pair, store, request).await,
+        Request::GetMany(request) => handle_get_many(pair, store, request).await,
+        Request::Observe(request) => handle_observe(pair, store, request).await,
+        Request::Push(request) => handle_push(pair, store, request).await,
+        _ => Ok(()),
+    };
+    if let Err(err) = served {
+        tracing::debug!("blob stream failed: {err:#}");
+    }
+    #[cfg(feature = "test-util")]
+    if let Some(held) = held {
+        held.done.notify_one();
+    }
+}
+
+/// Holds a stream that read its request, if a scenario armed a hold, until
+/// the stop closes the stream tracker — its router's shutdown has returned
+/// by then — or the scenario releases it.
+#[cfg(feature = "test-util")]
+async fn hold_blob_stream(
+    hold_slot: &BlobStreamHoldSlot,
+    streams: &TaskTracker,
+) -> Option<Arc<BlobStreamHold>> {
+    let held = hold_slot.lock().ok().and_then(|mut slot| slot.take())?;
+    held.reached.notify_one();
+    while !streams.is_closed() {
+        tokio::select! {
+            () = held.release.notified() => break,
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+    Some(held)
+}
+
 /// Default of [`SpawnOptions::reconcile_interval`]. Gossip is best-effort
 /// and the rescue triggers ride the same gossip, so without this pass a
 /// late write can starve. Each pass re-dials a doc's import-time contacts,
@@ -117,6 +202,14 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// Default of [`SpawnOptions::pod_reconcile_interval`]: a pod store's
 /// writes arrive over its swarm, and its pass catches up what gossip lost.
 const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// When the pod pass first runs after a spawn: past the 30 s in which a
+/// peer's connections to this node's previous process time out (QUIC's idle
+/// timeout, which iroh keeps). A peer's path selector is asked again when a
+/// connection opens, not when one closes, so the connection this run opens
+/// is what moves a peer that held more connections to the old address than
+/// this process opened at its start (`components/mee-pdn/iroh-defects.md`).
+const POD_PASS_AFTER_SPAWN: Duration = Duration::from_secs(45);
 
 /// The peers one run of the pod stores' pass reaches per store, so a
 /// pod's sessions stay bounded whatever its size.
@@ -134,8 +227,20 @@ const FLUSH_OBSERVES: usize = 16;
 /// Default of [`SpawnOptions::blob_collection_interval`].
 const BLOB_COLLECTION_INTERVAL: Duration = Duration::from_secs(600);
 
+/// How often iroh-blobs asks the collection's protect callback, a run going
+/// ahead once [`SpawnOptions::blob_collection_interval`] has passed: a
+/// stopped node's collection task ends at the next ask, and holds the blob
+/// store's runtime until then. Each ask that skips its run logs one line at
+/// info from iroh-blobs.
+const BLOB_COLLECTION_TICK: Duration = Duration::from_secs(60);
+
 /// Default of [`SpawnOptions::pod_change_settle`].
 const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
+
+/// How long a stop waits for the blob protocol's streams and then the blob
+/// store to finish: a stream ends at its next read or write on the closed
+/// endpoint, and a request it left in the store at its first answer.
+const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
@@ -152,12 +257,30 @@ const CONNECTION_RECEIVE_WINDOW: u32 = 248_750_000;
 /// to one node.
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
+    /// Nothing on disk and no blob collection: the workspace's suites, never
+    /// a product build.
+    #[cfg(any(test, feature = "test-util"))]
     Memory,
     /// `identities/<identity>/` (replica store and persisted author),
     /// `blobs/`, `node.key`, `lock`. Created owner-only when absent: the
     /// replica store holds namespace secrets and the blobs payload bytes in
     /// the clear.
     Directory(std::path::PathBuf),
+}
+
+impl StorageConfig {
+    /// `None` on a node in memory.
+    #[cfg_attr(
+        not(any(test, feature = "test-util")),
+        allow(clippy::unnecessary_wraps) // a product build has no node in memory
+    )]
+    fn directory(&self) -> Option<&std::path::Path> {
+        match self {
+            #[cfg(any(test, feature = "test-util"))]
+            Self::Memory => None,
+            Self::Directory(directory) => Some(directory),
+        }
+    }
 }
 
 /// What the endpoint binds to be reachable; each variant keeps what the one
@@ -182,12 +305,11 @@ pub enum Connectivity {
 }
 
 /// Spawn-time configuration ([`SyncNode::spawn_with`]). Build with
-/// [`SpawnOptions::memory`], [`SpawnOptions::on_directory`], or
-/// [`SpawnOptions::for_product`].
+/// [`SpawnOptions::on_directory`] or [`SpawnOptions::for_product`]; the
+/// suites also with `SpawnOptions::memory`.
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
-    /// Required: a spawn that names neither memory nor a directory is not
-    /// expressible.
+    /// Required: a spawn that names no storage is not expressible.
     pub storage: StorageConfig,
     pub reconcile_interval: Duration,
     /// The pass over each pod store, whose every run reaches at most 5
@@ -220,6 +342,7 @@ pub const DEFAULT_REPLICA_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 impl SpawnOptions {
     /// In memory, direct paths — what the in-process suites run on.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn memory() -> Self {
         Self {
             storage: StorageConfig::Memory,
@@ -267,6 +390,8 @@ impl SpawnOptions {
 pub struct SyncNode {
     router: Router,
     blobs: iroh_blobs::api::Store,
+    /// The blob protocol's stream tasks, which outlive the router.
+    blob_streams: TaskTracker,
     gossip: Gossip,
     /// The half of the node each hosted identity owns.
     identities: Identities,
@@ -288,6 +413,15 @@ pub struct SyncNode {
     /// Holds the next blob collection run once it has read the replicas.
     #[cfg(feature = "test-util")]
     collection_pause: CollectionPauseSlot,
+    /// Every blob collection run the protect callback was asked about.
+    #[cfg(feature = "test-util")]
+    collection_runs: Arc<std::sync::atomic::AtomicUsize>,
+    /// Holds the next blob stream once it has read its request.
+    #[cfg(feature = "test-util")]
+    blob_stream_hold: BlobStreamHoldSlot,
+    /// The steps of every stop, in the order they ran.
+    #[cfg(feature = "test-util")]
+    stop_steps: StopSteps,
     /// Handed to every hosted identity's book; empty until a scenario takes
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
@@ -295,10 +429,13 @@ pub struct SyncNode {
     /// Handed to every hosted identity's book like `pod_verdicts`.
     #[cfg(feature = "test-util")]
     session_traces: crate::access::SessionTraceSink,
-    /// Blob collection runs once set: at spawn on memory, at the host's
-    /// [`start_blob_collection`](Self::start_blob_collection) on a
-    /// directory.
+    /// Blob collection runs once set, at the host's
+    /// [`start_blob_collection`](Self::start_blob_collection); a node in
+    /// memory has none.
     collecting: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the stop once the blob store is closed: the collection's task
+    /// then ends at its next ask.
+    blob_store_closed: Arc<std::sync::atomic::AtomicBool>,
     /// What the passes report, so a scenario can order its absence
     /// assertions after runs that happened.
     #[cfg(feature = "test-util")]
@@ -313,9 +450,9 @@ pub struct SyncNode {
     /// Cloned into every hosted identity's engine; the task at the other
     /// end holds the identity map weakly (`serve_co_located`).
     co_located_requests: pdn_store::engine::CoLocatedRequests,
-    /// Released by `shutdown` with the stores, or with the process. `None`
-    /// on a memory node.
-    directory_lock: Option<std::fs::File>,
+    /// Taken by the stop with the stores, or released with the process.
+    /// `None` on a memory node.
+    directory_lock: Mutex<Option<std::fs::File>>,
     /// `None` on a memory node, which comes back as nobody.
     address_book: Option<Arc<AddressBook>>,
 }
@@ -512,19 +649,113 @@ impl HostedStack {
     }
 }
 
-/// A node dropped without [`shutdown`](SyncNode::shutdown) still lets go of
-/// its blob store: blob collection's task holds the store, and ends only once
-/// the store has stopped.
+/// A node dropped without [`shutdown`](SyncNode::shutdown) stops as a
+/// stopped one does, in a task of its own; dropped outside a tokio runtime,
+/// it stops nothing but its directory lock.
 impl Drop for SyncNode {
     fn drop(&mut self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        if let Some(stop) = self
+            .reconciler_stop
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            let _ = stop.send(());
+        }
+        let identities = Arc::clone(&self.identities);
+        let router = self.router.clone();
+        let blob_streams = self.blob_streams.clone();
         let blobs = self.blobs.clone();
+        let blob_store_closed = Arc::clone(&self.blob_store_closed);
+        let directory_lock = self.directory_lock.get_mut().ok().and_then(Option::take);
+        #[cfg(feature = "test-util")]
+        let stop_steps = Arc::clone(&self.stop_steps);
         let _detached = runtime.spawn(async move {
-            let _ = blobs.shutdown().await;
+            let _ = stop_node(
+                &identities,
+                &router,
+                &blob_streams,
+                &blobs,
+                &blob_store_closed,
+                directory_lock,
+                #[cfg(feature = "test-util")]
+                &stop_steps,
+            )
+            .await;
         });
     }
+}
+
+/// The stop [`SyncNode::shutdown`] and a node's drop share: every engine,
+/// then the router, then the blob protocol's streams, then the blob store
+/// and the directory lock (the `node-assembly` spec, "Shutdown stops every
+/// protocol side by side, and a late call fails").
+async fn stop_node(
+    identities: &Identities,
+    router: &Router,
+    blob_streams: &TaskTracker,
+    blobs: &iroh_blobs::api::Store,
+    blob_store_closed: &std::sync::atomic::AtomicBool,
+    directory_lock: Option<std::fs::File>,
+    #[cfg(feature = "test-util")] stop_steps: &StopSteps,
+) -> Result<()> {
+    #[cfg(feature = "test-util")]
+    let step = |done: StopStep| {
+        if let Ok(mut steps) = stop_steps.lock() {
+            steps.push(done);
+        }
+    };
+    // Before the blob store closes: a running engine starts downloads that
+    // read it. The router serves the dispatcher, not the engines, so each
+    // engine is shut down by name.
+    let stacks: Vec<Arc<HostedStack>> = match identities.read() {
+        Ok(hosted) => hosted.values().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
+    };
+    for stack in stacks {
+        let _ = stack.docs.engine().shutdown().await;
+    }
+    #[cfg(feature = "test-util")]
+    step(StopStep::Engines);
+    // Everything below runs whatever the router answers: a stop that
+    // returned early would leave the blob store and the directory lock
+    // held for the rest of the process.
+    let routing_stopped = router.shutdown().await;
+    #[cfg(feature = "test-util")]
+    step(StopStep::Router);
+    // A request a stream read before the router's shutdown still reaches
+    // the store, and the store's shutdown closes its database beneath it
+    // at once: the read then poisons the entry and iroh-blobs panics on
+    // its own task.
+    blob_streams.close();
+    let finished = tokio::time::timeout(BLOB_STORE_IDLE_WAIT, async {
+        blob_streams.wait().await;
+        blobs.wait_idle().await
+    })
+    .await;
+    if finished.is_err() {
+        tracing::warn!("the blob store was still busy when the node stopped");
+    }
+    #[cfg(feature = "test-util")]
+    step(StopStep::BlobStreams);
+    // Explicit rather than on the last handle's drop: a node respawned on
+    // the same directory would meet its predecessor's database lock.
+    // Best-effort: a store already shut down answers with an error.
+    let _ = blobs.shutdown().await;
+    blob_store_closed.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(feature = "test-util")]
+    step(StopStep::BlobStore);
+    // With the stores, not with the node's drop: a detached task holding
+    // the node alive a moment longer must not make a spawn on the same
+    // directory read as a second running node.
+    if let Some(lock) = directory_lock {
+        let _ = lock.unlock();
+    }
+    routing_stopped?;
+    Ok(())
 }
 
 /// The dial side of a node's protocols: connect out, read the node's own
@@ -562,10 +793,26 @@ impl SyncNode {
     /// before anything binds. A handler's `accept` should return
     /// `Err(AcceptError)` rather than panic: a panic is contained per
     /// connection, but a `panic = "abort"` build still aborts the process.
-    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
     pub async fn spawn_with(
         extra_protocols: Vec<ExtraProtocol>,
         options: SpawnOptions,
+    ) -> Result<Self> {
+        Self::assemble(extra_protocols, options, true).await
+    }
+
+    /// A node that serves no payload: a peer's fetch of its entries'
+    /// payloads fails at the dial and is tried again, so a download stays
+    /// under way on the peer for as long as a scenario needs.
+    #[cfg(feature = "test-util")]
+    pub async fn spawn_serving_no_payloads_for_test(options: SpawnOptions) -> Result<Self> {
+        Self::assemble(Vec::new(), options, false).await
+    }
+
+    #[allow(clippy::too_many_lines)] // one node assembled in order, each part beside what it feeds
+    async fn assemble(
+        extra_protocols: Vec<ExtraProtocol>,
+        options: SpawnOptions,
+        serve_payloads: bool,
     ) -> Result<Self> {
         // An extra silently replacing a built-in handler would leave a node
         // that looks alive and never syncs.
@@ -585,19 +832,21 @@ impl SyncNode {
         )
         .await?;
         let identities: Identities = Arc::default();
-        // A memory node holds nothing an identity could come back for.
-        let collecting = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
-            options.storage,
-            StorageConfig::Memory
-        )));
+        let collecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blob_store_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(feature = "test-util")]
         let collection_pause = CollectionPauseSlot::default();
+        #[cfg(feature = "test-util")]
+        let collection_runs = Arc::<std::sync::atomic::AtomicUsize>::default();
         let blobs_store = open_blob_store(
             &options,
             &identities,
             &collecting,
+            &blob_store_closed,
             #[cfg(feature = "test-util")]
             &collection_pause,
+            #[cfg(feature = "test-util")]
+            &collection_runs,
         )
         .await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -613,8 +862,22 @@ impl SyncNode {
             })
         };
 
-        let mut router = Router::builder(endpoint)
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs_store, None))
+        let blob_streams = TaskTracker::new();
+        #[cfg(feature = "test-util")]
+        let blob_stream_hold = BlobStreamHoldSlot::default();
+        let mut router = Router::builder(endpoint);
+        if serve_payloads {
+            router = router.accept(
+                BLOBS_ALPN,
+                BlobsServing {
+                    store: blobs_store.clone(),
+                    streams: blob_streams.clone(),
+                    #[cfg(feature = "test-util")]
+                    hold: Arc::clone(&blob_stream_hold),
+                },
+            );
+        }
+        router = router
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(DOCS_ALPN, DocsDispatch::new(resolver));
         for (alpn, handler) in extra_protocols {
@@ -653,6 +916,7 @@ impl SyncNode {
         Ok(Self {
             router,
             blobs: blobs_store,
+            blob_streams,
             gossip,
             identities,
             cache_budget_bytes: options.replica_cache_budget_bytes,
@@ -666,17 +930,24 @@ impl SyncNode {
             #[cfg(feature = "test-util")]
             collection_pause,
             #[cfg(feature = "test-util")]
+            collection_runs,
+            #[cfg(feature = "test-util")]
+            blob_stream_hold,
+            #[cfg(feature = "test-util")]
+            stop_steps: StopSteps::default(),
+            #[cfg(feature = "test-util")]
             pod_verdicts: Arc::default(),
             #[cfg(feature = "test-util")]
             session_traces: Arc::default(),
             #[cfg(feature = "test-util")]
             pass_probes,
             collecting,
+            blob_store_closed,
             storage: options.storage,
             pod_notices: Arc::default(),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
             co_located_requests,
-            directory_lock,
+            directory_lock: Mutex::new(directory_lock),
             address_book,
         })
     }
@@ -760,6 +1031,7 @@ impl SyncNode {
         let held_for = crate::access::identity_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
         Ok(match &self.storage {
+            #[cfg(any(test, feature = "test-util"))]
             StorageConfig::Memory => Docs::memory(held_for, provider),
             StorageConfig::Directory(directory) => {
                 let own = identity_directory(directory, identity);
@@ -810,18 +1082,19 @@ impl SyncNode {
     }
 
     /// Record `identity` as hosted here, with `pms` as its private
-    /// PMS: the commit point of a create or a link. The
-    /// replicas are flushed first, so the record never names one the store
-    /// has not written, and the record is written beside, synced and
-    /// renamed over, so a process that dies mid-write leaves none. The
+    /// PMS: the commit point of a create or a link. The identity's stores
+    /// are flushed first, so the record never names a replica, or an
+    /// identity key, the disk does not hold, and a failed commit fails the
+    /// call; the record is written beside, synced and renamed over, so a
+    /// process that dies mid-write leaves none. The
     /// parent directory is not synced after the rename, so an OS crash or a
     /// power loss can take the record back after this returned `Ok`. A node
     /// in memory records nothing.
     pub async fn record_hosting(&self, identity: PdnId, pms: NamespaceId) -> Result<()> {
-        let StorageConfig::Directory(root) = &self.storage else {
+        let Some(root) = self.storage.directory() else {
             return Ok(());
         };
-        self.flush_replicas(identity, pms).await?;
+        self.flush_stores(identity).await?;
         let own = identity_directory(root, identity);
         tokio::task::spawn_blocking(move || write_hosting_record(&own, pms))
             .await
@@ -833,7 +1106,7 @@ impl SyncNode {
     /// not listed, and an unreadable record fails, naming its file. Empty on
     /// a node in memory.
     pub fn recorded_hosting(&self) -> Result<Vec<RecordedHosting>> {
-        let StorageConfig::Directory(root) = &self.storage else {
+        let Some(root) = self.storage.directory() else {
             return Ok(Vec::new());
         };
         read_hosting_records(root)
@@ -943,7 +1216,6 @@ impl SyncNode {
                 caller,
                 contact.addr.clone(),
                 None,
-                None,
                 pdn_store::admit_all(),
             )
             .await;
@@ -1009,6 +1281,10 @@ impl SyncNode {
     /// and their sync starts once they are registered, so their first
     /// sessions are ones the book can judge. A failure leaves neither; a call
     /// dropped midway leaves what it made, so its caller runs it to its end.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn create_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         if stack.registry.pod(pod)?.is_some() {
@@ -1150,10 +1426,41 @@ impl SyncNode {
         pause
     }
 
+    /// Holds the next blob stream once it has read its request, before it
+    /// reaches the blob store, until `release` is notified or the node's
+    /// stop has shut its router down.
+    #[cfg(feature = "test-util")]
+    pub fn hold_next_blob_stream_for_test(&self) -> Arc<BlobStreamHold> {
+        let hold = Arc::new(BlobStreamHold::default());
+        if let Ok(mut slot) = self.blob_stream_hold.lock() {
+            *slot = Some(Arc::clone(&hold));
+        }
+        hold
+    }
+
+    /// The steps every stop of this node took, a drop's included, in the
+    /// order they ran.
+    #[cfg(feature = "test-util")]
+    pub fn stop_steps_for_test(&self) -> StopSteps {
+        Arc::clone(&self.stop_steps)
+    }
+
+    /// The blob collection runs this node's protect callback was asked
+    /// about since spawn; a count that grows after the node stopped is a
+    /// collection task outliving its store.
+    #[cfg(feature = "test-util")]
+    pub fn collection_runs_for_test(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.collection_runs)
+    }
+
     /// Import both stores of `pod` from their write tickets: nothing new for
     /// a pod held on these stores, the pod again for its tombstone. Both
     /// stores' sync starts once they are registered, as at `create_pod`. A failed import drops nothing — a replica may predate
     /// it — and a retry lands on it.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn import_pod(
         &self,
         identity: PdnId,
@@ -1167,6 +1474,10 @@ impl SyncNode {
     /// tickets to the same two stores that other identities minted — among
     /// the contacts as well, each dialed as the identity whose ticket names
     /// it: a ticket names all its nodes as the one identity that minted it.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn import_pod_with(
         &self,
         identity: PdnId,
@@ -1272,6 +1583,16 @@ impl SyncNode {
             records: Some(records.clone()),
         };
         derive_before_start(stack, self.router.endpoint().id(), pod, &held).await?;
+        if let Ok(missing @ 1..) =
+            entries_without_payload(membership, stack.author, &self.blobs).await
+        {
+            tracing::warn!(
+                identity = %stack.identity,
+                %pod,
+                missing,
+                "membership entries this device wrote have no payload on disk: a kill cut them within the stores' settle window"
+            );
+        }
         let caught_up = PodCatchUp {
             membership: crate::private_metadata::watch_doc(membership).await?,
             records: crate::private_metadata::watch_doc(records).await?,
@@ -1305,6 +1626,10 @@ impl SyncNode {
     /// Drop both of `pod`'s stores and its registration, as if the pod
     /// had never been held here: the undo of a create or a join before
     /// anything of the pod left this device. Nothing for a pod not held.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn discard_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         let Some(held) = stack.registry.unregister_pod(pod)? else {
@@ -1463,6 +1788,10 @@ impl SyncNode {
     /// At a departure: drop `pod`'s record store and keep its membership
     /// store, out of its swarm, as the tombstone. Finishes what an earlier
     /// forget left; [`UnknownPod`] for a pod `identity` never held.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn forget_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
@@ -1688,6 +2017,13 @@ impl SyncNode {
     /// what the entry counts for is the membership view's and the record
     /// view's.
     /// [`UnknownPod`] for a tombstone too.
+    ///
+    /// A membership store's entry is on disk with its payload when this
+    /// returns, and a commit that fails fails the call: the membership view
+    /// rests on its payload, which no other device holds yet. A record
+    /// store's lands in the stores' write batches, on disk within their
+    /// settle window; [`flush_stores`](Self::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn write_pod_entry(
         &self,
         identity: PdnId,
@@ -1701,6 +2037,7 @@ impl SyncNode {
         doc.set_bytes(stack.author, key.to_vec(), payload.to_vec())
             .await?;
         if store == PodStore::Membership {
+            stack.api.flush().await?;
             // Stated before the write returns, not once the change watch's
             // burst settles: an inviter pulls a newcomer's first write from a
             // device this write lists, and an unstated one is dialed as us.
@@ -2031,11 +2368,8 @@ impl SyncNode {
             .ok_or(UnknownPod { pod })?;
         let records = held.records.ok_or(UnknownPod { pod })?;
         Ok(PodTickets {
-            membership: held
-                .membership
-                .ticket(ShareMode::Write, addr_options)
-                .await?,
-            records: records.ticket(ShareMode::Write, addr_options).await?,
+            membership: held.membership.ticket(addr_options).await?,
+            records: records.ticket(addr_options).await?,
         })
     }
 
@@ -2118,9 +2452,6 @@ impl SyncNode {
                  it cannot be opened as a device-shared store"
             ));
         }
-        if !holds_namespace(&stack.api, namespace).await? {
-            return Ok(None);
-        }
         let Some(doc) = stack
             .api
             .open(namespace)
@@ -2140,10 +2471,12 @@ impl SyncNode {
     /// database has refused everything else. The blob store is asked for a
     /// hash other than the empty one, which it answers without asking its
     /// metadata actor: a placement that meets the full disk stops that
-    /// actor and leaves the replica store answering.
+    /// actor and leaves the replica store answering. Each identity's stores
+    /// are flushed too, which answers a commit their own timer saw fail.
     pub async fn check_stores(&self) -> Result<()> {
         let _held = self.blobs.has(Hash::from_bytes([0; 32])).await?;
         for stack in self.stacks()? {
+            stack.api.flush().await?;
             if let Some(tracked) = stack.tracked_snapshot().first() {
                 let _peers = tracked.doc.get_sync_peers().await?;
             } else {
@@ -2174,6 +2507,10 @@ impl SyncNode {
 
     /// Untrack and drop a device-shared store's doc. A pod's stores go
     /// through [`forget_pod`](Self::forget_pod).
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn forget_doc(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
         let Some(stack) = self.stack(identity)? else {
             return Ok(());
@@ -2186,21 +2523,36 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Commit the store's open write transaction, so what this node wrote
-    /// is on disk before anything durable points at it: a read takes a
-    /// snapshot, and taking one commits the batch first. Store-wide although
-    /// it names a namespace; the read matches nothing — the commit is the
-    /// point.
-    pub async fn flush_replicas(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
+    /// Make every write of `identity` so far durable — its replica store's
+    /// entries and the payloads they hold in the node's blob store — and
+    /// answer the error of a commit that failed. To call before anything
+    /// durable outside the stores names what was written: the stores
+    /// otherwise commit within their settle window, a failure only logged.
+    pub async fn flush_stores(&self, identity: PdnId) -> Result<()> {
+        self.require(identity)?.api.flush().await
+    }
+
+    /// How many entries this device wrote into `identity`'s PMS and into
+    /// the membership stores of its pods whose payload the blob store does
+    /// not hold: each a write a kill cut within the stores' settle window
+    /// with no flush behind it, which what rests on it waits for forever.
+    /// Zero while every such write is flushed before it returns.
+    pub async fn own_entries_without_payload(&self, identity: PdnId) -> Result<usize> {
         let stack = self.require(identity)?;
-        let doc = stack
-            .tracked(namespace)?
-            .map(|tracked| tracked.doc)
-            .ok_or_else(|| {
-                anyhow::anyhow!("namespace {namespace} is not tracked for identity {identity}")
-            })?;
-        let _committed = doc.get_many(Query::all().limit(0)).await?;
-        Ok(())
+        let mut docs: Vec<Doc> = stack.access.armed_pms()?.into_iter().collect();
+        docs.extend(
+            stack
+                .registry
+                .pods()?
+                .into_iter()
+                .map(|(_pod, held)| held.membership),
+        );
+        let mut missing = 0usize;
+        for doc in docs {
+            missing = missing
+                .saturating_add(entries_without_payload(&doc, stack.author, &self.blobs).await?);
+        }
+        Ok(missing)
     }
 
     pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
@@ -2209,6 +2561,10 @@ impl SyncNode {
 
     /// A standalone author; an identity's own stores write with
     /// [`default_author`](Self::default_author) instead.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn create_author(&self, identity: PdnId) -> Result<AuthorId> {
         let author = self.require(identity)?.api.author_create().await?;
         Ok(author)
@@ -2257,7 +2613,7 @@ impl SyncNode {
     /// Let blob collection run on a directory-configured node, once the
     /// host has hosted again every identity it means to: a run before that
     /// would remove the payloads of an identity recovery has yet to reach.
-    /// A memory node collects from its spawn.
+    /// A node in memory never collects.
     pub fn start_blob_collection(&self) {
         self.collecting
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2282,31 +2638,22 @@ impl SyncNode {
                 tracing::warn!("the address book was not saved at shutdown: {err:#}");
             }
         }
-        // Everything below runs whatever the router answers: a stop that
-        // returned early would leave every engine, the blob store and the
-        // directory lock held for the rest of the process.
-        let routed = self.router.shutdown().await;
-        // The router serves the dispatcher, not the engines, so each
-        // identity's engine is shut down by name.
-        let stacks: Vec<Arc<HostedStack>> = match self.identities.read() {
-            Ok(hosted) => hosted.values().cloned().collect(),
-            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
-        };
-        for stack in stacks {
-            let _ = stack.docs.engine().shutdown().await;
-        }
-        // Explicit rather than on the last handle's drop: a node respawned
-        // on the same directory would meet its predecessor's database lock.
-        // Best-effort: a store already shut down answers with an error.
-        let _ = self.blobs.shutdown().await;
-        // With the stores, not with this value's drop: a detached task
-        // holding the node alive a moment longer must not make a spawn on
-        // the same directory read as a second running node.
-        if let Some(lock) = &self.directory_lock {
-            let _ = lock.unlock();
-        }
-        routed?;
-        Ok(())
+        let directory_lock = self
+            .directory_lock
+            .lock()
+            .ok()
+            .and_then(|mut held| held.take());
+        stop_node(
+            &self.identities,
+            &self.router,
+            &self.blob_streams,
+            &self.blobs,
+            &self.blob_store_closed,
+            directory_lock,
+            #[cfg(feature = "test-util")]
+            &self.stop_steps,
+        )
+        .await
     }
 
     fn stack(&self, identity: PdnId) -> Result<Option<Arc<HostedStack>>> {
@@ -2447,8 +2794,8 @@ fn identity_directory(directory: &std::path::Path, identity: PdnId) -> std::path
         .join(encode_hex(identity.as_bytes()))
 }
 
-/// Answered from the listing: the fork reports "no such namespace" and
-/// "the store could not answer" as one error of the same shape.
+/// Answered from the listing: opening a replica holds it open.
+#[cfg(feature = "test-util")]
 async fn holds_namespace(api: &DocsApi, namespace: NamespaceId) -> Result<bool> {
     let mut listed = api.list().await?;
     while let Some(entry) = listed.next().await {
@@ -2561,59 +2908,102 @@ fn governing_store(stack: &HostedStack, namespace: NamespaceId) -> Option<Namesp
 }
 
 /// The node's one blob store, collected at the interval `options` sets
-/// once `collecting` is set.
+/// once `collecting` is set; a node in memory's is never collected.
 async fn open_blob_store(
     options: &SpawnOptions,
     identities: &Identities,
     collecting: &Arc<std::sync::atomic::AtomicBool>,
+    closed: &Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-util")] pause: &CollectionPauseSlot,
+    #[cfg(feature = "test-util")] runs: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<iroh_blobs::api::Store> {
-    let collection = GcConfig {
-        interval: options.blob_collection_interval,
-        add_protected: Some(protect_hosted(
-            Arc::downgrade(identities),
-            Arc::clone(collecting),
-            #[cfg(feature = "test-util")]
-            Arc::clone(pause),
-        )),
-    };
     Ok(match &options.storage {
-        StorageConfig::Memory => MemStore::new_with_opts(iroh_blobs::store::mem::Options {
-            gc_config: Some(collection),
-        })
-        .into(),
+        #[cfg(any(test, feature = "test-util"))]
+        StorageConfig::Memory => iroh_blobs::store::mem::MemStore::new().into(),
         StorageConfig::Directory(directory) => {
             let root = directory.join(BLOBS_DIR);
             let mut store_options = iroh_blobs::store::fs::options::Options::new(&root);
-            store_options.gc = Some(collection);
-            FsStore::load_with_opts(root.join("blobs.db"), store_options)
-                .await
-                .with_context(|| format!("cannot open the blob store in {}", directory.display()))?
-                .into()
+            let opened = Arc::new(std::sync::OnceLock::new());
+            store_options.gc = Some(GcConfig {
+                interval: options.blob_collection_interval.min(BLOB_COLLECTION_TICK),
+                add_protected: Some(protect_hosted(
+                    Arc::downgrade(identities),
+                    Arc::clone(collecting),
+                    Arc::clone(closed),
+                    Arc::clone(&opened),
+                    options.blob_collection_interval,
+                    #[cfg(feature = "test-util")]
+                    Arc::clone(pause),
+                    #[cfg(feature = "test-util")]
+                    Arc::clone(runs),
+                )),
+            });
+            let store: iroh_blobs::api::Store =
+                FsStore::load_with_opts(root.join("blobs.db"), store_options)
+                    .await
+                    .with_context(|| {
+                        format!("cannot open the blob store in {}", directory.display())
+                    })?
+                    .into();
+            let _ = opened.set(store.clone());
+            store
         }
     })
 }
 
 /// Blob collection's protect callback: every payload a replica of an
 /// identity the node hosts references, the node's one blob store being
-/// every identity's. Every run before `collecting` is set is skipped.
+/// every identity's. A run goes ahead once `interval` has passed since the
+/// last and `collecting` is set; every other ask is skipped. Once the
+/// node's stop has closed the store (`closed`), or the node is gone with no
+/// stop to close it, the callback lets the next run fail on the closed
+/// store: iroh-blobs ends the collection's task on a failed run alone, and
+/// the task holds the store's runtime while it lives
+/// (`components/mee-pdn/iroh-defects.md`).
 fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
     collecting: Arc<std::sync::atomic::AtomicBool>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    store: Arc<std::sync::OnceLock<iroh_blobs::api::Store>>,
+    interval: Duration,
     #[cfg(feature = "test-util")] pause: CollectionPauseSlot,
+    #[cfg(feature = "test-util")] runs: Arc<std::sync::atomic::AtomicUsize>,
 ) -> ProtectCb {
+    let next_run = Arc::new(Mutex::new(std::time::Instant::now() + interval));
     Arc::new(move |live: &mut HashSet<Hash>| {
+        #[cfg(feature = "test-util")]
+        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let identities = identities.clone();
         let collecting = Arc::clone(&collecting);
+        let closed = Arc::clone(&closed);
+        let store = Arc::clone(&store);
+        let next_run = Arc::clone(&next_run);
         #[cfg(feature = "test-util")]
         let pause = Arc::clone(&pause);
         Box::pin(async move {
+            let Some(identities) = identities.upgrade() else {
+                // Dropped outside a tokio runtime, so no stop closed the
+                // store: it is closed here.
+                if !closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    if let Some(store) = store.get().cloned() {
+                        // A task of its own: the callback's future has to
+                        // be `Sync`, which the store's calls are not.
+                        let _ = tokio::spawn(async move { store.shutdown().await }).await;
+                    }
+                }
+                return last_collection_run(&store).await;
+            };
+            if closed.load(std::sync::atomic::Ordering::Acquire) {
+                return last_collection_run(&store).await;
+            }
+            let now = std::time::Instant::now();
+            match next_run.lock() {
+                Ok(due) if now >= *due => {}
+                _ => return ProtectOutcome::Abort,
+            }
             if !collecting.load(std::sync::atomic::Ordering::Acquire) {
                 return ProtectOutcome::Abort;
             }
-            let Some(identities) = identities.upgrade() else {
-                return ProtectOutcome::Abort;
-            };
             let stacks: Vec<Arc<HostedStack>> = match identities.read() {
                 Ok(hosted) => hosted.values().cloned().collect(),
                 Err(_poisoned) => return ProtectOutcome::Abort,
@@ -2632,9 +3022,29 @@ fn protect_hosted(
                     pause.release.notified().await;
                 }
             }
+            if let Ok(mut due) = next_run.lock() {
+                *due = now + interval;
+            }
             ProtectOutcome::Continue
         })
     })
+}
+
+/// The answer that ends the collection's task once the node's stop closed
+/// the store: iroh-blobs drops the store's metadata database before its
+/// shutdown answers, and a run's every call goes there first, so the run
+/// fails before it sweeps anything. A store that still answers is left to a
+/// skipped run instead.
+async fn last_collection_run(
+    store: &std::sync::OnceLock<iroh_blobs::api::Store>,
+) -> ProtectOutcome {
+    let Some(store) = store.get().cloned() else {
+        return ProtectOutcome::Abort;
+    };
+    match tokio::spawn(async move { store.sync_db().await.is_err() }).await {
+        Ok(true) => ProtectOutcome::Continue,
+        _ => ProtectOutcome::Abort,
+    }
 }
 
 /// Every payload hash the replicas of one identity's store reference.
@@ -2830,7 +3240,7 @@ fn generate_node_key(_directory: &std::path::Path, path: &std::path::Path) -> Re
 /// store held by another node as [`DirectoryHeld`] rather than a lock error
 /// that reads as corruption. The underlying error stays in the chain.
 fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::Error {
-    let StorageConfig::Directory(directory) = storage else {
+    let Some(directory) = storage.directory() else {
         return err;
     };
     let held = err.chain().any(|cause| {
@@ -2841,7 +3251,7 @@ fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::
     });
     if held {
         err.context(DirectoryHeld {
-            directory: directory.clone(),
+            directory: directory.to_path_buf(),
         })
     } else {
         err.context(format!(
@@ -2863,10 +3273,10 @@ async fn prepare_storage(
     Option<std::fs::File>,
     Option<Arc<AddressBook>>,
 )> {
-    let StorageConfig::Directory(directory) = storage else {
+    let Some(directory) = storage.directory() else {
         return Ok((None, None, None));
     };
-    let directory = directory.clone();
+    let directory = directory.to_path_buf();
     let (key, lock, book) = tokio::task::spawn_blocking(move || {
         provision_directory(&directory)?;
         let lock = lock_directory(&directory)?;
@@ -2896,12 +3306,16 @@ async fn bind_endpoint(
         }
         Connectivity::RelaysAndAddressLookup => Endpoint::builder(presets::N0),
     };
-    let builder = builder.transport_config(
-        QuicTransportConfig::builder()
-            .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
-            .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
-            .build(),
-    );
+    let builder = builder
+        .path_selector(std::sync::Arc::new(
+            crate::path_selector::ReceivingPathSelector,
+        ))
+        .transport_config(
+            QuicTransportConfig::builder()
+                .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+                .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+                .build(),
+        );
     let builder = match secret_key {
         Some(key) => builder.secret_key(key),
         None => builder,
@@ -3034,10 +3448,11 @@ async fn reconcile_pass(
     }
 }
 
-/// Every `interval`, reconcile each store of every pod a hosted identity
-/// holds with at most [`POD_RECONCILE_PEERS`] peers, drawn afresh from its
-/// contacts — derived first from the pod's membership — and the peers the
-/// engine recorded. A failed run is retried by the next. Ends as
+/// Every `interval`, the first run within [`POD_PASS_AFTER_SPAWN`] of the
+/// spawn, reconcile each store of every pod a hosted identity holds with at
+/// most [`POD_RECONCILE_PEERS`] peers, drawn afresh from its contacts —
+/// derived first from the pod's membership — and the peers the engine
+/// recorded. A failed run is retried by the next. Ends as
 /// [`reconcile_pass`] does.
 async fn pod_reconcile_pass(
     interval: Duration,
@@ -3046,10 +3461,9 @@ async fn pod_reconcile_pass(
     probes: Arc<PassProbes>,
     mut stop: watch::Receiver<()>,
 ) {
-    while tokio::time::timeout(interval, stop.changed())
-        .await
-        .is_err()
-    {
+    let mut wait = interval.min(POD_PASS_AFTER_SPAWN);
+    while tokio::time::timeout(wait, stop.changed()).await.is_err() {
+        wait = interval;
         let stacks: Vec<Arc<HostedStack>> = match identities.read() {
             Ok(guard) => guard.values().cloned().collect(),
             Err(_poisoned) => continue,
@@ -3885,6 +4299,26 @@ async fn own_payloads(
     Ok(payloads.into_iter().collect())
 }
 
+/// The entries `author` wrote into `doc` whose payload `blobs` does not hold.
+async fn entries_without_payload(
+    doc: &Doc,
+    author: AuthorId,
+    blobs: &iroh_blobs::api::Store,
+) -> Result<usize> {
+    let mut missing = 0usize;
+    let mut entries = std::pin::pin!(doc.get_many(Query::all()).await?);
+    while let Some(entry) = entries.next().await {
+        let entry = entry?;
+        if entry.author() == author
+            && entry.content_len() > 0
+            && !blobs.has(entry.content_hash()).await?
+        {
+            missing = missing.saturating_add(1);
+        }
+    }
+    Ok(missing)
+}
+
 /// The hold [`SyncNode::pause_next_pod_start_for_test`] puts on a pod
 /// start: `reached` once its membership store's sync has started.
 #[cfg(feature = "test-util")]
@@ -3906,6 +4340,34 @@ pub struct CollectionPause {
 
 #[cfg(feature = "test-util")]
 type CollectionPauseSlot = Arc<std::sync::Mutex<Option<Arc<CollectionPause>>>>;
+
+/// The hold [`SyncNode::hold_next_blob_stream_for_test`] puts on a blob
+/// stream: `reached` once it has read its request, `done` once it has
+/// answered it.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Default)]
+pub struct BlobStreamHold {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub done: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-util")]
+type BlobStreamHoldSlot = Arc<std::sync::Mutex<Option<Arc<BlobStreamHold>>>>;
+
+/// One step of a node's stop, as [`SyncNode::stop_steps_for_test`] lists
+/// them.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStep {
+    Engines,
+    Router,
+    BlobStreams,
+    BlobStore,
+}
+
+#[cfg(feature = "test-util")]
+pub type StopSteps = Arc<std::sync::Mutex<Vec<StopStep>>>;
 
 /// The sessions one replica of a pod's store finishes, from
 /// [`SyncNode::watch_pod_sessions`]. Unread past its buffer it drops

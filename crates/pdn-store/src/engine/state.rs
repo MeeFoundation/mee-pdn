@@ -37,7 +37,7 @@ pub enum Origin {
 
 /// The state we're in for a node and a namespace
 #[derive(Debug, Clone, Default)]
-pub enum SyncState {
+pub(crate) enum SyncState {
     #[default]
     Idle,
     Running {
@@ -49,7 +49,7 @@ pub enum SyncState {
 /// Contains an entry for each active (syncing) namespace, and in there an entry for each
 /// counterpart we synced with.
 #[derive(Default)]
-pub struct NamespaceStates(BTreeMap<NamespaceId, NamespaceState>);
+pub(crate) struct NamespaceStates(BTreeMap<NamespaceId, NamespaceState>);
 
 /// A counterpart is a node id and the identity across the session — the
 /// callee when dialing, the caller when accepting. A node hosting two
@@ -66,7 +66,7 @@ struct NamespaceState {
 
 impl NamespaceStates {
     /// Are we syncing this namespace?
-    pub fn is_syncing(&self, namespace: &NamespaceId) -> bool {
+    pub(crate) fn is_syncing(&self, namespace: &NamespaceId) -> bool {
         self.0.contains_key(namespace)
     }
 
@@ -81,7 +81,7 @@ impl NamespaceStates {
 
     /// The counterparts of `namespace`'s running exchanges, each with how
     /// it began.
-    pub fn running_described(&self, namespace: &NamespaceId) -> Vec<String> {
+    pub(crate) fn running_described(&self, namespace: &NamespaceId) -> Vec<String> {
         self.0.get(namespace).map_or_else(Vec::new, |state| {
             state
                 .nodes
@@ -119,7 +119,7 @@ impl NamespaceStates {
     /// Start a sync request.
     ///
     /// Returns true if the request should be performed, and false if it should be aborted.
-    pub fn start_connect(
+    pub(crate) fn start_connect(
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
@@ -142,7 +142,7 @@ impl NamespaceStates {
     /// tie-break): that exchange finishes through the accept path.
     ///
     /// Returns true if the running outgoing exchange was cleared.
-    pub fn abort_connect(
+    pub(crate) fn abort_connect(
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
@@ -158,7 +158,7 @@ impl NamespaceStates {
     /// Accept a sync request.
     ///
     /// Returns the [`AcceptOutcome`] to be performed.
-    pub fn accept_request(
+    pub(crate) fn accept_request(
         &mut self,
         me: &EndpointId,
         own_identity: Identity,
@@ -195,7 +195,11 @@ impl NamespaceStates {
     ///
     /// This should be set to `true` if there are pending content hashes after a sync finished, and
     /// to `false` whenever a `PendingContentReady` was emitted.
-    pub fn set_may_emit_ready(&mut self, namespace: &NamespaceId, value: bool) -> Option<()> {
+    pub(crate) fn set_may_emit_ready(
+        &mut self,
+        namespace: &NamespaceId,
+        value: bool,
+    ) -> Option<()> {
         let state = self.0.get_mut(namespace)?;
         state.may_emit_ready = value;
         Some(())
@@ -206,7 +210,7 @@ impl NamespaceStates {
     /// If this returns `false`, an event should not be emitted even if the queue becomes empty,
     /// because a currently running sync did not yet terminate. Once it terminates, the event will
     /// be emitted from the handler for finished syncs.
-    pub fn may_emit_ready(&mut self, namespace: &NamespaceId) -> Option<bool> {
+    pub(crate) fn may_emit_ready(&mut self, namespace: &NamespaceId) -> Option<bool> {
         let state = self.0.get_mut(namespace)?;
         if state.may_emit_ready {
             state.may_emit_ready = false;

@@ -1,204 +1,98 @@
-use anyhow::{Context, Result};
-use iroh_blobs::api::blobs::{ExportMode, ImportMode};
-use n0_future::StreamExt;
-use pdn_store::store::Query;
-use rand::Rng;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use iroh_gossip::net::Gossip;
+use pdn_store::{
+    api::Doc,
+    filter::{SessionAccess, SessionAccessProvider},
+    protocol::Docs,
+    store::Query,
+};
 use testresult::TestResult;
-use tokio::io::AsyncWriteExt;
 use tracing_test::traced_test;
 
-use self::util::{
-    path::{key_to_path, path_to_key},
-    Node,
-};
-use crate::util::empty_endpoint;
+use self::util::{empty_endpoint, Node, TEST_HOLDER};
 
 mod util;
 
-/// Test that closing a doc does not close other instances.
+/// A `Doc` the engine's own access provider holds, as the data layer's
+/// registry holds a pod's, fails its next call once the last `Docs` is
+/// dropped. The test's own handle is dropped first, so the one inside the
+/// provider is the only one left to keep the engine alive.
 #[tokio::test]
 #[traced_test]
-async fn test_doc_close() -> Result<()> {
-    let node = Node::memory(empty_endpoint().await?).spawn().await?;
-    // let author = node.authors().default().await?;
-    let author = node.docs().author_default().await?;
-    // open doc two times
-    let doc1 = node.docs().create().await?;
-    let doc2 = node.docs().open(doc1.id()).await?.expect("doc to exist");
-    // close doc1 instance
-    doc1.close().await?;
-    // operations on doc1 now fail.
-    assert!(doc1.set_bytes(author, "foo", "bar").await.is_err());
-    // dropping doc1 will close the doc if not already closed
-    // wait a bit because the close-on-drop spawns a task for which we cannot track completion.
-    drop(doc1);
-    n0_future::time::sleep(n0_future::time::Duration::from_millis(100)).await;
-
-    // operations on doc2 still succeed
-    doc2.set_bytes(author, "foo", "bar").await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[traced_test]
-async fn test_doc_import_export() -> TestResult<()> {
-    let node = Node::memory(empty_endpoint().await?).spawn().await?;
-
-    // create temp file
-    let temp_dir = tempfile::tempdir().context("tempdir")?;
-
-    let in_root = temp_dir.path().join("in");
-    tokio::fs::create_dir_all(in_root.clone())
-        .await
-        .context("create dir all")?;
-    let out_root = temp_dir.path().join("out");
-
-    let path = in_root.join("test");
-
-    let size = 100;
-    let mut buf = vec![0u8; size];
-    rand::rng().fill_bytes(&mut buf);
-    let mut file = tokio::fs::File::create(path.clone())
-        .await
-        .context("create file")?;
-    file.write_all(&buf.clone()).await.context("write_all")?;
-    file.flush().await.context("flush")?;
-
-    // create doc & author
-    let client = node.client();
-    let blobs = client.blobs();
-    let docs_client = client.docs();
-    let doc = docs_client.create().await.context("doc create")?;
-    // let author = client.authors().create().await.context("author create")?;
-    let author = client
-        .docs()
-        .author_create()
-        .await
-        .context("author create")?;
-
-    // import file
-    let import_outcome = doc
-        .import_file(
-            blobs,
-            author,
-            path_to_key(path.clone(), None, Some(in_root))?,
-            path,
-            ImportMode::TryReference,
-        )
-        .await
-        .context("import file")?
-        .await
-        .context("import finish")?;
-
-    // export file
-    let entry = doc
-        .get_one(Query::author(author).key_exact(import_outcome.key))
-        .await
-        .context("get one")?
-        .unwrap();
-    let key = entry.key().to_vec();
-    let path = key_to_path(key, None, Some(out_root))?;
-    // TODO(Frando): iroh-blobs should do this IMO.
-    // tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-    let progress = doc
-        .export_file(blobs, entry, path.clone(), ExportMode::Copy)
+async fn a_doc_the_access_provider_holds_stops_with_the_last_docs() -> Result<()> {
+    let endpoint = empty_endpoint().await?;
+    let blobs = iroh_blobs::store::mem::MemStore::new();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let held: Arc<Mutex<Option<Doc>>> = Default::default();
+    let access: SessionAccessProvider = {
+        let held = held.clone();
+        Arc::new(move |_namespace, _identity, _caller, _peer, _role| {
+            let _held = &held;
+            Box::pin(std::future::ready(SessionAccess::whole()))
+        })
+    };
+    let docs = Docs::memory(TEST_HOLDER, access)
+        .spawn(endpoint, (*blobs).clone(), gossip)
         .await?;
-    let mut progress = progress.stream().await;
-    while let Some(msg) = progress.next().await {
-        println!("MSG {msg:?}");
-    }
-    // let _export_outcome = doc
-    //     .export_file(blobs, entry, path.clone(), ExportMode::Copy)
-    //     .await
-    //     .context("export file")?
-    //     .finish()
-    //     .await
-    //     .context("export finish")?;
+    let author = docs.author_default().await?;
+    let doc = docs.create().await?;
+    doc.set_bytes(author, "key", "before").await?;
+    *held.lock().expect("lock") = Some(doc);
 
-    let got_bytes = tokio::fs::read(path).await.context("tokio read")?;
-    assert_eq!(buf, got_bytes);
-
+    drop(docs);
+    let doc = held.lock().expect("lock").clone().expect("held");
+    let err = doc
+        .set_bytes(author, "key", "after")
+        .await
+        .expect_err("a call after the last Docs is dropped");
+    assert_eq!(err.to_string(), "the store has stopped");
     Ok(())
 }
 
-#[tokio::test]
-async fn test_authors() -> Result<()> {
-    let node = Node::memory(empty_endpoint().await?).spawn().await?;
-
-    // default author always exists
-    let authors: Vec<_> = node.docs().author_list().await?.try_collect().await?;
-    assert_eq!(authors.len(), 1);
-    let default_author = node.docs().author_default().await?;
-    assert_eq!(authors, vec![default_author]);
-
-    let author_id = node.docs().author_create().await?;
-
-    let authors: Vec<_> = node.docs().author_list().await?.try_collect().await?;
-    assert_eq!(authors.len(), 2);
-
-    let author = node
-        .docs()
-        .author_export(author_id)
-        .await?
-        .expect("should have author");
-    node.docs().author_delete(author_id).await?;
-    let authors: Vec<_> = node.docs().author_list().await?.try_collect().await?;
-    assert_eq!(authors.len(), 1);
-
-    node.docs().author_import(author).await?;
-
-    let authors: Vec<_> = node.docs().author_list().await?.try_collect().await?;
-    assert_eq!(authors.len(), 2);
-
-    assert!(node.docs().author_default().await? != author_id);
-    node.docs().author_set_default(author_id).await?;
-    assert_eq!(node.docs().author_default().await?, author_id);
-
-    Ok(())
-}
-
+/// A node's default author exists in its store: a write under it goes
+/// through.
 #[tokio::test]
 async fn test_default_author_memory() -> Result<()> {
     let iroh = Node::memory(empty_endpoint().await?).spawn().await?;
     let author = iroh.docs().author_default().await?;
-    assert!(iroh.docs().author_export(author).await?.is_some());
-    assert!(iroh.docs().author_delete(author).await.is_err());
+    let doc = iroh.docs().create().await?;
+    doc.set_bytes(author, "key", "value").await?;
     Ok(())
 }
 
+/// A persistent node keeps its default author across restarts, creates a
+/// new one when the default author file is gone, and refuses to start when
+/// the file names an author its store does not hold.
 #[tokio::test]
 #[traced_test]
-#[cfg(feature = "fs-store")]
 async fn test_default_author_persist() -> TestResult<()> {
     let iroh_root_dir = tempfile::TempDir::new()?;
     let iroh_root = iroh_root_dir.path();
 
-    // check that the default author exists and cannot be deleted.
     let default_author = {
         let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
             .spawn()
             .await?;
         let author = iroh.docs().author_default().await?;
-        assert!(iroh.docs().author_export(author).await?.is_some());
-        assert!(iroh.docs().author_delete(author).await.is_err());
+        let doc = iroh.docs().create().await?;
+        doc.set_bytes(author, "key", "value").await?;
         iroh.shutdown().await?;
         author
     };
 
-    // check that the default author is persisted across restarts.
     {
         let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
             .spawn()
             .await?;
         let author = iroh.docs().author_default().await?;
         assert_eq!(author, default_author);
-        assert!(iroh.docs().author_export(author).await?.is_some());
-        assert!(iroh.docs().author_delete(author).await.is_err());
+        let doc = iroh.docs().create().await?;
+        doc.set_bytes(author, "key", "value").await?;
         iroh.shutdown().await?;
     };
 
-    // check that a new default author is created if the default author file is deleted
-    // manually.
     let default_author = {
         tokio::fs::remove_file(iroh_root.join("default-author")).await?;
         let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
@@ -206,28 +100,22 @@ async fn test_default_author_persist() -> TestResult<()> {
             .await?;
         let author = iroh.docs().author_default().await?;
         assert!(author != default_author);
-        assert!(iroh.docs().author_export(author).await?.is_some());
-        assert!(iroh.docs().author_delete(author).await.is_err());
+        let doc = iroh.docs().create().await?;
+        doc.set_bytes(author, "key", "value").await?;
         iroh.shutdown().await?;
         author
     };
 
-    // check that the node fails to start if the default author is missing from the docs store.
     {
-        let mut docs_store = pdn_store::store::fs::Store::persistent(
-            iroh_root.join("docs.redb"),
-            util::TEST_CACHE_BYTES,
-        )?;
-        docs_store.delete_author(default_author)?;
-        docs_store.flush()?;
-        drop(docs_store);
+        let stranger = pdn_store::Author::new(&mut rand::rng()).id();
+        assert!(stranger != default_author);
+        tokio::fs::write(iroh_root.join("default-author"), stranger.to_string()).await?;
         let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
             .spawn()
             .await;
         assert!(iroh.is_err());
 
-        // somehow the blob store is not shutdown correctly (yet?) on macos.
-        // so we give it some time until we find a proper fix.
+        // On macOS the failed node's blob store lets go of its files late.
         #[cfg(target_os = "macos")]
         n0_future::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -242,24 +130,62 @@ async fn test_default_author_persist() -> TestResult<()> {
         iroh?.shutdown().await?;
     }
 
-    // check that the default author can be set manually and is persisted.
-    let default_author = {
-        let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
-            .spawn()
-            .await?;
-        let author = iroh.docs().author_create().await?;
-        iroh.docs().author_set_default(author).await?;
-        assert_eq!(iroh.docs().author_default().await?, author);
-        iroh.shutdown().await?;
-        author
-    };
-    {
-        let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
-            .spawn()
-            .await?;
-        assert_eq!(iroh.docs().author_default().await?, default_author);
-        iroh.shutdown().await?;
-    }
+    Ok(())
+}
 
+/// A write [`DocsApi::flush`](pdn_store::api::DocsApi::flush) answered for
+/// is on disk whole at once: a copy of the node's directory taken then,
+/// which is what a kill leaves behind, reads its entry and its payload.
+///
+/// Without the flush both stores commit on timers of their own, the replica
+/// store's within half a second and the blob store's within one, so a copy
+/// taken at once holds neither.
+#[tokio::test]
+#[traced_test]
+async fn a_flushed_write_is_on_disk_at_once() -> TestResult<()> {
+    let root = tempfile::TempDir::new()?;
+    let iroh = Node::persistent(root.path(), empty_endpoint().await?)
+        .spawn()
+        .await?;
+    let author = iroh.docs().author_default().await?;
+    let doc = iroh.docs().create().await?;
+    let namespace = doc.id();
+    let hash = doc.set_bytes(author, "key", "value").await?;
+    iroh.docs().flush().await?;
+    let copy = tempfile::TempDir::new()?;
+    copy_tree(root.path(), copy.path())?;
+    iroh.shutdown().await?;
+
+    let reopened = Node::persistent(copy.path(), empty_endpoint().await?)
+        .spawn()
+        .await?;
+    let doc = reopened
+        .docs()
+        .open(namespace)
+        .await?
+        .ok_or("the flushed replica is not in the copy")?;
+    let entry = doc
+        .get_one(Query::key_exact("key"))
+        .await?
+        .ok_or("the flushed entry is not in the copy")?;
+    assert_eq!(entry.content_hash(), hash);
+    let payload = reopened.blobs().get_bytes(hash).await?;
+    assert_eq!(payload.as_ref(), b"value");
+    reopened.shutdown().await?;
+    Ok(())
+}
+
+/// `from` copied file by file into `to`, as it lies on disk at this moment.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }

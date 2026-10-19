@@ -674,7 +674,7 @@ async fn create_to_record(state: &Mutex<State>, identity: PdnId) -> Result<PodId
         let own = node
             .share_pod_tickets(identity, pod, AddrInfoOptions::RelayAndAddresses)
             .await?;
-        record_pod(&hosted.pms, pod, Seq::FIRST, &own, None).await
+        record_pod(&node, identity, &hosted.pms, pod, Seq::FIRST, &own, None).await
     }
     .await;
     let Err(err) = written else {
@@ -1123,7 +1123,16 @@ async fn join_via_dialogue(
     {
         let state = state.lock().await;
         let pms = &state.hosted(identity)?.pms;
-        record_pod(pms, pod, Seq::new(offer.seq), &own, Some(&inviter)).await?;
+        record_pod(
+            &node,
+            identity,
+            pms,
+            pod,
+            Seq::new(offer.seq),
+            &own,
+            Some(&inviter),
+        )
+        .await?;
     }
     #[cfg(feature = "test-util")]
     {
@@ -1445,8 +1454,11 @@ where
 /// its other devices. Beside its own tickets go the ones the inviter handed
 /// over at a join, so a sibling, or this device after a restart, has a
 /// member's device to dial, named as that member, before its membership view
-/// lists anyone.
+/// lists anyone. The entry is written once the tickets are on disk, their
+/// payloads included: an entry without them lists a pod no restart opens.
 async fn record_pod(
+    node: &SyncNode,
+    identity: PdnId,
     pms: &data_layer::PrivateMetadataStore,
     pod: PodId,
     seq: Seq,
@@ -1470,6 +1482,7 @@ async fn record_pod(
     for (kind, ticket) in kinds {
         pms.put_ticket(&kind, ticket).await?;
     }
+    node.flush_stores(identity).await?;
     pms.record_pod(pod, seq).await
 }
 

@@ -14,6 +14,7 @@ mod access;
 mod address_book;
 mod identity_key;
 pub mod node;
+mod path_selector;
 mod pod;
 pub mod private_metadata;
 mod registry;
@@ -25,7 +26,9 @@ pub use identity_key::{
     creates, devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair,
 };
 #[cfg(feature = "test-util")]
-pub use node::{CollectionPause, PodSession, PodSessions, PodStartPause};
+pub use node::{
+    BlobStreamHold, CollectionPause, PodSession, PodSessions, PodStartPause, StopStep, StopSteps,
+};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{
@@ -49,10 +52,7 @@ pub use node::{
 };
 // pdn-store vocabulary of the share and import flows, so downstream crates
 // need no direct dependency on the fork.
-pub use pdn_store::{
-    api::protocol::{AddrInfoOptions, ShareMode},
-    AuthorId, Contact, DocTicket, Identity, NamespaceId,
-};
+pub use pdn_store::{api::AddrInfoOptions, AuthorId, Contact, DocTicket, Identity, NamespaceId};
 pub use private_metadata::{
     pod_inviter_ticket_kind, pod_ticket_kind, CatchUpTimeout, CatchUpWatch, PrivateMetadataStore,
 };

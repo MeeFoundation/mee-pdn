@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use data_layer::{
     pod_ticket_kind, AddrInfoOptions, CatchUpTimeout, DocTicket, PodStore, PrivateMetadataStore,
-    RecordKey, Seq, ShareMode, SyncNode,
+    RecordKey, Seq, SyncNode,
 };
 use pdn_types::{PodId, RecordId};
 use test_utils::{eventually, host_identity, ids, join_identity, memory_node, TIMEOUT};
@@ -39,7 +39,7 @@ async fn wait_ticket(pms: &PrivateMetadataStore, kind: &str, want: &DocTicket) -
 async fn fresh_ticket(node: &SyncNode) -> Result<DocTicket> {
     PrivateMetadataStore::create(node, ids::ALICE)
         .await?
-        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await
 }
 
@@ -55,7 +55,7 @@ async fn two_devices() -> Result<(
     let laptop = memory_node().await?;
     let phone_pms = host_identity(&phone, ids::ALICE).await?;
     let ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
     let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
     phone_pms.add_device(laptop.node_id()).await?;
@@ -75,7 +75,7 @@ async fn sync_two_devices() -> Result<()> {
     phone_pms.record_pod(FAMILY, Seq::FIRST).await?;
 
     let pms_ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
     let laptop_pms = join_identity(&laptop, ids::ALICE, pms_ticket).await?;
     phone_pms.add_device(laptop.node_id()).await?;
@@ -199,7 +199,7 @@ async fn pms_carries_arbitrary_tickets() -> Result<()> {
     phone_pms.put_ticket(&kind, &payload_ticket).await?;
 
     let ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
     let laptop_pms = join_identity(&laptop, ids::ALICE, ticket).await?;
     phone_pms.add_device(laptop.node_id()).await?;
@@ -234,7 +234,7 @@ async fn pms_wait_returns_on_a_session_not_on_content() -> Result<()> {
     let phone_pms = host_identity(&phone, ids::ALICE).await?;
     phone_pms.record_pod(FAMILY, Seq::FIRST).await?;
     let ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
 
     laptop.provision_identity(ids::ALICE).await?;
@@ -267,7 +267,7 @@ async fn pms_wait_times_out_without_a_reachable_peer() -> Result<()> {
 
     let phone_pms = host_identity(&phone, ids::ALICE).await?;
     let ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
     // The ticket's only contact goes away before the import.
     phone.shutdown().await?;
@@ -331,11 +331,10 @@ async fn empty_payload_write_is_rejected() -> Result<()> {
 /// than its unread subscription buffers, reads them all, and still writes
 /// and lists, while the subscription reports the changes it dropped.
 ///
-/// Six hundred records: past the 256-slot insert buffer and the 64 slots of
-/// the RPC stream behind it, while the 256-slot live buffer does not fill,
-/// the records sharing one payload. Each probe waits the whole budget: the
-/// store stopping for good is what it catches, and a loaded runner holds
-/// one call for seconds.
+/// Six hundred records: past the 256-slot insert buffer, while the 256-slot
+/// live buffer does not fill, the records sharing one payload. Each probe
+/// waits the whole budget: the store stopping for good is what it catches,
+/// and a loaded runner holds one call for seconds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscriber_that_stops_reading_holds_up_no_sync() -> Result<()> {
     const RECORDS: u16 = 600;

@@ -17,10 +17,9 @@ use crate::{
 
 /// A query iterator for entry queries.
 #[derive(Debug)]
-pub struct QueryIterator {
+pub(crate) struct QueryIterator {
     range: QueryRange,
     query: Query,
-    offset: u64,
     count: u64,
 }
 
@@ -79,7 +78,6 @@ impl QueryIterator {
         Ok(Self {
             range,
             query,
-            offset: 0,
             count: 0,
         })
     }
@@ -95,62 +93,52 @@ impl Iterator for QueryIterator {
                 return None;
             }
         }
-        loop {
-            let next = match &mut self.range {
-                QueryRange::AuthorKey { range, key_filter } => {
-                    // get the next entry from the query range, filtered by the key and empty filters
-                    range.next_filtered(&self.query.sort_direction, |(_ns, _author, key), value| {
-                        key_filter.matches(key)
-                            && (self.query.include_empty || !value_is_empty(&value))
-                    })
-                }
-
-                QueryRange::KeyAuthor {
-                    range,
-                    author_filter,
-                    selector,
-                } => loop {
-                    // get the next entry from the query range, filtered by the author filter
-                    let next = range
-                        .next_filtered(&self.query.sort_direction, |(_ns, _key, author)| {
-                            author_filter.matches(&(AuthorId::from(author)))
-                        });
-
-                    // early-break if next contains Err
-                    let next = match next.transpose() {
-                        Err(err) => break Some(Err(err)),
-                        Ok(next) => next,
-                    };
-
-                    // push the entry into the selector. if active, only the latest entry
-                    // for each key will be emitted.
-                    let next = match selector {
-                        None => next,
-                        Some(selector) => match selector.push(next) {
-                            SelectorRes::Continue => continue,
-                            SelectorRes::Finished => None,
-                            SelectorRes::Some(res) => Some(res),
-                        },
-                    };
-
-                    // skip the entry if empty and no empty entries requested
-                    if !self.query.include_empty && matches!(&next, Some(e) if e.is_empty()) {
-                        continue;
-                    }
-
-                    break next.map(Result::Ok);
-                },
-            };
-
-            // skip the entry if we didn't get past the requested offset yet.
-            if self.offset < self.query.offset() && matches!(next, Some(Ok(_))) {
-                self.offset += 1;
-                continue;
+        let next = match &mut self.range {
+            QueryRange::AuthorKey { range, key_filter } => {
+                // get the next entry from the query range, filtered by the key and empty filters
+                range.next_filtered(|(_ns, _author, key), value| {
+                    key_filter.matches(key) && (self.query.include_empty || !value_is_empty(&value))
+                })
             }
 
-            self.count += 1;
-            return next;
-        }
+            QueryRange::KeyAuthor {
+                range,
+                author_filter,
+                selector,
+            } => loop {
+                // get the next entry from the query range, filtered by the author filter
+                let next = range.next_filtered(|(_ns, _key, author)| {
+                    author_filter.matches(&(AuthorId::from(author)))
+                });
+
+                // early-break if next contains Err
+                let next = match next.transpose() {
+                    Err(err) => break Some(Err(err)),
+                    Ok(next) => next,
+                };
+
+                // push the entry into the selector. if active, only the latest entry
+                // for each key will be emitted.
+                let next = match selector {
+                    None => next,
+                    Some(selector) => match selector.push(next) {
+                        SelectorRes::Continue => continue,
+                        SelectorRes::Finished => None,
+                        SelectorRes::Some(res) => Some(res),
+                    },
+                };
+
+                // skip the entry if empty and no empty entries requested
+                if !self.query.include_empty && matches!(&next, Some(e) if e.is_empty()) {
+                    continue;
+                }
+
+                break next.map(Result::Ok);
+            },
+        };
+
+        self.count += 1;
+        next
     }
 }
 

@@ -502,6 +502,24 @@ impl Runtime {
         self.state.lock().await.node.hosted_identities()
     }
 
+    /// The runtime's dial side, for a scenario that holds connections of
+    /// its own to a peer.
+    #[cfg(feature = "test-util")]
+    pub async fn dial_handle_for_test(&self) -> data_layer::DialHandle {
+        self.state.lock().await.node.dial_handle()
+    }
+
+    /// [`SyncNode::own_entries_without_payload`](data_layer::SyncNode::own_entries_without_payload)
+    /// for `identity`.
+    #[cfg(feature = "test-util")]
+    pub async fn own_entries_without_payload_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<usize> {
+        let node = std::sync::Arc::clone(&self.state.lock().await.node);
+        node.own_entries_without_payload(identity).await
+    }
+
     /// The public identity key in `identity`'s own PMS on this
     /// runtime; `None` until its payload has arrived.
     #[cfg(feature = "test-util")]

@@ -4,8 +4,7 @@
 
 use anyhow::Result;
 use data_layer::{
-    AddrInfoOptions, DocTicket, IdentityNotProvisioned, PrivateMetadataStore, Seq, ShareMode,
-    SyncNode,
+    AddrInfoOptions, DocTicket, IdentityNotProvisioned, PrivateMetadataStore, Seq, SyncNode,
 };
 use pdn_types::{PdnId, PodId};
 use test_utils::{eventually, host_identity, ids, join_identity, memory_node, wait_devices};
@@ -24,9 +23,7 @@ async fn provision_with_fixtures(
 ) -> Result<(PrivateMetadataStore, DocTicket)> {
     let pms = host_identity(phone, identity).await?;
     pms.record_pod(pod, Seq::FIRST).await?;
-    let ticket = pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket = pms.share_ticket(AddrInfoOptions::RelayAndAddresses).await?;
     Ok((pms, ticket))
 }
 
@@ -78,7 +75,7 @@ async fn three_devices_two_identities() -> Result<()> {
 
     // Tablet joins work only, from the PMS ticket the LAPTOP mints.
     let tablet_ticket = work_laptop_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
     let work_tablet_pms = join_from(&tablet, ids::ALICE_AT_WORK, tablet_ticket).await?;
 

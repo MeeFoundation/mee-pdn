@@ -1,17 +1,16 @@
 //! Storage trait and implementation for pdn-store documents
 use std::num::NonZeroUsize;
 
-use anyhow::Result;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::{AuthorId, Entry, NamespaceId};
+use crate::AuthorId;
 
 pub mod fs;
 mod pubkeys;
 mod util;
-pub use fs::Store;
-pub use pubkeys::*;
+pub(crate) use fs::Store;
+pub(crate) use pubkeys::*;
 
 /// Number of peers to cache per document.
 pub(crate) const PEERS_PER_DOC_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
@@ -21,7 +20,7 @@ pub(crate) const PEERS_PER_DOC_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::ne
 
 /// Error return from [`Store::open_replica`]
 #[derive(Debug, thiserror::Error)]
-pub enum OpenError {
+pub(crate) enum OpenError {
     /// The replica does not exist.
     #[error("Replica not found")]
     NotFound,
@@ -30,135 +29,13 @@ pub enum OpenError {
     Other(#[from] anyhow::Error),
 }
 
-/// Store that gives read access to download policies for a document.
-pub trait DownloadPolicyStore {
-    /// Get the download policy for a document.
-    fn get_download_policy(&mut self, namespace: &NamespaceId) -> Result<DownloadPolicy>;
-}
-
-impl<T: DownloadPolicyStore> DownloadPolicyStore for &mut T {
-    fn get_download_policy(&mut self, namespace: &NamespaceId) -> Result<DownloadPolicy> {
-        DownloadPolicyStore::get_download_policy(*self, namespace)
-    }
-}
-
-impl DownloadPolicyStore for crate::store::Store {
-    fn get_download_policy(&mut self, namespace: &NamespaceId) -> Result<DownloadPolicy> {
-        self.get_download_policy(namespace)
-    }
-}
-
 /// Outcome of [`Store::import_namespace`]
 #[derive(Debug, Clone, Copy)]
-pub enum ImportNamespaceOutcome {
+pub(crate) enum ImportNamespaceOutcome {
     /// The namespace did not exist before and is now inserted.
     Inserted,
-    /// The namespace existed and now has an upgraded capability.
-    Upgraded,
     /// The namespace existed and its capability remains unchanged.
     NoChange,
-}
-
-/// Download policy to decide which content blobs shall be downloaded.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DownloadPolicy {
-    /// Do not download any key unless it matches one of the filters.
-    NothingExcept(Vec<FilterKind>),
-    /// Download every key unless it matches one of the filters.
-    EverythingExcept(Vec<FilterKind>),
-}
-
-impl Default for DownloadPolicy {
-    fn default() -> Self {
-        DownloadPolicy::EverythingExcept(Vec::default())
-    }
-}
-
-/// Filter strategy used in download policies.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FilterKind {
-    /// Matches if the contained bytes are a prefix of the key.
-    Prefix(Bytes),
-    /// Matches if the contained bytes and the key are the same.
-    Exact(Bytes),
-}
-
-impl std::fmt::Display for FilterKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // hardly usable but good enough as a poc
-        let (kind, bytes) = match self {
-            FilterKind::Prefix(bytes) => ("prefix", bytes),
-            FilterKind::Exact(bytes) => ("exact", bytes),
-        };
-        let (encoding, repr) = match String::from_utf8(bytes.to_vec()) {
-            Ok(repr) => ("utf8", repr),
-            Err(_) => ("hex", hex::encode(bytes)),
-        };
-        write!(f, "{kind}:{encoding}:{repr}")
-    }
-}
-
-impl std::str::FromStr for FilterKind {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let Some((kind, rest)) = s.split_once(':') else {
-            anyhow::bail!("missing filter kind, either \"prefix:\" or \"exact:\"")
-        };
-        let Some((encoding, rest)) = rest.split_once(':') else {
-            anyhow::bail!("missing encoding: either \"hex:\" or \"utf8:\"")
-        };
-
-        let is_exact = match kind {
-            "exact" => true,
-            "prefix" => false,
-            other => {
-                anyhow::bail!("expected filter kind \"prefix:\" or \"exact:\", found {other}")
-            }
-        };
-
-        let decoded = match encoding {
-            "utf8" => Bytes::from(rest.to_owned()),
-            "hex" => match hex::decode(rest) {
-                Ok(bytes) => Bytes::from(bytes),
-                Err(_) => anyhow::bail!("failed to decode hex"),
-            },
-            other => {
-                anyhow::bail!("expected encoding: either \"hex:\" or \"utf8:\", found {other}")
-            }
-        };
-
-        if is_exact {
-            Ok(FilterKind::Exact(decoded))
-        } else {
-            Ok(FilterKind::Prefix(decoded))
-        }
-    }
-}
-
-impl FilterKind {
-    /// Verifies whether this filter matches a given key
-    pub fn matches(&self, key: impl AsRef<[u8]>) -> bool {
-        match self {
-            FilterKind::Prefix(prefix) => key.as_ref().starts_with(prefix),
-            FilterKind::Exact(expected) => expected == key.as_ref(),
-        }
-    }
-}
-
-impl DownloadPolicy {
-    /// Check if an entry should be downloaded according to this policy.
-    pub fn matches(&self, entry: &Entry) -> bool {
-        let key = entry.key();
-        match self {
-            DownloadPolicy::NothingExcept(patterns) => {
-                patterns.iter().any(|pattern| pattern.matches(key))
-            }
-            DownloadPolicy::EverythingExcept(patterns) => {
-                patterns.iter().all(|pattern| !pattern.matches(key))
-            }
-        }
-    }
 }
 
 /// A query builder for document queries.
@@ -168,9 +45,7 @@ pub struct QueryBuilder<K> {
     filter_author: AuthorFilter,
     filter_key: KeyFilter,
     limit: Option<u64>,
-    offset: u64,
     include_empty: bool,
-    sort_direction: SortDirection,
 }
 
 impl<K> QueryBuilder<K> {
@@ -199,33 +74,18 @@ impl<K> QueryBuilder<K> {
         self.limit = Some(limit);
         self
     }
-    /// Set the offset within the result set from where to start returning results.
-    pub fn offset(mut self, offset: u64) -> Self {
-        self.offset = offset;
-        self
-    }
 }
 
-/// Query on all entries without aggregation.
+/// Query on all entries without aggregation, ordered by author, then key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FlatQuery {
-    sort_by: SortBy,
-}
+pub struct FlatQuery {}
 
-/// Query that only returns the latest entry for a key which has entries from multiple authors.
+/// Query that only returns the latest entry for a key which has entries from multiple authors,
+/// ordered by key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SingleLatestPerKeyQuery {}
 
 impl QueryBuilder<FlatQuery> {
-    /// Set the sort for the query.
-    ///
-    /// The default is to sort by author, then by key, in ascending order.
-    pub fn sort_by(mut self, sort_by: SortBy, direction: SortDirection) -> Self {
-        self.kind.sort_by = sort_by;
-        self.sort_direction = direction;
-        self
-    }
-
     /// Build the query.
     pub fn build(self) -> Query {
         Query::from(self)
@@ -233,15 +93,6 @@ impl QueryBuilder<FlatQuery> {
 }
 
 impl QueryBuilder<SingleLatestPerKeyQuery> {
-    /// Set the order direction for the query.
-    ///
-    /// Ordering is always by key for this query type.
-    /// Default direction is ascending.
-    pub fn sort_direction(mut self, direction: SortDirection) -> Self {
-        self.sort_direction = direction;
-        self
-    }
-
     /// Build the query.
     pub fn build(self) -> Query {
         Query::from(self)
@@ -255,9 +106,7 @@ impl From<QueryBuilder<SingleLatestPerKeyQuery>> for Query {
             filter_author: builder.filter_author,
             filter_key: builder.filter_key,
             limit: builder.limit,
-            offset: builder.offset,
             include_empty: builder.include_empty,
-            sort_direction: builder.sort_direction,
         }
     }
 }
@@ -269,9 +118,7 @@ impl From<QueryBuilder<FlatQuery>> for Query {
             filter_author: builder.filter_author,
             filter_key: builder.filter_key,
             limit: builder.limit,
-            offset: builder.offset,
             include_empty: builder.include_empty,
-            sort_direction: builder.sort_direction,
         }
     }
 }
@@ -284,9 +131,7 @@ pub struct Query {
     filter_author: AuthorFilter,
     filter_key: KeyFilter,
     limit: Option<u64>,
-    offset: u64,
     include_empty: bool,
-    sort_direction: SortDirection,
 }
 
 impl Query {
@@ -319,44 +164,19 @@ impl Query {
     pub fn limit(&self) -> Option<u64> {
         self.limit
     }
-
-    /// Get the offset for this query (number of entries to skip at the beginning).
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-}
-
-/// Sort direction
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub enum SortDirection {
-    /// Sort ascending
-    #[default]
-    Asc,
-    /// Sort descending
-    Desc,
 }
 
 #[derive(derive_more::Debug, Clone, Serialize, Deserialize)]
 enum QueryKind {
-    #[debug("Flat {{ sort_by: {:?}}}", _0)]
+    #[debug("Flat")]
     Flat(FlatQuery),
     #[debug("SingleLatestPerKey")]
     SingleLatestPerKey(SingleLatestPerKeyQuery),
 }
 
-/// Fields by which the query can be sorted
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub enum SortBy {
-    /// Sort by key, then author.
-    KeyAuthor,
-    /// Sort by author, then key.
-    #[default]
-    AuthorKey,
-}
-
 /// Key matching.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, Eq, PartialEq)]
-pub enum KeyFilter {
+pub(crate) enum KeyFilter {
     /// Matches any key.
     #[default]
     Any,
@@ -385,7 +205,7 @@ impl KeyFilter {
 
 /// Author matching.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, Eq, PartialEq)]
-pub enum AuthorFilter {
+pub(crate) enum AuthorFilter {
     /// Matches any author.
     #[default]
     Any,
@@ -406,21 +226,5 @@ impl AuthorFilter {
 impl From<AuthorId> for AuthorFilter {
     fn from(value: AuthorId) -> Self {
         AuthorFilter::Exact(value)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_filter_kind_encode_decode() {
-        const REPR: &str = "prefix:utf8:memes/futurama";
-        let filter: FilterKind = REPR.parse().expect("should decode");
-        assert_eq!(
-            filter,
-            FilterKind::Prefix(Bytes::from(String::from("memes/futurama")))
-        );
-        assert_eq!(filter.to_string(), REPR)
     }
 }

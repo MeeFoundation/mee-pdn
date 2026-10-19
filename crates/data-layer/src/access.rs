@@ -219,6 +219,14 @@ impl AccessBook {
         Ok(())
     }
 
+    pub(crate) fn armed_pms(&self) -> Result<Option<Doc>> {
+        Ok(self
+            .pms
+            .read()
+            .map_err(|_poisoned| anyhow::anyhow!("access book lock poisoned"))?
+            .clone())
+    }
+
     pub(crate) fn disarm_pms(&self) -> Result<()> {
         *self
             .pms

@@ -382,7 +382,7 @@ where
 }
 
 /// State for the receiver side of the sync protocol.
-pub struct BobState {
+pub(crate) struct BobState {
     /// The namespace the peer named in its Init, set before the accept
     /// decision. Present without a session for the whole span from that
     /// point to the session opening, which is why the two are separate
@@ -637,7 +637,7 @@ impl BobState {
 
     /// Consume self and get the [`SyncOutcome`] this connection's completed
     /// rounds accumulated.
-    pub fn into_outcome(self) -> SyncOutcome {
+    pub(crate) fn into_outcome(self) -> SyncOutcome {
         self.progress
     }
 }
@@ -663,7 +663,6 @@ mod tests {
     /// dispatch the identities exist for.
     const TEST_HOLDER: Identity = Identity::from_bytes([0u8; 32]);
     /// A cache big enough that nothing in a scenario evicts.
-    #[cfg(feature = "fs-store")]
     const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
     /// An empty first message for `namespace`, under the one test identity.
@@ -814,7 +813,6 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    #[cfg(feature = "fs-store")]
     async fn test_sync_many_authors_fs() -> Result<()> {
         let tmpdir = tempfile::tempdir()?;
         let alice_store =
@@ -1056,7 +1054,6 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    #[cfg(feature = "fs-store")]
     async fn test_sync_timestamps_fs() -> Result<()> {
         let tmpdir = tempfile::tempdir()?;
         let alice_store =
@@ -1366,7 +1363,6 @@ mod tests {
                     bob_peer_id,
                     &mut writer,
                     &mut reader,
-                    None,
                     &access,
                 )
                 .await
@@ -1461,7 +1457,7 @@ mod tests {
         let (proxy_bob, bob_io) = tokio::io::duplex(64 * 1024);
         let (mut from_alice, mut to_alice) = tokio::io::split(proxy_alice);
         let (mut from_bob, mut to_bob) = tokio::io::split(proxy_bob);
-        let _upstream =
+        let _alice_to_bob =
             tokio::spawn(async move { tokio::io::copy(&mut from_alice, &mut to_bob).await });
         let _first_reply_only = tokio::spawn(async move {
             let mut length = [0u8; 4];
@@ -1511,7 +1507,6 @@ mod tests {
                     bob_peer,
                     &mut writer,
                     &mut reader,
-                    None,
                     &access,
                 )
                 .await
@@ -1785,24 +1780,16 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(reclaimed, "the abandoned snapshot was never reclaimed");
-        // The reclaim is counted, so the same event is visible on a running
-        // node and not only from inside this test.
-        #[cfg(feature = "metrics")]
-        {
-            assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
-            assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
-        }
+        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
 
         // A session whose handle is alive is not swept out from under it.
         let session = handle.sync_session_start(namespace_id).await?;
         tokio::time::sleep(crate::actor::MAX_COMMIT_DELAY * 3).await;
         assert_eq!(handle.debug_session_count().await?, 1);
         // Held, not reclaimed: the ordinary path leaves this counter alone.
-        #[cfg(feature = "metrics")]
-        {
-            assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
-            assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
-        }
+        assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
+        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
         assert!(handle
             .sync_initial_message(namespace_id, session.id(), None)
             .await
@@ -2726,11 +2713,6 @@ mod tests {
     /// live actor's delivery — that stops draining its bounded channel,
     /// because a release has to sit in the queue across a reclaim pass and
     /// nothing else holds the actor still for that long.
-    ///
-    /// Its subject is the counter, which this crate's `metrics` feature
-    /// provides: without it the test would rest on the feature arriving
-    /// through another crate's defaults.
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn an_ordinary_release_is_not_counted_as_reclaimed() -> Result<()> {
         let mut rng = rand::rng();
@@ -2870,6 +2852,76 @@ mod tests {
             held,
             vec![short],
             "the receiving side must hold the short entry and not the long one"
+        );
+        Ok(())
+    }
+
+    /// An entry whose hash and length disagree on whether it is empty — the
+    /// empty hash with a length, or a length of 0 with another hash — is
+    /// dropped at ingest, and the session goes on to deliver the rest. The
+    /// two are written past validation, as a modified node's store holds them.
+    #[tokio::test]
+    async fn an_entry_whose_hash_and_length_disagree_on_emptiness_is_dropped_at_ingest(
+    ) -> Result<()> {
+        use crate::ranger::Store as _;
+
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let mut alice_store = store::Store::memory();
+        let author = alice_store.new_author(&mut rng)?;
+        drop(alice_store.new_replica(namespace.clone())?);
+        alice_store.close_replica(namespace.id());
+        let now = crate::sync::system_time_now();
+        {
+            let mut raw = crate::store::fs::StoreInstance::new(namespace.id(), &mut alice_store);
+            for (key, record) in [
+                (&b"whole"[..], crate::Record::current_from_data("v")),
+                (
+                    &b"empty-hash-with-a-length"[..],
+                    crate::Record::unchecked(Hash::EMPTY, 5, now),
+                ),
+                (
+                    &b"a-length-of-zero"[..],
+                    crate::Record::unchecked(Hash::new(b"v"), 0, now),
+                ),
+            ] {
+                raw.entry_put(crate::SignedEntry::from_parts(
+                    &namespace, &author, key, record,
+                ))?;
+            }
+        }
+        let mut bob_store = store::Store::memory();
+        drop(bob_store.new_replica(namespace.clone())?);
+        bob_store.close_replica(namespace.id());
+
+        let alice = SyncHandle::spawn(alice_store, None, "alice".to_string());
+        alice
+            .open(namespace.id(), OpenOpts::default().sync())
+            .await?;
+        let bob = SyncHandle::spawn(bob_store, None, "bob".to_string());
+        bob.open(namespace.id(), OpenOpts::default().sync()).await?;
+        run_sync(
+            alice.clone(),
+            alice_peer,
+            bob.clone(),
+            bob_peer,
+            namespace.id(),
+        )
+        .await?;
+        let _alice_store = alice.shutdown().await?;
+        let mut bob_store = bob.shutdown().await?;
+
+        let held = bob_store
+            .get_many(namespace.id(), Query::all().include_empty())?
+            .map(|entry| entry.map(|entry| entry.key().to_vec()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            held,
+            vec![b"whole".to_vec()],
+            "the receiving side must hold the whole entry alone"
         );
         Ok(())
     }

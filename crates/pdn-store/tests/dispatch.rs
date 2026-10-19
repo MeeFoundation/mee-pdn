@@ -14,10 +14,7 @@ use iroh::{endpoint::presets, protocol::Router, Endpoint, PublicKey, Watcher as 
 use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 use iroh_gossip::net::Gossip;
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc, DocsApi,
-    },
+    api::{AddrInfoOptions, Doc, DocsApi},
     net::{accept_session, connect_and_sync, refuse_session, AbortReason, ConnectError},
     protocol::{Docs, DocsDispatch, IdentityResolver},
     store::Query,
@@ -170,7 +167,7 @@ async fn namespace_with(api: &DocsApi, other: &DocsApi, value: &[u8]) -> Result<
     let doc = api.create().await?;
     let author = api.author_default().await?;
     doc.set_bytes(author, KEY.to_vec(), value.to_vec()).await?;
-    let ticket = doc.share(ShareMode::Read, AddrInfoOptions::Id).await?;
+    let ticket = doc.share(AddrInfoOptions::Id).await?;
     let theirs = other.import_namespace(ticket.capability).await?;
     Ok((doc, theirs))
 }
@@ -232,8 +229,13 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
     ] {
         // Contacts only: no swarm, so the only session either node can
         // open is the dial this scenario makes.
-        doc.start_sync_scoped(vec![Contact::new(serving_addr.clone(), identity)], identity)
-            .await?;
+        doc.sync_with_peers(
+            vec![Contact::new(serving_addr.clone(), identity)],
+            vec![],
+            identity,
+            false,
+        )
+        .await?;
         assert!(
             eventually(|| holds(doc, value)).await?,
             "the session for {identity:?} carried nothing"
@@ -276,7 +278,6 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
         CALLER,
         serving_addr.clone(),
         None,
-        None,
         pdn_store::admit_all(),
     )
     .await
@@ -288,7 +289,6 @@ async fn a_session_is_dispatched_by_the_identity_it_names() -> Result<()> {
         WORK,
         CALLER,
         serving_addr.clone(),
-        None,
         None,
         pdn_store::admit_all(),
     )
@@ -332,7 +332,12 @@ async fn a_session_handed_to_another_identitys_engine_is_refused() -> Result<()>
     let (_work_doc, work_here) =
         namespace_with(serving.work.api(), dialing.docs.api(), WORK_VALUE).await?;
     work_here
-        .start_sync_scoped(vec![Contact::new(serving_addr.clone(), WORK)], WORK)
+        .sync_with_peers(
+            vec![Contact::new(serving_addr.clone(), WORK)],
+            vec![],
+            WORK,
+            false,
+        )
         .await?;
     assert!(
         eventually(|| holds(&work_here, WORK_VALUE)).await?,
@@ -347,7 +352,6 @@ async fn a_session_handed_to_another_identitys_engine_is_refused() -> Result<()>
         LEISURE,
         CALLER,
         serving_addr,
-        None,
         None,
         pdn_store::admit_all(),
     )
@@ -382,7 +386,7 @@ async fn the_dialing_side_is_asked_about_the_identity_it_addresses() -> Result<(
     let namespace = work_here.id();
 
     work_here
-        .start_sync_scoped(vec![Contact::new(serving_addr, WORK)], WORK)
+        .sync_with_peers(vec![Contact::new(serving_addr, WORK)], vec![], WORK, false)
         .await?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -446,9 +450,11 @@ async fn a_remote_always_syncing_is_redialed_a_bounded_number_of_times() -> Resu
         .accept(pdn_store::ALPN, busy.clone())
         .spawn();
     let doc = dialing.docs.api().create().await?;
-    doc.start_sync_scoped(
+    doc.sync_with_peers(
         vec![Contact::new(busy_router.endpoint().addr(), WORK)],
+        vec![],
         CALLER,
+        false,
     )
     .await?;
 
@@ -478,9 +484,11 @@ async fn a_dial_toward_a_peer_that_is_no_neighbor_is_not_tried_again() -> Result
     let dialing = dialing_node().await?;
     let doc = dialing.docs.api().create().await?;
     let gone = iroh::SecretKey::from_bytes(&[0x9d; 32]).public();
-    doc.start_sync_scoped(
+    doc.sync_with_peers(
         vec![Contact::new(iroh::EndpointAddr::new(gone), WORK)],
+        vec![],
         CALLER,
+        false,
     )
     .await?;
 
@@ -671,7 +679,7 @@ async fn a_download_from_a_neighbor_is_tried_again_until_the_replica_is_left() -
         "the download was not tried again"
     );
 
-    ours.leave().await?;
+    dialing.docs.drop_doc(ours.id()).await?;
     let at_leave = asked();
     tokio::time::sleep(Duration::from_secs(17)).await;
     assert_eq!(
@@ -738,7 +746,6 @@ async fn a_session_refused_when_asked_again_frees_the_pairs_slot() -> Result<()>
             WORK,
             CALLER,
             serving.endpoint().addr(),
-            None,
             None,
             pdn_store::admit_all(),
         )

@@ -84,23 +84,20 @@ mod tests {
     use iroh::PublicKey;
 
     use super::*;
-    use crate::NamespaceId;
+    use crate::NamespaceSecret;
 
+    /// A write ticket encodes to the bytes the build before a change wrote,
+    /// so a ticket a PMS stored decodes after the change to the same
+    /// namespace secret, node and identity.
     #[test]
     fn test_ticket_base32() {
         let node_id =
             PublicKey::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
                 .unwrap();
-        let namespace_id = NamespaceId::from(
-            &<[u8; 32]>::try_from(
-                hex::decode("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
+        let secret = NamespaceSecret::from_bytes(&[0x11; 32]);
 
         let ticket = DocTicket {
-            capability: Capability::Read(namespace_id),
+            capability: Capability::Write(secret),
             nodes: vec![EndpointAddr::new(node_id)],
             identity: Identity::from_bytes([0xab; 32]),
         };
@@ -115,14 +112,23 @@ mod tests {
             .unwrap();
         let expected = parse_hexdump("
             00 # variant
-            01 # capability discriminator, 1 = read
-            ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6 # namespace id, 32 bytes, see above
+            00 # capability discriminator, 0 = write
+            20 # the secret's length, 32
+            1111111111111111111111111111111111111111111111111111111111111111 # namespace secret, 32 bytes
             01 # one node
             ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6 # node id, 32 bytes, see above
             00 # no addrs
             abababababababababababababababababababababababababababababababab # identity, 32 bytes
         ").unwrap();
         assert_eq!(base32, expected);
+    }
+
+    /// A write capability's raw form, as the namespaces table stores it, is
+    /// the kind byte `1` and the secret's bytes.
+    #[test]
+    fn a_write_capability_is_stored_as_kind_one_and_its_secret() {
+        let secret = NamespaceSecret::from_bytes(&[0x11; 32]);
+        assert_eq!(Capability::Write(secret).raw(), (1, [0x11; 32]));
     }
 
     /// Parses a commented multi line hexdump into a vector of bytes.

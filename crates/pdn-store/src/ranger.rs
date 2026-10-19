@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::ContentStatus;
 
 /// Store entries that can be fingerprinted and put into ranges.
-pub trait RangeEntry: Debug + Clone {
+pub(crate) trait RangeEntry: Debug + Clone {
     /// The key type for this entry.
     ///
     /// This type must implement [`Ord`] to define the range ordering used in the set
@@ -47,20 +47,14 @@ pub enum ValidateOutcome {
 }
 
 /// A trait constraining types that are valid entry keys.
-pub trait RangeKey: Sized + Debug + Ord + PartialEq + Clone + 'static {
+pub(crate) trait RangeKey: Sized + Debug + Ord + PartialEq + Clone + 'static {
     /// Returns `true` if `self` is a prefix of `other`.
     #[cfg(test)]
     fn is_prefix_of(&self, other: &Self) -> bool;
-
-    /// Returns true if `other` is a prefix of `self`.
-    #[cfg(test)]
-    fn is_prefixed_by(&self, other: &Self) -> bool {
-        other.is_prefix_of(self)
-    }
 }
 
 /// A trait constraining types that are valid entry values.
-pub trait RangeValue: Sized + Debug + Ord + PartialEq + Clone + 'static {}
+pub(crate) trait RangeValue: Sized + Debug + Ord + PartialEq + Clone + 'static {}
 
 /// Stores a range.
 ///
@@ -114,7 +108,7 @@ impl<K> From<(K, K)> for Range<K> {
 }
 
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Fingerprint(pub [u8; 32]);
+pub(crate) struct Fingerprint(pub [u8; 32]);
 
 impl Debug for Fingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,7 +132,7 @@ impl std::ops::BitXorAssign for Fingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RangeFingerprint<K> {
+pub(crate) struct RangeFingerprint<K> {
     #[serde(bound(
         serialize = "Range<K>: Serialize",
         deserialize = "Range<K>: Deserialize<'de>"
@@ -150,7 +144,7 @@ pub struct RangeFingerprint<K> {
 
 /// Transfers items inside a range to the other participant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RangeItem<E: RangeEntry> {
+pub(crate) struct RangeItem<E: RangeEntry> {
     /// The range out of which the elements are.
     #[serde(bound(
         serialize = "Range<E::Key>: Serialize",
