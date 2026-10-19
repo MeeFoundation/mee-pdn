@@ -15,9 +15,11 @@ count=$1
 shift
 docker info >/dev/null 2>&1 || { echo "no container daemon — the stand needs one"; exit 1; }
 just build-image
+just build-observation-image
 PDN_STAND_IMAGE=$(just stand-image)
-[ -n "$PDN_STAND_IMAGE" ] || { echo "the image built, but the daemon does not name it"; exit 1; }
-export PDN_STAND_IMAGE
+PDN_STAND_OBSERVATION_IMAGE=$(just stand-image pdn-node-http:observation)
+[ -n "$PDN_STAND_IMAGE" ] && [ -n "$PDN_STAND_OBSERVATION_IMAGE" ] || { echo "the images built, but the daemon does not name them"; exit 1; }
+export PDN_STAND_IMAGE PDN_STAND_OBSERVATION_IMAGE
 # The paths the harness writes to (`common/mod.rs`).
 logs=target/tmp/stand-logs
 replaced_log=target/tmp/stand-replacements.log

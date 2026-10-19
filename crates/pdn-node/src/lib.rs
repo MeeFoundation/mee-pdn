@@ -9,6 +9,8 @@ mod armer;
 mod ceremony;
 pub mod identity;
 pub mod linking;
+#[cfg(feature = "test-util")]
+pub mod observation;
 pub mod pods;
 pub mod runtime;
 pub mod sync;
@@ -24,8 +26,8 @@ pub use pods::{
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
 pub use ceremony::InviterUnreachable;
 pub use data_layer::{
-    CatchUpTimeout, DirectoryHeld, OpId, Operation, PodStore, SpawnOptions, StorageConfig,
-    UnknownEntry, UnknownPod,
+    CatchUpTimeout, Connectivity, DirectoryHeld, OpId, Operation, PodStore, SpawnOptions,
+    StorageConfig, UnknownEntry, UnknownPod,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{

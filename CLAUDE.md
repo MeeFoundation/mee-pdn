@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Directory layout
 
-`mia-docs/` is a sibling repo cloned in-place at the top of the workspace (gitignored) — ADRs, openspec specs. `mia-ontologies/` is an optional one, cloned the same way.
+Sibling repos are cloned in-place at the top of the workspace, gitignored here and carrying their own history: `mia-docs/`, the optional `mia-ontologies/`, and the 2 the mobile host is built and consumed through.
 
 - **`mia-docs/` is the source of truth** — ADRs, specs, changes and code practices. What it says is what the platform is and is going to be.
 - **`mia-ontologies/` is the product's long-range vision, not a specification.** It is written without regard to this codebase, to its upstream dependencies (iroh and the rest) or to `mia-docs/`. Much of it is untested; some of it is unworkable, some of it wrong, and some of it contradicts the platform or itself — take nothing in it on faith. Read it for what the product may want in some distant future and may yet change its mind about; check every claim against `mia-docs/` and the code, and when the two disagree, `mia-docs/` wins and the disagreement is worth raising.
+- `pdn-sdk/` — the binding artifacts of the `pdn-mobile` facade: generation, the XCFramework, the Android archive, and the releases an application names. The facade itself is a crate of this workspace.
+- `pdn-app/` — the mobile application: React Native screens over a release of `pdn-sdk`, with its own README and CLAUDE.md.
 
 ## Project
 
@@ -31,12 +33,13 @@ Each crate carries its own `CLAUDE.md` with its contracts and what is deliberate
 - [`crates/pdn-layer`](crates/pdn-layer/) — the platform surface products consume: domain model and the `PdnOp` operation AST. No iroh dependencies.
 - [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / pods / sync services over `data-layer`, plus the linking ceremony (ADR-0012) and a pod's join (ADR-0015). No host or HTTP dependencies.
 - [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime, with the `/debug/` subtree behind `PDN_DEBUG` (`1` or `true`).
+- [`crates/pdn-mobile`](crates/pdn-mobile/) — the mobile host: a uniffi facade over the runtime, one handle owning one node, with its own error table. `pdn-sdk` packages what it produces.
 
 ## Commands
 
 Task runner is [just](https://github.com/casey/just) — `just --list` prints every recipe with its doc comment.
 
-`rust-toolchain.toml` pins the compiler and its components for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
+`rust-toolchain.toml` pins the compiler, its components and the mobile targets (an iOS device and simulator, Android) for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
 
 The devcontainer is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: `.devcontainer/sandcat/` is sandcat's generated setup copied unchanged, and this workspace's additions live in the files around it. [`.devcontainer/UPSTREAM.md`](.devcontainer/UPSTREAM.md) records each sync with upstream, the decisions taken in it, and how to run the next one.
 

@@ -397,6 +397,30 @@ impl Doc {
         self.engine()?.subscribe(self.namespace_id).await
     }
 
+    /// An ordered subscription to this document, as
+    /// [`Engine::observe`](crate::engine::Engine::observe) gives it.
+    pub async fn observe(
+        &self,
+        capacity: usize,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.engine()?.observe(self.namespace_id, capacity).await
+    }
+
+    /// [`Self::sync_with_peers`] with no recorded peer and the swarm joined,
+    /// with an ordered subscription attached, as
+    /// [`Engine::start_sync_observed`](crate::engine::Engine::start_sync_observed)
+    /// gives it.
+    pub async fn start_sync_observed(
+        &self,
+        peers: Vec<Contact>,
+        default_identity: Identity,
+        capacity: usize,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.engine()?
+            .start_sync_observed(self.namespace_id, peers, default_identity, capacity)
+            .await
+    }
+
     /// Returns sync peers for this document
     pub async fn get_sync_peers(&self) -> Result<Option<Vec<PeerIdBytes>>> {
         self.engine()?.sync.get_sync_peers(self.namespace_id).await

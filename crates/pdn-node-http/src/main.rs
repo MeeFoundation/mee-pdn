@@ -2,22 +2,22 @@
 //!
 //! Environment: `PDN_DATA_DIR` (required — the runtime's storage directory;
 //! the host offers no in-memory mode, and unset stops the start),
-//! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`), and
-//! `PDN_DEBUG` — `1` or `true` mounts the scaffolding `/debug/` routes,
-//! unset, `0` or `false` leaves them absent, and any other value stops the
-//! start. The binary is glue only — assembly and authorization posture
-//! live in `pdn-node` (see the library crate docs).
+//! `PDN_HOST` (default `127.0.0.1`), `PDN_PORT` (default `3011`),
+//! `PDN_CONNECTIVITY` (`direct` by default, `relays` or `product` for a peer
+//! that is not on this network), `PDN_POD_RECONCILE_INTERVAL_SECS` (the
+//! runtime's default unset, otherwise a positive whole number of seconds),
+//! and `PDN_DEBUG` — `1` or `true` mounts the
+//! scaffolding `/debug/` routes, unset, `0` or `false` leaves them absent,
+//! and any other value stops the start. The binary is glue only — assembly
+//! and authorization posture live in `pdn-node` (see the library crate docs).
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use pdn_node::{Runtime, SpawnOptions};
-use pdn_node_http::{bind_addr_from_env, data_dir_from_env, debug_enabled_from_env, router};
-
-/// How long `main` waits for axum's graceful drain before moving on to
-/// `runtime.shutdown()`. This budget and that shutdown together have to fit
-/// inside a container runtime's default grace — SIGTERM, then SIGKILL about
-/// 10 seconds later — or the drain is the first thing lost.
-const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+use pdn_node::Runtime;
+use pdn_node_http::{
+    bind_addr_from_env, connectivity_from_env, data_dir_from_env, debug_enabled_from_env,
+    pod_reconcile_interval_from_env, serve, spawn_options,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,10 +28,19 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = data_dir_from_env()?;
     let bind_addr = bind_addr_from_env()?;
     let debug_enabled = debug_enabled_from_env()?;
+    let connectivity = connectivity_from_env()?;
+    let pod_reconcile_interval = pod_reconcile_interval_from_env()?;
 
     // Spawned before the listener binds: an unusable directory exits here,
     // serving nothing and never falling back to memory.
-    let runtime = Arc::new(Runtime::spawn(SpawnOptions::on_directory(data_dir)).await?);
+    let runtime = Arc::new(
+        Runtime::spawn(spawn_options(
+            data_dir,
+            connectivity,
+            pod_reconcile_interval,
+        ))
+        .await?,
+    );
     // The two startup markers bracket the only silent stretch of a node's
     // life: without them a node stuck in `spawn` and one serving but
     // unreachable leave byte-identical logs.
@@ -57,30 +66,9 @@ async fn run(
     bind_addr: std::net::SocketAddr,
     debug_enabled: bool,
 ) -> anyhow::Result<()> {
-    let app = router(Arc::clone(runtime), debug_enabled);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = ?listener.local_addr()?, "HTTP listening");
-
-    // The drain budget starts counting only once a stop signal arrives.
-    let stopped = Arc::new(tokio::sync::Notify::new());
-    let signalled = Arc::clone(&stopped);
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        stop_signal().await;
-        signalled.notify_one();
-    });
-
-    let drain_budget_spent = async {
-        stopped.notified().await;
-        tokio::time::sleep(GRACEFUL_DRAIN_BUDGET).await;
-    };
-
-    tokio::select! {
-        served = serve => served.map_err(Into::into),
-        () = drain_budget_spent => {
-            tracing::warn!(?GRACEFUL_DRAIN_BUDGET, "HTTP graceful-drain budget expired");
-            Ok(())
-        },
-    }
+    serve(runtime, listener, debug_enabled, stop_signal()).await
 }
 
 /// Ctrl-C or SIGTERM: a container stop sends the latter, so on Ctrl-C alone

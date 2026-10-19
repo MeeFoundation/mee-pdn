@@ -14,25 +14,32 @@
 mod bind;
 mod error;
 mod identity;
+#[cfg(feature = "observation")]
+mod observation;
 mod parse;
 mod pods;
 pub mod shapes;
 
-use std::{future::Future, sync::Arc};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Query, Request, State},
+    http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse as _, Response},
     routing::{get, post},
     Router,
 };
 use pdn_node::{Runtime, SyncService as _};
+use tokio::sync::watch;
 
+#[cfg(feature = "observation")]
+pub use crate::observation::MAX_OPEN_STREAMS;
 pub use crate::{
     bind::{
-        bind_addr, bind_addr_from_env, data_dir, data_dir_from_env, debug_enabled,
-        debug_enabled_from_env, DEFAULT_HOST, DEFAULT_PORT,
+        bind_addr, bind_addr_from_env, connectivity, connectivity_from_env, data_dir,
+        data_dir_from_env, debug_enabled, debug_enabled_from_env, pod_reconcile_interval,
+        pod_reconcile_interval_from_env, spawn_options, DEFAULT_HOST, DEFAULT_PORT,
     },
     error::HostError,
 };
@@ -43,18 +50,68 @@ pub use crate::{
 pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Requests the `/debug/` subtree serves at once; past it, 503.
 pub const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// The response header naming the pod an observed join joined
+/// (`observation` feature).
+pub const POD_HEADER: &str = "pdn-pod";
+
+/// How long [`serve`] waits for axum's graceful drain once `stop` resolves.
+/// This budget and the runtime's shutdown after it together have to fit
+/// inside a container runtime's default grace — SIGTERM, then SIGKILL about
+/// 10 seconds later — or the drain is the first thing lost.
+pub const GRACEFUL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Serve `runtime` on `listener` until `stop` resolves, then drain for at
+/// most [`GRACEFUL_DRAIN_BUDGET`]. Open event streams end at `stop`.
+pub async fn serve(
+    runtime: &Arc<Runtime>,
+    listener: tokio::net::TcpListener,
+    debug: bool,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let (stopped, mut stopping) = watch::channel(false);
+    let app = assemble(Arc::clone(runtime), debug, stopping.clone());
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        stop.await;
+        let _ = stopped.send(true);
+    });
+    let drain_budget_spent = async {
+        if stopping.wait_for(|stopped| *stopped).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(GRACEFUL_DRAIN_BUDGET).await;
+    };
+    tokio::select! {
+        served = serve => served.map_err(Into::into),
+        () = drain_budget_spent => {
+            tracing::warn!(?GRACEFUL_DRAIN_BUDGET, "HTTP graceful-drain budget expired");
+            Ok(())
+        },
+    }
+}
 
 /// This one branch gates the whole `/debug/` subtree: off means absent, so
-/// requests there fall through to 404, not to an unauthorized answer.
+/// requests there fall through to 404, not to an unauthorized answer. Event
+/// streams of a router built here end only with the runtime.
 pub fn router(runtime: Arc<Runtime>, debug: bool) -> Router {
+    assemble(runtime, debug, watch::channel(false).1)
+}
+
+fn assemble(runtime: Arc<Runtime>, debug: bool, stopping: watch::Receiver<bool>) -> Router {
     let app = Router::new()
         .route("/live", get(live))
         .route("/ready", get(ready));
     let app = if debug {
-        let debug = debug_routes().layer(middleware::from_fn_with_state(
-            Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
-            admit_request,
-        ));
+        let routes = debug_routes();
+        #[cfg(feature = "observation")]
+        let routes = routes.merge(observation::routes(Arc::clone(&runtime), stopping));
+        #[cfg(not(feature = "observation"))]
+        drop(stopping);
+        let debug = routes
+            .layer(middleware::from_fn_with_state(
+                Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+                admit_request,
+            ))
+            .layer(middleware::from_fn(permit_any_origin));
         app.merge(debug)
     } else {
         app
@@ -96,6 +153,31 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, Host
     with_runtime_budget(runtime.sync().hosted_identities()).await?;
     with_runtime_budget(runtime.sync().check_storage()).await?;
     Ok("ok")
+}
+
+/// Cross-origin headers, so a page a browser loaded from somewhere else can
+/// drive this node the way an application drives its own. Scoped to the
+/// debug subtree, which exists only where `PDN_DEBUG` says so, and open to
+/// any origin because a stand that answers on loopback has no origin worth
+/// naming.
+async fn permit_any_origin(request: Request, next: Next) -> Response {
+    let preflight = request.method() == axum::http::Method::OPTIONS;
+    let mut response = if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    headers.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("content-type"),
+    );
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET,POST,PUT,DELETE,OPTIONS"),
+    );
+    response
 }
 
 /// One route to one service call. Deliberately absent, and to stay absent:
@@ -158,12 +240,30 @@ async fn debug_status(
     let sync = runtime.sync();
     let hosted = with_runtime_budget(sync.hosted_identities()).await?;
     let mut lines = vec![format!("node {}", sync.node_id())];
+    lines.extend(build_lines().map(str::to_owned));
     lines.extend(
         hosted
             .into_iter()
             .map(|identity| format!("hosts {identity}")),
     );
     Ok(lines.join("\n") + "\n")
+}
+
+/// Which build answers: `profile` from whether debug assertions are
+/// compiled in, so a caller can refuse to measure the wrong one.
+fn build_lines() -> [&'static str; 2] {
+    [
+        if cfg!(debug_assertions) {
+            "profile debug"
+        } else {
+            "profile release"
+        },
+        if cfg!(feature = "observation") {
+            "observation on"
+        } else {
+            "observation off"
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -188,6 +288,19 @@ mod tests {
         let err = result.expect_err("a pending future must time out, not resolve");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(elapsed, READINESS_BUDGET);
+    }
+
+    /// A debug build states `profile debug`, and the observation line
+    /// follows the feature it was built with.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_debug_build_states_its_profile() {
+        let observation = if cfg!(feature = "observation") {
+            "observation on"
+        } else {
+            "observation off"
+        };
+        assert_eq!(build_lines(), ["profile debug", observation]);
     }
 
     /// A request past the admission limit is shed with 503. The admission

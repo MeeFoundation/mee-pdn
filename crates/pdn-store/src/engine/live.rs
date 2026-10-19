@@ -35,8 +35,9 @@ use crate::{
     actor::SyncHandle,
     engine::gossip::GossipState,
     net::{
-        connect_and_sync_asking, handle_in_process_session, handle_session, AbortReason,
-        AcceptError, AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
+        connect_and_sync_asking, handle_in_process_session, handle_session, session_id,
+        AbortReason, AcceptError, AcceptOutcome, ConnectError, SessionId, SessionOpening,
+        SyncFinished,
     },
     subscribers::{Delivery, LagNotice, Subscribers},
     AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
@@ -120,6 +121,10 @@ pub(crate) enum ToLiveActor {
         /// Whether to join the replica's gossip swarm. Scoped access syncs
         /// without ever joining the swarm.
         join_gossip: bool,
+        /// An ordered subscriber, registered before the replica is opened
+        /// for sync and before the first dial.
+        #[debug("observer")]
+        observer: Option<async_channel::Sender<Event>>,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
     },
@@ -137,6 +142,15 @@ pub(crate) enum ToLiveActor {
         reply: sync::oneshot::Sender<()>,
     },
     Subscribe {
+        namespace: NamespaceId,
+        #[debug("sender")]
+        sender: async_channel::Sender<Event>,
+        #[debug("oneshot::Sender")]
+        reply: sync::oneshot::Sender<Result<()>>,
+    },
+    /// An ordered subscriber; refused for a namespace not syncing, whose
+    /// inserts this actor never receives.
+    Observe {
         namespace: NamespaceId,
         #[debug("sender")]
         sender: async_channel::Sender<Event>,
@@ -252,6 +266,13 @@ pub(crate) enum ToLiveActor {
 /// Events informing about actions of the live sync progress.
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, strum::Display)]
 pub enum Event {
+    /// A local insertion; only ordered subscribers receive it.
+    LocalInsert { entry: SignedEntry },
+    /// A remote insertion; only ordered subscribers receive it.
+    RemoteInsert {
+        from: crate::PeerIdBytes,
+        entry: SignedEntry,
+    },
     /// The content of an entry was downloaded and is now available at the local node
     ContentReady {
         /// The content hash of the newly available entry content
@@ -289,6 +310,7 @@ type SyncConnectRes = (
     PublicKey,
     Identity,
     SyncReason,
+    Option<SessionId>,
     Result<SyncFinished, ConnectError>,
 );
 /// The namespace and peer the session was opened on, then the identity it
@@ -298,6 +320,7 @@ type SyncAcceptRes = (
     NamespaceId,
     PublicKey,
     Identity,
+    Option<SessionId>,
     Result<SyncFinished, AcceptError>,
 );
 type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
@@ -647,15 +670,15 @@ impl LiveActor {
                 }
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
-                    let (namespace, peer, callee, reason, res) = res.context("running_sync_connect closed")?;
-                    self.on_sync_via_connect_finished(namespace, peer, callee, reason, res).await;
+                    let (namespace, peer, callee, reason, session, res) = res.context("running_sync_connect closed")?;
+                    self.on_sync_via_connect_finished(namespace, peer, callee, reason, session, res).await;
 
                 }
                 Some(res) = self.running_sync_accept.join_next(), if !self.running_sync_accept.is_empty() => {
                     trace!(?i, "tick: running_sync_accept");
-                    let (namespace, peer, caller, res) = res.context("running_sync_accept closed")?;
+                    let (namespace, peer, caller, session, res) = res.context("running_sync_accept closed")?;
                     self.release_peer_identity(namespace, peer, caller);
-                    self.on_sync_via_accept_finished(caller, res).await;
+                    self.on_sync_via_accept_finished(caller, session, res).await;
                 }
                 res = self.gossip.next_ended(), if !self.gossip.is_empty() => {
                     match res {
@@ -711,11 +734,18 @@ impl LiveActor {
                 recorded,
                 default_identity,
                 join_gossip,
+                observer,
                 reply,
             } => {
+                if let Some(observer) = &observer {
+                    self.subscribers.observe(namespace, observer.clone());
+                }
                 let res = self
                     .start_sync(namespace, peers, recorded, default_identity, join_gossip)
                     .await;
+                if let (Err(_), Some(observer)) = (&res, &observer) {
+                    self.subscribers.unobserve(namespace, observer);
+                }
                 reply.send(res).ok();
             }
             ToLiveActor::LeaveGossip { namespace, reply } => {
@@ -736,6 +766,19 @@ impl LiveActor {
             } => {
                 self.subscribers.subscribe(namespace, sender);
                 reply.send(Ok(())).ok();
+            }
+            ToLiveActor::Observe {
+                namespace,
+                sender,
+                reply,
+            } => {
+                let res = if self.state.is_syncing(&namespace) {
+                    self.subscribers.observe(namespace, sender);
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("{} is not syncing", namespace.fmt_short()))
+                };
+                reply.send(res).ok();
             }
             ToLiveActor::HandleSession { conn, opening } => {
                 self.handle_session(conn, opening).await;
@@ -976,6 +1019,7 @@ impl LiveActor {
             // bidirectional), so the embedder's access provider gates this
             // role exactly like the accept role, asked once the session's
             // snapshot is open.
+            let mut session = None;
             let res = connect_and_sync_asking(
                 &endpoint,
                 &sync,
@@ -984,9 +1028,10 @@ impl LiveActor {
                 caller,
                 EndpointAddr::new(peer),
                 &session_access,
+                &mut session,
             )
             .await;
-            (namespace, peer, callee, reason, res)
+            (namespace, peer, callee, reason, session, res)
         }
         .instrument(Span::current());
         self.running_sync_connect.spawn(fut);
@@ -1041,7 +1086,7 @@ impl LiveActor {
                 &session_access,
             )
             .await;
-            (namespace, peer, callee, reason, res)
+            (namespace, peer, callee, reason, None, res)
         }
         .instrument(Span::current());
         self.running_sync_connect.spawn(fut);
@@ -1385,6 +1430,7 @@ impl LiveActor {
         peer: PublicKey,
         callee: Identity,
         reason: SyncReason,
+        session: Option<SessionId>,
         result: Result<SyncFinished, ConnectError>,
     ) {
         match result {
@@ -1433,6 +1479,7 @@ impl LiveActor {
                     peer,
                     callee,
                     Origin::Connect(reason),
+                    session,
                     res.map_err(Into::into),
                 )
                 .await;
@@ -1586,6 +1633,7 @@ impl LiveActor {
     async fn on_sync_via_accept_finished(
         &mut self,
         caller: Identity,
+        session: Option<SessionId>,
         res: Result<SyncFinished, AcceptError>,
     ) {
         match res {
@@ -1595,6 +1643,7 @@ impl LiveActor {
                     state.peer,
                     caller,
                     Origin::Accept,
+                    session,
                     Ok(state),
                 )
                 .await
@@ -1613,6 +1662,7 @@ impl LiveActor {
                         peer,
                         caller,
                         Origin::Accept,
+                        session,
                         Err(anyhow::Error::from(err)),
                     )
                     .await;
@@ -1629,6 +1679,7 @@ impl LiveActor {
         peer: PublicKey,
         counterpart: Identity,
         origin: Origin,
+        session: Option<SessionId>,
         result: Result<SyncFinished>,
     ) {
         match &result {
@@ -1743,6 +1794,7 @@ impl LiveActor {
             result: result_for_event,
             finished: SystemTime::now(),
             started,
+            session,
         };
         self.subscribers
             .send(&namespace, Event::SyncFinished(ev))
@@ -1897,6 +1949,30 @@ impl LiveActor {
     }
 
     async fn on_replica_event(&mut self, event: crate::Event) -> Result<()> {
+        // Before anything else: a download this event queues completes after it.
+        match &event {
+            crate::Event::LocalInsert { namespace, entry } => {
+                self.subscribers
+                    .send_ordered(namespace, || Event::LocalInsert {
+                        entry: entry.clone(),
+                    })
+                    .await
+            }
+            crate::Event::RemoteInsert {
+                namespace,
+                entry,
+                from,
+                ..
+            } => {
+                self.subscribers
+                    .send_ordered(namespace, || Event::RemoteInsert {
+                        from: *from,
+                        entry: entry.clone(),
+                    })
+                    .await
+            }
+            crate::Event::Lagged { .. } => {}
+        }
         match event {
             crate::Event::LocalInsert { namespace, entry } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
@@ -2106,6 +2182,7 @@ impl LiveActor {
         opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     ) {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
+        let session = session_id(&conn);
         let accept_request_cb = self.accept_callback();
         let sync = self.sync.handle().clone();
         self.running_sync_accept.spawn(
@@ -2114,7 +2191,7 @@ impl LiveActor {
                 // The connection outlives the session it carries: dropping
                 // it at the dispatcher would cut the streams mid-exchange.
                 drop(conn);
-                (namespace, peer, caller, res)
+                (namespace, peer, caller, session, res)
             }
             .instrument(Span::current()),
         );
@@ -2129,7 +2206,7 @@ impl LiveActor {
         self.running_sync_accept.spawn(
             async move {
                 let res = handle_in_process_session(sync, opening, accept_request_cb).await;
-                (namespace, peer, caller, res)
+                (namespace, peer, caller, None, res)
             }
             .instrument(Span::current()),
         );
@@ -2163,6 +2240,9 @@ pub struct SyncEvent {
     pub started: SystemTime,
     /// Result of the sync operation
     pub result: std::result::Result<SyncDetails, String>,
+    /// The id both ends of a session over a network connection report;
+    /// `None` in process and for a dial that never connected.
+    pub session: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -2182,35 +2262,65 @@ impl From<&SyncFinished> for SyncDetails {
     }
 }
 
+/// The product's subscribers, which take inserts from the replica itself,
+/// and the ordered ones, which take them from this actor.
 #[derive(Debug, Default)]
-struct SubscribersMap(HashMap<NamespaceId, Subscribers<Event>>);
+struct SubscribersMap {
+    all: HashMap<NamespaceId, Subscribers<Event>>,
+    ordered: HashMap<NamespaceId, Subscribers<Event>>,
+}
 
 impl SubscribersMap {
     fn subscribe(&mut self, namespace: NamespaceId, sender: async_channel::Sender<Event>) {
-        self.0
+        self.all
             .entry(namespace)
             .or_default()
             .subscribe(sender, Delivery::Lossy);
     }
 
-    async fn send(&mut self, namespace: &NamespaceId, event: Event) -> bool {
-        debug!(namespace=%namespace.fmt_short(), %event, "emit event");
-        let Some(subscribers) = self.0.get_mut(namespace) else {
-            return false;
-        };
-        subscribers.send(event).await;
-        if subscribers.is_empty() {
-            self.0.remove(namespace);
+    fn observe(&mut self, namespace: NamespaceId, sender: async_channel::Sender<Event>) {
+        self.ordered
+            .entry(namespace)
+            .or_default()
+            .subscribe(sender, Delivery::Lossy);
+    }
+
+    fn unobserve(&mut self, namespace: NamespaceId, sender: &async_channel::Sender<Event>) {
+        if let Some(subscribers) = self.ordered.get_mut(&namespace) {
+            subscribers.unsubscribe(sender);
         }
-        true
+    }
+
+    async fn send(&mut self, namespace: &NamespaceId, event: Event) {
+        debug!(namespace=%namespace.fmt_short(), %event, "emit event");
+        for map in [&mut self.all, &mut self.ordered] {
+            if let Some(subscribers) = map.get_mut(namespace) {
+                subscribers.send(event.clone()).await;
+                if subscribers.is_empty() {
+                    map.remove(namespace);
+                }
+            }
+        }
+    }
+
+    /// Builds the event only for a namespace with an ordered subscriber.
+    async fn send_ordered(&mut self, namespace: &NamespaceId, event: impl FnOnce() -> Event) {
+        if let Some(subscribers) = self.ordered.get_mut(namespace) {
+            subscribers.send_with(event).await;
+            if subscribers.is_empty() {
+                self.ordered.remove(namespace);
+            }
+        }
     }
 
     fn remove(&mut self, namespace: &NamespaceId) {
-        self.0.remove(namespace);
+        self.all.remove(namespace);
+        self.ordered.remove(namespace);
     }
 
     fn clear(&mut self) {
-        self.0.clear();
+        self.all.clear();
+        self.ordered.clear();
     }
 }
 
