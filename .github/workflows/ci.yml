@@ -78,23 +78,21 @@ jobs:
   # is a break of the whole mobile host — and it is invisible to
   # `lint-test-wasm`, which builds for this runner's own target.
   mobile-android:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
+        run: rustup toolchain install
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
 
@@ -113,20 +111,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios
+        run: rustup toolchain install
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
 

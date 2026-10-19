@@ -39,7 +39,7 @@ Each crate carries its own `CLAUDE.md` with its contracts and what is deliberate
 
 Task runner is [just](https://github.com/casey/just) — `just --list` prints every recipe with its doc comment.
 
-`rust-toolchain.toml` pins the compiler, its components and the wasm targets for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
+`rust-toolchain.toml` pins the compiler, its components, the wasm targets and the mobile ones (an iOS device and simulator, Android) for everything that runs rustup — a developer's machine, CI, the devcontainer (mise reads the file there); `just setup-tooling` installs it. The stand image (`ops/Dockerfile`) does not see the file and names its own base image, so a bump moves both.
 
 The devcontainer is a [sandcat](https://github.com/VirtusLab/sandcat) sandbox: `.devcontainer/sandcat/` is sandcat's generated setup copied unchanged, and this workspace's additions live in the files around it. [`.devcontainer/UPSTREAM.md`](.devcontainer/UPSTREAM.md) records each sync with upstream, the decisions taken in it, and how to run the next one.
 
