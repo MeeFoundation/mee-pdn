@@ -12,7 +12,9 @@ echo "hammering $(basename "$exe") x$count (loopback, one process per iteration)
 fails=0
 i=1
 while [ "$i" -le "$count" ]; do
-  if out=$(RUST_BACKTRACE=1 "$exe" </dev/null 2>&1); then
+  # One test at a time: a panic hook one test installs is process-wide, and
+  # would count, or lose, the panics of a test running beside it.
+  if out=$(RUST_BACKTRACE=1 "$exe" --test-threads=1 </dev/null 2>&1); then
     printf '.'
   else
     printf 'X'

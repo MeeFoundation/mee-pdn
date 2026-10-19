@@ -183,6 +183,7 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
     },
+    #[cfg(test)]
     GetExact {
         author: AuthorId,
         key: Bytes,
@@ -594,6 +595,7 @@ impl SyncHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_exact(
         &self,
         namespace: NamespaceId,
@@ -1029,6 +1031,7 @@ impl Actor {
                 let res = self.store.register_useful_peer(namespace, peer);
                 send_reply(reply, res)
             }
+            #[cfg(test)]
             ReplicaAction::GetExact {
                 author,
                 key,

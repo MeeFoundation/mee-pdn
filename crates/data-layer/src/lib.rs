@@ -26,7 +26,9 @@ pub use identity_key::{
     creates, devices_verify, join_verifies, pdn_id_of, pod_id_of, IdentityKeyPair,
 };
 #[cfg(feature = "test-util")]
-pub use node::{CollectionPause, PodSession, PodSessions, PodStartPause};
+pub use node::{
+    BlobStreamHold, CollectionPause, PodSession, PodSessions, PodStartPause, StopStep, StopSteps,
+};
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;
 pub use pod::{

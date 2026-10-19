@@ -147,7 +147,7 @@ stress *args: _need-nextest
   @sh scripts/stress.sh "$@"
 
 # Local flaky-hunt: run one test BINARY in a loop — a fresh process per
-# iteration, running all its tests once via libtest.
+# iteration, running all its tests once via libtest, one after another.
 #
 # This amortizes the per-process node-startup cost across the binary's tests,
 # unlike nextest's process-per-test, which pays it per test and, on macOS,

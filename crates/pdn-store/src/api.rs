@@ -221,7 +221,8 @@ impl Doc {
         engine(&self.engine)
     }
 
-    /// Sets the content of a key to a byte array.
+    /// Sets the content of a key to a byte array, answering the hash of the
+    /// payload it wrote.
     pub async fn set_bytes(
         &self,
         author_id: AuthorId,
@@ -240,14 +241,9 @@ impl Doc {
         };
         engine
             .sync
-            .insert_local(self.namespace_id, author_id, key.clone(), hash, len as u64)
+            .insert_local(self.namespace_id, author_id, key, hash, len as u64)
             .await?;
-        let entry = engine
-            .sync
-            .get_exact(self.namespace_id, author_id, key, false)
-            .await?
-            .ok_or_else(|| anyhow!("failed to get entry after insertion"))?;
-        Ok(entry.content_hash())
+        Ok(hash)
     }
 
     /// Deletes `author_id`'s entry at `key` by writing an empty entry there;

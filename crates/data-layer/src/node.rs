@@ -20,7 +20,10 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher as _,
 };
 use iroh_blobs::{
-    provider::{events::EventSender, handle_stream, StreamPair},
+    protocol::Request,
+    provider::{
+        events::EventSender, handle_get, handle_get_many, handle_observe, handle_push, StreamPair,
+    },
     store::{fs::FsStore, mem::MemStore, GcConfig, ProtectCb, ProtectOutcome},
     Hash, ALPN as BLOBS_ALPN,
 };
@@ -114,6 +117,8 @@ impl ProtocolHandler for PanicGuarded {
 struct BlobsServing {
     store: iroh_blobs::api::Store,
     streams: TaskTracker,
+    #[cfg(feature = "test-util")]
+    hold: BlobStreamHoldSlot,
 }
 
 impl ProtocolHandler for BlobsServing {
@@ -121,10 +126,69 @@ impl ProtocolHandler for BlobsServing {
     /// task untracked, without the provider events the node takes none of.
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         while let Ok(pair) = StreamPair::accept(&connection, EventSender::DEFAULT).await {
-            self.streams.spawn(handle_stream(pair, self.store.clone()));
+            self.streams.spawn(serve_blob_stream(
+                pair,
+                self.store.clone(),
+                #[cfg(feature = "test-util")]
+                self.hold.clone(),
+                #[cfg(feature = "test-util")]
+                self.streams.clone(),
+            ));
         }
         Ok(())
     }
+}
+
+/// `iroh_blobs::provider::handle_stream`, split at the read of the request
+/// so a scenario can hold a stream between its request and the store.
+async fn serve_blob_stream(
+    mut pair: StreamPair,
+    store: iroh_blobs::api::Store,
+    #[cfg(feature = "test-util")] hold_slot: BlobStreamHoldSlot,
+    #[cfg(feature = "test-util")] streams: TaskTracker,
+) {
+    let request = match pair.read_request().await {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::debug!("blob stream failed: {err:#}");
+            return;
+        }
+    };
+    #[cfg(feature = "test-util")]
+    let held = hold_blob_stream(&hold_slot, &streams).await;
+    let served = match request {
+        Request::Get(request) => handle_get(pair, store, request).await,
+        Request::GetMany(request) => handle_get_many(pair, store, request).await,
+        Request::Observe(request) => handle_observe(pair, store, request).await,
+        Request::Push(request) => handle_push(pair, store, request).await,
+        _ => Ok(()),
+    };
+    if let Err(err) = served {
+        tracing::debug!("blob stream failed: {err:#}");
+    }
+    #[cfg(feature = "test-util")]
+    if let Some(held) = held {
+        held.done.notify_one();
+    }
+}
+
+/// Holds a stream that read its request, if a scenario armed a hold, until
+/// the stop closes the stream tracker — its router's shutdown has returned
+/// by then — or the scenario releases it.
+#[cfg(feature = "test-util")]
+async fn hold_blob_stream(
+    hold_slot: &BlobStreamHoldSlot,
+    streams: &TaskTracker,
+) -> Option<Arc<BlobStreamHold>> {
+    let held = hold_slot.lock().ok().and_then(|mut slot| slot.take())?;
+    held.reached.notify_one();
+    while !streams.is_closed() {
+        tokio::select! {
+            () = held.release.notified() => break,
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+    Some(held)
 }
 
 /// Default of [`SpawnOptions::reconcile_interval`]. Gossip is best-effort
@@ -316,6 +380,15 @@ pub struct SyncNode {
     /// Holds the next blob collection run once it has read the replicas.
     #[cfg(feature = "test-util")]
     collection_pause: CollectionPauseSlot,
+    /// Every blob collection run the protect callback was asked about.
+    #[cfg(feature = "test-util")]
+    collection_runs: Arc<std::sync::atomic::AtomicUsize>,
+    /// Holds the next blob stream once it has read its request.
+    #[cfg(feature = "test-util")]
+    blob_stream_hold: BlobStreamHoldSlot,
+    /// The steps of every stop, in the order they ran.
+    #[cfg(feature = "test-util")]
+    stop_steps: StopSteps,
     /// Handed to every hosted identity's book; empty until a scenario takes
     /// the channel, so nothing accumulates unread.
     #[cfg(feature = "test-util")]
@@ -341,9 +414,9 @@ pub struct SyncNode {
     /// Cloned into every hosted identity's engine; the task at the other
     /// end holds the identity map weakly (`serve_co_located`).
     co_located_requests: pdn_store::engine::CoLocatedRequests,
-    /// Released by `shutdown` with the stores, or with the process. `None`
-    /// on a memory node.
-    directory_lock: Option<std::fs::File>,
+    /// Taken by the stop with the stores, or released with the process.
+    /// `None` on a memory node.
+    directory_lock: Mutex<Option<std::fs::File>>,
     /// `None` on a memory node, which comes back as nobody.
     address_book: Option<Arc<AddressBook>>,
 }
@@ -540,19 +613,109 @@ impl HostedStack {
     }
 }
 
-/// A node dropped without [`shutdown`](SyncNode::shutdown) still lets go of
-/// its blob store: blob collection's task holds the store, and ends only once
-/// the store has stopped.
+/// A node dropped without [`shutdown`](SyncNode::shutdown) stops as a
+/// stopped one does, in a task of its own; dropped outside a tokio runtime,
+/// it stops nothing but its directory lock.
 impl Drop for SyncNode {
     fn drop(&mut self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        if let Some(stop) = self
+            .reconciler_stop
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            let _ = stop.send(());
+        }
+        let identities = Arc::clone(&self.identities);
+        let router = self.router.clone();
+        let blob_streams = self.blob_streams.clone();
         let blobs = self.blobs.clone();
+        let directory_lock = self.directory_lock.get_mut().ok().and_then(Option::take);
+        #[cfg(feature = "test-util")]
+        let stop_steps = Arc::clone(&self.stop_steps);
         let _detached = runtime.spawn(async move {
-            let _ = blobs.shutdown().await;
+            let _ = stop_node(
+                &identities,
+                &router,
+                &blob_streams,
+                &blobs,
+                directory_lock,
+                #[cfg(feature = "test-util")]
+                &stop_steps,
+            )
+            .await;
         });
     }
+}
+
+/// The stop [`SyncNode::shutdown`] and a node's drop share: every engine,
+/// then the router, then the blob protocol's streams, then the blob store
+/// and the directory lock (the `node-assembly` spec, "Shutdown stops every
+/// protocol side by side, and a late call fails").
+async fn stop_node(
+    identities: &Identities,
+    router: &Router,
+    blob_streams: &TaskTracker,
+    blobs: &iroh_blobs::api::Store,
+    directory_lock: Option<std::fs::File>,
+    #[cfg(feature = "test-util")] stop_steps: &StopSteps,
+) -> Result<()> {
+    #[cfg(feature = "test-util")]
+    let step = |done: StopStep| {
+        if let Ok(mut steps) = stop_steps.lock() {
+            steps.push(done);
+        }
+    };
+    // Before the blob store closes: a running engine starts downloads that
+    // read it. The router serves the dispatcher, not the engines, so each
+    // engine is shut down by name.
+    let stacks: Vec<Arc<HostedStack>> = match identities.read() {
+        Ok(hosted) => hosted.values().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
+    };
+    for stack in stacks {
+        let _ = stack.docs.engine().shutdown().await;
+    }
+    #[cfg(feature = "test-util")]
+    step(StopStep::Engines);
+    // Everything below runs whatever the router answers: a stop that
+    // returned early would leave the blob store and the directory lock
+    // held for the rest of the process.
+    let routing_stopped = router.shutdown().await;
+    #[cfg(feature = "test-util")]
+    step(StopStep::Router);
+    // A request a stream read before the router's shutdown still reaches
+    // the store, and the store's shutdown closes its database beneath it
+    // at once: the read then poisons the entry and iroh-blobs panics on
+    // its own task.
+    blob_streams.close();
+    let finished = tokio::time::timeout(BLOB_STORE_IDLE_WAIT, async {
+        blob_streams.wait().await;
+        blobs.wait_idle().await
+    })
+    .await;
+    if finished.is_err() {
+        tracing::warn!("the blob store was still busy when the node stopped");
+    }
+    #[cfg(feature = "test-util")]
+    step(StopStep::BlobStreams);
+    // Explicit rather than on the last handle's drop: a node respawned on
+    // the same directory would meet its predecessor's database lock.
+    // Best-effort: a store already shut down answers with an error.
+    let _ = blobs.shutdown().await;
+    #[cfg(feature = "test-util")]
+    step(StopStep::BlobStore);
+    // With the stores, not with the node's drop: a detached task holding
+    // the node alive a moment longer must not make a spawn on the same
+    // directory read as a second running node.
+    if let Some(lock) = directory_lock {
+        let _ = lock.unlock();
+    }
+    routing_stopped?;
+    Ok(())
 }
 
 /// The dial side of a node's protocols: connect out, read the node's own
@@ -636,12 +799,16 @@ impl SyncNode {
         )));
         #[cfg(feature = "test-util")]
         let collection_pause = CollectionPauseSlot::default();
+        #[cfg(feature = "test-util")]
+        let collection_runs = Arc::<std::sync::atomic::AtomicUsize>::default();
         let blobs_store = open_blob_store(
             &options,
             &identities,
             &collecting,
             #[cfg(feature = "test-util")]
             &collection_pause,
+            #[cfg(feature = "test-util")]
+            &collection_runs,
         )
         .await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -658,6 +825,8 @@ impl SyncNode {
         };
 
         let blob_streams = TaskTracker::new();
+        #[cfg(feature = "test-util")]
+        let blob_stream_hold = BlobStreamHoldSlot::default();
         let mut router = Router::builder(endpoint);
         if serve_payloads {
             router = router.accept(
@@ -665,6 +834,8 @@ impl SyncNode {
                 BlobsServing {
                     store: blobs_store.clone(),
                     streams: blob_streams.clone(),
+                    #[cfg(feature = "test-util")]
+                    hold: Arc::clone(&blob_stream_hold),
                 },
             );
         }
@@ -721,6 +892,12 @@ impl SyncNode {
             #[cfg(feature = "test-util")]
             collection_pause,
             #[cfg(feature = "test-util")]
+            collection_runs,
+            #[cfg(feature = "test-util")]
+            blob_stream_hold,
+            #[cfg(feature = "test-util")]
+            stop_steps: StopSteps::default(),
+            #[cfg(feature = "test-util")]
             pod_verdicts: Arc::default(),
             #[cfg(feature = "test-util")]
             session_traces: Arc::default(),
@@ -731,7 +908,7 @@ impl SyncNode {
             pod_notices: Arc::default(),
             reconciler_stop: Mutex::new(Some(reconciler_stop)),
             co_located_requests,
-            directory_lock,
+            directory_lock: Mutex::new(directory_lock),
             address_book,
         })
     }
@@ -1202,6 +1379,33 @@ impl SyncNode {
             *slot = Some(Arc::clone(&pause));
         }
         pause
+    }
+
+    /// Holds the next blob stream once it has read its request, before it
+    /// reaches the blob store, until `release` is notified or the node's
+    /// stop has shut its router down.
+    #[cfg(feature = "test-util")]
+    pub fn hold_next_blob_stream_for_test(&self) -> Arc<BlobStreamHold> {
+        let hold = Arc::new(BlobStreamHold::default());
+        if let Ok(mut slot) = self.blob_stream_hold.lock() {
+            *slot = Some(Arc::clone(&hold));
+        }
+        hold
+    }
+
+    /// The steps every stop of this node took, a drop's included, in the
+    /// order they ran.
+    #[cfg(feature = "test-util")]
+    pub fn stop_steps_for_test(&self) -> StopSteps {
+        Arc::clone(&self.stop_steps)
+    }
+
+    /// The blob collection runs this node's protect callback was asked
+    /// about since spawn; a count that grows after the node stopped is a
+    /// collection task outliving its store.
+    #[cfg(feature = "test-util")]
+    pub fn collection_runs_for_test(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.collection_runs)
     }
 
     /// Import both stores of `pod` from their write tickets: nothing new for
@@ -2330,48 +2534,21 @@ impl SyncNode {
                 tracing::warn!("the address book was not saved at shutdown: {err:#}");
             }
         }
-        // The engines before the router: a running engine starts downloads
-        // that read the blob store the router's shutdown closes. The router
-        // serves the dispatcher, not the engines, so each engine is shut down
-        // by name.
-        let stacks: Vec<Arc<HostedStack>> = match self.identities.read() {
-            Ok(hosted) => hosted.values().cloned().collect(),
-            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
-        };
-        for stack in stacks {
-            let _ = stack.docs.engine().shutdown().await;
-        }
-        // Everything below runs whatever the router answers: a stop that
-        // returned early would leave the blob store and the directory lock
-        // held for the rest of the process.
-        let routed = self.router.shutdown().await;
-        // A request a stream read before the router's shutdown still reaches
-        // the store, and the store's shutdown closes its database beneath it
-        // at once: the read then poisons the entry and iroh-blobs panics on
-        // its own task.
-        self.blob_streams.close();
-        let finished = tokio::time::timeout(BLOB_STORE_IDLE_WAIT, async {
-            self.blob_streams.wait().await;
-            self.blobs.wait_idle().await
-        })
-        .await;
-        if finished.is_err() {
-            tracing::warn!("the blob store was still busy when the node stopped");
-        }
-        // After the router, whose shutdown awaits every connection's handler,
-        // and explicit rather than on the last handle's drop: a node
-        // respawned on the same directory would meet its predecessor's
-        // database lock. Best-effort: a store already shut down answers with
-        // an error.
-        let _ = self.blobs.shutdown().await;
-        // With the stores, not with this value's drop: a detached task
-        // holding the node alive a moment longer must not make a spawn on
-        // the same directory read as a second running node.
-        if let Some(lock) = &self.directory_lock {
-            let _ = lock.unlock();
-        }
-        routed?;
-        Ok(())
+        let directory_lock = self
+            .directory_lock
+            .lock()
+            .ok()
+            .and_then(|mut held| held.take());
+        stop_node(
+            &self.identities,
+            &self.router,
+            &self.blob_streams,
+            &self.blobs,
+            directory_lock,
+            #[cfg(feature = "test-util")]
+            &self.stop_steps,
+        )
+        .await
     }
 
     fn stack(&self, identity: PdnId) -> Result<Option<Arc<HostedStack>>> {
@@ -2632,6 +2809,7 @@ async fn open_blob_store(
     identities: &Identities,
     collecting: &Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-util")] pause: &CollectionPauseSlot,
+    #[cfg(feature = "test-util")] runs: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<iroh_blobs::api::Store> {
     let collection = GcConfig {
         interval: options.blob_collection_interval,
@@ -2640,6 +2818,8 @@ async fn open_blob_store(
             Arc::clone(collecting),
             #[cfg(feature = "test-util")]
             Arc::clone(pause),
+            #[cfg(feature = "test-util")]
+            Arc::clone(runs),
         )),
     };
     Ok(match &options.storage {
@@ -2666,8 +2846,11 @@ fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
     collecting: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-util")] pause: CollectionPauseSlot,
+    #[cfg(feature = "test-util")] runs: Arc<std::sync::atomic::AtomicUsize>,
 ) -> ProtectCb {
     Arc::new(move |live: &mut HashSet<Hash>| {
+        #[cfg(feature = "test-util")]
+        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let identities = identities.clone();
         let collecting = Arc::clone(&collecting);
         #[cfg(feature = "test-util")]
@@ -3975,6 +4158,34 @@ pub struct CollectionPause {
 
 #[cfg(feature = "test-util")]
 type CollectionPauseSlot = Arc<std::sync::Mutex<Option<Arc<CollectionPause>>>>;
+
+/// The hold [`SyncNode::hold_next_blob_stream_for_test`] puts on a blob
+/// stream: `reached` once it has read its request, `done` once it has
+/// answered it.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Default)]
+pub struct BlobStreamHold {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub done: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-util")]
+type BlobStreamHoldSlot = Arc<std::sync::Mutex<Option<Arc<BlobStreamHold>>>>;
+
+/// One step of a node's stop, as [`SyncNode::stop_steps_for_test`] lists
+/// them.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStep {
+    Engines,
+    Router,
+    BlobStreams,
+    BlobStore,
+}
+
+#[cfg(feature = "test-util")]
+pub type StopSteps = Arc<std::sync::Mutex<Vec<StopStep>>>;
 
 /// The sessions one replica of a pod's store finishes, from
 /// [`SyncNode::watch_pod_sessions`]. Unread past its buffer it drops
