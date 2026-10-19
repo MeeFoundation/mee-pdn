@@ -52,6 +52,11 @@ unsafe_code = "deny"
 unused_must_use = "deny"
 non_ascii_idents = "deny"
 
+# No crate here is published: its docs are read in the source or in a build
+# with private items, where a link from a public item to a private one works.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
 [workspace.lints.clippy]
 # Groups
 correctness = { level = "deny", priority = -1 }

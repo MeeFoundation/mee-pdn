@@ -67,6 +67,8 @@ Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/te
 
 Strict safety-first linting, configured in the workspace `Cargo.toml`, `clippy.toml` and `rustfmt.toml`, enforced by `just check`. Prefer `.get()` and `TryFrom`/`TryInto` over indexing and `as`.
 
+`just check` also builds every crate's documentation, private items included, with rustdoc's warnings denied, so a doc link that no longer resolves — a renamed function, a constant behind `#[cfg(test)]` — fails it. Outside `crates/pdn-store` a public item's doc may link a private one (`[workspace.lints.rustdoc]` in the workspace `Cargo.toml`): no crate is published, and its docs are read in the source.
+
 An emptiness assert compares the value with an empty one, so that a failure prints what the value held:
 
 - `assert_eq!(listed, [])`, and `assert_ne!(listed, [])` for a value that must hold something.
