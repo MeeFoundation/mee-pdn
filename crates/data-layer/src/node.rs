@@ -203,6 +203,14 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// writes arrive over its swarm, and its pass catches up what gossip lost.
 const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// When the pod pass first runs after a spawn: past the 30 s in which a
+/// peer's connections to this node's previous process time out (QUIC's idle
+/// timeout, which iroh keeps). A peer's path selector is asked again when a
+/// connection opens, not when one closes, so the connection this run opens
+/// is what moves a peer that held more connections to the old address than
+/// this process opened at its start (`components/mee-pdn/iroh-defects.md`).
+const POD_PASS_AFTER_SPAWN: Duration = Duration::from_secs(45);
+
 /// The peers one run of the pod stores' pass reaches per store, so a
 /// pod's sessions stay bounded whatever its size.
 const POD_RECONCILE_PEERS: usize = 5;
@@ -3440,10 +3448,11 @@ async fn reconcile_pass(
     }
 }
 
-/// Every `interval`, reconcile each store of every pod a hosted identity
-/// holds with at most [`POD_RECONCILE_PEERS`] peers, drawn afresh from its
-/// contacts — derived first from the pod's membership — and the peers the
-/// engine recorded. A failed run is retried by the next. Ends as
+/// Every `interval`, the first run within [`POD_PASS_AFTER_SPAWN`] of the
+/// spawn, reconcile each store of every pod a hosted identity holds with at
+/// most [`POD_RECONCILE_PEERS`] peers, drawn afresh from its contacts —
+/// derived first from the pod's membership — and the peers the engine
+/// recorded. A failed run is retried by the next. Ends as
 /// [`reconcile_pass`] does.
 async fn pod_reconcile_pass(
     interval: Duration,
@@ -3452,10 +3461,9 @@ async fn pod_reconcile_pass(
     probes: Arc<PassProbes>,
     mut stop: watch::Receiver<()>,
 ) {
-    while tokio::time::timeout(interval, stop.changed())
-        .await
-        .is_err()
-    {
+    let mut wait = interval.min(POD_PASS_AFTER_SPAWN);
+    while tokio::time::timeout(wait, stop.changed()).await.is_err() {
+        wait = interval;
         let stacks: Vec<Arc<HostedStack>> = match identities.read() {
             Ok(guard) => guard.values().cloned().collect(),
             Err(_poisoned) => continue,

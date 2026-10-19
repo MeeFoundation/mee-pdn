@@ -502,6 +502,13 @@ impl Runtime {
         self.state.lock().await.node.hosted_identities()
     }
 
+    /// The runtime's dial side, for a scenario that holds connections of
+    /// its own to a peer.
+    #[cfg(feature = "test-util")]
+    pub async fn dial_handle_for_test(&self) -> data_layer::DialHandle {
+        self.state.lock().await.node.dial_handle()
+    }
+
     /// [`SyncNode::own_entries_without_payload`](data_layer::SyncNode::own_entries_without_payload)
     /// for `identity`.
     #[cfg(feature = "test-util")]

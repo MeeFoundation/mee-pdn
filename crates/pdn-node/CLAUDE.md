@@ -10,4 +10,4 @@ Each `Runtime` is one running node hosting any number of identities, each added 
 
 Hosting survives a restart on a directory-configured runtime (`SpawnOptions::on_directory`): each hosted identity's own subdirectory carries its hosting record — the namespace of its PMS, written at the commit point of the create or link, once the store set is provisioned and armed for session classification and both of its stores are flushed (`SyncNode::flush_stores`), and before the identity enters the runtime's hosted set — and `spawn` re-hosts every identity whose subdirectory holds one, through the same tail `create` runs, with its pods re-opened from the PMS by the armer's sweeps. An unreadable record stops the start; a subdirectory without one is an unfinished create or link and hosts nothing; on a memory runtime hosting ends with the process.
 
-Scenario tests in `tests/`. No host or HTTP dependencies.
+Scenario tests in `tests/`; `pdn-test-peer` (`tests/support/test_peer.rs`, built under `test-util` alone) is the member a scenario runs as a process of its own to kill it, since a node stopped in the test's process closes its connections. No host or HTTP dependencies.
