@@ -2156,6 +2156,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.1"
+source = "git+https://github.com/MeeFoundation/iroh-blobs?rev=2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff#2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff"
 dependencies = [
  "arrayvec",
  "bao-tree",

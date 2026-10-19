@@ -641,22 +641,6 @@ async fn a_device_that_linked_before_the_restart_is_still_a_device() -> Result<(
     Ok(())
 }
 
-/// `from` copied file by file into `to`, as it lies on disk at this moment:
-/// what a kill at this moment leaves for the next start.
-fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
 /// An identity whose create returned is on disk whole: a copy of the
 /// directory taken at once comes back hosting it, with its identity key.
 ///
@@ -671,7 +655,7 @@ async fn an_identity_whose_create_returned_is_on_disk_whole() -> Result<()> {
     let runtime = runtime_on(dir.path()).await?;
     let alice = runtime.identity().create().await?;
     let copy = tempfile::tempdir()?;
-    copy_tree(dir.path(), copy.path())?;
+    test_utils::crash_copy(dir.path(), copy.path())?;
     let key = runtime.identity_public_key_for_test(alice).await?;
     runtime.shutdown().await?;
     assert!(key.is_some(), "the identity's own key must be readable");
@@ -686,6 +670,13 @@ async fn an_identity_whose_create_returned_is_on_disk_whole() -> Result<()> {
         recovered.identity_public_key_for_test(alice).await?,
         key,
         "the copy must hold the identity's key"
+    );
+    assert_eq!(
+        recovered
+            .own_entries_without_payload_for_test(alice)
+            .await?,
+        0,
+        "the copy holds this device's entries without their payloads"
     );
     recovered.shutdown().await?;
     // Denied: nothing comes back from a directory that never held it.
@@ -720,7 +711,7 @@ async fn a_pod_whose_record_is_on_disk_opens_from_it() -> Result<()> {
         "the created pod must be listed"
     );
     let copy = tempfile::tempdir()?;
-    copy_tree(dir.path(), copy.path())?;
+    test_utils::crash_copy(dir.path(), copy.path())?;
     runtime.shutdown().await?;
 
     let recovered = runtime_on(copy.path()).await?;
@@ -737,6 +728,13 @@ async fn a_pod_whose_record_is_on_disk_opens_from_it() -> Result<()> {
     })
     .await?;
     assert!(opened, "the copy must open the pod its record names");
+    assert_eq!(
+        recovered
+            .own_entries_without_payload_for_test(alice)
+            .await?,
+        0,
+        "the copy holds this device's entries without their payloads"
+    );
     recovered.shutdown().await?;
     Ok(())
 }

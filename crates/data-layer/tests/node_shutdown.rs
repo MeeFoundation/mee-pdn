@@ -255,3 +255,16 @@ async fn a_dropped_node_leaves_no_blob_collection_running() -> Result<()> {
     collection_ends(&runs).await;
     Ok(())
 }
+
+/// A node dropped outside a tokio runtime, where no stop can run, leaves no
+/// blob collection running either: the collection closes the store itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_dropped_outside_a_runtime_leaves_no_blob_collection_running() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (node, runs) = collecting_node(dir.path()).await?;
+    std::thread::spawn(move || drop(node))
+        .join()
+        .map_err(|_panic| anyhow::anyhow!("the drop panicked"))?;
+    collection_ends(&runs).await;
+    Ok(())
+}

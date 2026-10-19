@@ -27,11 +27,10 @@ tracing = "0.1"
 pdn-store = { path = "crates/pdn-store" }
 
 [patch.crates-io]
-# Upstream's latest release plus two fixes: a store runtime dropped on its own
-# thread, which hangs a failed blob store open forever, and garbage collection
-# that outlives its store's shutdown, holding the store's runtime. What the
-# fork carries and when it goes: UPSTREAM.md in the fork.
-iroh-blobs = { path = "../iroh-blobs" }
+# Upstream's latest release plus the fix for a store runtime dropped on its own
+# thread, which hangs a failed blob store open forever. What the fork carries
+# and when it goes: UPSTREAM.md in the fork.
+iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
 # Upstream's main past its 0.101.0 release, which answers a Join from a peer
 # that restarted with the same id: under 0.101.0 a node killed and started
 # again gets no neighbor from a peer that still holds its old link, and its

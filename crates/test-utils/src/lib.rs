@@ -33,6 +33,24 @@ pub async fn memory_node() -> Result<SyncNode> {
     SyncNode::spawn(data_layer::SpawnOptions::memory()).await
 }
 
+/// `from` copied file by file into `to` as it lies on disk at this moment:
+/// what a kill at this moment leaves for the next start, with nothing a
+/// stop would write. Read a store before it to commit the replica store's
+/// batch alone, the worst order a kill can meet.
+pub fn crash_copy(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            crash_copy(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// The cast: bare [`PdnId`] values, one byte pattern each.
 pub mod ids {
     use pdn_types::PdnId;

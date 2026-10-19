@@ -96,6 +96,12 @@ enum Action {
         reply: Option<oneshot::Sender<Store>>,
     },
     #[cfg(test)]
+    #[display("DebugFailNextCommit")]
+    DebugFailNextCommit {
+        #[debug("reply")]
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
     #[display("DebugTasksLen")]
     DebugTasksLen {
         #[debug("reply")]
@@ -640,6 +646,13 @@ impl SyncHandle {
     }
 
     #[cfg(test)]
+    async fn fail_next_commit_for_test(&self) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Action::DebugFailNextCommit { reply }).await?;
+        Ok(rx.await?)
+    }
+
+    #[cfg(test)]
     async fn debug_tasks_len(&self) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::DebugTasksLen { reply }).await?;
@@ -740,6 +753,9 @@ struct Actor {
     content_status_callback: Option<ContentStatusCallback>,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
+    /// A commit the idle timer ran and saw fail, held for the next write or
+    /// flush to answer with: no caller waits on the timer's own.
+    failed_commit: Option<anyhow::Error>,
 }
 
 impl Actor {
@@ -760,6 +776,7 @@ impl Actor {
             content_status_callback,
             tasks: Default::default(),
             metrics,
+            failed_commit: None,
         }
     }
 
@@ -786,6 +803,9 @@ impl Actor {
                     self.reclaim_abandoned_sessions();
                     if let Err(cause) = self.store.flush() {
                         error!(?cause, "failed to flush store");
+                        self.failed_commit = Some(cause.context(
+                            "a commit of this store failed, and the writes it held are lost",
+                        ));
                     }
                     continue;
                 }
@@ -847,6 +867,11 @@ impl Actor {
                 unreachable!("Shutdown is handled in run()")
             }
             #[cfg(test)]
+            Action::DebugFailNextCommit { reply } => {
+                self.store.fail_next_commit();
+                send_reply(reply, ())
+            }
+            #[cfg(test)]
             Action::DebugTasksLen { reply } => send_reply(reply, self.tasks.len()),
             #[cfg(test)]
             Action::DebugSessionCount { reply } => send_reply(reply, self.sessions.len()),
@@ -872,7 +897,13 @@ impl Actor {
             Action::ContentHashes { reply } => {
                 send_reply_with(reply, self, |this| this.store.content_hashes())
             }
-            Action::FlushStore { reply } => send_reply(reply, self.store.flush()),
+            Action::FlushStore { reply } => {
+                let flushed = match self.failed_commit.take() {
+                    Some(failed) => Err(failed),
+                    None => self.store.flush(),
+                };
+                send_reply(reply, flushed)
+            }
             Action::SyncSessionEnd { session, alive } => {
                 self.sessions.remove(&session);
                 // Kept the registration out of the reclaim pass while this
@@ -944,6 +975,9 @@ impl Actor {
                 reply,
             } => {
                 send_reply_with_async(reply, self, async move |this| {
+                    if let Some(failed) = this.failed_commit.take() {
+                        return Err(failed);
+                    }
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
                     replica.insert(&key, &author, hash, len).await?;
@@ -953,6 +987,9 @@ impl Actor {
             }
             ReplicaAction::Delete { author, key, reply } => {
                 send_reply_with_async(reply, self, async |this| {
+                    if let Some(failed) = this.failed_commit.take() {
+                        return Err(failed);
+                    }
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
                     let res = replica.delete(&key, &author).await?;
@@ -1357,6 +1394,52 @@ mod tests {
         sync.subscribe(id, tx).await?;
         sync.close(id).await?;
         assert!(rx.recv().await.is_err());
+        Ok(())
+    }
+
+    /// A commit the idle timer runs and sees fail answers the store's next
+    /// write as its error rather than the log alone, and the write after
+    /// that goes through.
+    #[tokio::test]
+    async fn a_failed_idle_commit_fails_the_next_write() -> anyhow::Result<()> {
+        let sync = SyncHandle::spawn(store::Store::memory(), None, "foo".into());
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        sync.import_namespace(namespace.into()).await?;
+        sync.open(id, Default::default()).await?;
+        let author = sync.import_author(Author::new(&mut rand::rng())).await?;
+        // On disk before the failure, so only the write below is lost.
+        sync.flush_store().await?;
+        sync.fail_next_commit_for_test().await?;
+        sync.insert_local(
+            id,
+            author,
+            Bytes::from_static(b"lost"),
+            Hash::new(b"lost"),
+            4,
+        )
+        .await?;
+        // The idle timer runs once nothing arrives for `MAX_COMMIT_DELAY`.
+        tokio::time::sleep(MAX_COMMIT_DELAY * 3).await;
+
+        let next = sync
+            .insert_local(
+                id,
+                author,
+                Bytes::from_static(b"next"),
+                Hash::new(b"next"),
+                4,
+            )
+            .await;
+        assert!(next.is_err(), "the failed commit reached no caller");
+        sync.insert_local(
+            id,
+            author,
+            Bytes::from_static(b"after"),
+            Hash::new(b"after"),
+            5,
+        )
+        .await?;
         Ok(())
     }
 

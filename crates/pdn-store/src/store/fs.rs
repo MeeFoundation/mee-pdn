@@ -56,6 +56,9 @@ pub(crate) struct Store {
     writes: HashMap<NamespaceId, u64>,
     #[cfg(test)]
     commits: usize,
+    /// Fails the next commit of a dirty transaction, as a full disk does.
+    #[cfg(test)]
+    fail_next_commit: bool,
 }
 
 impl Drop for Store {
@@ -134,6 +137,8 @@ impl Store {
             writes: Default::default(),
             #[cfg(test)]
             commits: 0,
+            #[cfg(test)]
+            fail_next_commit: false,
         })
     }
 
@@ -168,10 +173,18 @@ impl Store {
         }
         #[cfg(test)]
         {
+            if std::mem::take(&mut self.fail_next_commit) {
+                return Err(anyhow!("the commit failed for test"));
+            }
             self.commits += 1;
         }
         w.commit()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit(&mut self) {
+        self.fail_next_commit = true;
     }
 
     /// How many write transactions were actually committed (test
