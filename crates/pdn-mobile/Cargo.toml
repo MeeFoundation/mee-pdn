@@ -51,7 +51,7 @@ serde_json = "1"
 thiserror = "2"
 # The facade owns the asynchronous runtime the operations need; a foreign
 # caller brings none.
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tower = { version = "0.5", features = ["util"], optional = true }
 tracing = { workspace = true }
 # The unrecognized failure carries no cause across the binding boundary: the

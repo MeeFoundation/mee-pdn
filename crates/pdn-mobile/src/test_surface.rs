@@ -25,7 +25,7 @@ use pdn_node::{IdentityService as _, Runtime, SyncService as _};
 use serde::Deserialize;
 use tower::ServiceExt as _;
 
-use crate::node::{install, State};
+use crate::node::{claimed, fresh_bring_up, install, State};
 
 /// A day of samples at one a second; past it the oldest go first.
 const SAMPLES_KEPT: usize = 86_400;
@@ -119,7 +119,7 @@ impl Surface {
     fn router(&self) -> Option<Router> {
         let runtime = match &*self.state.lock().ok()? {
             State::Up(runtime) => Arc::clone(runtime),
-            State::Down | State::ComingUp => return None,
+            State::Down | State::ComingUp(_) => return None,
         };
         let mut cached = self.router.lock().ok()?;
         if let Some((held, router)) = cached.as_ref() {
@@ -140,12 +140,15 @@ impl Surface {
         connectivity: pdn_node::Connectivity,
         pod_interval: Duration,
     ) -> anyhow::Result<Option<serde_json::Value>> {
+        let (ours, _held) = fresh_bring_up()?;
         let previous = {
             let mut state = self.state.lock().map_err(|_| poisoned())?;
-            match std::mem::replace(&mut *state, State::ComingUp) {
+            if matches!(*state, State::ComingUp(_)) {
+                return Ok(None);
+            }
+            match std::mem::replace(&mut *state, State::ComingUp(Arc::clone(&ours))) {
                 State::Up(runtime) => Some(runtime),
-                State::Down => None,
-                State::ComingUp => return Ok(None),
+                State::Down | State::ComingUp(_) => None,
             }
         };
         self.router.lock().map_err(|_| poisoned())?.take();
@@ -163,7 +166,9 @@ impl Surface {
         .await;
         if let Err(err) = cleared {
             if let Ok(mut state) = self.state.lock() {
-                *state = State::Down;
+                if claimed(&state, &ours) {
+                    *state = State::Down;
+                }
             }
             return Err(err);
         }
@@ -171,14 +176,32 @@ impl Surface {
             reconcile_interval: RECONCILE_INTERVAL,
             ..pdn_node_http::spawn_options(self.storage.clone(), connectivity, Some(pod_interval))
         };
-        if !install(&self.state, Runtime::spawn(options).await).await? {
+        // The identity comes before the install: a reset that follows takes the
+        // node only once this one has stopped writing to its directory.
+        let created = async {
+            let runtime = Runtime::spawn(options).await?;
+            match runtime.identity().create().await {
+                Ok(identity) => Ok((runtime, identity)),
+                Err(err) => {
+                    runtime.shutdown().await?;
+                    Err(err)
+                }
+            }
+        }
+        .await;
+        let (spawned, identity) = match created {
+            Ok((runtime, identity)) => (Ok(runtime), Some(identity)),
+            Err(err) => (Err(err), None),
+        };
+        if !install(&self.state, &ours, spawned).await? {
             anyhow::bail!("a stop overtook the reset");
         }
         let runtime = match &*self.state.lock().map_err(|_| poisoned())? {
             State::Up(runtime) => Arc::clone(runtime),
-            State::Down | State::ComingUp => anyhow::bail!("a stop overtook the reset"),
+            State::Down | State::ComingUp(_) => anyhow::bail!("a stop overtook the reset"),
         };
-        let identity = runtime.identity().create().await?;
+        let identity =
+            identity.ok_or_else(|| anyhow::anyhow!("a node came up without its identity"))?;
         Ok(Some(serde_json::json!({
             "identity": identity.to_string(),
             "node": runtime.sync().node_id().to_string(),

@@ -37,8 +37,19 @@ use crate::{
 /// bring-ups cannot both reach the spawn.
 pub(crate) enum State {
     Down,
-    ComingUp,
+    ComingUp(BringUp),
     Up(Arc<Runtime>),
+}
+
+/// One bring-up in flight, told from a later one by identity: its task holds
+/// the lock until its node is installed or shut down, which is what a stop
+/// that overtakes it waits for.
+pub(crate) type BringUp = Arc<tokio::sync::Mutex<()>>;
+
+/// Whether `state` is still the bring-up `ours` claimed; a stop and a later
+/// bring-up may both have come between.
+pub(crate) fn claimed(state: &State, ours: &BringUp) -> bool {
+    matches!(state, State::ComingUp(held) if Arc::ptr_eq(held, ours))
 }
 
 /// One node, reached through one handle.
@@ -141,10 +152,13 @@ impl PdnNode {
             reconcile_interval: interval,
             ..SpawnOptions::for_product(storage_dir)
         };
-        self.claim_bring_up()?;
+        let (ours, held) = self.claim_bring_up()?;
         let state = Arc::clone(&self.state);
         let installed = self
-            .on_node(async move { install(&state, Runtime::spawn(options).await).await })
+            .on_node(async move {
+                let _held = held;
+                install(&state, &ours, Runtime::spawn(options).await).await
+            })
             .await?;
         if installed {
             Ok(())
@@ -161,16 +175,22 @@ impl PdnNode {
     /// identities and pods are found again on the next bring-up. What does not come back is work in flight — an invite
     /// minted and not consumed, a ceremony interrupted.
     pub async fn stop(&self) -> Result<(), PdnError> {
-        let runtime = {
+        let previous = {
             let mut state = self.state()?;
-            match std::mem::replace(&mut *state, State::Down) {
-                State::Up(runtime) => Some(runtime),
-                State::Down | State::ComingUp => None,
-            }
+            std::mem::replace(&mut *state, State::Down)
         };
-        match runtime {
-            None => Ok(()),
-            Some(runtime) => self.on_node(async move { runtime.shutdown().await }).await,
+        match previous {
+            State::Down => Ok(()),
+            State::Up(runtime) => self.on_node(async move { runtime.shutdown().await }).await,
+            // Without the wait, the overtaken node still holds the directory
+            // when the caller's next bring-up reaches it.
+            State::ComingUp(bring_up) => {
+                self.on_node(async move {
+                    let _ended = bring_up.lock().await;
+                    Ok(())
+                })
+                .await
+            }
         }
     }
 
@@ -454,15 +474,20 @@ impl PdnNode {
         })
     }
 
-    /// Claim the transition into a bring-up, refusing a second one.
-    fn claim_bring_up(&self) -> Result<(), PdnError> {
+    /// Claim the transition into a bring-up, refusing a second one; the
+    /// guard goes to the task that installs the node.
+    fn claim_bring_up(&self) -> Result<(BringUp, tokio::sync::OwnedMutexGuard<()>), PdnError> {
         let mut state = self.state()?;
         match *state {
             State::Down => {
-                *state = State::ComingUp;
-                Ok(())
+                let (ours, held) = fresh_bring_up().map_err(|err| {
+                    tracing::error!("a bring-up's lock was not free: {err}");
+                    PdnError::Internal
+                })?;
+                *state = State::ComingUp(Arc::clone(&ours));
+                Ok((ours, held))
             }
-            State::ComingUp | State::Up(_) => Err(PdnError::NodeAlreadyUp),
+            State::ComingUp(_) | State::Up(_) => Err(PdnError::NodeAlreadyUp),
         }
     }
 
@@ -470,7 +495,7 @@ impl PdnNode {
     fn runtime(&self) -> Result<Arc<Runtime>, PdnError> {
         match &*self.state()? {
             State::Up(runtime) => Ok(Arc::clone(runtime)),
-            State::Down | State::ComingUp => Err(PdnError::NodeNotUp),
+            State::Down | State::ComingUp(_) => Err(PdnError::NodeNotUp),
         }
     }
 
@@ -504,6 +529,13 @@ impl PdnNode {
     }
 }
 
+/// A bring-up and its task's guard over it.
+pub(crate) fn fresh_bring_up() -> anyhow::Result<(BringUp, tokio::sync::OwnedMutexGuard<()>)> {
+    let ours: BringUp = Arc::new(tokio::sync::Mutex::new(()));
+    let held = Arc::clone(&ours).try_lock_owned()?;
+    Ok((ours, held))
+}
+
 /// The bring-up's last act, inside the bring-up's own task: put the node
 /// where the exported calls look for it, and report whether it went there.
 ///
@@ -513,13 +545,16 @@ impl PdnNode {
 /// would be refused by a node the caller had already stopped.
 pub(crate) async fn install(
     state: &Mutex<State>,
+    ours: &BringUp,
     spawned: anyhow::Result<Runtime>,
 ) -> anyhow::Result<bool> {
     let runtime = match spawned {
         Ok(runtime) => runtime,
         Err(err) => {
             if let Ok(mut guard) = state.lock() {
-                *guard = State::Down;
+                if claimed(&guard, ours) {
+                    *guard = State::Down;
+                }
             }
             return Err(err);
         }
@@ -530,14 +565,13 @@ pub(crate) async fn install(
         let mut guard = state
             .lock()
             .map_err(|_| anyhow::anyhow!("the facade's state lock is poisoned"))?;
-        match *guard {
-            State::ComingUp => {
-                if let Some(runtime) = held.take() {
-                    *guard = State::Up(Arc::new(runtime));
-                }
-                true
+        if claimed(&guard, ours) {
+            if let Some(runtime) = held.take() {
+                *guard = State::Up(Arc::new(runtime));
             }
-            State::Down | State::Up(_) => false,
+            true
+        } else {
+            false
         }
     };
     if let Some(runtime) = held {
@@ -581,7 +615,54 @@ impl Drop for PdnNode {
 
 #[cfg(test)]
 mod tests {
-    use super::PdnNode;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use super::{claimed, fresh_bring_up, install, PdnNode, State};
+
+    /// A stop that overtakes a bring-up returns only once that bring-up's
+    /// task is done with its node, so the caller's next bring-up finds the
+    /// directory free. The bring-up is staged by hand: the spawn it waits
+    /// for has no hook to hold it, and a real one finishes before a stop
+    /// arrives unless the network is slow.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_bring_up_it_overtakes() -> anyhow::Result<()> {
+        let node = PdnNode::new()?;
+        let (ours, held) = fresh_bring_up()?;
+        *node.state()? = State::ComingUp(ours);
+        let stopping = {
+            let node = Arc::clone(&node);
+            tokio::spawn(async move { node.stop().await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !stopping.is_finished(),
+            "the stop returned while the bring-up it overtook still held its node"
+        );
+        drop(held);
+        stopping.await??;
+        Ok(())
+    }
+
+    /// The failed spawn of a bring-up a stop overtook leaves the bring-up
+    /// that came after it in place, rather than putting the handle down
+    /// under it.
+    #[tokio::test]
+    async fn an_overtaken_bring_ups_failure_leaves_the_later_one_in_place() -> anyhow::Result<()> {
+        let (overtaken, _overtaken_held) = fresh_bring_up()?;
+        let (later, _later_held) = fresh_bring_up()?;
+        let state = Mutex::new(State::ComingUp(Arc::clone(&later)));
+        let spawned = Err(anyhow::anyhow!("another node holds the storage directory"));
+        assert!(install(&state, &overtaken, spawned).await.is_err());
+        let held = state.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+        assert!(
+            claimed(&held, &later),
+            "the overtaken bring-up's failure put the later one's state down"
+        );
+        Ok(())
+    }
 
     /// Every thread the facade's runtime starts, a worker and a blocking one,
     /// carries the `pdn-node` prefix. The naming sits behind no feature, so
