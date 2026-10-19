@@ -716,6 +716,9 @@ mod tests {
         assert!(change_of(Ok(LiveEvent::PendingContentReady)).is_none());
     }
 
+    /// A pending-device marker whose seconds overflow the clock reads as
+    /// malformed, which the expiry sweep deletes, and one of a later marker
+    /// version as unknown, which the sweep keeps.
     #[test]
     fn pending_marker_rejects_overflow_and_preserves_unknown_versions() {
         let mut overflow = vec![PENDING_DEVICE_MARKER_VERSION];

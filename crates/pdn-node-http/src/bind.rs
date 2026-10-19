@@ -78,6 +78,8 @@ pub fn data_dir_from_env() -> Result<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    /// A host with neither `PDN_HOST` nor `PDN_PORT` set listens on
+    /// loopback at the default port.
     #[test]
     fn nothing_configured_binds_loopback() {
         let addr = bind_addr(None, None).unwrap();
@@ -85,6 +87,8 @@ mod tests {
         assert!(addr.ip().is_loopback(), "the default must not be reachable");
     }
 
+    /// A configured host and port are bound as given, every interface
+    /// included.
     #[test]
     fn a_configured_bind_is_taken_as_given() {
         let addr = bind_addr(Some("0.0.0.0"), Some("8080")).unwrap();
@@ -92,6 +96,8 @@ mod tests {
         assert!(!addr.ip().is_loopback());
     }
 
+    /// A port set without a host moves the host to that port and keeps it
+    /// on loopback.
     #[test]
     fn a_configured_port_alone_stays_on_loopback() {
         assert_eq!(
@@ -100,6 +106,7 @@ mod tests {
         );
     }
 
+    /// A bare IPv6 address, without brackets, is a host `PDN_HOST` accepts.
     #[test]
     fn bare_ipv6_is_accepted() {
         assert_eq!(
@@ -108,17 +115,22 @@ mod tests {
         );
     }
 
+    /// A port that is no number, or a host that is no IP address, fails the
+    /// start rather than falling back to the default.
     #[test]
     fn an_unparseable_value_fails_instead_of_defaulting() {
         assert!(bind_addr(None, Some("http")).is_err());
         assert!(bind_addr(Some("not a host"), None).is_err());
     }
 
+    /// An unset `PDN_DEBUG` leaves the debug subtree off.
     #[test]
     fn nothing_configured_is_off() {
         assert!(!debug_enabled(None).unwrap());
     }
 
+    /// `PDN_DEBUG` set to `1` or `true` turns the debug subtree on, and `0`
+    /// or `false` leaves it off.
     #[test]
     fn a_configured_value_is_taken_as_given() {
         assert!(debug_enabled(Some("1")).unwrap());
@@ -127,6 +139,8 @@ mod tests {
         assert!(!debug_enabled(Some("false")).unwrap());
     }
 
+    /// A `PDN_DEBUG` value outside the closed set — another word, another
+    /// case, a leading space — fails the start rather than reading as off.
     #[test]
     fn an_unrecognized_value_fails_instead_of_defaulting_to_off() {
         assert!(debug_enabled(Some("yes")).is_err());
@@ -134,6 +148,8 @@ mod tests {
         assert!(debug_enabled(Some(" 1")).is_err());
     }
 
+    /// A host whose `PDN_DATA_DIR` is unset or empty fails to start, and the
+    /// error names the variable.
     #[test]
     fn an_unset_data_dir_fails_naming_the_variable() {
         for raw in [None, Some("")] {
@@ -145,6 +161,7 @@ mod tests {
         }
     }
 
+    /// A configured `PDN_DATA_DIR` is the storage directory as given.
     #[test]
     fn a_configured_data_dir_is_taken_as_given() {
         assert_eq!(

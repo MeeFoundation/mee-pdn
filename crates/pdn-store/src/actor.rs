@@ -1383,6 +1383,7 @@ fn send_reply_error<T>(_err: T) -> SendReplyError {
 mod tests {
     use super::*;
     use crate::store;
+    /// Closing an open replica ends its subscribers' event channel.
     #[tokio::test]
     async fn open_close() -> anyhow::Result<()> {
         let store = store::Store::memory();

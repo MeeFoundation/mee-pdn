@@ -379,6 +379,9 @@ async fn sync_subscribe_no_sync() -> Result<()> {
     Ok(())
 }
 
+/// A replica imported without peers takes the 100 entries written before
+/// its first session from that session, and 100 more written afterwards as
+/// they are written; `N_ENTRIES` sets the count.
 #[tokio::test]
 #[traced_test]
 async fn sync_gossip_bulk() -> Result<()> {
@@ -697,6 +700,9 @@ async fn sync_leave_gossip_keeps_sync_running() -> Result<()> {
     Ok(())
 }
 
+/// A replica whose ticket names its peer by relay alone syncs through the
+/// relay: it takes the peer's entry with its content, and the update after
+/// it.
 #[tokio::test]
 #[traced_test]
 async fn test_sync_via_relay() -> Result<()> {
@@ -809,6 +815,9 @@ async fn test_sync_via_relay() -> Result<()> {
     Ok(())
 }
 
+/// A node restarted on its storage directory reopens its replica with what
+/// it held, takes at its first sync a write its peer made while it was down,
+/// and takes the peer's later writes live.
 #[tokio::test]
 #[traced_test]
 async fn sync_restart_node() -> Result<()> {
@@ -1061,6 +1070,9 @@ async fn sync_big() -> Result<()> {
     Ok(())
 }
 
+/// Opening every replica a listing names while the listing is still being
+/// read finishes — 200 replicas within 2 s — rather than deadlocking the
+/// store's actor.
 #[tokio::test]
 #[traced_test]
 async fn test_list_docs_stream() -> testresult::TestResult<()> {
@@ -1243,12 +1255,13 @@ impl PartialEq<ExpectedEntry> for (Entry, Bytes) {
     }
 }
 
+/// A deleted entry reads as absent, and its payload leaves the blob store at
+/// the next blob collection.
 #[tokio::test]
 #[traced_test]
 async fn doc_delete() -> Result<()> {
     let tempdir = tempdir()?;
-    // TODO(Frando): iroh-blobs has gc only for fs store atm, change test to test both
-    // mem and persistent once this changes.
+    // A file-backed node: the suites' in-memory one runs no blob collection.
     let ep = empty_endpoint().await?;
     let node = Node::persistent(tempdir.path(), ep)
         .gc_interval(Some(Duration::from_millis(100)))
@@ -1268,8 +1281,7 @@ async fn doc_delete() -> Result<()> {
     let entry = get_exact(&doc, author, b"foo".to_vec(), false).await?;
     assert!(entry.is_none());
 
-    // wait for gc
-    // TODO: allow to manually trigger gc
+    // Twenty intervals of the collection, which runs on its own schedule.
     n0_future::time::sleep(Duration::from_secs(2)).await;
     let bytes = client.blobs().get_bytes(hash).await;
     assert!(bytes.is_err());
@@ -1277,6 +1289,8 @@ async fn doc_delete() -> Result<()> {
     Ok(())
 }
 
+/// A dropped replica fails every call of its handle, opens as absent, and
+/// ends its subscription.
 #[tokio::test]
 #[traced_test]
 async fn sync_drop_doc() -> Result<()> {

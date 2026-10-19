@@ -39,6 +39,7 @@ mod tests {
 
     use super::*;
 
+    /// A path segment that is no hex identity answers 400.
     #[test]
     fn a_malformed_identity_is_400() {
         let err = segment::<PdnId>("not-hex", "identity").unwrap_err();
@@ -53,18 +54,23 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A record kind spelled otherwise than its key segment — `Claim` for
+    /// `claim` — answers 400.
     #[test]
     fn an_unknown_record_kind_is_400() {
         let err = segment::<RecordKind>("Claim", "record kind").unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Well-formed JSON of the wrong shape answers 400, where axum's `Json`
+    /// extractor would answer 422.
     #[test]
     fn a_body_of_the_wrong_shape_is_400() {
         let err = json::<PdnId>(&Bytes::from_static(b"{\"a\":1}"), "an identity").unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A query whose value does not parse answers 400.
     #[test]
     fn a_malformed_query_is_400() {
         let err = query::<crate::shapes::Lifetime>(Some("lifetime_secs=nope"), "invite query")

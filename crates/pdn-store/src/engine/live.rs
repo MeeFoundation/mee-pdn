@@ -2314,6 +2314,8 @@ fn fmt_accept_namespace(res: &Result<SyncFinished, AcceptError>) -> String {
 mod tests {
     use super::*;
 
+    /// An event sent to lossy subscribers whose receivers are all gone
+    /// completes rather than waiting on them.
     #[tokio::test]
     async fn test_sync_remove() {
         let pk = PublicKey::from_bytes(&[1; 32]).unwrap();

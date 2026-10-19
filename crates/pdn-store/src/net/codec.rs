@@ -676,6 +676,8 @@ mod tests {
         })
     }
 
+    /// One session between two replicas, each holding an entry the other
+    /// lacks, leaves both holding both.
     #[tokio::test]
     async fn test_sync_simple() -> Result<()> {
         let mut rng = rand::rng();
@@ -803,6 +805,9 @@ mod tests {
         Ok(())
     }
 
+    /// Two replicas written by several authors each, at keys both sides
+    /// share, hold every entry of both after one session, for every count
+    /// of authors and entries the scenario walks.
     #[tokio::test]
     #[traced_test]
     async fn test_sync_many_authors_memory() -> Result<()> {
@@ -811,6 +816,7 @@ mod tests {
         test_sync_many_authors(alice_store, bob_store).await
     }
 
+    /// The fs-store twin of `test_sync_many_authors_memory`.
     #[tokio::test]
     #[traced_test]
     async fn test_sync_many_authors_fs() -> Result<()> {
@@ -1044,6 +1050,8 @@ mod tests {
         Ok((alice_task.await?, bob_task.await?))
     }
 
+    /// One author's entries at one key on two replicas converge, after a
+    /// session, on the later write on both sides.
     #[tokio::test]
     #[traced_test]
     async fn test_sync_timestamps_memory() -> Result<()> {
@@ -1052,6 +1060,7 @@ mod tests {
         test_sync_timestamps(alice_store, bob_store).await
     }
 
+    /// The fs-store twin of `test_sync_timestamps_memory`.
     #[tokio::test]
     #[traced_test]
     async fn test_sync_timestamps_fs() -> Result<()> {

@@ -1248,6 +1248,9 @@ mod tests {
         store::{OpenError, Query, Store},
     };
 
+    /// A replica's entries read back by key, author, prefix and range, one
+    /// entry per author at a key, and the store keeps the peers a replica
+    /// synced with as a cache of `PEERS_PER_DOC_CACHE_SIZE`, the newest first.
     #[tokio::test]
     async fn test_basics_memory() -> Result<()> {
         let store = store::Store::memory();
@@ -1256,6 +1259,7 @@ mod tests {
         Ok(())
     }
 
+    /// The fs-store twin of `test_basics_memory`.
     #[tokio::test]
     async fn test_basics_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -1439,12 +1443,15 @@ mod tests {
         Ok(())
     }
 
+    /// The store's content hashes are those of every entry of every replica
+    /// it holds.
     #[tokio::test]
     async fn test_content_hashes_iterator_memory() -> Result<()> {
         let store = store::Store::memory();
         test_content_hashes_iterator(store).await
     }
 
+    /// The fs-store twin of `test_content_hashes_iterator_memory`.
     #[tokio::test]
     async fn test_content_hashes_iterator_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -1474,6 +1481,8 @@ mod tests {
         Ok(())
     }
 
+    /// Record identifiers order by namespace, then author, then key, and a
+    /// range over them holds its start and leaves out its end.
     #[test]
     fn test_multikey() {
         let mut rng = rand::rng();
@@ -1564,6 +1573,8 @@ mod tests {
         }
     }
 
+    /// A local write older than the entry at its author's key is refused as
+    /// `NewerEntryExists`, and the newer entry stays.
     #[tokio::test]
     async fn test_timestamps_memory() -> Result<()> {
         let store = store::Store::memory();
@@ -1572,6 +1583,7 @@ mod tests {
         Ok(())
     }
 
+    /// The fs-store twin of `test_timestamps_memory`.
     #[tokio::test]
     async fn test_timestamps_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -1626,6 +1638,8 @@ mod tests {
         Ok(())
     }
 
+    /// Two replicas each lacking entries of the other hold every entry of
+    /// both after one session, Alice sending 2 entries and Bob 6.
     #[tokio::test]
     async fn test_replica_sync_memory() -> Result<()> {
         let alice_store = store::Store::memory();
@@ -1635,6 +1649,7 @@ mod tests {
         Ok(())
     }
 
+    /// The fs-store twin of `test_replica_sync_memory`.
     #[tokio::test]
     async fn test_replica_sync_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
@@ -1679,6 +1694,8 @@ mod tests {
         Ok(())
     }
 
+    /// One author's writes at one key on two replicas converge on both, after
+    /// a session, on the later write, whichever side made it.
     #[tokio::test]
     async fn test_replica_timestamp_sync_memory() -> Result<()> {
         let alice_store = store::Store::memory();
@@ -1688,6 +1705,7 @@ mod tests {
         Ok(())
     }
 
+    /// The fs-store twin of `test_replica_timestamp_sync_memory`.
     #[tokio::test]
     async fn test_replica_timestamp_sync_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
@@ -1721,7 +1739,7 @@ mod tests {
             Some(bob_hash)
         );
         assert_eq!(
-            get_content_hash(&mut alice_store, namespace.id(), author.id(), key)?,
+            get_content_hash(&mut bob_store, namespace.id(), author.id(), key)?,
             Some(bob_hash)
         );
 
@@ -1738,28 +1756,12 @@ mod tests {
             Some(alice_hash_2)
         );
         assert_eq!(
-            get_content_hash(&mut alice_store, namespace.id(), author.id(), key)?,
+            get_content_hash(&mut bob_store, namespace.id(), author.id(), key)?,
             Some(alice_hash_2)
         );
         alice_store.flush()?;
         bob_store.flush()?;
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_session_snapshot_freezes_egress_memory() -> Result<()> {
-        let alice_store = store::Store::memory();
-        let bob_store = store::Store::memory();
-        test_session_snapshot_freezes_egress(alice_store, bob_store).await
-    }
-
-    #[tokio::test]
-    async fn test_session_snapshot_freezes_egress_fs() -> Result<()> {
-        let alice_dbfile = tempfile::NamedTempFile::new()?;
-        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
-        let bob_dbfile = tempfile::NamedTempFile::new()?;
-        let bob_store = store::fs::Store::persistent(bob_dbfile.path(), TEST_CACHE_BYTES)?;
-        test_session_snapshot_freezes_egress(alice_store, bob_store).await
     }
 
     /// A session serves the store as of session setup: a write landing
@@ -1770,6 +1772,23 @@ mod tests {
     /// a handle: the subject is what the store layer does with one, and the
     /// actor's part — looking the snapshot up and handing it over — is what
     /// `a_session_serves_the_view_frozen_at_its_start` covers.
+    #[tokio::test]
+    async fn test_session_snapshot_freezes_egress_memory() -> Result<()> {
+        let alice_store = store::Store::memory();
+        let bob_store = store::Store::memory();
+        test_session_snapshot_freezes_egress(alice_store, bob_store).await
+    }
+
+    /// The fs-store twin of `test_session_snapshot_freezes_egress_memory`.
+    #[tokio::test]
+    async fn test_session_snapshot_freezes_egress_fs() -> Result<()> {
+        let alice_dbfile = tempfile::NamedTempFile::new()?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path(), TEST_CACHE_BYTES)?;
+        let bob_dbfile = tempfile::NamedTempFile::new()?;
+        let bob_store = store::fs::Store::persistent(bob_dbfile.path(), TEST_CACHE_BYTES)?;
+        test_session_snapshot_freezes_egress(alice_store, bob_store).await
+    }
+
     async fn test_session_snapshot_freezes_egress(
         mut alice_store: Store,
         mut bob_store: Store,
@@ -1969,12 +1988,18 @@ mod tests {
         Ok(())
     }
 
+    /// A session opened while nothing was written since the last commit
+    /// commits nothing, and one opened after a write commits it. Opening a
+    /// session flushes, and reads open a write transaction of their own, so
+    /// without the check every session would commit an empty transaction — a
+    /// durable file sync on the one actor thread every replica shares.
     #[tokio::test]
     async fn a_session_over_an_unwritten_store_commits_nothing_memory() -> Result<()> {
         let store = store::Store::memory();
         a_session_over_an_unwritten_store_commits_nothing(store).await
     }
 
+    /// The fs-store twin of `a_session_over_an_unwritten_store_commits_nothing_memory`.
     #[tokio::test]
     async fn a_session_over_an_unwritten_store_commits_nothing_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -1982,11 +2007,6 @@ mod tests {
         a_session_over_an_unwritten_store_commits_nothing(store).await
     }
 
-    /// Opening a session flushes, and reads open a write transaction of
-    /// their own, so between writes the flush would commit a transaction
-    /// that changed nothing — a durable file sync per session, on the one
-    /// actor thread every replica shares. A transaction nothing was written
-    /// through is dropped instead.
     async fn a_session_over_an_unwritten_store_commits_nothing(mut store: Store) -> Result<()> {
         let mut rng = rand::rng();
         let author = Author::new(&mut rng);
@@ -2038,19 +2058,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_session_snapshot_commits_pending_write_batch_memory() -> Result<()> {
-        let store = store::Store::memory();
-        test_session_snapshot_commits_pending_write_batch(store).await
-    }
-
-    #[tokio::test]
-    async fn test_session_snapshot_commits_pending_write_batch_fs() -> Result<()> {
-        let dbfile = tempfile::NamedTempFile::new()?;
-        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
-        test_session_snapshot_commits_pending_write_batch(store).await
-    }
-
     /// Opening a session commits the store's pending write batch
     /// (`snapshot_owned` flushes): an entry inserted right before session
     /// setup is in the snapshot, and the store stays writable afterwards
@@ -2058,6 +2065,20 @@ mod tests {
     ///
     /// The subject is the store's own flush behaviour, so the snapshot is
     /// taken and put on a `StoreInstance` here — no exchange is involved.
+    #[tokio::test]
+    async fn test_session_snapshot_commits_pending_write_batch_memory() -> Result<()> {
+        let store = store::Store::memory();
+        test_session_snapshot_commits_pending_write_batch(store).await
+    }
+
+    /// The fs-store twin of `test_session_snapshot_commits_pending_write_batch_memory`.
+    #[tokio::test]
+    async fn test_session_snapshot_commits_pending_write_batch_fs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let store = store::fs::Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
+        test_session_snapshot_commits_pending_write_batch(store).await
+    }
+
     async fn test_session_snapshot_commits_pending_write_batch(mut store: Store) -> Result<()> {
         use crate::{ranger::Store as _, store::fs::StoreInstance};
 
@@ -2289,6 +2310,9 @@ mod tests {
         Ok(())
     }
 
+    /// A local write stamped up to `MAX_TIMESTAMP_FUTURE_SHIFT` ahead of the
+    /// clock is taken, and one stamped past it is refused as
+    /// `TooFarInTheFuture`, the entry before it standing.
     #[tokio::test]
     async fn test_future_timestamp() -> Result<()> {
         let mut rng = rand::rng();
@@ -2405,6 +2429,7 @@ mod tests {
         Ok(())
     }
 
+    /// A local write of empty content is refused as `EntryIsEmpty`.
     #[tokio::test]
     async fn test_insert_empty() -> Result<()> {
         let mut store = store::Store::memory();
@@ -2538,12 +2563,15 @@ mod tests {
         Ok(())
     }
 
+    /// A replica is removed only once closed, takes its entries with it and
+    /// cannot be reopened, and its namespace can then be created again.
     #[tokio::test]
     async fn test_replica_remove_memory() -> Result<()> {
         let alice_store = store::Store::memory();
         test_replica_remove(alice_store).await
     }
 
+    /// The fs-store twin of `test_replica_remove_memory`.
     #[tokio::test]
     async fn test_replica_remove_fs() -> Result<()> {
         let alice_dbfile = tempfile::NamedTempFile::new()?;
@@ -2641,12 +2669,15 @@ mod tests {
         Ok(())
     }
 
+    /// The latest entry per author is each author's last write, a second
+    /// author's counted apart.
     #[tokio::test]
     async fn test_latest_iter_memory() -> Result<()> {
         let store = store::Store::memory();
         test_latest_iter(store).await
     }
 
+    /// The fs-store twin of `test_latest_iter_memory`.
     #[tokio::test]
     async fn test_latest_iter_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -2719,6 +2750,8 @@ mod tests {
         Ok(())
     }
 
+    /// Binary keys, the bytes 0 and 255 among them, each stand as a key of
+    /// their own.
     #[tokio::test]
     async fn test_replica_byte_keys_memory() -> Result<()> {
         let store = store::Store::memory();
@@ -2727,6 +2760,7 @@ mod tests {
         Ok(())
     }
 
+    /// The fs-store twin of `test_replica_byte_keys_memory`.
     #[tokio::test]
     async fn test_replica_byte_keys_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -2817,6 +2851,8 @@ mod tests {
         Ok(())
     }
 
+    /// A session whose egress filter admits one of three entries delivers
+    /// that entry alone.
     #[tokio::test]
     async fn an_egress_predicate_delivers_only_what_it_admits() -> Result<()> {
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
@@ -3009,6 +3045,9 @@ mod tests {
         Ok(())
     }
 
+    /// Queries over one replica read every entry by author and then key, the
+    /// latest per key, a prefix and a limit, and an entry its author deleted
+    /// only under `include_empty`.
     #[tokio::test]
     async fn test_replica_queries_mem() -> Result<()> {
         let store = store::Store::memory();
@@ -3017,6 +3056,7 @@ mod tests {
         Ok(())
     }
 
+    /// The fs-store twin of `test_replica_queries_mem`.
     #[tokio::test]
     async fn test_replica_queries_fs() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;

@@ -317,6 +317,8 @@ where
 mod tests {
     use super::*;
 
+    /// A session access prints its egress and its ingest as placeholders,
+    /// never as the closures it holds.
     #[test]
     fn session_access_debug_is_opaque() {
         let access = SessionAccess::Allow {

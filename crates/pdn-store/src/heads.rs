@@ -110,6 +110,8 @@ impl FromIterator<(Timestamp, AuthorId)> for AuthorHeads {
 mod tests {
     use super::*;
     use crate::Record;
+    /// Heads encoded under a size limit keep the newest authors that fit —
+    /// 6 of 10 in 256 bytes — and decode to exactly those.
     #[test]
     fn author_heads_encode_decode() -> Result<()> {
         let mut heads = AuthorHeads::default();
@@ -127,6 +129,8 @@ mod tests {
         Ok(())
     }
 
+    /// One side has news for the other for each author whose head is newer
+    /// on it or absent on the other, and for those alone.
     #[test]
     fn author_heads_compare() -> Result<()> {
         let a = [
