@@ -476,6 +476,7 @@ impl Host {
             .map_err(|_poisoned| anyhow::anyhow!("base-url lock poisoned"))?
             .clone();
         let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(plain_http_tls()?)
             .connect_timeout(READY_PROBE_TIMEOUT)
             .build()
             .context("building the stream client")?;
