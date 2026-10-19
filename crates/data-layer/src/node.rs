@@ -24,7 +24,7 @@ use iroh_blobs::{
     provider::{
         events::EventSender, handle_get, handle_get_many, handle_observe, handle_push, StreamPair,
     },
-    store::{fs::FsStore, mem::MemStore, GcConfig, ProtectCb, ProtectOutcome},
+    store::{fs::FsStore, GcConfig, ProtectCb, ProtectOutcome},
     Hash, ALPN as BLOBS_ALPN,
 };
 use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
@@ -242,12 +242,30 @@ const CONNECTION_RECEIVE_WINDOW: u32 = 248_750_000;
 /// to one node.
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
+    /// Nothing on disk and no blob collection: the workspace's suites, never
+    /// a product build.
+    #[cfg(any(test, feature = "test-util"))]
     Memory,
     /// `identities/<identity>/` (replica store and persisted author),
     /// `blobs/`, `node.key`, `lock`. Created owner-only when absent: the
     /// replica store holds namespace secrets and the blobs payload bytes in
     /// the clear.
     Directory(std::path::PathBuf),
+}
+
+impl StorageConfig {
+    /// `None` on a node in memory.
+    #[cfg_attr(
+        not(any(test, feature = "test-util")),
+        allow(clippy::unnecessary_wraps) // a product build has no node in memory
+    )]
+    fn directory(&self) -> Option<&std::path::Path> {
+        match self {
+            #[cfg(any(test, feature = "test-util"))]
+            Self::Memory => None,
+            Self::Directory(directory) => Some(directory),
+        }
+    }
 }
 
 /// What the endpoint binds to be reachable; each variant keeps what the one
@@ -272,12 +290,11 @@ pub enum Connectivity {
 }
 
 /// Spawn-time configuration ([`SyncNode::spawn_with`]). Build with
-/// [`SpawnOptions::memory`], [`SpawnOptions::on_directory`], or
-/// [`SpawnOptions::for_product`].
+/// [`SpawnOptions::on_directory`] or [`SpawnOptions::for_product`]; the
+/// suites also with `SpawnOptions::memory`.
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
-    /// Required: a spawn that names neither memory nor a directory is not
-    /// expressible.
+    /// Required: a spawn that names no storage is not expressible.
     pub storage: StorageConfig,
     pub reconcile_interval: Duration,
     /// The pass over each pod store, whose every run reaches at most 5
@@ -310,6 +327,7 @@ pub const DEFAULT_REPLICA_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 impl SpawnOptions {
     /// In memory, direct paths — what the in-process suites run on.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn memory() -> Self {
         Self {
             storage: StorageConfig::Memory,
@@ -396,9 +414,9 @@ pub struct SyncNode {
     /// Handed to every hosted identity's book like `pod_verdicts`.
     #[cfg(feature = "test-util")]
     session_traces: crate::access::SessionTraceSink,
-    /// Blob collection runs once set: at spawn on memory, at the host's
-    /// [`start_blob_collection`](Self::start_blob_collection) on a
-    /// directory.
+    /// Blob collection runs once set, at the host's
+    /// [`start_blob_collection`](Self::start_blob_collection); a node in
+    /// memory has none.
     collecting: Arc<std::sync::atomic::AtomicBool>,
     /// What the passes report, so a scenario can order its absence
     /// assertions after runs that happened.
@@ -792,11 +810,7 @@ impl SyncNode {
         )
         .await?;
         let identities: Identities = Arc::default();
-        // A memory node holds nothing an identity could come back for.
-        let collecting = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
-            options.storage,
-            StorageConfig::Memory
-        )));
+        let collecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(feature = "test-util")]
         let collection_pause = CollectionPauseSlot::default();
         #[cfg(feature = "test-util")]
@@ -992,6 +1006,7 @@ impl SyncNode {
         let held_for = crate::access::identity_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
         Ok(match &self.storage {
+            #[cfg(any(test, feature = "test-util"))]
             StorageConfig::Memory => Docs::memory(held_for, provider),
             StorageConfig::Directory(directory) => {
                 let own = identity_directory(directory, identity);
@@ -1050,7 +1065,7 @@ impl SyncNode {
     /// power loss can take the record back after this returned `Ok`. A node
     /// in memory records nothing.
     pub async fn record_hosting(&self, identity: PdnId, pms: NamespaceId) -> Result<()> {
-        let StorageConfig::Directory(root) = &self.storage else {
+        let Some(root) = self.storage.directory() else {
             return Ok(());
         };
         self.flush_replicas(identity, pms).await?;
@@ -1065,7 +1080,7 @@ impl SyncNode {
     /// not listed, and an unreadable record fails, naming its file. Empty on
     /// a node in memory.
     pub fn recorded_hosting(&self) -> Result<Vec<RecordedHosting>> {
-        let StorageConfig::Directory(root) = &self.storage else {
+        let Some(root) = self.storage.directory() else {
             return Ok(Vec::new());
         };
         read_hosting_records(root)
@@ -2509,7 +2524,7 @@ impl SyncNode {
     /// Let blob collection run on a directory-configured node, once the
     /// host has hosted again every identity it means to: a run before that
     /// would remove the payloads of an identity recovery has yet to reach.
-    /// A memory node collects from its spawn.
+    /// A node in memory never collects.
     pub fn start_blob_collection(&self) {
         self.collecting
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2803,7 +2818,7 @@ fn governing_store(stack: &HostedStack, namespace: NamespaceId) -> Option<Namesp
 }
 
 /// The node's one blob store, collected at the interval `options` sets
-/// once `collecting` is set.
+/// once `collecting` is set; a node in memory's is never collected.
 async fn open_blob_store(
     options: &SpawnOptions,
     identities: &Identities,
@@ -2811,26 +2826,23 @@ async fn open_blob_store(
     #[cfg(feature = "test-util")] pause: &CollectionPauseSlot,
     #[cfg(feature = "test-util")] runs: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<iroh_blobs::api::Store> {
-    let collection = GcConfig {
-        interval: options.blob_collection_interval,
-        add_protected: Some(protect_hosted(
-            Arc::downgrade(identities),
-            Arc::clone(collecting),
-            #[cfg(feature = "test-util")]
-            Arc::clone(pause),
-            #[cfg(feature = "test-util")]
-            Arc::clone(runs),
-        )),
-    };
     Ok(match &options.storage {
-        StorageConfig::Memory => MemStore::new_with_opts(iroh_blobs::store::mem::Options {
-            gc_config: Some(collection),
-        })
-        .into(),
+        #[cfg(any(test, feature = "test-util"))]
+        StorageConfig::Memory => iroh_blobs::store::mem::MemStore::new().into(),
         StorageConfig::Directory(directory) => {
             let root = directory.join(BLOBS_DIR);
             let mut store_options = iroh_blobs::store::fs::options::Options::new(&root);
-            store_options.gc = Some(collection);
+            store_options.gc = Some(GcConfig {
+                interval: options.blob_collection_interval,
+                add_protected: Some(protect_hosted(
+                    Arc::downgrade(identities),
+                    Arc::clone(collecting),
+                    #[cfg(feature = "test-util")]
+                    Arc::clone(pause),
+                    #[cfg(feature = "test-util")]
+                    Arc::clone(runs),
+                )),
+            });
             FsStore::load_with_opts(root.join("blobs.db"), store_options)
                 .await
                 .with_context(|| format!("cannot open the blob store in {}", directory.display()))?
@@ -3078,7 +3090,7 @@ fn generate_node_key(_directory: &std::path::Path, path: &std::path::Path) -> Re
 /// store held by another node as [`DirectoryHeld`] rather than a lock error
 /// that reads as corruption. The underlying error stays in the chain.
 fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::Error {
-    let StorageConfig::Directory(directory) = storage else {
+    let Some(directory) = storage.directory() else {
         return err;
     };
     let held = err.chain().any(|cause| {
@@ -3089,7 +3101,7 @@ fn annotate_store_error(err: anyhow::Error, storage: &StorageConfig) -> anyhow::
     });
     if held {
         err.context(DirectoryHeld {
-            directory: directory.clone(),
+            directory: directory.to_path_buf(),
         })
     } else {
         err.context(format!(
@@ -3111,10 +3123,10 @@ async fn prepare_storage(
     Option<std::fs::File>,
     Option<Arc<AddressBook>>,
 )> {
-    let StorageConfig::Directory(directory) = storage else {
+    let Some(directory) = storage.directory() else {
         return Ok((None, None, None));
     };
-    let directory = directory.clone();
+    let directory = directory.to_path_buf();
     let (key, lock, book) = tokio::task::spawn_blocking(move || {
         provision_directory(&directory)?;
         let lock = lock_directory(&directory)?;

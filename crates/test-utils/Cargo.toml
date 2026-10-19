@@ -5,6 +5,12 @@ edition = "2021"
 description = "Shared plumbing for scenario tests: poll-until helpers and the cast of test identities"
 publish = false
 
+[features]
+# The node in memory, which data-layer builds only under its `test-util`.
+# Named by the dev-dependencies alone: a feature on the plain dependency
+# would reach every workspace build, the product check's included.
+test-util = ["data-layer/test-util"]
+
 [dependencies]
 anyhow = "1"
 # `data-layer`'s own tests depend on this crate, so it must not depend on

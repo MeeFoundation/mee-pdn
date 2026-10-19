@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use data_layer::{DocTicket, PrivateMetadataStore, SpawnOptions, SyncNode};
+use data_layer::{DocTicket, PrivateMetadataStore, SyncNode};
 
 pub mod pod;
 use pdn_types::{NodeId, PdnId};
@@ -28,8 +28,9 @@ pub fn count_panics() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
 }
 
 /// A node on memory storage — what the in-process suites run on.
+#[cfg(feature = "test-util")]
 pub async fn memory_node() -> Result<SyncNode> {
-    SyncNode::spawn(SpawnOptions::memory()).await
+    SyncNode::spawn(data_layer::SpawnOptions::memory()).await
 }
 
 /// The cast: bare [`PdnId`] values, one byte pattern each.

@@ -8,7 +8,7 @@ The identity key pair and everything derived from it or signed by it live in `id
 
 Blob collection runs over the node's one blob store at `SpawnOptions::blob_collection_interval`, its single protect callback answering with the payloads every hosted identity's replica store references, read through each engine's `collection_hashes`, which keeps a payload written or fetched since the previous run until a read that sees its entry, and on a storage directory starting only at the host's `start_blob_collection` — pdn-node calls it once recovery has hosted its identities again — so a start removes nothing of an identity recovery has yet to reach. The blob store's shutdown ends the collection's task (the iroh-blobs fork's `UPSTREAM.md`), which otherwise holds the store's runtime for the rest of the process.
 
-Storage is a required choice of every spawn (`SpawnOptions::storage`): memory by name — the workspace's suites, via their spawn helpers — or a directory by name, with no default. A configured directory holds everything a node needs to be itself:
+Storage is a required choice of every spawn (`SpawnOptions::storage`): memory by name — the workspace's suites, via their spawn helpers, and only under `test-util`, with no blob collection — or a directory by name, with no default. A configured directory holds everything a node needs to be itself:
 
 ```
 <directory>/
