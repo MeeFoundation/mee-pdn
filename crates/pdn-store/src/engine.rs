@@ -648,18 +648,33 @@ impl DefaultAuthorStorage {
             }
             Self::Persistent(ref path) => {
                 use anyhow::Context;
-                tokio::fs::write(path, author_id.to_string())
+                let path = path.clone();
+                let context = format!(
+                    "Failed to write the default author to `{}`",
+                    path.to_string_lossy()
+                );
+                tokio::task::spawn_blocking(move || write_whole(&path, author_id.to_string()))
                     .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to write the default author to `{}`",
-                            path.to_string_lossy()
-                        )
-                    })?;
+                    .context(context.clone())?
+                    .context(context)?;
             }
         }
         Ok(())
     }
+}
+
+/// Written beside and renamed over, so a crash leaves `path` whole or absent:
+/// a torn file fails every later start.
+fn write_whole(path: &std::path::Path, contents: String) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let staged = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(contents.as_bytes())?;
+        // A rename can commit before the data reaches the disk.
+        file.sync_all()?;
+    }
+    std::fs::rename(&staged, path)
 }
 
 /// Persistent default author for a docs engine.
