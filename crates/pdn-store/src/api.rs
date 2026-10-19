@@ -379,13 +379,14 @@ impl Doc {
     /// Leaves this document's gossip swarm without stopping its live sync.
     ///
     /// The narrow inverse of the swarm join that [`Self::start_sync`]
-    /// performs, for downgrading a replica to scoped access: the replica
-    /// stays open and syncing — reconciliation keeps accepting and dialing,
-    /// event subscribers stay live — while the gossip channel closes in
-    /// both directions: nothing more is ingested from the topic, and local
-    /// inserts stop broadcasting to it. Idempotent: leaving a swarm that
-    /// was never joined does nothing; a later [`Self::start_sync`]
-    /// re-joins.
+    /// performs, for a replica held out of its swarm — the data layer's pod
+    /// tombstone: the replica stays open and syncing — reconciliation keeps
+    /// accepting and dialing, event subscribers stay live — while the
+    /// gossip channel closes in both directions: nothing more is ingested
+    /// from the topic, and local inserts stop broadcasting to it.
+    /// Idempotent: leaving a swarm that was never joined does nothing; a
+    /// later [`Self::start_sync`], or a [`Self::sync_with_peers`] that joins
+    /// the swarm, re-joins.
     pub async fn leave_gossip(&self) -> Result<()> {
         self.engine()?.leave_gossip(self.namespace_id).await
     }

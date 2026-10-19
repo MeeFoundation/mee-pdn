@@ -64,8 +64,6 @@ impl<K: Key + 'static, V: Value + 'static> RangeExt<K, V> for Range<'_, K, V> {
 #[debug("RecordsRange")]
 pub(crate) struct RecordsRange<'a>(Range<'a, RecordsId<'static>, RecordsValue<'static>>);
 
-// pub type RecordsRange<'a> = Range<'a, RecordsId<'static>, RecordsValue<'static>>;
-
 impl<'a> RecordsRange<'a> {
     pub(super) fn with_bounds(
         records: &'a impl ReadableTable<RecordsId<'static>, RecordsValue<'static>>,
@@ -75,7 +73,6 @@ impl<'a> RecordsRange<'a> {
         Ok(Self(range))
     }
 
-    //
     /// Get the next item in the range.
     ///
     /// Omit items for which the `matcher` function returns false.

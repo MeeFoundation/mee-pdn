@@ -13,7 +13,7 @@ It is the platform's own variant of n0's `iroh-docs` (ADR-0016): it holds what a
 Two non-obvious facts shape the whole design:
 
 - **Documents store hashes, not content.** Each *Entry* maps a key to the BLAKE3 hash, size, and timestamp of some content — the content bytes themselves are never stored in or transferred through a replica. Actual blob transfer is delegated to `iroh-blobs`.
-- **`Docs` is a "meta-protocol."** It composes `iroh-blobs` (content) and `iroh-gossip` (live notification) on top of an `iroh` endpoint. Setting up `Docs` requires wiring up `Blobs` and `Gossip` too, and mounting `DocsDispatch`, the one accept path (`tests/util/mod.rs` shows the assembly).
+- **`Docs` is a "meta-protocol."** It composes `iroh-blobs` (content) and `iroh-gossip` (live notification) on top of an `iroh` endpoint. Setting up `Docs` requires wiring up an iroh-blobs store and `Gossip` too, and mounting `DocsDispatch`, the one accept path (`tests/util/mod.rs` shows the assembly).
 
 Entries are signed by two keypairs: a **Namespace** key (write capability; its public `NamespaceId` is the replica's unique id) and an **Author** key (proof of authorship; any number of `AuthorId`s, with app-specific meaning).
 
@@ -45,7 +45,7 @@ Requests flow top-to-bottom; each layer is in its own module. The two key indire
 Docs (protocol.rs)          ── entry point, holds the engine. Builder: Docs::memory()/persistent(path).spawn(endpoint, blobs, gossip)
   ├─ DocsDispatch           ── iroh ProtocolHandler: hands an accepted session to the engine of the identity it names
   └─ DocsApi, Doc (api.rs)  ── handles calling the engine; derefs from Docs
-       └─ Engine (engine.rs)        ── coordinates everything below; holds Endpoint, blob store, downloader, default author
+       └─ Engine (engine.rs)        ── coordinates everything below; holds Endpoint, blob store, default author
             ├─ SyncHandle (actor.rs)        ── store/replica operations
             └─ LiveActor (engine/live.rs)   ── live sync coordination
 ```

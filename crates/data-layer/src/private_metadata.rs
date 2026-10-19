@@ -3,7 +3,8 @@
 //! Four record families under disjoint prefixes: `devices/`,
 //! `pending-devices/`, `tickets/` and `pods/`, and the identity key pair at
 //! `identity-key`. Device and pod records are record-level; ticket and key
-//! payloads are blobs, so their reads wait for content.
+//! payloads are blobs, so their reads answer `None` until the content
+//! arrives.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -236,8 +237,8 @@ fn pending_device_marker(marker: &[u8]) -> PendingMarker {
         .map_or(PendingMarker::Malformed, PendingMarker::Timestamp)
 }
 
-/// The owning identity is not kept here — the handle's identity knows which
-/// identity it serves.
+/// The owning identity is not kept here — the caller holding the handle
+/// names it.
 #[derive(Debug)]
 pub struct PrivateMetadataStore {
     doc: Doc,

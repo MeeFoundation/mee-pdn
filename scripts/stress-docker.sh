@@ -1,7 +1,7 @@
 #!/bin/sh
 # The container flaky hunt. Usage: stress-docker.sh <count> [nextest args...]
 #
-# Three things this encodes, each learnt from a hunt that lost evidence:
+# Three things this encodes, each keeping evidence a hunt would lose:
 # the hunt runs to its end (`--no-fail-fast`), because one container that
 # never gets its port published would otherwise cancel the remaining
 # iterations; a failure keeps the nodes' logs, because the assertion says a

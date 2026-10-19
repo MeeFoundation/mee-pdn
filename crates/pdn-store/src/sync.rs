@@ -1,10 +1,7 @@
 //! API for pdn-store replicas
 
-// Names and concepts are roughly based on Willows design at the moment:
-//
+// Names and concepts roughly follow Willow's design:
 // https://hackmd.io/DTtck8QOQm6tZaQBBtTf7w
-//
-// This is going to change!
 
 use std::{
     cmp::Ordering,
@@ -346,8 +343,8 @@ where
 
     /// Insert an entry into this replica which was received from a remote peer.
     ///
-    /// This will verify both the namespace and author signatures of the entry, emit an `on_insert`
-    /// event, and insert the entry into the replica store.
+    /// This will verify both the namespace and author signatures of the entry, insert the entry
+    /// into the replica store, and emit an [`Event::RemoteInsert`].
     ///
     /// Returns the number of entries removed as a consequence of this insertion,
     /// or an error if the entry failed to validate or if a store operation failed.
@@ -464,8 +461,6 @@ where
                 .insert(entry.author(), entry.timestamp());
         }
 
-        // let subscribers = std::rc::Rc::new(&mut self.subscribers);
-        // l
         let cb = self.info.content_status_cb.clone();
 
         let mut session_store = crate::filter::SessionStore::new(&mut self.store, filter);
@@ -539,7 +534,10 @@ where
 /// * the entry's timestamp is not more than 10 minutes in the future of our system time
 /// * the entry's key is no longer than [`MAX_KEY_BYTES`]
 /// * the entry has the empty hash exactly when it has length 0
-/// * the entry is newer than an existing entry for the same key and author, if such exists.
+/// * a remote entry passes `ingest`, the session's verdict, when one is given.
+///
+/// Whether the entry is newer than the one held at its key and author is the
+/// store's `put` to decide.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
     store: &S,
@@ -849,8 +847,8 @@ impl EntrySignature {
 
 /// A single entry in a `Replica`
 ///
-/// An entry is identified by a key, its [`Author`], and the `Replica`'s
-/// [`NamespaceSecret`]. Its value is the [32-byte BLAKE3 hash](iroh_blobs::Hash)
+/// An entry is identified by a key, its [`AuthorId`], and the `Replica`'s
+/// [`NamespaceId`]. Its value is the [32-byte BLAKE3 hash](iroh_blobs::Hash)
 /// of the entry's content data, the size of this content data, and a timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {

@@ -44,7 +44,7 @@ git clone git@github.com:MeeFoundation/mia-ontologies.git
 - `just build`: build all workspace crates
 - `just test`: run tests for all workspace crates
 - `just check`: format & lint check
-- `just fix`: format & lint check + autofix, tests
+- `just fix`: audit, lint and format with autofixes, then the tests and the container suite (needs docker)
 
 ## Crates
 

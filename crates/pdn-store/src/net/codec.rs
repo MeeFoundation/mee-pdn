@@ -683,7 +683,7 @@ mod tests {
         let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
 
         let mut alice_store = store::Store::memory();
-        // For now uses same author on both sides.
+        // One author writes on both sides.
         let author = alice_store.new_author(&mut rng).unwrap();
 
         let namespace = NamespaceSecret::new(&mut rng);
@@ -1881,7 +1881,7 @@ mod tests {
             "the round failed for another reason: {err:?}"
         );
 
-        // The call `handle_connection` makes on every path.
+        // The call `run_session` makes on every path.
         let outcome = state.into_outcome();
         assert_eq!(outcome.num_sent, 0);
         assert_eq!(outcome.num_recv, 0);

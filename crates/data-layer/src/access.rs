@@ -53,8 +53,10 @@ enum WriteAdmission {
     Rests(Arc<Rests>),
     /// Exactly the entries these authors signed and the device statements
     /// of `statements_of`, on a pod's store: what a dial takes from a callee
-    /// it serves nothing. A statement carries its member's signature, which
-    /// the membership view checks whoever authored the entry.
+    /// it serves nothing, and what an accept takes from a node no statement
+    /// of the current member it names lists. A statement carries its
+    /// member's signature, which the membership view checks whoever
+    /// authored the entry.
     Signed {
         authors: Arc<HashSet<AuthorId>>,
         statements_of: Option<PdnId>,
@@ -67,9 +69,9 @@ type Read = (MembershipView, Vec<HeldEntry>);
 
 /// What a dial still takes from a pod session's callee it serves nothing.
 enum Unserved {
-    /// Everything: the membership view counts no member, or lists no device
-    /// of the current member the callee names, as while the payloads of
-    /// their statements are on their way.
+    /// Everything: the membership view counts no current member, or lists
+    /// no device of the current member the callee names, as while the
+    /// payloads of their statements are on their way.
     Unresolved,
     /// The entries every device of a current member signed, and the device
     /// statements of the current member the callee names: a device none of
@@ -78,7 +80,8 @@ enum Unserved {
         authors: Arc<HashSet<AuthorId>>,
         statements_of: Option<PdnId>,
     },
-    /// Nothing: a replica whose own identity departed takes its past alone.
+    /// Nothing: the pod is not held, or the replica's own identity
+    /// departed.
     Nothing,
 }
 
@@ -88,9 +91,9 @@ enum Unserved {
 pub(crate) struct AccessBook {
     /// Whom this book judges for.
     identity: PdnId,
-    /// This identity's own PMS, armed by `host_identity`. Until it
-    /// is here every pod session is refused: the records that judge one
-    /// are in it.
+    /// This identity's own PMS, armed by `host_identity`. Until it is here
+    /// a session on the PMS is refused and no device counts as a sibling:
+    /// the device records are in it.
     pms: RwLock<Option<Doc>>,
     /// Set right after the stack spawns, before any session can arrive.
     blobs: OnceLock<iroh_blobs::api::Store>,
@@ -435,12 +438,15 @@ impl AccessBook {
         Ok(SessionAccess::Deny)
     }
 
-    /// A pod's membership store, served whole to a device of the member
-    /// the caller names — a sibling by this identity's own PMS,
-    /// another member by the device statements this identity's membership
-    /// view counts — and to nobody else, by the pod stores spec, though a
-    /// node no statement of a current member lists is taken that member's
-    /// statements alone. The record store serves no session.
+    /// Either of a pod's stores, served whole to a device of the member the
+    /// caller names — a sibling by this identity's own PMS, another current
+    /// member by the device statements this identity's membership view
+    /// counts — and to nobody else, by the pod stores spec, but for the
+    /// membership store's exceptions: a former member's device is served its
+    /// departure's past, a replica whose own identity departed sends its
+    /// own, and a node no statement of a current member lists is taken that
+    /// member's statements alone. The record store has none of these
+    /// exceptions.
     async fn classify_pod(
         &self,
         registry: &Arc<Registry>,
@@ -538,17 +544,20 @@ impl AccessBook {
                 .is_some_and(|member| member.state.member)
     }
 
-    /// A pod session served nothing (Invariant 2): denied when accepting, whatever
-    /// `unserved` would say; when dialing, nothing served but the replica's
-    /// own statements while it lists nobody, and what it admits taken.
+    /// A pod session served nothing (Invariant 2): denied when accepting,
+    /// whatever `unserved` would say; when dialing, nothing served but the
+    /// replica's own statements while [`Unserved::Unresolved`] holds — the
+    /// membership view counts no current member, or lists no device of the
+    /// one the callee names — and what it admits taken.
     fn refused(&self, role: SessionRole, unserved: impl FnOnce() -> Unserved) -> SessionAccess {
         if matches!(role, SessionRole::Accept) {
             return SessionAccess::Deny;
         }
         let (admission, egress) = match unserved() {
-            // A replica that lists nobody yet sends its own statements, so a
-            // device whose siblings are gone reaches a member device — the
-            // egress exception Invariant 2 names.
+            // A replica that counts no current member yet sends its own
+            // statements, so a device whose siblings are gone reaches a
+            // member device — the egress exception Invariant 2 names; it is
+            // sent as well when the callee's member lists no device yet.
             Unserved::Unresolved => (WriteAdmission::Whole, self.own_statements()),
             Unserved::Members {
                 authors,
@@ -772,7 +781,6 @@ impl AccessBook {
         }
     }
 
-    /// Whether the peer is a device of this book's own identity.
     /// The devices the identity's own PMS lists; none before it is
     /// armed.
     pub(crate) async fn own_devices(&self) -> Result<Vec<NodeId>> {
@@ -782,6 +790,7 @@ impl AccessBook {
         crate::private_metadata::listed_devices(&pms).await
     }
 
+    /// Whether the peer is a device of this book's own identity.
     async fn peer_is_own_device(&self, peer_key: &[u8]) -> Result<bool> {
         let Some(pms) = self.own_pms()? else {
             return Ok(false);

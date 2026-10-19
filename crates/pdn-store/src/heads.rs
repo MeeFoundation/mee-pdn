@@ -9,7 +9,7 @@ use crate::AuthorId;
 type Timestamp = u64;
 
 /// Per author, the greatest timestamp a replica holds. A trigger, not a
-/// proof: equal heads do not mean equal contents (see `SyncHandle::author_heads`).
+/// proof: equal heads do not mean equal contents.
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub(crate) struct AuthorHeads {
     heads: BTreeMap<AuthorId, Timestamp>,

@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
-// use super::gossip::{GossipActor, ToGossipActor};
 use self::draining::DrainingSync;
 use super::state::{NamespaceStates, Origin, SyncReason};
 use crate::{
@@ -105,7 +104,7 @@ pub(crate) struct SyncReport {
     identity: Identity,
 }
 
-/// Messages to the sync actor
+/// Messages to the live actor
 #[derive(derive_more::Debug, strum::Display)]
 pub(crate) enum ToLiveActor {
     StartSync {
@@ -117,8 +116,9 @@ pub(crate) enum ToLiveActor {
         /// Whom a peer no contact or session named is dialed as; `None`
         /// keeps what an earlier start stated, else this engine's identity.
         default_identity: Option<Identity>,
-        /// Whether to join the replica's gossip swarm. Scoped access syncs
-        /// without ever joining the swarm.
+        /// Whether to join the replica's gossip swarm. A replica held out of
+        /// its swarm — the data layer's pod tombstone — syncs without
+        /// joining it.
         join_gossip: bool,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
@@ -836,10 +836,6 @@ impl LiveActor {
         Ok(true)
     }
 
-    /// Which identity `peer` is dialed as for `namespace`: what a contact
-    /// or a past session named, else the consumer's default for the
-    /// replica, else this engine's own identity — what a sibling device of
-    /// the same identity is.
     /// Give back the identity a finished session named, and drop the pair
     /// once nothing names it: a session that was refused leaves no trace,
     /// and one that ran leaves none either.
@@ -1175,7 +1171,6 @@ impl LiveActor {
         namespace: NamespaceId,
         kill_subscribers: bool,
     ) -> anyhow::Result<()> {
-        // self.subscribers.remove(&namespace);
         self.prerequisites.remove(&namespace);
         let held_on_it: Vec<(NamespaceId, PublicKey, Identity)> = self
             .held_dials
@@ -1211,8 +1206,8 @@ impl LiveActor {
         Ok(())
     }
 
-    /// The stated identities of `namespace`'s peers become `contacts`'
-    /// alone; the ones a running session named stay until it ends.
+    /// The exchanges of `namespaces` running, the dials held behind one of
+    /// them or held on one, and the redials due.
     fn syncs_in_flight(&self, namespaces: &[NamespaceId]) -> usize {
         let running: usize = namespaces
             .iter()
@@ -1266,6 +1261,8 @@ impl LiveActor {
         lines.join("; ")
     }
 
+    /// The stated identities of `namespace`'s peers become `contacts`'
+    /// alone; the ones a running session named stay until it ends.
     fn state_contacts(&mut self, namespace: NamespaceId, contacts: Vec<Contact>) {
         for ((tracked, _peer), identities) in &mut self.peer_identities {
             if *tracked == namespace {
@@ -1362,9 +1359,9 @@ impl LiveActor {
             }
         }
 
-        // tell gossip to join — unless this is scoped access, which stays
-        // outside the replica's swarm: reconciliation is its only data
-        // path, and the direct syncs below still run.
+        // tell gossip to join — unless the replica is held out of its
+        // swarm: reconciliation is then its only data path, and the direct
+        // syncs below still run.
         if join_gossip {
             self.gossip.join(namespace, peer_ids.clone()).await?;
         }
@@ -2094,9 +2091,6 @@ impl LiveActor {
         }
     }
 
-    /// An engine that is the whole node's docs handler: read the first
-    /// message here, then serve it. A node of several identities dispatches
-    /// before this point ([`crate::protocol::Docs`]).
     #[instrument("accept", skip_all)]
     /// Serve a session whose first message named this engine's identity.
     #[instrument("accept", skip_all)]

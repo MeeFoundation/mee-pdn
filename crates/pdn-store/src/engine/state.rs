@@ -19,7 +19,7 @@ pub enum SyncReason {
     NewNeighbor,
     /// We synced after receiving a sync report that indicated news for us
     SyncReport,
-    /// We received a sync report while a sync was running, so run again afterwars
+    /// A dial was asked for while an exchange with the pair was running, so run again afterwards
     Resync,
     /// An in-process session with an identity of this same node: a write's
     /// announcement, a contact naming this node, or the periodic pass.
@@ -405,7 +405,6 @@ mod tests {
         NamespaceId::from(&[7u8; 32])
     }
 
-    /// Two deterministic endpoint ids, returned as (lower, higher) by key bytes.
     /// The identity across the session. Both directions of a mutual dial
     /// name the same one when each node hosts one identity, which is what
     /// makes the tie-break below meet its own dial.
@@ -419,6 +418,7 @@ mod tests {
         Identity::from_bytes([1u8; 32])
     }
 
+    /// Two deterministic endpoint ids, returned as (lower, higher) by key bytes.
     fn node_pair() -> (EndpointId, EndpointId) {
         let a = SecretKey::from_bytes(&[1u8; 32]).public();
         let b = SecretKey::from_bytes(&[2u8; 32]).public();

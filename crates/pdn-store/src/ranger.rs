@@ -18,7 +18,7 @@ pub(crate) trait RangeEntry: Debug + Clone {
     /// See [`RangeKey`] for details.
     type Key: RangeKey;
 
-    /// The value type for this entry. See
+    /// The value type for this entry.
     ///
     /// The type must implement [`Ord`] to define which of two entries at one key supersedes the
     /// other.
@@ -300,8 +300,8 @@ pub trait Store<E: RangeEntry>: Sized {
     /// If terminated, returns `None`
     ///
     /// `validate_cb` is called for each incoming entry received from the remote.
-    /// It must return true if the entry is valid and should be stored, and false otherwise
-    /// (which means the entry will be dropped and not stored).
+    /// It returns [`ValidateOutcome::Accept`] for an entry to store and
+    /// [`ValidateOutcome::Drop`] for one to keep out.
     ///
     /// `on_insert_cb` is called for each entry that was actually inserted into the store (so not
     /// for entries which validated, but are not inserted because the store holds a newer entry at
@@ -513,7 +513,6 @@ pub trait Store<E: RangeEntry>: Sized {
                             fingerprint,
                         }));
                     } else {
-                        // let content_status_cb = content_status_cb.clone();
                         let values = chunk.into_iter().filter_map(|entry| match entry {
                             Err(_err) => None,
                             Ok(entry) => Some(async {
@@ -982,7 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multikey() {
-        /// Uses the blanket impl of [`RangeKey]` for `T: AsRef<[u8]>` in this module.
+        /// A key ordered by author first, then by its bytes.
         #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
         struct Multikey {
             author: [u8; 4],
@@ -1062,7 +1061,7 @@ mod tests {
     }
 
     // This tests two things:
-    // 1) validate cb returning false leads to no changes on both sides after sync
+    // 1) validate cb returning `Drop` leads to no changes on both sides after sync
     // 2) validate cb receives expected entries
     #[tokio::test]
     async fn test_validate_cb() {
@@ -1096,7 +1095,7 @@ mod tests {
             bob.put((k, v)).unwrap();
         }
 
-        // run sync with a validate callback returning false, so no new entries are stored on either side
+        // run sync with a validate callback returning `Drop`, so no new entries are stored on either side
         let mut res = sync_exchange_messages(alice, bob, &validate_alice, &validate_bob, 100).await;
         res.assert_alice_set("unchanged", &alice_set);
         res.assert_bob_set("unchanged", &bob_set);

@@ -140,7 +140,8 @@ pub struct Member {
     /// After its chain as far as the first sequence holding no entry.
     pub state: MemberState,
     pub identity_key: Option<[u8; 32]>,
-    /// The union of its counted device statements.
+    /// The union of its counted device statements and of the devices its
+    /// verified join statements name.
     pub devices: BTreeSet<MemberDevice>,
     /// The highest version among its counted device statements; `0` for
     /// none. The next statement takes the version after it.
