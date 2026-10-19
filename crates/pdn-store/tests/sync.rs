@@ -1334,6 +1334,39 @@ async fn a_drop_with_a_start_of_sync_behind_it_deletes_the_replica() -> Result<(
     Ok(())
 }
 
+/// A replica dropped while another open of it is outstanding is deleted,
+/// and the drop succeeds. The handle that open gave fails its next call, as
+/// every handle of a dropped replica does.
+#[tokio::test]
+#[traced_test]
+async fn a_drop_with_another_open_outstanding_deletes_the_replica() -> Result<()> {
+    let mut rng = test_rng(b"a_drop_with_another_open_outstanding_deletes_the_replica");
+    let node = spawn_node(0, &mut rng).await?;
+    let docs = node.client().docs();
+    let doc = docs.create().await?;
+    doc.start_sync(vec![], util::TEST_HOLDER).await?;
+    let author = docs.author_create().await?;
+    let other = docs
+        .open(doc.id())
+        .await?
+        .ok_or_else(|| anyhow!("the created replica does not open"))?;
+
+    docs.drop_doc(doc.id()).await?;
+    let mut listed = docs.list().await?;
+    while let Some((id, _kind)) = listed.try_next().await? {
+        assert_ne!(id, doc.id(), "the dropped replica is still held");
+    }
+    assert!(
+        other
+            .set_bytes(author, b"key".to_vec(), b"value".to_vec())
+            .await
+            .is_err(),
+        "a handle of the dropped replica still writes"
+    );
+    node.shutdown().await?;
+    Ok(())
+}
+
 async fn assert_latest(blobs: &iroh_blobs::api::Store, doc: &Doc, key: &[u8], value: &[u8]) {
     let content = get_latest(blobs, doc, key).await.unwrap();
     assert_eq!(content, value.to_vec());

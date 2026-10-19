@@ -6,6 +6,7 @@ use pdn_store::{
     api::Doc,
     filter::{SessionAccess, SessionAccessProvider},
     protocol::Docs,
+    store::Query,
 };
 use testresult::TestResult;
 use tracing_test::traced_test;
@@ -129,5 +130,62 @@ async fn test_default_author_persist() -> TestResult<()> {
         iroh?.shutdown().await?;
     }
 
+    Ok(())
+}
+
+/// A write [`DocsApi::flush`](pdn_store::api::DocsApi::flush) answered for
+/// is on disk whole at once: a copy of the node's directory taken then,
+/// which is what a kill leaves behind, reads its entry and its payload.
+///
+/// Without the flush both stores commit on timers of their own, the replica
+/// store's within half a second and the blob store's within one, so a copy
+/// taken at once holds neither.
+#[tokio::test]
+#[traced_test]
+async fn a_flushed_write_is_on_disk_at_once() -> TestResult<()> {
+    let root = tempfile::TempDir::new()?;
+    let iroh = Node::persistent(root.path(), empty_endpoint().await?)
+        .spawn()
+        .await?;
+    let author = iroh.docs().author_default().await?;
+    let doc = iroh.docs().create().await?;
+    let namespace = doc.id();
+    let hash = doc.set_bytes(author, "key", "value").await?;
+    iroh.docs().flush().await?;
+    let copy = tempfile::TempDir::new()?;
+    copy_tree(root.path(), copy.path())?;
+    iroh.shutdown().await?;
+
+    let reopened = Node::persistent(copy.path(), empty_endpoint().await?)
+        .spawn()
+        .await?;
+    let doc = reopened
+        .docs()
+        .open(namespace)
+        .await?
+        .ok_or("the flushed replica is not in the copy")?;
+    let entry = doc
+        .get_one(Query::key_exact("key"))
+        .await?
+        .ok_or("the flushed entry is not in the copy")?;
+    assert_eq!(entry.content_hash(), hash);
+    let payload = reopened.blobs().get_bytes(hash).await?;
+    assert_eq!(payload.as_ref(), b"value");
+    reopened.shutdown().await?;
+    Ok(())
+}
+
+/// `from` copied file by file into `to`, as it lies on disk at this moment.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }

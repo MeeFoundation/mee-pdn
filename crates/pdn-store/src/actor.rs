@@ -1051,7 +1051,9 @@ impl Actor {
                 Ok(())
             }
             ReplicaAction::DropReplica { reply } => send_reply_with(reply, self, |this| {
-                this.close(namespace);
+                // Every handle at once: an open another caller holds would
+                // otherwise keep the replica open and fail the delete.
+                this.close_every_handle(namespace);
                 this.store.remove_replica(&namespace)
             }),
             ReplicaAction::ExportSecretKey { reply } => {
@@ -1114,6 +1116,14 @@ impl Actor {
             self.store.close_replica(namespace);
         }
         res
+    }
+
+    fn close_every_handle(&mut self, namespace: NamespaceId) {
+        if self.states.close_every_handle(namespace) {
+            self.sessions.retain(|_, s| s.namespace != namespace);
+            self.record_open_sessions();
+            self.store.close_replica(namespace);
+        }
     }
 
     fn close_all(&mut self) {
@@ -1273,6 +1283,11 @@ impl OpenReplicas {
                 }
             }
         }
+    }
+
+    /// Whether `namespace` was open.
+    fn close_every_handle(&mut self, namespace: NamespaceId) -> bool {
+        self.0.remove(&namespace).is_some()
     }
 
     fn close_all(&mut self) -> impl Iterator<Item = NamespaceId> + '_ {

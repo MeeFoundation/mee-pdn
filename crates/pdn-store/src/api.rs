@@ -134,6 +134,10 @@ impl DocsApi {
     /// again.
     ///
     /// If you need only a single author, use [`Self::author_default`].
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`DocsApi::flush`] first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn author_create(&self) -> Result<AuthorId> {
         let author = Author::new(&mut rand::rng());
         self.engine()?.sync.import_author(author).await
@@ -148,6 +152,10 @@ impl DocsApi {
     }
 
     /// Creates a new document.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`DocsApi::flush`] first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn create(&self) -> Result<Doc> {
         let engine = self.engine()?;
         let namespace = NamespaceSecret::new(&mut rand::rng());
@@ -162,13 +170,32 @@ impl DocsApi {
     /// This is a destructive operation. Both the document secret key and all entries in the
     /// document will be permanently deleted from the node's storage. Content blobs will be deleted
     /// through garbage collection unless they are referenced from another document or tag.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`DocsApi::flush`] first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn drop_doc(&self, doc_id: NamespaceId) -> Result<()> {
         self.engine()?.drop_replica(doc_id).await
+    }
+
+    /// Makes every write so far durable: every replica's entries, and the
+    /// payloads [`Doc::set_bytes`] added to the blob store. Answers the error
+    /// of a commit that failed, which the stores' own commits only log.
+    pub async fn flush(&self) -> Result<()> {
+        let engine = self.engine()?;
+        // Payloads first: an entry on disk without its payload reads as a
+        // write whose content is lost.
+        engine.blob_store().sync_db().await?;
+        engine.sync.flush_store().await
     }
 
     /// Imports a document from a namespace capability.
     ///
     /// This does not start sync automatically. Use [`Doc::start_sync`] to start sync.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`DocsApi::flush`] first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn import_namespace(&self, capability: Capability) -> Result<Doc> {
         let engine = self.engine()?;
         let doc_id = engine.sync.import_namespace(capability).await?;
@@ -223,6 +250,10 @@ impl Doc {
 
     /// Sets the content of a key to a byte array, answering the hash of the
     /// payload it wrote.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`DocsApi::flush`] first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn set_bytes(
         &self,
         author_id: AuthorId,
@@ -250,6 +281,10 @@ impl Doc {
     /// no other key is touched.
     ///
     /// Returns 1 when an older entry at `key` was replaced, 0 otherwise.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`DocsApi::flush`] first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn del(&self, author_id: AuthorId, key: impl Into<Bytes>) -> Result<usize> {
         self.engine()?
             .sync

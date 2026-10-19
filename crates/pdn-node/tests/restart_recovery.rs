@@ -640,3 +640,103 @@ async fn a_device_that_linked_before_the_restart_is_still_a_device() -> Result<(
     first.shutdown().await?;
     Ok(())
 }
+
+/// `from` copied file by file into `to`, as it lies on disk at this moment:
+/// what a kill at this moment leaves for the next start.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// An identity whose create returned is on disk whole: a copy of the
+/// directory taken at once comes back hosting it, with its identity key.
+///
+/// The copy stands in for a kill, holding what was on disk at that moment
+/// and nothing a stop would write. Without the commit point's flush, the
+/// key's payload sits in the blob store's write batch for up to a second
+/// after the hosting record is on disk. Denied: a runtime on an empty
+/// directory hosts nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_whose_create_returned_is_on_disk_whole() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let runtime = runtime_on(dir.path()).await?;
+    let alice = runtime.identity().create().await?;
+    let copy = tempfile::tempdir()?;
+    copy_tree(dir.path(), copy.path())?;
+    let key = runtime.identity_public_key_for_test(alice).await?;
+    runtime.shutdown().await?;
+    assert!(key.is_some(), "the identity's own key must be readable");
+
+    let recovered = runtime_on(copy.path()).await?;
+    assert_eq!(
+        recovered.sync().hosted_identities().await?,
+        vec![alice],
+        "the copy must host the identity whose create returned"
+    );
+    assert_eq!(
+        recovered.identity_public_key_for_test(alice).await?,
+        key,
+        "the copy must hold the identity's key"
+    );
+    recovered.shutdown().await?;
+    // Denied: nothing comes back from a directory that never held it.
+    let empty = tempfile::tempdir()?;
+    let fresh = runtime_on(empty.path()).await?;
+    assert_eq!(fresh.sync().hosted_identities().await?, []);
+    fresh.shutdown().await?;
+    Ok(())
+}
+
+/// A pod is never held without its tickets: a copy of the directory taken
+/// once the PMS's record of a created pod is on disk opens the pod.
+///
+/// The list reads the PMS, and that read commits the replica store's write
+/// batch while the blob store's stays open: an order the stores' own
+/// commits reach within their settle window. Without the flush before the
+/// record, the copy then holds the record and the tickets' entries but not
+/// their payloads, and the pod is listed and never opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pod_whose_record_is_on_disk_opens_from_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let runtime = runtime_on(dir.path()).await?;
+    let alice = runtime.identity().create().await?;
+    let pod = runtime.pods().create(alice).await?;
+    assert!(
+        runtime
+            .pods()
+            .list(alice)
+            .await?
+            .iter()
+            .any(|info| info.id == pod),
+        "the created pod must be listed"
+    );
+    let copy = tempfile::tempdir()?;
+    copy_tree(dir.path(), copy.path())?;
+    runtime.shutdown().await?;
+
+    let recovered = runtime_on(copy.path()).await?;
+    let opened = test_utils::eventually(|| async {
+        Ok(recovered
+            .pods()
+            .members(alice, pod)
+            .await
+            .is_ok_and(|members| {
+                members
+                    .iter()
+                    .any(|member| member.id == alice && member.owner)
+            }))
+    })
+    .await?;
+    assert!(opened, "the copy must open the pod its record names");
+    recovered.shutdown().await?;
+    Ok(())
+}

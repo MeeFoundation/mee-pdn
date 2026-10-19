@@ -247,6 +247,9 @@ pub struct PrivateMetadataStore {
 }
 
 impl PrivateMetadataStore {
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn create(node: &SyncNode, identity: PdnId) -> Result<Self> {
         // Author first, tracked doc last: nothing awaits between the
         // tracking and the handle reaching the caller, so a dropped future
@@ -265,6 +268,10 @@ impl PrivateMetadataStore {
     }
 
     /// Import via the write ticket the linking reply carries.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn import(node: &SyncNode, identity: PdnId, ticket: DocTicket) -> Result<Self> {
         // Author first, tracked doc last — see `create`.
         let author = node.default_author(identity)?;
@@ -310,6 +317,10 @@ impl PrivateMetadataStore {
 
     /// Record `device` as a confirmed device — one holding this PMS's
     /// write ticket.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn add_device(&self, device: NodeId) -> Result<()> {
         self.doc
             .set_bytes(self.author, device_key(&device).into_bytes(), vec![1u8])
@@ -319,6 +330,10 @@ impl PrivateMetadataStore {
 
     /// Record that `device` has begun linking, conferring nothing; the
     /// newcomer promotes itself with [`confirm_device`](Self::confirm_device).
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn add_pending_device(&self, device: NodeId) -> Result<()> {
         let _mutation = self.pending_mutations.lock().await;
         self.write_pending_device_at(device, SystemTime::now())
@@ -353,6 +368,9 @@ impl PrivateMetadataStore {
         self.write_pending_device_at(device, created_at).await
     }
 
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn cleanup_pending_devices(&self) -> Result<()> {
         self.cleanup_pending_devices_at(SystemTime::now()).await
     }
@@ -444,6 +462,10 @@ impl PrivateMetadataStore {
     /// itself: only a holder of the write ticket can, so the record is
     /// evidence the linking reply arrived — which the inviter cannot
     /// establish on its own.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn confirm_device(&self, device: NodeId) -> Result<()> {
         let _mutation = self.pending_mutations.lock().await;
         self.doc
@@ -475,6 +497,10 @@ impl PrivateMetadataStore {
 
     /// Record that the identity's membership event at `seq` of its chain in
     /// `pod` — its created or joined event — holds the pod.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn record_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
         self.doc
             .set_bytes(
@@ -489,6 +515,10 @@ impl PrivateMetadataStore {
     /// Record that the identity's left event at `seq`, or a removed event at
     /// `seq` its device learned of, ends its holding of `pod`: a tombstone
     /// at that sequence.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn tombstone_pod(&self, pod: PodId, seq: Seq) -> Result<()> {
         self.doc
             .del(self.author, pod_record_key(&pod, seq).into_bytes())
@@ -554,6 +584,9 @@ impl PrivateMetadataStore {
         Ok(highest)
     }
 
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn put_ticket(&self, kind: &str, ticket: &DocTicket) -> Result<()> {
         self.doc
             .set_bytes(
@@ -567,6 +600,10 @@ impl PrivateMetadataStore {
 
     /// Written once, by the identity's creation; the payload is the 32
     /// secret bytes, from which the pair follows.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle window;
+    /// [`SyncNode::flush_stores`](crate::SyncNode::flush_stores) first where
+    /// anything durable outside the stores names what it wrote.
     pub async fn put_identity_key(&self, key: &IdentityKeyPair) -> Result<()> {
         self.doc
             .set_bytes(

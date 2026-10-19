@@ -272,7 +272,7 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
         (carol.id, &carol_pms),
     ] {
         publish_pod(pms, pod, &tickets).await?;
-        first.flush_replicas(identity, pms.namespace()).await?;
+        first.flush_stores(identity).await?;
         hosted.push((identity, pms.namespace()));
     }
     first.shutdown().await?;

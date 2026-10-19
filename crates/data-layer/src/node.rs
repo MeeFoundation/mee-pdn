@@ -1057,10 +1057,11 @@ impl SyncNode {
     }
 
     /// Record `identity` as hosted here, with `pms` as its private
-    /// PMS: the commit point of a create or a link. The
-    /// replicas are flushed first, so the record never names one the store
-    /// has not written, and the record is written beside, synced and
-    /// renamed over, so a process that dies mid-write leaves none. The
+    /// PMS: the commit point of a create or a link. The identity's stores
+    /// are flushed first, so the record never names a replica, or an
+    /// identity key, the disk does not hold, and a failed commit fails the
+    /// call; the record is written beside, synced and renamed over, so a
+    /// process that dies mid-write leaves none. The
     /// parent directory is not synced after the rename, so an OS crash or a
     /// power loss can take the record back after this returned `Ok`. A node
     /// in memory records nothing.
@@ -1068,7 +1069,7 @@ impl SyncNode {
         let Some(root) = self.storage.directory() else {
             return Ok(());
         };
-        self.flush_replicas(identity, pms).await?;
+        self.flush_stores(identity).await?;
         let own = identity_directory(root, identity);
         tokio::task::spawn_blocking(move || write_hosting_record(&own, pms))
             .await
@@ -1255,6 +1256,10 @@ impl SyncNode {
     /// and their sync starts once they are registered, so their first
     /// sessions are ones the book can judge. A failure leaves neither; a call
     /// dropped midway leaves what it made, so its caller runs it to its end.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn create_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         if stack.registry.pod(pod)?.is_some() {
@@ -1427,6 +1432,10 @@ impl SyncNode {
     /// a pod held on these stores, the pod again for its tombstone. Both
     /// stores' sync starts once they are registered, as at `create_pod`. A failed import drops nothing — a replica may predate
     /// it — and a retry lands on it.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn import_pod(
         &self,
         identity: PdnId,
@@ -1440,6 +1449,10 @@ impl SyncNode {
     /// tickets to the same two stores that other identities minted — among
     /// the contacts as well, each dialed as the identity whose ticket names
     /// it: a ticket names all its nodes as the one identity that minted it.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn import_pod_with(
         &self,
         identity: PdnId,
@@ -1578,6 +1591,10 @@ impl SyncNode {
     /// Drop both of `pod`'s stores and its registration, as if the pod
     /// had never been held here: the undo of a create or a join before
     /// anything of the pod left this device. Nothing for a pod not held.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn discard_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         let Some(held) = stack.registry.unregister_pod(pod)? else {
@@ -1736,6 +1753,10 @@ impl SyncNode {
     /// At a departure: drop `pod`'s record store and keep its membership
     /// store, out of its swarm, as the tombstone. Finishes what an earlier
     /// forget left; [`UnknownPod`] for a pod `identity` never held.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn forget_pod(&self, identity: PdnId, pod: PodId) -> Result<()> {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
@@ -1961,6 +1982,10 @@ impl SyncNode {
     /// what the entry counts for is the membership view's and the record
     /// view's.
     /// [`UnknownPod`] for a tombstone too.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn write_pod_entry(
         &self,
         identity: PdnId,
@@ -2441,6 +2466,10 @@ impl SyncNode {
 
     /// Untrack and drop a device-shared store's doc. A pod's stores go
     /// through [`forget_pod`](Self::forget_pod).
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn forget_doc(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
         let Some(stack) = self.stack(identity)? else {
             return Ok(());
@@ -2453,21 +2482,13 @@ impl SyncNode {
         Ok(())
     }
 
-    /// Commit the store's open write transaction, so what this node wrote
-    /// is on disk before anything durable points at it: a read takes a
-    /// snapshot, and taking one commits the batch first. Store-wide although
-    /// it names a namespace; the read matches nothing — the commit is the
-    /// point.
-    pub async fn flush_replicas(&self, identity: PdnId, namespace: NamespaceId) -> Result<()> {
-        let stack = self.require(identity)?;
-        let doc = stack
-            .tracked(namespace)?
-            .map(|tracked| tracked.doc)
-            .ok_or_else(|| {
-                anyhow::anyhow!("namespace {namespace} is not tracked for identity {identity}")
-            })?;
-        let _committed = doc.get_many(Query::all().limit(0)).await?;
-        Ok(())
+    /// Make every write of `identity` so far durable — its replica store's
+    /// entries and the payloads they hold in the node's blob store — and
+    /// answer the error of a commit that failed. To call before anything
+    /// durable outside the stores names what was written: the stores
+    /// otherwise commit within their settle window, a failure only logged.
+    pub async fn flush_stores(&self, identity: PdnId) -> Result<()> {
+        self.require(identity)?.api.flush().await
     }
 
     pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
@@ -2476,6 +2497,10 @@ impl SyncNode {
 
     /// A standalone author; an identity's own stores write with
     /// [`default_author`](Self::default_author) instead.
+    ///
+    /// Lands in the stores' write batches, on disk within their settle
+    /// window; [`flush_stores`](Self::flush_stores) first where anything durable outside the
+    /// stores names what it wrote.
     pub async fn create_author(&self, identity: PdnId) -> Result<AuthorId> {
         let author = self.require(identity)?.api.author_create().await?;
         Ok(author)
