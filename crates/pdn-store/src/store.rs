@@ -18,7 +18,7 @@ pub(crate) const PEERS_PER_DOC_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::ne
     None => panic!("this is clearly non zero"),
 };
 
-/// Error return from [`Store::open_replica`]
+/// Error return from [`Store::load_replica_info`](fs::Store::load_replica_info).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpenError {
     /// The replica does not exist.
@@ -123,8 +123,9 @@ impl From<QueryBuilder<FlatQuery>> for Query {
     }
 }
 
-/// Note: When using the `SingleLatestPerKey` query kind, the key filter is applied *before* the
-/// grouping, the author filter is applied *after* the grouping.
+/// Note: When using the `SingleLatestPerKey` query kind, the key filter and the author filter are
+/// both applied *before* the grouping — the latest entry per key is chosen among the authors the
+/// filter admits — and the empty filter *after* it, so an empty latest entry hides the key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {
     kind: QueryKind,

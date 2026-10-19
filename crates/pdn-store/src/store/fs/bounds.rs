@@ -185,6 +185,9 @@ fn map_bound<'a, T, U: 'a>(bound: &'a Bound<T>, f: impl Fn(&'a T) -> U) -> Bound
 mod tests {
     use super::*;
 
+    /// The records table's bounds: a prefix ends before its successor, an
+    /// exact key is one point, and a bound whose successor would overflow — a
+    /// namespace or an author of all 255 bytes — stays open.
     #[test]
     fn records_bounds() {
         let ns = NamespaceId::from(&[255u8; 32]);
@@ -235,6 +238,9 @@ mod tests {
         );
     }
 
+    /// The by-key index's bounds: a prefix ends before its successor, an
+    /// all-255 prefix at the next namespace or open past the last one, and an
+    /// exact key spans every author at that key.
     #[test]
     fn by_key_bounds() {
         let ns = NamespaceId::from(&[255u8; 32]);

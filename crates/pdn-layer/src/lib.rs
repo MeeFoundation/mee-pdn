@@ -75,20 +75,20 @@ pub enum PdnOp {
     RotateKey { compromised: bool },
 
     /// List keys currently active under my `PdnId`, never none.
-    /// -> Vec<OperationalKey>
+    /// -> `Vec<OperationalKey>`
     ActiveDevices,
 
     // --- Claims ----------------------------------------------------------
     /// Write a claim (addressed by its `ClaimId`). -> ()
     WriteClaim { claim: Claim },
 
-    /// Get a claim by id. -> Option<Claim>
+    /// Get a claim by id. -> `Option<Claim>`
     GetClaim { claim_id: ClaimId },
 
     /// Enumerate everything I can see about a specific `PdnId`.
-    /// -> Vec<ClaimId>
+    /// -> `Vec<ClaimId>`
     ListClaimsAbout { about: PdnId },
 
-    /// Enumerate all claims I have authored. -> Vec<ClaimId>
+    /// Enumerate all claims I have authored. -> `Vec<ClaimId>`
     ListMyClaims,
 }

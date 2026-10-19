@@ -78,7 +78,7 @@ impl Docs {
         }
     }
 
-    /// The engine under this handler, for a node that dispatches accepted
+    /// The engine these docs hold, for a node that dispatches accepted
     /// connections to the identity each names.
     pub fn engine(&self) -> &Engine {
         &self.engine

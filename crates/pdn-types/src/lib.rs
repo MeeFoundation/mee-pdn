@@ -15,7 +15,7 @@ pub struct ByteIdParseError {
     pub message: String,
 }
 
-/// Parse a lowercase hex string into `[u8; N]`.
+/// Parse a hex string, digits of either case, into `[u8; N]`.
 ///
 /// # Safety invariants (indexing)
 /// - Length is checked to be exactly `2 * N` before iteration.

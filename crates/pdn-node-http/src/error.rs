@@ -126,6 +126,8 @@ mod tests {
         HostError::from(err.into()).status()
     }
 
+    /// A refusal by the runtime's rules — a linking or a join refused, an
+    /// act refused by role, a record placed twice — answers 403.
     #[test]
     fn refusals_are_403() {
         assert_eq!(status(LinkingRefused), StatusCode::FORBIDDEN);
@@ -145,6 +147,8 @@ mod tests {
         );
     }
 
+    /// An identity or a pod the runtime does not host, and an act colliding
+    /// with one already committed or in flight, answers 409.
     #[test]
     fn what_the_runtime_does_not_host_is_409() {
         assert_eq!(
@@ -173,6 +177,8 @@ mod tests {
         );
     }
 
+    /// A linking payload or a pod invite of a format version the runtime
+    /// does not speak answers 400.
     #[test]
     fn unspoken_payload_versions_are_400() {
         assert_eq!(
@@ -207,6 +213,7 @@ mod tests {
         );
     }
 
+    /// An error no refusal type names answers 500, with a fixed message.
     #[test]
     fn an_unmapped_error_is_500() {
         let err = HostError::from(anyhow!("the inviter was never reached"));
@@ -214,6 +221,7 @@ mod tests {
         assert_eq!(err.message, "internal server error");
     }
 
+    /// A refusal under a layer of context keeps the status of the refusal.
     #[test]
     fn a_wrapped_refusal_keeps_its_status() {
         let wrapped = Err::<(), _>(anyhow::Error::new(LinkingRefused))
@@ -222,6 +230,8 @@ mod tests {
         assert_eq!(HostError::from(wrapped).status(), StatusCode::FORBIDDEN);
     }
 
+    /// A mapped error's response carries its text, the identity it names
+    /// included.
     #[test]
     fn the_response_carries_the_errors_text() {
         let err = HostError::from(anyhow::Error::new(UnknownIdentity { identity: PEER }));
@@ -232,6 +242,8 @@ mod tests {
         );
     }
 
+    /// An unmapped error answers the fixed message alone, nothing of its
+    /// cause chain.
     #[test]
     fn an_internal_cause_chain_never_reaches_the_response() {
         let err = anyhow!("private storage path /secret/node.db")
@@ -241,6 +253,7 @@ mod tests {
         assert!(!host.message.contains("/secret/node.db"));
     }
 
+    /// The host's own errors answer the status their constructor names.
     #[test]
     fn the_hosts_own_statuses() {
         assert_eq!(

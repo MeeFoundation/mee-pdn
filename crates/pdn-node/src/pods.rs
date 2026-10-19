@@ -53,8 +53,9 @@ pub const JOIN_DIALOGUE_TIMEOUT: Duration = Duration::from_secs(15);
 /// as offline. Payloads that device lacks extend it (`PodFlush::wait`).
 pub const LEAVE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What `join` waits, once both tickets are recorded, for each store's first
-/// session; the catch-up a timeout cuts short is the armer's to finish.
+/// What `join` waits in all, once both tickets are recorded, for each
+/// store's first session and then for its membership view to list the
+/// identity; the catch-up a timeout cuts short is the armer's to finish.
 pub const JOIN_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The invite payload: bearer-free, since it is shown on a screen. Its

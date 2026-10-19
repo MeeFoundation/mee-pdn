@@ -53,8 +53,9 @@ pub const SHUTDOWN_SERVING_BUDGET: std::time::Duration = std::time::Duration::fr
 
 /// One permit per serving half of either ceremony in flight, over either
 /// transport. [`Runtime::shutdown`] drains them before the node stops, since
-/// the router stops the blob store beside the handlers it would wait for.
-/// The count bounds nothing: it gives the drain a fixed number to wait for.
+/// the node's stop shuts every engine down before its router, and a serving
+/// half still running then writes into stopped stores. The count bounds
+/// nothing: it gives the drain a fixed number to wait for.
 #[derive(Debug, Clone)]
 pub(crate) struct ServingHalves(Arc<tokio::sync::Semaphore>);
 

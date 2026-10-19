@@ -2,8 +2,8 @@
 //! [`pdn_node::Runtime`] over HTTP. Each route delegates to a single
 //! service call; the host holds no state, authorizes nothing, and adds no
 //! identity of its own. `PDN_DATA_DIR` is required — no in-memory mode, so
-//! a host cannot promise persistence it does not provide. `GET /live` is
-//! the one always-on route; `/debug/` is scaffolding behind `PDN_DEBUG` set
+//! a host cannot promise persistence it does not provide. `GET /live` and
+//! `GET /ready` are the always-on routes; `/debug/` is scaffolding behind `PDN_DEBUG` set
 //! to `1` or `true`, its route names unpinned. The surface carries live
 //! ceremony secrets and authenticates nobody — hence the flag and the
 //! loopback default bind, which the stand's image overrides because a node
