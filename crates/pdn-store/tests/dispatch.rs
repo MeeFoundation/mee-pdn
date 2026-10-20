@@ -651,6 +651,10 @@ async fn withholding_node() -> Result<Withholding> {
 /// 16 s, so a try armed before it has fired by the last read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_download_from_a_neighbor_is_tried_again_until_the_replica_is_left() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("pdn_store::engine::live=debug,pdn_store::engine=info")
+        .with_test_writer()
+        .try_init();
     let dialing = dialing_node().await?;
     let holder = withholding_node().await?;
     let (theirs, ours) = namespace_with(holder.docs.api(), dialing.docs.api(), WORK_VALUE).await?;

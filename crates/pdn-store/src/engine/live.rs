@@ -2232,16 +2232,38 @@ async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Ha
             return Outcome::LocalFailure;
         }
     }
-    let connection = match pool.get_or_connect(provider).await {
-        Ok(connection) => connection,
-        Err(err) => {
-            debug!(provider = %provider.fmt_short(), "no connection for a fetch: {err:#}");
-            return Outcome::ConnectFailed;
+    let connection =
+        match n0_future::time::timeout(NO_PROGRESS, pool.get_or_connect(provider)).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(err)) => {
+                debug!(provider = %provider.fmt_short(), "no connection for a fetch: {err:#}");
+                return Outcome::ConnectFailed;
+            }
+            Err(_elapsed) => return Outcome::Stalled,
+        };
+    fetch_over(&connection, &blobs, hash).await
+}
+
+/// [`fetch`] over a connection to the provider.
+async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash: Hash) -> Outcome {
+    let provider = connection.remote_id();
+    // Opened here: `fetch` reports a stream that fails to open as a failure of
+    // the local store (iroh-blobs-007).
+    let pair = match n0_future::time::timeout(NO_PROGRESS, connection.open_bi()).await {
+        Ok(Ok((send, recv))) => iroh_blobs::get::StreamPair::new(
+            u64::try_from(connection.stable_id()).unwrap_or_default(),
+            recv,
+            send,
+        ),
+        Ok(Err(err)) => {
+            debug!(provider = %provider.fmt_short(), %hash, "no stream for a fetch: {err:#}");
+            return Outcome::Failed;
         }
+        Err(_elapsed) => return Outcome::Stalled,
     };
     let progress = blobs
         .remote()
-        .fetch((*connection).clone(), content)
+        .fetch(pair, HashAndFormat::raw(hash))
         .stream();
     tokio::pin!(progress);
     loop {
@@ -2314,7 +2336,55 @@ fn fmt_accept_namespace(res: &Result<SyncFinished, AcceptError>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use iroh::{
+        endpoint::presets,
+        protocol::{AcceptError, ProtocolHandler, Router},
+    };
+
     use super::*;
+
+    /// Accepts a connection and closes it at once.
+    #[derive(Debug, Clone)]
+    struct Closing;
+
+    impl ProtocolHandler for Closing {
+        async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+            connection.close(0u32.into(), b"closing");
+            Ok(())
+        }
+    }
+
+    /// A request over a connection its provider closed is the provider's
+    /// failure, though iroh-blobs reports a stream that cannot open as a
+    /// failure of the local store (iroh-blobs-007).
+    #[tokio::test]
+    async fn a_request_over_a_connection_the_provider_closed_is_the_providers_failure(
+    ) -> anyhow::Result<()> {
+        let provider = Router::builder(
+            Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?,
+        )
+        .accept(iroh_blobs::ALPN, Closing)
+        .spawn();
+        let fetching = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let connection = fetching
+            .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+            .await?;
+        connection.closed().await;
+        let store = iroh_blobs::store::mem::MemStore::new();
+
+        let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
+        assert_eq!(outcome, Outcome::Failed);
+
+        fetching.close().await;
+        provider.shutdown().await?;
+        Ok(())
+    }
 
     /// A fetch failing on the node's own blob store is the store's failure,
     /// and one failing on the provider's answer is the provider's.
