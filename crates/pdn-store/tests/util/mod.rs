@@ -3,7 +3,10 @@
 use std::{
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock, Weak,
+    },
 };
 
 use iroh::{
@@ -95,6 +98,82 @@ pub async fn endpoint(
         .await
 }
 
+/// What a test node's blob protocol records and does: the requests it
+/// holds open at once, and while held, every request kept unanswered.
+#[derive(Debug)]
+pub struct BlobServing {
+    open: AtomicUsize,
+    most: AtomicUsize,
+    held: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for BlobServing {
+    fn default() -> Self {
+        Self {
+            open: AtomicUsize::new(0),
+            most: AtomicUsize::new(0),
+            held: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+impl BlobServing {
+    /// The requests it holds open now.
+    pub fn open(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// The most requests it has held open at once.
+    pub fn most_open(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
+    }
+
+    /// Every request from now on, and every one waiting, stays unanswered.
+    pub fn hold(&self) {
+        self.held.send_replace(true);
+    }
+
+    /// Answers the requests held, and every later one.
+    pub fn release(&self) {
+        self.held.send_replace(false);
+    }
+}
+
+/// `iroh_blobs::provider::handle_connection` with each request counted by
+/// [`BlobServing`] and held while it holds.
+#[derive(Debug, Clone)]
+struct ServedBlobs {
+    store: iroh_blobs::api::Store,
+    serving: Arc<BlobServing>,
+}
+
+impl iroh::protocol::ProtocolHandler for ServedBlobs {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        while let Ok(pair) = iroh_blobs::provider::StreamPair::accept(
+            &connection,
+            iroh_blobs::provider::events::EventSender::DEFAULT,
+        )
+        .await
+        {
+            let store = self.store.clone();
+            let serving = Arc::clone(&self.serving);
+            tokio::spawn(async move {
+                let open = serving.open.fetch_add(1, Ordering::SeqCst) + 1;
+                serving.most.fetch_max(open, Ordering::SeqCst);
+                let mut held = serving.held.subscribe();
+                if held.wait_for(|held| !held).await.is_ok() {
+                    iroh_blobs::provider::handle_stream(pair, store).await.ok();
+                }
+                serving.open.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        Ok(())
+    }
+}
+
 /// An iroh node that just has the blobs transport
 #[derive(Debug)]
 pub struct Node {
@@ -140,6 +219,8 @@ pub struct Builder {
     #[debug(skip)]
     access: Option<SessionAccessProvider>,
     serve_blobs: bool,
+    blob_serving: Option<Arc<BlobServing>>,
+    fetches_per_provider: Option<u32>,
 }
 
 impl Builder {
@@ -156,12 +237,15 @@ impl Builder {
         // what a consumer states when its scenario is the codec rather than
         // the access model.
         let access = self.access.clone().unwrap_or_else(serve_whole);
-        let docs_builder = match self.storage {
+        let mut docs_builder = match self.storage {
             Storage::Memory => Docs::memory(TEST_HOLDER, access),
             Storage::Persistent(ref path) => {
                 Docs::persistent(path.to_path_buf(), TEST_CACHE_BYTES, TEST_HOLDER, access)
             }
         };
+        if let Some(limit) = self.fetches_per_provider {
+            docs_builder = docs_builder.fetches_per_provider(limit);
+        }
         let docs = match docs_builder
             .spawn(self.endpoint.clone(), blobs.clone(), gossip.clone())
             .await
@@ -172,11 +256,23 @@ impl Builder {
                 return Err(err);
             }
         };
-        if self.serve_blobs {
-            router = router.accept(
-                iroh_blobs::ALPN,
-                iroh_blobs::BlobsProtocol::new(&blobs, None),
-            );
+        match (self.serve_blobs, self.blob_serving) {
+            (false, _) => {}
+            (true, Some(serving)) => {
+                router = router.accept(
+                    iroh_blobs::ALPN,
+                    ServedBlobs {
+                        store: blobs.clone(),
+                        serving,
+                    },
+                );
+            }
+            (true, None) => {
+                router = router.accept(
+                    iroh_blobs::ALPN,
+                    iroh_blobs::BlobsProtocol::new(&blobs, None),
+                );
+            }
         }
         if let Some(protected) = protected {
             protected.set(docs.downgrade()).ok();
@@ -217,6 +313,18 @@ impl Builder {
         self
     }
 
+    /// Serves payloads through `serving`, which counts and can hold them.
+    pub fn blob_serving(mut self, serving: Arc<BlobServing>) -> Self {
+        self.blob_serving = Some(serving);
+        self
+    }
+
+    /// The engine's limit of fetches in flight toward one provider.
+    pub fn fetches_per_provider(mut self, limit: u32) -> Self {
+        self.fetches_per_provider = Some(limit);
+        self
+    }
+
     fn new(storage: Storage, endpoint: Endpoint) -> Self {
         Self {
             endpoint,
@@ -224,6 +332,8 @@ impl Builder {
             gc_interval: None,
             access: None,
             serve_blobs: true,
+            blob_serving: None,
+            fetches_per_provider: None,
         }
     }
 }
@@ -304,6 +414,11 @@ impl Node {
     /// Returns the node id
     pub fn id(&self) -> EndpointId {
         self.router.endpoint().id()
+    }
+
+    /// The node's endpoint, for a connection a scenario opens itself.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.router.endpoint()
     }
 
     /// Ensure the node is "online", aka, is connected to a relay and

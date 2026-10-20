@@ -9,26 +9,27 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use iroh::{address_lookup::memory::MemoryLookup, Endpoint, EndpointAddr, EndpointId, PublicKey};
+use iroh::{address_lookup::memory::MemoryLookup, Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::{
-    api::{
-        blobs::BlobStatus,
-        downloader::{ContentDiscovery, DownloadRequest, Downloader, SplitStrategy},
-        Store,
-    },
+    api::{blobs::BlobStatus, remote::GetProgressItem, Store},
+    get::GetError,
+    util::connection_pool::{self, ConnectionPool},
     Hash, HashAndFormat,
 };
 use iroh_gossip::net::Gossip;
 use n0_future::{
     task::JoinSet,
-    time::{Duration, SystemTime},
-    FutureExt,
+    time::{Duration, Instant, SystemTime},
+    FutureExt, StreamExt,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
-use self::draining::DrainingSync;
+use self::{
+    draining::DrainingSync,
+    fetches::{Fetches, Outcome, Steps, NO_PROGRESS},
+};
 use super::state::{NamespaceStates, Origin, SyncReason};
 use crate::{
     actor::SyncHandle,
@@ -42,6 +43,7 @@ use crate::{
 };
 
 mod draining;
+mod fetches;
 
 /// The stream halves an in-process session runs over: a pipe, since iroh
 /// refuses a connection to this endpoint's own id.
@@ -170,11 +172,9 @@ pub(crate) enum ToLiveActor {
         reason: SyncReason,
         retry: Option<u64>,
     },
-    /// A download that failed toward a provider that is a gossip neighbor,
-    /// asked for again by the try of series `series`.
-    RetryDownload {
-        namespace: NamespaceId,
-        hash: Hash,
+    /// The pause of `provider`'s series `series` is over.
+    ResumeFetches {
+        provider: PublicKey,
         series: u64,
     },
     /// The exchanges of `namespaces` running, held behind another's, or
@@ -300,7 +300,7 @@ type SyncAcceptRes = (
     Identity,
     Result<SyncFinished, AcceptError>,
 );
-type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
+type FetchRes = (PublicKey, Hash, Outcome);
 
 /// The identities one peer of one replica is dialed as. Two sources, held
 /// apart because they are trusted and live differently: a contact is the
@@ -357,13 +357,13 @@ const REDIAL_AFTER_ABORT: Duration = Duration::from_millis(500);
 /// remote answering every dial as already syncing keeps one going forever.
 const MAX_REDIALS: u32 = 3;
 
-/// The wait before a dial or a download that failed toward a gossip
-/// neighbor is tried again; each further wait doubles, up to
+/// The wait before a dial that failed toward a gossip neighbor is tried
+/// again, and a provider's first pause; each further wait doubles, up to
 /// [`UNREACHED_RETRY_MAX`].
 const UNREACHED_RETRY_FIRST: Duration = Duration::from_secs(1);
 const UNREACHED_RETRY_MAX: Duration = Duration::from_secs(16);
 
-/// How long after its first failure such a dial or download is still tried:
+/// How long after its first failure such a dial or provider is still tried:
 /// past the minute in which a peer restarted on a new port opens another
 /// connection here, which is when iroh selects its path again.
 const UNREACHED_RETRY_FOR: Duration = Duration::from_secs(120);
@@ -446,7 +446,6 @@ pub(crate) struct LiveActor {
     endpoint: Endpoint,
     bao_store: Store,
     held_payloads: Arc<super::held::HeldPayloads>,
-    downloader: Downloader,
     memory_lookup: MemoryLookup,
 
     /// Send messages to self.
@@ -459,25 +458,25 @@ pub(crate) struct LiveActor {
     running_sync_connect: JoinSet<SyncConnectRes>,
     /// Running sync futures (from accept).
     running_sync_accept: JoinSet<SyncAcceptRes>,
-    /// Running download futures.
-    download_tasks: JoinSet<DownloadRes>,
-    /// Content hashes which are wanted but not yet queued because no provider was found,
-    /// keyed by the namespace whose entry wants them (the namespace drives retries on
+    /// Running fetches, each from one provider.
+    download_tasks: JoinSet<FetchRes>,
+    /// Which provider each wanted payload is fetched from, and when.
+    fetches: Fetches,
+    pool: ConnectionPool,
+    /// Payloads [`Fetches`] left with no provider during this turn of the
+    /// loop, parked at its end.
+    unrouted: Vec<Hash>,
+    /// Wanted payloads no provider is registered for, keyed by the
+    /// namespace whose entry wants them (the namespace drives retries on
     /// sync-finished and keeps `PendingContentReady` attribution correct).
     missing_hashes: HashSet<(NamespaceId, Hash)>,
     /// Per namespace whose content scan runs, the peer of the last session
     /// that went through meanwhile: its retry of parked content ran before
     /// the scan parked anything.
     content_scans: HashMap<NamespaceId, Option<PublicKey>>,
-    /// Queued content whose running download should be retried once if it fails: a fresh
-    /// provider was registered (through a finished sync) after the running download had
-    /// already snapshotted its provider set, so the provider is only reachable by a new
-    /// download attempt.
-    retry_after_failure: HashSet<(NamespaceId, Hash)>,
-    /// Content hashes queued in downloader.
+    /// Wanted payloads with a provider to fetch them from, in flight or
+    /// waiting in [`Fetches`].
     queued_hashes: QueuedHashes,
-    /// Nodes known to have a hash
-    hash_providers: ProviderNodes,
 
     /// Subscribers to actor events
     subscribers: SubscribersMap,
@@ -514,10 +513,6 @@ pub(crate) struct LiveActor {
     /// with the pair ends any other way or the neighbor leaves; a series
     /// run out stays until then.
     unreached_dials: HashMap<(NamespaceId, PublicKey, Identity), RetrySeries>,
-    /// Downloads that failed toward a provider that is a gossip neighbor,
-    /// until one succeeds or no provider is a neighbor; a series run out
-    /// stays until then.
-    unreached_downloads: HashMap<(NamespaceId, Hash), RetrySeries>,
     /// The id the next [`RetrySeries`] takes.
     next_retry_series: u64,
     /// The topics each peer is a gossip neighbor in: a connection with a
@@ -540,7 +535,7 @@ impl LiveActor {
         gossip: Gossip,
         bao_store: Store,
         held_payloads: Arc<super::held::HeldPayloads>,
-        downloader: Downloader,
+        fetches_per_provider: usize,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         session_access: crate::filter::SessionAccessProvider,
@@ -551,6 +546,11 @@ impl LiveActor {
         let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            iroh_blobs::ALPN,
+            connection_pool::Options::default(),
+        );
         Ok(Self {
             inbox,
             sync: DrainingSync::new(sync),
@@ -559,18 +559,18 @@ impl LiveActor {
             gossip: gossip_state,
             bao_store,
             held_payloads,
-            downloader,
             sync_actor_tx,
             running_sync_connect: Default::default(),
             running_sync_accept: Default::default(),
             subscribers: Default::default(),
             download_tasks: Default::default(),
+            fetches: Fetches::new(fetches_per_provider),
+            pool,
+            unrouted: Vec::new(),
             state: Default::default(),
             missing_hashes: Default::default(),
             content_scans: Default::default(),
-            retry_after_failure: Default::default(),
             queued_hashes: Default::default(),
-            hash_providers: Default::default(),
             session_access,
             identity,
             peer_identities: Default::default(),
@@ -580,7 +580,6 @@ impl LiveActor {
             redials_due: Default::default(),
             redial_streaks: Default::default(),
             unreached_dials: Default::default(),
-            unreached_downloads: Default::default(),
             next_retry_series: 0,
             neighbors: Default::default(),
             in_process_sessions,
@@ -623,8 +622,8 @@ impl LiveActor {
                 // completions are bounded by the downloads this actor started.
                 Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
                     trace!(?i, "tick: pending_downloads");
-                    let (namespace, hash, res) = res.context("pending_downloads closed")?;
-                    self.on_download_ready(namespace, hash, res).await;
+                    let (provider, hash, outcome) = res.context("pending_downloads closed")?;
+                    self.on_fetch_finished(provider, hash, outcome).await;
                 }
                 msg = self.inbox.recv() => {
                     let msg = msg.context("to_actor closed")?;
@@ -664,6 +663,7 @@ impl LiveActor {
                     }
                 }
             }
+            self.park_unrouted().await;
         }
     }
 
@@ -763,18 +763,9 @@ impl LiveActor {
                 }
                 self.sync_with_identity(namespace, peer, callee, reason);
             }
-            ToLiveActor::RetryDownload {
-                namespace,
-                hash,
-                series,
-            } => {
-                if let Some(tries) = self.unreached_downloads.get_mut(&(namespace, hash)) {
-                    tries.fired(series);
-                }
-                // A try armed before a leave fetches nothing for it.
-                if self.state.is_syncing(&namespace) {
-                    self.queue_download(namespace, hash, true).await;
-                }
+            ToLiveActor::ResumeFetches { provider, series } => {
+                let steps = self.fetches.resume(provider, series);
+                self.apply_fetches(steps);
             }
             ToLiveActor::SyncsInFlight { namespaces, reply } => {
                 reply.send(self.syncs_in_flight(&namespaces)).ok();
@@ -830,7 +821,7 @@ impl LiveActor {
                 node,
                 hash,
             } => {
-                self.on_neighbor_content_ready(namespace, node, hash).await;
+                self.register_provider(namespace, hash, node);
             }
         };
         Ok(true)
@@ -1159,9 +1150,13 @@ impl LiveActor {
             return;
         }
         for hash in missing {
-            self.missing_hashes.insert((namespace, hash));
+            if self.queued_hashes.contains_hash(&hash) {
+                self.queued_hashes.insert(hash, namespace);
+            } else {
+                self.missing_hashes.insert((namespace, hash));
+            }
             if let Some(peer) = met {
-                self.start_download(namespace, hash, peer, true).await;
+                self.register_provider(namespace, hash, peer);
             }
         }
     }
@@ -1188,8 +1183,9 @@ impl LiveActor {
                 .retain(|(tracked, _peer, _callee), _streak| *tracked != namespace);
             self.unreached_dials
                 .retain(|(tracked, _peer, _callee), _series| *tracked != namespace);
-            self.unreached_downloads
-                .retain(|(tracked, _hash), _series| *tracked != namespace);
+            for hash in self.queued_hashes.remove_namespace(&namespace) {
+                self.fetches.unwant(&hash);
+            }
             self.missing_hashes
                 .retain(|(tracked, _hash)| *tracked != namespace);
             self.sync.set_sync(namespace, false).await?;
@@ -1481,16 +1477,8 @@ impl LiveActor {
     fn end_retries_toward(&mut self, peer: PublicKey) {
         self.unreached_dials
             .retain(|(_namespace, toward, _callee), _series| *toward != peer);
-        let neighbors = &self.neighbors;
-        let providers = self.hash_providers.0.lock().expect("poisoned");
-        self.unreached_downloads
-            .retain(|(_namespace, hash), _series| {
-                providers.get(hash).is_some_and(|nodes| {
-                    nodes
-                        .iter()
-                        .any(|provider| neighbors.contains_key(provider))
-                })
-            });
+        let steps = self.fetches.neighbor_gone(peer);
+        self.apply_fetches(steps);
     }
 
     fn new_retry_series(&mut self) -> RetrySeries {
@@ -1533,50 +1521,6 @@ impl LiveActor {
         let id = series.id;
         debug!(?delay, "dial could not reach a neighbor: trying again");
         self.redial_after(namespace, peer, callee, reason, delay, Some(id));
-    }
-
-    /// [`Self::retry_unreached_dial`] for a payload download: tried again
-    /// while one of the hash's providers is a neighbor.
-    async fn retry_unreached_download(&mut self, namespace: NamespaceId, hash: Hash) {
-        let providers: Vec<PublicKey> = self
-            .hash_providers
-            .0
-            .lock()
-            .expect("poisoned")
-            .get(&hash)
-            .map(|nodes| nodes.iter().copied().collect())
-            .unwrap_or_default();
-        let reached = providers
-            .into_iter()
-            .any(|provider| self.is_neighbor(provider));
-        let key = (namespace, hash);
-        if !reached {
-            self.unreached_downloads.remove(&key);
-            return;
-        }
-        let fresh = self.new_retry_series();
-        let tries = self.unreached_downloads.entry(key).or_insert(fresh);
-        let was_exhausted = tries.exhausted;
-        let Some(delay) = tries.arm() else {
-            if tries.exhausted && !was_exhausted {
-                info!(%hash, namespace = %namespace.fmt_short(), "download tries toward a neighbor exhausted");
-            }
-            return;
-        };
-        let series = tries.id;
-        debug!(%hash, ?delay, "download could not reach a neighbor: trying again");
-        let to_self = self.sync_actor_tx.clone();
-        n0_future::task::spawn(async move {
-            n0_future::time::sleep(delay).await;
-            to_self
-                .send(ToLiveActor::RetryDownload {
-                    namespace,
-                    hash,
-                    series,
-                })
-                .await
-                .ok();
-        });
     }
 
     #[instrument("accept", skip_all, fields(peer = %fmt_accept_peer(&res), namespace = %fmt_accept_namespace(&res)))]
@@ -1660,16 +1604,9 @@ impl LiveActor {
                     }
                 }
 
-                // Retry content that is still missing for this namespace: the peer we
-                // just synced with is a fresh provider candidate. Entries whose records
-                // arrive ahead of their content are parked in `missing_hashes` and are
-                // otherwise unparked only by a best-effort gossip `ContentReady`
-                // broadcast — if that one message is lost, the content would starve
-                // until an unrelated insert. `start_download` skips content that
-                // arrived in the meantime and dedupes in-flight downloads. Content
-                // already being downloaded gets the peer registered as a provider,
-                // and the download is retried once if it fails: the running attempt
-                // snapshotted its provider set before this peer joined it.
+                // Every payload the namespace waits for may come from the peer just synced
+                // with: one parked because its entry came from a node lacking it would
+                // otherwise wait on a best-effort gossip `ContentReady`.
                 let queued: Vec<Hash> = self
                     .queued_hashes
                     .by_namespace
@@ -1683,16 +1620,13 @@ impl LiveActor {
                     .map(|(_, hash)| *hash)
                     .collect();
                 for hash in parked {
-                    debug!(peer=%peer.fmt_short(), %hash, "retrying parked content");
-                    self.start_download(namespace, hash, peer, true).await;
+                    self.register_provider(namespace, hash, peer);
                 }
                 if let Some(met) = self.content_scans.get_mut(&namespace) {
                     *met = Some(peer);
                 }
                 for hash in queued {
-                    debug!(peer=%peer.fmt_short(), %hash, "registering sync peer for queued content");
-                    self.retry_after_failure.insert((namespace, hash));
-                    self.start_download(namespace, hash, peer, true).await;
+                    self.register_provider(namespace, hash, peer);
                 }
 
                 // broadcast a sync report to our neighbors, but only if we received new entries.
@@ -1812,58 +1746,118 @@ impl LiveActor {
             .await;
     }
 
-    async fn on_download_ready(
-        &mut self,
-        namespace: NamespaceId,
-        hash: Hash,
-        res: Result<(), anyhow::Error>,
-    ) {
-        let completed_namespaces = self.queued_hashes.remove_hash(&hash);
-        debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
-        if res.is_ok() {
-            self.retry_after_failure.retain(|(_, h)| *h != hash);
-            self.unreached_downloads
-                .retain(|(_, h), _series| *h != hash);
-            self.subscribers
-                .send(&namespace, Event::ContentReady { hash })
-                .await;
-            // Inform our neighbors that we have new content ready.
-            self.broadcast_neighbors(namespace, &Op::ContentReady(hash))
-                .await;
-        } else {
-            if let Err(error) = &res {
-                debug!(%hash, "download failed: {error:#}");
-            }
-            // A download that outlived a leave parks nothing for it.
-            if self.state.is_syncing(&namespace) {
-                self.missing_hashes.insert((namespace, hash));
-                if self.retry_after_failure.remove(&(namespace, hash)) {
-                    // A provider was registered while the failed download was already
-                    // running with an older provider snapshot: retry once with the
-                    // enriched set.
-                    debug!(%hash, "retrying failed download with providers registered meanwhile");
-                    self.queue_download(namespace, hash, true).await;
-                } else {
-                    self.retry_unreached_download(namespace, hash).await;
+    async fn on_fetch_finished(&mut self, provider: PublicKey, hash: Hash, outcome: Outcome) {
+        debug!(provider = %provider.fmt_short(), %hash, ?outcome, "fetch finished");
+        let neighbor = self.is_neighbor(provider);
+        let steps = self
+            .fetches
+            .finished(provider, hash, outcome, neighbor, Instant::now());
+        match outcome {
+            Outcome::Fetched => {
+                let (wanting, emptied) = self.queued_hashes.take_hash(&hash);
+                for namespace in wanting {
+                    self.subscribers
+                        .send(&namespace, Event::ContentReady { hash })
+                        .await;
+                    self.broadcast_neighbors(namespace, &Op::ContentReady(hash))
+                        .await;
                 }
+                self.emit_pending_content_ready(emptied).await;
             }
+            // Whole already, as an insert finding its payload held reports nothing.
+            Outcome::Held => {
+                let (_wanting, emptied) = self.queued_hashes.take_hash(&hash);
+                self.emit_pending_content_ready(emptied).await;
+            }
+            _ => {}
         }
-        for namespace in completed_namespaces.iter() {
-            if let Some(true) = self.state.may_emit_ready(namespace) {
-                self.subscribers
-                    .send(namespace, Event::PendingContentReady)
-                    .await;
-            }
+        self.apply_fetches(steps);
+    }
+
+    /// Records `provider` as holding `hash`; a payload `namespace` parked
+    /// is wanted again once a provider holds it.
+    fn register_provider(&mut self, namespace: NamespaceId, hash: Hash, provider: PublicKey) {
+        let steps = self.fetches.register(hash, provider);
+        self.apply_fetches(steps);
+        if self.missing_hashes.remove(&(namespace, hash)) {
+            self.want(namespace, hash);
         }
     }
 
-    async fn on_neighbor_content_ready(
-        &mut self,
-        namespace: NamespaceId,
-        node: EndpointId,
-        hash: Hash,
-    ) {
-        self.start_download(namespace, hash, node, true).await;
+    /// Wants `hash` for `namespace`: fetched from the providers registered
+    /// for it, or parked while there is none.
+    fn want(&mut self, namespace: NamespaceId, hash: Hash) {
+        if self.fetches.is_wanted(&hash) {
+            self.queued_hashes.insert(hash, namespace);
+            return;
+        }
+        let (routed, steps) = self.fetches.want(hash);
+        if routed {
+            self.queued_hashes.insert(hash, namespace);
+        } else {
+            self.missing_hashes.insert((namespace, hash));
+        }
+        self.apply_fetches(steps);
+    }
+
+    /// Starts the fetches and times the pause `steps` name, and keeps what
+    /// they unrouted for [`Self::park_unrouted`].
+    fn apply_fetches(&mut self, steps: Steps) {
+        for (provider, hash) in steps.start {
+            let pool = self.pool.clone();
+            let blobs = self.bao_store.clone();
+            self.download_tasks.spawn(async move {
+                let outcome = fetch(pool, blobs, provider, hash).await;
+                (provider, hash, outcome)
+            });
+        }
+        if let Some((provider, series, wait)) = steps.pause {
+            debug!(provider = %provider.fmt_short(), ?wait, "fetches from a provider pause");
+            let to_self = self.sync_actor_tx.clone();
+            n0_future::task::spawn(async move {
+                n0_future::time::sleep(wait).await;
+                to_self
+                    .send(ToLiveActor::ResumeFetches { provider, series })
+                    .await
+                    .ok();
+            });
+        }
+        self.unrouted.extend(steps.unrouted);
+    }
+
+    /// Parks what this turn left with no provider, for every namespace that
+    /// wants it and is still synced.
+    async fn park_unrouted(&mut self) {
+        if self.unrouted.is_empty() {
+            return;
+        }
+        let mut emptied = Vec::new();
+        for hash in std::mem::take(&mut self.unrouted) {
+            // Wanted again by a provider registered later in the turn.
+            if self.fetches.is_wanted(&hash) {
+                continue;
+            }
+            let (wanting, done) = self.queued_hashes.take_hash(&hash);
+            for namespace in wanting {
+                if self.state.is_syncing(&namespace) {
+                    self.missing_hashes.insert((namespace, hash));
+                }
+            }
+            emptied.extend(done);
+        }
+        self.emit_pending_content_ready(emptied).await;
+    }
+
+    /// `PendingContentReady` for each of `namespaces`, which no longer wait
+    /// for any payload, where a finished sync left it due.
+    async fn emit_pending_content_ready(&mut self, namespaces: Vec<NamespaceId>) {
+        for namespace in namespaces {
+            if let Some(true) = self.state.may_emit_ready(&namespace) {
+                self.subscribers
+                    .send(&namespace, Event::PendingContentReady)
+                    .await;
+            }
+        }
     }
 
     #[instrument("on_sync_report", skip_all, fields(peer = %from.fmt_short(), namespace = %report.namespace.fmt_short()))]
@@ -1945,7 +1939,12 @@ impl LiveActor {
                 }
                 if matches!(remote_content_status, ContentStatus::Complete) {
                     let node_id = PublicKey::from_bytes(&from)?;
-                    self.start_download(namespace, hash, node_id, false).await;
+                    let steps = self.fetches.register(hash, node_id);
+                    self.apply_fetches(steps);
+                    self.missing_hashes.remove(&(namespace, hash));
+                    self.want(namespace, hash);
+                } else if self.queued_hashes.contains_hash(&hash) {
+                    self.queued_hashes.insert(hash, namespace);
                 } else {
                     self.missing_hashes.insert((namespace, hash));
                 }
@@ -1956,61 +1955,6 @@ impl LiveActor {
         }
 
         Ok(())
-    }
-
-    async fn start_download(
-        &mut self,
-        namespace: NamespaceId,
-        hash: Hash,
-        node: PublicKey,
-        only_if_missing: bool,
-    ) {
-        self.hash_providers
-            .0
-            .lock()
-            .expect("poisoned")
-            .entry(hash)
-            .or_default()
-            .insert(node);
-        self.queue_download(namespace, hash, only_if_missing).await;
-    }
-
-    /// Queue a download for `hash` from the providers registered so far, unless the
-    /// content is already complete or a download is already running.
-    async fn queue_download(&mut self, namespace: NamespaceId, hash: Hash, only_if_missing: bool) {
-        // Neither queued nor parked: the status read would change nothing, and a neighbor's
-        // ContentReady for content already held would wait on the blob store in the loop.
-        if only_if_missing
-            && !self.queued_hashes.contains_hash(&hash)
-            && !self.missing_hashes.contains(&(namespace, hash))
-        {
-            return;
-        }
-        let entry_status = self.bao_store.blobs().status(hash).await;
-        if matches!(entry_status, Ok(BlobStatus::Complete { .. })) {
-            self.missing_hashes.remove(&(namespace, hash));
-            return;
-        }
-        if self.queued_hashes.contains_hash(&hash) {
-            self.queued_hashes.insert(hash, namespace);
-        } else if !only_if_missing || self.missing_hashes.contains(&(namespace, hash)) {
-            let req = DownloadRequest::new(
-                HashAndFormat::raw(hash),
-                self.hash_providers.clone(),
-                SplitStrategy::None,
-            );
-            let handle = self.downloader.download_with_opts(req);
-
-            self.queued_hashes.insert(hash, namespace);
-            self.missing_hashes.remove(&(namespace, hash));
-            self.download_tasks.spawn(async move {
-                (
-                    namespace,
-                    hash,
-                    handle.await.map_err(|e| anyhow::anyhow!(e)),
-                )
-            });
-        }
     }
 
     /// The accept decision: the engine's own session state first, then the
@@ -2214,24 +2158,6 @@ struct QueuedHashes {
     by_namespace: HashMap<NamespaceId, HashSet<Hash>>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ProviderNodes(Arc<std::sync::Mutex<HashMap<Hash, HashSet<EndpointId>>>>);
-
-impl ContentDiscovery for ProviderNodes {
-    fn find_providers(&self, hash: HashAndFormat) -> n0_future::stream::Boxed<EndpointId> {
-        let nodes = self
-            .0
-            .lock()
-            .expect("poisoned")
-            .get(&hash.hash)
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        Box::pin(n0_future::stream::iter(nodes))
-    }
-}
-
 impl QueuedHashes {
     fn insert(&mut self, hash: Hash, namespace: NamespaceId) {
         self.by_hash.entry(hash).or_default().insert(namespace);
@@ -2256,12 +2182,88 @@ impl QueuedHashes {
         removed_namespaces
     }
 
+    /// Removes `hash`, answering the namespaces that wanted it and those
+    /// of them that now want nothing.
+    fn take_hash(&mut self, hash: &Hash) -> (Vec<NamespaceId>, Vec<NamespaceId>) {
+        let wanting: Vec<NamespaceId> = self
+            .by_hash
+            .get(hash)
+            .map(|namespaces| namespaces.iter().copied().collect())
+            .unwrap_or_default();
+        let emptied = self.remove_hash(hash);
+        (wanting, emptied)
+    }
+
+    /// Removes `namespace`, answering the hashes no other namespace wants.
+    fn remove_namespace(&mut self, namespace: &NamespaceId) -> Vec<Hash> {
+        let hashes = self.by_namespace.remove(namespace).unwrap_or_default();
+        let mut unwanted = Vec::new();
+        for hash in hashes {
+            if let Some(namespaces) = self.by_hash.get_mut(&hash) {
+                namespaces.remove(namespace);
+                if namespaces.is_empty() {
+                    self.by_hash.remove(&hash);
+                    unwanted.push(hash);
+                }
+            }
+        }
+        unwanted
+    }
+
     fn contains_hash(&self, hash: &Hash) -> bool {
         self.by_hash.contains_key(hash)
     }
 
     fn contains_namespace(&self, namespace: &NamespaceId) -> bool {
         self.by_namespace.contains_key(namespace)
+    }
+}
+
+/// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
+/// [`NO_PROGRESS`] with nothing: the request's stream lives in this future,
+/// so dropping it frees the stream (iroh-blobs-006).
+async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Hash) -> Outcome {
+    let content = HashAndFormat::raw(hash);
+    match blobs.remote().local(content).await {
+        Ok(local) if local.is_complete() => return Outcome::Held,
+        Ok(_) => {}
+        Err(err) => {
+            debug!(%hash, "the blob store cannot say what it holds: {err:#}");
+            return Outcome::LocalFailure;
+        }
+    }
+    let connection = match pool.get_or_connect(provider).await {
+        Ok(connection) => connection,
+        Err(err) => {
+            debug!(provider = %provider.fmt_short(), "no connection for a fetch: {err:#}");
+            return Outcome::ConnectFailed;
+        }
+    };
+    let progress = blobs
+        .remote()
+        .fetch((*connection).clone(), content)
+        .stream();
+    tokio::pin!(progress);
+    loop {
+        match n0_future::time::timeout(NO_PROGRESS, progress.next()).await {
+            Err(_elapsed) => return Outcome::Stalled,
+            Ok(Some(GetProgressItem::Progress(_))) => {}
+            Ok(Some(GetProgressItem::Done(_))) => return Outcome::Fetched,
+            Ok(Some(GetProgressItem::Error(err))) => {
+                debug!(provider = %provider.fmt_short(), %hash, "fetch failed: {err:#}");
+                return outcome_of_failure(&err);
+            }
+            Ok(None) => return Outcome::Failed,
+        }
+    }
+}
+
+/// Whose failure a fetch's error is: the node's own blob store's, or the
+/// provider's.
+fn outcome_of_failure(err: &GetError) -> Outcome {
+    match err {
+        GetError::LocalFailure { .. } => Outcome::LocalFailure,
+        _ => Outcome::Failed,
     }
 }
 
@@ -2313,6 +2315,16 @@ fn fmt_accept_namespace(res: &Result<SyncFinished, AcceptError>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch failing on the node's own blob store is the store's failure,
+    /// and one failing on the provider's answer is the provider's.
+    #[test]
+    fn a_fetch_failing_on_the_local_store_is_no_providers_failure() {
+        let local = n0_error::e!(GetError::LocalFailure, n0_error::anyerr!("disk full"));
+        assert_eq!(outcome_of_failure(&local), Outcome::LocalFailure);
+        let remote = n0_error::e!(GetError::BadRequest, n0_error::anyerr!("refused"));
+        assert_eq!(outcome_of_failure(&remote), Outcome::Failed);
+    }
 
     /// An event sent to lossy subscribers whose receivers are all gone
     /// completes rather than waiting on them.

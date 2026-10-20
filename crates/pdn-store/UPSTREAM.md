@@ -40,7 +40,7 @@ What this crate took from n0's `iroh-docs`, and what was done here with each ups
 
 ### #88 · cbenhagen · fix: retry incomplete blob downloads after sync
 
-**Already fixed here, another way.** Of the pull request's four cases: content a peer lacked is asked for from the peer of every later successful session (#112 above); content a restart left missing is parked by a scan at the first `start_sync` of a namespace in the live actor's life (`content_a_restart_left_missing_is_fetched_from_the_first_sync_peer` in `tests/sync.rs`); a download that fails toward a gossip neighbor is tried again (`retry_unreached_download` in `src/engine/live.rs`); and a change of download policy does not apply, the crate holding no download policies. Upstream's scan of the whole replica at the end of every session is not taken: the scan here runs once per namespace per start. No action.
+**Already fixed here, another way.** Of the pull request's four cases: content a peer lacked is asked for from the peer of every later successful session (#112 above); content a restart left missing is parked by a scan at the first `start_sync` of a namespace in the live actor's life (`content_a_restart_left_missing_is_fetched_from_the_first_sync_peer` in `tests/sync.rs`); a download that fails toward a gossip neighbor is tried again (the provider's series of pauses in `src/engine/live/fetches.rs`); and a change of download policy does not apply, the crate holding no download policies. Upstream's scan of the whole replica at the end of every session is not taken: the scan here runs once per namespace per start. No action.
 
 ## Commits
 

@@ -239,6 +239,11 @@ const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
 /// endpoint, and a request it left in the store at its first answer.
 const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 
+/// Bidirectional streams a peer holds open on one connection, the
+/// transport's default. A blob request takes one, so it is also how many
+/// payloads an engine fetches from one provider at once.
+const MAX_BI_STREAMS: u32 = 100;
+
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
 /// past the count sends that peer nothing on any topic.
@@ -1028,7 +1033,7 @@ impl SyncNode {
         // bytes it compares and never interprets.
         let held_for = crate::access::identity_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
-        Ok(match &self.storage {
+        let builder = match &self.storage {
             #[cfg(any(test, feature = "test-util"))]
             StorageConfig::Memory => Docs::memory(held_for, provider),
             StorageConfig::Directory(directory) => {
@@ -1049,7 +1054,8 @@ impl SyncNode {
                 );
                 Docs::persistent(own, share, held_for, provider)
             }
-        })
+        };
+        Ok(builder.fetches_per_provider(MAX_BI_STREAMS))
     }
 
     /// What the caches of this node's replica stores may together hold:
@@ -3312,6 +3318,7 @@ async fn bind_endpoint(
         ))
         .transport_config(
             QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BI_STREAMS))
                 .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
                 .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
                 .build(),
