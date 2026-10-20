@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -9,8 +9,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use iroh::{
-    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
-    SecretKey,
+    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint,
+    EndpointAddr, PublicKey, SecretKey, TransportAddr,
 };
 use iroh_blobs::Hash;
 use iroh_gossip::{api::Event as GossipEvent, net::Gossip, proto::TopicId};
@@ -467,6 +467,54 @@ async fn sync_gossip_bulk() -> Result<()> {
         elapsed / n_entries as u32
     );
 
+    Ok(())
+}
+
+/// Downloads past a hundred toward one peer whose connect gets no answer all
+/// end within a bound, through the downloader the engine builds
+/// (`Store::downloader`), which starts one download per remote insert
+/// (iroh-util-001).
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_past_a_hundred_toward_a_silent_peer_all_end() -> Result<()> {
+    const DOWNLOADS: usize = 500;
+    // A socket nobody reads: the handshake toward it gets no answer.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let peer = SecretKey::from_bytes(&[7; 32]).public();
+    let lookup = MemoryLookup::new();
+    lookup.add_endpoint_info(EndpointAddr {
+        id: peer,
+        addrs: [TransportAddr::Ip(silent.local_addr()?)]
+            .into_iter()
+            .collect(),
+    });
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .address_lookup(lookup)
+        .bind()
+        .await?;
+    let store = iroh_blobs::store::mem::MemStore::new();
+    let downloader = store.downloader(&endpoint);
+
+    let ended = Arc::new(AtomicUsize::new(0));
+    let downloads = (0..DOWNLOADS).map(|i| {
+        let download = downloader.download(Hash::new(i.to_le_bytes()), vec![peer]);
+        let ended = Arc::clone(&ended);
+        async move {
+            let _failed = download.await.is_err();
+            ended.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    // Each fails once the connect times out, 1 s by the pool's default.
+    let _bound = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_buffered::join_all(downloads),
+    )
+    .await;
+    assert_eq!(
+        ended.load(Ordering::SeqCst),
+        DOWNLOADS,
+        "downloads that ended within 10 s"
+    );
+    endpoint.close().await;
     Ok(())
 }
 
