@@ -109,10 +109,7 @@ impl ProtocolHandler for PanicGuarded {
 }
 
 /// The blob protocol with its streams' tasks tracked and the store's closing
-/// left to the node: the router shuts its protocols down before it cancels
-/// their connections, and a stream's task outlives the router's shutdown, so
-/// a request a stream already read would reach a store that is closing,
-/// which iroh-blobs answers by panicking on its own task.
+/// left to the node (iroh-blobs-003).
 #[derive(Debug, Clone)]
 struct BlobsServing {
     store: iroh_blobs::api::Store,
@@ -208,7 +205,7 @@ const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 /// timeout, which iroh keeps). A peer's path selector is asked again when a
 /// connection opens, not when one closes, so the connection this run opens
 /// is what moves a peer that held more connections to the old address than
-/// this process opened at its start (`components/mee-pdn/iroh-defects.md`).
+/// this process opened at its start (iroh-001).
 const POD_PASS_AFTER_SPAWN: Duration = Duration::from_secs(45);
 
 /// The peers one run of the pod stores' pass reaches per store, so a
@@ -2962,9 +2959,7 @@ async fn open_blob_store(
 /// last and `collecting` is set; every other ask is skipped. Once the
 /// node's stop has closed the store (`closed`), or the node is gone with no
 /// stop to close it, the callback lets the next run fail on the closed
-/// store: iroh-blobs ends the collection's task on a failed run alone, and
-/// the task holds the store's runtime while it lives
-/// (`components/mee-pdn/iroh-defects.md`).
+/// store (iroh-blobs-004).
 fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
     collecting: Arc<std::sync::atomic::AtomicBool>,

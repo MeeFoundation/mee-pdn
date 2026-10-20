@@ -1,8 +1,8 @@
 //! The endpoint's path selector: iroh's default choice by tier and biased
 //! RTT, except that a path no connection receives on gives way to one some
 //! connection does, and within a tier a path fewer connections receive on
-//! gives way to one more of them receive on. Why iroh's own selector is
-//! replaced, and what this one answers: the `node-assembly` spec, "A peer
+//! gives way to one more of them receive on. iroh's own selector is replaced
+//! for iroh-001; what this one answers: the `node-assembly` spec, "A peer
 //! that restarts at a new address is reached at it".
 
 use std::cmp::Reverse;
