@@ -366,7 +366,9 @@ impl Fetches {
     }
 
     /// Starts fetches toward `provider` while it has room: its limit, one
-    /// while it is probed, none while it pauses.
+    /// while it is probed, none while it pauses. A probe that finds nothing
+    /// to fetch ends the series: kept, it would count the provider's next
+    /// failure, however late, against its 2 minutes and drop it unpaused.
     fn dispatch(&mut self, provider: PublicKey, steps: &mut Steps) {
         let limit = self.limit;
         let Some(entry) = self.providers.get_mut(&provider) else {
@@ -390,6 +392,9 @@ impl Fetches {
             wanted.fetching = Some(provider);
             entry.in_flight = entry.in_flight.saturating_add(1);
             steps.start.push((provider, hash));
+        }
+        if entry.in_flight == 0 && entry.series.as_ref().is_some_and(|series| series.probing) {
+            entry.series = None;
         }
     }
 }
@@ -569,6 +574,36 @@ mod tests {
         let (routed, steps) = fetches.want(p);
         assert!(routed);
         assert_eq!(steps.start, [(b1, p)]);
+    }
+
+    /// A provider whose pause ends with nothing left to probe starts afresh:
+    /// its next stall, an hour later, pauses it again rather than dropping it.
+    ///
+    /// The stalled payload goes to a second provider, which delivers it
+    /// before the pause ends.
+    #[test]
+    fn a_probe_with_nothing_to_fetch_ends_the_series() {
+        let mut fetches = Fetches::new(100);
+        let (a1, b1) = (node(1), node(2));
+        let (p, q) = (payload(1), payload(2));
+        want_from(&mut fetches, b1, &[p]);
+        fetches.register(p, a1);
+        let t0 = Instant::now();
+        let steps = fetches.finished(b1, p, Outcome::Stalled, false, t0);
+        let (_, series, _) = steps.pause.expect("a pause");
+        assert_eq!(steps.start, [(a1, p)], "a1 takes the stalled payload");
+        fetches.finished(a1, p, Outcome::Fetched, false, t0);
+        assert_eq!(fetches.resume(b1, series).start, [], "nothing to probe");
+
+        want_from(&mut fetches, b1, &[q]);
+        let later = t0 + Duration::from_secs(3_600);
+        let steps = fetches.finished(b1, q, Outcome::Stalled, false, later);
+        assert_eq!(steps.unrouted, [], "b1 still holds q");
+        assert_eq!(
+            steps.pause.map(|(_, _, wait)| wait),
+            Some(UNREACHED_RETRY_FIRST),
+            "a new series"
+        );
     }
 
     /// A connect failure toward a provider that is no gossip neighbor drops
