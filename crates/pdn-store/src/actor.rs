@@ -744,8 +744,9 @@ struct Actor {
     /// Frozen read snapshots of running sync sessions, keyed by session id.
     ///
     /// Each entry pins a redb read transaction until removed: the session
-    /// guard's drop removes it, and closing the replica sweeps whatever a
-    /// lost release message left behind.
+    /// guard's drop removes it, and the reclaim pass and closing the replica
+    /// sweep whatever a lost release message or an undelivered handle left
+    /// behind.
     sessions: HashMap<SyncSessionId, SessionSnapshot>,
     next_session_id: u64,
     last_session_sweep: Instant,
@@ -1382,6 +1383,7 @@ fn send_reply_error<T>(_err: T) -> SendReplyError {
 mod tests {
     use super::*;
     use crate::store;
+    /// Closing an open replica ends its subscribers' event channel.
     #[tokio::test]
     async fn open_close() -> anyhow::Result<()> {
         let store = store::Store::memory();

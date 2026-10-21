@@ -998,6 +998,8 @@ mod tests {
     /// A cache big enough that nothing in a scenario evicts.
     const TEST_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
+    /// An author's key-prefix query over keys of all 255 bytes reads every
+    /// key under the prefix, in order.
     #[tokio::test]
     async fn test_ranges() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
@@ -1061,6 +1063,9 @@ mod tests {
         Ok(())
     }
 
+    /// A persistent store keeps a replica's capability and an author's key,
+    /// a second write at a key replaces the first, and a removed entry reads
+    /// as absent.
     #[test]
     fn test_basics() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;

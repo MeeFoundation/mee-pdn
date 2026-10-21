@@ -198,7 +198,9 @@ check: _check-devcontainer-tools
   # The store keeps its own lints, not the workspace's; its warnings and
   # rustdoc's are denied here (an intra-doc link to a private item is one).
   cargo clippy -p pdn-store --all-targets -- -Dwarnings
-  RUSTDOCFLAGS=-Dwarnings cargo doc -p pdn-store --no-deps
+  # Private items too: most docs sit on them, and a link there that no longer
+  # resolves is otherwise seen by nothing.
+  RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)
 
 # Lint and type-check, attempt fixes
 check-fix:
@@ -218,7 +220,9 @@ check-fix:
   # The store keeps its own lints, not the workspace's; its warnings and
   # rustdoc's are denied here (an intra-doc link to a private item is one).
   cargo clippy -p pdn-store --all-targets -- -Dwarnings
-  RUSTDOCFLAGS=-Dwarnings cargo doc -p pdn-store --no-deps
+  # Private items too: most docs sit on them, and a link there that no longer
+  # resolves is otherwise seen by nothing.
+  RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)
 
 # Every test of the HTTP surface is a container test: needs a container
 # daemon and builds the image. `clean-stale --init` marks an unmarked target/, so a first

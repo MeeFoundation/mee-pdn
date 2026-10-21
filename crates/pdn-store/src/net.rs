@@ -15,7 +15,7 @@ use crate::{
 
 pub use crate::net::codec::SessionOpening;
 
-/// The ALPN identifier for the iroh-docs protocol
+/// The sync protocol's ALPN, the name upstream iroh-docs gives its own.
 pub const ALPN: &[u8] = b"/iroh-sync/1";
 
 mod codec;
@@ -308,8 +308,9 @@ pub async fn accept_session(
     })?
 }
 
-/// Refuse a session read this far, with the reason a caller that named a
-/// identity this node does not host is given. The refusal is the whole
+/// Refuse a session read this far with `reason` — the dispatcher gives a
+/// caller that named an identity this node does not host
+/// [`AbortReason::NotFound`]. The refusal is the whole
 /// message, so it is torn down like a served session: without waiting
 /// for the caller, the connection can end before the frame reaches it
 /// and the refusal arrives as a lost connection.
@@ -565,7 +566,7 @@ where
 pub struct SyncFinished {
     /// The namespace that was synced.
     pub namespace: NamespaceId,
-    /// The peer we syned with.
+    /// The peer we synced with.
     pub peer: PublicKey,
     /// The outcome of the sync operation
     pub(crate) outcome: SyncOutcome,

@@ -1,4 +1,4 @@
-//! Handlers and actors to for live syncing replicas.
+//! The engine and its actors for live syncing replicas.
 //!
 //! `Replica` is also called documents here.
 
@@ -99,8 +99,8 @@ pub struct Engine {
 impl Engine {
     /// Start the sync engine.
     ///
-    /// This will spawn two tokio tasks for the live sync coordination and gossip actors, and a
-    /// thread for the actor interacting with doc storage.
+    /// This spawns a tokio task for the live sync coordination and a thread for the actor
+    /// interacting with doc storage; the gossip it is handed runs on its own.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn(
         endpoint: Endpoint,
@@ -202,8 +202,8 @@ impl Engine {
 
     /// Start to sync a document.
     ///
-    /// If `peers` is non-empty, it will both do an initial set-reconciliation sync with each peer,
-    /// and join an iroh-gossip swarm with these peers to receive and broadcast document updates.
+    /// Joins the document's iroh-gossip swarm, bootstrapped from `peers` and every peer the store
+    /// recorded, and does an initial set-reconciliation sync with each of them.
     pub(crate) async fn start_sync(
         &self,
         namespace: NamespaceId,
@@ -372,11 +372,12 @@ impl Engine {
     /// Leave a document's gossip swarm without stopping its live sync.
     ///
     /// The narrow inverse of the swarm join that [`Self::start_sync`]
-    /// performs, for downgrading a replica to scoped access: the replica
-    /// stays open and syncing — reconciliation keeps accepting and dialing,
-    /// event subscribers stay live — while the gossip channel closes in
-    /// both directions. Idempotent: leaving a swarm that was never joined
-    /// does nothing. A later [`Self::start_sync`] re-joins.
+    /// performs, for a replica held out of its swarm: the replica stays
+    /// open and syncing — reconciliation keeps accepting and dialing, event
+    /// subscribers stay live — while the gossip channel closes in both
+    /// directions. Idempotent: leaving a swarm that was never joined does
+    /// nothing. A later [`Self::start_sync`], or a
+    /// [`Self::sync_with_peers`] that joins the swarm, re-joins.
     pub(crate) async fn leave_gossip(&self, namespace: NamespaceId) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
@@ -643,8 +644,7 @@ impl LiveEvent {
 
 /// Where to persist the default author.
 ///
-/// If set to `Mem`, a new author will be created in the docs store before spawning the sync
-/// engine.
+/// If set to `Mem`, a new author is created in the docs store at every spawn of the engine.
 ///
 /// If set to `Persistent`, the default author will be loaded from and persisted to the specified
 /// path (as hex encoded string of the author's public key).
@@ -661,7 +661,7 @@ impl DefaultAuthorStorage {
     ///
     /// Will create and save a new author if the storage is empty.
     ///
-    /// Returns an error if the author can't be parsed or if the uathor does not exist in the docs
+    /// Returns an error if the author can't be parsed or if the author does not exist in the docs
     /// store.
     pub async fn load(&self, docs_store: &SyncHandle) -> anyhow::Result<AuthorId> {
         match self {

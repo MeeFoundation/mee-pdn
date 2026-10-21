@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Capability, Contact, Identity};
 
-/// Contains both a key (either secret or public) to a document, and a list of peers to join.
+/// A document's write capability, its namespace secret, and a list of peers to join.
 #[derive(Serialize, Deserialize, Clone, Debug, derive_more::Display)]
 #[display("{}", Ticket::encode_string(self))]
 pub struct DocTicket {
-    /// either a public or private key
+    /// The write capability: the document's namespace secret.
     pub capability: Capability,
     /// A list of nodes to contact.
     pub nodes: Vec<EndpointAddr>,
@@ -19,11 +19,8 @@ pub struct DocTicket {
     pub identity: Identity,
 }
 
-/// Wire format for [`DocTicket`].
-///
-/// In the future we might have multiple variants (not versions, since they
-/// might be both equally valid), so this is a single variant enum to force
-/// postcard to add a discriminator.
+/// Wire format for [`DocTicket`]: a single-variant enum, so postcard writes
+/// a discriminator that a further variant can take.
 #[derive(Serialize, Deserialize)]
 enum TicketWireFormat {
     Variant0(DocTicket),

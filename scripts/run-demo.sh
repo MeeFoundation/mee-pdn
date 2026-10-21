@@ -31,8 +31,7 @@ cleanup() {
 }
 trap cleanup EXIT
 # The count comes from the compose file rather than from this line: a
-# number written here goes stale the first time a node is added, and it
-# already did.
+# number written here goes stale the first time a node is added.
 nodes=$($compose config --services | wc -l | tr -d ' ')
 # The nodes come up from one image named by its content id, so the show and
 # the gate run one artifact rather than one tag: the one handed over, as the

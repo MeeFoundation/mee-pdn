@@ -62,13 +62,15 @@ On macOS a stress run now and then marks a test `LEAK`: it passed, and its stdou
 Run a single crate's tests: `just test -p <crate-name>`.
 Run a single test: `just test -E 'test(<test_name>)'`.
 
-Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/test-util`, the feature the runtime's fault and pause hooks sit behind, and a bare cargo invocation fails to build the scenarios that use them. The recipes drop the flag when the caller narrows the package selection away from `pdn-node`, because cargo rejects a feature of an unselected package.
+Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/test-util`, the feature the runtime's fault and pause hooks sit behind, and a bare cargo invocation fails to build the scenarios that use them. The recipes drop the flag when the caller narrows the package selection away from `pdn-node`, because cargo rejects a feature of an unselected package; a selection naming `data-layer` gets `data-layer/test-util` instead, the observation surface the flag turns on under it.
 
 `crates/pdn-store` builds in one configuration, the one the product runs, and keeps its own lints rather than the workspace's: `just check` lints it with its warnings and rustdoc's denied, and under `just test` its tests run like any crate's.
 
 ## Lint rules
 
 Strict safety-first linting, configured in the workspace `Cargo.toml`, `clippy.toml` and `rustfmt.toml`, enforced by `just check`. Prefer `.get()` and `TryFrom`/`TryInto` over indexing and `as`.
+
+`just check` also builds every crate's documentation, private items included, with rustdoc's warnings denied, so a doc link that no longer resolves — a renamed function, a constant behind `#[cfg(test)]` — fails it. Outside `crates/pdn-store` a public item's doc may link a private one (`[workspace.lints.rustdoc]` in the workspace `Cargo.toml`): no crate is published, and its docs are read in the source.
 
 An emptiness assert compares the value with an empty one, so that a failure prints what the value held:
 

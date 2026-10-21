@@ -25,7 +25,7 @@ pub(crate) const NAMESPACES_TABLE: TableDefinition<&[u8; 32], (u8, &[u8; 32])> =
 /// Table: Records
 /// Key:   `([u8; 32], [u8; 32], &[u8])`
 ///      # (NamespaceId, AuthorId, Key)
-/// Value: `(u64, [u8; 32], [u8; 32], u64, [u8; 32])`
+/// Value: `(u64, [u8; 64], [u8; 64], u64, [u8; 32])`
 ///      # (timestamp, signature_namespace, signature_author, len, hash)
 pub(crate) const RECORDS_TABLE: TableDefinition<RecordsId, RecordsValue> =
     TableDefinition::new("records-1");
@@ -45,7 +45,7 @@ pub(crate) type LatestPerAuthorKey<'a> = (&'a [u8; 32], &'a [u8; 32]);
 pub(crate) type LatestPerAuthorValue<'a> = (u64, &'a [u8]);
 
 /// Table: Records by key
-/// Key:   `([u8; 32], Vec<u8>, [u8; 32]])` # (NamespaceId, Key, AuthorId)
+/// Key:   `([u8; 32], Vec<u8>, [u8; 32])` # (NamespaceId, Key, AuthorId)
 /// Value: `()`
 pub(crate) const RECORDS_BY_KEY_TABLE: TableDefinition<RecordsByKeyId, ()> =
     TableDefinition::new("records-by-key-1");
@@ -57,7 +57,7 @@ pub(crate) type RecordsByKeyIdOwned = ([u8; 32], Bytes, [u8; 32]);
 /// Value: `(u64, [u8; 32])` # ([`Nanos`], &[`PeerIdBytes`]) representing the last time a peer was used.
 pub(crate) const NAMESPACE_PEERS_TABLE: MultimapTableDefinition<&[u8; 32], (Nanos, &PeerIdBytes)> =
     MultimapTableDefinition::new("sync-peers-1");
-/// Number of seconds elapsed since [`n0_future::time::SystemTime::UNIX_EPOCH`]. Used to register the
+/// Number of nanoseconds elapsed since [`n0_future::time::SystemTime::UNIX_EPOCH`]. Used to register the
 /// last time a peer was useful in a document.
 // NOTE: resolution is nanoseconds, stored as a u64 since this covers ~500years from unix epoch,
 // which should be more than enough

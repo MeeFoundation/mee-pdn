@@ -248,7 +248,7 @@ const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 const MAX_UNI_STREAMS: u32 = 4_096;
 
 /// What one connection buffers across its streams: the 199 streams times
-/// 1,250,000 bytes the transport's defaults allowed, so the larger stream
+/// 1,250,000 bytes the transport's defaults allow, so the larger stream
 /// count gives a caller no more memory.
 const CONNECTION_RECEIVE_WINDOW: u32 = 248_750_000;
 
@@ -261,8 +261,9 @@ pub enum StorageConfig {
     /// a product build.
     #[cfg(any(test, feature = "test-util"))]
     Memory,
-    /// `identities/<identity>/` (replica store and persisted author),
-    /// `blobs/`, `node.key`, `lock`. Created owner-only when absent: the
+    /// `identities/<identity>/` (replica store, persisted author and
+    /// hosting record), `blobs/`, `node.key`, `lock`, `peers`. Created
+    /// owner-only when absent: the
     /// replica store holds namespace secrets and the blobs payload bytes in
     /// the clear.
     Directory(std::path::PathBuf),
@@ -1081,8 +1082,8 @@ impl SyncNode {
         Ok(self.require(identity)?.docs.replica_cache_bytes())
     }
 
-    /// Record `identity` as hosted here, with `pms` as its private
-    /// PMS: the commit point of a create or a link. The identity's stores
+    /// Record `identity` as hosted here, with `pms` as its PMS: the
+    /// commit point of a create or a link. The identity's stores
     /// are flushed first, so the record never names a replica, or an
     /// identity key, the disk does not hold, and a failed commit fails the
     /// call; the record is written beside, synced and renamed over, so a
@@ -1112,10 +1113,12 @@ impl SyncNode {
         read_hosting_records(root)
     }
 
-    /// Arm `identity`'s PMS for session classification: its device
-    /// records decide who is one of its devices, and its pods' stores
-    /// serve fail-closed from here on. The PMS's sync starts here,
-    /// after the arming, so its first session is one the book can judge.
+    /// Arm `identity`'s PMS for session classification: from here on the
+    /// PMS is served by its ticket (Invariant 1) and its device records
+    /// decide who is one of its devices, a sibling on a pod's store among
+    /// them; before it, a session on the PMS is refused. The PMS's sync
+    /// starts here, after the arming, so its first session is one the book
+    /// can judge.
     pub fn host_identity(&self, identity: PdnId, pms: &PrivateMetadataStore) -> Result<()> {
         let stack = self.require(identity)?;
         stack.access.arm_pms(pms.doc_handle())?;
@@ -1172,8 +1175,8 @@ impl SyncNode {
 
     /// Take `identity`'s replica of `namespace` out of its gossip swarm,
     /// its reconciliation left running: no announcement reaches it. It holds
-    /// until this node's next reconcile pass, which re-joins the swarm and
-    /// opens sessions to the contacts itself.
+    /// until a start of its sync joins the swarm again — the next reconcile
+    /// pass, or on a pod store a flush or a dial the node makes on its own.
     #[cfg(feature = "test-util")]
     pub async fn leave_swarm_for_test(
         &self,
@@ -1870,7 +1873,7 @@ impl SyncNode {
         let stack = self.require(identity)?;
         let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
         if let Some(records) = held.records {
-            // Drop first, as `forget_namespace` does: a failed drop leaves
+            // Drop first, as `forget_doc` does: a failed drop leaves
             // the pod held, and a retry still finds it.
             self.forget_doc(identity, records.id()).await?;
             stack.registry.set_pod_records(pod, None)?;
@@ -1973,8 +1976,8 @@ impl SyncNode {
 
     /// Wait, at most `timeout`, until the membership view of `identity`'s
     /// replica of `pod` lists `identity` itself as a member: a session
-    /// brings its own entries ahead of their payloads. [`CatchUpTimeout`]
-    /// when it does not.
+    /// brings its own entries ahead of their payloads.
+    /// [`CatchUpTimeout`](crate::CatchUpTimeout) when it does not.
     pub async fn await_pod_member(
         &self,
         identity: PdnId,
@@ -2514,7 +2517,9 @@ impl SyncNode {
     /// Once; a second take yields `None`. From the take on, every
     /// derivation of a pod's contacts — at each change to its membership
     /// store and each run of the pod stores' pass, ahead of its dials —
-    /// reports what it finds, until the record store is forgotten.
+    /// reports what it finds: a departure or an unlisted device while the
+    /// record store is held, the identity a member again while only the
+    /// tombstone is.
     pub fn take_pod_notices(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<PodNotice>> {
         let mut sender = self.pod_notices.lock().ok()?;
         if sender.is_some() {
@@ -2883,7 +2888,7 @@ fn read_hosting_records(directory: &std::path::Path) -> Result<Vec<RecordedHosti
 }
 
 /// One subdirectory per hosted identity, named by the identity, each
-/// holding that identity's replica store and author.
+/// holding that identity's replica store, author and hosting record.
 fn identity_directory(directory: &std::path::Path, identity: PdnId) -> std::path::PathBuf {
     directory
         .join(IDENTITIES_DIR)
@@ -3486,7 +3491,8 @@ async fn wait_until_dialable(endpoint: &Endpoint) {
 }
 
 /// `Ok(None)` covers both "no such entry" and "record stored, payload not
-/// yet fetched". Every payload-waiting read in this layer goes through here.
+/// yet fetched"; nothing waits for the payload. Every PMS read of a payload
+/// goes through here.
 pub(crate) async fn read_payload(
     doc: &Doc,
     blobs: &iroh_blobs::api::Store,
@@ -3547,7 +3553,7 @@ async fn reconcile_pass(
 /// Every `interval`, the first run within [`POD_PASS_AFTER_SPAWN`] of the
 /// spawn, reconcile each store of every pod a hosted identity holds with at
 /// most [`POD_RECONCILE_PEERS`] peers, drawn afresh from its contacts —
-/// derived first from the pod's membership — and the peers the engine
+/// derived first from the pod's membership — and no peer the engine
 /// recorded. A failed run is retried by the next. Ends as
 /// [`reconcile_pass`] does.
 async fn pod_reconcile_pass(
@@ -3655,10 +3661,6 @@ async fn start_pod_store(
         .await
 }
 
-/// Derive both of a pod's stores' contacts from its membership and set
-/// them whole: as the stores are tracked, and as the engine dials each
-/// peer, since a peer a gossip message or a recorded session names is
-/// dialed as what contacts stated for it.
 /// What a derivation found of the identity's own standing.
 #[derive(Default)]
 struct Derived {
@@ -3668,6 +3670,10 @@ struct Derived {
     nobody: bool,
 }
 
+/// Derive both of a pod's stores' contacts from its membership and set
+/// them whole: as the stores are tracked, and as the engine dials each
+/// peer, since a peer a gossip message or a recorded session names is
+/// dialed as what contacts stated for it.
 async fn derive_pod_contacts(
     stack: &HostedStack,
     node: EndpointId,
@@ -4000,15 +4006,17 @@ async fn dial_again(
 }
 
 /// A pod store's contacts: every device the statements of the pod's
-/// current members list, each dialed as its member, and the identity's own
-/// devices by its PMS, dialed as the identity; never this device as
-/// this identity. `None` while the membership view lists nobody: a replica
-/// that holds nothing yet keeps the contacts its ticket gave it.
-/// A tombstone drops the members' devices once a session with a current
-/// member's replica — a counterpart among `met`, on whichever node — went
-/// through. A
-/// replica holding its record store again keeps them while its membership
-/// view still shows the departure: they are how a rejoin dials its inviter.
+/// current members list, each dialed as its member, the identity's own
+/// devices by its PMS, dialed as the identity, and every device a ticket
+/// names as a current member that no statement lists, dialed as that
+/// member ([`ticketed_unlisted`]); never this device as this identity.
+/// `None` while the membership view lists nobody: a replica that holds
+/// nothing yet keeps the contacts its ticket gave it. A tombstone drops
+/// the members' devices and the ticketed ones once a session with a
+/// current member's replica — a counterpart among `met`, on whichever
+/// node — went through. A replica holding its record store again keeps
+/// them while its membership view still shows the departure: they are how
+/// a rejoin dials its inviter.
 async fn pod_contacts(
     stack: &HostedStack,
     node: EndpointId,

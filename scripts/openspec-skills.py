@@ -2,8 +2,8 @@
 """Derives the root's OpenSpec skills (.claude, .agents) from the ones `openspec update` writes in mia-docs.
 
 The workspace root is not an openspec root — the specs live in the sibling repo `mia-docs/` — so the
-skills here are mia-docs' generated ones, with every `openspec` command told to run from `mia-docs/`.
-Nothing else differs: project specifics live in mia-docs/openspec/config.yaml, which the generated
+skills here are mia-docs' generated ones, with every `openspec` command told to run from `mia-docs/` and
+a line after the frontmatter saying so. Nothing else differs: project specifics live in mia-docs/openspec/config.yaml, which the generated
 skills read at run time. Codex's UI metadata (`agents/openai.yaml`) is kept by hand and left alone; a
 skill that vanished upstream is removed here too.
 """
