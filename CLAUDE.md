@@ -9,7 +9,7 @@ Sibling repos are cloned in-place at the top of the workspace, gitignored here a
 - **`mia-docs/` is the source of truth** — ADRs, specs, changes and code practices. What it says is what the platform is and is going to be.
 - **`mia-ontologies/` is the product's long-range vision, not a specification.** It is written without regard to this codebase, to its upstream dependencies (iroh and the rest) or to `mia-docs/`. Much of it is untested; some of it is unworkable, some of it wrong, and some of it contradicts the platform or itself — take nothing in it on faith. Read it for what the product may want in some distant future and may yet change its mind about; check every claim against `mia-docs/` and the code, and when the two disagree, `mia-docs/` wins and the disagreement is worth raising.
 - `pdn-sdk/` — the binding artifacts of the `pdn-mobile` facade: generation, the XCFramework, the Android archive, and the releases an application names. The facade itself is a crate of this workspace.
-- `pdn-app/` — the mobile application: React Native screens over a release of `pdn-sdk`, with its own README and CLAUDE.md.
+- `pdn-app/` — the mobile application: React Native screens over a release of `pdn-sdk`, with its own README and CLAUDE.md, and the phone's half of the load test.
 
 ## Project
 
@@ -65,6 +65,8 @@ Run a single test: `just test -E 'test(<test_name>)'`.
 Go through `just`, not bare `cargo nextest run`: the recipes enable `pdn-node/test-util`, the feature the runtime's fault and pause hooks sit behind, and a bare cargo invocation fails to build the scenarios that use them. The recipes drop the flag when the caller narrows the package selection away from `pdn-node`, because cargo rejects a feature of an unselected package; a selection naming `data-layer` gets `data-layer/test-util` instead, the observation surface the flag turns on under it, one naming `pdn-store` its `observation` feature, and one naming `pdn-node-http` or `pdn-mobile` that host's `observation` feature, which serves the surface over HTTP (`scripts/test-features.sh`).
 
 `crates/pdn-store` builds in one configuration, the one the product runs, and keeps its own lints rather than the workspace's: `just check` lints it with its warnings and rustdoc's denied, and under `just test` its tests run like any crate's.
+
+`sync-test/` is the pod load test ([`sync-test/load.md`](sync-test/load.md)): Python stdlib scripts, run as `python3 -I`, driving `pdn-node-http` processes over the routes of its `observation` feature. `just load` collects test L on the laptop, or with `--container` in the runner image, which is what `.github/workflows/load.yml` runs by hand and publishes to the `load-history` branch. Test P, with the phone as `r`, is `pdn-app`'s `just load`: the same harness, with the phone's build and checks in `pdn-app/sync-test/`.
 
 ## Lint rules
 

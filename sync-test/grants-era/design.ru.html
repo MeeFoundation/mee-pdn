@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Тест надёжности sync</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1f2328; --quiet: #59636e; --rule: #d1d9e0; --code-bg: #f6f8fa;
+  --edge: #8c959f; --grid: #e6e9ec; --accent: #2f6fdb; --warn: #d1242f; --accent-tint: rgba(47,111,219,0.12);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --fg: #e6edf3; --quiet: #9198a1; --rule: #30363d; --code-bg: #161b22;
+    --edge: #6e7681; --grid: #262c33; --accent: #4c8df6; --warn: #f85149; --accent-tint: rgba(76,141,246,0.16);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 30px; line-height: 1.25; margin: 0 0 4px; }
+h2 { font-size: 22px; margin: 40px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+.byline { color: var(--quiet); margin: 0 0 24px; }
+code { font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+.table-wrap { overflow-x: auto; margin: 12px 0 16px; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th, td { border: 1px solid var(--rule); padding: 6px 10px; text-align: left; vertical-align: top; }
+th { background: var(--code-bg); }
+a { color: var(--accent); }
+figure { margin: 20px 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { color: var(--quiet); font-size: 13px; margin-top: 6px; }
+ul.check { list-style: none; padding-left: 4px; }
+ul.check li::before { content: "☐ "; color: var(--quiet); }
+.formula { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 10px 14px; border-radius: 8px; overflow-x: auto; }
+svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .ink { fill: var(--fg); } svg .quiet { fill: var(--quiet); }
+svg .box { fill: none; stroke: var(--edge); stroke-width: 1.25; }
+svg .box-main { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 2; }
+svg .line { fill: none; stroke: var(--edge); stroke-width: 1.25; }
+svg .arrowhead { fill: var(--edge); }
+</style>
+</head>
+<body>
+<main>
+<h1>Тест надёжности sync: один телефон против многих node'ов</h1>
+<p class="byline">Черновик дизайна, 2026-09-28 · <a href="design.html">English version</a></p>
+
+<h2>Кратко</h2>
+<p>Одна команда, один телефон, десять node'ов на ноутбуке: тест отправляет на телефон 10,000 пронумерованных entry по настоящему Wi-Fi, посередине на 30 секунд обрывает телефону сеть и заканчивается вердиктом PASS, FAIL или INCONCLUSIVE с перцентилями задержки. Единственное ручное действие — телефон подключён кабелем, разблокирован и сидит в той же Wi-Fi.</p>
+<p><strong>Сценарий в двух словах.</strong></p>
+<ol>
+<li>Десять writer'ов (node'ы на ноутбуке) подключаются к телефону и заранее дают ему grant на каждый path, который будут писать.</li>
+<li>Каждый пишет одну пронумерованную entry каждые 100 мс в течение 100 секунд.</li>
+<li>С 40-й по 70-ю секунду правило фаервола отрезает телефон от node'ов; собственный канал управления теста при этом не рвётся.</li>
+<li>Каждый node, включая телефон, сообщает о каждой полученной entry и о каждой завершённой sync-сессии.</li>
+<li>Запись останавливается; тест ждёт ещё одну успешную сессию с каждым writer'ом и затем снимает список того, что лежит на телефоне.</li>
+<li>Каждая entry классифицируется, печатаются вердикт и цифры.</li>
+</ol>
+<p><strong>Главное правило на примере.</strong> Телефон забирает данные у каждого writer'а в sync-сессии раз в 5 секунд, и сессия приносит всё, что было у writer'а в момент её начала.</p>
+<ul>
+<li>Entry 417 от <code>w3</code> записана в 41.203. В 43.000 её на телефоне нет, но ни одна сессия с <code>w3</code> после записи ещё не начиналась: <strong>в пути</strong> — это нормально.</li>
+<li>Сессия началась в 43.900 и успешно закончилась на обеих сторонах, а 417 так и не пришла к моменту, когда закончилась сторона телефона: <strong>нарушение</strong> — дефект, сколько бы мы ни ждали.</li>
+<li>Обрыв не снимается, и ни одна сессия не проходит: <strong>застряло</strong> — прогон INCONCLUSIVE, это не успех и не доказанная потеря.</li>
+</ul>
+<p><strong>Как выглядит отчёт</strong> (формат, а не результат замера):</p>
+<pre><code>VERDICT: FAIL — 1 violated, 1 lost
+expected 10,160 · readable 10,159 · stalled pairs 0 · split sessions 0 · undetermined 0
+latency, steady phase: p50 3.1 s · p90 5.6 s · p99 6.4 s (clock ±4 ms)
+partition: first session 1.2 s after reconnect · catch-up 7.9 s
+path: direct Wi-Fi, no relay · host CPU peak 58%
+LOST w3 s/000000417 -> phone: w3 accepted 43.900-44.050 ok, phone ok at 44.185; logs tmp/run-20260928-1412/</code></pre>
+<p>Дальше документ описывает сценарий целиком, как считается каждая цифра и почему ей можно доверять — включая заложенные дефекты, которые тест обязан поймать, прежде чем его цифры чего-то стоят.</p>
+
+<h2>На что отвечает тест</h2>
+<p>Тест отвечает на два вопроса о sync между одним физическим телефоном и многими node'ами через настоящий Wi-Fi: доходит ли каждая entry, которая должна дойти, и сколько это занимает. Он отличает entry, которая ещё не пришла, от entry, которую sync уже не доставил, и делает это без таймера ожидания.</p>
+<p>За прогон тест сообщает:</p>
+<ul>
+<li>сколько entry доставлено, потеряно, испорчено, устарело или оказалось там, где grant их не разрешает;</li>
+<li>сколько проходит от записи entry до момента, когда её можно прочитать у reader'а, в перцентилях;</li>
+<li>сколько телефону нужно, чтобы догнать остальных после обрыва и восстановления сети;</li>
+<li>можно ли доверять самому прогону: CPU хоста, потеря событий, ошибка часов, сетевой путь.</li>
+</ul>
+<p>Намеренно не отвечает:</p>
+<ul>
+<li><strong>на вопрос о relay и обходе NAT.</strong> Основной прогон идёт по прямому пути через Wi-Fi; прогон через relay — отдельный вариант, иначе нагрузка публичного relay окажется внутри цифры.</li>
+<li><strong>на вопрос о батарее и радио.</strong> Телефон всё время на экране agent'а; в фоне iOS останавливает node, и это отдельный сценарий.</li>
+<li><strong>на вопрос, что withdraw делает с уже доставленными данными.</strong> Grantee отвязывает и забывает replica issuer'а, как только withdraw до него дошёл; сценарий withdraw проверяет, что ничего записанного после withdraw не приходит и что телефон затем отказывает по этому issuer'у.</li>
+<li><strong>на вопрос о пределах одного ноутбука.</strong> Когда CPU хоста упирается в потолок, задержка помечается как предел машины, а не платформы.</li>
+</ul>
+
+<h2>Установка</h2>
+<p>На ноутбуке работают все node'ы и координатор; на одном физическом iPhone — тестовая сборка приложения; оба в одной Wi-Fi. Ручная подготовка касается только телефона: подключён кабелем, разблокирован, автоблокировка выключена, та же Wi-Fi, что у ноутбука, и тестовая сборка установлена один раз с разрешённым доступом к локальной сети. iOS спрашивает это разрешение при каждой свежей установке, и ответить может только человек, поэтому прогоны сбрасывают хранилище node'а, а не переустанавливают приложение.</p>
+
+<figure>
+<svg viewBox="0 0 760 420" role="img" aria-label="Entry идут по настоящему Wi-Fi, управление не проходит через шейпер" font-size="13">
+<defs><marker id="setup-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrowhead"/></marker></defs>
+<text x="24" y="30" font-size="15" font-weight="600" class="ink">Entry идут по настоящему Wi-Fi, управление не проходит через шейпер</text>
+<rect x="24" y="52" width="340" height="340" rx="8" class="box"/>
+<text x="40" y="76" font-weight="600" class="ink">Ноутбук (macOS)</text>
+<rect x="40" y="92" width="308" height="72" rx="8" class="box"/>
+<text x="56" y="116" font-weight="600" class="ink">Координатор</text>
+<text x="56" y="136" font-size="11.5" class="quiet">сценарий, журналы writer'ов, вердикт</text>
+<text x="56" y="152" font-size="11.5" class="quiet">управляет /debug, читает /debug/events</text>
+<rect x="40" y="204" width="308" height="72" rx="8" class="box"/>
+<text x="56" y="228" font-weight="600" class="ink">N writer'ов + 2 контроля</text>
+<text x="56" y="248" font-size="11.5" class="quiet">pdn-node-http, release, connectivity direct</text>
+<text x="56" y="264" font-size="11.5" class="quiet">по процессу и UDP-порту на node</text>
+<rect x="40" y="316" width="308" height="56" rx="8" class="box-main"/>
+<text x="56" y="340" font-weight="600" class="ink">pf + dummynet</text>
+<text x="56" y="360" font-size="11.5" class="ink">UDP телефона: задержка, потери, обрыв</text>
+<rect x="392" y="240" width="150" height="72" rx="8" class="box"/>
+<text x="408" y="264" font-weight="600" class="ink">Wi-Fi роутер</text>
+<text x="408" y="284" font-size="11.5" class="quiet">одна LAN, без</text>
+<text x="408" y="300" font-size="11.5" class="quiet">изоляции клиентов</text>
+<rect x="572" y="52" width="164" height="340" rx="8" class="box"/>
+<text x="588" y="76" font-weight="600" class="ink">iPhone</text>
+<rect x="584" y="92" width="140" height="72" rx="8" class="box"/>
+<text x="600" y="116" font-weight="600" class="ink">Agent</text>
+<text x="600" y="136" font-size="11.5" class="quiet">тестовая сборка</text>
+<text x="600" y="152" font-size="11.5" class="quiet">локальный журнал</text>
+<rect x="584" y="204" width="140" height="72" rx="8" class="box"/>
+<text x="600" y="228" font-weight="600" class="ink">pdn-mobile node</text>
+<text x="600" y="248" font-size="11.5" class="quiet">for_product</text>
+<text x="600" y="264" font-size="11.5" class="quiet">reconcile раз в 5 с</text>
+<g class="line">
+<path d="M194 164V204" marker-end="url(#setup-arrow)"/>
+<path d="M194 276V316" marker-end="url(#setup-arrow)"/>
+<path d="M348 344H467V312" marker-end="url(#setup-arrow)" marker-start="url(#setup-arrow)"/>
+<path d="M542 260H584" marker-end="url(#setup-arrow)" marker-start="url(#setup-arrow)"/>
+<path d="M654 164V204" marker-end="url(#setup-arrow)"/>
+<path d="M348 128H584" stroke-dasharray="5 4" marker-end="url(#setup-arrow)" marker-start="url(#setup-arrow)"/>
+</g>
+<text x="204" y="188" font-size="11.5" class="quiet">HTTP /debug, loopback</text>
+<text x="204" y="300" font-size="11.5" class="quiet">iroh QUIC</text>
+<text x="376" y="376" font-size="11.5" class="quiet">entry: iroh QUIC,</text>
+<text x="376" y="392" font-size="11.5" class="quiet">прямой UDP по LAN</text>
+<text x="468" y="118" text-anchor="middle" font-size="11.5" class="quiet">управление: HTTP (TCP) по LAN</text>
+<text x="468" y="148" text-anchor="middle" font-size="11.5" class="quiet">не шейпится, не рвётся</text>
+<text x="664" y="188" font-size="11.5" class="quiet">facade</text>
+</svg>
+<figcaption>Установка: ноутбук, роутер, телефон.</figcaption>
+</figure>
+
+<p>Entry между телефоном и каждым node'ом ноутбука идут как iroh QUIC по прямому UDP через роутер. Шейпер трогает только этот UDP; координатор связан с agent'ом по TCP, поэтому обрыв пути данных телефона никогда не обрывает управление тестом.</p>
+<p><strong>Участники.</strong></p>
+<div class="table-wrap"><table>
+<tr><th>Участник</th><th>Где</th><th>Роль в основном прогоне</th></tr>
+<tr><td>Writer'ы <code>w1..wN</code></td><td>ноутбук, по процессу <code>pdn-node-http</code> на каждый</td><td>Issuer'ы: каждый подключается к телефону, заранее даёт ему grant на все slot'ы и пишет</td></tr>
+<tr><td>Телефон</td><td>iPhone, <code>pdn-mobile</code> node внутри тестовой сборки</td><td>Grantee всех N writer'ов; измеряемый reader</td></tr>
+<tr><td>Контрольный <code>outsider</code></td><td>node на ноутбуке</td><td>Держит ticket к namespace'у <code>w1</code>, но без grant'а: не должен получить ни одной entry <code>w1</code></td></tr>
+<tr><td>Контрольный <code>partial</code></td><td>node на ноутбуке</td><td>Держит grant от <code>w1</code> только на чётные slot'ы: должен получить ровно их</td></tr>
+<tr><td>Координатор</td><td>ноутбук, один скрипт</td><td>Ведёт сценарий, хранит журналы, подписан на события всех node'ов, считает вердикт</td></tr>
+<tr><td>Agent</td><td>внутри тестовой сборки</td><td>Выполняет команды координатора через тот же facade, что и экраны, и пересылает события node'а телефона</td></tr>
+</table></div>
+<p><em>Slot</em> — это path, заранее выданный в grant'е под одну entry, которую прогон запишет. Контрольные node'ы нужны потому, что тест, который доказывает только получение данных теми, кому можно, ничего не говорит о доступе (<code>access-control-tests.md</code>). <code>outsider</code> получает свой ticket вручную от координатора, а не через продукт: без ticket'а он бы никогда не обратился к <code>w1</code>, и пустой результат ничего бы не доказал. Ручной ticket допустим как раз для такого negative control (<code>product-path-arrangement.md</code>). Одна проверка отказа сегодня недоступна: тот, кто знает хэш payload'а, может скачать этот blob, потому что канал blob'ов ещё не закрыт (отложенный пробел в спеке subset-reconciliation). Отчёт показывает это как известный пробел, а не как успех.</p>
+<p><strong>Почему именно такая сеть.</strong></p>
+<ul>
+<li><strong>Радио телефона несёт все N connection'ов</strong>, так что мобильный node под настоящей нагрузкой: CPU, пробуждения радио, поведение сокетов iOS.</li>
+<li><strong>Телефон можно отрезать скриптом.</strong> Node'ы ноутбука работают с <code>PDN_CONNECTIVITY=direct</code> и не имеют relay; единственный путь к ним с телефона — прямой UDP. Правила pf, отбрасывающие UDP к IP телефона и от него, — настоящий обрыв настоящего телефона, а канал управления идёт по TCP и проходит.</li>
+<li><strong>Задержка и потери — теми же правилами.</strong> dummynet, встроенный в macOS шейпер, задерживает и отбрасывает пакеты в ядре, так что QUIC под iroh встречает настоящие задержки, потери и повторные отправки. Тест ставит правила в обе стороны для адреса телефона, на интерфейсе, который назовёт <code>route get &lt;IP телефона&gt;</code>, и доказывает их работу счётчиками правил pf после пробного UDP-пакета.</li>
+<li><strong>Loopback между node'ами ноутбука не шейпится</strong>, так что измеряется путь телефона, а не ноутбука.</li>
+</ul>
+<p>Две вещи на ноутбуке могут молча всё сломать. Docker Desktop прячет контейнеры за NAT, поэтому ни один node, с которым говорит телефон, не работает в контейнере. Фаервол приложений macOS может отбрасывать входящий UDP к свежесобранному неподписанному <code>pdn-node-http</code>; шаг подключения громко падает, если телефон не достаёт до node'а, вместо того чтобы молча мерить relay или пустоту.</p>
+
+<h2>Прогон по шагам</h2>
+<p>Одна команда проводит весь сценарий и заканчивается вердиктом; ничто в ней не ждёт человека.</p>
+<pre><code>sync-test --writers 10 --entries 1000 --rate 10 --payload 256 --scenario partition</code></pre>
+<p>Цифры ниже — значения по умолчанию для основного прогона: 10 writer'ов, по 1,000 entry со скоростью 10 в секунду (100 секунд записи), payload 256 байт, 30-секундный обрыв посередине.</p>
+<ol>
+<li><strong>Предпроверка.</strong> Координатор убеждается, что телефон подключён (<code>xcrun devicectl list devices</code>), и записывает git-ревизию, профиль сборки и число ядер хоста.</li>
+<li><strong>Подъём.</strong> Свежие директории для всех node'ов ноутбука; 10 writer'ов и 2 контрольных стартуют из release-сборки.</li>
+<li><strong>Запуск agent'а.</strong> Координатор запускает тестовую сборку по кабелю (<code>xcrun devicectl device process launch</code>), передавая свой адрес и id прогона через окружение запуска; маленький нативный модуль отдаёт их в JavaScript, который сам окружение процесса не видит. Agent подключается обратно по HTTP, удаляет директорию хранилища своего node'а внутри контейнера приложения, поднимает свежий node и создаёт одну identity — чистое состояние без переустановки, которая снова спросила бы разрешение на локальную сеть. Agent сообщает Wi-Fi-адрес телефона.</li>
+<li><strong>Проверка сети.</strong> Координатор находит интерфейс в сторону телефона (<code>route get &lt;IP телефона&gt;</code>), ставит правила pf для UDP к этому адресу и от него без задержки и потерь, шлёт пробный UDP-пакет и прерывает прогон, если счётчики правил не выросли.</li>
+<li><strong>Замер часов.</strong> Координатор и agent обмениваются 20 пингами с метками времени и оставляют тот, у которого самый короткий круг; это повторяется каждые 30 секунд весь прогон.</li>
+<li><strong>Подключение и grant'ы.</strong> Каждый writer выпускает invite; agent его принимает, и это громко падает, если телефон не достаёт до node'а. Затем каждый writer публикует телефону один grant на свои 1,000 slot'ов <code>s/</code> и 16 slot'ов <code>h/</code>. <code>partial</code> подключается к <code>w1</code>, и тот даёт ему grant на чётные slot'ы; <code>outsider</code> получает ticket <code>w1</code> вручную. Координатор ждёт, пока каждый grant станет читаемым у своего grantee, чтобы трафик grant'ов закончился до начала замера.</li>
+<li><strong>Подписка.</strong> Координатор открывает <code>/debug/events</code> на каждом node'е ноутбука, а agent начинает пересылать события node'а телефона. С этого момента каждое прибытие entry и каждая завершённая sync-сессия записываются с меткой времени, поставленной там, где событие произошло.</li>
+<li><strong>Спокойная фаза (0–40 с).</strong> Каждый writer пишет следующую entry каждые 100 мс, а раз в 5 секунд — новую версию одного slot'а <code>h/</code>.</li>
+<li><strong>Обрыв (40–70 с).</strong> Координатор переключает правила pf на отбрасывание. Writer'ы продолжают писать. Ни одна сессия между телефоном и writer'ом не проходит; записанные сейчас entry копятся как <em>в пути</em>.</li>
+<li><strong>Восстановление (70–100 с).</strong> Правила снова пропускают трафик; запись продолжается до конца 1,000.</li>
+<li><strong>Затишье.</strong> Запись останавливается. Координатор ждёт, пока для каждого writer'а обе стороны не сообщат об успехе <em>зачётной сессии</em>, начавшейся после последней записи этого writer'а (определение — в разделе о классификации). Пара, у которой такой сессии нет в течение 5 × интервал reconcile телефона (25 секунд), <em>застряла</em>, и прогон не может пройти.</li>
+<li><strong>Итоговый список.</strong> Agent снимает список каждого namespace'а writer'ов на телефоне и выгружает его; контрольные node'ы перечисляются на ноутбуке. Оба используют список без подталкивания sync'а, так что сам список не запускает сессий. Локальный журнал agent'а забирается по кабелю (<code>xcrun devicectl device copy from</code>), чтобы отчёт о событии, не дошедший до координатора по HTTP, не был принят за пропавшую entry.</li>
+<li><strong>Вердикт.</strong> Каждая ожидаемая entry классифицируется для каждого reader'а, контрольные node'ы сверяются со своими ожидаемыми наборами, считаются метрики, в <code>runs.csv</code> добавляется строка, печатается вердикт: PASS, FAIL или INCONCLUSIVE.</li>
+</ol>
+<p><strong>Другие сценарии</strong> повторяют те же шаги и меняют только шаги 8–10:</p>
+<div class="table-wrap"><table>
+<tr><th>Сценарий</th><th>Что меняется</th><th>На какой вопрос отвечает</th></tr>
+<tr><td>steady</td><td>без обрыва</td><td>Базовые задержка и потери</td></tr>
+<tr><td>partition</td><td>как выше</td><td>Время догонки; ноль потерь через обрыв</td></tr>
+<tr><td>lossy</td><td>pf добавляет 50 мс задержки в одну сторону и 2% потерь на весь прогон</td><td>Поведение на плохой связи</td></tr>
+<tr><td>restart</td><td>координатор убивает и перезапускает приложение на 40-й секунде через <code>devicectl</code>; agent поднимает node на той же директории</td><td>Долговечное состояние и продолжение после перезапуска процесса</td></tr>
+<tr><td>fan-out</td><td>пишет телефон, читают node'ы ноутбука; время в журнале — по часам телефона</td><td>Нагрузка на отправляющую сторону</td></tr>
+<tr><td>same identity</td><td>node ноутбука и телефон — два устройства одной identity после linking; пишут оба</td><td>Репликация между устройствами одной identity, которая идёт через swarm; entry может прийти с любого устройства</td></tr>
+<tr><td>join under load</td><td>половина writer'ов подключается, когда остальные уже пишут; grant каждого writer'а читается обратно до его первой записи</td><td>Установление connection'а на занятом node'е</td></tr>
+<tr><td>withdraw</td><td>на 60-й секунде <code>w2</code> делает withdraw своего grant'а</td><td>Ни одна entry <code>w2</code>, записанная после withdraw, не приходит до того, как телефон отвяжет namespace; после этого телефон отказывает по <code>w2</code>, и этот отказ — ожидаемый исход, а не потеря</td></tr>
+</table></div>
+
+<h2>Данные теста и что записывается</h2>
+<p>Каждую запись можно наблюдать отдельно, каждое наблюдение несёт метку времени, поставленную там, где оно произошло, и ничто из того, чем тест наблюдает, не запускает sync.</p>
+<p><strong>Entry.</strong> Каждый writer пишет <code>s/000000001</code>, <code>s/000000002</code>, … по одному разу и никогда не переписывает slot, так что каждая entry — отдельная единица измерения; номера фиксированной ширины держат списки и логи в порядке записи. Запись заменяет только entry по своему ключу (<code>put</code> в <code>crates/pdn-store/src/ranger.rs</code>). Отдельный небольшой набор <code>h/000001..h/000016</code> переписывается с растущим номером версии. Для них ожидается только последняя версия: более ранние могут быть вытеснены раньше, чем их увидит хоть одна сессия, и не классифицируются.</p>
+<p><strong>Payload.</strong> Сам себя описывает и сам себя проверяет, дополняется до <code>--payload</code> байт:</p>
+<pre><code>{"run":"20260928-1412","writer":"w3","seq":417,"pad":"xxxx…","sha256":"9f2c…"}</code></pre>
+<p><code>sha256</code> покрывает остальные поля. Reader может доказать целость entry, не спрашивая writer'а, а payload из другого прогона, от другого writer'а или из другого slot'а сразу узнаётся.</p>
+<p><strong>Grant'ы заранее.</strong> Claim покрывает ровно один path (<code>covers_key</code> и <code>egress_filter</code> в <code>crates/data-layer/src/access.rs</code>), поэтому каждый slot, который использует прогон, выдаётся на шаге 6, до замера. Grant, переопубликованный во время прогона, добавил бы свой трафик в цифры по entry.</p>
+<p><strong>Журнал writer'а.</strong> По каждой entry — одна строка после ответа на вызов записи:</p>
+<div class="table-wrap"><table>
+<tr><th>Поле</th><th>Пример</th><th>Откуда</th></tr>
+<tr><td>writer, seq, path</td><td><code>w3</code>, 417, <code>s/000000417</code></td><td>координатор</td></tr>
+<tr><td><code>t_write</code></td><td>12:00:41.203</td><td>собственная метка времени entry, которую ставит node writer'а при вставке (<code>timestamp()</code> в <code>crates/pdn-store/src/sync.rs</code>), по часам writer'а</td></tr>
+<tr><td>sha256</td><td><code>9f2c…</code></td><td>координатор</td></tr>
+<tr><td>результат</td><td>ok / отказ + причина</td><td>вызов записи</td></tr>
+</table></div>
+<p><code>t_write</code> едет внутри entry, так что телефон видит то же значение, а собственный HTTP-круг координатора в неё не попадает. Отказанная запись нигде не ожидается и считается отдельной строкой отчёта: это сбой writer'а, а не потеря sync'а.</p>
+<p><strong>Журнал событий.</strong> Каждый node сообщает эти события из собственного потока движка sync (<code>LiveEvent</code> в <code>crates/pdn-store/src/engine.rs</code>), с меткой времени, поставленной в Rust там, где событие возникло:</p>
+<div class="table-wrap"><table>
+<tr><th>Событие</th><th>Поля</th><th>Зачем</th></tr>
+<tr><td><code>InsertRemote</code></td><td>node, namespace, path, метка entry, отправивший peer, статус содержимого, время</td><td>Прибытие entry</td></tr>
+<tr><td><code>ContentReady</code></td><td>node, хэш содержимого, время</td><td>Entry становится читаемой: свежий payload — отдельный blob, который скачивается после самой entry</td></tr>
+<tr><td><code>PendingContentReady</code></td><td>node, время</td><td>Скачивания, поставленные последним sync'ом, завершились или провалились</td></tr>
+<tr><td><code>SyncFinished</code></td><td>node, peer node, происхождение (позвонили мы или приняли звонок), начало, конец, ok или ошибка</td><td>Какие сессии были, когда и чем закончились</td></tr>
+<tr><td><code>Lagged</code></td><td>node, время</td><td>Поток движка выронил события: entry, о которых они сообщали, в replica есть, а сведения о сессиях и скачиваниях пропали</td></tr>
+</table></div>
+<p>Node'ы ноутбука отдают поток через новый debug-маршрут <code>/debug/events</code>; node телефона отдаёт его agent'у через facade тестовой сборки. Каждое звено — маршрут, facade → agent, agent → координатор — нумерует события, и дыра в нумерации трактуется как <code>Lagged</code>.</p>
+<p><strong>Наблюдение не запускает sync.</strong> И продуктовый <code>read</code>, и продуктовый <code>list</code> replica, полученной по grant'у, подталкивают sync (<code>nudge_scoped</code> в <code>crates/data-layer/src/node.rs</code>). Тест, опрашивающий телефон, мерил бы собственный опрос. Прогон наблюдает только через события. Итоговый список использует список без подталкивания, которого пока нет: <code>read_unnudged</code> есть только для тестов и читает один ключ, так что и facade тестовой сборки, и debug-маршрут должны получить такой список. Экраны приложения опрашивают; отдельный вариант <em>активный reader</em> опрашивает так же, как экран, и его строки так и помечены.</p>
+<p><strong>Замеры часов.</strong> Каждые 30 секунд координатор и agent обмениваются пингами с метками времени; замер с самым коротким кругом даёт смещение часов телефона и его погрешность — половину этого круга. Смещение используется только для задержки: классификация никогда не сравнивает часы двух устройств.</p>
+
+<h2>Классификация каждой entry</h2>
+<p>Отсутствующая entry становится сбоем только тогда, когда sync-сессия, которая обязана была её принести, успешно закончилась на обеих сторонах, а entry у reader'а так и нет. Одно лишь прошедшее время никогда не превращает «ещё нет» в «потеряно», и ни одно решение не сравнивает часы двух устройств.</p>
+<p><strong>Как entry на самом деле перемещаются.</strong> Gossip не несёт entry: локальная запись только объявляет «у этого автора есть новое», а entry ходят исключительно внутри сессии сверки (<code>on_replica_event</code> в <code>crates/pdn-store/src/engine/live.rs</code>; swarm не несёт содержимого). Replica, полученная по grant'у, в swarm не входит: её держатель по <em>проходу reconcile</em> — циклу, который каждый интервал заново звонит контактам каждой отслеживаемой replica, на телефоне раз в 5 секунд, — открывает сессию с каждым writer'ом (<code>reconcile_pass</code> и <code>SyncStrategy::ContactsOnly</code> в <code>crates/data-layer/src/node.rs</code>). Поэтому ожидание до одного интервала — норма.</p>
+<p>Writer'ы тоже звонят телефону: после одной успешной сессии writer запоминает телефон как peer'а, и его собственный проход ему звонит (<code>register_useful_peer</code> в <code>live.rs</code>). Такие сессии адресуются собственной identity writer'а, а не identity телефона, и должны либо проваливаться, либо ничего не нести. Правило их никогда не использует; они показываются отдельно в здоровье сессий.</p>
+<p><strong>Гарантия, на которой стоит правило.</strong> Сессия отдаёт представление replica writer'а, замороженное в момент подготовки сессии (<code>sync_session_start</code> в <code>crates/pdn-store/src/actor.rs</code>), а успешная сессия оставляет у reader'а всё из этого представления, что покрывает его grant. Первая половина описана в спеке; для второй нет теста, который изолирует одну сессию, — поэтому такой тест стоит шагом 0 в плане работ.</p>
+<p><strong>Почему обе стороны должны сообщить ok.</strong> Отчёта writer'а мало. Когда звонящая сторона ломается посреди обмена, она всё равно чисто закрывает поток (<code>connect_and_sync_inner</code> в <code>crates/pdn-store/src/net.rs</code>), а принимающая сторона читает этот конец как нормальное завершение (<code>run_rounds</code> в <code>crates/pdn-store/src/net/codec.rs</code>). Writer сообщает ok, а телефон — ошибку. Сессия, успешная только на одной стороне, правилом не используется; это отдельная находка — <em>расколотая сессия</em>.</p>
+<p><strong>Зачётная сессия</strong> для entry <em>e</em> writer'а <em>W</em> и reader'а <em>R</em> — это сессия, которую начал <em>R</em> и принял <em>W</em>, такая что:</p>
+<ol>
+<li><code>SyncFinished</code> на стороне <em>W</em> (звонок принят, peer <em>R</em>) — ok, и его <code>started</code> позже, чем <code>t_write</code> entry <em>e</em>; оба времени по часам <em>W</em>. <code>started</code> берётся до заморозки представления, значит, представление содержит <em>e</em>.</li>
+<li><code>SyncFinished</code> на стороне <em>R</em> для той же сессии (звонок наш, peer <em>W</em>) — ok. Проход никогда не начинает вторую сессию для пары, пока идёт первая, поэтому события двух сторон сопоставляются один к одному, по порядку.</li>
+</ol>
+<p>Тогда <em>e</em> обязана быть у <em>R</em> к моменту, когда закончилась сторона <em>R</em>: <code>InsertRemote</code> для <em>e</em> на <em>R</em> не позже этого <code>finished</code>, оба времени по часам <em>R</em>.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" role="img" aria-label="Отсутствующая entry в пути, пока сессия, начавшаяся после записи, не закончится успешно на обеих сторонах" font-size="13">
+<defs><marker id="cls-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrowhead"/></marker></defs>
+<text x="24" y="30" font-size="15" font-weight="600" class="ink">Нет entry — «в пути», пока поздняя сессия не пройдёт на обеих сторонах</text>
+<text x="24" y="50" font-size="11.5" class="quiet">entry s/000000417 от w3, reader — телефон · время w3 по часам ноутбука, телефона — по его часам · не в масштабе</text>
+<line x1="40" y1="150" x2="720" y2="150" class="line" marker-end="url(#cls-arrow)"/>
+<path d="M120 142l8 8l-8 8l-8 -8z" style="fill: var(--edge)"/>
+<text x="120" y="130" text-anchor="middle" class="ink">запись</text>
+<text x="120" y="180" text-anchor="middle" font-size="11.5" class="quiet">41.203</text>
+<rect x="60" y="88" width="110" height="14" rx="7" style="fill: var(--grid); stroke: var(--edge); stroke-width: 1"/>
+<text x="24" y="80" font-size="11.5" class="quiet">сессия началась раньше: ничего не доказывает</text>
+<rect x="360" y="143" width="130" height="14" rx="7" style="fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.25"/>
+<text x="425" y="130" text-anchor="middle" class="ink">зачётная сессия</text>
+<text x="410" y="180" text-anchor="middle" font-size="11.5" class="quiet">w3 принял: 43.900 → 44.050, ok</text>
+<text x="410" y="196" text-anchor="middle" font-size="11.5" class="quiet">началась после записи</text>
+<line x1="490" y1="110" x2="490" y2="162" style="stroke: var(--warn); stroke-width: 1.25" stroke-dasharray="4 4"/>
+<text x="498" y="104" font-size="11.5" class="quiet">сторона телефона ok: 44.185 по его часам</text>
+<line x1="128" y1="236" x2="486" y2="236" style="stroke: var(--accent); stroke-width: 2"/>
+<text x="307" y="256" text-anchor="middle" font-weight="600" class="ink">нет здесь = в пути (норма)</text>
+<text x="307" y="274" text-anchor="middle" font-size="11.5" class="quiet">grantee забирает данные на проходе reconcile, раз в 5 с</text>
+<line x1="494" y1="236" x2="712" y2="236" style="stroke: var(--warn); stroke-width: 2"/>
+<text x="603" y="256" text-anchor="middle" font-weight="600" class="ink">нет здесь = нарушение</text>
+<text x="603" y="274" text-anchor="middle" font-size="11.5" class="quiet">дефект, сколько ни жди</text>
+</svg>
+<figcaption>Одна entry, один reader: «в пути» против «нарушения».</figcaption>
+</figure>
+
+<p><strong>Разбор примера</strong>: entry <code>s/000000417</code> от <code>w3</code>, reader — телефон.</p>
+<ul>
+<li>41.203 по часам ноутбука — <code>w3</code> её пишет; это собственная метка времени entry.</li>
+<li>43.000 — на телефоне её нет, и ни одна сессия с <code>w3</code> после записи не начиналась. <strong>В пути.</strong> То, что у телефона уже есть 418 или 416, ни о чём не говорит: сверка не доставляет в порядке записи.</li>
+<li>Проход телефона звонит <code>w3</code>. <code>w3</code> сообщает, что принял сессию: начало 43.900, конец 44.050, ok (часы ноутбука) — она началась после записи, значит, её представление содержит 417. Телефон сообщает ту же сессию как ok, конец 44.185 по его часам. Сессия зачётная.</li>
+<li><code>InsertRemote</code> для 417 на телефоне — в 44.160 по его часам, раньше 44.185: <strong>доставлена в этой сессии</strong>. Blob её payload'а приходит следом, <code>ContentReady</code> в 44.240. Часы телефона спешат на 0.130 с (±0.004 с), так что по часам ноутбука entry стала читаемой в 44.110: задержка 2.907 с ±0.004 с.</li>
+<li>Если бы <code>InsertRemote</code> для 417 не было к 44.185 по часам телефона: <strong>нарушение</strong>. Если она придёт в более поздней сессии, она дополнительно считается <em>опоздавшей после нарушения</em>; если никогда — <strong>потеряна</strong>. В любом случае это дефект, и отчёт называет сессию, которая должна была её принести.</li>
+<li>Если бы <code>w3</code> сообщил ok, а телефон — ошибку: это не нарушение, а <strong>расколотая сессия</strong>, и 417 остаётся в пути до следующей.</li>
+</ul>
+<p>Сессия, начавшаяся <em>до</em> записи (серая полоса), ничего не доказывает, как бы поздно она ни закончилась: в момент заморозки представления entry у writer'а могло ещё не быть.</p>
+<p><strong>Все состояния</strong> — для каждой пары «ожидаемая entry, reader»:</p>
+<div class="table-wrap"><table>
+<tr><th>Состояние</th><th>Условие</th><th>Что значит</th></tr>
+<tr><td>доставлена (readable)</td><td>entry есть, хэш payload'а совпадает с журналом, содержимое доступно</td><td>Доставлено; считается задержка</td></tr>
+<tr><td>ждёт содержимого (content pending)</td><td>entry есть, payload ещё не скачан</td><td>Норма: неудачное скачивание повторяется следующей успешной сессией (<code>missing_hashes</code> в <code>live.rs</code>); решается только в итоговом списке</td></tr>
+<tr><td>в пути (in flight)</td><td>entry нет, зачётной сессии ещё не было</td><td>Норма; показывается возраст</td></tr>
+<tr><td>нарушение (violated)</td><td>entry нет к моменту, когда закончилась сторона <em>R</em> зачётной сессии</td><td>Дефект: сессия доставила меньше своего представления</td></tr>
+<tr><td>потеряна (lost)</td><td>нечитаема в итоговом списке, хотя зачётная сессия была</td><td>Дефект: окончательная потеря</td></tr>
+<tr><td>содержимое потеряно (content lost)</td><td>в итоговом списке entry есть, а payload'а нет</td><td>Дефект: payload так и не скачан</td></tr>
+<tr><td>застряло (stalled)</td><td>у пары writer–reader нет зачётной сессии после последней записи writer'а в течение 5 × интервал reconcile reader'а; все отсутствующие entry пары перечисляются под ней</td><td>Потеря не доказана и не исключена: прогон INCONCLUSIVE</td></tr>
+<tr><td>не определено (undetermined)</td><td>события reader'а или writer'а на нужном отрезке потеряны (<code>Lagged</code> или дыра в нумерации на звене)</td><td>Нарушение без доказательств не заявляется; итоговый список всё равно решает, доставлена entry или потеряна</td></tr>
+</table></div>
+<p>Находки, которые не относятся к отдельной entry:</p>
+<div class="table-wrap"><table>
+<tr><th>Находка</th><th>Условие</th><th>Что значит</th></tr>
+<tr><td>расколотая сессия (split session)</td><td>одна сторона сообщает ok, другая — ошибку</td><td>Дефект в отчётах о сессиях, см. выше</td></tr>
+<tr><td>испорчена (corrupt)</td><td>хэш payload'а entry не совпадает</td><td>Дефект: целостность</td></tr>
+<tr><td>лишнее (extra)</td><td>у контрольного node'а entry вне его ожидаемого набора или у любого reader'а payload, которого нет ни в одном журнале</td><td>Дефект: контроль доступа</td></tr>
+<tr><td>устарело (stale)</td><td>slot <code>h/</code> в итоговом списке хранит версию старше последней из журнала</td><td>Дефект: сходимость «побеждает последняя»</td></tr>
+</table></div>
+<p>Для контрольных node'ов ожидаемый набор задан явно: у <code>outsider</code> не должно быть ни одной entry <code>w1</code>, у <code>partial</code> — ровно чётные slot'ы. Оба читаются на ноутбуке.</p>
+<p><code>SyncFinished</code> называет node peer'а, а не его identity. В основном прогоне на каждом node'е одна identity, так что node однозначно определяет собеседника; вариантам с несколькими identity на node'е или со связанными через linking устройствами сначала нужна identity в событии.</p>
+
+<h2>Метрики и как считается каждая</h2>
+<p>Каждая цифра отчёта считается только из трёх источников: журналы writer'ов, журналы событий и итоговые списки. Задержка — это измерение; условием прохождения она становится только после того, как для сценария согласован порог.</p>
+<p><strong>Вердикт.</strong></p>
+<ul>
+<li><strong>FAIL</strong> — любой дефект: нарушение, потеря, потеря содержимого, расколотая сессия, порча, лишнее, устаревшее.</li>
+<li><strong>INCONCLUSIVE</strong> — дефектов нет, но есть хотя бы одна застрявшая пара или неопределённых пар больше 1% ожидаемых: прогон не смог показать, потеряно ли что-нибудь.</li>
+<li><strong>PASS</strong> — ни того, ни другого.</li>
+</ul>
+<p><strong>Счётчики.</strong> <em>Ожидаемая пара</em> — это entry и reader, до которого она обязана дойти: каждая entry <code>s/</code>, запись которой вернула ok, и последняя версия каждого slot'а <code>h/</code>, умноженные на всех reader'ов, чей grant их покрывает.</p>
+<div class="table-wrap"><table>
+<tr><th>Метрика</th><th>Как считается</th><th>О чём говорит</th></tr>
+<tr><td>expected</td><td>число ожидаемых пар</td><td>Знаменатель для всего ниже</td></tr>
+<tr><td>readable</td><td>ожидаемые пары, читаемые в итоговом списке</td><td>Доставлено</td></tr>
+<tr><td>violated</td><td>ожидаемые пары без entry к концу стороны reader'а в зачётной сессии</td><td>Сбои гарантии, включая исправленные позже</td></tr>
+<tr><td>late after violation</td><td>нарушенные пары, читаемые в итоговом списке</td><td>Исправлено более поздней сессией: всё равно дефект</td></tr>
+<tr><td>lost</td><td>ожидаемые пары, нечитаемые в итоговом списке, у которых была зачётная сессия</td><td>Окончательные потери</td></tr>
+<tr><td>content lost</td><td>entry есть в итоговом списке, payload'а нет</td><td>Payload'ы, которые так и не скачались</td></tr>
+<tr><td>download retries</td><td>скачивания payload'ов, которые сначала провалились, а потом прошли</td><td>Временные сбои; не дефект, особенно показательно в сценарии lossy</td></tr>
+<tr><td>stalled pairs</td><td>пары writer–reader без зачётной сессии после последней записи writer'а в течение 5 × интервал reconcile reader'а, вместе с их отсутствующими entry</td><td>Сбой связи или сессий; делает прогон INCONCLUSIVE</td></tr>
+<tr><td>split sessions</td><td>сессии, успешные на одной стороне и с ошибкой на другой</td><td>Неверные отчёты о сессиях</td></tr>
+<tr><td>corrupt</td><td>entry с несовпадающим хэшем payload'а</td><td>Целостность</td></tr>
+<tr><td>extra</td><td>entry у контрольного node'а вне его набора или payload'ы, которых нет ни в одном журнале</td><td>Контроль доступа</td></tr>
+<tr><td>stale</td><td>slot'ы <code>h/</code> с версией старше последней из журнала</td><td>Сходимость «побеждает последняя»</td></tr>
+<tr><td>undetermined</td><td>ожидаемые пары, у которых на нужном отрезке потеряны события reader'а или writer'а</td><td>Насколько проверка нарушений ослепла</td></tr>
+<tr><td>refused writes</td><td>строки журнала с отказом</td><td>Сбои writer'ов, а не sync'а</td></tr>
+</table></div>
+<p><strong>Задержка</strong> — для каждой доставленной пары, в секундах:</p>
+<p class="formula">задержка = t_readable(R) − offset(R) − t_write(W)</p>
+<p><code>t_write</code> — собственная метка времени entry. <code>t_readable</code> — время <code>ContentReady</code> для хэша payload'а по часам reader'а, или время <code>InsertRemote</code> в редком случае, когда содержимое уже было. <code>offset</code> — часы reader'а минус часы ноутбука по ближайшему замеру, 0 для reader'а на ноутбуке; каждое значение несёт погрешность этого замера.</p>
+<ul>
+<li>Показывается как p50, p90, p99 и максимум (перцентили по ближайшему рангу) отдельно для каждой фазы (спокойная, обрыв, восстановление) и для каждого reader'а: смешение фаз дало бы 30 секундам обрыва задавить хвост и спрятать установившееся значение.</li>
+<li>У пар, доставленных только по итоговому списку (их события потеряны), задержки нет; они считаются, а не угадываются.</li>
+<li>Форма распределения в спокойной фазе примерно известна заранее: ожидание следующего прохода reader'а (интервал плюс время самого прохода, дольше, если предыдущая сессия пары ещё идёт и проход её пропускает), затем сессия, затем скачивание blob'а. p50 в несколько секунд при интервале 5 секунд — это дизайн, а не медлительность. Открытое изменение <code>reconcile-trigger</code> в <code>mia-docs</code> заменило бы эту форму целиком.</li>
+<li><strong>Проверка часов.</strong> Исправленное время прибытия обязано лежать между <code>t_write</code> entry и <code>finished</code> стороны writer'а в сессии, которая её принесла (оба по часам ноутбука), с запасом на погрешность. Прибытие вне этого окна в любую сторону означает, что смещение неверно, и задержки телефона в этом прогоне помечаются недействительными. Классификация от этого не меняется: она смещения не использует.</li>
+</ul>
+<p><strong>Восстановление</strong> — для сценария с обрывом:</p>
+<ul>
+<li><em>время до первой сессии</em> = первая зачётная сессия между телефоном и любым writer'ом после того, как правила pf снова пропускают трафик, минус этот момент;</li>
+<li><em>время догонки</em> = последнее <code>t_readable</code> среди entry, записанных во время обрыва, минус этот момент;</li>
+<li><em>время схождения</em> = последнее <code>t_readable</code> прогона минус последнее <code>t_write</code>.</li>
+</ul>
+<p>Сессия, шедшая в момент обрыва, может держать свою пару, пока транспорт не сдастся — таймаут простоя QUIC или <code>SYNC_SESSION_TIMEOUT</code> в 300 секунд в <code>crates/pdn-store/src/net.rs</code>, — и всё это время проход пропускает пару. Такие сессии перечисляются рядом со временем восстановления: время задают они, а не сеть.</p>
+<p><strong>Здоровье сессий</strong> — по каждой паре writer–reader и по происхождению (звонил телефон, звонил writer): успешные, проваленные и расколотые сессии, тексты ошибок и промежутки между успешными сессиями. Медианный промежуток намного больше интервала reconcile значит, что проход работает не так, как настроен, и это объясняет задержку раньше, чем кто-то обвинит сеть.</p>
+<p><strong>Годность прогона</strong> — записывается в ту же строку и печатается первой:</p>
+<div class="table-wrap"><table>
+<tr><th>Проверка</th><th>Правило</th><th>Что, если не выполнено</th></tr>
+<tr><td>CPU хоста</td><td>пик %CPU процессов node'ов ниже 90% ядер</td><td>Задержка помечается как предел хоста; счётчики остаются в силе</td></tr>
+<tr><td>потеря событий</td><td>неопределённых пар меньше 1% ожидаемых</td><td>Прогон INCONCLUSIVE</td></tr>
+<tr><td>часы</td><td>полукруг каждого замера меньше 20 мс, и каждое прибытие внутри окна проверки часов</td><td>Задержки телефона недействительны</td></tr>
+<tr><td>путь</td><td>все connection'ы телефона прямые, ни одного через relay (<code>/debug/paths</code>)</td><td>Прогон относится к другому сетевому варианту</td></tr>
+<tr><td>шейпер</td><td>счётчики pf выросли на пробный UDP-пакет</td><td>Прогон прерывается до старта</td></tr>
+<tr><td>передний план</td><td>приложение ни разу не уходило с переднего плана</td><td>Прогон недействителен</td></tr>
+</table></div>
+<p>Ни одна из этих проверок не превращает дефект в успех: перегруженный ноутбук может замедлить sync, но не даёт платформе права терять entry.</p>
+
+<h2>Почему цифрам можно доверять</h2>
+<p>Причин две: каждый известный способ, которым тест sync'а врёт, закрыт конструкцией, и сам тест прогоняется на заложенных дефектах и обязан назвать каждый именно тем, что он есть.</p>
+<p><strong>Как тест sync'а может врать и как это закрыто.</strong></p>
+<div class="table-wrap"><table>
+<tr><th>Угроза</th><th>Что пошло бы не так</th><th>Как закрыто</th></tr>
+<tr><td>Потерю решает таймер</td><td>Медленная entry за пределом бюджета выглядит потерянной, а бюджет, поднятый, чтобы это скрыть, скрывает и настоящие потери</td><td>Потерю решает зачётная сессия, а не прошедшее время</td></tr>
+<tr><td>Решает слово одной стороны</td><td>Writer сообщает ok о сессии, которую reader провалил</td><td>Обе стороны должны сообщить ok; расхождение — расколотая сессия</td></tr>
+<tr><td>Сессии, которые ничего не доказывают</td><td>Сессии по звонку writer'а адресованы не той identity и ничего не несут</td><td>Зачётны только сессии, начатые reader'ом и принятые writer'ом</td></tr>
+<tr><td>Наблюдатель запускает sync</td><td>Каждый продуктовый read и list подталкивает sync, и опрос укорачивает измеряемую задержку</td><td>Во время прогона — только события; в конце один список без подталкивания; опрашивающий reader — отдельный помеченный вариант</td></tr>
+<tr><td>Проверяется только то, что есть</td><td>Сверка того, что есть у reader'а, с writer'ом не замечает ничего, чего у reader'а нет</td><td>Ожидаемые пары берутся из журналов и grant'ов; классифицируется каждая</td></tr>
+<tr><td>Часы расходятся</td><td>Часы телефона и ноутбука расходятся на секунды</td><td>Порядок относительно записи — по часам writer'а, присутствие — по часам reader'а; межустройственное смещение входит только в задержку и проверяется в обе стороны</td></tr>
+<tr><td>Потерянные события</td><td>Поток движка или звено пересылки роняет события</td><td><code>Lagged</code> и дыры в нумерации на каждом звене, у writer'а и у reader'а, делают пары неопределёнными, но не нарушенными</td></tr>
+<tr><td>Потерянные отчёты</td><td>HTTP-отчёт agent'а о прибытии теряется</td><td>Локальный журнал agent'а забирается по кабелю и служит источником для вердикта</td></tr>
+<tr><td>Вытесненные версии</td><td>Промежуточные версии <code>h/</code> считаются потерянными</td><td>Для slot'а <code>h/</code> ожидается только последняя версия</td></tr>
+<tr><td>Трафик grant'ов в цифрах по entry</td><td>Переопубликация grant'а во время прогона</td><td>Все slot'ы выданы до замера; grant'ы читаются обратно до первой записи</td></tr>
+<tr><td>Неверный ожидаемый набор</td><td>Отказанная запись считается потерянной</td><td>Ожидаются только записи, вернувшие ok</td></tr>
+<tr><td>Пустой контроль</td><td>Участник без ticket'а никуда не звонит и тривиально ничего не получает</td><td>У <code>outsider</code> есть ticket, но нет grant'а</td></tr>
+<tr><td>Шейпер ничего не делает</td><td>Прогон «плохой сети» на идеальной сети</td><td>Счётчики pf должны вырасти на пробный UDP-пакет, иначе прогон прерывается</td></tr>
+<tr><td>Скрытый relay или закрытый порт</td><td>Цифра «прямого пути» измерена через relay, или фаервол прячет node</td><td>Путь записывается по каждому connection'у; шаг подключения громко падает, если node недоступен</td></tr>
+<tr><td>Перегрузка хоста</td><td>Задержку задаёт ноутбук, а не платформа</td><td>CPU записывается; выше 90% задержка помечается как предел хоста</td></tr>
+<tr><td>Телефон засыпает</td><td>В фоне iOS останавливает node</td><td>Автоблокировка выключена; agent сообщает о каждой смене состояния приложения; прогон, где приложение уходило с переднего плана, недействителен</td></tr>
+<tr><td>Остатки прошлого прогона</td><td>Тёплая директория уже хранит namespace'ы прошлого прогона</td><td>Свежие директории на ноутбуке; agent удаляет директорию node'а телефона перед подъёмом</td></tr>
+<tr><td>Тестовая сборка отличается от продукта</td><td>Измеряется код, которого нет в продукте</td><td>Agent вызывает тот же facade, что и экраны; сборка добавляет только экран agent'а, канал управления, поток событий и список без подталкивания; release-конфигурация</td></tr>
+</table></div>
+<p><strong>Сам тест проверяется.</strong> Прежде чем его цифры начнут что-то значить, обвязка прогоняется на специально заложенных дефектах, с node'ом ноутбука вместо телефона. Каждый дефект должен дать ровно указанный отчёт; обвязка, которая покажет PASS на любом из них, сломана.</p>
+<div class="table-wrap"><table>
+<tr><th>Заложенный дефект</th><th>Ожидаемый отчёт</th></tr>
+<tr><td>Журнал содержит <code>s/000000500</code> от <code>w2</code>, но она не записывалась</td><td>нарушение, затем потеря; FAIL; все остальные пары доставлены</td></tr>
+<tr><td><code>w3</code> пишет один payload с неверным sha256</td><td>ровно одна испорченная; FAIL</td></tr>
+<tr><td><code>w1</code> выдаёт <code>partial</code> slot 7 (нечётный), а ожидаемый набор — только чётные</td><td>ровно одно лишнее; FAIL</td></tr>
+<tr><td>Сторона reader'а в одной сессии проваливается через тестовый хук</td><td>ровно одна расколотая сессия; entry остаются в пути и приходят со следующей сессией; FAIL</td></tr>
+<tr><td>Обрыв не снимается</td><td>пары телефона застряли, нарушений нет, потерь нет; INCONCLUSIVE</td></tr>
+<tr><td>Смещение часов сдвинуто на +2 с, затем на −2 с</td><td>часы недействительны в обоих прогонах; счётчики не меняются</td></tr>
+<tr><td>Интервал reconcile reader'а поднят до 30 с</td><td>дольше в пути, ноль нарушений, ноль застрявших; PASS</td></tr>
+<tr><td>Звено пересылки роняет диапазон событий</td><td>неопределённые пары, ни одного нарушения на их основе</td></tr>
+</table></div>
+<p>Для этого набора ноутбуку не хватает двух вещей: настройки интервала reconcile у <code>pdn-node-http</code>, где сейчас стоит 10-секундное значение runtime'а по умолчанию, и — в Linux-конвейере, где pf нет, — другого способа отрезать node: остановить процесс reader'а или nftables внутри контейнера. Это повторяет правило репозитория: тест, переведённый на продуктовый путь, обязан падать при намеренно сломанном механизме (<code>product-path-arrangement.md</code>).</p>
+<p><strong>Что статистически доказывает чистый прогон.</strong> Ноль потерь в <em>n</em> независимых испытаниях ограничивает долю потерь сверху величиной 3/<em>n</em> с доверием 95% (правило трёх, <code>flaky-tests.md</code>). Entry не независимы: сломанная сессия обычно теряет много сразу. Поэтому отчёт даёт две границы. По сессиям — честная: в основном прогоне около 130 зачётных сессий (10 writer'ов, примерно по одной в 5 секунд за 70 секунд, пока сеть есть), так что чистый прогон ограничивает долю теряющих сессий величиной 3 из 130. По entry — 10,160 пар, но это верно, только если потери независимы. Большую уверенность дают дополнительные прогоны, а не более длинный отчёт.</p>
+<p><strong>Каждый найденный дефект воспроизводим.</strong> Отчёт называет writer'а, reader'а, seq, <code>t_write</code>, обе стороны сессии, которая должна была принести entry, и директорию логов. Этого достаточно, чтобы воспроизвести случай сценарным тестом в workspace, где его исправляют и закрепляют, как требует <code>flaky-tests.md</code>.</p>
+
+<h2>Что проверить заранее и порядок работ</h2>
+<p>Дизайн опирается на свойства кода и инструментов, которые прочитаны, но ещё не испытаны; каждое подтверждается первым, и неподтвердившееся меняет дизайн раньше, чем на нём что-то построят.</p>
+<p><strong>Подтвердить или построить в коде:</strong></p>
+<ul class="check">
+<li>Одна успешная scoped-сессия оставляет у grantee все покрытые entry из отданного ею представления — утверждение, на котором стоит классификация. Сегодня его не изолирует ни один тест: <code>crates/data-layer/tests/read_restriction.rs</code> опрашивает <code>read</code>, который подталкивает sync, так что доказывает итоговую сходимость, а не одну сессию.</li>
+<li>Replica применяет вставку вместе с меткой времени до того, как открывает представление любой сессии: метка ставится внутри вставки (<code>Record::new_current</code> в <code>crates/pdn-store/src/sync.rs</code>), а <code>started</code> предшествует представлению. Если бы сессия могла заморозить представление между меткой entry и её вставкой, сессия, начатая после <code>t_write</code>, могла бы её не содержать без всякого дефекта.</li>
+<li>Звонящая сторона при сбое обмена шлёт <code>Abort</code>, а не закрывает поток чисто. Без этого writer сообщает ok о сессии, которую reader провалил; host может вызвать это через публичную поверхность, так что это исправление, а не заметка.</li>
+<li>Что на самом деле делают сессии по звонку writer'а к grantee: проваливаются или проходят пустыми. Правило исключает их в любом случае; здоровью сессий нужно знать, что именно.</li>
+<li>Node с <code>Connectivity::Direct</code> кладёт в invite свой адрес в LAN, и node телефона с <code>for_product</code> звонит ему напрямую. Этот путь ещё ничем не испытан.</li>
+<li>Подписка на события namespace'а данных из <code>pdn-node</code>, маршрут <code>/debug/events</code> и тот же поток в facade: сегодня ничего этого нет.</li>
+<li>Список без подталкивания — в тестовой сборке facade и в debug-маршрутах.</li>
+<li>Настройка интервала reconcile у <code>pdn-node-http</code>.</li>
+<li>Grant на 1,016 claim'ов влезает в предел payload'а entry и публикуется за разумное время.</li>
+<li>iroh сообщает по каждому удалённому node'у, прямое connection или через relay, — для <code>/debug/paths</code>.</li>
+</ul>
+<p><strong>Подтвердить в инструментах:</strong></p>
+<ul class="check">
+<li><code>xcrun devicectl device process launch</code> передаёт переменные окружения, нативный модуль отдаёт их в JavaScript, а <code>xcrun devicectl device copy from</code> читает контейнер данных приложения.</li>
+<li>Доступ к локальной сети переживает перезапуск приложения и удаление директории node'а; заново спрашивает только переустановка.</li>
+<li>Правила pf для IP телефона на интерфейсе, который назвал <code>route get</code>, отбрасывают его UDP в обе стороны и пропускают TCP, а их счётчики это показывают.</li>
+<li>Фаервол приложений macOS пропускает входящий UDP к свежесобранному <code>pdn-node-http</code>, или ему это разрешено.</li>
+</ul>
+<p><strong>Порядок работ.</strong> Каждый шаг полезен сам по себе, а телефон появляется последним — на методике, уже доказанной на ноутбуке.</p>
+<ol start="0">
+<li><strong>Тест одной сессии</strong> в workspace: покрытые и непокрытые entry, ровно одна scoped-сессия, у grantee все покрытые entry и ни одной непокрытой. Ничего из дальнейшего не строится, пока он не проходит.</li>
+<li><strong>Разведка сети, примерно полдня:</strong> прямой путь, правила pf и фаервол — руками.</li>
+<li><strong><code>pdn-node-http</code>:</strong> <code>/debug/events</code> с нумерацией событий, <code>/debug/paths</code>, список без подталкивания, настройка интервала reconcile.</li>
+<li><strong>Координатор и набор заложенных дефектов, только ноутбук.</strong> Все строки таблицы заложенных дефектов проходят до шага 4.</li>
+<li><strong>OpenSpec-изменение в <code>mobile-common</code>:</strong> тестовая сборка, agent, его канал управления, поток событий и список без подталкивания в facade. README приложения утверждает, что оно не говорит по HTTP ни с чем, а его поведение описано в <code>mobile-common</code>, поэтому сначала спека, потом код.</li>
+<li><strong>Agent в <code>pdn-app</code></strong>, затем на телефоне — сценарии steady и partition.</li>
+<li><strong>Остальные сценарии</strong>, затем сетевые варианты: роутер со своим шейпером, LTE с relay, второй телефон.</li>
+</ol>
+<p>Координатор — скрипт на Python только со стандартной библиотекой, запускается как <code>python3 -I</code>, как требуют правила репозитория для скриптов. Живёт в <code>pdn-app/sync-test/</code>, потому что разворачивает именно это приложение.</p>
+</main>
+</body>
+</html>

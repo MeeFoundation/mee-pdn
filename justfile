@@ -75,6 +75,16 @@ observation_image := "pdn-node-http:observation"
 build-observation-image:
   @sh scripts/build-image.sh {{ observation_image }} observation
 
+# The pod load test, sync-test/load.md ("One command"): test L on the laptop,
+# or in the runner image with --container as CI does. Runs land in tmp/load,
+# or in sync-test/runs with --container, as <run>-ramp-plain. Test P, with
+# the phone as r, is pdn-app's `just load`.
+[doc("Collect a full report's data for test L: the ramp with its catch-ups (--container: in the runner image)")]
+[arg("container", long="container", value="true")]
+[arg("run", long="run")]
+load container="false" run="":
+  @sh sync-test/full.sh plain "{{ container }}" "{{ run }}"
+
 # What the build context actually carries, listed against the allowed set in
 # .dockerignore. The criterion is presence — anything outside that set is a
 # leak whatever it weighs; the sizes say which leak is expensive.
