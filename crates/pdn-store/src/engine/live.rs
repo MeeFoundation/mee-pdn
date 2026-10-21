@@ -636,6 +636,7 @@ impl LiveActor {
                 Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
                     trace!(?i, "tick: pending_downloads");
                     let (provider, hash, outcome) = res.context("pending_downloads closed")?;
+                    DIAG_PHASES[4].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     self.on_fetch_finished(provider, hash, outcome).await;
                 }
                 msg = self.inbox.recv() => {
@@ -1251,9 +1252,11 @@ impl LiveActor {
     /// What the fetches stand at, and the payloads parked.
     fn fetches_report(&self) -> String {
         format!(
-            "{}; {} parked",
+            "{}; {} parked; {}; download_tasks {}",
             self.fetches.report(),
-            self.missing_hashes.len()
+            self.missing_hashes.len(),
+            diag_phases(),
+            self.download_tasks.len()
         )
     }
 
@@ -1842,6 +1845,7 @@ impl LiveActor {
             let blobs = self.bao_store.clone();
             self.download_tasks.spawn(async move {
                 let outcome = fetch(pool, blobs, provider, hash).await;
+                DIAG_PHASES[4].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 (provider, hash, outcome)
             });
         }
@@ -2260,12 +2264,47 @@ impl QueuedHashes {
     }
 }
 
+/// DIAG: fetch tasks currently inside each phase: local, connect, open, progress, finished-not-taken.
+pub(crate) static DIAG_PHASES: [std::sync::atomic::AtomicUsize; 5] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+#[derive(Debug)]
+struct DiagPhase(usize);
+impl DiagPhase {
+    fn enter(i: usize) -> Self {
+        DIAG_PHASES[i].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(i)
+    }
+}
+impl Drop for DiagPhase {
+    fn drop(&mut self) {
+        DIAG_PHASES[self.0].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn diag_phases() -> String {
+    let v: Vec<usize> = DIAG_PHASES
+        .iter()
+        .map(|a| a.load(std::sync::atomic::Ordering::SeqCst))
+        .collect();
+    format!(
+        "DIAG phases local {} connect {} open {} progress {} done-untaken {}",
+        v[0], v[1], v[2], v[3], v[4]
+    )
+}
+
 /// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
 /// [`NO_PROGRESS`] with nothing: the request's stream lives in this future,
 /// so dropping it frees the stream (iroh-blobs-006).
 async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Hash) -> Outcome {
     let content = HashAndFormat::raw(hash);
-    match blobs.remote().local(content).await {
+    let phase = DiagPhase::enter(0);
+    let local = blobs.remote().local(content).await;
+    drop(phase);
+    match local {
         Ok(local) if local.is_complete() => return Outcome::Held,
         Ok(_) => {}
         Err(err) => {
@@ -2273,15 +2312,17 @@ async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Ha
             return Outcome::LocalFailure;
         }
     }
-    let connection =
-        match n0_future::time::timeout(NO_PROGRESS, pool.get_or_connect(provider)).await {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(err)) => {
-                debug!(provider = %provider.fmt_short(), "no connection for a fetch: {err:#}");
-                return Outcome::ConnectFailed;
-            }
-            Err(_elapsed) => return Outcome::Stalled,
-        };
+    let phase = DiagPhase::enter(1);
+    let connected = n0_future::time::timeout(NO_PROGRESS, pool.get_or_connect(provider)).await;
+    drop(phase);
+    let connection = match connected {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(err)) => {
+            debug!(provider = %provider.fmt_short(), "no connection for a fetch: {err:#}");
+            return Outcome::ConnectFailed;
+        }
+        Err(_elapsed) => return Outcome::Stalled,
+    };
     fetch_over(&connection, &blobs, hash).await
 }
 
@@ -2290,7 +2331,10 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
     let provider = connection.remote_id();
     // Opened here: `fetch` reports a stream that fails to open as a failure of
     // the local store (iroh-blobs-007).
-    let pair = match n0_future::time::timeout(NO_PROGRESS, connection.open_bi()).await {
+    let phase = DiagPhase::enter(2);
+    let opened = n0_future::time::timeout(NO_PROGRESS, connection.open_bi()).await;
+    drop(phase);
+    let pair = match opened {
         Ok(Ok((send, recv))) => iroh_blobs::get::StreamPair::new(
             u64::try_from(connection.stable_id()).unwrap_or_default(),
             recv,
@@ -2307,6 +2351,7 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
         .fetch(pair, HashAndFormat::raw(hash))
         .stream();
     tokio::pin!(progress);
+    let _phase = DiagPhase::enter(3);
     loop {
         match n0_future::time::timeout(NO_PROGRESS, progress.next()).await {
             Err(_elapsed) => return Outcome::Stalled,

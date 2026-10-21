@@ -749,6 +749,10 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 /// `a_catch_up_keeps_the_limit_toward_its_provider`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("pdn_store::engine::live=debug,pdn_store::engine=info,pdn_store::net=info")
+        .with_test_writer()
+        .try_init();
     const ENTRIES: usize = 2_000;
     const LIMIT: u32 = 10;
     let mut rng = test_rng(b"a_provider_registered_during_a_catch_up_takes_waiting_payloads");
@@ -765,7 +769,7 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     })
     .await?;
     let joining = loopback_node(&mut rng, |node| node.fetches_per_provider(LIMIT)).await?;
-    let (doc, _hashes) = records_with_payloads(&first, ENTRIES).await?;
+    let (doc, diag_hashes) = records_with_payloads(&first, ENTRIES).await?;
     let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
     let (_doc_second, events_second) =
         util::import_and_subscribe(second.docs(), ticket.clone()).await?;
@@ -808,9 +812,20 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     })
     .await;
     let fetches = joining.engine().fetches_report().await?;
+    let syncs = joining
+        .engine()
+        .syncs_in_flight_report(vec![doc_joining.id()])
+        .await?;
+    let mut held = 0usize;
+    for hash in &diag_hashes {
+        if joining.blobs().has(*hash).await? {
+            held += 1;
+        }
+    }
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}; DIAG syncs: {syncs}; DIAG joining blobs held {held}; DIAG first open {} second open {}; first most {} second most {}",
+        first_serving.open(), second_serving.open(), first_serving.most_open(), second_serving.most_open()
     );
     assert!(
         open_counts
