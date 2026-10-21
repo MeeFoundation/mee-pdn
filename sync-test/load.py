@@ -58,6 +58,8 @@ LONG_IDLE_EXTRA_S = 30
 DEFAULT_POD_INTERVAL_S = 300
 STEADY_S, STEADY_RATE, DRAIN_S = 60, 10, 60
 CATCHUP_MIN_S, CATCHUP_RECORDS_PER_S = 120, 100
+# After a lost event the joiner's listing is read this often: the catch-up's end is then late by up to this much.
+CATCHUP_LISTING_EVERY_S = 1
 # --grid: a fresh pod per (N, V) and short windows, to map where sync stays stable; no idle verdicts.
 GRID_FILL_STALL_S = 60
 FILL_MIN_S, FILL_RECORDS_PER_S = 300, 20
@@ -274,6 +276,8 @@ def predicted_passes(start, interval, t0, t1):
 
 
 def selfcheck():
+    assert listed_complete([{'present': True}] * 3, 3), 'every record held with its payload'
+    assert not listed_complete([{'present': True}, {'present': False}, {'present': True}], 3), 'a payload missing'
     assert cputime_s('0:01.50') == 1.5 and cputime_s('1:02:03.00') == 3723 and cputime_s('1-00:00:01.00') == 86_401
     assert percentiles([]) == (None, None, None) and percentiles([2.0]) == (2.0, 2.0, 2.0)
     assert percentiles([float(i) for i in range(101)])[:2] == (50.0, 90.0)
@@ -1079,14 +1083,27 @@ def catchup(run, pod, cell):
     stream = r.open_stream(pod.pod, True, join_invite=invite)
     pod.streams.append(stream)
     deadline = t0 + max(CATCHUP_MIN_S, held / CATCHUP_RECORDS_PER_S)
+    listed_us, next_listing = None, t0
     while time.monotonic() < deadline:
         if stream.answered.is_set() and (len(stream.ready) >= held or stream.ended):
             break
+        # A lost event leaves the count short for good, so the joiner's own listing says what it holds
+        # (the `Lagged` contract of the store's change subscription).
+        if stream.gaps and stream.answered.is_set() and time.monotonic() >= next_listing:
+            next_listing = time.monotonic() + CATCHUP_LISTING_EVERY_S
+            try:
+                complete = listed_complete(bare_listing(r, pod.pod), held)
+            except (RuntimeError, NodeDown):
+                complete = False
+            if complete:
+                listed_us = now_us()
+                break
         time.sleep(0.2)
     t1 = time.monotonic()
-    done = stream.status == 200 and len(stream.ready) >= held
+    done = stream.status == 200 and (len(stream.ready) >= held or listed_us is not None)
     rec = cell['catchup']
-    rec.update(answered=stream.status, error=stream.error, ready=len(stream.ready), lagged=stream.gaps)
+    rec.update(answered=stream.status, error=stream.error, ready=len(stream.ready), lagged=stream.gaps,
+               listed=listed_us is not None)
     rec.update(inserted=len(stream.order), events_silent_s=round(t1 - stream.last, 1) if stream.last else None,
                answered_s=round(stream.answered_at - t0, 1) if stream.answered_at else None)
     rec['host_share'] = run.sampler.host_share(t0, t1)
@@ -1096,6 +1113,10 @@ def catchup(run, pod, cell):
     values, hung = {}, False
     if done:
         last = max(stream.ready.values()) if stream.ready else t0_us
+        if listed_us is not None:
+            # The listing's own time bounds the end from above; the last readable record seen, from below.
+            rec['last_ready_s'] = round((last - t0_us) / 1e6, 3)
+            last = listed_us
         secs = (last - t0_us) / 1e6
         values = {'catchup_s': fmt(secs), 'catchup_records_per_s': fmt(held / secs if secs > 0 else None)}
         rec['bytes_per_s'] = held * pod.s / secs if secs > 0 else None
@@ -1145,6 +1166,11 @@ def keep_evidence(run, name, nodes, log_from):
             f.seek(log_from[node.name])
             (out / f'log-{node.name}.txt').write_bytes(f.read())
     return name
+
+
+def listed_complete(listing, held):
+    """Whether a listing holds `held` records with their payloads."""
+    return sum(1 for e in listing if e['present']) >= held
 
 
 def bare_listing(node, pod):
@@ -1356,7 +1382,10 @@ def ramp(run, n, rate, to):
             print(f'N={n} catch-up of {cell["catchup"]["held"]}: {values or "incomplete"}{" hung" if hung else ""}',
                   flush=True)
             run.meta.setdefault('ramp_catchup', []).append({'N': n, **values, 'incomplete': incomplete, 'hung': hung,
-                                                            'ready': cell['catchup'].get('ready')})
+                                                            'ready': cell['catchup'].get('ready'),
+                                                            'lagged': cell['catchup'].get('lagged'),
+                                                            'listed': cell['catchup'].get('listed'),
+                                                            'last_ready_s': cell['catchup'].get('last_ready_s')})
     finally:
         pod.stop()
         for node in pod.writers + ([pod.r] if pod.r else []):
