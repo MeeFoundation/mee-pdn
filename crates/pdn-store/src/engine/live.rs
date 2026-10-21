@@ -16,6 +16,7 @@ use iroh_blobs::{
         fsm::{AtBlobHeaderNextError, DecodeError},
         GetError,
     },
+    protocol::GetRequest,
     util::connection_pool::{self, ConnectionPool},
     Hash, HashAndFormat,
 };
@@ -547,7 +548,7 @@ impl LiveActor {
         gossip: Gossip,
         bao_store: Store,
         held_payloads: Arc<super::held::HeldPayloads>,
-        fetches_per_provider: usize,
+        fetches_per_provider: std::num::NonZeroUsize,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         session_access: crate::filter::SessionAccessProvider,
@@ -558,11 +559,7 @@ impl LiveActor {
         let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            iroh_blobs::ALPN,
-            connection_pool::Options::default(),
-        );
+        let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, fetch_pool_options());
         Ok(Self {
             inbox,
             sync: DrainingSync::new(sync),
@@ -576,7 +573,7 @@ impl LiveActor {
             running_sync_accept: Default::default(),
             subscribers: Default::default(),
             download_tasks: Default::default(),
-            fetches: Fetches::new(fetches_per_provider),
+            fetches: Fetches::new(fetches_per_provider.get()),
             pool,
             unrouted: Vec::new(),
             state: Default::default(),
@@ -2260,19 +2257,30 @@ impl QueuedHashes {
     }
 }
 
+/// The options of the pool an engine's fetches connect through: attempts to
+/// connect bounded only as connections are, as in iroh-util 0.6.0. An attempt
+/// the pool turns away fails as a connect does, which drops a provider that is
+/// no gossip neighbor (iroh-util-001).
+fn fetch_pool_options() -> connection_pool::Options {
+    let options = connection_pool::Options::default();
+    connection_pool::Options {
+        max_pending_connections: options.max_connections,
+        ..options
+    }
+}
+
 /// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
 /// [`NO_PROGRESS`] with nothing: the request's stream lives in this future,
 /// so dropping it frees the stream (iroh-blobs-006).
 async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Hash) -> Outcome {
-    let content = HashAndFormat::raw(hash);
-    match blobs.remote().local(content).await {
+    let missing = match blobs.remote().local(HashAndFormat::raw(hash)).await {
         Ok(local) if local.is_complete() => return Outcome::Held,
-        Ok(_) => {}
+        Ok(local) => local.missing(),
         Err(err) => {
             debug!(%hash, "the blob store cannot say what it holds: {err:#}");
             return Outcome::LocalFailure;
         }
-    }
+    };
     let connection =
         match n0_future::time::timeout(NO_PROGRESS, pool.get_or_connect(provider)).await {
             Ok(Ok(connection)) => connection,
@@ -2282,14 +2290,20 @@ async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Ha
             }
             Err(_elapsed) => return Outcome::Stalled,
         };
-    fetch_over(&connection, &blobs, hash).await
+    fetch_over(&connection, &blobs, missing).await
 }
 
-/// [`fetch`] over a connection to the provider.
-async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash: Hash) -> Outcome {
+/// [`fetch`] of what the blob store lacks of a payload, over a connection to
+/// the provider.
+async fn fetch_over(
+    connection: &iroh::endpoint::Connection,
+    blobs: &Store,
+    missing: GetRequest,
+) -> Outcome {
     let provider = connection.remote_id();
-    // Opened here: `fetch` reports a stream that fails to open as a failure of
-    // the local store (iroh-blobs-007).
+    let hash = missing.hash;
+    // Opened here: iroh-blobs reports a stream that fails to open as a failure
+    // of the local store (iroh-blobs-007).
     let pair = match n0_future::time::timeout(NO_PROGRESS, connection.open_bi()).await {
         Ok(Ok((send, recv))) => iroh_blobs::get::StreamPair::new(
             u64::try_from(connection.stable_id()).unwrap_or_default(),
@@ -2302,16 +2316,13 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
         }
         Err(_elapsed) => return Outcome::Stalled,
     };
-    let progress = blobs
-        .remote()
-        .fetch(pair, HashAndFormat::raw(hash))
-        .stream();
+    let progress = blobs.remote().execute_get(pair, missing).stream();
     tokio::pin!(progress);
     loop {
         match n0_future::time::timeout(NO_PROGRESS, progress.next()).await {
             Err(_elapsed) => return Outcome::Stalled,
             Ok(Some(GetProgressItem::Progress(_))) => {}
-            Ok(Some(GetProgressItem::Done(_))) => return Outcome::Fetched,
+            Ok(Some(GetProgressItem::Done(_))) => return landed(blobs, hash).await,
             Ok(Some(GetProgressItem::Error(err))) => {
                 debug!(provider = %provider.fmt_short(), %hash, "fetch failed: {err:#}");
                 return outcome_of_failure(&err);
@@ -2321,11 +2332,29 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
     }
 }
 
+/// What a fetch iroh-blobs reports done came to: iroh-blobs drops a failure
+/// of the blob store's last write (iroh-blobs-008).
+async fn landed(blobs: &Store, hash: Hash) -> Outcome {
+    match blobs.remote().local(HashAndFormat::raw(hash)).await {
+        Ok(local) if local.is_complete() => Outcome::Fetched,
+        Ok(_) => {
+            debug!(%hash, "a fetch reported done left the payload incomplete");
+            Outcome::LocalFailure
+        }
+        Err(err) => {
+            debug!(%hash, "the blob store cannot say what it holds: {err:#}");
+            Outcome::LocalFailure
+        }
+    }
+}
+
 /// Whose failure a fetch's error is: the node's own blob store's, the
 /// provider's answer that it lacks the payload, or the provider's.
 fn outcome_of_failure(err: &GetError) -> Outcome {
     match err {
-        GetError::LocalFailure { .. } => Outcome::LocalFailure,
+        // `IrpcSend`: the import into the blob store has failed and dropped
+        // the receiving end of what the fetch hands it (iroh-blobs-008).
+        GetError::LocalFailure { .. } | GetError::IrpcSend { .. } => Outcome::LocalFailure,
         GetError::AtBlobHeaderNext {
             source: AtBlobHeaderNextError::NotFound { .. },
             ..
@@ -2433,7 +2462,8 @@ mod tests {
         connection.closed().await;
         let store = iroh_blobs::store::mem::MemStore::new();
 
-        let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
+        let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
+        let outcome = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Failed);
 
         fetching.close().await;
@@ -2466,11 +2496,111 @@ mod tests {
             .await?;
         let store = iroh_blobs::store::mem::MemStore::new();
 
-        let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
+        let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
+        let outcome = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Lacks);
 
         fetching.close().await;
         provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// A payload the node's own blob store fails to write is the store's
+    /// failure, whether iroh-blobs reports its fetch done or failed
+    /// (iroh-blobs-008).
+    ///
+    /// The store's data directory is a file once the store is open, so a
+    /// payload past the 16 KiB the store keeps inline fails to land, under
+    /// root too. Its last write follows the end of the transfer for a payload
+    /// of 2 or 3 chunk groups, and comes before it for a larger one.
+    #[tokio::test]
+    async fn a_payload_the_blob_store_fails_to_write_is_a_local_failure() -> anyhow::Result<()> {
+        let held = iroh_blobs::store::mem::MemStore::new();
+        let mut payloads = Vec::new();
+        for size in [40_960, 1_048_576] {
+            payloads.push((size, held.add_bytes(vec![7u8; size]).await?.hash));
+        }
+        let provider = Router::builder(
+            Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?,
+        )
+        .accept(
+            iroh_blobs::ALPN,
+            iroh_blobs::BlobsProtocol::new(&held, None),
+        )
+        .spawn();
+        let fetching = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let connection = fetching
+            .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+            .await?;
+        let dir = tempfile::tempdir()?;
+        let store = iroh_blobs::store::fs::FsStore::load(dir.path()).await?;
+        std::fs::remove_dir_all(dir.path().join("data"))?;
+        std::fs::write(dir.path().join("data"), b"")?;
+
+        for (size, hash) in payloads {
+            let request = GetRequest::from(HashAndFormat::raw(hash));
+            let outcome = fetch_over(&connection, &store, request).await;
+            assert_eq!(outcome, Outcome::LocalFailure, "a payload of {size} bytes");
+        }
+
+        store.shutdown().await?;
+        fetching.close().await;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// Attempts to connect toward more silent peers at once than iroh-util's
+    /// own bound on pending attempts all reach the fetch pool's connect, none
+    /// turned away (iroh-util-001).
+    #[tokio::test]
+    async fn the_fetch_pool_turns_away_no_attempt_to_connect() -> anyhow::Result<()> {
+        // One past iroh-util's default of 64.
+        const PEERS: u8 = 65;
+        let lookup = MemoryLookup::new();
+        let mut silent = Vec::new();
+        let mut peers = Vec::new();
+        for seed in 0..PEERS {
+            // A socket nobody reads: the handshake toward it gets no answer.
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let peer = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+            lookup.add_endpoint_info(EndpointAddr {
+                id: peer,
+                addrs: [iroh::TransportAddr::Ip(socket.local_addr()?)]
+                    .into_iter()
+                    .collect(),
+            });
+            silent.push(socket);
+            peers.push(peer);
+        }
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .address_lookup(lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, fetch_pool_options());
+
+        let attempts = peers.iter().map(|peer| {
+            let pool = pool.clone();
+            async move { pool.get_or_connect(*peer).await }
+        });
+        let turned_away = futures_buffered::join_all(attempts)
+            .await
+            .iter()
+            .filter(|attempt| {
+                matches!(
+                    attempt,
+                    Err(connection_pool::PoolConnectError::TooManyPendingConnections { .. })
+                )
+            })
+            .count();
+        assert_eq!(turned_away, 0, "attempts turned away");
+
+        endpoint.close().await;
         Ok(())
     }
 

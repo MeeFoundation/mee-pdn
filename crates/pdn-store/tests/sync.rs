@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    num::NonZeroU32,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -699,7 +700,7 @@ async fn open_while_held(serving: &util::BlobServing) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
     const ENTRIES: usize = 500;
-    const LIMIT: u32 = 2;
+    const LIMIT: NonZeroU32 = NonZeroU32::new(2).unwrap();
     let mut rng = test_rng(b"a_catch_up_keeps_the_limit_toward_its_provider");
     let serving = Arc::new(util::BlobServing::default());
     let provider = loopback_node(&mut rng, |node| node.blob_serving(Arc::clone(&serving))).await?;
@@ -757,7 +758,7 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Result<()> {
     const ENTRIES: usize = 200;
-    const LIMIT: u32 = 10;
+    const LIMIT: NonZeroU32 = NonZeroU32::new(10).unwrap();
     let mut rng = test_rng(b"a_provider_registered_during_a_catch_up_takes_waiting_payloads");
     let (first_serving, second_serving) = (
         Arc::new(util::BlobServing::default()),
@@ -782,7 +783,7 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     .await?;
     doc_second.leave_gossip().await?;
 
-    let limit = usize::try_from(LIMIT)?;
+    let limit = usize::try_from(LIMIT.get())?;
     let (first_id, second_id) = (first.id(), second.id());
     first_serving.hold();
     second_serving.hold();
@@ -838,8 +839,15 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     Ok(())
 }
 
-/// A replica whose only provider answers nothing for 15 seconds and then
-/// serves receives every payload once it serves, with no session between.
+/// A replica whose only provider ignores the requests it receives for 15
+/// seconds receives every payload from it once it serves, with no session
+/// between.
+///
+/// A request the provider ignored stays unanswered for good, so a payload
+/// arrives only through a request made after the first ones were dropped,
+/// 10 s after they were made; the window for sessions opens a second before
+/// that drop, since nothing is parked earlier. The provider serves from 15 s
+/// on, between the first probe, at 11 s, and the second, at 23 s.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
     const ENTRIES: usize = 5;
@@ -849,11 +857,11 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
     let joining = loopback_node(&mut rng, |node| node).await?;
     let (doc, _hashes) = records_with_payloads(&provider, ENTRIES).await?;
     let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
-    serving.hold();
+    serving.ignore();
 
     let (_doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
-    let (mut inserted, mut ready, mut sessions_after_entries) = (0, 0, 0);
-    let mut released = false;
+    let (mut inserted, mut ready, mut sessions_while_waiting) = (0, 0, 0);
+    let mut answering = false;
     let entries_in = tokio::time::timeout(TIMEOUT, async {
         while inserted < ENTRIES {
             if let Some(LiveEvent::InsertRemote { .. }) = events.try_next().await? {
@@ -867,30 +875,29 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
         matches!(entries_in, Ok(Ok(()))),
         "the entries did not arrive"
     );
-    // The session that brought the entries ends within a moment of them.
-    let quiet_from = Instant::now() + Duration::from_secs(2);
-    let silent_until = quiet_from + Duration::from_secs(13);
+    let quiet_from = Instant::now() + Duration::from_secs(9);
+    let answer_from = Instant::now() + Duration::from_secs(15);
     let arrived = tokio::time::timeout(TIMEOUT, async {
         while ready < ENTRIES {
-            let next = if released {
+            let next = if answering {
                 events.try_next().await?
             } else {
-                match tokio::time::timeout_at(silent_until, events.try_next()).await {
+                match tokio::time::timeout_at(answer_from, events.try_next()).await {
                     Ok(next) => next?,
                     Err(_) => {
-                        serving.release();
-                        released = true;
+                        serving.answer();
+                        answering = true;
                         continue;
                     }
                 }
             };
             match next {
                 Some(LiveEvent::ContentReady { .. }) => {
-                    assert!(released, "a payload arrived while the provider was silent");
+                    assert!(answering, "a payload arrived while the provider was silent");
                     ready += 1;
                 }
                 Some(LiveEvent::SyncFinished(_)) if Instant::now() >= quiet_from => {
-                    sessions_after_entries += 1;
+                    sessions_while_waiting += 1;
                 }
                 Some(_) => {}
                 None => bail!("the event stream ended"),
@@ -905,7 +912,7 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
         "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
     );
     assert_eq!(
-        sessions_after_entries, 0,
+        sessions_while_waiting, 0,
         "sessions while the payloads waited"
     );
 

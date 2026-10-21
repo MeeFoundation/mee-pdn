@@ -1,7 +1,10 @@
 //! The docs [`Engine`]'s assembly, and the [`ProtocolHandler`] that hands an
 //! accepted session to the engine of the identity it names.
 
-use std::sync::{Arc, Weak};
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    sync::{Arc, Weak},
+};
 
 use anyhow::Result;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint};
@@ -129,13 +132,16 @@ pub struct Builder {
     #[debug("SessionAccessProvider")]
     session_access_provider: crate::filter::SessionAccessProvider,
     co_located: Option<crate::engine::CoLocatedRequests>,
-    fetches_per_provider: u32,
+    fetches_per_provider: NonZeroU32,
 }
 
 /// The fetches in flight toward one provider unless the builder names
 /// another: the bidirectional streams the transport grants a connection by
 /// default, one per request.
-pub const FETCHES_PER_PROVIDER: u32 = 100;
+pub const FETCHES_PER_PROVIDER: NonZeroU32 = match NonZeroU32::new(100) {
+    Some(limit) => limit,
+    None => panic!("100 is not zero"),
+};
 
 impl Builder {
     /// Set where this engine sends what it asks of its node about the
@@ -149,7 +155,7 @@ impl Builder {
     /// Set how many payloads this engine fetches from one provider at once:
     /// the bidirectional streams the endpoint grants a connection, past
     /// which a request only waits inside the transport.
-    pub fn fetches_per_provider(mut self, limit: u32) -> Self {
+    pub fn fetches_per_provider(mut self, limit: NonZeroU32) -> Self {
         self.fetches_per_provider = limit;
         self
     }
@@ -179,7 +185,7 @@ impl Builder {
             gossip,
             replica_store,
             blobs,
-            usize::try_from(self.fetches_per_provider).unwrap_or(usize::MAX),
+            NonZeroUsize::try_from(self.fetches_per_provider).unwrap_or(NonZeroUsize::MAX),
             author_store,
             self.session_access_provider,
             self.identity,

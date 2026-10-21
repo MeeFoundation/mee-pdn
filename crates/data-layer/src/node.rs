@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     net::IpAddr,
+    num::NonZeroU32,
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
     time::Duration,
@@ -242,7 +243,10 @@ const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 /// Bidirectional streams a peer holds open on one connection, the
 /// transport's default. A blob request takes one, so it is also how many
 /// payloads an engine fetches from one provider at once.
-const MAX_BI_STREAMS: u32 = 100;
+const MAX_BI_STREAMS: NonZeroU32 = match NonZeroU32::new(100) {
+    Some(count) => count,
+    None => NonZeroU32::MIN,
+};
 
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
@@ -3318,7 +3322,7 @@ async fn bind_endpoint(
         ))
         .transport_config(
             QuicTransportConfig::builder()
-                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BI_STREAMS))
+                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BI_STREAMS.get()))
                 .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
                 .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
                 .build(),
