@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use iroh::{Endpoint, PublicKey};
 use iroh_blobs::{
-    api::{blobs::BlobStatus, downloader::Downloader, Store},
+    api::{blobs::BlobStatus, Store},
     Hash,
 };
 use iroh_gossip::net::Gossip;
@@ -107,7 +107,7 @@ impl Engine {
         gossip: Gossip,
         replica_store: crate::store::Store,
         bao_store: iroh_blobs::api::Store,
-        downloader: Downloader,
+        fetches_per_provider: usize,
         default_author_storage: DefaultAuthorStorage,
         session_access: crate::filter::SessionAccessProvider,
         identity: Identity,
@@ -136,7 +136,7 @@ impl Engine {
             gossip.clone(),
             bao_store.clone(),
             Arc::clone(&held_payloads),
-            downloader,
+            fetches_per_provider,
             to_live_actor_recv,
             live_actor_tx.clone(),
             session_access,
@@ -297,6 +297,17 @@ impl Engine {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::SyncsInFlight { namespaces, reply })
+            .await?;
+        Ok(reply_rx.await?)
+    }
+
+    /// What this engine's payload fetches stand at — per provider the
+    /// fetches in flight, the payloads queued and any pause — and the
+    /// payloads parked, for a failure message.
+    pub async fn fetches_report(&self) -> Result<String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::FetchesReport { reply })
             .await?;
         Ok(reply_rx.await?)
     }

@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -9,8 +9,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use iroh::{
-    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
-    SecretKey,
+    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint,
+    EndpointAddr, PublicKey, SecretKey, TransportAddr,
 };
 use iroh_blobs::Hash;
 use iroh_gossip::{api::Event as GossipEvent, net::Gossip, proto::TopicId};
@@ -467,6 +467,511 @@ async fn sync_gossip_bulk() -> Result<()> {
         elapsed / n_entries as u32
     );
 
+    Ok(())
+}
+
+/// Requests past a hundred toward one peer whose connect gets no answer all
+/// end within a bound, through a connection pool as the engine fetches
+/// through one (iroh-util-001).
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_past_a_hundred_toward_a_silent_peer_all_end() -> Result<()> {
+    const REQUESTS: usize = 500;
+    // A socket nobody reads: the handshake toward it gets no answer.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let peer = SecretKey::from_bytes(&[7; 32]).public();
+    let lookup = MemoryLookup::new();
+    lookup.add_endpoint_info(EndpointAddr {
+        id: peer,
+        addrs: [TransportAddr::Ip(silent.local_addr()?)]
+            .into_iter()
+            .collect(),
+    });
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .address_lookup(lookup)
+        .bind()
+        .await?;
+    let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
+        endpoint.clone(),
+        iroh_blobs::ALPN,
+        iroh_blobs::util::connection_pool::Options::default(),
+    );
+
+    let ended = Arc::new(AtomicUsize::new(0));
+    let requests = (0..REQUESTS).map(|_| {
+        let pool = pool.clone();
+        let ended = Arc::clone(&ended);
+        async move {
+            let _failed = pool.get_or_connect(peer).await.is_err();
+            ended.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    // Each fails once the connect times out, 1 s by the pool's default.
+    let _bound = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_buffered::join_all(requests),
+    )
+    .await;
+    assert_eq!(
+        ended.load(Ordering::SeqCst),
+        REQUESTS,
+        "requests that ended within 10 s"
+    );
+    endpoint.close().await;
+    Ok(())
+}
+
+/// A node on loopback with a fresh key, `configure` adjusting its builder.
+async fn loopback_node(
+    rng: &mut impl CryptoRng,
+    configure: impl FnOnce(Builder) -> Builder,
+) -> Result<Node> {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&rng.random()))
+        .bind_addr("127.0.0.1:0")?
+        .bind()
+        .await?;
+    configure(Node::memory(endpoint)).spawn().await
+}
+
+/// A test node's blob serving keeps every request unanswered while held,
+/// answers them once released, and records how many it held open at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_test_nodes_blob_serving_counts_and_holds_requests() -> Result<()> {
+    let mut rng = test_rng(b"a_test_nodes_blob_serving_counts_and_holds_requests");
+    let serving = Arc::new(util::BlobServing::default());
+    let provider = loopback_node(&mut rng, |node| node.blob_serving(Arc::clone(&serving))).await?;
+    let fetcher = loopback_node(&mut rng, |node| node).await?;
+    let mut hashes = Vec::new();
+    for payload in [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()] {
+        hashes.push(provider.blobs().add_bytes(payload).await?.hash);
+    }
+    serving.hold();
+    let connection = fetcher
+        .endpoint()
+        .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+        .await?;
+    let fetches = futures_buffered::join_all(hashes.iter().map(|hash| {
+        std::future::IntoFuture::into_future(
+            fetcher.blobs().remote().fetch(connection.clone(), *hash),
+        )
+    }));
+    tokio::pin!(fetches);
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut fetches)
+            .await
+            .is_err(),
+        "a request was answered while held"
+    );
+    assert_eq!(serving.most_open(), 3, "requests held open at once");
+    serving.release();
+    let fetched = tokio::time::timeout(TIMEOUT, fetches).await?;
+    assert!(
+        fetched.iter().all(Result::is_ok),
+        "a released request failed: {fetched:?}"
+    );
+
+    provider.shutdown().await?;
+    fetcher.shutdown().await?;
+    Ok(())
+}
+
+/// A replica whose payloads went first to a provider that accepts every
+/// request and answers none receives them from a second provider of the
+/// same payloads.
+///
+/// The replica joins through the silent provider, so the session that
+/// brings the entries makes it every payload's first provider; a session
+/// with the second provider follows once every entry is in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_providers_payloads_come_from_another_provider() -> Result<()> {
+    const ENTRIES: usize = 5;
+    let mut rng = test_rng(b"a_silent_providers_payloads_come_from_another_provider");
+    let silent_serving = Arc::new(util::BlobServing::default());
+    let silent = loopback_node(&mut rng, |node| {
+        node.blob_serving(Arc::clone(&silent_serving))
+    })
+    .await?;
+    let second = loopback_node(&mut rng, |node| node).await?;
+    let joining = loopback_node(&mut rng, |node| node).await?;
+
+    let author = silent.docs().author_create().await?;
+    let doc_silent = silent.docs().create().await?;
+    let mut hashes = Vec::new();
+    for i in 0..ENTRIES {
+        hashes.push(
+            doc_silent
+                .set_bytes(
+                    author,
+                    format!("record/{i}").into_bytes(),
+                    format!("payload {i}").into_bytes(),
+                )
+                .await?,
+        );
+    }
+    let ticket = doc_silent.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let (_doc_second, events_second) =
+        util::import_and_subscribe(second.docs(), ticket.clone()).await?;
+    wait_for_events(events_second, ENTRIES, TIMEOUT, |e| {
+        matches!(e, LiveEvent::ContentReady { .. })
+    })
+    .await?;
+    silent_serving.hold();
+
+    let (doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
+    let (mut inserted, mut ready) = (0, 0);
+    let arrived = tokio::time::timeout(TIMEOUT, async {
+        while ready < ENTRIES {
+            match events.try_next().await? {
+                Some(LiveEvent::InsertRemote { .. }) => {
+                    inserted += 1;
+                    if inserted == ENTRIES {
+                        doc_joining
+                            .start_sync(
+                                util::contacts([second.endpoint().addr()]),
+                                util::TEST_HOLDER,
+                            )
+                            .await?;
+                    }
+                }
+                Some(LiveEvent::ContentReady { .. }) => ready += 1,
+                Some(_) => {}
+                None => bail!("the event stream ended"),
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    let fetches = joining.engine().fetches_report().await?;
+    assert!(
+        matches!(arrived, Ok(Ok(()))),
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+    );
+    for hash in hashes {
+        assert!(joining.blobs().has(hash).await?, "a payload is missing");
+    }
+
+    silent_serving.release();
+    for node in [silent, second, joining] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Writes `count` records on `node`, each with a payload of its own,
+/// answering the replica and the payloads' hashes.
+async fn records_with_payloads(node: &Node, count: usize) -> Result<(Doc, Vec<Hash>)> {
+    let author = node.docs().author_create().await?;
+    let doc = node.docs().create().await?;
+    let mut hashes = Vec::with_capacity(count);
+    for i in 0..count {
+        hashes.push(
+            doc.set_bytes(
+                author,
+                format!("record/{i}").into_bytes(),
+                format!("payload {i}").into_bytes(),
+            )
+            .await?,
+        );
+    }
+    Ok((doc, hashes))
+}
+
+/// Holds `serving`'s requests long enough for every request it answered to
+/// be done, and answers how many it holds open then: the requests of its
+/// fetchers in flight.
+async fn open_while_held(serving: &util::BlobServing) -> usize {
+    serving.hold();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let open = serving.open();
+    serving.release();
+    open
+}
+
+/// A replica joining a namespace of 2,000 entries whose payloads one
+/// provider holds never has more requests open at that provider than its
+/// limit, and receives every payload.
+///
+/// The count is read with the provider holding every request: a request it
+/// has answered can still be counted for a moment after the replica's next
+/// one arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
+    const ENTRIES: usize = 2_000;
+    const LIMIT: u32 = 2;
+    let mut rng = test_rng(b"a_catch_up_keeps_the_limit_toward_its_provider");
+    let serving = Arc::new(util::BlobServing::default());
+    let provider = loopback_node(&mut rng, |node| node.blob_serving(Arc::clone(&serving))).await?;
+    let joining = loopback_node(&mut rng, |node| node.fetches_per_provider(LIMIT)).await?;
+    let (doc, _hashes) = records_with_payloads(&provider, ENTRIES).await?;
+    let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
+
+    let (_doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
+    let mut ready = 0;
+    let mut open_counts = Vec::new();
+    let arrived = tokio::time::timeout(TIMEOUT, async {
+        while ready < ENTRIES {
+            match events.try_next().await? {
+                Some(LiveEvent::ContentReady { .. }) => {
+                    ready += 1;
+                    if ready % 500 == 1 {
+                        open_counts.push(open_while_held(&serving).await);
+                    }
+                }
+                Some(_) => {}
+                None => bail!("the event stream ended"),
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    let fetches = joining.engine().fetches_report().await?;
+    assert!(
+        matches!(arrived, Ok(Ok(()))),
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+    );
+    assert_eq!(
+        open_counts,
+        [2, 2, 2, 2],
+        "requests open at the provider while it held them"
+    );
+
+    provider.shutdown().await?;
+    joining.shutdown().await?;
+    Ok(())
+}
+
+/// A provider that finishes a session with a replica during its catch-up
+/// takes payloads the replica still waits for, at most the limit toward it
+/// as toward the first provider, and every payload arrives.
+///
+/// Counts are read with both providers holding every request, as in
+/// `a_catch_up_keeps_the_limit_toward_its_provider`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Result<()> {
+    const ENTRIES: usize = 2_000;
+    const LIMIT: u32 = 10;
+    let mut rng = test_rng(b"a_provider_registered_during_a_catch_up_takes_waiting_payloads");
+    let (first_serving, second_serving) = (
+        Arc::new(util::BlobServing::default()),
+        Arc::new(util::BlobServing::default()),
+    );
+    let first = loopback_node(&mut rng, |node| {
+        node.blob_serving(Arc::clone(&first_serving))
+    })
+    .await?;
+    let second = loopback_node(&mut rng, |node| {
+        node.blob_serving(Arc::clone(&second_serving))
+    })
+    .await?;
+    let joining = loopback_node(&mut rng, |node| node.fetches_per_provider(LIMIT)).await?;
+    let (doc, _hashes) = records_with_payloads(&first, ENTRIES).await?;
+    let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let (_doc_second, events_second) =
+        util::import_and_subscribe(second.docs(), ticket.clone()).await?;
+    wait_for_events(events_second, ENTRIES, TIMEOUT, |e| {
+        matches!(e, LiveEvent::ContentReady { .. })
+    })
+    .await?;
+
+    let limit = usize::try_from(LIMIT)?;
+    let (doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
+    let mut ready = 0;
+    let mut open_counts = Vec::new();
+    let arrived = tokio::time::timeout(TIMEOUT, async {
+        while ready < ENTRIES {
+            match events.try_next().await? {
+                Some(LiveEvent::ContentReady { .. }) => {
+                    ready += 1;
+                    if ready == 1 {
+                        doc_joining
+                            .start_sync(
+                                util::contacts([second.endpoint().addr()]),
+                                util::TEST_HOLDER,
+                            )
+                            .await?;
+                    }
+                    if ready % 500 == 0 {
+                        first_serving.hold();
+                        second_serving.hold();
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        open_counts.push((first_serving.open(), second_serving.open()));
+                        first_serving.release();
+                        second_serving.release();
+                    }
+                }
+                Some(_) => {}
+                None => bail!("the event stream ended"),
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    let fetches = joining.engine().fetches_report().await?;
+    assert!(
+        matches!(arrived, Ok(Ok(()))),
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+    );
+    assert!(
+        open_counts
+            .iter()
+            .all(|(first, second)| *first <= limit && *second <= limit),
+        "a provider held more than the limit: {open_counts:?}"
+    );
+    assert!(
+        open_counts.iter().any(|(_, second)| *second > 0),
+        "the second provider served nothing: {open_counts:?}"
+    );
+
+    for node in [first, second, joining] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A replica whose only provider answers nothing for 15 seconds and then
+/// serves receives every payload once it serves, with no session between.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
+    const ENTRIES: usize = 5;
+    let mut rng = test_rng(b"the_only_provider_silent_for_a_while_is_asked_again");
+    let serving = Arc::new(util::BlobServing::default());
+    let provider = loopback_node(&mut rng, |node| node.blob_serving(Arc::clone(&serving))).await?;
+    let joining = loopback_node(&mut rng, |node| node).await?;
+    let (doc, _hashes) = records_with_payloads(&provider, ENTRIES).await?;
+    let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
+    serving.hold();
+
+    let (_doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
+    let (mut inserted, mut ready, mut sessions_after_entries) = (0, 0, 0);
+    let mut released = false;
+    let entries_in = tokio::time::timeout(TIMEOUT, async {
+        while inserted < ENTRIES {
+            if let Some(LiveEvent::InsertRemote { .. }) = events.try_next().await? {
+                inserted += 1;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    assert!(
+        matches!(entries_in, Ok(Ok(()))),
+        "the entries did not arrive"
+    );
+    // The session that brought the entries ends within a moment of them.
+    let quiet_from = Instant::now() + Duration::from_secs(2);
+    let silent_until = quiet_from + Duration::from_secs(13);
+    let arrived = tokio::time::timeout(TIMEOUT, async {
+        while ready < ENTRIES {
+            let next = if released {
+                events.try_next().await?
+            } else {
+                match tokio::time::timeout_at(silent_until, events.try_next()).await {
+                    Ok(next) => next?,
+                    Err(_) => {
+                        serving.release();
+                        released = true;
+                        continue;
+                    }
+                }
+            };
+            match next {
+                Some(LiveEvent::ContentReady { .. }) => {
+                    assert!(released, "a payload arrived while the provider was silent");
+                    ready += 1;
+                }
+                Some(LiveEvent::SyncFinished(_)) if Instant::now() >= quiet_from => {
+                    sessions_after_entries += 1;
+                }
+                Some(_) => {}
+                None => bail!("the event stream ended"),
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    let fetches = joining.engine().fetches_report().await?;
+    assert!(
+        matches!(arrived, Ok(Ok(()))),
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+    );
+    assert_eq!(
+        sessions_after_entries, 0,
+        "sessions while the payloads waited"
+    );
+
+    provider.shutdown().await?;
+    joining.shutdown().await?;
+    Ok(())
+}
+
+/// A gossip neighbor that lacks a payload the replica waits for still has
+/// its own payload fetched at once.
+///
+/// The writer serves no payload, so the neighbor holds the first entry
+/// without its payload. The neighbor writes only after a session it ran as
+/// a neighbor has ended, since that end is what asks it for the payload it
+/// lacks; a pause from that answer is at least 1 s, which sizes the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_neighbor_lacking_a_payload_has_its_own_fetched_at_once() -> Result<()> {
+    let mut rng = test_rng(b"a_neighbor_lacking_a_payload_has_its_own_fetched_at_once");
+    let writer = loopback_node(&mut rng, |node| node.without_blob_serving()).await?;
+    let neighbor = loopback_node(&mut rng, |node| node).await?;
+    let replica = loopback_node(&mut rng, |node| node).await?;
+    let doc = writer.docs().create().await?;
+    let author = writer.docs().author_create().await?;
+    doc.set_bytes(author, b"record/lacked".to_vec(), b"lacked".to_vec())
+        .await?;
+    let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let (doc_neighbor, mut neighbor_events) =
+        util::import_and_subscribe(neighbor.docs(), ticket).await?;
+    next_event_matching(&mut neighbor_events, TIMEOUT, |event| {
+        matches!(event, LiveEvent::InsertRemote { .. })
+    })
+    .await;
+
+    let ticket = doc_neighbor
+        .share(AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let (_doc_replica, mut events) = util::import_and_subscribe(replica.docs(), ticket).await?;
+    let neighbor_id = neighbor.id();
+    next_event_matching(
+        &mut events,
+        TIMEOUT,
+        |event| matches!(event, LiveEvent::NeighborUp(peer) if *peer == neighbor_id),
+    )
+    .await;
+    next_event_matching(&mut events, TIMEOUT, |event| {
+        match_sync_finished(event, neighbor_id)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let author = neighbor.docs().author_create().await?;
+    let own = doc_neighbor
+        .set_bytes(author, b"record/own".to_vec(), b"own".to_vec())
+        .await?;
+    next_event_matching(&mut events, TIMEOUT, |event| {
+        matches!(event, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == own)
+    })
+    .await;
+    let inserted = Instant::now();
+    next_event_matching(
+        &mut events,
+        TIMEOUT,
+        |event| matches!(event, LiveEvent::ContentReady { hash } if *hash == own),
+    )
+    .await;
+    let fetches = replica.engine().fetches_report().await?;
+    assert!(
+        inserted.elapsed() < Duration::from_secs(1),
+        "the neighbor's own payload took {:?}; fetches: {fetches}",
+        inserted.elapsed()
+    );
+
+    writer.shutdown().await?;
+    neighbor.shutdown().await?;
+    replica.shutdown().await?;
     Ok(())
 }
 

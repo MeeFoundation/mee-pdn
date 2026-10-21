@@ -18,11 +18,11 @@ What this crate took from n0's `iroh-docs`, and what was done here with each ups
 
 **Already fixed here.** Upstream's `BobState` holds its progress as an option, takes it out at the start of a round and puts it back only when the round succeeds, so `into_outcome` panics after a failed round. Here `BobState::progress` in `src/net/codec.rs` is a plain `SyncOutcome`, each round works on a clone of it, and a failed round leaves what the completed rounds accumulated; `a_failed_round_leaves_the_outcome_readable` and `a_failed_round_keeps_what_completed_rounds_accumulated` in the same file prove it. No action.
 
-### #112 · vladimirlogachev · fix(sync): retry missing content downloads on every successful sync
+### #112 · vladimirlogachev · fix(sync): retry missing content downloads on every successful sync · iroh-docs-002
 
 **Already here: this crate's fix, offered upstream.** Parked content is keyed by namespace and hash, and every successful session asks its peer for the content its namespace has parked, in `on_sync_finished` in `src/engine/live.rs`; `sync_fetches_parked_content_from_later_sync_peer` in `tests/sync.rs` proves it. No action.
 
-### #111 · vladimirlogachev · fix(sync): clear connect state when the remote aborts a dial as already-syncing
+### #111 · vladimirlogachev · fix(sync): clear connect state when the remote aborts a dial as already-syncing · iroh-docs-001
 
 **Already here: this crate's fix, offered upstream.** `NamespaceStates::abort_connect` in `src/engine/state.rs` returns the pair to idle when the remote aborts the dial as already syncing, sparing an accept that took the slot over; `abort_connect_returns_rejected_dial_to_idle` and `abort_connect_spares_accept_takeover` there prove it. The crate also dials such a pair again, which the pull request does not. No action.
 
@@ -40,7 +40,7 @@ What this crate took from n0's `iroh-docs`, and what was done here with each ups
 
 ### #88 · cbenhagen · fix: retry incomplete blob downloads after sync
 
-**Already fixed here, another way.** Of the pull request's four cases: content a peer lacked is asked for from the peer of every later successful session (#112 above); content a restart left missing is parked by a scan at the first `start_sync` of a namespace in the live actor's life (`content_a_restart_left_missing_is_fetched_from_the_first_sync_peer` in `tests/sync.rs`); a download that fails toward a gossip neighbor is tried again (`retry_unreached_download` in `src/engine/live.rs`); and a change of download policy does not apply, the crate holding no download policies. Upstream's scan of the whole replica at the end of every session is not taken: the scan here runs once per namespace per start. No action.
+**Already fixed here, another way.** Of the pull request's four cases: content a peer lacked is asked for from the peer of every later successful session (#112 above); content a restart left missing is parked by a scan at the first `start_sync` of a namespace in the live actor's life (`content_a_restart_left_missing_is_fetched_from_the_first_sync_peer` in `tests/sync.rs`); a download that fails toward a gossip neighbor is tried again (the provider's series of pauses in `src/engine/live/fetches.rs`); and a change of download policy does not apply, the crate holding no download policies. Upstream's scan of the whole replica at the end of every session is not taken: the scan here runs once per namespace per start. No action.
 
 ## Commits
 

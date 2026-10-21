@@ -734,13 +734,9 @@ fn stand_client() -> Result<reqwest::Client> {
         .context("building the stand's HTTP client")
 }
 
-/// iroh 1.3 turns on reqwest's `rustls-no-provider`, and cargo unifies it into the stand's client:
-/// without a TLS configuration of its own the client panics, plain HTTP included, although `ring`
-/// is the one provider in the build — under that feature reqwest takes only a provider installed
-/// process-wide, never the one rustls's own features name. iroh keeps the feature on purpose and
-/// configures each of its own clients instead, and its maintainers decline to change that:
-/// <https://github.com/n0-computer/iroh/issues/4442#issuecomment-5089223911>. This configuration
-/// is the one iroh's relay tests build; its empty root store trusts no server.
+/// The stand client's own TLS configuration (iroh-002): without it the client panics, plain HTTP
+/// included. This configuration is the one iroh's relay tests build; its empty root store trusts
+/// no server.
 fn plain_http_tls() -> Result<rustls::ClientConfig> {
     Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
