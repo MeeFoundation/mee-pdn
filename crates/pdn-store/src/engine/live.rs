@@ -1797,6 +1797,9 @@ impl LiveActor {
                 let (_wanting, emptied) = self.queued_hashes.take_hash(&hash);
                 self.emit_pending_content_ready(emptied).await;
             }
+            Outcome::LocalFailure => {
+                warn!(%hash, "a fetch failed on the node's own blob store");
+            }
             _ => {}
         }
         self.apply_fetches(steps);

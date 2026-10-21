@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use iroh::PublicKey;
 use iroh_blobs::Hash;
 use n0_future::time::{Duration, Instant};
+use tracing::info;
 
 use super::{UNREACHED_RETRY_FIRST, UNREACHED_RETRY_FOR, UNREACHED_RETRY_MAX};
 
@@ -284,6 +285,7 @@ impl Fetches {
                 series
             }
             None => {
+                info!(provider = %provider.fmt_short(), "fetches toward a provider pause");
                 self.next_series = next_id.wrapping_add(1);
                 entry.series.insert(Series {
                     id: next_id,
@@ -294,7 +296,13 @@ impl Fetches {
             }
         };
         if now.saturating_duration_since(series.since) >= UNREACHED_RETRY_FOR {
+            let before = steps.unrouted.len();
             self.drop_provider(provider, steps);
+            info!(
+                provider = %provider.fmt_short(),
+                unrouted = steps.unrouted.len().saturating_sub(before),
+                "fetch tries toward a provider exhausted"
+            );
             return;
         }
         let wait = series.next_wait;
