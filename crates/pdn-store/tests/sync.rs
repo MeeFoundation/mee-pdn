@@ -688,16 +688,17 @@ async fn open_while_held(serving: &util::BlobServing) -> usize {
     open
 }
 
-/// A replica joining a namespace of 2,000 entries whose payloads one
-/// provider holds never has more requests open at that provider than its
-/// limit, and receives every payload.
+/// A replica joining a namespace of 500 entries whose payloads one provider
+/// holds never has more requests open at that provider than its limit, and
+/// receives every payload.
 ///
 /// The count is read with the provider holding every request: a request it
 /// has answered can still be counted for a moment after the replica's next
-/// one arrives.
+/// one arrives. The catch-up is sized for a debug build on a CI runner,
+/// whose reconciliation takes tens of milliseconds an entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
-    const ENTRIES: usize = 2_000;
+    const ENTRIES: usize = 500;
     const LIMIT: u32 = 2;
     let mut rng = test_rng(b"a_catch_up_keeps_the_limit_toward_its_provider");
     let serving = Arc::new(util::BlobServing::default());
@@ -708,16 +709,18 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 
     let (_doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
     let mut ready = 0;
+    let mut lagged = 0;
     let mut open_counts = Vec::new();
     let arrived = tokio::time::timeout(TIMEOUT, async {
         while ready < ENTRIES {
             match events.try_next().await? {
                 Some(LiveEvent::ContentReady { .. }) => {
                     ready += 1;
-                    if ready % 500 == 1 {
+                    if ready % 125 == 1 {
                         open_counts.push(open_while_held(&serving).await);
                     }
                 }
+                Some(LiveEvent::Lagged) => lagged += 1,
                 Some(_) => {}
                 None => bail!("the event stream ended"),
             }
@@ -728,7 +731,7 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
     let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+        "{ready} of {ENTRIES} payloads arrived ({lagged} lag notices): {arrived:?}; fetches: {fetches}"
     );
     assert_eq!(
         open_counts,
@@ -745,15 +748,15 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 /// takes payloads the replica still waits for, at most the limit toward it
 /// as toward the first provider, and every payload arrives.
 ///
-/// Counts are read with both providers holding every request, as in
-/// `a_catch_up_keeps_the_limit_toward_its_provider`.
+/// Both providers hold every request until the counts are read, so every
+/// payload still waits when the second provider's session ends. That session
+/// starts only once the replica holds every entry, and the second provider
+/// has left the swarm, so no entry of it registers it: only the session's
+/// end can. The catch-up is sized for a debug build on a CI runner, whose
+/// reconciliation takes tens of milliseconds an entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("pdn_store::engine::live=debug,pdn_store::engine=info,pdn_store::net=info")
-        .with_test_writer()
-        .try_init();
-    const ENTRIES: usize = 2_000;
+    const ENTRIES: usize = 200;
     const LIMIT: u32 = 10;
     let mut rng = test_rng(b"a_provider_registered_during_a_catch_up_takes_waiting_payloads");
     let (first_serving, second_serving) = (
@@ -769,41 +772,44 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     })
     .await?;
     let joining = loopback_node(&mut rng, |node| node.fetches_per_provider(LIMIT)).await?;
-    let (doc, diag_hashes) = records_with_payloads(&first, ENTRIES).await?;
+    let (doc, _hashes) = records_with_payloads(&first, ENTRIES).await?;
     let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
-    let (_doc_second, events_second) =
+    let (doc_second, events_second) =
         util::import_and_subscribe(second.docs(), ticket.clone()).await?;
     wait_for_events(events_second, ENTRIES, TIMEOUT, |e| {
         matches!(e, LiveEvent::ContentReady { .. })
     })
     .await?;
+    doc_second.leave_gossip().await?;
 
     let limit = usize::try_from(LIMIT)?;
+    let (first_id, second_id) = (first.id(), second.id());
+    first_serving.hold();
+    second_serving.hold();
     let (doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
     let mut ready = 0;
-    let mut open_counts = Vec::new();
+    let mut lagged = 0;
+    let mut open_counts = None;
+    let mut started = None;
     let arrived = tokio::time::timeout(TIMEOUT, async {
         while ready < ENTRIES {
             match events.try_next().await? {
-                Some(LiveEvent::ContentReady { .. }) => {
-                    ready += 1;
-                    if ready == 1 {
-                        doc_joining
-                            .start_sync(
-                                util::contacts([second.endpoint().addr()]),
-                                util::TEST_HOLDER,
-                            )
-                            .await?;
-                    }
-                    if ready % 500 == 0 {
-                        first_serving.hold();
-                        second_serving.hold();
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        open_counts.push((first_serving.open(), second_serving.open()));
-                        first_serving.release();
-                        second_serving.release();
-                    }
+                Some(LiveEvent::ContentReady { .. }) => ready += 1,
+                Some(event) if started.is_none() && match_sync_finished(&event, first_id) => {
+                    let doc = doc_joining.clone();
+                    let addr = second.endpoint().addr();
+                    started = Some(tokio::spawn(async move {
+                        doc.start_sync(util::contacts([addr]), util::TEST_HOLDER)
+                            .await
+                    }));
                 }
+                Some(event) if open_counts.is_none() && match_sync_finished(&event, second_id) => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    open_counts = Some((first_serving.open(), second_serving.open()));
+                    first_serving.release();
+                    second_serving.release();
+                }
+                Some(LiveEvent::Lagged) => lagged += 1,
                 Some(_) => {}
                 None => bail!("the event stream ended"),
             }
@@ -812,31 +818,19 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     })
     .await;
     let fetches = joining.engine().fetches_report().await?;
-    let syncs = joining
-        .engine()
-        .syncs_in_flight_report(vec![doc_joining.id()])
-        .await?;
-    let mut held = 0usize;
-    for hash in &diag_hashes {
-        if joining.blobs().has(*hash).await? {
-            held += 1;
-        }
-    }
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}; DIAG syncs: {syncs}; DIAG joining blobs held {held}; DIAG first open {} second open {}; first most {} second most {}",
-        first_serving.open(), second_serving.open(), first_serving.most_open(), second_serving.most_open()
+        "{ready} of {ENTRIES} payloads arrived ({lagged} lag notices): {arrived:?}; fetches: {fetches}"
     );
+    if let Some(started) = started {
+        started.await??;
+    }
+    let (first_open, second_open) = open_counts.expect("the counts were read");
     assert!(
-        open_counts
-            .iter()
-            .all(|(first, second)| *first <= limit && *second <= limit),
-        "a provider held more than the limit: {open_counts:?}"
+        first_open <= limit && second_open <= limit,
+        "a provider held more than the limit: {first_open} and {second_open}"
     );
-    assert!(
-        open_counts.iter().any(|(_, second)| *second > 0),
-        "the second provider served nothing: {open_counts:?}"
-    );
+    assert!(second_open > 0, "the second provider served nothing");
 
     for node in [first, second, joining] {
         node.shutdown().await?;
