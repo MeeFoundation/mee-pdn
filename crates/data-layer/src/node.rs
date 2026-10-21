@@ -109,10 +109,7 @@ impl ProtocolHandler for PanicGuarded {
 }
 
 /// The blob protocol with its streams' tasks tracked and the store's closing
-/// left to the node: the router shuts its protocols down before it cancels
-/// their connections, and a stream's task outlives the router's shutdown, so
-/// a request a stream already read would reach a store that is closing,
-/// which iroh-blobs answers by panicking on its own task.
+/// left to the node (iroh-blobs-003).
 #[derive(Debug, Clone)]
 struct BlobsServing {
     store: iroh_blobs::api::Store,
@@ -208,7 +205,7 @@ const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 /// timeout, which iroh keeps). A peer's path selector is asked again when a
 /// connection opens, not when one closes, so the connection this run opens
 /// is what moves a peer that held more connections to the old address than
-/// this process opened at its start (`components/mee-pdn/iroh-defects.md`).
+/// this process opened at its start (iroh-001).
 const POD_PASS_AFTER_SPAWN: Duration = Duration::from_secs(45);
 
 /// The peers one run of the pod stores' pass reaches per store, so a
@@ -241,6 +238,11 @@ const POD_CHANGE_SETTLE: Duration = Duration::from_millis(50);
 /// store to finish: a stream ends at its next read or write on the closed
 /// endpoint, and a request it left in the store at its first answer.
 const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
+
+/// Bidirectional streams a peer holds open on one connection, the
+/// transport's default. A blob request takes one, so it is also how many
+/// payloads an engine fetches from one provider at once.
+const MAX_BI_STREAMS: u32 = 100;
 
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
@@ -1031,7 +1033,7 @@ impl SyncNode {
         // bytes it compares and never interprets.
         let held_for = crate::access::identity_of(identity);
         let provider = session_access_provider(Arc::clone(access), Arc::clone(registry));
-        Ok(match &self.storage {
+        let builder = match &self.storage {
             #[cfg(any(test, feature = "test-util"))]
             StorageConfig::Memory => Docs::memory(held_for, provider),
             StorageConfig::Directory(directory) => {
@@ -1052,7 +1054,8 @@ impl SyncNode {
                 );
                 Docs::persistent(own, share, held_for, provider)
             }
-        })
+        };
+        Ok(builder.fetches_per_provider(MAX_BI_STREAMS))
     }
 
     /// What the caches of this node's replica stores may together hold:
@@ -2962,9 +2965,7 @@ async fn open_blob_store(
 /// last and `collecting` is set; every other ask is skipped. Once the
 /// node's stop has closed the store (`closed`), or the node is gone with no
 /// stop to close it, the callback lets the next run fail on the closed
-/// store: iroh-blobs ends the collection's task on a failed run alone, and
-/// the task holds the store's runtime while it lives
-/// (`components/mee-pdn/iroh-defects.md`).
+/// store (iroh-blobs-004).
 fn protect_hosted(
     identities: std::sync::Weak<std::sync::RwLock<HashMap<PdnId, Arc<HostedStack>>>>,
     collecting: Arc<std::sync::atomic::AtomicBool>,
@@ -3317,6 +3318,7 @@ async fn bind_endpoint(
         ))
         .transport_config(
             QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BI_STREAMS))
                 .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
                 .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
                 .build(),

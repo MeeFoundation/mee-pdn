@@ -43,8 +43,10 @@ private = { ignore = true }
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Where `[patch.crates-io]` in Cargo.toml takes iroh-blobs and iroh-gossip from.
+# Where `[patch.crates-io]` in Cargo.toml takes iroh-blobs, iroh-gossip and
+# iroh-util from.
 allow-git = [
     "https://github.com/MeeFoundation/iroh-blobs",
     "https://github.com/n0-computer/iroh-gossip",
+    "https://github.com/n0-computer/iroh-util",
 ]

@@ -55,6 +55,7 @@ impl Docs {
             identity,
             session_access_provider,
             co_located: None,
+            fetches_per_provider: FETCHES_PER_PROVIDER,
         }
     }
 
@@ -75,6 +76,7 @@ impl Docs {
             identity,
             session_access_provider,
             co_located: None,
+            fetches_per_provider: FETCHES_PER_PROVIDER,
         }
     }
 
@@ -127,7 +129,13 @@ pub struct Builder {
     #[debug("SessionAccessProvider")]
     session_access_provider: crate::filter::SessionAccessProvider,
     co_located: Option<crate::engine::CoLocatedRequests>,
+    fetches_per_provider: u32,
 }
+
+/// The fetches in flight toward one provider unless the builder names
+/// another: the bidirectional streams the transport grants a connection by
+/// default, one per request.
+pub const FETCHES_PER_PROVIDER: u32 = 100;
 
 impl Builder {
     /// Set where this engine sends what it asks of its node about the
@@ -135,6 +143,14 @@ impl Builder {
     /// this node to reconcile inside the process. Unset, both reach nobody.
     pub fn co_located_requests(mut self, requests: crate::engine::CoLocatedRequests) -> Self {
         self.co_located = Some(requests);
+        self
+    }
+
+    /// Set how many payloads this engine fetches from one provider at once:
+    /// the bidirectional streams the endpoint grants a connection, past
+    /// which a request only waits inside the transport.
+    pub fn fetches_per_provider(mut self, limit: u32) -> Self {
+        self.fetches_per_provider = limit;
         self
     }
 
@@ -158,13 +174,12 @@ impl Builder {
                 DefaultAuthorStorage::Persistent(path.join("default-author"))
             }
         };
-        let downloader = blobs.downloader(&endpoint);
         let engine = Engine::spawn(
             endpoint,
             gossip,
             replica_store,
             blobs,
-            downloader,
+            usize::try_from(self.fetches_per_provider).unwrap_or(usize::MAX),
             author_store,
             self.session_access_provider,
             self.identity,
