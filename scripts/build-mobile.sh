@@ -22,7 +22,10 @@ case "$target" in
     bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host/bin"
     CC_aarch64_linux_android="$bin/aarch64-linux-android$api-clang"
     AR_aarch64_linux_android="$bin/llvm-ar"
-    export CC_aarch64_linux_android AR_aarch64_linux_android
+    # The same wrapper links: `irpc` and `iroh-relay` build a cdylib of their
+    # own, which the host's linker cannot link for the device.
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+    export CC_aarch64_linux_android AR_aarch64_linux_android CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
     # The shared library an application loads.
     kind=cdylib
     ;;
