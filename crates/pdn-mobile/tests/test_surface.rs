@@ -481,25 +481,43 @@ async fn device_samples_are_answered_in_order() -> Result<()> {
 /// A reset whose client hangs up before its answer still brings its node up,
 /// and the reset after it is taken. Fails with the reset run inside the
 /// request's own future, which the hang-up drops between the stop and the
-/// bring-up.
+/// bring-up. The hang-up is placed by the status route, which answers 503
+/// from the stop to the install: a reset can finish inside any timeout a
+/// client is given.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reset_outlives_its_client() -> Result<()> {
     let phone = Phone::serve().await?;
     let first = phone.reset().await?;
     let (_, before) = phone.get("/debug/status").await?;
-    // Shorter than stopping the first node and bringing up the next.
-    let hasty = reqwest::Client::builder()
-        .timeout(Duration::from_millis(20))
-        .build()?;
-    let gone = hasty
-        .post(format!("{}/debug/agent/reset", phone.base))
-        .header("content-type", "application/json")
-        .body(format!(
-            r#"{{"pod_interval_secs":{POD_INTERVAL_SECS},"connectivity":"direct"}}"#
-        ))
-        .send()
-        .await;
-    assert!(gone.is_err(), "the reset answered before the hang-up");
+    let hasty = reqwest::Client::new();
+    let gone = tokio::spawn(
+        hasty
+            .post(format!("{}/debug/agent/reset", phone.base))
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"pod_interval_secs":{POD_INTERVAL_SECS},"connectivity":"direct"}}"#
+            ))
+            .send(),
+    );
+    let under_way = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, now) = phone.get("/debug/status").await?;
+            if status == 503 {
+                break anyhow::Ok(true);
+            }
+            if now.lines().next() != before.lines().next() {
+                break Ok(false);
+            }
+        }
+    })
+    .await??;
+    assert!(
+        under_way,
+        "the reset finished before its client could hang up"
+    );
+    // The hang-up: the request's task dropped, its client's connections with it.
+    gone.abort();
+    drop(hasty);
 
     // The node the abandoned reset brought up, told from the first by its id.
     let up = eventually(|| async {
