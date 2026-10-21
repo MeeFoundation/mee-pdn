@@ -153,7 +153,9 @@ async fn connect_and_sync_inner(
         .connect(peer, crate::ALPN)
         .await
         .map_err(ConnectError::connect)?;
-    *session = session_id(&connection);
+    if cfg!(feature = "observation") {
+        *session = session_id(&connection);
+    }
 
     let (mut send_stream, mut recv_stream) =
         connection.open_bi().await.map_err(ConnectError::connect)?;

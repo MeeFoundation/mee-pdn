@@ -1731,11 +1731,16 @@ impl SyncNode {
             .await?;
             return Ok(None);
         };
-        let events = tracked
-            .doc
-            .start_sync_observed(tracked.contacts, tracked.default_identity, capacity)
-            .await?;
-        Ok(Some(Box::pin(events)))
+        #[cfg(not(feature = "test-util"))]
+        anyhow::bail!("an ordered subscription of {capacity} events needs the test-util build");
+        #[cfg(feature = "test-util")]
+        {
+            let events = tracked
+                .doc
+                .start_sync_observed(tracked.contacts, tracked.default_identity, capacity)
+                .await?;
+            Ok(Some(Box::pin(events)))
+        }
     }
 
     /// `Ok` when [`import_pod`](Self::import_pod) would take `tickets` as

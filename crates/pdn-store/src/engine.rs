@@ -220,6 +220,7 @@ impl Engine {
     /// attached, as [`Self::observe`] gives it: registered before the replica is opened
     /// for sync and before its first dial, so it reports that sync from its
     /// first event. For a replica already syncing it is [`Self::observe`].
+    #[cfg(feature = "observation")]
     pub async fn start_sync_observed(
         &self,
         namespace: NamespaceId,
@@ -430,6 +431,7 @@ impl Engine {
     /// reader that falls behind, then drops behind one [`LiveEvent::Lagged`].
     /// Refused for a replica the live sync does not hold open; ends when the
     /// sync leaves the replica with its subscribers.
+    #[cfg(feature = "observation")]
     pub async fn observe(
         &self,
         namespace: NamespaceId,

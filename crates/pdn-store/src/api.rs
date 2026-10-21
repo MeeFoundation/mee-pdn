@@ -400,6 +400,7 @@ impl Doc {
 
     /// An ordered subscription to this document, as
     /// [`Engine::observe`](crate::engine::Engine::observe) gives it.
+    #[cfg(feature = "observation")]
     pub async fn observe(
         &self,
         capacity: usize,
@@ -411,6 +412,7 @@ impl Doc {
     /// with an ordered subscription attached, as
     /// [`Engine::start_sync_observed`](crate::engine::Engine::start_sync_observed)
     /// gives it.
+    #[cfg(feature = "observation")]
     pub async fn start_sync_observed(
         &self,
         peers: Vec<Contact>,

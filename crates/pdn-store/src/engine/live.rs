@@ -150,6 +150,7 @@ pub(crate) enum ToLiveActor {
     },
     /// An ordered subscriber; refused for a namespace not syncing, whose
     /// inserts this actor never receives.
+    #[cfg(feature = "observation")]
     Observe {
         namespace: NamespaceId,
         #[debug("sender")]
@@ -767,6 +768,7 @@ impl LiveActor {
                 self.subscribers.subscribe(namespace, sender);
                 reply.send(Ok(())).ok();
             }
+            #[cfg(feature = "observation")]
             ToLiveActor::Observe {
                 namespace,
                 sender,
@@ -1947,6 +1949,7 @@ impl LiveActor {
 
     async fn on_replica_event(&mut self, event: crate::Event) -> Result<()> {
         // Before anything else: a download this event queues completes after it.
+        #[cfg(feature = "observation")]
         match &event {
             crate::Event::LocalInsert { namespace, entry } => {
                 self.subscribers
@@ -2176,7 +2179,12 @@ impl LiveActor {
         opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     ) {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
-        let session = session_id(&conn);
+        // One key export per connection, for the observation alone.
+        let session = if cfg!(feature = "observation") {
+            session_id(&conn)
+        } else {
+            None
+        };
         let accept_request_cb = self.accept_callback();
         let sync = self.sync.handle().clone();
         self.running_sync_accept.spawn(
@@ -2298,6 +2306,7 @@ impl SubscribersMap {
     }
 
     /// Builds the event only for a namespace with an ordered subscriber.
+    #[cfg(feature = "observation")]
     async fn send_ordered(&mut self, namespace: &NamespaceId, event: impl FnOnce() -> Event) {
         if let Some(subscribers) = self.ordered.get_mut(namespace) {
             subscribers.send_with(event).await;
