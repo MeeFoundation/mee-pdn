@@ -273,6 +273,17 @@ impl Engine {
         Ok(reply_rx.await?)
     }
 
+    /// What this engine's payload fetches stand at — per provider the
+    /// fetches in flight, the payloads queued and any pause — and the
+    /// payloads parked, for a failure message.
+    pub async fn fetches_report(&self) -> Result<String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::FetchesReport { reply })
+            .await?;
+        Ok(reply_rx.await?)
+    }
+
     /// What [`Self::syncs_in_flight`] counts, each exchange, held dial and
     /// due redial named, for a scenario's failure message.
     pub async fn syncs_in_flight_report(&self, namespaces: Vec<NamespaceId>) -> Result<String> {

@@ -185,6 +185,11 @@ pub(crate) enum ToLiveActor {
         reply: sync::oneshot::Sender<usize>,
     },
     /// What [`ToLiveActor::SyncsInFlight`] counts, each item named.
+    /// [`LiveActor::fetches_report`].
+    FetchesReport {
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<String>,
+    },
     SyncsInFlightReport {
         namespaces: Vec<NamespaceId>,
         #[debug("onsehot::Sender")]
@@ -513,6 +518,10 @@ pub(crate) struct LiveActor {
     /// with the pair ends any other way or the neighbor leaves; a series
     /// run out stays until then.
     unreached_dials: HashMap<(NamespaceId, PublicKey, Identity), RetrySeries>,
+    /// Pairs whose last dial the remote refused, until a session with the
+    /// pair goes through: a dial of theirs crossing one of ours takes the
+    /// pair over.
+    refused_dials: HashSet<(NamespaceId, PublicKey, Identity)>,
     /// The id the next [`RetrySeries`] takes.
     next_retry_series: u64,
     /// The topics each peer is a gossip neighbor in: a connection with a
@@ -580,6 +589,7 @@ impl LiveActor {
             redials_due: Default::default(),
             redial_streaks: Default::default(),
             unreached_dials: Default::default(),
+            refused_dials: Default::default(),
             next_retry_series: 0,
             neighbors: Default::default(),
             in_process_sessions,
@@ -769,6 +779,9 @@ impl LiveActor {
             }
             ToLiveActor::SyncsInFlight { namespaces, reply } => {
                 reply.send(self.syncs_in_flight(&namespaces)).ok();
+            }
+            ToLiveActor::FetchesReport { reply } => {
+                reply.send(self.fetches_report()).ok();
             }
             ToLiveActor::SyncsInFlightReport { namespaces, reply } => {
                 reply.send(self.syncs_in_flight_report(&namespaces)).ok();
@@ -1183,6 +1196,8 @@ impl LiveActor {
                 .retain(|(tracked, _peer, _callee), _streak| *tracked != namespace);
             self.unreached_dials
                 .retain(|(tracked, _peer, _callee), _series| *tracked != namespace);
+            self.refused_dials
+                .retain(|(tracked, _peer, _callee)| *tracked != namespace);
             for hash in self.queued_hashes.remove_namespace(&namespace) {
                 self.fetches.unwant(&hash);
             }
@@ -1228,6 +1243,15 @@ impl LiveActor {
             .filter_map(|namespace| self.redials_due.get(namespace))
             .sum();
         running.saturating_add(held).saturating_add(due)
+    }
+
+    /// What the fetches stand at, and the payloads parked.
+    fn fetches_report(&self) -> String {
+        format!(
+            "{}; {} parked",
+            self.fetches.report(),
+            self.missing_hashes.len()
+        )
     }
 
     fn syncs_in_flight_report(&self, namespaces: &[NamespaceId]) -> String {
@@ -1416,6 +1440,9 @@ impl LiveActor {
                 self.redial_after(namespace, peer, callee, reason, delay, None);
             }
             res => {
+                if matches!(res, Err(ConnectError::RemoteAbort(AbortReason::NotFound))) {
+                    self.refused_dials.insert((namespace, peer, callee));
+                }
                 let unreached = matches!(res, Err(ConnectError::Connect { .. }));
                 if !unreached {
                     // The pair was reached, whatever the exchange came to.
@@ -1577,6 +1604,7 @@ impl LiveActor {
                 warn!(?origin, ?err, "sync failed");
             }
             Ok(ref details) => {
+                self.refused_dials.remove(&(namespace, peer, counterpart));
                 self.redial_streaks.remove(&(namespace, peer, counterpart));
                 self.unreached_dials.remove(&(namespace, peer, counterpart));
                 info!(
@@ -2079,8 +2107,15 @@ impl LiveActor {
         peer: PublicKey,
         caller: Identity,
     ) -> AcceptOutcome {
-        self.state
-            .accept_request(&self.endpoint.id(), self.identity, &namespace, peer, caller)
+        let refused_ours = self.refused_dials.contains(&(namespace, peer, caller));
+        self.state.accept_request(
+            &self.endpoint.id(),
+            self.identity,
+            &namespace,
+            peer,
+            caller,
+            refused_ours,
+        )
     }
 }
 

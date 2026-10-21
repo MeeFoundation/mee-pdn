@@ -93,6 +93,34 @@ impl Fetches {
         }
     }
 
+    /// Per provider the fetches in flight, the payloads queued and any
+    /// pause, and the payloads wanted, for a failure message.
+    pub(super) fn report(&self) -> String {
+        let mut lines: Vec<String> = self
+            .providers
+            .iter()
+            .filter(|(_, entry)| {
+                entry.in_flight > 0 || !entry.queue.is_empty() || entry.series.is_some()
+            })
+            .map(|(provider, entry)| {
+                let pause = match &entry.series {
+                    None => "",
+                    Some(series) if series.probing => ", probed",
+                    Some(_) => ", paused",
+                };
+                format!(
+                    "{}: {} in flight, {} queued{pause}",
+                    provider.fmt_short(),
+                    entry.in_flight,
+                    entry.queue.len()
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.push(format!("{} wanted", self.wanted.len()));
+        lines.join("; ")
+    }
+
     pub(super) fn is_wanted(&self, hash: &Hash) -> bool {
         self.wanted.contains_key(hash)
     }

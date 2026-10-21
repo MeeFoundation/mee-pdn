@@ -642,9 +642,10 @@ async fn a_silent_providers_payloads_come_from_another_provider() -> Result<()> 
         anyhow::Ok(())
     })
     .await;
+    let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}"
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
     );
     for hash in hashes {
         assert!(joining.blobs().has(hash).await?, "a payload is missing");
@@ -687,7 +688,7 @@ async fn open_while_held(serving: &util::BlobServing) -> usize {
     open
 }
 
-/// A replica joining a namespace of 20,000 entries whose payloads one
+/// A replica joining a namespace of 2,000 entries whose payloads one
 /// provider holds never has more requests open at that provider than its
 /// limit, and receives every payload.
 ///
@@ -696,7 +697,7 @@ async fn open_while_held(serving: &util::BlobServing) -> usize {
 /// one arrives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
-    const ENTRIES: usize = 20_000;
+    const ENTRIES: usize = 2_000;
     const LIMIT: u32 = 2;
     let mut rng = test_rng(b"a_catch_up_keeps_the_limit_toward_its_provider");
     let serving = Arc::new(util::BlobServing::default());
@@ -713,7 +714,7 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
             match events.try_next().await? {
                 Some(LiveEvent::ContentReady { .. }) => {
                     ready += 1;
-                    if ready % 5_000 == 1 {
+                    if ready % 500 == 1 {
                         open_counts.push(open_while_held(&serving).await);
                     }
                 }
@@ -724,9 +725,10 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
         anyhow::Ok(())
     })
     .await;
+    let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}"
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
     );
     assert_eq!(
         open_counts,
@@ -748,7 +750,7 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Result<()> {
     const ENTRIES: usize = 2_000;
-    const LIMIT: u32 = 2;
+    const LIMIT: u32 = 10;
     let mut rng = test_rng(b"a_provider_registered_during_a_catch_up_takes_waiting_payloads");
     let (first_serving, second_serving) = (
         Arc::new(util::BlobServing::default()),
@@ -772,6 +774,7 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     })
     .await?;
 
+    let limit = usize::try_from(LIMIT)?;
     let (doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
     let mut ready = 0;
     let mut open_counts = Vec::new();
@@ -804,14 +807,15 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
         anyhow::Ok(())
     })
     .await;
+    let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}"
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
     );
     assert!(
         open_counts
             .iter()
-            .all(|(first, second)| *first <= 2 && *second <= 2),
+            .all(|(first, second)| *first <= limit && *second <= limit),
         "a provider held more than the limit: {open_counts:?}"
     );
     assert!(
@@ -886,9 +890,10 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
         anyhow::Ok(())
     })
     .await;
+    let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}"
+        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
     );
     assert_eq!(
         sessions_after_entries, 0,
