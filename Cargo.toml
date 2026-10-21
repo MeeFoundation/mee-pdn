@@ -18,7 +18,8 @@ exclude = [
 resolver = "2"
 
 [workspace.dependencies]
-# The iroh stack is pinned here so every consumer agrees.
+# The iroh stack is pinned here so every consumer agrees. A bump of any of the
+# three owes the pass of crates/pdn-store/UPSTREAM.md (ADR-0016).
 iroh = "1.3"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
@@ -27,10 +28,15 @@ tracing = "0.1"
 pdn-store = { path = "crates/pdn-store" }
 
 [patch.crates-io]
-# Upstream's latest release plus the fix for a store runtime dropped on its own
-# thread, which hangs a failed blob store open forever. What the fork carries
-# and when it goes: UPSTREAM.md in the fork.
+# Each patch answers the iroh defects it names, listed with their state
+# upstream in mia-docs' components/mee-pdn/iroh-defects.md.
+# iroh-blobs-001: upstream's latest release with the fix. What the fork
+# carries and when it goes: UPSTREAM.md in the fork.
 iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
+# iroh-gossip-001: upstream's main, fixed and unreleased.
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "6cbbafa865c1b60c813dd8f12f78a54a45c1ecb1" }
+# iroh-util-001: upstream's main, fixed and unreleased.
+iroh-util = { git = "https://github.com/n0-computer/iroh-util", rev = "603d8907247e867c1451fff161ed9fb4070ce853" }
 
 # Full debug info is copied into every test binary and build variant, and on
 # macOS into object files beside them: tens of gigabytes of target/. Backtraces
@@ -45,6 +51,11 @@ debug = false
 unsafe_code = "deny"
 unused_must_use = "deny"
 non_ascii_idents = "deny"
+
+# No crate here is published: its docs are read in the source or in a build
+# with private items, where a link from a public item to a private one works.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
 
 [workspace.lints.clippy]
 # Groups

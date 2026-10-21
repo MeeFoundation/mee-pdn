@@ -14,8 +14,8 @@
 # artifacts, repository directories, environment files (a checkout may hold
 # one at any level), editor droppings, and the agent instruction files each
 # crate carries — one of which is machine-local and private. Named rather
-# than excluded as markdown, because a crate's README can be a build input:
-# the store's lands in its own rustdoc through `include_str!`.
+# than excluded as markdown: a markdown file a crate pulls into its rustdoc
+# through `include_str!` is a build input, though no crate does so now.
 **/target
 **/.git
 **/.env

@@ -1,21 +1,20 @@
-//! Handlers and actors to for live syncing replicas.
+//! The engine and its actors for live syncing replicas.
 //!
-//! [`crate::Replica`] is also called documents here.
+//! `Replica` is also called documents here.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use iroh::{Endpoint, PublicKey};
 use iroh_blobs::{
-    api::{blobs::BlobStatus, downloader::Downloader, Store},
-    store::{ProtectCb, ProtectOutcome},
+    api::{blobs::BlobStatus, Store},
     Hash,
 };
 use iroh_gossip::net::Gossip;
 use n0_future::{boxed::BoxStream, task::AbortOnDropHandle, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, error_span, Instrument};
+use tracing::{error, error_span, Instrument};
 
 use self::{
     held::HeldPayloads,
@@ -26,8 +25,8 @@ pub use self::{
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, Contact, ContentStatus,
-    ContentStatusCallback, Entry, Identity, NamespaceId,
+    actor::SyncHandle, Author, AuthorId, Contact, ContentStatus, ContentStatusCallback, Entry,
+    Identity, NamespaceId,
 };
 
 mod gossip;
@@ -75,11 +74,11 @@ const SUBSCRIBE_CHANNEL_CAP: usize = 256;
 #[derive(derive_more::Debug)]
 pub struct Engine {
     /// [`Endpoint`] used by the engine.
-    pub endpoint: Endpoint,
+    pub(crate) endpoint: Endpoint,
     /// Handle to the actor thread.
     pub sync: SyncHandle,
     /// The persistent default author for this engine.
-    pub default_author: DefaultAuthor,
+    pub(crate) default_author: DefaultAuthor,
     to_live_actor: mpsc::Sender<ToLiveActor>,
     #[allow(dead_code)]
     actor_handle: AbortOnDropHandle<()>,
@@ -95,23 +94,21 @@ pub struct Engine {
     /// so a dial can be shown to reach only the identity it named.
     in_process_served: std::sync::Mutex<std::collections::HashMap<Identity, u64>>,
     held_payloads: Arc<HeldPayloads>,
-    _gc_protect_task: AbortOnDropHandle<()>,
 }
 
 impl Engine {
     /// Start the sync engine.
     ///
-    /// This will spawn two tokio tasks for the live sync coordination and gossip actors, and a
-    /// thread for the actor interacting with doc storage.
+    /// This spawns a tokio task for the live sync coordination and a thread for the actor
+    /// interacting with doc storage; the gossip it is handed runs on its own.
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn(
+    pub(crate) async fn spawn(
         endpoint: Endpoint,
         gossip: Gossip,
         replica_store: crate::store::Store,
         bao_store: iroh_blobs::api::Store,
-        downloader: Downloader,
+        fetches_per_provider: usize,
         default_author_storage: DefaultAuthorStorage,
-        protect_cb: Option<ProtectCallbackHandler>,
         session_access: crate::filter::SessionAccessProvider,
         identity: Identity,
         co_located: Option<CoLocatedRequests>,
@@ -132,36 +129,6 @@ impl Engine {
         let sync = SyncHandle::spawn(replica_store, Some(content_status_cb.clone()), me.clone());
 
         let held_payloads = Arc::new(HeldPayloads::default());
-        let sync2 = sync.clone();
-        let held2 = Arc::clone(&held_payloads);
-        let gc_protect_task = AbortOnDropHandle::new(n0_future::task::spawn(async move {
-            let Some(mut protect_handler) = protect_cb else {
-                return;
-            };
-            while let Some(reply_tx) = protect_handler.0.recv().await {
-                let (tx, rx) = mpsc::channel(64);
-                if let Err(_err) = reply_tx.send(rx) {
-                    continue;
-                }
-                let hashes = match collection_hashes(&sync2, &held2).await {
-                    Ok(hashes) => hashes,
-                    Err(err) => {
-                        debug!("protect task: getting content hashes failed with {err:#}");
-                        if let Err(_err) = tx.send(Err(err)).await {
-                            debug!("protect task: failed to forward error");
-                        }
-                        continue;
-                    }
-                };
-                for hash in hashes {
-                    if let Err(_err) = tx.send(Ok(hash)).await {
-                        debug!("protect task: failed to forward hash");
-                        break;
-                    }
-                }
-            }
-        }));
-
         let in_process_sessions = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let actor = LiveActor::new(
             sync.clone(),
@@ -169,14 +136,13 @@ impl Engine {
             gossip.clone(),
             bao_store.clone(),
             Arc::clone(&held_payloads),
-            downloader,
+            fetches_per_provider,
             to_live_actor_recv,
             live_actor_tx.clone(),
             session_access,
             identity,
             Arc::clone(&in_process_sessions),
             co_located,
-            sync.metrics().clone(),
         )?;
         // Held from the spawn: the actor holds its node's request channel,
         // so a bare handle dropped by a failed or cancelled spawn would
@@ -212,7 +178,6 @@ impl Engine {
             in_process_sessions,
             in_process_served: std::sync::Mutex::default(),
             held_payloads,
-            _gc_protect_task: gc_protect_task,
         })
     }
 
@@ -231,20 +196,15 @@ impl Engine {
     }
 
     /// Get the blob store.
-    pub fn blob_store(&self) -> &Store {
+    pub(crate) fn blob_store(&self) -> &Store {
         &self.blob_store
-    }
-
-    /// Returns the metrics tracked for this engine.
-    pub fn metrics(&self) -> &Arc<Metrics> {
-        self.sync.metrics()
     }
 
     /// Start to sync a document.
     ///
-    /// If `peers` is non-empty, it will both do an initial set-reconciliation sync with each peer,
-    /// and join an iroh-gossip swarm with these peers to receive and broadcast document updates.
-    pub async fn start_sync(
+    /// Joins the document's iroh-gossip swarm, bootstrapped from `peers` and every peer the store
+    /// recorded, and does an initial set-reconciliation sync with each of them.
+    pub(crate) async fn start_sync(
         &self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
@@ -254,11 +214,13 @@ impl Engine {
             .await
     }
 
-    /// [`Self::sync_with_peers`] with no recorded peer and the swarm joined —
+    /// [`Doc::sync_with_peers`](crate::api::Doc::sync_with_peers) with no
+    /// recorded peer and the swarm joined —
     /// a pod store's start in the data layer — with an ordered subscription
     /// attached, as [`Self::observe`] gives it: registered before the replica is opened
     /// for sync and before its first dial, so it reports that sync from its
     /// first event. For a replica already syncing it is [`Self::observe`].
+    #[cfg(feature = "observation")]
     pub async fn start_sync_observed(
         &self,
         namespace: NamespaceId,
@@ -286,26 +248,10 @@ impl Engine {
             .await
     }
 
-    /// Start to sync a document without ever joining its gossip swarm.
-    ///
-    /// The scoped-access path: an initial set-reconciliation sync runs with
-    /// each peer, but the node stays outside the replica's swarm —
-    /// reconciliation is its only data path, so it sees updates on its next
-    /// sync, never over gossip.
-    pub async fn start_sync_scoped(
-        &self,
-        namespace: NamespaceId,
-        peers: Vec<Contact>,
-        default_identity: Identity,
-    ) -> Result<()> {
-        self.sync_with(namespace, peers, None, Some(default_identity), false, None)
-            .await
-    }
-
     /// Sync a document with `peers` and the recorded peers in `recorded`
     /// alone, none of the others this engine recorded for it; `join_gossip`
-    /// as in [`Self::start_sync`] and [`Self::start_sync_scoped`].
-    pub async fn sync_with_peers(
+    /// joins the swarm as [`Self::start_sync`] does.
+    pub(crate) async fn sync_with_peers(
         &self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
@@ -351,6 +297,17 @@ impl Engine {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::SyncsInFlight { namespaces, reply })
+            .await?;
+        Ok(reply_rx.await?)
+    }
+
+    /// What this engine's payload fetches stand at — per provider the
+    /// fetches in flight, the payloads queued and any pause — and the
+    /// payloads parked, for a failure message.
+    pub async fn fetches_report(&self) -> Result<String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::FetchesReport { reply })
             .await?;
         Ok(reply_rx.await?)
     }
@@ -412,18 +369,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Stop the live sync for a document and leave the gossip swarm.
-    ///
-    /// If `kill_subscribers` is true, all existing event subscribers will be dropped. This means
-    /// they will receive `None` and no further events in case of rejoining the document.
-    pub async fn leave(&self, namespace: NamespaceId, kill_subscribers: bool) -> Result<()> {
+    /// Leaves `namespace` and deletes its replica in one step of the live
+    /// actor: a start of sync queued behind it finds no replica, where one
+    /// taken between the two would reopen the replica and fail the delete.
+    pub(crate) async fn drop_replica(&self, namespace: NamespaceId) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
-            .send(ToLiveActor::Leave {
-                namespace,
-                kill_subscribers,
-                reply,
-            })
+            .send(ToLiveActor::DropReplica { namespace, reply })
             .await?;
         reply_rx.await??;
         Ok(())
@@ -432,12 +384,13 @@ impl Engine {
     /// Leave a document's gossip swarm without stopping its live sync.
     ///
     /// The narrow inverse of the swarm join that [`Self::start_sync`]
-    /// performs, for downgrading a replica to scoped access: the replica
-    /// stays open and syncing — reconciliation keeps accepting and dialing,
-    /// event subscribers stay live — while the gossip channel closes in
-    /// both directions. Idempotent: leaving a swarm that was never joined
-    /// does nothing. A later [`Self::start_sync`] re-joins.
-    pub async fn leave_gossip(&self, namespace: NamespaceId) -> Result<()> {
+    /// performs, for a replica held out of its swarm: the replica stays
+    /// open and syncing — reconciliation keeps accepting and dialing, event
+    /// subscribers stay live — while the gossip channel closes in both
+    /// directions. Idempotent: leaving a swarm that was never joined does
+    /// nothing. A later [`Self::start_sync`], or a
+    /// [`Self::sync_with_peers`] that joins the swarm, re-joins.
+    pub(crate) async fn leave_gossip(&self, namespace: NamespaceId) -> Result<()> {
         let (reply, reply_rx) = oneshot::channel();
         self.to_live_actor
             .send(ToLiveActor::LeaveGossip { namespace, reply })
@@ -447,7 +400,7 @@ impl Engine {
     }
 
     /// Subscribe to replica and sync progress events.
-    pub async fn subscribe(
+    pub(crate) async fn subscribe(
         &self,
         namespace: NamespaceId,
     ) -> Result<impl Stream<Item = Result<LiveEvent>> + Unpin + 'static> {
@@ -489,6 +442,7 @@ impl Engine {
     /// reader that falls behind, then drops behind one [`LiveEvent::Lagged`].
     /// Refused for a replica the live sync does not hold open; ends when the
     /// sync leaves the replica with its subscribers.
+    #[cfg(feature = "observation")]
     pub async fn observe(
         &self,
         namespace: NamespaceId,
@@ -516,14 +470,14 @@ impl Engine {
     }
 
     /// The identity every replica of this engine is held for.
-    pub fn identity(&self) -> Identity {
+    pub(crate) fn identity(&self) -> Identity {
         self.identity
     }
 
     /// Serve a connection dispatched here by the identity its first message
     /// named. The connection travels with the session it carries: dropping
     /// it at the dispatcher would cut the streams mid-exchange.
-    pub async fn handle_session(
+    pub(crate) async fn handle_session(
         &self,
         conn: iroh::endpoint::Connection,
         opening: crate::net::SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
@@ -703,17 +657,15 @@ impl LiveEvent {
 
 /// Where to persist the default author.
 ///
-/// If set to `Mem`, a new author will be created in the docs store before spawning the sync
-/// engine. Changing the default author will not be persisted.
+/// If set to `Mem`, a new author is created in the docs store at every spawn of the engine.
 ///
 /// If set to `Persistent`, the default author will be loaded from and persisted to the specified
 /// path (as hex encoded string of the author's public key).
 #[derive(Debug)]
-pub enum DefaultAuthorStorage {
+pub(crate) enum DefaultAuthorStorage {
     /// Memory storage.
     Mem,
     /// File based persistent storage.
-    #[cfg(feature = "fs-store")]
     Persistent(std::path::PathBuf),
 }
 
@@ -722,7 +674,7 @@ impl DefaultAuthorStorage {
     ///
     /// Will create and save a new author if the storage is empty.
     ///
-    /// Returns an error if the author can't be parsed or if the uathor does not exist in the docs
+    /// Returns an error if the author can't be parsed or if the author does not exist in the docs
     /// store.
     pub async fn load(&self, docs_store: &SyncHandle) -> anyhow::Result<AuthorId> {
         match self {
@@ -732,7 +684,6 @@ impl DefaultAuthorStorage {
                 docs_store.import_author(author).await?;
                 Ok(author_id)
             }
-            #[cfg(feature = "fs-store")]
             Self::Persistent(ref path) => {
                 use std::str::FromStr;
 
@@ -773,33 +724,46 @@ impl DefaultAuthorStorage {
     }
 
     /// Save a new default author.
-    pub async fn persist(&self, #[allow(unused)] author_id: AuthorId) -> anyhow::Result<()> {
+    async fn persist(&self, author_id: AuthorId) -> anyhow::Result<()> {
         match self {
             Self::Mem => {
                 // persistence is not possible for the mem storage so this is a noop.
             }
-            #[cfg(feature = "fs-store")]
             Self::Persistent(ref path) => {
                 use anyhow::Context;
-                tokio::fs::write(path, author_id.to_string())
+                let path = path.clone();
+                let context = format!(
+                    "Failed to write the default author to `{}`",
+                    path.to_string_lossy()
+                );
+                tokio::task::spawn_blocking(move || write_whole(&path, author_id.to_string()))
                     .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to write the default author to `{}`",
-                            path.to_string_lossy()
-                        )
-                    })?;
+                    .context(context.clone())?
+                    .context(context)?;
             }
         }
         Ok(())
     }
 }
 
+/// Written beside and renamed over, so a crash leaves `path` whole or absent:
+/// a torn file fails every later start.
+fn write_whole(path: &std::path::Path, contents: String) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let staged = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(contents.as_bytes())?;
+        // A rename can commit before the data reaches the disk.
+        file.sync_all()?;
+    }
+    std::fs::rename(&staged, path)
+}
+
 /// Persistent default author for a docs engine.
 #[derive(Debug)]
-pub struct DefaultAuthor {
-    value: RwLock<AuthorId>,
-    storage: DefaultAuthorStorage,
+pub(crate) struct DefaultAuthor {
+    value: AuthorId,
 }
 
 impl DefaultAuthor {
@@ -808,25 +772,12 @@ impl DefaultAuthor {
     /// If the storage is empty creates a new author and persists it.
     pub async fn load(storage: DefaultAuthorStorage, docs_store: &SyncHandle) -> Result<Self> {
         let value = storage.load(docs_store).await?;
-        Ok(Self {
-            value: RwLock::new(value),
-            storage,
-        })
+        Ok(Self { value })
     }
 
     /// Get the current default author.
     pub fn get(&self) -> AuthorId {
-        *self.value.read().unwrap()
-    }
-
-    /// Set the default author.
-    pub async fn set(&self, author_id: AuthorId, docs_store: &SyncHandle) -> Result<()> {
-        if docs_store.export_author(author_id).await?.is_none() {
-            bail!("The author does not exist");
-        }
-        self.storage.persist(author_id).await?;
-        *self.value.write().unwrap() = author_id;
-        Ok(())
+        self.value
     }
 }
 
@@ -842,73 +793,4 @@ async fn collection_hashes(sync: &SyncHandle, held: &HeldPayloads) -> Result<Vec
         held.restore(taken);
     }
     read
-}
-
-#[derive(Debug)]
-struct ProtectCallbackSender(mpsc::Sender<oneshot::Sender<mpsc::Receiver<Result<Hash>>>>);
-
-/// The handler for a blobs protection callback.
-///
-/// See [`ProtectCallbackHandler::new`].
-#[derive(Debug)]
-pub struct ProtectCallbackHandler(
-    pub(crate) mpsc::Receiver<oneshot::Sender<mpsc::Receiver<Result<Hash>>>>,
-);
-
-impl ProtectCallbackHandler {
-    /// Creates a callback and handler to manage blob protection.
-    ///
-    /// The returned [`ProtectCb`] must be passed set in the [`GcConfig`] of the [`iroh_blobs`] store where
-    /// the blobs for hashes in documents are persisted. The [`ProtectCallbackHandler`] must be passed to
-    /// [`Builder::protect_handler`] (or [`Engine::spawn`]). This will then ensure that hashes referenced
-    /// in docs will not be deleted from the blobs store, and will be garbage collected if they no longer appear
-    /// in any doc.
-    ///
-    /// [`Builder::protect_handler`]: crate::protocol::Builder::protect_handler
-    /// [`GcConfig`]: iroh_blobs::store::GcConfig
-    pub fn new() -> (Self, ProtectCb) {
-        let (tx, rx) = mpsc::channel(4);
-        let cb = ProtectCallbackSender(tx).into_cb();
-        let handler = ProtectCallbackHandler(rx);
-        (handler, cb)
-    }
-}
-
-impl ProtectCallbackSender {
-    fn into_cb(self) -> ProtectCb {
-        let start_tx = self.0.clone();
-        Arc::new(move |live| {
-            let start_tx = start_tx.clone();
-            Box::pin(async move {
-                let (tx, rx) = oneshot::channel();
-                if let Err(_err) = start_tx.send(tx).await {
-                    tracing::warn!(
-                        "Failed to get protected hashes from docs: ProtectCallback receiver dropped"
-                    );
-                    return ProtectOutcome::Abort;
-                }
-                let mut rx = match rx.await {
-                    Ok(rx) => rx,
-                    Err(_err) => {
-                        tracing::warn!(
-                            "Failed to get protected hashes from docs: ProtectCallback sender dropped"
-                        );
-                        return ProtectOutcome::Abort;
-                    }
-                };
-                while let Some(res) = rx.recv().await {
-                    match res {
-                        Err(err) => {
-                            tracing::warn!("Getting protected hashes produces error: {err:#}");
-                            return ProtectOutcome::Abort;
-                        }
-                        Ok(hash) => {
-                            live.insert(hash);
-                        }
-                    }
-                }
-                ProtectOutcome::Continue
-            })
-        })
-    }
 }

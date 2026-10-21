@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use data_layer::{
     pdn_id_of, pod_ticket_kind, AcceptError, AddrInfoOptions, CatchUpTimeout, Connection,
-    DocTicket, PodStore, PrivateMetadataStore, ProtocolHandler, ShareMode, SyncNode,
+    DocTicket, PodStore, PrivateMetadataStore, ProtocolHandler, SyncNode,
 };
 use pdn_node::{
     DialogueTimeout, IdentityService as _, InviterUnreachable, LinkingLocalFailure, LinkingPayload,
@@ -681,7 +681,7 @@ async fn a_timed_out_link_leaves_nothing_behind_on_the_dialing_node() -> Result<
     scratch.provision_identity(ids::DAVE).await?;
     let dead_pms = PrivateMetadataStore::create(&scratch, ids::DAVE).await?;
     let pms_ticket = dead_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
     scratch.shutdown().await?;
 

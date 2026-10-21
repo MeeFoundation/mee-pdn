@@ -18,13 +18,13 @@ permissions:
   contents: read
 
 jobs:
-  lint-test-wasm:
+  lint-test:
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Channel, components and targets from rust-toolchain.toml, in every job.
+      # Channel and components from rust-toolchain.toml, in every job.
       - name: Install Rust toolchain
         run: rustup toolchain install
 
@@ -44,39 +44,9 @@ jobs:
       - name: Run tests
         run: just test
 
-  # The store under its other feature sets and on the wasm32 target — the
-  # configurations the workspace build never compiles, so a break in them is
-  # invisible to the job above. Its own job, so its two extra builds of the
-  # iroh stack run beside the workspace's rather than after it.
-  store:
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install
-
-      - name: Install just + nextest
-        uses: ./.github/actions/install-tools
-        with:
-          tools: just cargo-nextest
-
-      - name: Cache cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: . -> target
-
-      - name: Lint the store's other feature sets, docs, and wasm build
-        run: just check-store
-
-      - name: Test the store's other feature sets and doctests
-        run: just test-store
-
-  # The facade for the 2 targets a device runs. Nothing below it had ever
-  # been compiled for either before the portability spike, so a break here
-  # is a break of the whole mobile host — and it is invisible to
-  # `lint-test-wasm`, which builds for this runner's own target.
+  # The facade for the 2 targets a device runs: a break here is a break of
+  # the whole mobile host, and `lint-test` builds for this runner's target
+  # alone.
   mobile-android:
     runs-on: ubuntu-26.04
     steps:

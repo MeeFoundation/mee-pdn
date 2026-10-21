@@ -8,14 +8,14 @@ use crate::{store::KeyFilter, AuthorId, NamespaceId};
 /// Bounds on the records table.
 ///
 /// Supports bounds by author, key
-pub struct RecordsBounds(Bound<RecordsIdOwned>, Bound<RecordsIdOwned>);
+pub(crate) struct RecordsBounds(Bound<RecordsIdOwned>, Bound<RecordsIdOwned>);
 
 impl RecordsBounds {
     pub fn new(start: Bound<RecordsIdOwned>, end: Bound<RecordsIdOwned>) -> Self {
         Self(start, end)
     }
 
-    pub fn author_key(ns: NamespaceId, author: AuthorId, key_matcher: KeyFilter) -> Self {
+    pub(crate) fn author_key(ns: NamespaceId, author: AuthorId, key_matcher: KeyFilter) -> Self {
         let key_is_exact = matches!(key_matcher, KeyFilter::Exact(_));
         let key = match key_matcher {
             KeyFilter::Any => Bytes::new(),
@@ -46,7 +46,7 @@ impl RecordsBounds {
     }
 
     #[cfg(test)]
-    pub fn author_prefix(ns: NamespaceId, author: AuthorId, prefix: Bytes) -> Self {
+    pub(crate) fn author_prefix(ns: NamespaceId, author: AuthorId, prefix: Bytes) -> Self {
         RecordsBounds::author_key(ns, author, KeyFilter::Prefix(prefix))
     }
 
@@ -54,11 +54,11 @@ impl RecordsBounds {
         Self::new(Self::namespace_start(&ns), Self::namespace_end(&ns))
     }
 
-    pub fn from_start(ns: &NamespaceId, end: Bound<RecordsIdOwned>) -> Self {
+    pub(crate) fn from_start(ns: &NamespaceId, end: Bound<RecordsIdOwned>) -> Self {
         Self::new(Self::namespace_start(ns), end)
     }
 
-    pub fn to_end(ns: &NamespaceId, start: Bound<RecordsIdOwned>) -> Self {
+    pub(crate) fn to_end(ns: &NamespaceId, start: Bound<RecordsIdOwned>) -> Self {
         Self::new(start, Self::namespace_end(ns))
     }
 
@@ -102,7 +102,7 @@ impl From<(Bound<RecordsIdOwned>, Bound<RecordsIdOwned>)> for RecordsBounds {
 /// Bounds for the by-key index table.
 ///
 /// Supports bounds by key.
-pub struct ByKeyBounds(Bound<RecordsByKeyIdOwned>, Bound<RecordsByKeyIdOwned>);
+pub(crate) struct ByKeyBounds(Bound<RecordsByKeyIdOwned>, Bound<RecordsByKeyIdOwned>);
 impl ByKeyBounds {
     pub fn new(ns: NamespaceId, matcher: &KeyFilter) -> Self {
         match matcher {
@@ -185,6 +185,9 @@ fn map_bound<'a, T, U: 'a>(bound: &'a Bound<T>, f: impl Fn(&'a T) -> U) -> Bound
 mod tests {
     use super::*;
 
+    /// The records table's bounds: a prefix ends before its successor, an
+    /// exact key is one point, and a bound whose successor would overflow — a
+    /// namespace or an author of all 255 bytes — stays open.
     #[test]
     fn records_bounds() {
         let ns = NamespaceId::from(&[255u8; 32]);
@@ -235,6 +238,9 @@ mod tests {
         );
     }
 
+    /// The by-key index's bounds: a prefix ends before its successor, an
+    /// all-255 prefix at the next namespace or open past the last one, and an
+    /// exact key spans every author at that key.
     #[test]
     fn by_key_bounds() {
         let ns = NamespaceId::from(&[255u8; 32]);

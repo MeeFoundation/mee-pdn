@@ -94,9 +94,8 @@ jobs:
     needs: dependency-audit
     runs-on: ubuntu-26.04
     # One pass of the scenario tests is about two minutes on a development
-    # machine and slower on a runner's four cores. The repeat count is the
-    # number to revisit once a first night has measured that: the budget is
-    # what the job is allowed to take, not what the hunt is worth.
+    # machine and slower on a runner's four cores. The budget is what the job
+    # is allowed to take, not what the hunt is worth.
     timeout-minutes: 120
     steps:
       - name: Checkout

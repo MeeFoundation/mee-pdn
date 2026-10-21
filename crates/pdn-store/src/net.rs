@@ -9,14 +9,13 @@ use tracing::{debug, error_span, trace, Instrument};
 
 use crate::{
     actor::SyncHandle,
-    metrics::Metrics,
     net::codec::{run_alice, BobState, DialAccess},
     Identity, NamespaceId, SyncOutcome,
 };
 
 pub use crate::net::codec::SessionOpening;
 
-/// The ALPN identifier for the iroh-docs protocol
+/// The sync protocol's ALPN, the name upstream iroh-docs gives its own.
 pub const ALPN: &[u8] = b"/iroh-sync/1";
 
 mod codec;
@@ -28,7 +27,7 @@ mod codec;
 /// The value carries a first sync of a large store over a slow link: about
 /// 2.8 MB, the served set of 10,000 entries in one message, from roughly 75
 /// kbit/s up.
-pub const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Names one session over a network connection: both ends export it from
 /// the connection's keying material, so they report the same id and no other
@@ -61,7 +60,7 @@ pub(crate) fn session_id(connection: &iroh::endpoint::Connection) -> Option<Sess
 /// setup, so the served view is stable across the exchange; entries
 /// written meanwhile travel on the next session. The snapshot is released
 /// when the session ends, on every path. The whole exchange is bounded by
-/// [`SYNC_SESSION_TIMEOUT`].
+/// `SYNC_SESSION_TIMEOUT`.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_and_sync(
     endpoint: &Endpoint,
@@ -70,7 +69,6 @@ pub async fn connect_and_sync(
     identity: Identity,
     caller: Identity,
     peer: EndpointAddr,
-    metrics: Option<&Metrics>,
     filter: Option<crate::filter::EntryFilter>,
     ingest: crate::filter::SessionIngest,
 ) -> Result<SyncFinished, ConnectError> {
@@ -83,7 +81,6 @@ pub async fn connect_and_sync(
             identity,
             caller,
             peer,
-            metrics,
             DialAccess::Given {
                 filter,
                 ingest: Some(ingest),
@@ -113,7 +110,6 @@ pub(crate) async fn connect_and_sync_asking(
     identity: Identity,
     caller: Identity,
     peer: EndpointAddr,
-    metrics: Option<&Metrics>,
     access: &crate::filter::SessionAccessProvider,
     session: &mut Option<SessionId>,
 ) -> Result<SyncFinished, ConnectError> {
@@ -126,7 +122,6 @@ pub(crate) async fn connect_and_sync_asking(
             identity,
             caller,
             peer,
-            metrics,
             DialAccess::Asked(access),
             session,
         ),
@@ -148,7 +143,6 @@ async fn connect_and_sync_inner(
     identity: Identity,
     caller: Identity,
     peer: EndpointAddr,
-    metrics: Option<&Metrics>,
     access: DialAccess<'_>,
     session: &mut Option<SessionId>,
 ) -> Result<SyncFinished, ConnectError> {
@@ -159,7 +153,9 @@ async fn connect_and_sync_inner(
         .connect(peer, crate::ALPN)
         .await
         .map_err(ConnectError::connect)?;
-    *session = session_id(&connection);
+    if cfg!(feature = "observation") {
+        *session = session_id(&connection);
+    }
 
     let (mut send_stream, mut recv_stream) =
         connection.open_bi().await.map_err(ConnectError::connect)?;
@@ -193,14 +189,6 @@ async fn connect_and_sync_inner(
         Ok(())
     }
     .await;
-
-    if let Some(metrics) = metrics {
-        if res.is_ok() {
-            metrics.sync_via_connect_success.inc();
-        } else {
-            metrics.sync_via_connect_failure.inc();
-        }
-    }
 
     let t_process = t_start.elapsed() - t_connect;
     match &res {
@@ -243,7 +231,7 @@ async fn connect_and_sync_inner(
 
 /// Whether we want to accept or reject an incoming sync request.
 #[derive(Clone)]
-pub enum AcceptOutcome {
+pub(crate) enum AcceptOutcome {
     /// Accept the sync request.
     Allow {
         /// This side's egress filter for the session: what the serving
@@ -264,7 +252,7 @@ pub enum AcceptOutcome {
 /// The access decision behind an accepted session: the snapshot opens after
 /// it, so a decision whose replicas were written in between is asked again.
 #[derive(Clone)]
-pub struct Recheck {
+pub(crate) struct Recheck {
     /// What the decision was read from.
     pub rests_on: crate::filter::RestsOn,
     /// Asks for the decision again; its answer stands.
@@ -322,8 +310,9 @@ pub async fn accept_session(
     })?
 }
 
-/// Refuse a session read this far, with the reason a caller that named a
-/// identity this node does not host is given. The refusal is the whole
+/// Refuse a session read this far with `reason` — the dispatcher gives a
+/// caller that named an identity this node does not host
+/// [`AbortReason::NotFound`]. The refusal is the whole
 /// message, so it is torn down like a served session: without waiting
 /// for the caller, the connection can end before the frame reaches it
 /// and the refusal arrives as a lost connection.
@@ -369,11 +358,10 @@ pub async fn refuse_session(
 /// semantics); a rejected request never opens one. The whole exchange is
 /// bounded by [`SYNC_SESSION_TIMEOUT`], mirroring [`connect_and_sync`]: a
 /// stalled accept blocks the pair just the same.
-pub async fn handle_session<F, Fut>(
+pub(crate) async fn handle_session<F, Fut>(
     sync: SyncHandle,
     opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     accept_cb: F,
-    metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
     F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
@@ -383,7 +371,7 @@ where
     let namespace = opening.namespace();
     match time::timeout(
         SYNC_SESSION_TIMEOUT,
-        handle_session_inner(sync, opening, accept_cb, metrics),
+        handle_session_inner(sync, opening, accept_cb),
     )
     .await
     {
@@ -400,7 +388,6 @@ async fn handle_session_inner<F, Fut>(
     sync: SyncHandle,
     opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     accept_cb: F,
-    metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
     F: Fn(NamespaceId, Identity, Identity, PublicKey) -> Fut,
@@ -409,7 +396,7 @@ where
     let t_start = Instant::now();
     let peer = opening.peer();
     let (res, outcome, mut send_stream, mut recv_stream) =
-        run_session(sync, opening, accept_cb, metrics).await;
+        run_session(sync, opening, accept_cb).await;
     let namespace = res.as_ref().ok().copied();
 
     // The exchange's own result wins: teardown fails as a consequence of
@@ -453,11 +440,10 @@ where
 /// inside this process. The codec, the session setup and the access
 /// provider calls are the network path's; only the teardown differs, a
 /// pipe having no peer to acknowledge the close.
-pub async fn handle_in_process_session<R, W, F, Fut>(
+pub(crate) async fn handle_in_process_session<R, W, F, Fut>(
     sync: SyncHandle,
     opening: SessionOpening<R, W>,
     accept_cb: F,
-    metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, AcceptError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -471,8 +457,7 @@ where
     // quiet on it, but the session holds a store snapshot and a
     // counterpart's slot either way, and nothing below carries a timeout.
     let session = time::timeout(SYNC_SESSION_TIMEOUT, async {
-        let (res, outcome, mut writer, _reader) =
-            run_session(sync, opening, accept_cb, metrics).await;
+        let (res, outcome, mut writer, _reader) = run_session(sync, opening, accept_cb).await;
         let _shut = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
         (res, outcome)
     })
@@ -502,7 +487,6 @@ async fn run_session<R, W, F, Fut>(
     sync: SyncHandle,
     opening: SessionOpening<R, W>,
     accept_cb: F,
-    metrics: Option<&Metrics>,
 ) -> (Result<NamespaceId, AcceptError>, SyncOutcome, W, R)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -519,14 +503,6 @@ where
         .instrument(span.clone())
         .await;
 
-    if let Some(metrics) = metrics {
-        if res.is_ok() {
-            metrics.sync_via_accept_success.inc();
-        } else {
-            metrics.sync_via_accept_failure.inc();
-        }
-    }
-
     let outcome = state.into_outcome();
     span.in_scope(|| match &res {
         Ok(_namespace) => debug!(sent = %outcome.num_sent, recv = %outcome.num_recv, "done, ok"),
@@ -540,7 +516,7 @@ where
 /// path uses, this side's access asked of `access` once the session's
 /// snapshot is open.
 #[allow(clippy::too_many_arguments)]
-pub async fn sync_in_process<R, W>(
+pub(crate) async fn sync_in_process<R, W>(
     sync: &SyncHandle,
     namespace: NamespaceId,
     identity: Identity,
@@ -548,7 +524,6 @@ pub async fn sync_in_process<R, W>(
     peer: PublicKey,
     writer: &mut W,
     reader: &mut R,
-    metrics: Option<&Metrics>,
     access: &crate::filter::SessionAccessProvider,
 ) -> Result<SyncFinished, ConnectError>
 where
@@ -577,13 +552,6 @@ where
         ))
     })?;
     let _shut = tokio::io::AsyncWriteExt::shutdown(writer).await;
-    if let Some(metrics) = metrics {
-        if res.is_ok() {
-            metrics.sync_via_connect_success.inc();
-        } else {
-            metrics.sync_via_connect_failure.inc();
-        }
-    }
     Ok(SyncFinished {
         namespace,
         peer,
@@ -600,17 +568,17 @@ where
 pub struct SyncFinished {
     /// The namespace that was synced.
     pub namespace: NamespaceId,
-    /// The peer we syned with.
+    /// The peer we synced with.
     pub peer: PublicKey,
     /// The outcome of the sync operation
-    pub outcome: SyncOutcome,
+    pub(crate) outcome: SyncOutcome,
     /// The time this operation took
-    pub timings: Timings,
+    pub(crate) timings: Timings,
 }
 
 /// Time a sync operation took
 #[derive(Debug, Default, Clone)]
-pub struct Timings {
+pub(crate) struct Timings {
     /// Time to establish connection
     pub connect: Duration,
     /// Time to run sync exchange

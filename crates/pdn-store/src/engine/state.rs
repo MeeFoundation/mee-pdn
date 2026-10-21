@@ -19,7 +19,7 @@ pub enum SyncReason {
     NewNeighbor,
     /// We synced after receiving a sync report that indicated news for us
     SyncReport,
-    /// We received a sync report while a sync was running, so run again afterwars
+    /// A dial was asked for while an exchange with the pair was running, so run again afterwards
     Resync,
     /// An in-process session with an identity of this same node: a write's
     /// announcement, a contact naming this node, or the periodic pass.
@@ -37,7 +37,7 @@ pub enum Origin {
 
 /// The state we're in for a node and a namespace
 #[derive(Debug, Clone, Default)]
-pub enum SyncState {
+pub(crate) enum SyncState {
     #[default]
     Idle,
     Running {
@@ -49,7 +49,7 @@ pub enum SyncState {
 /// Contains an entry for each active (syncing) namespace, and in there an entry for each
 /// counterpart we synced with.
 #[derive(Default)]
-pub struct NamespaceStates(BTreeMap<NamespaceId, NamespaceState>);
+pub(crate) struct NamespaceStates(BTreeMap<NamespaceId, NamespaceState>);
 
 /// A counterpart is a node id and the identity across the session — the
 /// callee when dialing, the caller when accepting. A node hosting two
@@ -66,7 +66,7 @@ struct NamespaceState {
 
 impl NamespaceStates {
     /// Are we syncing this namespace?
-    pub fn is_syncing(&self, namespace: &NamespaceId) -> bool {
+    pub(crate) fn is_syncing(&self, namespace: &NamespaceId) -> bool {
         self.0.contains_key(namespace)
     }
 
@@ -81,7 +81,7 @@ impl NamespaceStates {
 
     /// The counterparts of `namespace`'s running exchanges, each with how
     /// it began.
-    pub fn running_described(&self, namespace: &NamespaceId) -> Vec<String> {
+    pub(crate) fn running_described(&self, namespace: &NamespaceId) -> Vec<String> {
         self.0.get(namespace).map_or_else(Vec::new, |state| {
             state
                 .nodes
@@ -119,7 +119,7 @@ impl NamespaceStates {
     /// Start a sync request.
     ///
     /// Returns true if the request should be performed, and false if it should be aborted.
-    pub fn start_connect(
+    pub(crate) fn start_connect(
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
@@ -142,7 +142,7 @@ impl NamespaceStates {
     /// tie-break): that exchange finishes through the accept path.
     ///
     /// Returns true if the running outgoing exchange was cleared.
-    pub fn abort_connect(
+    pub(crate) fn abort_connect(
         &mut self,
         namespace: &NamespaceId,
         node: EndpointId,
@@ -158,18 +158,19 @@ impl NamespaceStates {
     /// Accept a sync request.
     ///
     /// Returns the [`AcceptOutcome`] to be performed.
-    pub fn accept_request(
+    pub(crate) fn accept_request(
         &mut self,
         me: &EndpointId,
         own_identity: Identity,
         namespace: &NamespaceId,
         node: EndpointId,
         caller: Identity,
+        refused_ours: bool,
     ) -> AcceptOutcome {
         let Some(state) = self.entry(namespace, (node, caller)) else {
             return AcceptOutcome::Reject(AbortReason::NotFound);
         };
-        state.accept_request(me, own_identity, &node, caller)
+        state.accept_request(me, own_identity, &node, caller, refused_ours)
     }
 
     /// Insert a finished sync operation into the state.
@@ -195,7 +196,11 @@ impl NamespaceStates {
     ///
     /// This should be set to `true` if there are pending content hashes after a sync finished, and
     /// to `false` whenever a `PendingContentReady` was emitted.
-    pub fn set_may_emit_ready(&mut self, namespace: &NamespaceId, value: bool) -> Option<()> {
+    pub(crate) fn set_may_emit_ready(
+        &mut self,
+        namespace: &NamespaceId,
+        value: bool,
+    ) -> Option<()> {
         let state = self.0.get_mut(namespace)?;
         state.may_emit_ready = value;
         Some(())
@@ -206,7 +211,7 @@ impl NamespaceStates {
     /// If this returns `false`, an event should not be emitted even if the queue becomes empty,
     /// because a currently running sync did not yet terminate. Once it terminates, the event will
     /// be emitted from the handler for finished syncs.
-    pub fn may_emit_ready(&mut self, namespace: &NamespaceId) -> Option<bool> {
+    pub(crate) fn may_emit_ready(&mut self, namespace: &NamespaceId) -> Option<bool> {
         let state = self.0.get_mut(namespace)?;
         if state.may_emit_ready {
             state.may_emit_ready = false;
@@ -313,12 +318,18 @@ impl PeerState {
         }
     }
 
+    /// `refused_ours`: the pair refused this side's last dial. A dial of
+    /// theirs crossing one of ours then takes the pair over, whatever the
+    /// tie-break: ours would be refused again, and theirs aborted in its
+    /// favour leaves no session at all (`reconciliation-sessions` spec, "A
+    /// dial crossing one its pair refused goes through").
     fn accept_request(
         &mut self,
         me: &EndpointId,
         own_identity: Identity,
         node: &EndpointId,
         caller: Identity,
+        refused_ours: bool,
     ) -> AcceptOutcome {
         let outcome = match &self.state {
             SyncState::Idle => AcceptOutcome::Allow {
@@ -331,6 +342,11 @@ impl PeerState {
                 // Incoming sync request while we are dialing ourselves.
                 // In this case, compare the binary representations of our and the other node's id
                 // to deterministically decide which of the two concurrent connections will succeed.
+                Origin::Connect(_reason) if refused_ours => AcceptOutcome::Allow {
+                    filter: None,
+                    ingest: crate::filter::admit_all(),
+                    recheck: None,
+                },
                 Origin::Connect(_reason) => {
                     match expected_sync_direction((me, own_identity), (node, caller)) {
                         SyncDirection::Accept => AcceptOutcome::Allow {
@@ -401,7 +417,6 @@ mod tests {
         NamespaceId::from(&[7u8; 32])
     }
 
-    /// Two deterministic endpoint ids, returned as (lower, higher) by key bytes.
     /// The identity across the session. Both directions of a mutual dial
     /// name the same one when each node hosts one identity, which is what
     /// makes the tie-break below meet its own dial.
@@ -415,6 +430,7 @@ mod tests {
         Identity::from_bytes([1u8; 32])
     }
 
+    /// Two deterministic endpoint ids, returned as (lower, higher) by key bytes.
     fn node_pair() -> (EndpointId, EndpointId) {
         let a = SecretKey::from_bytes(&[1u8; 32]).public();
         let b = SecretKey::from_bytes(&[2u8; 32]).public();
@@ -442,7 +458,7 @@ mod tests {
         let mut higher = NamespaceStates::default();
         higher.insert(namespace);
         assert!(higher.start_connect(&namespace, node, low, SyncReason::DirectJoin));
-        let accepted = higher.accept_request(&node, high, &namespace, node, low);
+        let accepted = higher.accept_request(&node, high, &namespace, node, low, false);
         assert!(
             matches!(accepted, AcceptOutcome::Allow { .. }),
             "the higher identity refused the exchange that should survive"
@@ -452,10 +468,42 @@ mod tests {
         let mut lower = NamespaceStates::default();
         lower.insert(namespace);
         assert!(lower.start_connect(&namespace, node, high, SyncReason::DirectJoin));
-        let refused = lower.accept_request(&node, low, &namespace, node, high);
+        let refused = lower.accept_request(&node, low, &namespace, node, high, false);
         assert!(
             matches!(refused, AcceptOutcome::Reject(AbortReason::AlreadySyncing)),
             "both sides accepted, so both exchanges ran"
+        );
+    }
+
+    /// A dial crossing one of ours from a pair that refused our last dial
+    /// takes the pair over, though the tie-break keeps ours: ours would be
+    /// refused again, and theirs aborted would leave no session at all.
+    /// Paired denial: with no refusal, the same crossing dial is aborted.
+    #[test]
+    fn a_dial_crossing_one_its_pair_refused_takes_the_pair_over() {
+        let namespace = namespace();
+        let (node, _other) = node_pair();
+        let (low, high) = (
+            Identity::from_bytes([1u8; 32]),
+            Identity::from_bytes([2u8; 32]),
+        );
+        let crossing = |refused_ours: bool| {
+            let mut lower = NamespaceStates::default();
+            lower.insert(namespace);
+            assert!(lower.start_connect(&namespace, node, high, SyncReason::Resync));
+            lower.accept_request(&node, low, &namespace, node, high, refused_ours)
+        };
+
+        assert!(
+            matches!(crossing(true), AcceptOutcome::Allow { .. }),
+            "the dial crossing a refused one was aborted"
+        );
+        assert!(
+            matches!(
+                crossing(false),
+                AcceptOutcome::Reject(AbortReason::AlreadySyncing)
+            ),
+            "the tie-break let a crossing dial through with nothing refused"
         );
     }
 
@@ -503,7 +551,7 @@ mod tests {
             let mut states = NamespaceStates::default();
             states.insert(namespace);
             let accepted =
-                states.accept_request(&me, own_identity(), &namespace, node, counterpart());
+                states.accept_request(&me, own_identity(), &namespace, node, counterpart(), false);
             assert!(matches!(accepted, AcceptOutcome::Allow { .. }));
             assert!(!states.start_connect(&namespace, node, counterpart(), reason));
 
@@ -534,7 +582,7 @@ mod tests {
                 ));
             }
             let outcome =
-                states.accept_request(&me, own_identity(), &namespace, node, counterpart());
+                states.accept_request(&me, own_identity(), &namespace, node, counterpart(), false);
             assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
             let finished = states.finish(&namespace, node, counterpart(), &Origin::Accept);
@@ -596,7 +644,8 @@ mod tests {
         states.insert(namespace);
 
         assert!(states.start_connect(&namespace, node, counterpart(), SyncReason::DirectJoin));
-        let outcome = states.accept_request(&me, own_identity(), &namespace, node, counterpart());
+        let outcome =
+            states.accept_request(&me, own_identity(), &namespace, node, counterpart(), false);
         assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
         // Our dial comes back rejected; the slot now belongs to the accept exchange.

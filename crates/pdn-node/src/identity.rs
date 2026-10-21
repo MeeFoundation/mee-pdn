@@ -94,10 +94,10 @@ impl Drop for CreateRollback {
     }
 }
 
-/// Best effort: the caller is already receiving an error. Dropping the
-/// identity's half of the node takes its replicas with it, so the PMS this
-/// create brought up needs no separate undo — it is named for the case
-/// where the identity stays.
+/// Best effort: the caller is already receiving an error. Drops the PMS
+/// this create made from the identity's store, then the identity's half of
+/// the node; its files stay on disk, and without a hosting record no start
+/// hosts it. `_hosting_armed` is carried and read by nothing.
 async fn undo_create(
     node: &data_layer::SyncNode,
     identity: PdnId,

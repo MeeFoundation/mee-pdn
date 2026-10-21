@@ -1,6 +1,7 @@
-//! [`ProtocolHandler`] implementation for the docs [`Engine`].
+//! The docs [`Engine`]'s assembly, and the [`ProtocolHandler`] that hands an
+//! accepted session to the engine of the identity it names.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Result;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint};
@@ -9,7 +10,7 @@ use iroh_gossip::net::Gossip;
 
 use crate::{
     api::DocsApi,
-    engine::{DefaultAuthorStorage, Engine, ProtectCallbackHandler},
+    engine::{DefaultAuthorStorage, Engine},
     net::{accept_session, refuse_session, AbortReason},
     store::Store,
     Identity,
@@ -19,7 +20,6 @@ use crate::{
 enum Storage {
     #[default]
     Memory,
-    #[cfg(feature = "fs-store")]
     Persistent {
         path: std::path::PathBuf,
         /// What the replica store's cache may hold. Fixed here because a
@@ -29,13 +29,14 @@ enum Storage {
 }
 
 /// Docs protocol.
+///
+/// Its clones hold the engine's only strong references: a [`DocsApi`] or a
+/// [`Doc`](crate::api::Doc) can sit inside what the engine holds, so the
+/// engine drops with the last `Docs`, whatever handles remain.
 #[derive(Debug, Clone)]
 pub struct Docs {
     engine: Arc<Engine>,
     api: DocsApi,
-    /// The task serving `api`, which holds the engine: it stops with the
-    /// last clone of this, whatever handles into the API remain.
-    _rpc: Arc<n0_future::task::AbortOnDropHandle<()>>,
     replica_cache_bytes: Option<usize>,
 }
 
@@ -51,16 +52,15 @@ impl Docs {
     ) -> Builder {
         Builder {
             storage: Storage::Memory,
-            protect_cb: None,
             identity,
             session_access_provider,
             co_located: None,
+            fetches_per_provider: FETCHES_PER_PROVIDER,
         }
     }
 
     /// Create a new [`Builder`] for the docs protocol, using a persistent replica and author storage
     /// in the given directory.
-    #[cfg(feature = "fs-store")]
     ///
     /// `cache_bytes` caps what this store's cache holds; the bound cannot
     /// be changed once the store is open, so a node dividing one budget
@@ -73,27 +73,30 @@ impl Docs {
     ) -> Builder {
         Builder {
             storage: Storage::Persistent { path, cache_bytes },
-            protect_cb: None,
             identity,
             session_access_provider,
             co_located: None,
+            fetches_per_provider: FETCHES_PER_PROVIDER,
         }
     }
 
-    /// The engine under this handler, for a node that dispatches accepted
+    /// The engine these docs hold, for a node that dispatches accepted
     /// connections to the identity each names.
-    pub fn engine(&self) -> &Arc<Engine> {
+    pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// A reference to the engine that does not keep it alive.
+    pub fn downgrade(&self) -> Weak<Engine> {
+        Arc::downgrade(&self.engine)
     }
 
     /// Creates a new [`Docs`] from an [`Engine`].
     pub fn new(engine: Engine) -> Self {
         let engine = Arc::new(engine);
-        let (api, rpc) = DocsApi::spawn(engine.clone());
         Self {
+            api: DocsApi::new(&engine),
             engine,
-            api,
-            _rpc: Arc::new(rpc),
             replica_cache_bytes: None,
         }
     }
@@ -118,49 +121,36 @@ impl std::ops::Deref for Docs {
     }
 }
 
-impl ProtocolHandler for Docs {
-    /// The one-identity half of the dispatch: this engine answers for its own
-    /// identity and refuses every other, which is what a resolver of one
-    /// identity does.
-    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        let opening = accept_session(&connection)
-            .await
-            .map_err(|err| iroh::protocol::AcceptError::from_err(n0_error::anyerr!(err)))?;
-        serve_dispatched(connection, opening, Some(self)).await
-    }
-
-    async fn shutdown(&self) {
-        if let Err(err) = self.engine.shutdown().await {
-            tracing::warn!("shutdown error: {:?}", err);
-        }
-    }
-}
-
 /// Builder for the docs protocol.
 #[derive(derive_more::Debug)]
 pub struct Builder {
     storage: Storage,
-    protect_cb: Option<ProtectCallbackHandler>,
     identity: Identity,
     #[debug("SessionAccessProvider")]
     session_access_provider: crate::filter::SessionAccessProvider,
     co_located: Option<crate::engine::CoLocatedRequests>,
+    fetches_per_provider: u32,
 }
 
-impl Builder {
-    /// Set the garbage collection protection handler for blobs.
-    ///
-    /// See [`ProtectCallbackHandler::new`] for details.
-    pub fn protect_handler(mut self, protect_handler: ProtectCallbackHandler) -> Self {
-        self.protect_cb = Some(protect_handler);
-        self
-    }
+/// The fetches in flight toward one provider unless the builder names
+/// another: the bidirectional streams the transport grants a connection by
+/// default, one per request.
+pub const FETCHES_PER_PROVIDER: u32 = 100;
 
+impl Builder {
     /// Set where this engine sends what it asks of its node about the
     /// node's other identities: a local write to announce, a contact naming
     /// this node to reconcile inside the process. Unset, both reach nobody.
     pub fn co_located_requests(mut self, requests: crate::engine::CoLocatedRequests) -> Self {
         self.co_located = Some(requests);
+        self
+    }
+
+    /// Set how many payloads this engine fetches from one provider at once:
+    /// the bidirectional streams the endpoint grants a connection, past
+    /// which a request only waits inside the transport.
+    pub fn fetches_per_provider(mut self, limit: u32) -> Self {
+        self.fetches_per_provider = limit;
         self
     }
 
@@ -173,7 +163,6 @@ impl Builder {
     ) -> anyhow::Result<Docs> {
         let (replica_store, replica_cache_bytes) = match &self.storage {
             Storage::Memory => (Store::memory(), None),
-            #[cfg(feature = "fs-store")]
             Storage::Persistent { path, cache_bytes } => (
                 Store::persistent(path.join("docs.redb"), *cache_bytes)?,
                 Some(*cache_bytes),
@@ -181,20 +170,17 @@ impl Builder {
         };
         let author_store = match &self.storage {
             Storage::Memory => DefaultAuthorStorage::Mem,
-            #[cfg(feature = "fs-store")]
             Storage::Persistent { path, .. } => {
                 DefaultAuthorStorage::Persistent(path.join("default-author"))
             }
         };
-        let downloader = blobs.downloader(&endpoint);
         let engine = Engine::spawn(
             endpoint,
             gossip,
             replica_store,
             blobs,
-            downloader,
+            usize::try_from(self.fetches_per_provider).unwrap_or(usize::MAX),
             author_store,
-            self.protect_cb,
             self.session_access_provider,
             self.identity,
             self.co_located,

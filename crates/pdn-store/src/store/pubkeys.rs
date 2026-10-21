@@ -12,7 +12,7 @@ use crate::{AuthorId, AuthorPublicKey, NamespaceId, NamespacePublicKey};
 /// Used to cache [`iroh::PublicKey`].
 ///
 /// This trait is implemented for the unit type `()`, where no caching is used.
-pub trait PublicKeyStore {
+pub(crate) trait PublicKeyStore {
     /// Convert a byte array into a [`iroh::PublicKey`].
     ///
     /// New keys are inserted into the [`PublicKeyStore`] and reused on subsequent calls.
@@ -54,7 +54,7 @@ impl PublicKeyStore for () {
 /// In-memory key storage
 // TODO: Make max number of keys stored configurable.
 #[derive(Debug, Clone, Default)]
-pub struct MemPublicKeyStore {
+pub(crate) struct MemPublicKeyStore {
     keys: Arc<RwLock<HashMap<[u8; 32], PublicKey>>>,
 }
 

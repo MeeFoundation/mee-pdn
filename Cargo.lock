@@ -1069,7 +1069,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.9",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1093,6 +1093,7 @@ dependencies = [
  "test-utils",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2306,8 +2307,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1dc4b05f73e7a1b9e83b531eb63c3fd671b0af3aeb13b59c546dd7ca747515"
+source = "git+https://github.com/n0-computer/iroh-gossip?rev=6cbbafa865c1b60c813dd8f12f78a54a45c1ecb1#6cbbafa865c1b60c813dd8f12f78a54a45c1ecb1"
 dependencies = [
  "blake3",
  "bytes",
@@ -2452,8 +2452,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20e41eb982f15230c55f0a70a74a514360e1f565b07861924fd0e8db172b3d00"
+source = "git+https://github.com/n0-computer/iroh-util?rev=603d8907247e867c1451fff161ed9fb4070ce853#603d8907247e867c1451fff161ed9fb4070ce853"
 dependencies = [
  "derive_more",
  "iroh",
@@ -3539,13 +3538,12 @@ dependencies = [
 
 [[package]]
 name = "pdn-store"
-version = "0.101.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
  "blake3",
  "bytes",
- "cfg_aliases",
  "data-encoding",
  "derive_more",
  "futures-buffered",
@@ -3559,7 +3557,6 @@ dependencies = [
  "n0-error",
  "n0-future",
  "nested_enum_utils",
- "noq",
  "num_enum",
  "parking_lot",
  "postcard",
@@ -3568,7 +3565,6 @@ dependencies = [
  "redb",
  "self_cell",
  "serde",
- "serde-error",
  "strum",
  "tempfile",
  "test-strategy",
@@ -4319,9 +4315,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -4485,15 +4481,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-error"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "342110fb7a5d801060c885da03bf91bfa7c7ca936deafcc64bb6706375605d47"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -5870,18 +5857,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

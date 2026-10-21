@@ -10,8 +10,8 @@ use std::sync::{
 
 use anyhow::Result;
 use data_layer::{
-    AcceptError, AddrInfoOptions, AlpnTaken, Connection, ProtocolHandler, Seq, ShareMode,
-    SpawnOptions, SyncNode, BUILT_IN_ALPNS,
+    AcceptError, AddrInfoOptions, AlpnTaken, Connection, ProtocolHandler, Seq, SpawnOptions,
+    SyncNode, BUILT_IN_ALPNS,
 };
 use pdn_types::{NodeId, PodId};
 use test_utils::{eventually, host_identity, ids, join_identity, memory_node};
@@ -123,9 +123,7 @@ async fn panicking_extra_handler_does_not_take_down_the_node() -> Result<()> {
     // it.
     let pms = host_identity(&node_a, ids::ALICE).await?;
     pms.record_pod(FAMILY, Seq::FIRST).await?;
-    let pms_ticket = pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let pms_ticket = pms.share_ticket(AddrInfoOptions::RelayAndAddresses).await?;
     let sibling_pms = join_identity(&node_b, ids::ALICE, pms_ticket).await?;
     pms.add_device(node_b.node_id()).await?;
     sibling_pms.add_device(node_b.node_id()).await?;

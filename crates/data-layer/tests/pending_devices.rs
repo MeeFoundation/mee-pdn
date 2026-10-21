@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use data_layer::{AddrInfoOptions, ShareMode};
+use data_layer::AddrInfoOptions;
 use test_utils::{eventually, host_identity, ids, join_identity, memory_node};
 
 /// Pending registrations older than the expiry are dropped by the cleanup
@@ -21,9 +21,7 @@ async fn expired_pending_devices_are_reclaimed_after_reimport() -> Result<()> {
         .await?;
     pms.add_pending_device(recent.node_id()).await?;
 
-    let ticket = pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-        .await?;
+    let ticket = pms.share_ticket(AddrInfoOptions::RelayAndAddresses).await?;
     let restarted = memory_node().await?;
     let reopened = join_identity(&restarted, ids::ALICE, ticket).await?;
     pms.add_device(restarted.node_id()).await?;

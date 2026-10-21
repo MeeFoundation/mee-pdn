@@ -9,9 +9,9 @@ use crate::AuthorId;
 type Timestamp = u64;
 
 /// Per author, the greatest timestamp a replica holds. A trigger, not a
-/// proof: equal heads do not mean equal contents (see `SyncHandle::author_heads`).
+/// proof: equal heads do not mean equal contents.
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
-pub struct AuthorHeads {
+pub(crate) struct AuthorHeads {
     heads: BTreeMap<AuthorId, Timestamp>,
 }
 
@@ -25,13 +25,9 @@ impl AuthorHeads {
     }
 
     /// Number of author-timestamp pairs.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.heads.len()
-    }
-
-    /// Whether this [`AuthorHeads`] is empty.
-    pub fn is_empty(&self) -> bool {
-        self.heads.is_empty()
     }
 
     /// Get the timestamp for an author.
@@ -40,7 +36,7 @@ impl AuthorHeads {
     }
 
     /// Can this state offer newer stuff to `other`?
-    pub fn has_news_for(&self, other: &Self) -> Option<NonZeroU64> {
+    pub(crate) fn has_news_for(&self, other: &Self) -> Option<NonZeroU64> {
         let mut updates = 0;
         for (author, ts_ours) in self.iter() {
             if other
@@ -52,13 +48,6 @@ impl AuthorHeads {
             }
         }
         NonZeroU64::new(updates)
-    }
-
-    /// Merge another author head state into this one.
-    pub fn merge(&mut self, other: &Self) {
-        for (a, t) in other.iter() {
-            self.insert(*a, *t);
-        }
     }
 
     /// Create an iterator over the entries in this state.
@@ -121,6 +110,8 @@ impl FromIterator<(Timestamp, AuthorId)> for AuthorHeads {
 mod tests {
     use super::*;
     use crate::Record;
+    /// Heads encoded under a size limit keep the newest authors that fit —
+    /// 6 of 10 in 256 bytes — and decode to exactly those.
     #[test]
     fn author_heads_encode_decode() -> Result<()> {
         let mut heads = AuthorHeads::default();
@@ -138,6 +129,8 @@ mod tests {
         Ok(())
     }
 
+    /// One side has news for the other for each author whose head is newer
+    /// on it or absent on the other, and for those alone.
     #[test]
     fn author_heads_compare() -> Result<()> {
         let a = [

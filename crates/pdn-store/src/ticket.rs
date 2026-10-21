@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Capability, Contact, Identity};
 
-/// Contains both a key (either secret or public) to a document, and a list of peers to join.
+/// A document's write capability, its namespace secret, and a list of peers to join.
 #[derive(Serialize, Deserialize, Clone, Debug, derive_more::Display)]
 #[display("{}", Ticket::encode_string(self))]
 pub struct DocTicket {
-    /// either a public or private key
+    /// The write capability: the document's namespace secret.
     pub capability: Capability,
     /// A list of nodes to contact.
     pub nodes: Vec<EndpointAddr>,
@@ -19,11 +19,8 @@ pub struct DocTicket {
     pub identity: Identity,
 }
 
-/// Wire format for [`DocTicket`].
-///
-/// In the future we might have multiple variants (not versions, since they
-/// might be both equally valid), so this is a single variant enum to force
-/// postcard to add a discriminator.
+/// Wire format for [`DocTicket`]: a single-variant enum, so postcard writes
+/// a discriminator that a further variant can take.
 #[derive(Serialize, Deserialize)]
 enum TicketWireFormat {
     Variant0(DocTicket),
@@ -84,23 +81,20 @@ mod tests {
     use iroh::PublicKey;
 
     use super::*;
-    use crate::NamespaceId;
+    use crate::NamespaceSecret;
 
+    /// A write ticket encodes to the bytes the build before a change wrote,
+    /// so a ticket a PMS stored decodes after the change to the same
+    /// namespace secret, node and identity.
     #[test]
     fn test_ticket_base32() {
         let node_id =
             PublicKey::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
                 .unwrap();
-        let namespace_id = NamespaceId::from(
-            &<[u8; 32]>::try_from(
-                hex::decode("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
+        let secret = NamespaceSecret::from_bytes(&[0x11; 32]);
 
         let ticket = DocTicket {
-            capability: Capability::Read(namespace_id),
+            capability: Capability::Write(secret),
             nodes: vec![EndpointAddr::new(node_id)],
             identity: Identity::from_bytes([0xab; 32]),
         };
@@ -115,14 +109,23 @@ mod tests {
             .unwrap();
         let expected = parse_hexdump("
             00 # variant
-            01 # capability discriminator, 1 = read
-            ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6 # namespace id, 32 bytes, see above
+            00 # capability discriminator, 0 = write
+            20 # the secret's length, 32
+            1111111111111111111111111111111111111111111111111111111111111111 # namespace secret, 32 bytes
             01 # one node
             ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6 # node id, 32 bytes, see above
             00 # no addrs
             abababababababababababababababababababababababababababababababab # identity, 32 bytes
         ").unwrap();
         assert_eq!(base32, expected);
+    }
+
+    /// A write capability's raw form, as the namespaces table stores it, is
+    /// the kind byte `1` and the secret's bytes.
+    #[test]
+    fn a_write_capability_is_stored_as_kind_one_and_its_secret() {
+        let secret = NamespaceSecret::from_bytes(&[0x11; 32]);
+        assert_eq!(Capability::Write(secret).raw(), (1, [0x11; 32]));
     }
 
     /// Parses a commented multi line hexdump into a vector of bytes.

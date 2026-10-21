@@ -1,7 +1,7 @@
 #!/bin/sh
 # Nextest over the workspace, extra args forwarded; test nodes bind loopback
-# (see data-layer node.rs). Nextest runs no doctests and the store's README
-# is one, so a run with no selection ends with the workspace doctests.
+# (see data-layer node.rs). Nextest runs no doctests, so a run with no
+# selection ends with the workspace doctests.
 set -eu
 cd "$(dirname "$0")/.."
 export PDN_BIND_ADDR=127.0.0.1

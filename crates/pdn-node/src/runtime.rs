@@ -53,8 +53,9 @@ pub const SHUTDOWN_SERVING_BUDGET: std::time::Duration = std::time::Duration::fr
 
 /// One permit per serving half of either ceremony in flight, over either
 /// transport. [`Runtime::shutdown`] drains them before the node stops, since
-/// the router stops the blob store beside the handlers it would wait for.
-/// The count bounds nothing: it gives the drain a fixed number to wait for.
+/// the node's stop shuts every engine down before its router, and a serving
+/// half still running then writes into stopped stores. The count bounds
+/// nothing: it gives the drain a fixed number to wait for.
 #[derive(Debug, Clone)]
 pub(crate) struct ServingHalves(Arc<tokio::sync::Semaphore>);
 
@@ -628,6 +629,24 @@ impl Runtime {
     #[cfg(feature = "test-util")]
     pub async fn provisioned_identities_for_test(&self) -> anyhow::Result<Vec<pdn_types::PdnId>> {
         self.state.lock().await.node.hosted_identities()
+    }
+
+    /// The runtime's dial side, for a scenario that holds connections of
+    /// its own to a peer.
+    #[cfg(feature = "test-util")]
+    pub async fn dial_handle_for_test(&self) -> data_layer::DialHandle {
+        self.state.lock().await.node.dial_handle()
+    }
+
+    /// [`SyncNode::own_entries_without_payload`](data_layer::SyncNode::own_entries_without_payload)
+    /// for `identity`.
+    #[cfg(feature = "test-util")]
+    pub async fn own_entries_without_payload_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<usize> {
+        let node = std::sync::Arc::clone(&self.state.lock().await.node);
+        node.own_entries_without_payload(identity).await
     }
 
     /// The public identity key in `identity`'s own PMS on this

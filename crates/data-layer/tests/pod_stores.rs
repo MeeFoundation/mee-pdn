@@ -9,7 +9,7 @@
 use anyhow::Result;
 use data_layer::{
     AddrInfoOptions, IdentityNotProvisioned, NamespaceId, PodTickets, PrivateMetadataStore,
-    ShareMode, SyncNode, UnknownPod,
+    SyncNode, UnknownPod,
 };
 use pdn_types::{PdnId, PodId};
 use test_utils::{host_identity, ids, memory_node};
@@ -100,9 +100,7 @@ async fn a_store_ticket_held_in_another_role_is_refused() -> Result<()> {
 
     alice_phone.create_pod(ids::ALICE, WEDDING).await?;
     let wedding = tickets(&alice_phone, ids::ALICE, WEDDING).await?;
-    let pms_ticket = alice_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let pms_ticket = alice_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     bob_phone.create_pod(ids::BOB, FAMILY).await?;
     let family = tickets(&bob_phone, ids::BOB, FAMILY).await?;
 

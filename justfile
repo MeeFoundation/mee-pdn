@@ -47,19 +47,6 @@ build-mobile target="aarch64-linux-android" features="":
 test *args: _need-nextest
   @sh scripts/test.sh "$@"
 
-# The store's other feature sets, beyond the default one the workspace
-# builds: `--all-features` and `--no-default-features` compile different
-# code — `fs-store` gates the file-backed store, `rpc` the network API — and
-# the wasm build in `check-store` is the one consumer of the featureless one.
-# Extra args are forwarded to nextest.
-[doc("Test the store under its other feature sets, doctests included")]
-test-store *args: _need-nextest
-  #!/bin/sh
-  set -eu
-  cargo nextest run -p pdn-store --all-features "$@"
-  cargo nextest run -p pdn-store --no-default-features "$@"
-  cargo test -p pdn-store --all-features --doc
-
 # Test in release mode via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs)
 test-release *args: _need-nextest
   #!/bin/sh
@@ -173,7 +160,7 @@ stress *args: _need-nextest
   @sh scripts/stress.sh "$@"
 
 # Local flaky-hunt: run one test BINARY in a loop — a fresh process per
-# iteration, running all its tests once via libtest.
+# iteration, running all its tests once via libtest, one after another.
 #
 # This amortizes the per-process node-startup cost across the binary's tests,
 # unlike nextest's process-per-test, which pays it per test and, on macOS,
@@ -208,6 +195,12 @@ check: _check-devcontainer-tools
   cargo clippy -p pdn-mobile --release --features observation --lib
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh)
   cargo check --workspace --all-targets $(sh scripts/test-features.sh)
+  # The store keeps its own lints, not the workspace's; its warnings and
+  # rustdoc's are denied here (an intra-doc link to a private item is one).
+  cargo clippy -p pdn-store --all-targets -- -Dwarnings
+  # Private items too: most docs sit on them, and a link there that no longer
+  # resolves is otherwise seen by nothing.
+  RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)
 
 # Lint and type-check, attempt fixes
 check-fix:
@@ -224,54 +217,40 @@ check-fix:
   cargo clippy --workspace --lib --bins
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh)
   cargo check --workspace --all-targets $(sh scripts/test-features.sh)
-
-# The store's other feature sets, its docs, and its wasm build, which
-# `check` never compiles: clippy with warnings denied on `--all-features`
-# and `--no-default-features`, rustdoc with warnings denied (an intra-doc
-# link to a private item is one), and the featureless build for
-# `wasm32-unknown-unknown`, where `getrandom` needs its backend named.
-[doc("Lint the store under its other feature sets, its docs, and the wasm32 build")]
-check-store:
-  #!/bin/sh
-  set -eu
-  cargo clippy -p pdn-store --all-features --all-targets -- -Dwarnings
-  cargo clippy -p pdn-store --no-default-features --lib --bins --tests -- -Dwarnings
-  RUSTDOCFLAGS=-Dwarnings cargo doc -p pdn-store --all-features --no-deps
-  RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build -p pdn-store --target wasm32-unknown-unknown --no-default-features
+  # The store keeps its own lints, not the workspace's; its warnings and
+  # rustdoc's are denied here (an intra-doc link to a private item is one).
+  cargo clippy -p pdn-store --all-targets -- -Dwarnings
+  # Private items too: most docs sit on them, and a link there that no longer
+  # resolves is otherwise seen by nothing.
+  RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)
 
 # Every test of the HTTP surface is a container test: needs a container
-# daemon and builds the image. The store's feature sets and wasm build run as
-# in the pipeline. `clean-stale --init` marks an unmarked target/, so a first
+# daemon and builds the image. `clean-stale --init` marks an unmarked target/, so a first
 # run cleans too; `clean-stale` runs only after every step passed, since a
 # failed run leaves unread what its later steps build.
-[doc("Audit, lint, build, test, store matrix, container suite, drop stale target/ (needs docker)")]
+[doc("Audit, lint, build, test, container suite, drop stale target/ (needs docker)")]
 precommit-check:
   #!/bin/sh
   set -eux
   just clean-stale --init
   just audit
   just check
-  just check-store
   just test
-  just test-store
   just test-docker
   just clean-stale
 
 # Every test of the HTTP surface is a container test: needs a container
-# daemon and builds the image. The store's feature sets and wasm build run as
-# in the pipeline. `clean-stale --init` marks an unmarked target/, so a first
+# daemon and builds the image. `clean-stale --init` marks an unmarked target/, so a first
 # run cleans too; `clean-stale` runs only after every step passed, since a
 # failed run leaves unread what its later steps build.
-[doc("Audit, lint, build, test, store matrix, container suite, attempt fixes, drop stale target/ (needs docker)")]
+[doc("Audit, lint, build, test, container suite, attempt fixes, drop stale target/ (needs docker)")]
 fix:
   #!/bin/sh
   set -eux
   just clean-stale --init
   just audit
   just check-fix
-  just check-store
   just test
-  just test-store
   just test-docker
   just clean-stale
 

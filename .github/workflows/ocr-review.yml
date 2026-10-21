@@ -1,8 +1,7 @@
-# OpenCodeReview - GitHub Actions PR Auto-Review Demo
-#
-# Demonstrates invoking the reusable action for both automatic PR review
-# (pull_request_target: opened/synchronize/reopened) and on-demand re-review
-# via comments starting with '/open-code-review' or '@open-code-review'.
+# OpenCodeReview: a review of the pull request named at dispatch, through the
+# reusable action. The automatic triggers — pull_request_target on
+# opened/synchronize/reopened, and comments starting with '/open-code-review'
+# or '@open-code-review' — sit commented out under `on:`.
 #
 # Required secrets/vars (Settings -> Secrets and variables -> Actions):
 #   secret    OCR_LLM_URL            LLM API endpoint
@@ -11,7 +10,7 @@
 #   variable  OCR_LLM_USE_ANTHROPIC  'true' for Anthropic, 'false' for OpenAI-compatible
 #
 # For the full list of action inputs/outputs and the four comment-posting modes
-# (sticky / incremental), see action.yml at the repo root.
+# (sticky / incremental), see action.yml at the root of alibaba/open-code-review.
 
 name: OpenCodeReview PR Review
 
@@ -134,7 +133,7 @@ jobs:
           # The action installs the reviewer from npm, `latest` unless named;
           # kept at the action's own tag.
           ocr_version: 1.12.9
-          # For issue_comment triggers, pass the resolved refs; for
-          # pull_request_target the action resolves them from the event.
+          # For every trigger but pull_request_target, pass the resolved refs;
+          # for pull_request_target the action resolves them from the event.
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}

@@ -15,8 +15,8 @@ use std::{
 use anyhow::{Context, Result};
 use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice, MemberState,
-    MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace, ShareMode,
-    SpawnOptions, SyncNode, Traced,
+    MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace, SpawnOptions,
+    SyncNode, Traced,
 };
 use pdn_types::PodId;
 use test_utils::{
@@ -1167,9 +1167,7 @@ async fn a_rejoining_device_dials_its_inviter_as_the_inviter_before_its_membersh
 async fn linked(phone: &SyncNode, laptop: &SyncNode) -> Result<(Person, PrivateMetadataStore)> {
     let (person, pms) = host(phone).await?;
     pms.add_device(laptop.node_id()).await?;
-    let ticket = pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let laptop_pms = join_identity(laptop, person.id, ticket).await?;
     assert!(wait_devices(&laptop_pms, &[phone.node_id(), laptop.node_id()]).await?);
     Ok((person, pms))
@@ -1233,9 +1231,7 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
 
     // Bob's laptop, linked after the removal, reads Carol's earlier record.
     bob_pms.add_device(bob_laptop.node_id()).await?;
-    let pms_ticket = bob_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let pms_ticket = bob_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     join_identity(&bob_laptop, bob.id, pms_ticket).await?;
     let bobs = MembershipKey::Devices {
         member: bob.id,
@@ -1320,9 +1316,7 @@ async fn a_leave_dated_before_its_join_still_ends_holding_on_every_device() -> R
     let (carol_phone, carol_laptop) = (node(QUIET).await?, node(QUIET).await?);
     let (carol, phone_pms) = host(&carol_phone).await?;
     phone_pms.add_device(carol_laptop.node_id()).await?;
-    let ticket = phone_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = phone_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let laptop_pms = join_identity(&carol_laptop, carol.id, ticket).await?;
     let both = [carol_phone.node_id(), carol_laptop.node_id()];
     assert!(wait_devices(&laptop_pms, &both).await?);

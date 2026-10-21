@@ -12,7 +12,7 @@ use std::{collections::HashSet, time::Duration};
 use anyhow::{Context, Result};
 use data_layer::{
     identity_of, pod_id_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice,
-    MemberState, MembershipKey, PodStore, Seq, SessionTrace, ShareMode, SpawnOptions, SyncNode,
+    MemberState, MembershipKey, PodStore, Seq, SessionTrace, SpawnOptions, SyncNode,
 };
 use pdn_store::SessionRole;
 use pdn_types::{NodeId, PdnId, PodId};
@@ -780,9 +780,7 @@ async fn a_write_announced_from_a_device_no_statement_lists_is_pulled_as_its_mem
     let (alice, _) = host(&alice_phone).await?;
     let (bob, bob_pms) = host(&bob_laptop).await?;
     bob_pms.add_device(bob_phone.node_id()).await?;
-    let ticket = bob_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = bob_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let phone_pms = join_identity(&bob_phone, bob.id, ticket).await?;
     assert!(wait_devices(&phone_pms, &[bob_laptop.node_id(), bob_phone.node_id()]).await?);
     let pod = create(&alice_phone, &alice).await?;
@@ -854,9 +852,7 @@ async fn a_device_no_statement_lists_passes_its_members_statement_to_a_member_pu
     let (alice, _) = host(&alice_phone).await?;
     let (carol, carol_pms) = host(&carol_phone).await?;
     carol_pms.add_device(carol_tablet.node_id()).await?;
-    let ticket = carol_pms
-        .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-        .await?;
+    let ticket = carol_pms.share_ticket(AddrInfoOptions::Addresses).await?;
     let tablet_pms = join_identity(&carol_tablet, carol.id, ticket).await?;
     assert!(
         wait_devices(
@@ -1050,9 +1046,7 @@ async fn a_pod_store_keeps_its_own_interval() -> Result<()> {
     let laptop_pms = join_identity(
         &bob_laptop,
         bob.id,
-        bob_pms
-            .share_ticket(ShareMode::Write, AddrInfoOptions::Addresses)
-            .await?,
+        bob_pms.share_ticket(AddrInfoOptions::Addresses).await?,
     )
     .await?;
     bob_pms.add_device(bob_laptop.node_id()).await?;

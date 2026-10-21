@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use data_layer::{
-    pod_ticket_kind, AddrInfoOptions, PodStore, PodTickets, PrivateMetadataStore, Seq, ShareMode,
+    pod_ticket_kind, AddrInfoOptions, PodStore, PodTickets, PrivateMetadataStore, Seq,
     SpawnOptions, SyncNode, UnknownPod, DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
 };
 use pdn_types::{PdnId, PodId};
@@ -272,7 +272,7 @@ async fn two_identities_of_one_node_converge_again_after_a_restart() -> Result<(
         (carol.id, &carol_pms),
     ] {
         publish_pod(pms, pod, &tickets).await?;
-        first.flush_replicas(identity, pms.namespace()).await?;
+        first.flush_stores(identity).await?;
         hosted.push((identity, pms.namespace()));
     }
     first.shutdown().await?;
@@ -338,7 +338,7 @@ async fn an_import_naming_an_identity_the_node_does_not_host_registers_nothing()
     let record = c::place_claim(&node, &work, pod, 0x01).await?;
     let tickets = c::tickets(&node, &work, pod).await?;
     let pms_ticket = work_pms
-        .share_ticket(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .share_ticket(AddrInfoOptions::RelayAndAddresses)
         .await?;
 
     for refusal in [

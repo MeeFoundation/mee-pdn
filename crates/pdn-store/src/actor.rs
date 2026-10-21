@@ -12,31 +12,24 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use iroh_blobs::Hash;
-use irpc::channel::mpsc;
 use n0_future::{
     task::JoinSet,
     time::{Duration, Instant},
     TryFutureExt,
 };
-use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-#[cfg(wasm_browser)]
-use tracing::Instrument;
 use tracing::{debug, error, error_span, trace, warn};
 
 use crate::{
-    api::{
-        protocol::{AuthorListResponse, ListResponse},
-        RpcError, RpcResult,
-    },
     metrics::Metrics,
     ranger::Message,
     store::{
         fs::{tables::ReadOnlyTables, ContentHashesIterator, StoreInstance},
-        DownloadPolicy, ImportNamespaceOutcome, Query, Store,
+        Query, Store,
     },
     subscribers::Delivery,
-    Author, AuthorHeads, AuthorId, Capability, ContentStatus, ContentStatusCallback, Event,
+    Author, AuthorHeads, AuthorId, Capability, CapabilityKind, ContentStatusCallback, Event,
     NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, SignedEntry, SyncOutcome,
 };
 
@@ -61,27 +54,16 @@ enum Action {
         #[debug("reply")]
         reply: oneshot::Sender<Result<Option<Author>>>,
     },
-    #[display("DeleteAuthor")]
-    DeleteAuthor {
-        author: AuthorId,
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<()>>,
-    },
     #[display("NewReplica")]
     ImportNamespace {
         capability: Capability,
         #[debug("reply")]
         reply: oneshot::Sender<Result<NamespaceId>>,
     },
-    #[display("ListAuthors")]
-    ListAuthors {
-        #[debug("reply")]
-        reply: mpsc::Sender<RpcResult<AuthorListResponse>>,
-    },
     #[display("ListReplicas")]
     ListReplicas {
         #[debug("reply")]
-        reply: mpsc::Sender<RpcResult<ListResponse>>,
+        reply: mpsc::Sender<Result<(NamespaceId, CapabilityKind)>>,
     },
     #[display("ContentHashes")]
     ContentHashes {
@@ -114,6 +96,12 @@ enum Action {
         reply: Option<oneshot::Sender<Store>>,
     },
     #[cfg(test)]
+    #[display("DebugFailNextCommit")]
+    DebugFailNextCommit {
+        #[debug("reply")]
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
     #[display("DebugTasksLen")]
     DebugTasksLen {
         #[debug("reply")]
@@ -137,10 +125,6 @@ enum ReplicaAction {
     Close {
         #[debug("reply")]
         reply: oneshot::Sender<Result<bool>>,
-    },
-    GetState {
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<OpenState>>,
     },
     SetSync {
         sync: bool,
@@ -170,13 +154,6 @@ enum ReplicaAction {
         key: Bytes,
         #[debug("reply")]
         reply: oneshot::Sender<Result<usize>>,
-    },
-    InsertRemote {
-        entry: SignedEntry,
-        from: PeerIdBytes,
-        content_status: ContentStatus,
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<()>>,
     },
     SyncSessionStart {
         /// Write counts to compare in the step that opens the snapshot.
@@ -212,6 +189,7 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
     },
+    #[cfg(test)]
     GetExact {
         author: AuthorId,
         key: Bytes,
@@ -220,7 +198,7 @@ enum ReplicaAction {
     },
     GetMany {
         query: Query,
-        reply: mpsc::Sender<RpcResult<SignedEntry>>,
+        reply: mpsc::Sender<Result<SignedEntry>>,
     },
     DropReplica {
         reply: oneshot::Sender<Result<()>>,
@@ -236,30 +214,6 @@ enum ReplicaAction {
     Writes {
         reply: oneshot::Sender<Result<u64>>,
     },
-    AuthorHeads {
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<AuthorHeads>>,
-    },
-    SetDownloadPolicy {
-        policy: DownloadPolicy,
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<()>>,
-    },
-    GetDownloadPolicy {
-        #[debug("reply")]
-        reply: oneshot::Sender<Result<DownloadPolicy>>,
-    },
-}
-
-/// The state for an open replica.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenState {
-    /// Whether to accept sync requests for this replica.
-    pub sync: bool,
-    /// How many event subscriptions are open
-    pub subscribers: usize,
-    /// By how many handles the replica is currently held open
-    pub handles: usize,
 }
 
 #[derive(Debug)]
@@ -276,7 +230,7 @@ struct OpenReplica {
 /// the first session of another, and a handle handed a foreign id would
 /// resolve its own snapshot of that namespace and serve a session from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SyncSessionId {
+pub(crate) struct SyncSessionId {
     actor: u64,
     seq: u64,
 }
@@ -298,9 +252,8 @@ pub struct SyncSessionId {
 /// the reclaim metric fire on ordinary exchanges.
 #[must_use = "dropping the handle ends the session and releases its snapshot"]
 #[derive(Debug)]
-pub struct SyncSession {
+pub(crate) struct SyncSession {
     id: SyncSessionId,
-    namespace: NamespaceId,
     tx: async_channel::Sender<Action>,
     /// Held, never read: the actor watches the strong count.
     _alive: Arc<()>,
@@ -311,11 +264,6 @@ impl SyncSession {
     /// [`SyncHandle::sync_process_message`].
     pub fn id(&self) -> SyncSessionId {
         self.id
-    }
-
-    /// The namespace this session is of.
-    pub fn namespace(&self) -> NamespaceId {
-        self.namespace
     }
 }
 
@@ -352,24 +300,21 @@ struct SessionSnapshot {
 ///
 /// The handle is cheaply cloneable. Once the last clone is dropped, the actor thread is joined.
 /// The thread will finish processing all messages in the channel queue, and then exit.
-/// To prevent this last drop from blocking the calling thread, you can call [`SyncHandle::shutdown`]
+/// To prevent this last drop from blocking the calling thread, you can call `SyncHandle::shutdown`
 /// and await its result before dropping the last [`SyncHandle`]. This ensures that
 /// waiting for the actor to finish happens in an async context, and therefore that the final
 /// [`SyncHandle::drop`] will not block.
 #[derive(Debug, Clone)]
 pub struct SyncHandle {
     tx: async_channel::Sender<Action>,
-    #[cfg(wasm_browser)]
-    #[allow(unused)]
-    join_handle: Arc<Option<n0_future::task::JoinHandle<()>>>,
-    #[cfg(not(wasm_browser))]
     join_handle: Arc<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(test)]
     metrics: Arc<Metrics>,
 }
 
 /// Options when opening a replica.
 #[derive(Debug, Default)]
-pub struct OpenOpts {
+pub(crate) struct OpenOpts {
     /// Set to true to set sync state to true.
     pub sync: bool,
     /// A [`Delivery::Blocking`] subscription: only the live actor opens one,
@@ -392,7 +337,7 @@ impl OpenOpts {
 #[allow(missing_docs)]
 impl SyncHandle {
     /// Spawn a sync actor and return a handle.
-    pub fn spawn(
+    pub(crate) fn spawn(
         store: Store,
         content_status_callback: Option<ContentStatusCallback>,
         me: String,
@@ -402,10 +347,6 @@ impl SyncHandle {
         let actor = Actor::new(store, action_rx, content_status_callback, metrics.clone());
 
         let span = error_span!("sync", %me);
-        #[cfg(wasm_browser)]
-        let join_handle = n0_future::task::spawn(actor.run_async().instrument(span));
-
-        #[cfg(not(wasm_browser))]
         let join_handle = std::thread::Builder::new()
             .name("sync-actor".to_string())
             .spawn(move || {
@@ -421,16 +362,18 @@ impl SyncHandle {
         SyncHandle {
             tx: action_tx,
             join_handle,
+            #[cfg(test)]
             metrics,
         }
     }
 
     /// Returns the metrics collected in this sync actor.
-    pub fn metrics(&self) -> &Arc<Metrics> {
+    #[cfg(test)]
+    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
     }
 
-    pub async fn open(&self, namespace: NamespaceId, opts: OpenOpts) -> Result<()> {
+    pub(crate) async fn open(&self, namespace: NamespaceId, opts: OpenOpts) -> Result<()> {
         tracing::debug!("SyncHandle::open called");
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::Open { reply, opts };
@@ -438,14 +381,14 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn close(&self, namespace: NamespaceId) -> Result<bool> {
+    pub(crate) async fn close(&self, namespace: NamespaceId) -> Result<bool> {
         let (reply, rx) = oneshot::channel();
         self.send_replica(namespace, ReplicaAction::Close { reply })
             .await?;
         rx.await?
     }
 
-    pub async fn subscribe(
+    pub(crate) async fn subscribe(
         &self,
         namespace: NamespaceId,
         sender: async_channel::Sender<Event>,
@@ -456,7 +399,7 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn unsubscribe(
+    pub(crate) async fn unsubscribe(
         &self,
         namespace: NamespaceId,
         sender: async_channel::Sender<Event>,
@@ -467,14 +410,14 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn set_sync(&self, namespace: NamespaceId, sync: bool) -> Result<()> {
+    pub(crate) async fn set_sync(&self, namespace: NamespaceId, sync: bool) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::SetSync { sync, reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
 
-    pub async fn insert_local(
+    pub(crate) async fn insert_local(
         &self,
         namespace: NamespaceId,
         author: AuthorId,
@@ -494,7 +437,7 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn delete(
+    pub(crate) async fn delete(
         &self,
         namespace: NamespaceId,
         author: AuthorId,
@@ -502,24 +445,6 @@ impl SyncHandle {
     ) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::Delete { author, key, reply };
-        self.send_replica(namespace, action).await?;
-        rx.await?
-    }
-
-    pub async fn insert_remote(
-        &self,
-        namespace: NamespaceId,
-        entry: SignedEntry,
-        from: PeerIdBytes,
-        content_status: ContentStatus,
-    ) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::InsertRemote {
-            entry,
-            from,
-            content_status,
-            reply,
-        };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -533,7 +458,7 @@ impl SyncHandle {
     /// pending write batch, so the snapshot holds every entry inserted
     /// before session setup. The returned handle owns the snapshot;
     /// dropping it releases the snapshot on any session exit path.
-    pub async fn sync_session_start(&self, namespace: NamespaceId) -> Result<SyncSession> {
+    pub(crate) async fn sync_session_start(&self, namespace: NamespaceId) -> Result<SyncSession> {
         Ok(self
             .sync_session_start_unless_written(namespace, Vec::new())
             .await?
@@ -543,7 +468,7 @@ impl SyncHandle {
     /// [`sync_session_start`](Self::sync_session_start), beside whether every
     /// replica in `read` still has the write count it names when the
     /// snapshot opens.
-    pub async fn sync_session_start_unless_written(
+    pub(crate) async fn sync_session_start_unless_written(
         &self,
         namespace: NamespaceId,
         read: Vec<(NamespaceId, u64)>,
@@ -554,7 +479,6 @@ impl SyncHandle {
         let (id, alive, unwritten) = rx.await??;
         let session = SyncSession {
             id,
-            namespace,
             tx: self.tx.clone(),
             _alive: alive,
         };
@@ -575,7 +499,7 @@ impl SyncHandle {
         Ok(())
     }
 
-    pub async fn sync_initial_message(
+    pub(crate) async fn sync_initial_message(
         &self,
         namespace: NamespaceId,
         session: SyncSessionId,
@@ -592,7 +516,7 @@ impl SyncHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn sync_process_message(
+    pub(crate) async fn sync_process_message(
         &self,
         namespace: NamespaceId,
         message: Message<SignedEntry>,
@@ -624,14 +548,17 @@ impl SyncHandle {
         Ok(rx.await?)
     }
 
-    pub async fn get_sync_peers(&self, namespace: NamespaceId) -> Result<Option<Vec<PeerIdBytes>>> {
+    pub(crate) async fn get_sync_peers(
+        &self,
+        namespace: NamespaceId,
+    ) -> Result<Option<Vec<PeerIdBytes>>> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::GetSyncPeers { reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
 
-    pub async fn register_useful_peer(
+    pub(crate) async fn register_useful_peer(
         &self,
         namespace: NamespaceId,
         peer: PeerIdBytes,
@@ -652,14 +579,7 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn author_heads(&self, namespace: NamespaceId) -> Result<AuthorHeads> {
-        let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::AuthorHeads { reply };
-        self.send_replica(namespace, action).await?;
-        rx.await?
-    }
-
-    pub async fn has_news_for_us(
+    pub(crate) async fn has_news_for_us(
         &self,
         namespace: NamespaceId,
         heads: AuthorHeads,
@@ -670,18 +590,19 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn get_many(
+    pub(crate) async fn get_many(
         &self,
         namespace: NamespaceId,
         query: Query,
-        reply: mpsc::Sender<RpcResult<SignedEntry>>,
+        reply: mpsc::Sender<Result<SignedEntry>>,
     ) -> Result<()> {
         let action = ReplicaAction::GetMany { query, reply };
         self.send_replica(namespace, action).await?;
         Ok(())
     }
 
-    pub async fn get_exact(
+    #[cfg(test)]
+    pub(crate) async fn get_exact(
         &self,
         namespace: NamespaceId,
         author: AuthorId,
@@ -699,33 +620,36 @@ impl SyncHandle {
         rx.await?
     }
 
-    pub async fn drop_replica(&self, namespace: NamespaceId) -> Result<()> {
+    pub(crate) async fn drop_replica(&self, namespace: NamespaceId) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::DropReplica { reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
 
-    pub async fn export_secret_key(&self, namespace: NamespaceId) -> Result<NamespaceSecret> {
+    pub(crate) async fn export_secret_key(
+        &self,
+        namespace: NamespaceId,
+    ) -> Result<NamespaceSecret> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::ExportSecretKey { reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
 
-    pub async fn get_state(&self, namespace: NamespaceId) -> Result<OpenState> {
-        let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::GetState { reply };
-        self.send_replica(namespace, action).await?;
-        rx.await?
-    }
-
-    pub async fn shutdown(&self) -> Result<Store> {
+    pub(crate) async fn shutdown(&self) -> Result<Store> {
         let (reply, rx) = oneshot::channel();
         let action = Action::Shutdown { reply: Some(reply) };
         self.send(action).await?;
         let store = rx.await?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    async fn fail_next_commit_for_test(&self) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Action::DebugFailNextCommit { reply }).await?;
+        Ok(rx.await?)
     }
 
     #[cfg(test)]
@@ -735,61 +659,33 @@ impl SyncHandle {
         Ok(rx.await?)
     }
 
-    pub async fn list_authors(
+    pub(crate) async fn list_replicas(
         &self,
-        reply: mpsc::Sender<RpcResult<AuthorListResponse>>,
+        reply: mpsc::Sender<Result<(NamespaceId, CapabilityKind)>>,
     ) -> Result<()> {
-        self.send(Action::ListAuthors { reply }).await
-    }
-
-    pub async fn list_replicas(&self, reply: mpsc::Sender<RpcResult<ListResponse>>) -> Result<()> {
         self.send(Action::ListReplicas { reply }).await
     }
 
-    pub async fn import_author(&self, author: Author) -> Result<AuthorId> {
+    pub(crate) async fn import_author(&self, author: Author) -> Result<AuthorId> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ImportAuthor { author, reply }).await?;
         rx.await?
     }
 
-    pub async fn export_author(&self, author: AuthorId) -> Result<Option<Author>> {
+    pub(crate) async fn export_author(&self, author: AuthorId) -> Result<Option<Author>> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ExportAuthor { author, reply }).await?;
         rx.await?
     }
 
-    pub async fn delete_author(&self, author: AuthorId) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Action::DeleteAuthor { author, reply }).await?;
-        rx.await?
-    }
-
-    pub async fn import_namespace(&self, capability: Capability) -> Result<NamespaceId> {
+    pub(crate) async fn import_namespace(&self, capability: Capability) -> Result<NamespaceId> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ImportNamespace { capability, reply })
             .await?;
         rx.await?
     }
 
-    pub async fn get_download_policy(&self, namespace: NamespaceId) -> Result<DownloadPolicy> {
-        let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::GetDownloadPolicy { reply };
-        self.send_replica(namespace, action).await?;
-        rx.await?
-    }
-
-    pub async fn set_download_policy(
-        &self,
-        namespace: NamespaceId,
-        policy: DownloadPolicy,
-    ) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::SetDownloadPolicy { reply, policy };
-        self.send_replica(namespace, action).await?;
-        rx.await?
-    }
-
-    pub async fn content_hashes(&self) -> Result<ContentHashesIterator> {
+    pub(crate) async fn content_hashes(&self) -> Result<ContentHashesIterator> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ContentHashes { reply }).await?;
         rx.await?
@@ -804,7 +700,7 @@ impl SyncHandle {
     ///
     /// It's not necessary to call this function before shutdown, as `shutdown` will
     /// trigger a flush on its own.
-    pub async fn flush_store(&self) -> Result<()> {
+    pub(crate) async fn flush_store(&self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::FlushStore { reply }).await?;
         rx.await?
@@ -826,26 +722,15 @@ impl SyncHandle {
 impl Drop for SyncHandle {
     fn drop(&mut self) {
         // this means we're dropping the last reference
-        #[allow(unused)]
         if let Some(handle) = Arc::get_mut(&mut self.join_handle) {
-            #[cfg(wasm_browser)]
-            {
-                let tx = self.tx.clone();
-                n0_future::task::spawn(async move {
-                    tx.send(Action::Shutdown { reply: None }).await.ok();
-                });
-            }
-            #[cfg(not(wasm_browser))]
-            {
-                // this call is the reason tx can not be a tokio mpsc channel.
-                // we have no control about where drop is called, yet tokio send_blocking panics
-                // when called from inside a tokio runtime.
-                self.tx.send_blocking(Action::Shutdown { reply: None }).ok();
-                let handle = handle.take().expect("this can only run once");
+            // this call is the reason tx can not be a tokio mpsc channel.
+            // we have no control about where drop is called, yet tokio send_blocking panics
+            // when called from inside a tokio runtime.
+            self.tx.send_blocking(Action::Shutdown { reply: None }).ok();
+            let handle = handle.take().expect("this can only run once");
 
-                if let Err(err) = handle.join() {
-                    warn!(?err, "Failed to join sync actor");
-                }
+            if let Err(err) = handle.join() {
+                warn!(?err, "Failed to join sync actor");
             }
         }
     }
@@ -859,8 +744,9 @@ struct Actor {
     /// Frozen read snapshots of running sync sessions, keyed by session id.
     ///
     /// Each entry pins a redb read transaction until removed: the session
-    /// guard's drop removes it, and closing the replica sweeps whatever a
-    /// lost release message left behind.
+    /// guard's drop removes it, and the reclaim pass and closing the replica
+    /// sweep whatever a lost release message or an undelivered handle left
+    /// behind.
     sessions: HashMap<SyncSessionId, SessionSnapshot>,
     next_session_id: u64,
     last_session_sweep: Instant,
@@ -868,6 +754,9 @@ struct Actor {
     content_status_callback: Option<ContentStatusCallback>,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
+    /// A commit the idle timer ran and saw fail, held for the next write or
+    /// flush to answer with: no caller waits on the timer's own.
+    failed_commit: Option<anyhow::Error>,
 }
 
 impl Actor {
@@ -888,10 +777,10 @@ impl Actor {
             content_status_callback,
             tasks: Default::default(),
             metrics,
+            failed_commit: None,
         }
     }
 
-    #[cfg(not(wasm_browser))]
     fn run_in_thread(self) -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -915,6 +804,9 @@ impl Actor {
                     self.reclaim_abandoned_sessions();
                     if let Err(cause) = self.store.flush() {
                         error!(?cause, "failed to flush store");
+                        self.failed_commit = Some(cause.context(
+                            "a commit of this store failed, and the writes it held are lost",
+                        ));
                     }
                     continue;
                 }
@@ -938,7 +830,6 @@ impl Actor {
                 }
             };
             trace!(%action, "tick");
-            self.metrics.actor_tick_main.inc();
             // The arm above runs only while the actor is idle, and an actor
             // under load is exactly where a pinned page set hurts.
             self.reclaim_abandoned_sessions();
@@ -977,6 +868,11 @@ impl Actor {
                 unreachable!("Shutdown is handled in run()")
             }
             #[cfg(test)]
+            Action::DebugFailNextCommit { reply } => {
+                self.store.fail_next_commit();
+                send_reply(reply, ())
+            }
+            #[cfg(test)]
             Action::DebugTasksLen { reply } => send_reply(reply, self.tasks.len()),
             #[cfg(test)]
             Action::DebugSessionCount { reply } => send_reply(reply, self.sessions.len()),
@@ -987,43 +883,28 @@ impl Actor {
             Action::ExportAuthor { author, reply } => {
                 send_reply(reply, self.store.get_author(&author))
             }
-            Action::DeleteAuthor { author, reply } => {
-                send_reply(reply, self.store.delete_author(author))
-            }
             Action::ImportNamespace { capability, reply } => send_reply_with(reply, self, |this| {
                 let id = capability.id();
-                let outcome = this.store.import_namespace(capability.clone())?;
-                if let ImportNamespaceOutcome::Upgraded = outcome {
-                    if let Ok(state) = this.states.get_mut(&id) {
-                        state.info.merge_capability(capability)?;
-                    }
-                }
+                this.store.import_namespace(capability)?;
                 Ok(id)
             }),
-            Action::ListAuthors { reply } => {
-                let iter = self
-                    .store
-                    .list_authors()
-                    .map(|a| a.map(|a| a.map(|a| AuthorListResponse { author_id: a.id() })));
-                self.tasks.spawn_local(async move {
-                    iter_to_irpc(reply, iter).await.ok();
-                });
-                Ok(())
-            }
             Action::ListReplicas { reply } => {
                 let iter = self.store.list_namespaces();
-                let iter = iter.map(|inner| {
-                    inner.map(|res| res.map(|(id, capability)| ListResponse { id, capability }))
-                });
                 self.tasks.spawn_local(async move {
-                    iter_to_irpc(reply, iter).await.ok();
+                    iter_to_channel(reply, iter).await.ok();
                 });
                 Ok(())
             }
             Action::ContentHashes { reply } => {
                 send_reply_with(reply, self, |this| this.store.content_hashes())
             }
-            Action::FlushStore { reply } => send_reply(reply, self.store.flush()),
+            Action::FlushStore { reply } => {
+                let flushed = match self.failed_commit.take() {
+                    Some(failed) => Err(failed),
+                    None => self.store.flush(),
+                };
+                send_reply(reply, flushed)
+            }
             Action::SyncSessionEnd { session, alive } => {
                 self.sessions.remove(&session);
                 // Kept the registration out of the reclaim pass while this
@@ -1095,43 +976,25 @@ impl Actor {
                 reply,
             } => {
                 send_reply_with_async(reply, self, async move |this| {
+                    if let Some(failed) = this.failed_commit.take() {
+                        return Err(failed);
+                    }
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
                     replica.insert(&key, &author, hash, len).await?;
-                    this.metrics.new_entries_local.inc();
-                    this.metrics.new_entries_local_size.inc_by(len);
                     Ok(())
                 })
                 .await
             }
             ReplicaAction::Delete { author, key, reply } => {
                 send_reply_with_async(reply, self, async |this| {
+                    if let Some(failed) = this.failed_commit.take() {
+                        return Err(failed);
+                    }
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
                     let res = replica.delete(&key, &author).await?;
                     Ok(res)
-                })
-                .await
-            }
-            ReplicaAction::InsertRemote {
-                entry,
-                from,
-                content_status,
-                reply,
-            } => {
-                send_reply_with_async(reply, self, async move |this| {
-                    // Ingest reads live: an entry the peer sends is judged
-                    // against current state, never a session's frozen view.
-                    let mut replica =
-                        this.states
-                            .replica_if_syncing(&namespace, &mut this.store, None)?;
-                    let len = entry.content_len();
-                    replica
-                        .insert_remote_entry(entry, from, content_status)
-                        .await?;
-                    this.metrics.new_entries_remote.inc();
-                    this.metrics.new_entries_remote_size.inc_by(len);
-                    Ok(())
                 })
                 .await
             }
@@ -1206,6 +1069,7 @@ impl Actor {
                 let res = self.store.register_useful_peer(namespace, peer);
                 send_reply(reply, res)
             }
+            #[cfg(test)]
             ReplicaAction::GetExact {
                 author,
                 key,
@@ -1221,57 +1085,28 @@ impl Actor {
                     .ensure_open(&namespace)
                     .and_then(|_| self.store.get_many(namespace, query));
                 self.tasks
-                    .spawn_local(iter_to_irpc(reply, iter).map_ok_or_else(|_| (), |_| ()));
+                    .spawn_local(iter_to_channel(reply, iter).map_ok_or_else(|_| (), |_| ()));
                 Ok(())
             }
             ReplicaAction::DropReplica { reply } => send_reply_with(reply, self, |this| {
-                this.close(namespace);
+                // Every handle at once: an open another caller holds would
+                // otherwise keep the replica open and fail the delete.
+                this.close_every_handle(namespace);
                 this.store.remove_replica(&namespace)
             }),
             ReplicaAction::ExportSecretKey { reply } => {
                 let res = self
                     .states
                     .get_mut(&namespace)
-                    .and_then(|state| Ok(state.info.capability.secret_key()?.clone()));
+                    .map(|state| state.info.capability.secret_key().clone());
                 send_reply(reply, res)
             }
-            ReplicaAction::GetState { reply } => send_reply_with(reply, self, move |this| {
-                let state = this.states.get_mut(&namespace)?;
-                let handles = state.handles;
-                let sync = state.sync;
-                let subscribers = state.info.subscribers_count();
-                Ok(OpenState {
-                    handles,
-                    sync,
-                    subscribers,
-                })
-            }),
             ReplicaAction::HasNewsForUs { heads, reply } => {
                 let res = self.store.has_news_for_us(namespace, &heads);
                 send_reply(reply, res)
             }
             ReplicaAction::Writes { reply } => {
                 send_reply(reply, Ok(self.store.writes_of(namespace)))
-            }
-            ReplicaAction::AuthorHeads { reply } => {
-                let res = self
-                    .store
-                    .get_latest_for_each_author(namespace)
-                    .and_then(|latest| {
-                        let mut heads = AuthorHeads::default();
-                        for entry in latest {
-                            let (author, timestamp, _key) = entry?;
-                            heads.insert(author, timestamp);
-                        }
-                        Ok(heads)
-                    });
-                send_reply(reply, res)
-            }
-            ReplicaAction::SetDownloadPolicy { policy, reply } => {
-                send_reply(reply, self.store.set_download_policy(&namespace, policy))
-            }
-            ReplicaAction::GetDownloadPolicy { reply } => {
-                send_reply(reply, self.store.get_download_policy(&namespace))
             }
         }
     }
@@ -1319,6 +1154,14 @@ impl Actor {
             self.store.close_replica(namespace);
         }
         res
+    }
+
+    fn close_every_handle(&mut self, namespace: NamespaceId) {
+        if self.states.close_every_handle(namespace) {
+            self.sessions.retain(|_, s| s.namespace != namespace);
+            self.record_open_sessions();
+            self.store.close_replica(namespace);
+        }
     }
 
     fn close_all(&mut self) {
@@ -1480,23 +1323,24 @@ impl OpenReplicas {
         }
     }
 
+    /// Whether `namespace` was open.
+    fn close_every_handle(&mut self, namespace: NamespaceId) -> bool {
+        self.0.remove(&namespace).is_some()
+    }
+
     fn close_all(&mut self) -> impl Iterator<Item = NamespaceId> + '_ {
         self.0.drain().map(|(n, _s)| n)
     }
 }
 
-async fn iter_to_irpc<T: irpc::RpcMessage>(
-    channel: mpsc::Sender<RpcResult<T>>,
+async fn iter_to_channel<T>(
+    channel: mpsc::Sender<Result<T>>,
     iter: Result<impl Iterator<Item = Result<T>>>,
 ) -> Result<(), SendReplyError> {
     match iter {
-        Err(err) => channel
-            .send(Err(RpcError::new(&*err)))
-            .await
-            .map_err(send_reply_error)?,
+        Err(err) => channel.send(Err(err)).await.map_err(send_reply_error)?,
         Ok(iter) => {
             for item in iter {
-                let item = item.map_err(|err| RpcError::new(&*err));
                 channel.send(item).await.map_err(send_reply_error)?;
             }
         }
@@ -1539,6 +1383,7 @@ fn send_reply_error<T>(_err: T) -> SendReplyError {
 mod tests {
     use super::*;
     use crate::store;
+    /// Closing an open replica ends its subscribers' event channel.
     #[tokio::test]
     async fn open_close() -> anyhow::Result<()> {
         let store = store::Store::memory();
@@ -1551,6 +1396,52 @@ mod tests {
         sync.subscribe(id, tx).await?;
         sync.close(id).await?;
         assert!(rx.recv().await.is_err());
+        Ok(())
+    }
+
+    /// A commit the idle timer runs and sees fail answers the store's next
+    /// write as its error rather than the log alone, and the write after
+    /// that goes through.
+    #[tokio::test]
+    async fn a_failed_idle_commit_fails_the_next_write() -> anyhow::Result<()> {
+        let sync = SyncHandle::spawn(store::Store::memory(), None, "foo".into());
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        sync.import_namespace(namespace.into()).await?;
+        sync.open(id, Default::default()).await?;
+        let author = sync.import_author(Author::new(&mut rand::rng())).await?;
+        // On disk before the failure, so only the write below is lost.
+        sync.flush_store().await?;
+        sync.fail_next_commit_for_test().await?;
+        sync.insert_local(
+            id,
+            author,
+            Bytes::from_static(b"lost"),
+            Hash::new(b"lost"),
+            4,
+        )
+        .await?;
+        // The idle timer runs once nothing arrives for `MAX_COMMIT_DELAY`.
+        tokio::time::sleep(MAX_COMMIT_DELAY * 3).await;
+
+        let next = sync
+            .insert_local(
+                id,
+                author,
+                Bytes::from_static(b"next"),
+                Hash::new(b"next"),
+                4,
+            )
+            .await;
+        assert!(next.is_err(), "the failed commit reached no caller");
+        sync.insert_local(
+            id,
+            author,
+            Bytes::from_static(b"after"),
+            Hash::new(b"after"),
+            5,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1603,7 +1494,7 @@ mod tests {
     /// Tests that streamer tasks spawned into `Actor.tasks` are reaped
     /// once they complete.
     ///
-    /// The three streaming actions (`ListAuthors`, `ListReplicas`, and
+    /// The two streaming actions (`ListReplicas` and
     /// `ReplicaAction::GetMany`) each `spawn_local` a task into
     /// `Actor.tasks` to drive their reply channel. The actor must
     /// `join_next` those tasks once they finish, otherwise the
@@ -1622,20 +1513,14 @@ mod tests {
 
         for _ in 0..ITERATIONS {
             let (tx, mut rx) = mpsc::channel(64);
-            sync.list_authors(tx).await?;
-            while rx.recv().await?.is_some() {}
-        }
-
-        for _ in 0..ITERATIONS {
-            let (tx, mut rx) = mpsc::channel(64);
             sync.list_replicas(tx).await?;
-            while rx.recv().await?.is_some() {}
+            while rx.recv().await.is_some() {}
         }
 
         for _ in 0..ITERATIONS {
             let (tx, mut rx) = mpsc::channel(64);
             sync.get_many(id, store::Query::all().into(), tx).await?;
-            while rx.recv().await?.is_some() {}
+            while rx.recv().await.is_some() {}
         }
 
         let mut last = sync.debug_tasks_len().await?;
@@ -1649,7 +1534,7 @@ mod tests {
             last <= 16,
             "residual Actor.tasks JoinSet len = {last}, expected <= 16 \
              (was the join_next arm in run_async lost? streamer tasks \
-             for ListAuthors / ListReplicas / GetMany are not being reaped)"
+             for ListReplicas / GetMany are not being reaped)"
         );
 
         sync.close(id).await?;

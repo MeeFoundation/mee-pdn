@@ -10,10 +10,11 @@ description = "Data layer: document sync over our iroh-docs variant, every sessi
 # side of the tracked contact set, the session and pass counters, a pod's
 # exchanges in flight, and the session opened under a named holder, so a
 # scenario can assert what the
-# node derived instead of sleeping and guessing. Off in every product
+# node derived instead of sleeping and guessing. The node in memory too,
+# which keeps nothing across a restart. Off in every product
 # build; `pdn-node/test-util` turns it on, and `just test -p data-layer`
-# names it directly.
-test-util = []
+# names it directly. The store's ordered subscription comes with it.
+test-util = ["pdn-store/observation"]
 
 [dependencies]
 anyhow = "1"
@@ -22,7 +23,9 @@ futures-core = "0.3"
 futures-lite = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-iroh = { workspace = true }
+# The path selector hook: iroh's own selector keeps a dead path to a peer
+# that restarted at a new address (src/path_selector.rs).
+iroh = { workspace = true, features = ["unstable-custom-transports"] }
 iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
 pdn-store = { workspace = true }
@@ -35,12 +38,15 @@ rand = "0.10"
 redb = "4.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+# The blob protocol's stream tasks, tracked so a stop waits for them before
+# it closes the blob store.
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 # Scenario tests of directory-configured nodes get a directory each.
 tempfile = "3"
-test-utils = { path = "../test-utils" }
+test-utils = { path = "../test-utils", features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]

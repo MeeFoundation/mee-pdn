@@ -4,8 +4,8 @@
 # `just audit`.
 
 [graph]
-# The whole lock, feature-gated branches included — the store's wasm and
-# migration features sit outside the default workspace build.
+# The whole lock: every dependency any feature gates is audited, whichever
+# build enables it.
 all-features = true
 
 [advisories]
@@ -43,5 +43,10 @@ private = { ignore = true }
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The fork `[patch.crates-io]` in Cargo.toml takes iroh-blobs from.
-allow-git = ["https://github.com/MeeFoundation/iroh-blobs"]
+# Where `[patch.crates-io]` in Cargo.toml takes iroh-blobs, iroh-gossip and
+# iroh-util from.
+allow-git = [
+    "https://github.com/MeeFoundation/iroh-blobs",
+    "https://github.com/n0-computer/iroh-gossip",
+    "https://github.com/n0-computer/iroh-util",
+]

@@ -3,7 +3,7 @@
 //! capacity its caller names, and the session id both ends of a session
 //! report.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, Watcher as _};
@@ -11,13 +11,10 @@ use iroh_blobs::{store::mem::MemStore, BlobsProtocol, Hash};
 use iroh_gossip::net::Gossip;
 use n0_future::{Stream, StreamExt};
 use pdn_store::{
-    api::{
-        protocol::{AddrInfoOptions, ShareMode},
-        Doc, DocsApi,
-    },
+    api::{AddrInfoOptions, Doc, DocsApi},
     engine::{LiveEvent, Origin, SyncEvent},
     filter::serve_whole,
-    protocol::Docs,
+    protocol::{Docs, DocsDispatch, IdentityResolver},
     Contact, ContentStatus, Identity, NamespaceId,
 };
 
@@ -46,10 +43,14 @@ impl Peer {
         let docs = Docs::memory(HOLDER, serve_whole())
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await?;
+        let resolve: IdentityResolver = {
+            let docs = docs.clone();
+            Arc::new(move |identity| (identity == HOLDER).then(|| docs.clone()))
+        };
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
             .accept(iroh_gossip::ALPN, gossip)
-            .accept(pdn_store::ALPN, docs.clone())
+            .accept(pdn_store::ALPN, DocsDispatch::new(resolve))
             .spawn();
         Ok(Self {
             router,
@@ -93,8 +94,10 @@ async fn writer_and_reader(count: usize, prefix: &str) -> Result<(Peer, Doc, Pee
     let reader = Peer::spawn().await?;
     let written = writer.api().create().await?;
     write(&writer, &written, prefix, 0..count).await?;
-    written.start_sync_scoped(vec![], HOLDER).await?;
-    let ticket = written.share(ShareMode::Write, AddrInfoOptions::Id).await?;
+    written
+        .sync_with_peers(vec![], vec![], HOLDER, false)
+        .await?;
+    let ticket = written.share(AddrInfoOptions::Id).await?;
     let read = reader.api().import_namespace(ticket.capability).await?;
     Ok((writer, written, reader, read))
 }
@@ -198,10 +201,11 @@ async fn a_thousand_entry_session_is_reported_entries_first() -> Result<()> {
     const ENTRIES: usize = 1_000;
     let (writer, written, reader, read) = writer_and_reader(ENTRIES, "k").await?;
     let hashes: Vec<Hash> = (0..ENTRIES).map(|i| Hash::new(format!("k{i}"))).collect();
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     let mut observed = read.observe(CAPACITY).await?;
     let mut product = read.subscribe().await?;
-    read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
 
     // Sentinels: the session ended and every payload arrived, so the
     // subscriber has read nothing across the whole session.
@@ -240,12 +244,13 @@ async fn a_thousand_entry_session_is_reported_entries_first() -> Result<()> {
 async fn a_download_completes_after_its_insert() -> Result<()> {
     let (writer, _written, reader, read) = writer_and_reader(1, "k").await?;
     let hash = Hash::new("k0");
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     // The engine's own: the API's forwarding reads as events come, so a
     // reader behind it never comes late.
     let mut observed = reader.docs.engine().observe(read.id(), CAPACITY).await?;
     let mut product = read.subscribe().await?;
-    read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
     wait_for(&mut product, finished_ok).await?;
     wait_until_held(&reader, &[hash]).await?;
 
@@ -285,7 +290,7 @@ async fn a_replica_not_held_open_for_sync_is_refused() -> Result<()> {
             .is_err(),
         "the engine opened an ordered subscription on a replica not syncing"
     );
-    doc.start_sync_scoped(vec![], HOLDER).await?;
+    doc.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     let _observed = doc.observe(CAPACITY).await?;
     peer.router.shutdown().await?;
     Ok(())
@@ -300,10 +305,11 @@ async fn a_replica_not_held_open_for_sync_is_refused() -> Result<()> {
 async fn a_dropped_replica_ends_its_ordered_subscription() -> Result<()> {
     let (writer, written, reader, read) = writer_and_reader(1, "k").await?;
     let namespace: NamespaceId = read.id();
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     let mut observed = read.observe(CAPACITY).await?;
     let mut product = read.subscribe().await?;
-    read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
     wait_for(&mut product, finished_ok).await?;
 
     reader.api().drop_doc(namespace).await?;
@@ -323,7 +329,9 @@ async fn a_dropped_replica_ends_its_ordered_subscription() -> Result<()> {
     // new subscription to the namespace opens.
     let mut writer_events = written.subscribe().await?;
     write(&writer, &written, "late", 0..1).await?;
-    written.start_sync_scoped(reader.contacts(), HOLDER).await?;
+    written
+        .sync_with_peers(reader.contacts(), vec![], HOLDER, false)
+        .await?;
     // The writer's end of the earlier session can still arrive here.
     let refused = wait_for(&mut writer_events, |e| {
         finished(e).is_some_and(|s| matches!(s.origin, Origin::Connect(_)))
@@ -357,11 +365,12 @@ async fn a_dropped_replica_ends_its_ordered_subscription() -> Result<()> {
 async fn a_subscriber_past_its_capacity_is_told_and_holds_up_nothing() -> Result<()> {
     const SMALL: usize = 16;
     let (writer, _written, reader, read) = writer_and_reader(100, "k").await?;
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     // The engine's own: the API holds events of its own in front of it.
     let mut observed = reader.docs.engine().observe(read.id(), SMALL).await?;
     let mut product = read.subscribe().await?;
-    read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
     wait_for(&mut product, finished_ok).await?;
 
     let mut kept = Vec::new();
@@ -410,10 +419,10 @@ async fn an_in_process_session_is_reported_in_the_same_order() -> Result<()> {
             .set_bytes(author, format!("k{i}"), format!("k{i}"))
             .await?;
     }
-    written.start_sync_scoped(vec![], WORK).await?;
-    let ticket = written.share(ShareMode::Read, AddrInfoOptions::Id).await?;
+    written.sync_with_peers(vec![], vec![], WORK, false).await?;
+    let ticket = written.share(AddrInfoOptions::Id).await?;
     let read = leisure.api().import_namespace(ticket.capability).await?;
-    read.start_sync_scoped(vec![], LEISURE).await?;
+    read.sync_with_peers(vec![], vec![], LEISURE, false).await?;
     let mut observed = leisure.engine().observe(read.id(), CAPACITY).await?;
     let mut product = read.subscribe().await?;
 
@@ -481,20 +490,23 @@ async fn an_ordered_subscription_taken_with_the_start_reports_the_first_session(
 async fn a_pairs_later_session_follows_the_end_of_its_earlier_one() -> Result<()> {
     const BATCH: usize = 50;
     let (writer, written, reader, read) = writer_and_reader(BATCH, "first").await?;
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     // The engine's own: the API's forwarding reads as events come, so a
     // reader behind it never comes late.
     let mut observed = reader.docs.engine().observe(read.id(), CAPACITY).await?;
     let mut product = read.subscribe().await?;
 
-    read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
     wait_for(&mut product, |e| {
         finished(e).is_some_and(|s| s.result.is_ok() && matches!(s.origin, Origin::Connect(_)))
     })
     .await?;
 
     write(&writer, &written, "second", 0..BATCH).await?;
-    written.start_sync_scoped(reader.contacts(), HOLDER).await?;
+    written
+        .sync_with_peers(reader.contacts(), vec![], HOLDER, false)
+        .await?;
     let carried = |e: &LiveEvent| {
         finished(e).is_some_and(|s| {
             matches!(s.origin, Origin::Accept)
@@ -545,14 +557,17 @@ async fn a_shared_payload_downloads_once_and_a_held_one_not_at_all() -> Result<(
     let shared = written.set_bytes(author, "a", "shared").await?;
     written.set_bytes(author, "b", "shared").await?;
     let held = written.set_bytes(author, "c", "held").await?;
-    written.start_sync_scoped(vec![], HOLDER).await?;
+    written
+        .sync_with_peers(vec![], vec![], HOLDER, false)
+        .await?;
     reader.blobs.add_bytes("held").await?;
-    let ticket = written.share(ShareMode::Read, AddrInfoOptions::Id).await?;
+    let ticket = written.share(AddrInfoOptions::Id).await?;
     let read = reader.api().import_namespace(ticket.capability).await?;
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     let mut observed = read.observe(CAPACITY).await?;
     let mut product = read.subscribe().await?;
-    read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
     wait_for(&mut product, finished_ok).await?;
     wait_until_held(&reader, &[shared]).await?;
 
@@ -595,7 +610,7 @@ async fn a_shared_payload_downloads_once_and_a_held_one_not_at_all() -> Result<(
 #[tokio::test(flavor = "multi_thread")]
 async fn both_sides_of_a_session_carry_one_session_id() -> Result<()> {
     let (writer, written, reader, read) = writer_and_reader(3, "k").await?;
-    read.start_sync_scoped(vec![], HOLDER).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
     let mut reader_events = read.subscribe().await?;
     let mut writer_events = written.subscribe().await?;
     let dialed = |e: &LiveEvent| {
@@ -610,7 +625,8 @@ async fn both_sides_of_a_session_carry_one_session_id() -> Result<()> {
         if round > 0 {
             write(&writer, &written, "more", 0..2).await?;
         }
-        read.start_sync_scoped(writer.contacts(), HOLDER).await?;
+        read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+            .await?;
         let reader_side = wait_for(&mut reader_events, dialed).await?;
         let writer_side = wait_for(&mut writer_events, accepted).await?;
         let (reader_side, writer_side) = (

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::ContentStatus;
 
 /// Store entries that can be fingerprinted and put into ranges.
-pub trait RangeEntry: Debug + Clone {
+pub(crate) trait RangeEntry: Debug + Clone {
     /// The key type for this entry.
     ///
     /// This type must implement [`Ord`] to define the range ordering used in the set
@@ -18,7 +18,7 @@ pub trait RangeEntry: Debug + Clone {
     /// See [`RangeKey`] for details.
     type Key: RangeKey;
 
-    /// The value type for this entry. See
+    /// The value type for this entry.
     ///
     /// The type must implement [`Ord`] to define which of two entries at one key supersedes the
     /// other.
@@ -47,20 +47,14 @@ pub enum ValidateOutcome {
 }
 
 /// A trait constraining types that are valid entry keys.
-pub trait RangeKey: Sized + Debug + Ord + PartialEq + Clone + 'static {
+pub(crate) trait RangeKey: Sized + Debug + Ord + PartialEq + Clone + 'static {
     /// Returns `true` if `self` is a prefix of `other`.
     #[cfg(test)]
     fn is_prefix_of(&self, other: &Self) -> bool;
-
-    /// Returns true if `other` is a prefix of `self`.
-    #[cfg(test)]
-    fn is_prefixed_by(&self, other: &Self) -> bool {
-        other.is_prefix_of(self)
-    }
 }
 
 /// A trait constraining types that are valid entry values.
-pub trait RangeValue: Sized + Debug + Ord + PartialEq + Clone + 'static {}
+pub(crate) trait RangeValue: Sized + Debug + Ord + PartialEq + Clone + 'static {}
 
 /// Stores a range.
 ///
@@ -114,7 +108,7 @@ impl<K> From<(K, K)> for Range<K> {
 }
 
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Fingerprint(pub [u8; 32]);
+pub(crate) struct Fingerprint(pub [u8; 32]);
 
 impl Debug for Fingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,7 +132,7 @@ impl std::ops::BitXorAssign for Fingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RangeFingerprint<K> {
+pub(crate) struct RangeFingerprint<K> {
     #[serde(bound(
         serialize = "Range<K>: Serialize",
         deserialize = "Range<K>: Deserialize<'de>"
@@ -150,7 +144,7 @@ pub struct RangeFingerprint<K> {
 
 /// Transfers items inside a range to the other participant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RangeItem<E: RangeEntry> {
+pub(crate) struct RangeItem<E: RangeEntry> {
     /// The range out of which the elements are.
     #[serde(bound(
         serialize = "Range<E::Key>: Serialize",
@@ -306,8 +300,8 @@ pub trait Store<E: RangeEntry>: Sized {
     /// If terminated, returns `None`
     ///
     /// `validate_cb` is called for each incoming entry received from the remote.
-    /// It must return true if the entry is valid and should be stored, and false otherwise
-    /// (which means the entry will be dropped and not stored).
+    /// It returns [`ValidateOutcome::Accept`] for an entry to store and
+    /// [`ValidateOutcome::Drop`] for one to keep out.
     ///
     /// `on_insert_cb` is called for each entry that was actually inserted into the store (so not
     /// for entries which validated, but are not inserted because the store holds a newer entry at
@@ -519,7 +513,6 @@ pub trait Store<E: RangeEntry>: Sized {
                             fingerprint,
                         }));
                     } else {
-                        // let content_status_cb = content_status_cb.clone();
                         let values = chunk.into_iter().filter_map(|entry| match entry {
                             Err(_err) => None,
                             Ok(entry) => Some(async {
@@ -853,6 +846,9 @@ mod tests {
         }
     }
 
+    /// The paper's first example: two sets each lacking entries of the other
+    /// converge in three messages from Alice and two from Bob, Bob splitting
+    /// the first range once.
     #[tokio::test]
     async fn test_paper_1() {
         let alice_set = [("ape", 1), ("eel", 1), ("fox", 1), ("gnu", 1)];
@@ -890,6 +886,8 @@ mod tests {
         assert!(res.bob_to_alice[1].parts[1].is_range_item());
     }
 
+    /// Sets that differ in Alice's `fox` alone converge in three messages
+    /// from Alice and two from Bob.
     #[tokio::test]
     async fn test_paper_2() {
         let alice_set = [
@@ -917,6 +915,8 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
     }
 
+    /// Alice's set holding Bob's four entries and four more converges with
+    /// it in three messages from Alice and two from Bob.
     #[tokio::test]
     async fn test_paper_3() {
         let alice_set = [
@@ -936,6 +936,8 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
     }
 
+    /// Two three-entry sets sharing two entries converge in two messages
+    /// each way.
     #[tokio::test]
     async fn test_limits() {
         let alice_set = [("ape", 1), ("bee", 1), ("cat", 1)];
@@ -946,6 +948,8 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
     }
 
+    /// Sets of path-like keys sharing one key converge in two messages each
+    /// way.
     #[tokio::test]
     async fn test_prefixes_simple() {
         let alice_set = [("/foo/bar", 1), ("/foo/baz", 1), ("/foo/cat", 1)];
@@ -956,6 +960,8 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
     }
 
+    /// An empty side converges with a side of three keys in one message
+    /// each way.
     #[tokio::test]
     async fn test_prefixes_empty_alice() {
         let alice_set = [];
@@ -966,6 +972,8 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
     }
 
+    /// A side of three keys converges with an empty side in two messages
+    /// from it and one back.
     #[tokio::test]
     async fn test_prefixes_empty_bob() {
         let alice_set = [("/foo/bar", 1), ("/foo/baz", 1), ("/foo/cat", 1)];
@@ -976,6 +984,8 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
     }
 
+    /// At a key both sides hold, the higher value wins on both, in two
+    /// messages from the side holding it and one back.
     #[tokio::test]
     async fn test_equal_key_higher_value() {
         let alice_set = [("foo", 2)];
@@ -986,9 +996,11 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
     }
 
+    /// Keys ordered by author first and then by their bytes converge into
+    /// the union of both sets on both sides, in two messages each way.
     #[tokio::test]
     async fn test_multikey() {
-        /// Uses the blanket impl of [`RangeKey]` for `T: AsRef<[u8]>` in this module.
+        /// A key ordered by author first, then by its bytes.
         #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
         struct Multikey {
             author: [u8; 4],
@@ -1067,9 +1079,8 @@ mod tests {
         );
     }
 
-    // This tests two things:
-    // 1) validate cb returning false leads to no changes on both sides after sync
-    // 2) validate cb receives expected entries
+    /// Entries each side's validate callback drops leave both sets as they
+    /// were, and each callback sees every entry the other side holds.
     #[tokio::test]
     async fn test_validate_cb() {
         let alice_set = [("alice1", 1), ("alice2", 2)];
@@ -1102,7 +1113,7 @@ mod tests {
             bob.put((k, v)).unwrap();
         }
 
-        // run sync with a validate callback returning false, so no new entries are stored on either side
+        // run sync with a validate callback returning `Drop`, so no new entries are stored on either side
         let mut res = sync_exchange_messages(alice, bob, &validate_alice, &validate_bob, 100).await;
         res.assert_alice_set("unchanged", &alice_set);
         res.assert_bob_set("unchanged", &bob_set);
@@ -1372,6 +1383,9 @@ mod tests {
         }
     }
 
+    /// A range reads its keys from its start up to its end excluded, an
+    /// empty bound reaching the store's edge, and a range whose start lies
+    /// past its end wraps around.
     #[test]
     fn store_get_range() {
         let mut store = SimpleStore::<&'static str, i32>::default();
@@ -1483,6 +1497,8 @@ mod tests {
         mk_test_set(values).into_iter().collect()
     }
 
+    /// A one-key side converges with a side holding that key and six more,
+    /// sending no value twice.
     #[tokio::test]
     async fn simple_store_sync_1() {
         let alice = mk_test_vec(["3"]);
@@ -1490,6 +1506,8 @@ mod tests {
         let _res = sync(&alice, &bob).await;
     }
 
+    /// Interleaved disjoint sets, `1 3` and `2`, converge, sending no value
+    /// twice.
     #[tokio::test]
     async fn simple_store_sync_x() {
         let alice = mk_test_vec(["1", "3"]);
@@ -1497,6 +1515,8 @@ mod tests {
         let _res = sync(&alice, &bob).await;
     }
 
+    /// Interleaved sets sharing one key, `1 3` and `0 2 3`, converge, sending
+    /// no value twice.
     #[tokio::test]
     async fn simple_store_sync_2() {
         let alice = mk_test_vec(["1", "3"]);
@@ -1504,6 +1524,8 @@ mod tests {
         let _res = sync(&alice, &bob).await;
     }
 
+    /// Disjoint sets on either side of each other, `8 9` and `1 2 3`,
+    /// converge, sending no value twice.
     #[tokio::test]
     async fn simple_store_sync_3() {
         let alice = mk_test_vec(["8", "9"]);
@@ -1511,6 +1533,7 @@ mod tests {
         let _res = sync(&alice, &bob).await;
     }
 
+    /// Any two sets of up to 10 short keys converge, sending no value twice.
     #[proptest]
     fn simple_store_sync(
         #[strategy(test_vec_string_unit())] alice: Vec<(String, ())>,
@@ -1525,6 +1548,8 @@ mod tests {
         });
     }
 
+    /// Any two sets of up to 10 short keys with values converge on the
+    /// higher value at each key, sending no value twice.
     #[proptest]
     fn simple_store_sync_u8(
         #[strategy(test_vec_string_u8())] alice: Vec<(String, u8)>,
@@ -1569,6 +1594,8 @@ mod tests {
         (expected, actual)
     }
 
+    /// A range over any set of up to 10 keys reads exactly the keys it
+    /// contains, a wrapping range included.
     #[proptest]
     fn simple_store_get_ranges(
         #[strategy(test_set_string_unit())] contents: BTreeMap<String, ()>,

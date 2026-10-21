@@ -6,4 +6,4 @@ paths:
 
 # pdn-store checks
 
-Any modification of `crates/pdn-store` ends with the checks the pipeline's `store` job runs, all from the workspace root: `just check`, `just check-store` (clippy on the other two feature sets and rustdoc, warnings denied, then the wasm32 build), `just test`, and `just test-store` (the other two feature sets, then doctests). The crate's `CLAUDE.md`, section "Pre-push checklist", says what each covers.
+Any modification of `crates/pdn-store` ends with `just check` (the store's warnings and rustdoc's denied) and `just test`, from the workspace root. The crate's `CLAUDE.md`, section "Pre-push checklist", says what each covers.
