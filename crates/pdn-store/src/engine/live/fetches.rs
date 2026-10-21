@@ -502,7 +502,8 @@ mod tests {
         );
     }
 
-    /// A timer of a series that has ended resumes nothing.
+    /// A timer of a series that has ended resumes nothing, the provider's
+    /// next series included.
     #[test]
     fn a_stale_timer_resumes_nothing() {
         let mut fetches = Fetches::new(100);
@@ -510,12 +511,18 @@ mod tests {
         let (p, q) = (payload(1), payload(2));
         want_from(&mut fetches, b1, &[p, q]);
         let steps = fetches.finished(b1, p, Outcome::Stalled, false, Instant::now());
-        let (_, series, _) = steps.pause.expect("a pause");
-        fetches.finished(b1, q, Outcome::Fetched, false, Instant::now());
+        let (_, stale, _) = steps.pause.expect("a pause");
+        let steps = fetches.finished(b1, q, Outcome::Fetched, false, Instant::now());
+        assert_eq!(steps.start, [(b1, p)], "the success ended the series");
+        let steps = fetches.finished(b1, p, Outcome::Stalled, false, Instant::now());
+        let (_, current, _) = steps.pause.expect("a second pause");
+        assert_ne!(stale, current);
+
+        assert_eq!(fetches.resume(b1, stale).start, [], "the stale timer");
         assert_eq!(
-            fetches.resume(b1, series).start,
-            [],
-            "the success ended the series"
+            fetches.resume(b1, current).start,
+            [(b1, p)],
+            "the current timer probes"
         );
     }
 
@@ -596,13 +603,16 @@ mod tests {
 
     /// A fetch failing on the node's own blob store unroutes its payload and
     /// pauses no provider.
+    ///
+    /// The provider is a gossip neighbor, the one a failure of its own would
+    /// pause.
     #[test]
     fn a_local_failure_pauses_no_provider() {
         let mut fetches = Fetches::new(1);
         let a1 = node(1);
         let (p, q) = (payload(1), payload(2));
         want_from(&mut fetches, a1, &[p, q]);
-        let steps = fetches.finished(a1, p, Outcome::LocalFailure, false, Instant::now());
+        let steps = fetches.finished(a1, p, Outcome::LocalFailure, true, Instant::now());
         assert!(steps.pause.is_none());
         assert_eq!(steps.unrouted, [p]);
         assert_eq!(steps.start, [(a1, q)], "a1 keeps its limit");
