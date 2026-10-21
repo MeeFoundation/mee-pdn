@@ -12,7 +12,10 @@ use anyhow::{Context, Result};
 use iroh::{address_lookup::memory::MemoryLookup, Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::{
     api::{blobs::BlobStatus, remote::GetProgressItem, Store},
-    get::GetError,
+    get::{
+        fsm::{AtBlobHeaderNextError, DecodeError},
+        GetError,
+    },
     util::connection_pool::{self, ConnectionPool},
     Hash, HashAndFormat,
 };
@@ -2318,11 +2321,25 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
     }
 }
 
-/// Whose failure a fetch's error is: the node's own blob store's, or the
-/// provider's.
+/// Whose failure a fetch's error is: the node's own blob store's, the
+/// provider's answer that it lacks the payload, or the provider's.
 fn outcome_of_failure(err: &GetError) -> Outcome {
     match err {
         GetError::LocalFailure { .. } => Outcome::LocalFailure,
+        GetError::AtBlobHeaderNext {
+            source: AtBlobHeaderNextError::NotFound { .. },
+            ..
+        }
+        | GetError::Decode {
+            source:
+                DecodeError::ChunkNotFound { .. }
+                | DecodeError::ParentNotFound { .. }
+                | DecodeError::LeafNotFound { .. },
+            ..
+        } => Outcome::Lacks,
+        // A stream the provider reset with an error code: it read the request
+        // and refused it, its connection standing.
+        _ if err.open().is_none() && err.iroh_error_code().is_some() => Outcome::Lacks,
         _ => Outcome::Failed,
     }
 }
@@ -2418,6 +2435,39 @@ mod tests {
 
         let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
         assert_eq!(outcome, Outcome::Failed);
+
+        fetching.close().await;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// A provider that does not hold the payload answers that it lacks it,
+    /// which is no failure of the provider.
+    #[tokio::test]
+    async fn a_provider_without_the_payload_answers_that_it_lacks_it() -> anyhow::Result<()> {
+        let held = iroh_blobs::store::mem::MemStore::new();
+        let provider = Router::builder(
+            Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?,
+        )
+        .accept(
+            iroh_blobs::ALPN,
+            iroh_blobs::BlobsProtocol::new(&held, None),
+        )
+        .spawn();
+        let fetching = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let connection = fetching
+            .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+            .await?;
+        let store = iroh_blobs::store::mem::MemStore::new();
+
+        let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
+        assert_eq!(outcome, Outcome::Lacks);
 
         fetching.close().await;
         provider.shutdown().await?;

@@ -27,6 +27,8 @@ pub(super) enum Outcome {
     /// Nothing arrived for [`NO_PROGRESS`].
     Stalled,
     ConnectFailed,
+    /// The provider answered that it lacks the payload, whole or in part.
+    Lacks,
     /// The provider failed it once the connection stood.
     Failed,
     /// The node's own blob store failed it.
@@ -219,6 +221,12 @@ impl Fetches {
             }
             Outcome::Stalled => {
                 self.pause(provider, now, &mut steps);
+                self.requeue(hash, &mut steps);
+            }
+            // An answer about this payload alone: a pause would hold back
+            // every payload the provider does hold.
+            Outcome::Lacks => {
+                self.drop_pair(hash, provider);
                 self.requeue(hash, &mut steps);
             }
             Outcome::ConnectFailed | Outcome::Failed if neighbor => {
@@ -642,6 +650,20 @@ mod tests {
         let steps = fetches.finished(a1, p, Outcome::Failed, false, Instant::now());
         assert_eq!(steps.unrouted, [p]);
         assert_eq!(steps.start, [(a1, q)]);
+    }
+
+    /// A provider that answers that it lacks a payload loses that payload
+    /// alone and keeps fetching the rest, though it is a gossip neighbor.
+    #[test]
+    fn a_provider_lacking_a_payload_keeps_fetching_the_rest() {
+        let mut fetches = Fetches::new(1);
+        let a1 = node(1);
+        let (p, q) = (payload(1), payload(2));
+        want_from(&mut fetches, a1, &[p, q]);
+        let steps = fetches.finished(a1, p, Outcome::Lacks, true, Instant::now());
+        assert!(steps.pause.is_none());
+        assert_eq!(steps.unrouted, [p]);
+        assert_eq!(steps.start, [(a1, q)], "a1 keeps its limit");
     }
 
     /// A fetch failing on the node's own blob store unroutes its payload and

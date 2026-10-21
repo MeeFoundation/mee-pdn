@@ -905,6 +905,76 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
     Ok(())
 }
 
+/// A gossip neighbor that lacks a payload the replica waits for still has
+/// its own payload fetched at once.
+///
+/// The writer serves no payload, so the neighbor holds the first entry
+/// without its payload. The neighbor writes only after a session it ran as
+/// a neighbor has ended, since that end is what asks it for the payload it
+/// lacks; a pause from that answer is at least 1 s, which sizes the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_neighbor_lacking_a_payload_has_its_own_fetched_at_once() -> Result<()> {
+    let mut rng = test_rng(b"a_neighbor_lacking_a_payload_has_its_own_fetched_at_once");
+    let writer = loopback_node(&mut rng, |node| node.without_blob_serving()).await?;
+    let neighbor = loopback_node(&mut rng, |node| node).await?;
+    let replica = loopback_node(&mut rng, |node| node).await?;
+    let doc = writer.docs().create().await?;
+    let author = writer.docs().author_create().await?;
+    doc.set_bytes(author, b"record/lacked".to_vec(), b"lacked".to_vec())
+        .await?;
+    let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
+    let (doc_neighbor, mut neighbor_events) =
+        util::import_and_subscribe(neighbor.docs(), ticket).await?;
+    next_event_matching(&mut neighbor_events, TIMEOUT, |event| {
+        matches!(event, LiveEvent::InsertRemote { .. })
+    })
+    .await;
+
+    let ticket = doc_neighbor
+        .share(AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let (_doc_replica, mut events) = util::import_and_subscribe(replica.docs(), ticket).await?;
+    let neighbor_id = neighbor.id();
+    next_event_matching(
+        &mut events,
+        TIMEOUT,
+        |event| matches!(event, LiveEvent::NeighborUp(peer) if *peer == neighbor_id),
+    )
+    .await;
+    next_event_matching(&mut events, TIMEOUT, |event| {
+        match_sync_finished(event, neighbor_id)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let author = neighbor.docs().author_create().await?;
+    let own = doc_neighbor
+        .set_bytes(author, b"record/own".to_vec(), b"own".to_vec())
+        .await?;
+    next_event_matching(&mut events, TIMEOUT, |event| {
+        matches!(event, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == own)
+    })
+    .await;
+    let inserted = Instant::now();
+    next_event_matching(
+        &mut events,
+        TIMEOUT,
+        |event| matches!(event, LiveEvent::ContentReady { hash } if *hash == own),
+    )
+    .await;
+    let fetches = replica.engine().fetches_report().await?;
+    assert!(
+        inserted.elapsed() < Duration::from_secs(1),
+        "the neighbor's own payload took {:?}; fetches: {fetches}",
+        inserted.elapsed()
+    );
+
+    writer.shutdown().await?;
+    neighbor.shutdown().await?;
+    replica.shutdown().await?;
+    Ok(())
+}
+
 /// This tests basic sync and gossip with 3 peers.
 #[tokio::test]
 #[traced_test]
