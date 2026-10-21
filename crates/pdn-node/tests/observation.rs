@@ -644,14 +644,19 @@ async fn the_listing_starts_no_session() -> Result<()> {
 
 const HELD: usize = 1_000;
 
-/// A pod `alice` created on `alice_phone` holding [`HELD`] records of
+/// The control's pod: on a CI runner a catch-up of [`HELD`] records takes
+/// about the whole of [`pdn_node::JOIN_CATCH_UP_TIMEOUT`].
+const CONTROL_HELD: usize = 100;
+
+/// A pod `alice` created on `alice_phone` holding `held` records of
 /// distinct payloads, their keys, and an invite to it.
 async fn pod_holding_records(
     alice_phone: &Runtime,
     alice: PdnId,
+    held: usize,
 ) -> Result<(PodId, HashSet<String>, pdn_node::PodInvite)> {
     let pod = alice_phone.pods().create(alice).await?;
-    for index in 0..HELD {
+    for index in 0..held {
         alice_phone
             .pods()
             .put_record(
@@ -668,7 +673,7 @@ async fn pod_holding_records(
         .into_iter()
         .map(|entry| entry.key)
         .collect();
-    assert_eq!(keys.len(), HELD);
+    assert_eq!(keys.len(), held);
     let invite = alice_phone.pods().invite(alice, pod, None).await?;
     Ok((pod, keys, invite))
 }
@@ -683,7 +688,7 @@ async fn a_joiners_first_session_is_reported_from_its_first_insert() -> Result<(
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
-    let (pod, keys, invite) = pod_holding_records(&alice_phone, alice).await?;
+    let (pod, keys, invite) = pod_holding_records(&alice_phone, alice, HELD).await?;
 
     let (joined, mut subscription) = bob_phone.join_pod_observed_for_test(bob, invite).await?;
     assert_eq!(joined, pod);
@@ -720,16 +725,16 @@ async fn a_joiners_first_session_is_reported_from_its_first_insert() -> Result<(
     Ok(())
 }
 
-/// The control of the observed join: the same arrangement through `join`
-/// and then a subscription holds no `insert_remote` of the records the
-/// joiner's first session carried, up to a record placed after the join.
-/// Fails with `join` answering before its catch-up.
+/// The control of the observed join: a pod of [`CONTROL_HELD`] records
+/// joined through `join` and then a subscription holds no `insert_remote` of
+/// the records the joiner's first session carried, up to a record placed
+/// after the join. Fails with `join` answering before its catch-up.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_product_join_followed_by_a_subscription_misses_the_first_session() -> Result<()> {
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
     let alice = alice_phone.identity().create().await?;
     let bob = bob_phone.identity().create().await?;
-    let (pod, keys, invite) = pod_holding_records(&alice_phone, alice).await?;
+    let (pod, keys, invite) = pod_holding_records(&alice_phone, alice, CONTROL_HELD).await?;
 
     bob_phone.pods().join(bob, invite).await?;
     let mut subscription = bob_phone.observe_pod_for_test(bob, pod).await?;
