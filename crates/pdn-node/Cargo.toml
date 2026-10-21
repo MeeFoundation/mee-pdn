@@ -35,7 +35,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # `rt` for the detached identity-armer task the runtime spawns per
 # hosted identity.
-# `macros` for the observation task's select.
+# `macros` for the `select!` in the armer and in the observation task.
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 # Background failures warn through the ecosystem's subscriber; already in

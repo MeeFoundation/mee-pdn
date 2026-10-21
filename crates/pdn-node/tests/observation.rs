@@ -429,7 +429,7 @@ async fn a_departure_closes_the_record_stream(departure: Departure) -> Result<()
     Ok(())
 }
 
-/// A removal the removaled member's node folds closes its record stream; no
+/// A removal the removed member's node folds closes its record stream; no
 /// record placed afterwards reaches the subscription, while its membership
 /// store's records continue. Fails with a store's end not reported.
 #[tokio::test(flavor = "multi_thread")]
@@ -577,7 +577,7 @@ async fn the_listing_holds_a_placed_record_beside_a_forged_entry_at_its_key() ->
             Ok(refused.is_err_and(|err| is::<UnknownPod>(&err)))
         })
         .await?,
-        "the removaled member is not refused the listing"
+        "the removed member is not refused the listing"
     );
 
     for runtime in [alice_phone, bob_phone] {

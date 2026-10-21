@@ -82,7 +82,7 @@ impl LinkBudget {
 pub struct NoQuery {}
 
 /// The pod a `create` or a `join` answers with.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldPod {
     pub pod: PodId,
 }

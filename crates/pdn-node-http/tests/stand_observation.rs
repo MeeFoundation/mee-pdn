@@ -225,7 +225,7 @@ async fn a_removed_members_record_stream_closes() -> Result<()> {
     let key = key_of(&alice_node, alice, pod, b"after the removal").await?;
     record_reads(&bob_node, bob, pod, later, b"after the removal").await?;
 
-    // Denied (the removaled member): nothing of the record store, and the
+    // Denied (the removed member): nothing of the record store, and the
     // route still open.
     let watched_until = tokio::time::Instant::now() + REMOVED_WATCH;
     loop {
@@ -233,9 +233,9 @@ async fn a_removed_members_record_stream_closes() -> Result<()> {
         match removed.read(wait).await? {
             Read::Record(record) => assert!(
                 record.store == ObservedStore::Membership && !is_insert_of(&record, &key),
-                "the removaled member's route yielded {record:?}"
+                "the removed member's route yielded {record:?}"
             ),
-            Read::Ended => anyhow::bail!("the removaled member's event route ended"),
+            Read::Ended => anyhow::bail!("the removed member's event route ended"),
             Read::Quiet => break,
         }
     }
@@ -367,7 +367,7 @@ async fn an_observed_join_streams_the_catch_up_from_its_first_insert() -> Result
         .get(&format!("/debug/identities/{dave_work}/pods"))
         .await?
         .json()?;
-    assert!(held.pods.is_empty(), "{held:?}");
+    assert_eq!(held.pods, [], "{held:?}");
     Ok(())
 }
 
@@ -427,15 +427,16 @@ async fn an_invalid_pod_interval_stops_the_start() -> Result<()> {
     Ok(())
 }
 
-/// The largest catch-up a join survives: an observed join of a pod holding
-/// 1,000 records of 256 B yields every record's `insert_remote` and its
-/// content, from `seq` 0 with no `lagged`, although the route answers only
-/// once the join has waited and its consumer reads nothing before. Sized
-/// under the live actor's 1,024-event `replica_events` channel: a join
-/// session inserting more can deadlock the live actor and the store actor
-/// (tasks.md 2.10). At this size the transport between node and test holds
-/// the whole stream, so the runtime's draining task is proven in `pdn-node`
-/// by `a_consumer_that_reads_late_receives_the_time_of_production`.
+/// The largest catch-up the stand's tests observe: an observed
+/// join of a pod holding 1,000 records of 256 B yields every record's
+/// `insert_remote` and its content, from `seq` 0 with no `lagged`,
+/// although the route answers only once the join has waited and its
+/// consumer reads nothing before. Sized just under the live actor's
+/// 1,024-event `replica_events` channel: a first session past it is the
+/// case `DrainingSync` in `crates/pdn-store` exists for, pinned by its own
+/// tests, and at this size the transport between node and test holds the
+/// whole stream, so the runtime's draining task is proven in `pdn-node` by
+/// `a_consumer_that_reads_late_receives_the_time_of_production`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http images (just test-docker)"]
 async fn the_largest_catch_up_is_observed_whole() -> Result<()> {

@@ -1,62 +1,10 @@
-//! The mobile host: a uniffi facade over the [`pdn_node`] runtime, and the
-//! second host of the same shape as `pdn-node-http`.
-//!
-//! One exported call per service call of the runtime, and no orchestration
-//! of the facade's own: it retries no ceremony, remembers no result, and
-//! holds no rule about what a member may read. An application
-//! and a facade that each kept a view of the same thing would drift, and
-//! the drift would show as a screen contradicting the node it sits on.
-//!
-//! # What is deliberately absent
-//!
-//! No exported call hands over or accepts a namespace ticket. A pod's
-//! tickets cross only inside the join dialogue, so an application able to
-//! import a ticket would hold a pod's stores the membership never admitted
-//! it to.
-//!
-//! No exported call shares or imports a namespace, forces a
-//! reconciliation, resets state, drops a replica, or reaches a store
-//! outside a service operation. Repeating a read is the whole of waiting: a
-//! screen given a synchronize control would keep showing convergence after
-//! convergence broke.
-//!
-//! None of the runtime's test-only surface is reachable, and the facade is
-//! built with that feature off, so a forced write and an observation of a
-//! replica's contact set are absent from the binary rather than merely
-//! unexported. The one exception is the sync tests' build behind the
-//! `observation` feature, which `pdn-sdk` never packages as a release.
-//!
-//! The facade authorizes nothing: no credential, token or permission of its
-//! own on any exported call. Reaching the facade is reaching the node, and
-//! it runs inside the application's process, so the application's own
-//! screen lock is the whole of the posture in front of it.
-//!
-//! # What it repeats from the runtime, and adds nothing to
-//!
-//! A node keeps its replicas, its payloads and its own key in the directory
-//! named at bring-up, and comes back on that directory as the same node
-//! hosting what it hosted. What a restart does not bring back is work in
-//! flight — an invite minted and not consumed, a ceremony interrupted. The
-//! device's storage is the only copy: nothing behind this surface keeps
-//! another.
-//!
-//! An identity is a placeholder value the runtime mints, with no key
-//! material behind it, so nothing here proves who a peer is. A pod's
-//! membership is evidence that a device ran a join with the same one-time
-//! secret, and nothing more.
-//!
-//! A peer is reached only in one local network: the runtime's endpoint binds
-//! with no relay and no discovery configured, so a peer is reached at an
-//! address the endpoint publishes about itself.
-//!
-//! # Its error table diverges from the other host's, on purpose
-//!
-//! `pdn-node-http` folds an unreachable counterparty and every ceremony
-//! timeout into its unrecognized failure, because for a container test the
-//! distinction a denial rests on is a refusal against a defect. A person
-//! holding a phone needs different acts out of those outcomes, so
-//! [`PdnError`] names them. The divergence is stated rather than left for a
-//! reader comparing the two hosts to find.
+//! The mobile host: a uniffi facade over the [`pdn_node`] runtime, the
+//! second host of the same shape as `pdn-node-http` — one exported call per
+//! service call of the runtime and no orchestration of its own, since an
+//! application and a facade each keeping a view of the same thing would
+//! drift. What stays absent from it, why its error table names more kinds
+//! than the other host's, and the `observation` build are in the crate's
+//! `CLAUDE.md`; its requirements are the `pdn-mobile/host` spec.
 
 mod error;
 mod node;

@@ -24,7 +24,7 @@ use tower::ServiceExt as _;
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_past_the_debug_ceiling_is_shed() -> Result<()> {
     let runtime = Arc::new(Runtime::spawn(SpawnOptions::memory()).await?);
-    let app = router(Arc::clone(&runtime), true);
+    let app = router(Arc::clone(&runtime), true, false);
     let acquired = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let lock_holder = {

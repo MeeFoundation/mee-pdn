@@ -334,8 +334,16 @@ impl Pump {
             return false;
         }
         if self.waiting.load(Ordering::Acquire) >= self.bound {
-            *self.lost(store) = true;
-            return true;
+            if body != RecordBody::Closed {
+                *self.lost(store) = true;
+                return true;
+            }
+            // A store's end goes past the bound, behind the `lagged` of what
+            // it lost: a consumer reading late must still learn the store
+            // ended.
+            if std::mem::take(self.lost(store)) && !self.send(store, t, RecordBody::Lagged) {
+                return false;
+            }
         }
         self.send(store, t, body)
     }

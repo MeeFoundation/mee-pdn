@@ -37,9 +37,10 @@ use tokio::sync::watch;
 pub use crate::observation::MAX_OPEN_STREAMS;
 pub use crate::{
     bind::{
-        bind_addr, bind_addr_from_env, connectivity, connectivity_from_env, data_dir,
-        data_dir_from_env, debug_enabled, debug_enabled_from_env, pod_reconcile_interval,
-        pod_reconcile_interval_from_env, spawn_options, DEFAULT_HOST, DEFAULT_PORT,
+        any_origin, any_origin_from_env, bind_addr, bind_addr_from_env, connectivity,
+        connectivity_from_env, data_dir, data_dir_from_env, debug_enabled, debug_enabled_from_env,
+        pod_reconcile_interval, pod_reconcile_interval_from_env, spawn_options, DEFAULT_HOST,
+        DEFAULT_PORT,
     },
     error::HostError,
 };
@@ -66,10 +67,11 @@ pub async fn serve(
     runtime: &Arc<Runtime>,
     listener: tokio::net::TcpListener,
     debug: bool,
+    any_origin: bool,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let (stopped, mut stopping) = watch::channel(false);
-    let app = assemble(Arc::clone(runtime), debug, stopping.clone());
+    let app = assemble(Arc::clone(runtime), debug, any_origin, stopping.clone());
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         stop.await;
         let _ = stopped.send(true);
@@ -90,13 +92,21 @@ pub async fn serve(
 }
 
 /// This one branch gates the whole `/debug/` subtree: off means absent, so
-/// requests there fall through to 404, not to an unauthorized answer. Event
-/// streams of a router built here end only with the runtime.
-pub fn router(runtime: Arc<Runtime>, debug: bool) -> Router {
-    assemble(runtime, debug, watch::channel(false).1)
+/// requests there fall through to 404, not to an unauthorized answer. With
+/// `any_origin` the subtree answers a page of any origin (`PDN_ANY_ORIGIN`);
+/// without it a browser's cross-origin read is refused as any browser
+/// refuses it. Event streams of a router built here end only with the
+/// runtime.
+pub fn router(runtime: Arc<Runtime>, debug: bool, any_origin: bool) -> Router {
+    assemble(runtime, debug, any_origin, watch::channel(false).1)
 }
 
-fn assemble(runtime: Arc<Runtime>, debug: bool, stopping: watch::Receiver<bool>) -> Router {
+fn assemble(
+    runtime: Arc<Runtime>,
+    debug: bool,
+    any_origin: bool,
+    stopping: watch::Receiver<bool>,
+) -> Router {
     let app = Router::new()
         .route("/live", get(live))
         .route("/ready", get(ready));
@@ -106,12 +116,15 @@ fn assemble(runtime: Arc<Runtime>, debug: bool, stopping: watch::Receiver<bool>)
         let routes = routes.merge(observation::routes(Arc::clone(&runtime), stopping));
         #[cfg(not(feature = "observation"))]
         drop(stopping);
-        let debug = routes
-            .layer(middleware::from_fn_with_state(
-                Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
-                admit_request,
-            ))
-            .layer(middleware::from_fn(permit_any_origin));
+        let debug = routes.layer(middleware::from_fn_with_state(
+            Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            admit_request,
+        ));
+        let debug = if any_origin {
+            debug.layer(middleware::from_fn(permit_any_origin))
+        } else {
+            debug
+        };
         app.merge(debug)
     } else {
         app
@@ -156,10 +169,10 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> Result<&'static str, Host
 }
 
 /// Cross-origin headers, so a page a browser loaded from somewhere else can
-/// drive this node the way an application drives its own. Scoped to the
-/// debug subtree, which exists only where `PDN_DEBUG` says so, and open to
-/// any origin because a stand that answers on loopback has no origin worth
-/// naming.
+/// drive this node the way an application drives its own (the demo's
+/// screens). Open to any origin, since a page served from a file has none;
+/// hence the switch of its own beside `PDN_DEBUG`: with it on, every page
+/// open in a browser on the host reads what the debug subtree answers.
 async fn permit_any_origin(request: Request, next: Next) -> Response {
     let preflight = request.method() == axum::http::Method::OPTIONS;
     let mut response = if preflight {

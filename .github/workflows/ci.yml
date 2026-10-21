@@ -44,6 +44,9 @@ jobs:
       - name: Run tests
         run: just test
 
+      - name: Test the product configuration
+        run: just test-product
+
   # The facade for the 2 targets a device runs: a break here is a break of
   # the whole mobile host, and `lint-test` builds for this runner's target
   # alone.
@@ -71,11 +74,16 @@ jobs:
       # image exports both variables, so the fallback is read in the shell —
       # the `env` context holds what a workflow sets, not what the image
       # exports, and naming it there would blank the variable instead.
+      # Both builds, each checked for the observation surface: the release
+      # carries none of it, the test build does.
       - name: Build the facade for Android
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
           [ -d "$ANDROID_NDK_HOME" ] || { echo "no NDK on this runner"; exit 1; }
           just build-mobile aarch64-linux-android
+          sh scripts/check-no-observation.sh target/aarch64-linux-android/release/libpdn_mobile.so absent
+          just build-mobile aarch64-linux-android observation
+          sh scripts/check-no-observation.sh target/aarch64-linux-android/release/libpdn_mobile.so present
 
   mobile-ios:
     runs-on: macos-latest
@@ -97,7 +105,11 @@ jobs:
           workspaces: . -> target
 
       - name: Build the facade for iOS
-        run: just build-mobile aarch64-apple-ios
+        run: |
+          just build-mobile aarch64-apple-ios
+          sh scripts/check-no-observation.sh target/aarch64-apple-ios/release/libpdn_mobile.a absent
+          just build-mobile aarch64-apple-ios observation
+          sh scripts/check-no-observation.sh target/aarch64-apple-ios/release/libpdn_mobile.a present
 
   stand:
     runs-on: ubuntu-26.04

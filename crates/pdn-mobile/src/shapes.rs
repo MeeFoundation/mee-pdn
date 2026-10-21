@@ -207,6 +207,8 @@ pub(crate) fn entry_payload(payload: &[u8]) -> Result<(), PdnError> {
 mod tests {
     use super::*;
 
+    /// An identity that is no hex id is refused by the host itself as
+    /// malformed input, before the runtime is called.
     #[test]
     fn a_malformed_identity_is_the_hosts_refusal() {
         let err = identity("not-hex", "identity").unwrap_err();
@@ -224,6 +226,8 @@ mod tests {
         assert!(lifetime(None).unwrap().is_none());
     }
 
+    /// An empty payload and one a byte past `MAX_ENTRY_PAYLOAD` are refused;
+    /// one byte is taken.
     #[test]
     fn an_empty_payload_and_one_above_the_ceiling_are_refused() {
         assert!(entry_payload(b"").is_err());

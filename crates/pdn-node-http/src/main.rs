@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use pdn_node::Runtime;
 use pdn_node_http::{
-    bind_addr_from_env, connectivity_from_env, data_dir_from_env, debug_enabled_from_env,
-    pod_reconcile_interval_from_env, serve, spawn_options,
+    any_origin_from_env, bind_addr_from_env, connectivity_from_env, data_dir_from_env,
+    debug_enabled_from_env, pod_reconcile_interval_from_env, serve, spawn_options,
 };
 
 #[tokio::main]
@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = data_dir_from_env()?;
     let bind_addr = bind_addr_from_env()?;
     let debug_enabled = debug_enabled_from_env()?;
+    let any_origin = any_origin_from_env()?;
     let connectivity = connectivity_from_env()?;
     let pod_reconcile_interval = pod_reconcile_interval_from_env()?;
 
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     // life: without them a node stuck in `spawn` and one serving but
     // unreachable leave byte-identical logs.
     tracing::info!("runtime spawned");
-    let result = run(&runtime, bind_addr, debug_enabled).await;
+    let result = run(&runtime, bind_addr, debug_enabled, any_origin).await;
     // On every outcome of `run`: skipping it leaves the endpoint and every
     // hosted identity's tasks running while the process tries to exit.
     let shutdown = runtime.shutdown().await;
@@ -65,10 +66,11 @@ async fn run(
     runtime: &Arc<Runtime>,
     bind_addr: std::net::SocketAddr,
     debug_enabled: bool,
+    any_origin: bool,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = ?listener.local_addr()?, "HTTP listening");
-    serve(runtime, listener, debug_enabled, stop_signal()).await
+    serve(runtime, listener, debug_enabled, any_origin, stop_signal()).await
 }
 
 /// Ctrl-C or SIGTERM: a container stop sends the latter, so on Ctrl-C alone

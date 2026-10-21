@@ -62,12 +62,12 @@ tracing-subscriber = "0.3"
 uniffi = { version = "0.32", default-features = false }
 
 [dev-dependencies]
-# The test surface's tests speak HTTP to it as a coordinator does.
+# The test surface's tests speak HTTP to it as a coordinator does. 0.12
+# rather than the stand harness's 0.13: iroh 1.3 turns on 0.13's
+# `rustls-no-provider`, and a client then needs a TLS configuration even for
+# plain HTTP (`plain_http_tls` there); 0.12 without TLS features needs none.
 reqwest = { version = "0.12", default-features = false }
 tempfile = "3"
-# The surface tests assert a payload minted here parses as the encoding the
-# other host over the same runtime takes, which is the runtime type's own.
-serde_json = "1"
 test-utils = { path = "../test-utils" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 

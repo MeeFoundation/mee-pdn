@@ -50,17 +50,32 @@ pub fn bind_addr_from_env() -> Result<SocketAddr> {
 
 /// `PDN_DEBUG`: a closed set of values, unset meaning off.
 pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
-    match raw {
-        Some("1" | "true") => Ok(true),
-        None | Some("0" | "false") => Ok(false),
-        Some(other) => Err(anyhow::anyhow!(
-            "PDN_DEBUG must be one of 1, true, 0, false, or unset — got {other:?}"
-        )),
-    }
+    flag("PDN_DEBUG", raw)
 }
 
 pub fn debug_enabled_from_env() -> Result<bool> {
     debug_enabled(env("PDN_DEBUG")?.as_deref())
+}
+
+/// `PDN_ANY_ORIGIN`: the debug subtree's cross-origin headers, the same
+/// closed set as `PDN_DEBUG`, unset meaning off. Off, a page in a browser
+/// on the host cannot read what the subtree answers; the demo turns it on.
+pub fn any_origin(raw: Option<&str>) -> Result<bool> {
+    flag("PDN_ANY_ORIGIN", raw)
+}
+
+pub fn any_origin_from_env() -> Result<bool> {
+    any_origin(env("PDN_ANY_ORIGIN")?.as_deref())
+}
+
+fn flag(name: &str, raw: Option<&str>) -> Result<bool> {
+    match raw {
+        Some("1" | "true") => Ok(true),
+        None | Some("0" | "false") => Ok(false),
+        Some(other) => Err(anyhow::anyhow!(
+            "{name} must be one of 1, true, 0, false, or unset — got {other:?}"
+        )),
+    }
 }
 
 /// `PDN_CONNECTIVITY`: a closed set of values, unset meaning `direct`.
@@ -182,7 +197,8 @@ mod tests {
         assert!(bind_addr(Some("not a host"), None).is_err());
     }
 
-    /// An unset `PDN_DEBUG` leaves the debug subtree off.
+    /// An unset `PDN_CONNECTIVITY` is direct paths, each named value is
+    /// its connectivity, and a value outside the closed set fails the start.
     #[test]
     fn connectivity_is_direct_unless_named() {
         assert_eq!(connectivity(None).unwrap(), Connectivity::Direct);
@@ -195,9 +211,24 @@ mod tests {
         assert!(connectivity(Some("relay")).is_err());
     }
 
+    /// An unset `PDN_DEBUG` leaves the debug subtree off, and an unset
+    /// `PDN_ANY_ORIGIN` leaves its cross-origin headers off.
     #[test]
     fn nothing_configured_is_off() {
         assert!(!debug_enabled(None).unwrap());
+        assert!(!any_origin(None).unwrap());
+    }
+
+    /// `PDN_ANY_ORIGIN` takes the closed set `PDN_DEBUG` takes, and a value
+    /// outside it fails the start naming the variable.
+    #[test]
+    fn any_origin_takes_the_debug_flags_values() {
+        assert!(any_origin(Some("1")).unwrap());
+        assert!(any_origin(Some("true")).unwrap());
+        assert!(!any_origin(Some("0")).unwrap());
+        assert!(!any_origin(Some("false")).unwrap());
+        let err = any_origin(Some("yes")).unwrap_err();
+        assert!(err.to_string().contains("PDN_ANY_ORIGIN"), "{err}");
     }
 
     /// `PDN_DEBUG` set to `1` or `true` turns the debug subtree on, and `0`
@@ -241,6 +272,8 @@ mod tests {
         );
     }
 
+    /// An unset `PDN_POD_RECONCILE_INTERVAL_SECS` parses as none, and the
+    /// spawn options then keep the runtime's own pod interval.
     #[test]
     fn an_unset_pod_interval_leaves_the_runtimes_default() {
         assert_eq!(pod_reconcile_interval(None).unwrap(), None);
@@ -248,6 +281,8 @@ mod tests {
         assert_eq!(options.pod_reconcile_interval, Duration::from_secs(300));
     }
 
+    /// A configured pod interval reaches the spawn options as given, beside
+    /// the connectivity named.
     #[test]
     fn a_configured_pod_interval_is_the_runtimes() {
         let interval = pod_reconcile_interval(Some("30")).unwrap();
@@ -261,6 +296,8 @@ mod tests {
         assert_eq!(options.connectivity, Connectivity::Relays);
     }
 
+    /// A pod interval of zero, a negative one, one with a unit, or an empty
+    /// one fails the start, the error naming the variable.
     #[test]
     fn a_pod_interval_that_is_no_positive_whole_number_fails_naming_the_variable() {
         for raw in ["0", "-5", "30s", ""] {

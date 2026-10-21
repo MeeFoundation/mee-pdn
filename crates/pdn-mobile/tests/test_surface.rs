@@ -394,12 +394,17 @@ async fn the_surface_answers_on_loopback_alone() -> Result<()> {
     // A datagram socket "connected" to a documentation address names the
     // interface the machine would route through, and sends nothing.
     let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    probe.connect("192.0.2.1:9")?;
-    let network = probe.local_addr()?.ip();
-    anyhow::ensure!(
-        !network.is_loopback() && !network.is_unspecified(),
-        "this machine has no network address to try"
-    );
+    let network = probe
+        .connect("192.0.2.1:9")
+        .and_then(|()| probe.local_addr())
+        .map(|addr| addr.ip());
+    let network = match network {
+        Ok(ip) if !ip.is_loopback() && !ip.is_unspecified() => ip,
+        _ => {
+            eprintln!("skipped: this machine has no network address to try");
+            return Ok(());
+        }
+    };
     // Denied: the same port at the network address.
     let refused = tokio::time::timeout(
         Duration::from_secs(5),
@@ -481,6 +486,7 @@ async fn device_samples_are_answered_in_order() -> Result<()> {
 async fn a_reset_outlives_its_client() -> Result<()> {
     let phone = Phone::serve().await?;
     let first = phone.reset().await?;
+    let (_, before) = phone.get("/debug/status").await?;
     // Shorter than stopping the first node and bringing up the next.
     let hasty = reqwest::Client::builder()
         .timeout(Duration::from_millis(20))
@@ -495,7 +501,12 @@ async fn a_reset_outlives_its_client() -> Result<()> {
         .await;
     assert!(gone.is_err(), "the reset answered before the hang-up");
 
-    let up = eventually(|| async { Ok(phone.get("/debug/status").await?.0 == 200) }).await?;
+    // The node the abandoned reset brought up, told from the first by its id.
+    let up = eventually(|| async {
+        let (status, after) = phone.get("/debug/status").await?;
+        Ok(status == 200 && after.lines().next() != before.lines().next())
+    })
+    .await?;
     assert!(up, "the abandoned reset left no node up");
     let next = phone.reset().await?;
     assert_ne!(

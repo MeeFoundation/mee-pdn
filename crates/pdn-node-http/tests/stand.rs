@@ -11,7 +11,7 @@ use pdn_node::RecordKind;
 use pdn_node_http::shapes::{HeldPods, HostedIdentities};
 
 mod common;
-use common::{record_reads, record_route, Stand};
+use common::{record_reads, record_route, Image, Stand};
 
 /// A device joins an identity: the linking payload minted on the first
 /// device is consumed on a second, which then hosts the identity and reads
@@ -319,5 +319,33 @@ async fn two_identities_on_one_node_keep_separate_pods() -> Result<()> {
             refused.text()
         );
     }
+    Ok(())
+}
+
+/// A node started with `PDN_ANY_ORIGIN` answers a debug request with the
+/// header a page of another origin needs to read it. Denied: a node started
+/// without it sends none, so a page reads nothing of a node nobody opened.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+async fn the_debug_surface_opens_to_any_origin_only_when_asked() -> Result<()> {
+    const ORIGIN: &str = "access-control-allow-origin";
+    let stand = Stand::new();
+    let opened = stand
+        .spawn_from("opened", Image::Stand, true, &[("PDN_ANY_ORIGIN", "1")])
+        .await?;
+    let closed = stand.spawn("closed").await?;
+
+    let answer = opened.get("/debug/status").await?;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(
+        answer.headers.get(ORIGIN).and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "{:?}",
+        answer.headers
+    );
+    // Denied (no flag).
+    let answer = closed.get("/debug/status").await?;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.headers.get(ORIGIN), None, "{:?}", answer.headers);
     Ok(())
 }

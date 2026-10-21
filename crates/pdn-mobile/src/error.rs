@@ -387,13 +387,4 @@ mod tests {
         let err = kind(UnknownIdentity { identity: PEER });
         assert!(err.to_string().contains(&PEER.to_string()));
     }
-
-    /// The host's own kinds, decided before the runtime is called.
-    #[test]
-    fn the_hosts_own_kinds() {
-        assert!(matches!(
-            PdnError::malformed("empty payload"),
-            PdnError::MalformedInput { .. }
-        ));
-    }
 }

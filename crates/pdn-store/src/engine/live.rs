@@ -626,10 +626,11 @@ impl LiveActor {
 
     /// Best effort: the node's periodic pass over its co-located pairs
     /// reconciles whatever a request lost to a full channel would have.
-    fn ask_co_located(&self, request: crate::engine::CoLocatedRequest) {
-        if let Some(requests) = &self.co_located {
-            let _ = requests.try_send(request);
-        }
+    /// Whether the request was queued: a full channel drops it.
+    fn ask_co_located(&self, request: crate::engine::CoLocatedRequest) -> bool {
+        self.co_located
+            .as_ref()
+            .is_some_and(|requests| requests.try_send(request).is_ok())
     }
 
     /// Run the actor loop.
@@ -979,11 +980,16 @@ impl LiveActor {
         // ticket, a device record, a contact list — reaches its identity
         // inside the process or not at all.
         if peer == self.endpoint.id() {
-            self.ask_co_located(crate::engine::CoLocatedRequest::Dial {
+            let asked = self.ask_co_located(crate::engine::CoLocatedRequest::Dial {
                 namespace,
                 caller: self.identity,
                 callee,
             });
+            // A dropped request runs no exchange, so nothing else would
+            // release the dials held on this one.
+            if !asked && !self.state.is_running(&namespace, (peer, callee)) {
+                self.release_held(namespace, peer, callee);
+            }
             return;
         }
         if let Some(first) = self.prerequisites.get(&namespace).copied() {
@@ -1068,9 +1074,9 @@ impl LiveActor {
                 return;
             }
         }
-        // Announced, so a pair found busy queues a resync. The replay dials
-        // through `sync_with_peer`, which on this identity's own namespace
-        // resolves to this identity itself and reaches no co-located one.
+        // Announced, so a pair found busy queues a resync; the replay dials
+        // the pair, which on this node's own id asks the co-located
+        // identity for the exchange again.
         let reason = SyncReason::Announced;
         if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
@@ -1464,11 +1470,12 @@ impl LiveActor {
                 // it — otherwise this (namespace, peer) pair stays `Running` forever and every
                 // later sync trigger for it is silently dropped.
                 self.state.abort_connect(&namespace, peer, callee, reason);
-                // An incoming exchange that took the slot over releases the
-                // held dials when it finishes; with none, nothing else would.
-                if !self.state.is_running(&namespace, (peer, callee)) {
-                    self.release_held(namespace, peer, callee);
-                }
+                // The dials held behind this one stay held: the exchange this
+                // dial was refused for has brought nothing here yet, and a
+                // record store dialed now is judged on the membership view
+                // before it. The redial, or the incoming exchange, releases
+                // them when it finishes (`a_leave_closes_the_record_stream`
+                // in pdn-node).
                 // The remote's exchange may be one this side refuses — a
                 // replica holding nothing yet judges no caller — and then
                 // neither runs; or one that froze the remote's view before
@@ -1481,6 +1488,10 @@ impl LiveActor {
                 *streak = streak.saturating_add(1);
                 if *streak > MAX_REDIALS {
                     debug!(?reason, "redials in a row exhausted");
+                    // No redial follows, so nothing else would release them.
+                    if !self.state.is_running(&namespace, (peer, callee)) {
+                        self.release_held(namespace, peer, callee);
+                    }
                     return;
                 }
                 let delay = REDIAL_AFTER_ABORT.saturating_mul(
@@ -1743,8 +1754,12 @@ impl LiveActor {
 
         let finished = self.state.finish(&namespace, peer, counterpart, &origin);
         // A dial the tie-break superseded leaves the held dials to the
-        // exchange that took its slot over.
-        if !self.state.is_running(&namespace, (peer, counterpart)) {
+        // exchange that took its slot over, and an exchange a resync is
+        // queued behind leaves them to the resync: asked for while this
+        // one ran, the dial they follow wanted news this one may not carry
+        // (`a_remove_closes_the_removed_members_record_stream` in pdn-node).
+        let resync_queued = finished.is_some_and(|(_started, resync)| resync);
+        if !resync_queued && !self.state.is_running(&namespace, (peer, counterpart)) {
             self.release_held(namespace, peer, counterpart);
         }
         let Some((started, resync)) = finished else {
@@ -1778,8 +1793,11 @@ impl LiveActor {
             self.state.set_may_emit_ready(&namespace, false);
         }
 
+        // The pair's own state queued it, so the pair is dialed again: the
+        // dials held on this exchange are keyed by the counterpart, and a
+        // dial of another identity of the peer would release none of them.
         if resync {
-            self.sync_with_peer(namespace, peer, SyncReason::Resync);
+            self.sync_with_identity(namespace, peer, counterpart, SyncReason::Resync);
         }
     }
 

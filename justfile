@@ -47,6 +47,11 @@ build-mobile target="aarch64-linux-android" features="":
 test *args: _need-nextest
   @sh scripts/test.sh "$@"
 
+# The product configuration's own tests: the facade a device installs and the store under it, no feature enabled (test nodes bind loopback — see data-layer node.rs)
+[doc("Test the facade and the store in the product configuration, no feature enabled")]
+test-product: _need-nextest
+  PDN_BIND_ADDR=127.0.0.1 cargo nextest run -p pdn-mobile -p pdn-store
+
 # Test in release mode via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs)
 test-release *args: _need-nextest
   #!/bin/sh
@@ -198,6 +203,9 @@ check: _check-devcontainer-tools
   # The store keeps its own lints, not the workspace's; its warnings and
   # rustdoc's are denied here (an intra-doc link to a private item is one).
   cargo clippy -p pdn-store --all-targets -- -Dwarnings
+  cargo clippy -p pdn-store --all-targets --features observation -- -Dwarnings
+  # The product graph enables no observation feature (see scripts/check-product-graph.sh).
+  sh scripts/check-product-graph.sh
   # Private items too: most docs sit on them, and a link there that no longer
   # resolves is otherwise seen by nothing.
   RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)

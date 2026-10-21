@@ -467,7 +467,7 @@ impl Runtime {
     ) -> anyhow::Result<(pdn_types::PodId, crate::observation::PodSubscription)> {
         let sub = crate::observation::fresh_sub()?;
         let (pod, stopping) = (invite.pod, self.stopping.clone());
-        let (pod, subscription, _waited) = self
+        let (pod, subscription, waited) = self
             .pods()
             .join_with(identity, invite, move |node, tickets| async move {
                 let (caught_up, observation) = node
@@ -489,6 +489,13 @@ impl Runtime {
                 Ok((caught_up, subscription))
             })
             .await?;
+        // A catch-up outlasting the wait leaves the pod recorded as `join`
+        // leaves it; any other failure of the wait is the join's.
+        if let Err(err) = waited {
+            if err.downcast_ref::<crate::CatchUpTimeout>().is_none() {
+                return Err(err);
+            }
+        }
         Ok((pod, subscription))
     }
 

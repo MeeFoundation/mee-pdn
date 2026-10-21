@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use pdn_mobile::{PdnError, PdnNode, PodActRefusal, PodMembershipAct, PodRecordKind};
-use pdn_node::PodInvite;
+use pdn_node::{Connectivity, PodInvite};
 use tempfile::TempDir;
 use test_utils::eventually;
 
@@ -41,7 +41,8 @@ impl Device {
     async fn boot() -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let node = PdnNode::new()?;
-        node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+        node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+            .await?;
         Ok(Self { node, _dir: dir })
     }
 }
@@ -265,7 +266,10 @@ async fn a_bring_up_nobody_awaits_leaves_the_handle_usable() -> Result<()> {
     let bringing = {
         let node = Arc::clone(&node);
         let path = path_of(&dir);
-        tokio::spawn(async move { node.bring_up(path, CADENCE_SECS).await })
+        tokio::spawn(async move {
+            node.bring_up_on(path, CADENCE_SECS, Connectivity::Direct)
+                .await
+        })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     node.stop().await?;
@@ -282,7 +286,8 @@ async fn a_bring_up_nobody_awaits_leaves_the_handle_usable() -> Result<()> {
 
     // And the directory is free, which is what says the overtaken node was
     // shut down rather than left running with nobody holding it.
-    node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
     node.stop().await?;
 
     // A bring-up whose caller goes away.
@@ -290,14 +295,19 @@ async fn a_bring_up_nobody_awaits_leaves_the_handle_usable() -> Result<()> {
     let cancelled = {
         let node = Arc::clone(&abandoned);
         let path = path_of(&dir);
-        tokio::spawn(async move { node.bring_up(path, CADENCE_SECS).await })
+        tokio::spawn(async move {
+            node.bring_up_on(path, CADENCE_SECS, Connectivity::Direct)
+                .await
+        })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     cancelled.abort();
     // The handle is not stranded mid-transition: a stop and a bring-up
     // reach a running node again.
     abandoned.stop().await?;
-    abandoned.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    abandoned
+        .bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
     let identity = abandoned.create_identity().await?;
     assert!(
         !identity.is_empty(),
@@ -322,9 +332,10 @@ async fn one_handle_owns_one_node() -> Result<()> {
         .expect_err("a call before a bring-up must be refused");
     assert!(matches!(before, PdnError::NodeNotUp), "{before:?}");
 
-    node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
     let again = node
-        .bring_up(path_of(&dir), CADENCE_SECS)
+        .bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
         .await
         .expect_err("a second bring-up must be refused");
     assert!(matches!(again, PdnError::NodeAlreadyUp), "{again:?}");
@@ -334,7 +345,7 @@ async fn one_handle_owns_one_node() -> Result<()> {
     // store.
     let sibling = PdnNode::new()?;
     let held = sibling
-        .bring_up(path_of(&dir), CADENCE_SECS)
+        .bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
         .await
         .expect_err("a directory a running node holds must be refused");
     assert!(matches!(held, PdnError::StorageHeld), "{held:?}");
@@ -348,7 +359,9 @@ async fn one_handle_owns_one_node() -> Result<()> {
     assert!(matches!(after, PdnError::NodeNotUp), "{after:?}");
 
     // With the first node down, the directory is free for the next one.
-    sibling.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    sibling
+        .bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
     sibling.stop().await?;
     Ok(())
 }
@@ -361,7 +374,8 @@ async fn one_handle_owns_one_node() -> Result<()> {
 async fn a_node_comes_back_on_its_directory() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let node = PdnNode::new()?;
-    node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
 
     let alice = node.create_identity().await?;
     let node_id = node.node_id().await?;
@@ -379,7 +393,8 @@ async fn a_node_comes_back_on_its_directory() -> Result<()> {
         .await?;
 
     node.stop().await?;
-    node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
 
     assert_eq!(node.node_id().await?, node_id, "the same node answers");
     assert_eq!(
@@ -423,5 +438,42 @@ async fn a_node_comes_back_on_its_directory() -> Result<()> {
 
     node.stop().await?;
     scanner.node.stop().await?;
+    Ok(())
+}
+
+/// A bring-up during a stop is refused as a node already up, and once the
+/// stops are over a bring-up reaches a running node: never the directory
+/// reported held. On a run where the shutdown ends within the wait, the
+/// refusal arm goes untaken and the bring-up after it still has to succeed.
+#[tokio::test]
+async fn a_bring_up_during_a_stop_is_refused_and_one_after_it_succeeds() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = PdnNode::new()?;
+    node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await?;
+    let first = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move { node.stop().await })
+    };
+    let second = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move { node.stop().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Either both stops are over already, or the node is still going down.
+    let during = node
+        .bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+        .await;
+    assert!(
+        matches!(during, Ok(()) | Err(PdnError::NodeAlreadyUp)),
+        "a bring-up during a stop: {during:?}"
+    );
+    first.await??;
+    second.await??;
+    if during.is_err() {
+        node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
+            .await?;
+    }
+    node.stop().await?;
     Ok(())
 }

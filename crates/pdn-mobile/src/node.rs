@@ -23,8 +23,8 @@ use std::{
 };
 
 use pdn_node::{
-    IdentityService as _, LinkingPayload, PodInvite, PodsService as _, Runtime, SpawnOptions,
-    SyncService as _,
+    Connectivity, IdentityService as _, LinkingPayload, PodInvite, PodsService as _, Runtime,
+    SpawnOptions, SyncService as _,
 };
 
 use crate::{
@@ -74,12 +74,13 @@ pub struct PdnNode {
     surface: Arc<crate::test_surface::Shared>,
 }
 
-/// Routes the runtime's diagnostics to the platform's log, once.
+/// Writes the runtime's diagnostics to stderr, once; the embedder routes
+/// stderr to the platform's log, or installs a subscriber of its own first
+/// and keeps it.
 ///
 /// What the error table calls an unrecognized failure carries no cause across
 /// the boundary — the cause chain stays in the log — so without this the one
-/// refusal a person cannot act on is also the one nobody can diagnose. An
-/// embedder that installed a subscriber of its own keeps it.
+/// refusal a person cannot act on is also the one nobody can diagnose.
 fn install_log() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -99,8 +100,8 @@ impl PdnNode {
     #[uniffi::constructor]
     pub fn new() -> Result<Arc<Self>, PdnError> {
         install_log();
-        // The prefix is what a sampler in the same process tells the node's
-        // threads by (the `sync-observation` change's test build); the name
+        // The prefix is what a sampler in the same process (the
+        // `observation` build's) tells the node's threads by; the name
         // changes nothing else, so every build carries it.
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .thread_name("pdn-node")
@@ -144,54 +145,62 @@ impl PdnNode {
         storage_dir: String,
         reconcile_interval_secs: u64,
     ) -> Result<(), PdnError> {
-        let interval = shapes::duration(reconcile_interval_secs, "reconcile interval")?;
         // A phone moves between networks, and a peer reached only at an
         // address published on the last one is not reached at all — which is
         // what `for_product` names, relays and address lookup included.
-        let options = SpawnOptions {
-            reconcile_interval: interval,
-            ..SpawnOptions::for_product(storage_dir)
-        };
-        let (ours, held) = self.claim_bring_up()?;
-        let state = Arc::clone(&self.state);
-        let installed = self
-            .on_node(async move {
-                let _held = held;
-                install(&state, &ours, Runtime::spawn(options).await).await
-            })
-            .await?;
-        if installed {
-            Ok(())
-        } else {
-            Err(PdnError::NodeNotUp)
-        }
+        self.bring_up_on(
+            storage_dir,
+            reconcile_interval_secs,
+            Connectivity::RelaysAndAddressLookup,
+        )
+        .await
     }
 
     /// Stop the node. Safe to repeat: a stop with nothing up is a no-op
-    /// rather than a failure.
+    /// rather than a failure, and a second stop during the first waits for
+    /// it. A bring-up during a stop is refused as a node already up.
     ///
     /// What a stop costs is availability, not what the node holds. A peer
     /// that needed data while the node was down did not get it, and the
-    /// identities and pods are found again on the next bring-up. What does not come back is work in flight — an invite
-    /// minted and not consumed, a ceremony interrupted.
+    /// identities and pods are found again on the next bring-up. What does
+    /// not come back is work in flight — an invite minted and not consumed,
+    /// a ceremony interrupted.
     pub async fn stop(&self) -> Result<(), PdnError> {
+        let (ours, held) = fresh_bring_up().map_err(|err| {
+            tracing::error!("a stop's lock was not free: {err}");
+            PdnError::Internal
+        })?;
         let previous = {
             let mut state = self.state()?;
-            std::mem::replace(&mut *state, State::Down)
-        };
-        match previous {
-            State::Down => Ok(()),
-            State::Up(runtime) => self.on_node(async move { runtime.shutdown().await }).await,
-            // Without the wait, the overtaken node still holds the directory
-            // when the caller's next bring-up reaches it.
-            State::ComingUp(bring_up) => {
-                self.on_node(async move {
-                    let _ended = bring_up.lock().await;
-                    Ok(())
-                })
-                .await
+            if matches!(*state, State::Down) {
+                return Ok(());
             }
-        }
+            // The handle stays between its states until the previous owner
+            // of the directory is gone: a bring-up meanwhile would find it
+            // held, and a stop meanwhile waits on this one's lock.
+            std::mem::replace(&mut *state, State::ComingUp(Arc::clone(&ours)))
+        };
+        let state = Arc::clone(&self.state);
+        self.on_node(async move {
+            let _held = held;
+            let stopped = match previous {
+                State::Up(runtime) => runtime.shutdown().await,
+                // The overtaken bring-up shuts its node down before its lock
+                // goes; a stop under way does the same.
+                State::ComingUp(theirs) => {
+                    let _ended = theirs.lock().await;
+                    Ok(())
+                }
+                State::Down => Ok(()),
+            };
+            if let Ok(mut guard) = state.lock() {
+                if claimed(&guard, &ours) {
+                    *guard = State::Down;
+                }
+            }
+            stopped
+        })
+        .await
     }
 
     /// The node id this node answers as — the same one after a bring-up on
@@ -465,6 +474,35 @@ impl PdnNode {
 }
 
 impl PdnNode {
+    /// `bring_up` at `connectivity`: a test of this surface runs 2 nodes on
+    /// one machine over direct paths, reaching nobody's relay. Not exported.
+    pub async fn bring_up_on(
+        &self,
+        storage_dir: String,
+        reconcile_interval_secs: u64,
+        connectivity: Connectivity,
+    ) -> Result<(), PdnError> {
+        let interval = shapes::duration(reconcile_interval_secs, "reconcile interval")?;
+        let options = SpawnOptions {
+            reconcile_interval: interval,
+            connectivity,
+            ..SpawnOptions::for_product(storage_dir)
+        };
+        let (ours, held) = self.claim_bring_up()?;
+        let state = Arc::clone(&self.state);
+        let installed = self
+            .on_node(async move {
+                let _held = held;
+                install(&state, &ours, Runtime::spawn(options).await).await
+            })
+            .await?;
+        if installed {
+            Ok(())
+        } else {
+            Err(PdnError::NodeNotUp)
+        }
+    }
+
     /// The state lock. A poisoned lock means a panic ran while it was held,
     /// which is a defect rather than a refusal.
     fn state(&self) -> Result<std::sync::MutexGuard<'_, State>, PdnError> {

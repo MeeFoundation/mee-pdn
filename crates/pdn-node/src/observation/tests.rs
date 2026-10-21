@@ -218,3 +218,37 @@ fn a_listed_entry_has_one_json_form() {
     let back: Vec<ListedEntry> = serde_json::from_value(json).expect("deserializes");
     assert_eq!(back, [present, missing]);
 }
+
+/// A store's end reaches a consumer that let the buffer fill: `closed` is
+/// numbered past the bound, behind the `lagged` of what the store lost.
+/// Fails with `closed` dropped at the bound like a record.
+#[tokio::test]
+async fn a_full_buffer_still_yields_the_stores_end() {
+    let mut pod = observed(2);
+    for _ in 0..4 {
+        pod.records
+            .send(Ok(LiveEvent::PendingContentReady))
+            .expect("open");
+    }
+    settle().await;
+    drop(pod.records);
+    settle().await;
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.push(read(&mut pod.subscription).await);
+    }
+
+    let shape: Vec<_> = seen
+        .iter()
+        .map(|record| (record.seq, record.store, record.body.clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (0, ObservedStore::Records, RecordBody::PendingContentReady),
+            (1, ObservedStore::Records, RecordBody::PendingContentReady),
+            (2, ObservedStore::Records, RecordBody::Lagged),
+            (3, ObservedStore::Records, RecordBody::Closed),
+        ]
+    );
+}

@@ -245,8 +245,7 @@ async fn a_download_completes_after_its_insert() -> Result<()> {
     let (writer, _written, reader, read) = writer_and_reader(1, "k").await?;
     let hash = Hash::new("k0");
     read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
-    // The engine's own: the API's forwarding reads as events come, so a
-    // reader behind it never comes late.
+    // The engine's subscription directly, which `Doc::observe` wraps.
     let mut observed = reader.docs.engine().observe(read.id(), CAPACITY).await?;
     let mut product = read.subscribe().await?;
     read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
@@ -366,7 +365,7 @@ async fn a_subscriber_past_its_capacity_is_told_and_holds_up_nothing() -> Result
     const SMALL: usize = 16;
     let (writer, _written, reader, read) = writer_and_reader(100, "k").await?;
     read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
-    // The engine's own: the API holds events of its own in front of it.
+    // The engine's subscription directly, which `Doc::observe` wraps.
     let mut observed = reader.docs.engine().observe(read.id(), SMALL).await?;
     let mut product = read.subscribe().await?;
     read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
@@ -491,8 +490,7 @@ async fn a_pairs_later_session_follows_the_end_of_its_earlier_one() -> Result<()
     const BATCH: usize = 50;
     let (writer, written, reader, read) = writer_and_reader(BATCH, "first").await?;
     read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
-    // The engine's own: the API's forwarding reads as events come, so a
-    // reader behind it never comes late.
+    // The engine's subscription directly, which `Doc::observe` wraps.
     let mut observed = reader.docs.engine().observe(read.id(), CAPACITY).await?;
     let mut product = read.subscribe().await?;
 

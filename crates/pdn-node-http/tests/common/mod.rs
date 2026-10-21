@@ -284,6 +284,7 @@ impl Default for Stand {
 
 pub struct Answer {
     pub status: StatusCode,
+    pub headers: reqwest::header::HeaderMap,
     pub body: Bytes,
 }
 
@@ -487,8 +488,13 @@ impl Host {
         .with_context(|| format!("{} did not answer {path}", self.label))?;
         let status = StatusCode::from_u16(response.status().as_u16())?;
         if !status.is_success() {
+            let headers = response.headers().clone();
             let body = response.bytes().await?;
-            return Ok(Err(Answer { status, body }));
+            return Ok(Err(Answer {
+                status,
+                headers,
+                body,
+            }));
         }
         let pod = response
             .headers()
@@ -618,8 +624,13 @@ impl Host {
             .await
             .with_context(|| format!("{} did not answer {path}", self.label))?;
         let status = StatusCode::from_u16(response.status().as_u16())?;
+        let headers = response.headers().clone();
         let body = response.bytes().await?;
-        Ok(Answer { status, body })
+        Ok(Answer {
+            status,
+            headers,
+            body,
+        })
     }
 }
 

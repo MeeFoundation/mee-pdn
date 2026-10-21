@@ -79,7 +79,7 @@ async fn hold_state_lock(
 #[tokio::test(flavor = "multi_thread")]
 async fn open_streams_leave_the_request_bound_free() -> Result<()> {
     let (runtime, identity, pod) = hosting_a_pod().await?;
-    let app = router(Arc::clone(&runtime), true);
+    let app = router(Arc::clone(&runtime), true, false);
     let streams = open_streams(&app, identity, pod, MAX_OPEN_STREAMS).await?;
     let (release, holder) = hold_state_lock(&runtime).await?;
 
@@ -115,7 +115,7 @@ async fn open_streams_leave_the_request_bound_free() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_past_the_bound_is_refused_without_subscribing() -> Result<()> {
     let (runtime, identity, pod) = hosting_a_pod().await?;
-    let app = router(Arc::clone(&runtime), true);
+    let app = router(Arc::clone(&runtime), true, false);
     let mut streams = open_streams(&app, identity, pod, MAX_OPEN_STREAMS).await?;
 
     let (release, holder) = hold_state_lock(&runtime).await?;
@@ -146,7 +146,7 @@ async fn an_observed_join_past_the_bound_is_refused_without_joining() -> Result<
     let joined = inviter.pods().create(owner).await?;
     let invite = serde_json::to_vec(&inviter.pods().invite(owner, joined, None).await?)?;
     let (runtime, identity, pod) = hosting_a_pod().await?;
-    let app = router(Arc::clone(&runtime), true);
+    let app = router(Arc::clone(&runtime), true, false);
     let mut streams = open_streams(&app, identity, pod, MAX_OPEN_STREAMS).await?;
     let join = || {
         Request::post(format!("/debug/identities/{identity}/pods/join-observed"))
@@ -193,7 +193,7 @@ async fn a_stop_ends_open_streams_within_the_drain() -> Result<()> {
     let served = tokio::spawn({
         let runtime = Arc::clone(&runtime);
         async move {
-            serve(&runtime, listener, true, async {
+            serve(&runtime, listener, true, false, async {
                 let _ = stopped.await;
             })
             .await

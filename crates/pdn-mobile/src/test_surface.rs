@@ -14,7 +14,6 @@ use std::{
 };
 
 use axum::{
-    body::Bytes,
     extract::{Query, Request, State as Extract},
     http::{header::CONTENT_TYPE, StatusCode},
     response::{IntoResponse as _, Response},
@@ -29,8 +28,8 @@ use crate::node::{claimed, fresh_bring_up, install, State};
 
 /// A day of samples at one a second; past it the oldest go first.
 const SAMPLES_KEPT: usize = 86_400;
-/// The runtime's default, named because the laptop nodes it is compared
-/// with run at it.
+/// What the laptop nodes a phone is compared with run at: the runtime's
+/// own default, which `bring_up` makes an application name.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What a handle keeps for its surface, served or not.
@@ -80,8 +79,9 @@ pub(crate) fn serve(
         }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         *served = Some(listener.local_addr()?.port());
-        tokio::net::TcpListener::from_std(listener)?
+        listener
     };
     let bound = listener.local_addr()?.port();
     let surface = Arc::new(Surface {
@@ -90,6 +90,7 @@ pub(crate) fn serve(
         storage,
         router: Mutex::new(None),
     });
+    let shared = Arc::clone(&surface.shared);
     let app = Router::new()
         .route("/debug/agent/reset", post(reset))
         .route("/debug/agent/samples", get(samples))
@@ -99,6 +100,10 @@ pub(crate) fn serve(
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::error!("the test surface stopped serving: {err}");
+        }
+        // Served no more: the next call binds again.
+        if let Ok(mut served) = shared.served.lock() {
+            *served = None;
         }
     });
     tracing::info!("the test surface serves 127.0.0.1:{bound}");
@@ -110,7 +115,9 @@ struct Surface {
     state: Arc<Mutex<State>>,
     storage: PathBuf,
     /// The laptop host's router for the node that is up, built once per node
-    /// so its request and stream bounds hold across requests.
+    /// so its request and stream bounds hold across requests. Without the
+    /// cross-origin headers: a page in the phone's browser is not a
+    /// coordinator.
     router: Mutex<Option<(Arc<Runtime>, Router)>>,
 }
 
@@ -127,7 +134,7 @@ impl Surface {
                 return Some(router.clone());
             }
         }
-        let router = pdn_node_http::router(Arc::clone(&runtime), true);
+        let router = pdn_node_http::router(Arc::clone(&runtime), true, false);
         *cached = Some((runtime, router.clone()));
         Some(router)
     }
@@ -217,11 +224,13 @@ struct ResetRequest {
     connectivity: String,
 }
 
-async fn reset(Extract(surface): Extract<Arc<Surface>>, body: Bytes) -> Response {
-    let request: ResetRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(err) => return malformed(format!("malformed reset: {err}")),
-    };
+/// `Json`, which refuses any other content type: a page in the phone's
+/// browser can send a form cross-origin without being asked, and that is
+/// not a request to wipe the node.
+async fn reset(
+    Extract(surface): Extract<Arc<Surface>>,
+    Json(request): Json<ResetRequest>,
+) -> Response {
     if request.pod_interval_secs == 0 {
         return malformed("the pod interval is a positive whole number of seconds".to_owned());
     }
