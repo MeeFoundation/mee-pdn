@@ -81,7 +81,10 @@ impl<T> Default for Subscribers<T> {
 }
 
 impl<T: LagNotice> Subscribers<T> {
+    /// Drops every subscriber whose receiver is gone: one that left between
+    /// two events would otherwise hold its buffer until the next one.
     pub(crate) fn subscribe(&mut self, tx: async_channel::Sender<T>, delivery: Delivery) {
+        self.0.retain(|s| !s.tx.is_closed());
         self.0.push(Subscriber {
             tx,
             delivery,
@@ -226,6 +229,23 @@ mod tests {
         drop(subscribers);
         let got = reader.await.expect("reader");
         assert_eq!(got, (0..10).map(Ev::N).collect::<Vec<_>>());
+    }
+
+    /// A subscriber whose receiver is gone is dropped by the next
+    /// registration, with no event in between.
+    #[tokio::test]
+    async fn a_subscriber_whose_receiver_is_gone_is_dropped_at_the_next_registration() {
+        let mut subscribers = Subscribers::default();
+        let (gone, gone_rx) = async_channel::bounded::<Ev>(4);
+        subscribers.subscribe(gone, Delivery::Lossy);
+        drop(gone_rx);
+        let (tx, _rx) = async_channel::bounded(4);
+        subscribers.subscribe(tx, Delivery::Lossy);
+        assert_eq!(
+            subscribers.0.len(),
+            1,
+            "the closed subscriber stayed registered"
+        );
     }
 
     /// A subscriber whose receiver is gone is dropped, whatever its delivery.

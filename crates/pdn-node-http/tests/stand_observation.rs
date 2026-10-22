@@ -18,7 +18,9 @@ use pdn_node::{
 use pdn_node_http::shapes::{Act, HeldPods};
 
 mod common;
-use common::{pod_route, record_reads, Host, Image, Method, Read, RecordStream, Stand};
+use common::{
+    pod_route, record_reads, record_route, Host, Image, Method, Read, RecordStream, Stand,
+};
 
 /// The wait for one record of a live pod: a write's announcement, or a
 /// session it asks for, takes seconds; nothing here waits on the pod pass.
@@ -185,8 +187,9 @@ async fn a_record_crossing_is_observed_on_both_sides() -> Result<()> {
 }
 
 /// A member an owner removes sees its record stream close while its event
-/// route stays open. Paired denial: no record placed after the removal reaches
-/// it, while the remaining member reads that record.
+/// route stays open. Paired denial: a record placed after the removal is
+/// absent or refused on the removed member's node, while the remaining
+/// member reads it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http images (just test-docker)"]
 async fn a_removed_members_record_stream_closes() -> Result<()> {
@@ -225,8 +228,19 @@ async fn a_removed_members_record_stream_closes() -> Result<()> {
     let key = key_of(&alice_node, alice, pod, b"after the removal").await?;
     record_reads(&bob_node, bob, pod, later, b"after the removal").await?;
 
-    // Denied (the removed member): nothing of the record store, and the
-    // route still open.
+    // Denied (the removed member): absent or refused, never read.
+    let denied_until = tokio::time::Instant::now() + REMOVED_WATCH;
+    while tokio::time::Instant::now() < denied_until {
+        let answer = carol_node.get(&record_route(carol, pod, later)).await?;
+        assert!(
+            matches!(answer.status, StatusCode::NOT_FOUND | StatusCode::CONFLICT),
+            "the removed member answered {} for {later:?}: {}",
+            answer.status,
+            answer.text()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The route stays open, the membership store's records alone on it.
     let watched_until = tokio::time::Instant::now() + REMOVED_WATCH;
     loop {
         let wait = watched_until.saturating_duration_since(tokio::time::Instant::now());

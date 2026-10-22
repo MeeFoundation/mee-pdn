@@ -213,6 +213,7 @@ class Live:
         self.run.meta['demo'] = {'steady_s': args.steady_s, 'rate': args.rate, 'join_bound_s': JOIN_BOUND_S,
                                  'silent_s': SILENT_S, 'drain_s': DRAIN_S, 'fill_bound_s': FILL_BOUND_S}
         self.view, self.args, self.pod, self.stopping = view, args, None, threading.Lock()
+        self.cancelled = threading.Event()
         view.sampler, view.run_dir = self.run.sampler, self.run.dir.relative_to(load.ROOT)
         view.roster = lambda: [(nd.name, nd.pid) for nd in list(self.run.live.values())]
 
@@ -229,6 +230,8 @@ class Live:
         pod = self.pod = load.Pod(run, n, S)
         nodes = []
         for name in [f'{pod.prefix}-w{i}' for i in range(1, n)] + [f'{pod.prefix}-r0']:
+            if self.cancelled.is_set():
+                return
             nd = load.Node(run, name).start()
             node_id = next((ln.split()[1] for ln in nd.status() if ln.startswith('node ')), '')
             view.learn(name, nd.identity, node_id)
@@ -266,6 +269,8 @@ class Live:
             view.catchup = {'name': f'{pod.prefix}-r{pod.incarnation + 1}', 'target': held, 't0': None,
                             'state': 'running', 'evidence': None}
         view.set_phase(4)
+        if self.cancelled.is_set():
+            return
         cu_values, cu_short, hung, (joiner, inviter, log_from), _, _ = load.catchup(run, pod, cell)
         values.update(cu_values)
         evidence = ''
@@ -290,11 +295,13 @@ class Live:
 
     def stop(self):
         """Stops every node this demo started and keeps the run directory but the nodes' stores; idempotent."""
+        self.cancelled.set()
         with self.stopping:
             pod, self.pod = self.pod, None
             if pod:
                 pod.stop()
             self.run.stop_all()
+            self.run.stop_recorded()
             shutil.rmtree(self.run.dir / 'nodes', ignore_errors=True)
             self.run.meta['finished'] = time.time()
             self.run.save()
@@ -752,9 +759,10 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, interrupt)
     interrupted = False
+    drive = threading.Thread(target=guarded, args=(world.drive, view), daemon=True)
     try:
         with Screen() as screen:
-            threading.Thread(target=guarded, args=(world.drive, view), daemon=True).start()
+            drive.start()
             last_frame, finished_at = 0.0, None
             while True:
                 cols, rows = shutil.get_terminal_size((100, 34))
@@ -777,7 +785,11 @@ def main():
     except KeyboardInterrupt:
         interrupted = True
     finally:
+        # The drive thread starts nodes of its own: stopped twice, around its end. A rehearsal starts no process.
         world.stop()
+        if isinstance(world, Live):
+            drive.join()
+            world.stop()
     if view.run_dir:
         print(f'run directory: {view.run_dir}')
     if interrupted:

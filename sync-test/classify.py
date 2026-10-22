@@ -30,7 +30,8 @@ UNDETERMINED_LIMIT = 0.01
 RECORDS, MEMBERSHIP = 'records', 'membership'
 DEFECTS = ('violated', 'lost', 'content_lost', 'uncounted', 'split', 'corrupt', 'extra')
 COUNTS = ('expected', 'readable', 'violated', 'late', 'lost', 'content_lost', 'uncounted', 'stalled_entries',
-          'stalled_readers', 'split', 'teardown_split', 'undetermined', 'undetermined_absent', 'corrupt', 'extra',
+          'stalled_readers', 'split', 'teardown_split', 'unstaged_split', 'undetermined', 'undetermined_absent',
+          'corrupt', 'extra',
           'refused', 'unlisted', 'via_relay', 'no_latency', 'clock_unchecked')
 EXIT = {'PASS': 0, 'FAIL': 1, 'INCONCLUSIVE': 2}
 
@@ -104,8 +105,12 @@ def arrived_before(arr, pos):
 
 
 def is_teardown(r, p):
+    """A split's kind: True for a teardown, False for a real split, None when the failing side names no stage
+    (`error_kind`), which the runtime's `sync_finished` carries only once pdn-store reports one."""
     failing = p if r['ok'] else r
-    return (failing.get('error_kind') == 'close' and r.get('received') is not None
+    if failing.get('error_kind') is None:
+        return None
+    return (failing['error_kind'] == 'close' and r.get('received') is not None
             and p.get('sent') is not None and r['received'] == p['sent'])
 
 
@@ -233,7 +238,10 @@ def classify(run):
             for pair in trusted:
                 (_, r), (_, p) = pair
                 if r['ok'] != p['ok']:
-                    if is_teardown(r, p):
+                    teardown = is_teardown(r, p)
+                    if teardown is None:
+                        c['unstaged_split'] += 1
+                    elif teardown:
                         c['teardown_split'] += 1
                     else:
                         c['split'] += 1
@@ -364,6 +372,9 @@ def classify(run):
         reasons.append(f'undetermined {undetermined_share:.1%} of expected')
     if c['unlisted']:
         reasons.append(f'unlisted entries {c["unlisted"]}')
+    if c['unstaged_split']:
+        reasons.append(f'{c["unstaged_split"]} split sessions whose failing side names no error_kind: '
+                       'a teardown and a real split cannot be told apart')
     if background:
         reasons.append('the app left the foreground')
     verdict = 'FAIL' if found else 'INCONCLUSIVE' if reasons else 'PASS'

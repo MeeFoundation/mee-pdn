@@ -32,6 +32,7 @@ else
 fi
 
 id=$(basename "$run")
+python3 -I report.py --synthetic
 python3 -I report.py report "$run" --history "$tree" --out "$tree/runs/$id" > "$tmp/report.md"
 cat "$tmp/report.md"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$tmp/report.md" >> "$GITHUB_STEP_SUMMARY"

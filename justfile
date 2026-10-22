@@ -199,6 +199,11 @@ check: _check-devcontainer-tools
   #!/bin/sh
   set -eux
   cargo fmt --all -- --check
+  # The load harness's self-checks: stdlib, seconds.
+  python3 -I sync-test/selfcheck.py --synthetic
+  python3 -I sync-test/analyze.py --synthetic
+  python3 -I sync-test/report.py --synthetic
+  python3 -I sync-test/load.py --selfcheck
   # Both configurations: the product build first — a break there is invisible
   # to a run that only ever enables the dev feature. Product targets only:
   # `--all-targets` builds the dev targets, and a dev-dependency on

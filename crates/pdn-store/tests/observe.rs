@@ -3,11 +3,23 @@
 //! capacity its caller names, and the session id both ends of a session
 //! report.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, Watcher as _};
-use iroh_blobs::{store::mem::MemStore, BlobsProtocol, Hash};
+use iroh_blobs::{
+    api::Store,
+    store::{fs::FsStore, mem::MemStore},
+    BlobsProtocol, Hash,
+};
 use iroh_gossip::net::Gossip;
 use n0_future::{Stream, StreamExt};
 use pdn_store::{
@@ -15,8 +27,10 @@ use pdn_store::{
     engine::{LiveEvent, Origin, SyncEvent},
     filter::serve_whole,
     protocol::{Docs, DocsDispatch, IdentityResolver},
-    Contact, ContentStatus, Identity, NamespaceId,
+    Contact, ContentStatus, Identity, NamespaceId, SessionAccess, SessionAccessProvider,
+    SessionRole,
 };
+use tokio::sync::Notify;
 
 const HOLDER: Identity = Identity::from_bytes([0u8; 32]);
 const WORK: Identity = Identity::from_bytes([0xa2; 32]);
@@ -26,22 +40,38 @@ const LEISURE: Identity = Identity::from_bytes([0xa3; 32]);
 const CAPACITY: usize = 4_096;
 /// A session between two endpoints on loopback, 1,000 entries at most.
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// The replica cache of a peer on the fs store.
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One node of one identity on loopback, its blob store kept for the
 /// scenario to inspect.
 struct Peer {
     router: Router,
     docs: Docs,
-    blobs: MemStore,
+    blobs: Store,
 }
 
 impl Peer {
     async fn spawn() -> Result<Self> {
+        Self::spawn_on(None).await
+    }
+
+    /// On the fs store and persistent replicas under `dir`, or in memory.
+    async fn spawn_on(dir: Option<&Path>) -> Result<Self> {
         let endpoint = loopback_endpoint().await?;
-        let blobs = MemStore::new();
+        let (blobs, docs) = match dir {
+            Some(dir) => (
+                (*FsStore::load(dir.join("blobs")).await?).clone(),
+                Docs::persistent(dir.to_path_buf(), CACHE_BYTES, HOLDER, serve_whole()),
+            ),
+            None => (
+                (*MemStore::new()).clone(),
+                Docs::memory(HOLDER, serve_whole()),
+            ),
+        };
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let docs = Docs::memory(HOLDER, serve_whole())
-            .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        let docs = docs
+            .spawn(endpoint.clone(), blobs.clone(), gossip.clone())
             .await?;
         let resolve: IdentityResolver = {
             let docs = docs.clone();
@@ -90,8 +120,17 @@ async fn loopback_endpoint() -> Result<Endpoint> {
 /// joins no swarm, so the two are never neighbors and the only sessions are
 /// the ones a scenario dials.
 async fn writer_and_reader(count: usize, prefix: &str) -> Result<(Peer, Doc, Peer, Doc)> {
-    let writer = Peer::spawn().await?;
-    let reader = Peer::spawn().await?;
+    writer_and_reader_on(count, prefix, None).await
+}
+
+/// [`writer_and_reader`] on the fs store under `dir`, or in memory.
+async fn writer_and_reader_on(
+    count: usize,
+    prefix: &str,
+    dir: Option<&Path>,
+) -> Result<(Peer, Doc, Peer, Doc)> {
+    let writer = Peer::spawn_on(dir.map(|dir| dir.join("writer")).as_deref()).await?;
+    let reader = Peer::spawn_on(dir.map(|dir| dir.join("reader")).as_deref()).await?;
     let written = writer.api().create().await?;
     write(&writer, &written, prefix, 0..count).await?;
     written
@@ -216,6 +255,53 @@ async fn a_thousand_entry_session_is_reported_entries_first() -> Result<()> {
     assert!(
         !events.iter().any(|e| matches!(e, LiveEvent::Lagged)),
         "a subscriber at 4,096 lagged on a 1,000-entry session"
+    );
+    let end = position(&events, finished_ok).context("the session's end")?;
+    let inserts = events
+        .get(..end)
+        .context("the events before the end")?
+        .iter()
+        .filter_map(remote_key)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        inserts.len(),
+        ENTRIES,
+        "not every insert came before the session's end"
+    );
+    drop(written);
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// A session delivering 10,000 entries with payloads on the fs store to a
+/// subscriber drained as fast as its events convert, one blob-store round
+/// trip per insert as the runtime's observation reads it, loses nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ten_thousand_entry_session_drained_at_conversion_pace_loses_nothing() -> Result<()> {
+    const ENTRIES: usize = 10_000;
+    let dir = tempfile::tempdir()?;
+    let (writer, written, reader, read) =
+        writer_and_reader_on(ENTRIES, "k", Some(dir.path())).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let mut observed = read.observe(CAPACITY).await?;
+    let drained =
+        tokio::spawn(
+            async move { read_until(&mut observed, downloads_ended_after_a_session()).await },
+        );
+    let started = std::time::Instant::now();
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+
+    let events = drained.await??;
+    eprintln!("{ENTRIES} entries observed in {:?}", started.elapsed());
+    let lagged = events
+        .iter()
+        .filter(|e| matches!(e, LiveEvent::Lagged))
+        .count();
+    assert_eq!(
+        lagged, 0,
+        "a subscriber drained at conversion pace lagged on a {ENTRIES}-entry session"
     );
     let end = position(&events, finished_ok).context("the session's end")?;
     let inserts = events
@@ -450,6 +536,107 @@ async fn an_in_process_session_is_reported_in_the_same_order() -> Result<()> {
     Ok(())
 }
 
+/// A dial held behind an in-process exchange that a resync is queued behind
+/// starts once the resync is dropped: an engine without a co-located
+/// channel runs no resync, and nothing else would release the held dial.
+///
+/// `work`'s in-process dial of `first` waits in its provider while a second
+/// one of `first` queues the resync and one of `then` is held behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_held_behind_a_dropped_in_process_resync_starts() -> Result<()> {
+    let endpoint = loopback_endpoint().await?;
+    let blobs = MemStore::new();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let first_id: Arc<std::sync::OnceLock<NamespaceId>> = Arc::default();
+    let dial_asked = Arc::new(Notify::new());
+    let go = Arc::new(Notify::new());
+    let gate = Arc::new(AtomicBool::new(true));
+    let work_access: SessionAccessProvider = {
+        let (first_id, dial_asked, go) = (first_id.clone(), dial_asked.clone(), go.clone());
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let held = role == SessionRole::Dial
+                && first_id.get() == Some(&namespace)
+                && gate.swap(false, Ordering::SeqCst);
+            let (dial_asked, go) = (dial_asked.clone(), go.clone());
+            Box::pin(async move {
+                if held {
+                    dial_asked.notify_one();
+                    go.notified().await;
+                }
+                SessionAccess::whole()
+            })
+        })
+    };
+    let work = Docs::memory(WORK, work_access)
+        .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        .await?;
+    let leisure = Docs::memory(LEISURE, serve_whole())
+        .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        .await?;
+    let (first, then) = (work.api().create().await?, work.api().create().await?);
+    first_id
+        .set(first.id())
+        .map_err(|_| anyhow!("first set once"))?;
+    for doc in [&first, &then] {
+        doc.sync_with_peers(vec![], vec![], WORK, false).await?;
+        let ticket = doc.share(AddrInfoOptions::Id).await?;
+        let read = leisure.api().import_namespace(ticket.capability).await?;
+        read.sync_with_peers(vec![], vec![], LEISURE, false).await?;
+    }
+    work.engine()
+        .order_after(then.id(), Some(first.id()))
+        .await?;
+    let mut then_events = then.subscribe().await?;
+    // Returns once the callee has read the dial's first message: a held
+    // dial sends none until released.
+    let dial = |namespace: NamespaceId| {
+        let (work, leisure) = (work.clone(), leisure.clone());
+        tokio::spawn(async move {
+            work.engine()
+                .sync_in_process(leisure.engine(), namespace, LEISURE)
+                .await
+        })
+    };
+
+    let first_dial = dial(first.id());
+    tokio::time::timeout(TIMEOUT, dial_asked.notified()).await?;
+    let then_dial = dial(then.id());
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while work.engine().syncs_in_flight(vec![then.id()]).await? == 0 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the dial of then was never held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Asked for while the exchange of `first` runs: queued as its resync,
+    // the pipe of this dial dropped.
+    assert!(
+        dial(first.id()).await?.is_err(),
+        "a dial of a pair already running opened a session"
+    );
+    go.notify_one();
+    first_dial.await??;
+
+    tokio::time::timeout(Duration::from_secs(10), then_dial)
+        .await
+        .context("the dial held behind the dropped resync never started")???;
+    let end = wait_for(&mut then_events, finished_ok).await?;
+    assert!(
+        matches!(
+            finished(&end).map(|end| &end.origin),
+            Some(Origin::Connect(_))
+        ),
+        "the exchange of then was not the held dial: {end:?}"
+    );
+    work.engine().shutdown().await?;
+    leisure.engine().shutdown().await?;
+    gossip.shutdown().await?;
+    blobs.shutdown().await?;
+    endpoint.close().await;
+    Ok(())
+}
+
 /// An ordered subscription taken with the start of sync reports every
 /// insert of the reader's first session before that session's end.
 ///
@@ -460,7 +647,7 @@ async fn an_ordered_subscription_taken_with_the_start_reports_the_first_session(
     const ENTRIES: usize = 300;
     let (writer, _written, reader, read) = writer_and_reader(ENTRIES, "k").await?;
     let mut observed = read
-        .start_sync_observed(writer.contacts(), HOLDER, CAPACITY)
+        .sync_with_peers_observed(writer.contacts(), Vec::new(), HOLDER, true, CAPACITY)
         .await?;
     let events = read_until(&mut observed, |e| finished(e).is_some()).await?;
     assert!(

@@ -324,7 +324,9 @@ async fn two_identities_on_one_node_keep_separate_pods() -> Result<()> {
 
 /// A node started with `PDN_ANY_ORIGIN` answers a debug request with the
 /// header a page of another origin needs to read it. Denied: a node started
-/// without it sends none, so a page reads nothing of a node nobody opened.
+/// without it sends none, so a page of another origin reads nothing of a
+/// node nobody opened; the `Host` header is not checked, so a page made
+/// same-origin by DNS rebinding is outside what this asserts.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn the_debug_surface_opens_to_any_origin_only_when_asked() -> Result<()> {

@@ -11,9 +11,9 @@
 //! The facade names no field of a payload, inspects none, and decides
 //! nothing from one. A code carrying an invitation to connect and a code
 //! carrying a device joining an identity are told apart by the call the
-//! caller makes, not by anything read here — which is why a code read for
-//! the wrong act reaches the runtime and comes back as the runtime's
-//! refusal.
+//! caller makes, not by anything read here: the call decodes the runtime
+//! type it consumes, strictly, so a code read for the wrong act is refused
+//! here as malformed input and never reaches the runtime.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de::DeserializeOwned, Serialize};

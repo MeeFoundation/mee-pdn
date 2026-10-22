@@ -214,27 +214,28 @@ impl Engine {
             .await
     }
 
-    /// [`Doc::sync_with_peers`](crate::api::Doc::sync_with_peers) with no
-    /// recorded peer and the swarm joined —
-    /// a pod store's start in the data layer — with an ordered subscription
-    /// attached, as [`Self::observe`] gives it: registered before the replica is opened
+    /// [`Doc::sync_with_peers`](crate::api::Doc::sync_with_peers) with an
+    /// ordered subscription attached, as
+    /// [`Self::observe`] gives it: registered before the replica is opened
     /// for sync and before its first dial, so it reports that sync from its
     /// first event. For a replica already syncing it is [`Self::observe`].
     #[cfg(feature = "observation")]
-    pub async fn start_sync_observed(
+    pub async fn sync_with_peers_observed(
         &self,
         namespace: NamespaceId,
         peers: Vec<Contact>,
+        recorded: Vec<PublicKey>,
         default_identity: Identity,
+        join_gossip: bool,
         capacity: usize,
     ) -> Result<BoxStream<Result<LiveEvent>>> {
         let (s, r) = async_channel::bounded(capacity);
         self.sync_with(
             namespace,
             peers,
-            Some(Vec::new()),
+            Some(recorded),
             Some(default_identity),
-            true,
+            join_gossip,
             Some(s),
         )
         .await?;

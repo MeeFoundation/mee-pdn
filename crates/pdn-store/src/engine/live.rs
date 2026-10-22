@@ -675,6 +675,9 @@ impl LiveActor {
                         }
                     }
                 }
+                // Before the session ends below: an ordered subscriber takes a
+                // session's inserts before its `SyncFinished` (the data layer's
+                // `change-subscription` spec).
                 event = self.sync.next_event() => {
                     trace!(?i, "tick: replica_event");
                     let event = event.context("replica_events closed")?;

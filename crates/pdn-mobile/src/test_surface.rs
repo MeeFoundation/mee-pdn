@@ -28,9 +28,6 @@ use crate::node::{claimed, fresh_bring_up, install, State};
 
 /// A day of samples at one a second; past it the oldest go first.
 const SAMPLES_KEPT: usize = 86_400;
-/// What the laptop nodes a phone is compared with run at: the runtime's
-/// own default, which `bring_up` makes an application name.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What a handle keeps for its surface, served or not.
 #[derive(Default)]
@@ -179,9 +176,13 @@ impl Surface {
             }
             return Err(err);
         }
+        // The shipping constructor, so the node under test is built as the
+        // phone's is; the reconcile interval `bring_up` makes an application
+        // name stays the runtime's default, which the laptop nodes run at.
         let options = pdn_node::SpawnOptions {
-            reconcile_interval: RECONCILE_INTERVAL,
-            ..pdn_node_http::spawn_options(self.storage.clone(), connectivity, Some(pod_interval))
+            connectivity,
+            pod_reconcile_interval: pod_interval,
+            ..pdn_node::SpawnOptions::for_product(self.storage.clone())
         };
         // The identity comes before the install: a reset that follows takes the
         // node only once this one has stopped writing to its directory.

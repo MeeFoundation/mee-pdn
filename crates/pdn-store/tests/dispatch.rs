@@ -422,7 +422,17 @@ async fn the_dialing_side_is_asked_about_the_identity_it_addresses() -> Result<(
 /// syncing, as a remote holding a pair's exchange forever answers.
 #[derive(Debug, Clone, Default)]
 struct AlwaysSyncing {
-    refused: Arc<std::sync::atomic::AtomicUsize>,
+    /// The namespace of each session refused, in order.
+    refused: Arc<Mutex<Vec<NamespaceId>>>,
+}
+
+impl AlwaysSyncing {
+    fn refused(&self) -> Vec<NamespaceId> {
+        self.refused
+            .lock()
+            .map(|refused| refused.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl iroh::protocol::ProtocolHandler for AlwaysSyncing {
@@ -433,8 +443,9 @@ impl iroh::protocol::ProtocolHandler for AlwaysSyncing {
         let Ok(opening) = accept_session(&connection).await else {
             return Ok(());
         };
-        self.refused
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.push(opening.namespace());
+        }
         let _ = refuse_session(opening, AbortReason::AlreadySyncing).await;
         Ok(())
     }
@@ -458,7 +469,7 @@ async fn a_remote_always_syncing_is_redialed_a_bounded_number_of_times() -> Resu
     )
     .await?;
 
-    let refused = || busy.refused.load(std::sync::atomic::Ordering::SeqCst);
+    let refused = || busy.refused().len();
     assert!(
         eventually(|| async { Ok(refused() >= 4) }).await?,
         "the first dial and its redials did not reach the remote: {}",
@@ -468,6 +479,51 @@ async fn a_remote_always_syncing_is_redialed_a_bounded_number_of_times() -> Resu
     // the two seconds before it.
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(refused(), 4, "the remote was dialed past the bound");
+
+    busy_router.shutdown().await?;
+    dialing.router.shutdown().await?;
+    Ok(())
+}
+
+/// A dial held behind another whose redials are exhausted starts once they
+/// are: the remote that refused `first` as already syncing four times in a
+/// row is then dialed for `then`, which nothing else would start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_held_behind_exhausted_redials_starts_once_they_are() -> Result<()> {
+    let dialing = dialing_node().await?;
+    let busy = AlwaysSyncing::default();
+    let busy_router = Router::builder(loopback_endpoint().await?)
+        .accept(pdn_store::ALPN, busy.clone())
+        .spawn();
+    let (first, then) = (
+        dialing.docs.api().create().await?,
+        dialing.docs.api().create().await?,
+    );
+    dialing
+        .docs
+        .engine()
+        .order_after(then.id(), Some(first.id()))
+        .await?;
+    first.sync_with_peers(vec![], vec![], CALLER, false).await?;
+    then.sync_with_peers(
+        vec![Contact::new(busy_router.endpoint().addr(), WORK)],
+        vec![],
+        CALLER,
+        false,
+    )
+    .await?;
+
+    assert!(
+        eventually(|| async { Ok(busy.refused().len() >= 5) }).await?,
+        "the held dial never started: {:?}",
+        busy.refused()
+    );
+    let refused = busy.refused();
+    assert_eq!(
+        refused.get(..5),
+        Some(&[first.id(), first.id(), first.id(), first.id(), then.id()][..]),
+        "the held dial started before the redials of first were exhausted: {refused:?}"
+    );
 
     busy_router.shutdown().await?;
     dialing.router.shutdown().await?;

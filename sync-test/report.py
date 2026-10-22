@@ -88,7 +88,9 @@ def ci_url():
 
 
 def stop_of(last, target):
-    """How a ramp ended, from its last step: one of load.py's two stops, the size reached, or the run cut short."""
+    """How a ramp ended, from its last step: one of load.py's three stops, the size reached, or the run cut short."""
+    if last.get('writes_failed') == '1':
+        return 'writes_failed'
     if last['stalled'] == '1':
         return 'stalled'
     if (number(last['p50_ms']) or 0) > BEHIND_MS:
@@ -115,43 +117,58 @@ def content_lags(path):
     return sorted(lags.values())
 
 
+def at_checkpoint(steps, c):
+    """The step whose delays stand for checkpoint `c`: the first not stalled one that reached it, a failed write
+    having shifted every later step off the grid."""
+    return next((r for r in steps if int(r['held']) >= c and r['stalled'] != '1'), None)
+
+
+def lagged(c):
+    """A catch-up that lost events: its end came from the joiner's listing, polled, so its time is not a metric."""
+    return bool(c.get('lagged'))
+
+
 def summarize(run):
     meta = json.loads((run / 'meta.json').read_text())
     with (run / 'ramp.csv').open() as f:
         rows = list(csv.DictReader(f))
     p = profile(meta)
     catchups = {c['N']: c for c in meta.get('ramp_catchup', [])}
+    errors = {e['N'] for e in meta.get('ramp_errors', [])}
     lines = []
     for n in p['N']:
         steps = [r for r in rows if int(r['N']) == n]
         if not steps:
-            lines.append({'N': n, 'stop': 'not run', 'reached': 0, 'catchup': 'not run', 'host_max_pct': None,
-                          'evidence': '', 'metrics': {}})
+            lines.append({'N': n, 'stop': 'error' if n in errors else 'not run', 'reached': 0, 'catchup': 'not run',
+                          'host_max_pct': None, 'evidence': '', 'metrics': {}, 'write_failures': 0, 'lagged': 0})
             continue
         last = steps[-1]
         metrics = {}
-        for r in steps:
-            # A stalled step's delays are of the records that did arrive.
-            if int(r['held']) in CHECKPOINTS and r['stalled'] != '1':
+        for c in CHECKPOINTS:
+            r = at_checkpoint(steps, c)
+            if r:
                 for q in ('p50', 'p95'):
-                    metrics[f'{q}_ms@{r["held"]}'] = number(r[f'{q}_ms'])
+                    metrics[f'{q}_ms@{c}'] = number(r[f'{q}_ms'])
         for m in ('r_cpu_ms_per_record', 'sessions_per_record'):
             xs = [x for x in (number(r[m]) for r in steps) if x is not None]
             metrics[m] = statistics.median(xs) if xs else None
         lags = sorted(x for path in (run / 'events').glob(f'n{n}s*-r0.jsonl') for x in content_lags(path))
         metrics['content_lag_p50_ms'], metrics['content_lag_p90_ms'] = percentile(lags, 0.5), percentile(lags, 0.9)
         c = catchups.get(n)
-        if c:
+        if c and not lagged(c):
             metrics['catchup_s'], metrics['catchup_records_per_s'] = (number(c.get('catchup_s')),
                                                                       number(c.get('catchup_records_per_s')))
         busy = [x for x in (number(r['host_share']) for r in steps) if x is not None]
-        stop = stop_of(last, p['V'])
+        stop = 'error' if n in errors else stop_of(last, p['V'])
+        evidence = {'stalled': 'stalled', 'writes_failed': 'writes-failed'}.get(stop)
         lines.append({'N': n, 'stop': stop, 'reached': int(last['held']),
-                      'catchup': 'not run' if not c else 'hung' if c['hung'] else 'incomplete' if c['incomplete']
-                      else 'done',
+                      'catchup': 'not run' if not c else ('hung' if c['hung'] else 'incomplete' if c['incomplete']
+                                                          else 'done') + (' (lagged)' if lagged(c) else ''),
                       'host_max_pct': max(busy) * 100 if busy else None,
-                      'evidence': f'stalled/ramp-N{n}-at{last["held"]}' if stop == 'stalled' else '',
-                      'metrics': {k: v for k, v in metrics.items() if v is not None}})
+                      'evidence': f'{evidence}/ramp-N{n}-at{last["held"]}' if evidence else '',
+                      'metrics': {k: v for k, v in metrics.items() if v is not None},
+                      'write_failures': sum(int(r.get('write_failures') or 0) for r in steps),
+                      'lagged': sum(int(r.get('lagged') or 0) for r in steps)})
     revisions = meta.get('revisions') or {}
     return {'run': meta['run'], 'started': meta['started'], 'finished': meta.get('finished'),
             'mee_pdn': revisions.get('image') or revisions.get('workspace', ''),
@@ -268,10 +285,10 @@ def render(cur, prev):
                    + (f', [its CI run]({prev["ci"]})' if prev['ci'] else ''))
     else:
         out.append('- No earlier run of this profile: nothing to compare with')
-    out += ['', "## Each N's ramp", '', '| N | stop | records reached | catch-up | host busy, max % | evidence |',
-            '|---|---|---|---|---|---|']
-    out += [f'| {line["N"]} | {line["stop"]} | {line["reached"]:,} | {line["catchup"]} | {fmt(line["host_max_pct"])} | '
-            f'{line["evidence"] or "–"} |' for line in cur['lines']]
+    out += ['', "## Each N's ramp", '', '| N | stop | records reached | write failures | events lost | catch-up | '
+            'host busy, max % | evidence |', '|---|---|---|---|---|---|---|---|']
+    out += [f'| {line["N"]} | {line["stop"]} | {line["reached"]:,} | {line["write_failures"]} | {line["lagged"]} | '
+            f'{line["catchup"]} | {fmt(line["host_max_pct"])} | {line["evidence"] or "–"} |' for line in cur['lines']]
     if prev:
         out += ['', '## Changes past the threshold', '',
                 f'An N whose stop or catch-up changed; a metric past ±{THRESHOLD_PCT["time"]} % (time) or '
@@ -488,30 +505,38 @@ def index(history):
 
 # --- the self-check --------------------------------------------------------------------------------------------------
 
-def synthetic_run(root, name, started, ns=(2, 4), rate=20, values=None, stalled=()):
+def synthetic_run(root, name, started, ns=(2, 4), rate=20, values=None, stalled=(), lagged=(), errors=(),
+                  offgrid=False):
     """A ramp run of test L up to 1,000 records: every step's value 1.0 unless `values` names it; the N in `stalled`
-    stop at 500, the others catch up. r's events give lags of 1 to 10 ms, and the catch-up delivers each record again
-    1 s late."""
+    stop at 500, the others catch up, the ones in `lagged` by their listing; the N in `errors` raised before a step.
+    `offgrid` ramps to 2,000 with one write failed at 300, p50 7.0 on the step past 1,000. r's events give lags of
+    1 to 10 ms, and the catch-up delivers each record again 1 s late."""
     run = root / name
     (run / 'events').mkdir(parents=True)
     value = lambda m: (values or {}).get(m, 1.0)
-    meta = {'run': name, 'test': 'L', 'variant': 'plain', 'N': list(ns), 'V': [1000], 'S': [256], 'ramp': rate,
-            'pod_interval_s': 300, 'skip_catchup': False, 'host': {'cpu_budget': 4.0}, 'revisions': {'image': name},
-            'started': started, 'finished': started + 60,
+    meta = {'run': name, 'test': 'L', 'variant': 'plain', 'N': list(ns), 'V': [2000 if offgrid else 1000], 'S': [256],
+            'ramp': rate, 'pod_interval_s': 300, 'skip_catchup': False, 'host': {'cpu_budget': 4.0},
+            'revisions': {'image': name}, 'started': started, 'finished': started + 60,
             'ramp_catchup': [{'N': n, 'catchup_s': value('catchup_s'), 'catchup_records_per_s':
-                              value('catchup_records_per_s'), 'incomplete': False, 'hung': False, 'ready': 1000}
-                             for n in ns if n not in stalled]}
+                              value('catchup_records_per_s'), 'incomplete': False, 'hung': False, 'ready': 1000,
+                              'lagged': int(n in lagged), 'listed': n in lagged}
+                             for n in ns if n not in stalled and n not in errors],
+            'ramp_errors': [{'N': n, 'error': 'NodeDown'} for n in errors]}
     (run / 'meta.json').write_text(json.dumps(meta))
     with (run / 'ramp.csv').open('w', newline='') as f:
         w = csv.DictWriter(f, load.RAMP_COLUMNS)
         w.writeheader()
         for n in ns:
-            for held in (100, 200, 300, 400, 500) if n in stalled else (100, 200, 300, 400, 500, 1000):
-                w.writerow({'run': name, 'N': n, 'held': held, 'records': 100, 'p50_ms': value('p50_ms'),
+            helds = ((100, 200, 300, 400, 500) if n in stalled else () if n in errors
+                     else (100, 200, 299, 399, 499, 999, 1499, 2000) if offgrid else (100, 200, 300, 400, 500, 1000))
+            for held in helds:
+                w.writerow({'run': name, 'N': n, 'held': held, 'records': 100,
+                            'p50_ms': 7.0 if held == 1499 else value('p50_ms'),
                             'p95_ms': value('p95_ms'), 'r_cpu_ms_per_record': value('r_cpu_ms_per_record'),
                             'r_cpu_pct': 1.0, 'host_share': 0.5, 'write_call_p50_ms': 1.0,
                             'sessions_per_record': value('sessions_per_record'),
-                            'stalled': int(n in stalled and held == 500)})
+                            'stalled': int(n in stalled and held == 500), 'lagged': 0,
+                            'write_failures': int(held == 299), 'writes_failed': 0})
         events = [{'store': 'membership', 'kind': 'content_ready', 'hash': 'm', 't': 0}]
         for again in (0, 1_000_000):
             for k in range(10):
@@ -538,6 +563,8 @@ def synthetic():
             'p50_ms': 1.2, 'r_cpu_ms_per_record': 1.2, 'catchup_records_per_s': 0.6, 'sessions_per_record': 0.8})
         b = summarize(b_run)
         alone = summarize(synthetic_run(runs, 'e', 400, ns=(2, 4, 8)))
+        off_run = synthetic_run(runs, 'f', 500, offgrid=True)
+        lag_run = synthetic_run(runs, 'g', 600, ns=(2, 4, 8), lagged={2}, errors={8})
 
         def flagged():
             cur = summarize(b_run)
@@ -547,7 +574,8 @@ def synthetic():
         want = {('worse', 'r_cpu_ms_per_record', 2), ('worse', 'catchup_records_per_s', 2),
                 ('better', 'sessions_per_record', 2), ('status', None, 4), ('worse', 'r_cpu_ms_per_record', 4),
                 ('better', 'sessions_per_record', 4)}
-        step = lambda stalled='0', p50='1', held='1000': {'stalled': stalled, 'p50_ms': p50, 'held': held}
+        step = lambda stalled='0', p50='1', held='1000', failed='0': {'stalled': stalled, 'p50_ms': p50, 'held': held,
+                                                                     'writes_failed': failed}
         cases = [
             ('a run is compared with the latest earlier run of its profile',
              lambda: (baseline(b, history_runs(history)) or {}).get('run'), 'a',
@@ -558,8 +586,17 @@ def synthetic():
              [('THRESHOLD_PCT', lambda f: {'time': 15, 'work': 15, 'events': 15}),
               ('HIGHER_IS_BETTER', lambda f: set()), ('state', lambda f: lambda line: ())]),
             ("a ramp's stop is read from its last step",
-             lambda: [stop_of(s, 1000) for s in (step(stalled='1'), step(p50='40000'), step(held='500'), step())],
-             ['stalled', 'behind', 'cut short', 'reached'], [('BEHIND_MS', lambda f: 10 ** 9)]),
+             lambda: [stop_of(s, 1000) for s in (step(stalled='1'), step(p50='40000'), step(held='500'), step(),
+                                                 step(failed='1'))],
+             ['stalled', 'behind', 'cut short', 'reached', 'writes_failed'], [('BEHIND_MS', lambda f: 10 ** 9)]),
+            ('a checkpoint a failed write shifted off the grid is read from the first step past it, failures counted',
+             lambda: (summarize(off_run)['lines'][0]['metrics'].get('p50_ms@1000'),
+                      summarize(off_run)['lines'][0]['write_failures']), (7.0, 1),
+             [('at_checkpoint', lambda f: lambda steps, c: next((r for r in steps if int(r['held']) == c), None))]),
+            ('a lagged catch-up is marked and its time is no metric; an N whose ramp raised is marked error',
+             lambda: [(ln['stop'], ln['catchup'], 'catchup_s' in ln['metrics']) for ln in summarize(lag_run)['lines']],
+             [('reached', 'done (lagged)', False), ('reached', 'done', True), ('error', 'not run', False)],
+             [('lagged', lambda f: lambda c: False)]),
             ("r's content lag counts each record from its first delivery",
              lambda: [summarize(runs / 'a')['lines'][0]['metrics'][m] for m in ('content_lag_p50_ms',
                                                                                  'content_lag_p90_ms')],
@@ -585,7 +622,8 @@ def synthetic():
                 bites.append(f'broken {attr}: {"bites" if bit else "DOES NOT BITE"}')
             print(f'{name}: {"ok" if ok else f"FAILED: {got!r} != {want_!r}"}; {"; ".join(bites)}')
         text = render(b, baseline(b, history_runs(history)))
-        for needle in ('Compared with `a`', '| 4 | stalled | 500 | not run |', 'stalled/ramp-N4-at500', '1.2 (+20 %)',
+        for needle in ('Compared with `a`', '| 4 | stalled | 500 | 0 | 0 | not run |', 'stalled/ramp-N4-at500',
+                       '1.2 (+20 %)',
                        '**status** N=4: reached at 1,000 records, catch-up done → stalled at 500 records, '
                        'catch-up not run'):
             if needle not in text:

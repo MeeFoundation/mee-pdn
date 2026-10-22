@@ -248,6 +248,14 @@ def cases(root):
            dict(expected=1, readable=1, teardown_split=1), 'PASS', None,
            ('is_teardown', lambda f: lambda r, p: False))
 
+    # The runtime's `sync_finished` of a failed side: `error`, no `error_kind`, no counters (`session_body` in
+    # crates/pdn-node/src/observation.rs).
+    ev = [local('w1', K1, 1.0)] + session('w1', 'r', 2.0, [K1], rok=False) + session('w1', 'r', 7.0, [])
+    del next(rec for _, rec in ev if rec['kind'] == 'sync_finished' and not rec['ok'])['error_kind']
+    yield ('split whose failing side names no stage: no verdict', build(root, 'unstaged', [write('w1', K1, 1.0)], ev, {'r': holding([K1])}),
+           dict(expected=1, readable=1, unstaged_split=1), 'INCONCLUSIVE', None,
+           ('is_teardown', lambda f: lambda r, p: False))
+
     ev = [local('w1', K1, 1.0)] + session('w1', 'r', 2.0, [K1], rok=False, rkind='sync', arrive=False) + session('w1', 'r', 7.0, [K1])
     yield ('split session', build(root, 'split', [write('w1', K1, 1.0)], ev, {'r': holding([K1])}),
            dict(expected=1, readable=1, split=1), 'FAIL', None,

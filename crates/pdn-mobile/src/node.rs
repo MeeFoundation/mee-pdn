@@ -636,12 +636,21 @@ impl Drop for PdnNode {
         let teardown = std::thread::Builder::new()
             .name("pdn-mobile-teardown".to_owned())
             .spawn(move || {
-                if let Some(State::Up(runtime)) = node {
-                    tokio.block_on(async move {
+                match node {
+                    Some(State::Up(runtime)) => tokio.block_on(async move {
                         if let Err(err) = runtime.shutdown().await {
                             tracing::error!("a released handle's node did not stop cleanly: {err}");
                         }
-                    });
+                    }),
+                    // A transition in flight ends on its own once its task
+                    // runs to its lock's release: a stop finishes its
+                    // shutdown, and a bring-up finds its claim gone and
+                    // shuts its node down (`install`). Letting the runtime
+                    // go first would drop that task mid-shutdown.
+                    Some(State::ComingUp(theirs)) => tokio.block_on(async move {
+                        let _ended = theirs.lock().await;
+                    }),
+                    Some(State::Down) | None => {}
                 }
                 drop(tokio);
             });
@@ -658,7 +667,9 @@ mod tests {
         time::Duration,
     };
 
-    use super::{claimed, fresh_bring_up, install, PdnNode, State};
+    use tokio::sync::oneshot;
+
+    use super::{claimed, fresh_bring_up, install, Connectivity, PdnError, PdnNode, State};
 
     /// A stop that overtakes a bring-up returns only once that bring-up's
     /// task is done with its node, so the caller's next bring-up finds the
@@ -681,6 +692,89 @@ mod tests {
         );
         drop(held);
         stopping.await??;
+        Ok(())
+    }
+
+    /// A stop keeps the handle between its states until the node is down:
+    /// a bring-up meanwhile is refused as a node already up, and a second
+    /// stop meanwhile waits for the first. The node going down is staged as
+    /// a bring-up holding its lock, since a real shutdown has no hook to
+    /// hold it.
+    #[tokio::test]
+    async fn a_stop_keeps_the_handle_between_its_states_until_the_node_is_down(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let node = PdnNode::new()?;
+        let (theirs, held) = fresh_bring_up()?;
+        *node.state()? = State::ComingUp(theirs);
+        let first = {
+            let node = Arc::clone(&node);
+            tokio::spawn(async move { node.stop().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let during = node
+            .bring_up_on(
+                dir.path().to_string_lossy().into_owned(),
+                1,
+                Connectivity::Direct,
+            )
+            .await;
+        assert!(
+            matches!(during, Err(PdnError::NodeAlreadyUp)),
+            "a bring-up during a stop: {during:?}"
+        );
+        let second = {
+            let node = Arc::clone(&node);
+            tokio::spawn(async move { node.stop().await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "a stop returned while the node it stops was still going down"
+        );
+        drop(held);
+        first.await??;
+        second.await??;
+        assert!(
+            matches!(*node.state()?, State::Down),
+            "both stops over, the handle is down"
+        );
+        Ok(())
+    }
+
+    /// A handle released mid-transition lets its runtime go only once the
+    /// transition's task is done with its node, rather than dropping the
+    /// task mid-shutdown. The task is staged on the facade's runtime: it
+    /// holds the transition's lock until the test says, and reports whether
+    /// it ran to its end.
+    #[tokio::test]
+    async fn a_released_handle_waits_for_the_transition_in_flight() -> anyhow::Result<()> {
+        let node = PdnNode::new()?;
+        let (theirs, held) = fresh_bring_up()?;
+        *node.state()? = State::ComingUp(theirs);
+        let (release, released) = oneshot::channel::<()>();
+        let (done, mut ended) = oneshot::channel::<()>();
+        {
+            let tokio = node.tokio.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let tokio = tokio
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no runtime"))?;
+            tokio.spawn(async move {
+                let _held = held;
+                let _ = released.await;
+                let _ = done.send(());
+            });
+        }
+        drop(node);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            matches!(ended.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "the released handle's runtime went before the transition in flight ended"
+        );
+        release
+            .send(())
+            .map_err(|()| anyhow::anyhow!("the transition's task is gone"))?;
+        ended.await?;
         Ok(())
     }
 

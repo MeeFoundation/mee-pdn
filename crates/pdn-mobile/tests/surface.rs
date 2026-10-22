@@ -200,11 +200,11 @@ async fn a_pod_member_reads_its_records_and_an_outsider_reads_nothing() -> Resul
     Ok(())
 }
 
-/// A code read for the wrong act reaches the runtime and comes back as the
-/// runtime's refusal, because nothing above the facade parses a payload to
-/// tell the two acts apart.
+/// A code read for the wrong act is refused by the facade as malformed
+/// input before the runtime sees it: each call decodes the runtime type it
+/// consumes, strictly, and neither payload kind decodes as the other.
 #[tokio::test]
-async fn a_code_read_for_the_wrong_act_is_refused_by_the_runtime() -> Result<()> {
+async fn a_code_read_for_the_wrong_act_is_refused_as_malformed() -> Result<()> {
     let inviter = Device::boot().await?;
     let scanner = Device::boot().await?;
     let alice = inviter.node.create_identity().await?;
@@ -441,12 +441,14 @@ async fn a_node_comes_back_on_its_directory() -> Result<()> {
     Ok(())
 }
 
-/// A bring-up during a stop is refused as a node already up, and once the
-/// stops are over a bring-up reaches a running node: never the directory
-/// reported held. On a run where the shutdown ends within the wait, the
-/// refusal arm goes untaken and the bring-up after it still has to succeed.
+/// Once 2 stops issued together are over, a bring-up reaches a running
+/// node: never the directory reported held. A smoke through the exported
+/// calls: the shutdown may be over before the bring-up, so both of its
+/// outcomes are admitted here, and the refusal during a stop and the second
+/// stop's wait are pinned on a staged transition in `src/node.rs`
+/// (`a_stop_keeps_the_handle_between_its_states_until_the_node_is_down`).
 #[tokio::test]
-async fn a_bring_up_during_a_stop_is_refused_and_one_after_it_succeeds() -> Result<()> {
+async fn a_bring_up_after_a_pair_of_stops_reaches_a_running_node() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let node = PdnNode::new()?;
     node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
@@ -474,6 +476,28 @@ async fn a_bring_up_during_a_stop_is_refused_and_one_after_it_succeeds() -> Resu
         node.bring_up_on(path_of(&dir), CADENCE_SECS, Connectivity::Direct)
             .await?;
     }
+    node.stop().await?;
+    Ok(())
+}
+
+/// A node brought up through the exported `bring_up` — the product's
+/// connectivity, relays and address lookup — is stopped and brought up on
+/// its directory again. Open defect: task 5.9 of the `mobile-host-surface`
+/// change saw the second bring-up refused as `StorageHeld` in 3 runs of 6,
+/// the directory still held by a node whose shutdown had returned; at
+/// `Connectivity::Direct`, where the scenarios above run, the same shape
+/// passes. Reaches the relays, so it runs by hand with the network:
+/// `just test -p pdn-mobile -E 'test(a_node_comes_back_on_its_directory_at_the_products_connectivity)' --run-ignored all`.
+#[tokio::test]
+#[ignore = "reaches the relays; run with --run-ignored all on a machine with the network"]
+async fn a_node_comes_back_on_its_directory_at_the_products_connectivity() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = PdnNode::new()?;
+    node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    let node_id = node.node_id().await?;
+    node.stop().await?;
+    node.bring_up(path_of(&dir), CADENCE_SECS).await?;
+    assert_eq!(node.node_id().await?, node_id, "the same node answers");
     node.stop().await?;
     Ok(())
 }

@@ -58,7 +58,8 @@ LONG_IDLE_EXTRA_S = 30
 DEFAULT_POD_INTERVAL_S = 300
 STEADY_S, STEADY_RATE, DRAIN_S = 60, 10, 60
 CATCHUP_MIN_S, CATCHUP_RECORDS_PER_S = 120, 100
-# After a lost event the joiner's listing is read this often: the catch-up's end is then late by up to this much.
+# After a lost event the joiner's listing is read this often, or every 4 listing durations when that is longer: a
+# listing is itself load on the joiner. The catch-up's end is then late by up to one poll interval.
 CATCHUP_LISTING_EVERY_S = 1
 # --grid: a fresh pod per (N, V) and short windows, to map where sync stays stable; no idle verdicts.
 GRID_FILL_STALL_S = 60
@@ -1083,27 +1084,30 @@ def catchup(run, pod, cell):
     stream = r.open_stream(pod.pod, True, join_invite=invite)
     pod.streams.append(stream)
     deadline = t0 + max(CATCHUP_MIN_S, held / CATCHUP_RECORDS_PER_S)
-    listed_us, next_listing = None, t0
+    listed_us, next_listing, listings, listings_s = None, t0, 0, 0.0
     while time.monotonic() < deadline:
         if stream.answered.is_set() and (len(stream.ready) >= held or stream.ended):
             break
         # A lost event leaves the count short for good, so the joiner's own listing says what it holds
         # (the `Lagged` contract of the store's change subscription).
         if stream.gaps and stream.answered.is_set() and time.monotonic() >= next_listing:
-            next_listing = time.monotonic() + CATCHUP_LISTING_EVERY_S
+            at, at_us = time.monotonic(), now_us()
             try:
                 complete = listed_complete(bare_listing(r, pod.pod), held)
             except (RuntimeError, NodeDown):
                 complete = False
+            took = time.monotonic() - at
+            listings, listings_s = listings + 1, listings_s + took
+            next_listing = time.monotonic() + max(CATCHUP_LISTING_EVERY_S, 4 * took)
             if complete:
-                listed_us = now_us()
+                listed_us = at_us
                 break
         time.sleep(0.2)
     t1 = time.monotonic()
     done = stream.status == 200 and (len(stream.ready) >= held or listed_us is not None)
     rec = cell['catchup']
     rec.update(answered=stream.status, error=stream.error, ready=len(stream.ready), lagged=stream.gaps,
-               listed=listed_us is not None)
+               listed=listed_us is not None, listings=listings, listings_s=round(listings_s, 3))
     rec.update(inserted=len(stream.order), events_silent_s=round(t1 - stream.last, 1) if stream.last else None,
                answered_s=round(stream.answered_at - t0, 1) if stream.answered_at else None)
     rec['host_share'] = run.sampler.host_share(t0, t1)
@@ -1114,7 +1118,7 @@ def catchup(run, pod, cell):
     if done:
         last = max(stream.ready.values()) if stream.ready else t0_us
         if listed_us is not None:
-            # The listing's own time bounds the end from above; the last readable record seen, from below.
+            # The end lies between the last readable record seen and the start of the listing that held every record.
             rec['last_ready_s'] = round((last - t0_us) / 1e6, 3)
             last = listed_us
         secs = (last - t0_us) / 1e6
@@ -1310,12 +1314,13 @@ RAMP_STEP, RAMP_STALL_S, RAMP_BEHIND_MS = 500, 60, 30_000
 # One printed line per step: write → readable on r (median, p95), r's CPU per record, the laptop's load.
 RAMP_ROW = '| {:<8} | {:>5} | {:>7} | {:>9} | {:>7} | {:>10} | {:>12} | {:>8} | {:<15} |'
 RAMP_COLUMNS = ['run', 'N', 'held', 'records', 'p50_ms', 'p95_ms', 'r_cpu_ms_per_record', 'r_cpu_pct', 'host_share',
-                'write_call_p50_ms', 'sessions_per_record', 'stalled']
+                'write_call_p50_ms', 'sessions_per_record', 'stalled', 'lagged', 'write_failures', 'writes_failed']
 
 
 def ramp(run, n, rate, to):
     """Writers place `rate` records a second until the pod holds `to`; one row per RAMP_STEP records. A step whose
-    content `r` has not all received after RAMP_STALL_S without progress ends the ramp, marked stalled."""
+    content `r` has not all received after RAMP_STALL_S without progress ends the ramp, marked stalled; a step a
+    writer dropped out of (its failure cap, or its process gone) ends it marked writes_failed."""
     pod = Pod(run, n, 256)
     out = run.dir / 'ramp.csv'
     new = not out.exists()
@@ -1329,11 +1334,13 @@ def ramp(run, n, rate, to):
                                   'sessions/rec', 'laptop %', 'content'), flush=True)
             print(RAMP_ROW.format(*[''] * 9).replace(' ', '-'), flush=True)
             while pod.held < to:
-                mark = len(pod.r.stream.order)
+                mark, gaps0 = len(pod.r.stream.order), pod.r.stream.gaps
                 count = min(100 if pod.held < 500 else RAMP_STEP, to - pod.held)
                 start = time.time() + 0.2
                 t0, t0_us = time.monotonic() + 0.2, int(start * 1e6)
-                placed, _ = pod.writing([start + k / rate for k in range(count)], f'ramp-{pod.held}')
+                placed, failures = pod.writing([start + k / rate for k in range(count)], f'ramp-{pod.held}')
+                # A writer at its failure cap leaves the rest of its share neither placed nor failed.
+                writes_failed = placed + len(failures) < count or any(w.proc.poll() is not None for w in pod.writers)
                 calls = [d for _, d in pod.calls]
                 held, moved = -1, time.monotonic()
                 while pod.r.stream.held_since(mark) < placed and time.monotonic() - moved < RAMP_STALL_S:
@@ -1344,7 +1351,16 @@ def ramp(run, n, rate, to):
                 got = pod.r.stream.held_since(mark)
                 lat = sorted(pod.r.stream.latencies_s(mark))
                 cpu = run.sampler.window(pod.r.pid, t0, t1)
-                stalled = got < placed
+                lagged = pod.r.stream.gaps - gaps0
+                stalled, listing, listing_error = got < placed, None, None
+                if stalled:
+                    try:
+                        listing = bare_listing(pod.r, pod.pod)
+                    except (NodeDown, RuntimeError) as e:
+                        listing_error = str(e)
+                    # A lost event leaves the count short for good: r's listing says what it holds, as in catchup().
+                    if lagged and listing is not None and listed_complete(listing, pod.held):
+                        stalled = False
                 behind = bool(lat) and lat[len(lat) // 2] * 1e3 > RAMP_BEHIND_MS
                 row = {'run': run.meta['run'], 'N': n, 'held': pod.held, 'records': len(lat),
                        'p50_ms': fmt(lat[len(lat) // 2] * 1e3 if lat else None),
@@ -1353,7 +1369,8 @@ def ramp(run, n, rate, to):
                        'r_cpu_pct': fmt(cpu[1] if cpu else None), 'host_share': fmt(run.sampler.host_share(t0, t1)),
                        'write_call_p50_ms': fmt(statistics.median(calls) * 1e3 if calls else None),
                        'sessions_per_record': fmt(sessions_carrying(pod.streams, t0_us, t1_us) / placed if placed else None),
-                       'stalled': int(stalled)}
+                       'stalled': int(stalled), 'lagged': lagged, 'write_failures': len(failures),
+                       'writes_failed': int(writes_failed)}
                 w.writerow(row)
                 f.flush()
                 ms = lambda k: f'{float(row[k]):,.0f}' if row[k] else '-'
@@ -1361,13 +1378,20 @@ def ramp(run, n, rate, to):
                                       ms('r_cpu_ms_per_record'),
                                       f'{float(row["sessions_per_record"]):.1f}' if row['sessions_per_record'] else '-',
                                       f'{float(row["host_share"] or 0) * 100:.0f}',
-                                      'CONTENT STOPPED' if stalled else 'BEHIND > 30 s' if behind else 'ok'), flush=True)
+                                      'WRITES FAILED' if writes_failed else 'CONTENT STOPPED' if stalled
+                                      else 'BEHIND > 30 s' if behind else 'ok'), flush=True)
+                if writes_failed:
+                    name = keep_evidence(run, f'writes-failed/ramp-N{n}-at{pod.held}', pod.writers,
+                                         {w.name: 0 for w in pod.writers})
+                    (run.dir / name / 'failures.txt').write_text(''.join(f'{e}\n' for e in failures))
+                    print(f'  writers: {len(failures)} failures, evidence in {name}', flush=True)
+                    return
                 if stalled:
                     name = keep_evidence(run, f'stalled/ramp-N{n}-at{pod.held}', [pod.r], {pod.r.name: 0})
                     # What `r` holds against what its events reported: a silent stream and a stalled sync differ here.
-                    listing = bare_listing(pod.r, pod.pod)
-                    held_now = {'events_held': pod.held - placed + got, 'listing_entries': len(listing),
-                                'listing_present': sum(1 for e in listing if e['present']),
+                    held_now = {'events_held': pod.held - placed + got, 'listing_entries': len(listing or []),
+                                'listing_present': sum(1 for e in listing or [] if e['present']),
+                                'listing_error': listing_error,
                                 'events_silent_s': round(time.monotonic() - pod.r.stream.last, 1)
                                 if pod.r.stream.last else None}
                     (run.dir / name / 'listing.json').write_text(json.dumps(held_now) + '\n')
@@ -1448,12 +1472,16 @@ def main():
         print(f'run {run.meta["run"]} in {run.dir}', flush=True)
         try:
             for n in args.n:
-                ramp(run, n, args.ramp, max(args.v))
+                try:
+                    ramp(run, n, args.ramp, max(args.v))
+                except (NodeDown, RuntimeError) as e:
+                    print(f'N={n}: {e}', flush=True)
+                    run.meta.setdefault('ramp_errors', []).append({'N': n, 'error': str(e)})
         finally:
             run.stop_all()
             run.meta.update(finished=time.time(), host_after=host_info())
             run.save()
-        return 0
+        return 1 if run.meta.get('ramp_errors') else 0
     print(f'run {run.meta["run"]} in {run.dir}; N order {run.meta["N"]}', flush=True)
     try:
         for n in run.meta['N']:
