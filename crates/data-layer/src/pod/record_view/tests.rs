@@ -27,6 +27,8 @@ impl Records {
             key: key.as_bytes().to_vec(),
             author,
             timestamp: self.clock,
+            hash: Hash::new(key),
+            len: 0,
             payload: Some(Hash::new(key)),
         });
         self.entries.len() - 1

@@ -23,6 +23,9 @@ x-node: &node
   image: ${PDN_STAND_IMAGE:-pdn-node-http:dev}
   environment:
     PDN_DEBUG: "1"
+    # The screens are pages a browser opened from a file: the debug subtree
+    # answers them with cross-origin headers only when asked to.
+    PDN_ANY_ORIGIN: "1"
     RUST_LOG: "info,pdn_node=debug,data_layer=debug"
   networks: [demo]
 

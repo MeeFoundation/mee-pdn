@@ -93,6 +93,8 @@ pub(crate) async fn record_entries(
             key: entry.key().to_vec(),
             author: entry.author(),
             timestamp: entry.timestamp(),
+            hash,
+            len: entry.content_len(),
             payload: blobs.has(hash).await?.then_some(hash),
         });
     }

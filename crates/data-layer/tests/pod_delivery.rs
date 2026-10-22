@@ -672,6 +672,77 @@ async fn a_record_store_starts_with_its_ticket_though_the_first_session_lists_no
     Ok(())
 }
 
+/// A pod whose start is in flight is out of the pod pass's reach: no run
+/// draws for it until the start is through, so the subscription the start
+/// attaches reads the first session's insert. Fails with the hold on
+/// starting pods taken out of the pass. The start is held between its two
+/// stores for four pod runs; the draw after the release is the control
+/// that the pass is alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pod_pass_leaves_a_pod_whose_start_is_in_flight_alone() -> Result<()> {
+    use futures_lite::StreamExt as _;
+    use pdn_store::engine::LiveEvent;
+
+    let (alice_phone, bob_phone) = (node(QUIET, QUIET).await?, node(QUIET, POD_RUN).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (bob, _) = host(&bob_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    invite(
+        &alice_phone,
+        &alice,
+        pod,
+        &bob,
+        vec![device_of(&bob_phone, &bob)?],
+    )
+    .await?;
+    place_claim(&alice_phone, &alice, pod, 1).await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    let mut draws = bob_phone
+        .take_pod_pass_draws()
+        .expect("the draw channel is taken once");
+
+    let pause = bob_phone.pause_next_pod_start_for_test();
+    let (imported, drawn_meanwhile) = tokio::join!(
+        bob_phone.import_pod_observed_for_test(bob.id, pod, tickets, &[], 1_024),
+        async {
+            pause.reached.notified().await;
+            let run = tokio::time::timeout(POD_RUN * 4, draws.recv()).await;
+            pause.release.notify_one();
+            run
+        }
+    );
+    let (caught_up, observation) = imported?;
+    assert!(
+        drawn_meanwhile.is_err(),
+        "a run drew for the pod while its start was in flight: {drawn_meanwhile:?}"
+    );
+    caught_up.wait(TIMEOUT).await?;
+    let drawn_after = tokio::time::timeout(TIMEOUT, draws.recv()).await?;
+    assert_eq!(drawn_after.map(|draw| draw.pod), Some(pod));
+
+    let mut records = observation
+        .records
+        .context("the import observes no record store")?;
+    let mut inserted = 0;
+    tokio::time::timeout(TIMEOUT, async {
+        while let Some(event) = records.next().await {
+            match event? {
+                LiveEvent::InsertRemote { .. } => inserted += 1,
+                LiveEvent::SyncFinished(sync) if sync.result.is_ok() => return Ok(()),
+                _ => {}
+            }
+        }
+        anyhow::bail!("the subscription ended before the first session")
+    })
+    .await??;
+    assert_eq!(inserted, 1, "the first session's insert went unseen");
+
+    for node in [alice_phone, bob_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// The first trace of `traces` that `wanted` picks, within the suites'
 /// budget.
 async fn next_trace(

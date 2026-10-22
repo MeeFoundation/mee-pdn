@@ -9,17 +9,20 @@ description = "Embeddable node runtime: identity, pods and sync services over da
 # Extra API surface that exists only to support scenario tests, never the
 # product: the runtime's fault and pause hooks (`fail_next_*_for_test`,
 # `pause_next_*`, `forge_next_join_for_test`), which land a failure, a
-# race or a modified inviter's offer on a chosen step, on demand. Off in
-# every product build; the `just` dev recipes turn it on. Named after
-# tokio's `test-util` (and singular, so it does not collide with the
-# `test-utils` crate). Not `cfg(test)`: integration tests compile the crate
-# as an external dependency, where `cfg(test)` is never set. Enables
-# data-layer's observation surface too (the membership and record views
-# and the replica counts the hooks hand on).
-test-util = ["data-layer/test-util"]
+# race or a modified inviter's offer on a chosen step, on demand, and the
+# runtime's observation of a pod's sync (`observation`). Off in every
+# product build; the `just` dev recipes turn it on. Named after tokio's
+# `test-util` (and singular, so it does not collide with the `test-utils`
+# crate). Not `cfg(test)`: integration tests compile the crate as an
+# external dependency, where `cfg(test)` is never set. Enables data-layer's
+# observation surface too (the membership and record views and the replica
+# counts the hooks hand on).
+test-util = ["data-layer/test-util", "dep:base64"]
 
 [dependencies]
 anyhow = "1"
+# The record listing's payload in its JSON form (`test-util`).
+base64 = { version = "0.22", optional = true }
 data-layer = { path = "../data-layer" }
 # Consuming data-layer's PMS change stream (the identity armer).
 futures-lite = "2"
@@ -32,7 +35,8 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # `rt` for the detached identity-armer task the runtime spawns per
 # hosted identity.
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+# `macros` for the `select!` in the armer and in the observation task.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 # Background failures warn through the ecosystem's subscriber; already in
 # the graph via iroh.
@@ -53,6 +57,8 @@ doc = false
 # ceremonies published, and the pin on the linking wire format.
 data-layer = { path = "../data-layer" }
 postcard = { version = "1.1.3", features = ["use-std"] }
+# The observation record's one JSON form.
+serde_json = "1"
 # Scenario tests of directory-configured runtimes get a directory each.
 tempfile = "3"
 test-utils = { path = "../test-utils", features = ["test-util"] }

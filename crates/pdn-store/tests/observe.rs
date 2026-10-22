@@ -1,0 +1,840 @@
+//! The ordered subscription (the data layer's `change-subscription` spec):
+//! one replica's events in the order the live actor handled them, at the
+//! capacity its caller names, and the session id both ends of a session
+//! report.
+
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context, Result};
+use iroh::{endpoint::presets, protocol::Router, Endpoint, Watcher as _};
+use iroh_blobs::{
+    api::Store,
+    store::{fs::FsStore, mem::MemStore},
+    BlobsProtocol, Hash,
+};
+use iroh_gossip::net::Gossip;
+use n0_future::{Stream, StreamExt};
+use pdn_store::{
+    api::{AddrInfoOptions, Doc, DocsApi},
+    engine::{LiveEvent, Origin, SyncEvent},
+    filter::serve_whole,
+    protocol::{Docs, DocsDispatch, IdentityResolver},
+    Contact, ContentStatus, Identity, NamespaceId, SessionAccess, SessionAccessProvider,
+    SessionRole,
+};
+use tokio::sync::Notify;
+
+const HOLDER: Identity = Identity::from_bytes([0u8; 32]);
+const WORK: Identity = Identity::from_bytes([0xa2; 32]);
+const LEISURE: Identity = Identity::from_bytes([0xa3; 32]);
+
+/// What the runtime's observation asks for per store.
+const CAPACITY: usize = 4_096;
+/// A session between two endpoints on loopback, 1,000 entries at most.
+const TIMEOUT: Duration = Duration::from_secs(60);
+/// The replica cache of a peer on the fs store.
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One node of one identity on loopback, its blob store kept for the
+/// scenario to inspect.
+struct Peer {
+    router: Router,
+    docs: Docs,
+    blobs: Store,
+}
+
+impl Peer {
+    async fn spawn() -> Result<Self> {
+        Self::spawn_on(None).await
+    }
+
+    /// On the fs store and persistent replicas under `dir`, or in memory.
+    async fn spawn_on(dir: Option<&Path>) -> Result<Self> {
+        let endpoint = loopback_endpoint().await?;
+        let (blobs, docs) = match dir {
+            Some(dir) => (
+                (*FsStore::load(dir.join("blobs")).await?).clone(),
+                Docs::persistent(dir.to_path_buf(), CACHE_BYTES, HOLDER, serve_whole()),
+            ),
+            None => (
+                (*MemStore::new()).clone(),
+                Docs::memory(HOLDER, serve_whole()),
+            ),
+        };
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let docs = docs
+            .spawn(endpoint.clone(), blobs.clone(), gossip.clone())
+            .await?;
+        let resolve: IdentityResolver = {
+            let docs = docs.clone();
+            Arc::new(move |identity| (identity == HOLDER).then(|| docs.clone()))
+        };
+        let router = Router::builder(endpoint)
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
+            .accept(iroh_gossip::ALPN, gossip)
+            .accept(pdn_store::ALPN, DocsDispatch::new(resolve))
+            .spawn();
+        Ok(Self {
+            router,
+            docs,
+            blobs,
+        })
+    }
+
+    fn api(&self) -> &DocsApi {
+        self.docs.api()
+    }
+
+    fn contacts(&self) -> Vec<Contact> {
+        vec![Contact::new(self.router.endpoint().addr(), HOLDER)]
+    }
+
+    async fn holds(&self, hash: Hash) -> Result<bool> {
+        Ok(self.blobs.has(hash).await?)
+    }
+}
+
+/// An endpoint publishes its first address a moment after it binds, and a
+/// contact taken before that names no path.
+async fn loopback_endpoint() -> Result<Endpoint> {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0u16))?
+        .bind()
+        .await?;
+    while endpoint.watch_addr().get().is_empty() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(endpoint)
+}
+
+/// A writer holding `count` entries `{prefix}{i}`, each with a payload of
+/// its own, and a reader holding the namespace and nothing of it. The reader
+/// joins no swarm, so the two are never neighbors and the only sessions are
+/// the ones a scenario dials.
+async fn writer_and_reader(count: usize, prefix: &str) -> Result<(Peer, Doc, Peer, Doc)> {
+    writer_and_reader_on(count, prefix, None).await
+}
+
+/// [`writer_and_reader`] on the fs store under `dir`, or in memory.
+async fn writer_and_reader_on(
+    count: usize,
+    prefix: &str,
+    dir: Option<&Path>,
+) -> Result<(Peer, Doc, Peer, Doc)> {
+    let writer = Peer::spawn_on(dir.map(|dir| dir.join("writer")).as_deref()).await?;
+    let reader = Peer::spawn_on(dir.map(|dir| dir.join("reader")).as_deref()).await?;
+    let written = writer.api().create().await?;
+    write(&writer, &written, prefix, 0..count).await?;
+    written
+        .sync_with_peers(vec![], vec![], HOLDER, false)
+        .await?;
+    let ticket = written.share(AddrInfoOptions::Id).await?;
+    let read = reader.api().import_namespace(ticket.capability).await?;
+    Ok((writer, written, reader, read))
+}
+
+async fn write(
+    peer: &Peer,
+    doc: &Doc,
+    prefix: &str,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<Hash>> {
+    let author = peer.api().author_default().await?;
+    let mut hashes = Vec::new();
+    for i in range {
+        let key = format!("{prefix}{i}");
+        hashes.push(doc.set_bytes(author, key.clone(), key).await?);
+    }
+    Ok(hashes)
+}
+
+/// Events up to and including the first `last` takes; panics when the
+/// stream ends or stays quiet past [`TIMEOUT`] first.
+async fn read_until(
+    events: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin),
+    mut last: impl FnMut(&LiveEvent) -> bool,
+) -> Result<Vec<LiveEvent>> {
+    let mut read = Vec::new();
+    loop {
+        let event = tokio::time::timeout(TIMEOUT, events.next())
+            .await
+            .with_context(|| format!("quiet after {} events", read.len()))?
+            .with_context(|| format!("ended after {} events", read.len()))??;
+        let done = last(&event);
+        read.push(event);
+        if done {
+            return Ok(read);
+        }
+    }
+}
+
+async fn wait_for(
+    events: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin),
+    wanted: impl FnMut(&LiveEvent) -> bool,
+) -> Result<LiveEvent> {
+    let mut read = read_until(events, wanted).await?;
+    read.pop().context("read_until returns what it matched")
+}
+
+async fn wait_until_held(peer: &Peer, hashes: &[Hash]) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    for hash in hashes {
+        while !peer.holds(*hash).await? {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "a payload never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    Ok(())
+}
+
+fn finished(event: &LiveEvent) -> Option<&SyncEvent> {
+    match event {
+        LiveEvent::SyncFinished(session) => Some(session),
+        _ => None,
+    }
+}
+
+fn finished_ok(event: &LiveEvent) -> bool {
+    finished(event).is_some_and(|session| session.result.is_ok())
+}
+
+/// After the first finished session: the downloads it queued have ended.
+fn downloads_ended_after_a_session() -> impl FnMut(&LiveEvent) -> bool {
+    let mut seen_end = false;
+    move |event| {
+        seen_end |= finished_ok(event);
+        seen_end && matches!(event, LiveEvent::PendingContentReady)
+    }
+}
+
+fn remote_key(event: &LiveEvent) -> Option<&[u8]> {
+    match event {
+        LiveEvent::InsertRemote { entry, .. } => Some(entry.key()),
+        _ => None,
+    }
+}
+
+fn position(events: &[LiveEvent], wanted: impl Fn(&LiveEvent) -> bool) -> Option<usize> {
+    events.iter().position(wanted)
+}
+
+/// A session delivering 1,000 entries to a subscriber that reads nothing
+/// until it and its downloads have ended reports every insert before the
+/// session's end, and loses nothing.
+///
+/// Fails with the ordered subscription replaced by `Engine::subscribe`, or
+/// with a capacity of 256: either buffer drops what the reader left unread.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thousand_entry_session_is_reported_entries_first() -> Result<()> {
+    const ENTRIES: usize = 1_000;
+    let (writer, written, reader, read) = writer_and_reader(ENTRIES, "k").await?;
+    let hashes: Vec<Hash> = (0..ENTRIES).map(|i| Hash::new(format!("k{i}"))).collect();
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let mut observed = read.observe(CAPACITY).await?;
+    let mut product = read.subscribe().await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+
+    // Sentinels: the session ended and every payload arrived, so the
+    // subscriber has read nothing across the whole session.
+    wait_for(&mut product, finished_ok).await?;
+    wait_until_held(&reader, &hashes).await?;
+
+    let events = read_until(&mut observed, downloads_ended_after_a_session()).await?;
+    assert!(
+        !events.iter().any(|e| matches!(e, LiveEvent::Lagged)),
+        "a subscriber at 4,096 lagged on a 1,000-entry session"
+    );
+    let end = position(&events, finished_ok).context("the session's end")?;
+    let inserts = events
+        .get(..end)
+        .context("the events before the end")?
+        .iter()
+        .filter_map(remote_key)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        inserts.len(),
+        ENTRIES,
+        "not every insert came before the session's end"
+    );
+    drop(written);
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// A session delivering 10,000 entries with payloads on the fs store to a
+/// subscriber drained as fast as its events convert, one blob-store round
+/// trip per insert as the runtime's observation reads it, loses nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ten_thousand_entry_session_drained_at_conversion_pace_loses_nothing() -> Result<()> {
+    const ENTRIES: usize = 10_000;
+    let dir = tempfile::tempdir()?;
+    let (writer, written, reader, read) =
+        writer_and_reader_on(ENTRIES, "k", Some(dir.path())).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let mut observed = read.observe(CAPACITY).await?;
+    let drained =
+        tokio::spawn(
+            async move { read_until(&mut observed, downloads_ended_after_a_session()).await },
+        );
+    let started = std::time::Instant::now();
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+
+    let events = drained.await??;
+    eprintln!("{ENTRIES} entries observed in {:?}", started.elapsed());
+    let lagged = events
+        .iter()
+        .filter(|e| matches!(e, LiveEvent::Lagged))
+        .count();
+    assert_eq!(
+        lagged, 0,
+        "a subscriber drained at conversion pace lagged on a {ENTRIES}-entry session"
+    );
+    let end = position(&events, finished_ok).context("the session's end")?;
+    let inserts = events
+        .get(..end)
+        .context("the events before the end")?
+        .iter()
+        .filter_map(remote_key)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        inserts.len(),
+        ENTRIES,
+        "not every insert came before the session's end"
+    );
+    drop(written);
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// A download's completion is reported after the insert that asked for it.
+///
+/// Fails with the ordered subscription replaced by `Engine::subscribe`,
+/// whose two merged channels hand a reader that comes late the live
+/// actor's events first whenever the insert's conversion is still pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_completes_after_its_insert() -> Result<()> {
+    let (writer, _written, reader, read) = writer_and_reader(1, "k").await?;
+    let hash = Hash::new("k0");
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    // The engine's subscription directly, which `Doc::observe` wraps.
+    let mut observed = reader.docs.engine().observe(read.id(), CAPACITY).await?;
+    let mut product = read.subscribe().await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+    wait_for(&mut product, finished_ok).await?;
+    wait_until_held(&reader, &[hash]).await?;
+
+    let events = read_until(&mut observed, downloads_ended_after_a_session()).await?;
+    let insert = position(&events, |e| remote_key(e) == Some(b"k0")).context("the insert")?;
+    let ready = position(
+        &events,
+        |e| matches!(e, LiveEvent::ContentReady { hash: h } if *h == hash),
+    )
+    .context("the download's completion")?;
+    assert!(
+        insert < ready,
+        "the download completed before its insert: {events:?}"
+    );
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// An ordered subscription to a replica the live sync does not hold open is
+/// refused; once its sync runs, the same request is served.
+///
+/// Fails with the actor's check that the namespace syncs removed.
+#[tokio::test]
+async fn a_replica_not_held_open_for_sync_is_refused() -> Result<()> {
+    let peer = Peer::spawn().await?;
+    let doc = peer.api().create().await?;
+    assert!(
+        doc.observe(CAPACITY).await.is_err(),
+        "an ordered subscription opened on a replica not syncing"
+    );
+    assert!(
+        peer.docs
+            .engine()
+            .observe(doc.id(), CAPACITY)
+            .await
+            .is_err(),
+        "the engine opened an ordered subscription on a replica not syncing"
+    );
+    doc.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let _observed = doc.observe(CAPACITY).await?;
+    peer.router.shutdown().await?;
+    Ok(())
+}
+
+/// A dropped replica ends its ordered subscription after the events
+/// reported before the drop, and a later write of the peer, dialed to this
+/// node, reaches no subscriber of it.
+///
+/// Fails with `leave` keeping the ordered subscribers it kills.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_replica_ends_its_ordered_subscription() -> Result<()> {
+    let (writer, written, reader, read) = writer_and_reader(1, "k").await?;
+    let namespace: NamespaceId = read.id();
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let mut observed = read.observe(CAPACITY).await?;
+    let mut product = read.subscribe().await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+    wait_for(&mut product, finished_ok).await?;
+
+    reader.api().drop_doc(namespace).await?;
+    let mut before_drop = Vec::new();
+    while let Some(event) = tokio::time::timeout(TIMEOUT, observed.next())
+        .await
+        .context("the subscription outlived its replica")?
+    {
+        before_drop.push(event?);
+    }
+    assert!(
+        before_drop.iter().any(|e| remote_key(e) == Some(b"k0")),
+        "the insert reported before the drop was lost"
+    );
+
+    // Paired denial: the peer's next write, dialed here, is refused, and no
+    // new subscription to the namespace opens.
+    let mut writer_events = written.subscribe().await?;
+    write(&writer, &written, "late", 0..1).await?;
+    written
+        .sync_with_peers(reader.contacts(), vec![], HOLDER, false)
+        .await?;
+    // The writer's end of the earlier session can still arrive here.
+    let refused = wait_for(&mut writer_events, |e| {
+        finished(e).is_some_and(|s| matches!(s.origin, Origin::Connect(_)))
+    })
+    .await?;
+    assert!(
+        !finished_ok(&refused),
+        "a dropped replica served a session: {refused:?}"
+    );
+    assert!(
+        reader
+            .docs
+            .engine()
+            .observe(namespace, CAPACITY)
+            .await
+            .is_err(),
+        "a dropped replica took an ordered subscription"
+    );
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// A subscriber that reads nothing while more events than its capacity are
+/// produced receives the events that fit and then one lag notice, and the
+/// session it watches completes in time.
+///
+/// Fails with the ordered subscription delivered `Blocking`: the live actor
+/// waits on the full channel and the session never finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscriber_past_its_capacity_is_told_and_holds_up_nothing() -> Result<()> {
+    const SMALL: usize = 16;
+    let (writer, _written, reader, read) = writer_and_reader(100, "k").await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    // The engine's subscription directly, which `Doc::observe` wraps.
+    let mut observed = reader.docs.engine().observe(read.id(), SMALL).await?;
+    let mut product = read.subscribe().await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+    wait_for(&mut product, finished_ok).await?;
+
+    let mut kept = Vec::new();
+    for _ in 0..SMALL {
+        let event = tokio::time::timeout(TIMEOUT, observed.next())
+            .await?
+            .context("the subscription ended")??;
+        kept.push(event);
+    }
+    let (last, fitted) = kept.split_last().context("events were read")?;
+    assert!(
+        matches!(last, LiveEvent::Lagged),
+        "no lag notice after the events that fit: {kept:?}"
+    );
+    assert!(
+        !fitted.iter().any(|e| matches!(e, LiveEvent::Lagged)),
+        "a lag notice before the buffer was full"
+    );
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// A session between two identities of one node is reported in the same
+/// order as one over the network: every insert before its end, which names
+/// the node itself as the counterpart and carries no session id.
+///
+/// Fails with the ordered subscription fed from two merged channels
+/// (`Engine::subscribe`), read once the session has ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_process_session_is_reported_in_the_same_order() -> Result<()> {
+    const ENTRIES: usize = 300;
+    let endpoint = loopback_endpoint().await?;
+    let blobs = MemStore::new();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let work = Docs::memory(WORK, serve_whole())
+        .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        .await?;
+    let leisure = Docs::memory(LEISURE, serve_whole())
+        .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        .await?;
+    let written = work.api().create().await?;
+    let author = work.api().author_default().await?;
+    for i in 0..ENTRIES {
+        written
+            .set_bytes(author, format!("k{i}"), format!("k{i}"))
+            .await?;
+    }
+    written.sync_with_peers(vec![], vec![], WORK, false).await?;
+    let ticket = written.share(AddrInfoOptions::Id).await?;
+    let read = leisure.api().import_namespace(ticket.capability).await?;
+    read.sync_with_peers(vec![], vec![], LEISURE, false).await?;
+    let mut observed = leisure.engine().observe(read.id(), CAPACITY).await?;
+    let mut product = read.subscribe().await?;
+
+    leisure
+        .engine()
+        .sync_in_process(work.engine(), read.id(), WORK)
+        .await?;
+    wait_for(&mut product, finished_ok).await?;
+    let events = read_until(&mut observed, finished_ok).await?;
+    let inserts = events.iter().filter_map(remote_key).count();
+    assert_eq!(
+        inserts, ENTRIES,
+        "not every insert came before the session's end"
+    );
+    let end = events
+        .last()
+        .and_then(finished)
+        .context("the session's end")?;
+    assert_eq!(end.peer, endpoint.id(), "the counterpart is not this node");
+    assert_eq!(end.session, None, "an in-process session carried an id");
+    work.engine().shutdown().await?;
+    leisure.engine().shutdown().await?;
+    gossip.shutdown().await?;
+    blobs.shutdown().await?;
+    endpoint.close().await;
+    Ok(())
+}
+
+/// A dial held behind an in-process exchange that a resync is queued behind
+/// starts once the resync is dropped: an engine without a co-located
+/// channel runs no resync, and nothing else would release the held dial.
+///
+/// `work`'s in-process dial of `first` waits in its provider while a second
+/// one of `first` queues the resync and one of `then` is held behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_held_behind_a_dropped_in_process_resync_starts() -> Result<()> {
+    let endpoint = loopback_endpoint().await?;
+    let blobs = MemStore::new();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let first_id: Arc<std::sync::OnceLock<NamespaceId>> = Arc::default();
+    let dial_asked = Arc::new(Notify::new());
+    let go = Arc::new(Notify::new());
+    let gate = Arc::new(AtomicBool::new(true));
+    let work_access: SessionAccessProvider = {
+        let (first_id, dial_asked, go) = (first_id.clone(), dial_asked.clone(), go.clone());
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let held = role == SessionRole::Dial
+                && first_id.get() == Some(&namespace)
+                && gate.swap(false, Ordering::SeqCst);
+            let (dial_asked, go) = (dial_asked.clone(), go.clone());
+            Box::pin(async move {
+                if held {
+                    dial_asked.notify_one();
+                    go.notified().await;
+                }
+                SessionAccess::whole()
+            })
+        })
+    };
+    let work = Docs::memory(WORK, work_access)
+        .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        .await?;
+    let leisure = Docs::memory(LEISURE, serve_whole())
+        .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
+        .await?;
+    let (first, then) = (work.api().create().await?, work.api().create().await?);
+    first_id
+        .set(first.id())
+        .map_err(|_| anyhow!("first set once"))?;
+    for doc in [&first, &then] {
+        doc.sync_with_peers(vec![], vec![], WORK, false).await?;
+        let ticket = doc.share(AddrInfoOptions::Id).await?;
+        let read = leisure.api().import_namespace(ticket.capability).await?;
+        read.sync_with_peers(vec![], vec![], LEISURE, false).await?;
+    }
+    work.engine()
+        .order_after(then.id(), Some(first.id()))
+        .await?;
+    let mut then_events = then.subscribe().await?;
+    // Returns once the callee has read the dial's first message: a held
+    // dial sends none until released.
+    let dial = |namespace: NamespaceId| {
+        let (work, leisure) = (work.clone(), leisure.clone());
+        tokio::spawn(async move {
+            work.engine()
+                .sync_in_process(leisure.engine(), namespace, LEISURE)
+                .await
+        })
+    };
+
+    let first_dial = dial(first.id());
+    tokio::time::timeout(TIMEOUT, dial_asked.notified()).await?;
+    let then_dial = dial(then.id());
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while work.engine().syncs_in_flight(vec![then.id()]).await? == 0 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the dial of then was never held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Asked for while the exchange of `first` runs: queued as its resync,
+    // the pipe of this dial dropped.
+    assert!(
+        dial(first.id()).await?.is_err(),
+        "a dial of a pair already running opened a session"
+    );
+    go.notify_one();
+    first_dial.await??;
+
+    tokio::time::timeout(Duration::from_secs(10), then_dial)
+        .await
+        .context("the dial held behind the dropped resync never started")???;
+    let end = wait_for(&mut then_events, finished_ok).await?;
+    assert!(
+        matches!(
+            finished(&end).map(|end| &end.origin),
+            Some(Origin::Connect(_))
+        ),
+        "the exchange of then was not the held dial: {end:?}"
+    );
+    work.engine().shutdown().await?;
+    leisure.engine().shutdown().await?;
+    gossip.shutdown().await?;
+    blobs.shutdown().await?;
+    endpoint.close().await;
+    Ok(())
+}
+
+/// An ordered subscription taken with the start of sync reports every
+/// insert of the reader's first session before that session's end.
+///
+/// Fails with the subscription left off the start and taken by `observe`
+/// once the first session has finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordered_subscription_taken_with_the_start_reports_the_first_session() -> Result<()> {
+    const ENTRIES: usize = 300;
+    let (writer, _written, reader, read) = writer_and_reader(ENTRIES, "k").await?;
+    let mut observed = read
+        .sync_with_peers_observed(writer.contacts(), Vec::new(), HOLDER, true, CAPACITY)
+        .await?;
+    let events = read_until(&mut observed, |e| finished(e).is_some()).await?;
+    assert!(
+        events.last().is_some_and(finished_ok),
+        "the first session failed"
+    );
+    let inserts = events.iter().filter_map(remote_key).collect::<HashSet<_>>();
+    assert_eq!(
+        inserts.len(),
+        ENTRIES,
+        "the first session's inserts were not all reported before its end"
+    );
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// Two consecutive sessions of one pair, the first dialed by the reader and
+/// the second accepted from the writer: every insert of the second comes
+/// after the first's end, for a subscriber that reads only after both.
+///
+/// Fails with the ordered subscription fed from two merged channels
+/// (`Engine::subscribe`), which order a late reader's events by the channel
+/// that is ready, not by when they happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairs_later_session_follows_the_end_of_its_earlier_one() -> Result<()> {
+    const BATCH: usize = 50;
+    let (writer, written, reader, read) = writer_and_reader(BATCH, "first").await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    // The engine's subscription directly, which `Doc::observe` wraps.
+    let mut observed = reader.docs.engine().observe(read.id(), CAPACITY).await?;
+    let mut product = read.subscribe().await?;
+
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+    wait_for(&mut product, |e| {
+        finished(e).is_some_and(|s| s.result.is_ok() && matches!(s.origin, Origin::Connect(_)))
+    })
+    .await?;
+
+    write(&writer, &written, "second", 0..BATCH).await?;
+    written
+        .sync_with_peers(reader.contacts(), vec![], HOLDER, false)
+        .await?;
+    let carried = |e: &LiveEvent| {
+        finished(e).is_some_and(|s| {
+            matches!(s.origin, Origin::Accept)
+                && s.result
+                    .as_ref()
+                    .is_ok_and(|details| details.entries_received > 0)
+        })
+    };
+    wait_for(&mut product, carried).await?;
+
+    let events = read_until(&mut observed, carried).await?;
+    let first_end = position(&events, |e| {
+        finished(e).is_some_and(|s| matches!(s.origin, Origin::Connect(_)))
+    })
+    .context("the first session's end")?;
+    let second = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| remote_key(e).is_some_and(|key| key.starts_with(b"second")))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second.len(),
+        BATCH,
+        "the second session's inserts are missing"
+    );
+    assert!(
+        second.iter().all(|at| *at > first_end),
+        "an insert of the later session came before the earlier one's end"
+    );
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// Of 3 entries arriving in one session, 2 sharing a payload and 1 carrying
+/// a payload the reader held before, one completed download is reported,
+/// for the shared payload, and the third's insert reports its content as
+/// complete.
+///
+/// Fails with a download queued per entry, held or already queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_payload_downloads_once_and_a_held_one_not_at_all() -> Result<()> {
+    let writer = Peer::spawn().await?;
+    let reader = Peer::spawn().await?;
+    let written = writer.api().create().await?;
+    let author = writer.api().author_default().await?;
+    let shared = written.set_bytes(author, "a", "shared").await?;
+    written.set_bytes(author, "b", "shared").await?;
+    let held = written.set_bytes(author, "c", "held").await?;
+    written
+        .sync_with_peers(vec![], vec![], HOLDER, false)
+        .await?;
+    reader.blobs.add_bytes("held").await?;
+    let ticket = written.share(AddrInfoOptions::Id).await?;
+    let read = reader.api().import_namespace(ticket.capability).await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let mut observed = read.observe(CAPACITY).await?;
+    let mut product = read.subscribe().await?;
+    read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+        .await?;
+    wait_for(&mut product, finished_ok).await?;
+    wait_until_held(&reader, &[shared]).await?;
+
+    let events = read_until(&mut observed, downloads_ended_after_a_session()).await?;
+    let downloads = events
+        .iter()
+        .filter_map(|e| match e {
+            LiveEvent::ContentReady { hash } => Some(*hash),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        downloads,
+        vec![shared],
+        "not exactly one download, of the shared payload"
+    );
+    let third = events
+        .iter()
+        .find_map(|e| match e {
+            LiveEvent::InsertRemote {
+                entry,
+                content_status,
+                ..
+            } if entry.content_hash() == held => Some(*content_status),
+            _ => None,
+        })
+        .context("the third entry's insert")?;
+    assert_eq!(third, ContentStatus::Complete);
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}
+
+/// Both sides of a session carry one session id, the reader's count
+/// received equals the writer's count sent, and the pair's next session
+/// carries another id.
+///
+/// Fails with the id taken from `stable_id`, which each end numbers on its
+/// own.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_sides_of_a_session_carry_one_session_id() -> Result<()> {
+    let (writer, written, reader, read) = writer_and_reader(3, "k").await?;
+    read.sync_with_peers(vec![], vec![], HOLDER, false).await?;
+    let mut reader_events = read.subscribe().await?;
+    let mut writer_events = written.subscribe().await?;
+    let dialed = |e: &LiveEvent| {
+        finished(e).is_some_and(|s| s.result.is_ok() && matches!(s.origin, Origin::Connect(_)))
+    };
+    let accepted = |e: &LiveEvent| {
+        finished(e).is_some_and(|s| s.result.is_ok() && matches!(s.origin, Origin::Accept))
+    };
+
+    let mut ids = Vec::new();
+    for round in 0..2 {
+        if round > 0 {
+            write(&writer, &written, "more", 0..2).await?;
+        }
+        read.sync_with_peers(writer.contacts(), vec![], HOLDER, false)
+            .await?;
+        let reader_side = wait_for(&mut reader_events, dialed).await?;
+        let writer_side = wait_for(&mut writer_events, accepted).await?;
+        let (reader_side, writer_side) = (
+            finished(&reader_side).context("matched as finished")?,
+            finished(&writer_side).context("matched as finished")?,
+        );
+        assert!(
+            reader_side.session.is_some(),
+            "a dialed session carried no id"
+        );
+        assert_eq!(
+            reader_side.session, writer_side.session,
+            "the two ends of one session report different ids"
+        );
+        let (received, sent) = (
+            reader_side.result.clone().map_err(anyhow::Error::msg)?,
+            writer_side.result.clone().map_err(anyhow::Error::msg)?,
+        );
+        assert_eq!(received.entries_received, sent.entries_sent);
+        ids.push(reader_side.session);
+    }
+    assert_ne!(ids.first(), ids.get(1), "two sessions carried one id");
+    writer.router.shutdown().await?;
+    reader.router.shutdown().await?;
+    Ok(())
+}

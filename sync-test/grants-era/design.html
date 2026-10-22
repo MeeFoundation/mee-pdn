@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sync reliability test</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1f2328; --quiet: #59636e; --rule: #d1d9e0; --code-bg: #f6f8fa;
+  --edge: #8c959f; --grid: #e6e9ec; --accent: #2f6fdb; --warn: #d1242f; --accent-tint: rgba(47,111,219,0.12);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --fg: #e6edf3; --quiet: #9198a1; --rule: #30363d; --code-bg: #161b22;
+    --edge: #6e7681; --grid: #262c33; --accent: #4c8df6; --warn: #f85149; --accent-tint: rgba(76,141,246,0.16);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 30px; line-height: 1.25; margin: 0 0 4px; }
+h2 { font-size: 22px; margin: 40px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+.byline { color: var(--quiet); margin: 0 0 24px; }
+code { font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+.table-wrap { overflow-x: auto; margin: 12px 0 16px; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th, td { border: 1px solid var(--rule); padding: 6px 10px; text-align: left; vertical-align: top; }
+th { background: var(--code-bg); }
+a { color: var(--accent); }
+figure { margin: 20px 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { color: var(--quiet); font-size: 13px; margin-top: 6px; }
+ul.check { list-style: none; padding-left: 4px; }
+ul.check li::before { content: "☐ "; color: var(--quiet); }
+.formula { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 10px 14px; border-radius: 8px; overflow-x: auto; }
+svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .ink { fill: var(--fg); } svg .quiet { fill: var(--quiet); }
+svg .box { fill: none; stroke: var(--edge); stroke-width: 1.25; }
+svg .box-main { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 2; }
+svg .line { fill: none; stroke: var(--edge); stroke-width: 1.25; }
+svg .arrowhead { fill: var(--edge); }
+</style>
+</head>
+<body>
+<main>
+<h1>Sync reliability test: one phone against many nodes</h1>
+<p class="byline">Design draft, 2026-09-28 · <a href="design.ru.html">Русская версия</a></p>
+
+<h2>Summary</h2>
+<p>One command, one phone, ten laptop nodes: the test sends 10,000 numbered entries to the phone over real Wi-Fi, cuts the phone's network for 30 seconds in the middle, and ends with PASS, FAIL or INCONCLUSIVE plus latency percentiles. The only manual step is having the phone on a cable, unlocked, on the same Wi-Fi.</p>
+<p><strong>The scenario in brief.</strong></p>
+<ol>
+<li>Ten writer nodes on the laptop connect to the phone and grant it every path they will write.</li>
+<li>Each writes one numbered entry every 100 ms for 100 seconds.</li>
+<li>From 40 to 70 seconds a firewall rule cuts the phone off from the nodes; the test's own control channel stays up.</li>
+<li>Every node, the phone included, reports each entry it receives and each sync session it finishes.</li>
+<li>Writing stops; the test waits for one more successful session per writer, then lists what the phone holds.</li>
+<li>Every entry is classified, and the verdict and the numbers are printed.</li>
+</ol>
+<p><strong>The key rule, by example.</strong> The phone pulls from each writer in a sync session every 5 seconds, and a session carries everything the writer held when it started.</p>
+<ul>
+<li>Entry 417 of <code>w3</code> is written at 41.203. At 43.000 the phone lacks it, but no session with <code>w3</code> has started since the write: <strong>in flight</strong> — normal.</li>
+<li>A session started at 43.900 and ended ok on both sides, and 417 had not arrived by the phone's end of it: <strong>violated</strong> — a defect, however long we wait.</li>
+<li>The partition never lifts, so no session ever qualifies: <strong>stalled</strong> — the run is INCONCLUSIVE, neither a pass nor a proven loss.</li>
+</ul>
+<p><strong>What a report looks like</strong> (the format, not a measurement):</p>
+<pre><code>VERDICT: FAIL — 1 violated, 1 lost
+expected 10,160 · readable 10,159 · stalled pairs 0 · split sessions 0 · undetermined 0
+latency, steady phase: p50 3.1 s · p90 5.6 s · p99 6.4 s (clock ±4 ms)
+partition: first session 1.2 s after reconnect · catch-up 7.9 s
+path: direct Wi-Fi, no relay · host CPU peak 58%
+LOST w3 s/000000417 -> phone: w3 accepted 43.900-44.050 ok, phone ok at 44.185; logs tmp/run-20260928-1412/</code></pre>
+<p>The rest of this document gives the whole scenario, how every number is computed, and why each can be trusted — including the planted defects the test must catch before its numbers count.</p>
+
+<h2>What the test answers</h2>
+<p>The test answers two questions about sync between one physical phone and many nodes over a real Wi-Fi link: does every entry that should arrive actually arrive, and how long does it take. It separates an entry that has not arrived <em>yet</em> from one that sync has already failed to deliver, and it says so without a waiting timer.</p>
+<p>It answers, per run:</p>
+<ul>
+<li>how many entries were delivered, lost, corrupted, stale, or present where no grant allows them;</li>
+<li>how long an entry takes from its write to being readable on the reader, as percentiles;</li>
+<li>how long the phone takes to catch up after its network is cut and restored;</li>
+<li>whether the run itself can be trusted: host CPU, event loss, clock error, network path.</li>
+</ul>
+<p>It deliberately does not answer:</p>
+<ul>
+<li><strong>relay and NAT traversal performance.</strong> The main run uses a direct Wi-Fi path; a relay run is a separate variant, because a public relay's load would sit inside the number.</li>
+<li><strong>battery and radio cost.</strong> The phone stays in the foreground on the agent screen; iOS stops the node in the background, which is a separate scenario.</li>
+<li><strong>what a withdraw does to data already delivered.</strong> The grantee unbinds and forgets the issuer's replica once the withdraw replicates; the withdraw scenario checks that nothing written after the withdraw arrives, and that the phone then refuses that issuer.</li>
+<li><strong>throughput limits of one laptop.</strong> When the host CPU saturates, latency is reported as the machine's limit, not the platform's.</li>
+</ul>
+
+<h2>Setup</h2>
+<p>One laptop runs every node and the coordinator; one physical iPhone runs a test build of the application; both sit on one Wi-Fi network. The manual preparation is the phone alone: connected by cable, unlocked, auto-lock off, on the same Wi-Fi as the laptop, and the test build installed once with Local Network access allowed — iOS asks for that permission on every fresh install, and only a person can answer it, so runs reset the node's storage instead of reinstalling.</p>
+
+<figure>
+<svg viewBox="0 0 760 420" role="img" aria-label="Entries cross a real Wi-Fi link; control never passes the shaper" font-size="13">
+<defs><marker id="setup-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrowhead"/></marker></defs>
+<text x="24" y="30" font-size="15" font-weight="600" class="ink">Entries cross a real Wi-Fi link; control never passes the shaper</text>
+<rect x="24" y="52" width="340" height="340" rx="8" class="box"/>
+<text x="40" y="76" font-weight="600" class="ink">Laptop (macOS)</text>
+<rect x="40" y="92" width="308" height="72" rx="8" class="box"/>
+<text x="56" y="116" font-weight="600" class="ink">Coordinator</text>
+<text x="56" y="136" font-size="11.5" class="quiet">scenario, writer journals, verdict</text>
+<text x="56" y="152" font-size="11.5" class="quiet">drives /debug, reads /debug/events</text>
+<rect x="40" y="204" width="308" height="72" rx="8" class="box"/>
+<text x="56" y="228" font-weight="600" class="ink">N writers + 2 controls, pdn-node-http</text>
+<text x="56" y="248" font-size="11.5" class="quiet">release build, PDN_CONNECTIVITY=direct</text>
+<text x="56" y="264" font-size="11.5" class="quiet">one process and one UDP port per node</text>
+<rect x="40" y="316" width="308" height="56" rx="8" class="box-main"/>
+<text x="56" y="340" font-weight="600" class="ink">pf + dummynet</text>
+<text x="56" y="360" font-size="11.5" class="ink">UDP to and from the phone: delay, loss, cut</text>
+<rect x="392" y="240" width="150" height="72" rx="8" class="box"/>
+<text x="408" y="264" font-weight="600" class="ink">Wi-Fi router</text>
+<text x="408" y="284" font-size="11.5" class="quiet">one LAN, no client</text>
+<text x="408" y="300" font-size="11.5" class="quiet">isolation</text>
+<rect x="572" y="52" width="164" height="340" rx="8" class="box"/>
+<text x="588" y="76" font-weight="600" class="ink">iPhone</text>
+<rect x="584" y="92" width="140" height="72" rx="8" class="box"/>
+<text x="600" y="116" font-weight="600" class="ink">Agent</text>
+<text x="600" y="136" font-size="11.5" class="quiet">test build of pdn-app</text>
+<text x="600" y="152" font-size="11.5" class="quiet">local journal</text>
+<rect x="584" y="204" width="140" height="72" rx="8" class="box"/>
+<text x="600" y="228" font-weight="600" class="ink">pdn-mobile node</text>
+<text x="600" y="248" font-size="11.5" class="quiet">for_product</text>
+<text x="600" y="264" font-size="11.5" class="quiet">reconcile every 5 s</text>
+<g class="line">
+<path d="M194 164V204" marker-end="url(#setup-arrow)"/>
+<path d="M194 276V316" marker-end="url(#setup-arrow)"/>
+<path d="M348 344H467V312" marker-end="url(#setup-arrow)" marker-start="url(#setup-arrow)"/>
+<path d="M542 260H584" marker-end="url(#setup-arrow)" marker-start="url(#setup-arrow)"/>
+<path d="M654 164V204" marker-end="url(#setup-arrow)"/>
+<path d="M348 128H584" stroke-dasharray="5 4" marker-end="url(#setup-arrow)" marker-start="url(#setup-arrow)"/>
+</g>
+<text x="204" y="188" font-size="11.5" class="quiet">HTTP /debug, loopback</text>
+<text x="204" y="300" font-size="11.5" class="quiet">iroh QUIC</text>
+<text x="376" y="376" font-size="11.5" class="quiet">entries: iroh QUIC,</text>
+<text x="376" y="392" font-size="11.5" class="quiet">direct UDP over the LAN</text>
+<text x="468" y="118" text-anchor="middle" font-size="11.5" class="quiet">control: HTTP (TCP) over LAN</text>
+<text x="468" y="148" text-anchor="middle" font-size="11.5" class="quiet">not shaped, never cut</text>
+<text x="664" y="188" font-size="11.5" class="quiet">facade</text>
+</svg>
+<figcaption>Setup: laptop, router, phone.</figcaption>
+</figure>
+
+<p>Entries between the phone and every laptop node travel as iroh QUIC over direct UDP through the router. The shaper touches only that UDP; the coordinator reaches the agent over TCP, so cutting the phone's data path never cuts the test's control of it.</p>
+<p><strong>Participants.</strong></p>
+<div class="table-wrap"><table>
+<tr><th>Participant</th><th>Where</th><th>Role in the main run</th></tr>
+<tr><td>Writers <code>w1..wN</code></td><td>laptop, one <code>pdn-node-http</code> process each</td><td>Issuers: each connects to the phone, grants it every slot up front, then writes</td></tr>
+<tr><td>Phone</td><td>iPhone, <code>pdn-mobile</code> node inside the test build</td><td>Grantee of all N writers; the reader being measured</td></tr>
+<tr><td>Control <code>outsider</code></td><td>laptop node</td><td>Holds a ticket to <code>w1</code>'s namespace but no grant: must receive none of <code>w1</code>'s entries</td></tr>
+<tr><td>Control <code>partial</code></td><td>laptop node</td><td>Holds a grant from <code>w1</code> covering only its even slots: must receive exactly those</td></tr>
+<tr><td>Coordinator</td><td>laptop, one script</td><td>Runs the scenario, keeps the journals, subscribes to every node's events, computes the verdict</td></tr>
+<tr><td>Agent</td><td>inside the test build</td><td>Executes the coordinator's commands through the same facade the screens use, and forwards the phone node's events</td></tr>
+</table></div>
+<p>A <em>slot</em> is a path granted in advance for one entry the run will write. The two controls exist because a test that only proves authorized parties receive data verifies nothing about access (<code>access-control-tests.md</code>). <code>outsider</code> gets its ticket by a hand-made handover from the coordinator, not through the product: without a ticket it would never dial <code>w1</code>, and receiving nothing would prove nothing. A hand-made ticket is admitted for exactly this kind of negative control (<code>product-path-arrangement.md</code>). One denial is out of reach today: a party that knows a payload's hash can fetch that blob, because the blob channel is not yet gated (a deferred gap in the subset-reconciliation spec). The report lists it as a known gap, not a pass.</p>
+<p><strong>Why this network arrangement.</strong></p>
+<ul>
+<li><strong>The phone's radio carries every one of the N connections</strong>, so the mobile node is under real load: CPU, radio wake-ups, iOS socket behaviour.</li>
+<li><strong>The phone can be cut from a script.</strong> Laptop nodes run <code>PDN_CONNECTIVITY=direct</code> and so have no relay; the only path from the phone to them is direct UDP. pf rules dropping UDP to and from the phone's IP are a real partition of the real phone, and the control channel, which is TCP, passes.</li>
+<li><strong>Delay and loss use the same rules.</strong> dummynet, macOS's own traffic shaper, holds or drops packets in the kernel, so the QUIC under iroh meets real delay, loss and retransmits. The test adds rules in both directions for the phone's address, on the interface <code>route get &lt;phone IP&gt;</code> names, and proves them by pf's own rule counters after a UDP probe.</li>
+<li><strong>Loopback between laptop nodes is not shaped</strong>, so what is measured is the phone's path, not the laptop's.</li>
+</ul>
+<p>Two things on the laptop can defeat this silently. Docker Desktop puts containers behind NAT, so no node the phone talks to runs in one. The macOS application firewall can drop inbound UDP to a freshly built, unsigned <code>pdn-node-http</code>; the connect step fails loudly if the phone cannot reach a node, rather than measuring a relay or nothing.</p>
+
+<h2>The run, step by step</h2>
+<p>One command runs the whole scenario and ends with a verdict; nothing in it waits for a person.</p>
+<pre><code>sync-test --writers 10 --entries 1000 --rate 10 --payload 256 --scenario partition</code></pre>
+<p>The numbers below are the defaults of the main run: 10 writers, 1,000 entries each at 10 entries a second (100 seconds of writing), 256-byte payloads, a 30-second partition in the middle.</p>
+<ol>
+<li><strong>Preflight.</strong> The coordinator checks the phone is attached (<code>xcrun devicectl list devices</code>) and records the git revision, the build profile and the host's core count.</li>
+<li><strong>Bring up.</strong> Fresh directories for every laptop node; 10 writers and 2 controls start from a release build.</li>
+<li><strong>Launch the agent.</strong> The coordinator launches the test build over the cable (<code>xcrun devicectl device process launch</code>), passing its own address and a run id as launch environment; a small native module hands them to JavaScript, which cannot read the process environment itself. The agent connects back over HTTP, deletes its node's storage directory inside the app container, brings up a fresh node and creates one identity — a clean state without a reinstall, which would ask for Local Network permission again. It reports the phone's Wi-Fi address.</li>
+<li><strong>Network check.</strong> The coordinator finds the interface toward the phone (<code>route get &lt;phone IP&gt;</code>), installs pf rules for UDP to and from that address with no delay and no loss, sends a UDP probe, and aborts unless the rules' counters rose.</li>
+<li><strong>Clock sample.</strong> The coordinator and the agent exchange 20 timestamped pings and keep the one with the smallest round trip; this repeats every 30 seconds for the whole run.</li>
+<li><strong>Connect and grant.</strong> Each writer mints an invite; the agent consumes it, which fails loudly if the phone cannot reach that node. Each writer then publishes one grant to the phone covering its 1,000 <code>s/</code> slots and its 16 <code>h/</code> slots. <code>partial</code> connects to <code>w1</code>, which grants it the even slots; <code>outsider</code> receives <code>w1</code>'s ticket by the handover. The coordinator waits until each grant is readable on its grantee, so grant traffic is over before measurement starts.</li>
+<li><strong>Subscribe.</strong> The coordinator opens <code>/debug/events</code> on every laptop node, and the agent starts forwarding the phone node's events. From here on every entry arrival and every finished sync session is recorded, timestamped where it happens.</li>
+<li><strong>Steady phase (0–40 s).</strong> Every writer writes its next entry every 100 ms, and every 5 seconds a new version of one <code>h/</code> slot.</li>
+<li><strong>Partition (40–70 s).</strong> The coordinator switches the pf rules to drop. Writers keep writing. No session between the phone and a writer succeeds; entries written now pile up as <em>in flight</em>.</li>
+<li><strong>Recovery (70–100 s).</strong> The rules pass traffic again; writing continues to the end of the 1,000.</li>
+<li><strong>Quiescence.</strong> Writing stops. The coordinator waits until, for every writer, a <em>qualifying session</em> that started after that writer's last write has been reported ok by both sides (defined in the classification section). A pair with no such session within 5 × the phone's reconcile interval (25 seconds) is <em>stalled</em>, and the run cannot pass.</li>
+<li><strong>Final listing.</strong> The agent lists every writer's namespace on the phone and uploads the list; the controls are listed on the laptop. Both use an unnudged listing, so the listing itself starts no session. The agent's local journal is pulled over the cable (<code>xcrun devicectl device copy from</code>), so an event report that never reached the coordinator over HTTP is not mistaken for a missing entry.</li>
+<li><strong>Verdict.</strong> Every expected entry is classified for every reader, the controls are checked against their expected sets, the metrics are computed, one row is appended to <code>runs.csv</code>, and the verdict is printed: PASS, FAIL or INCONCLUSIVE.</li>
+</ol>
+<p><strong>Other scenarios</strong> reuse the same steps and change only steps 8–10:</p>
+<div class="table-wrap"><table>
+<tr><th>Scenario</th><th>Change</th><th>Question it answers</th></tr>
+<tr><td>steady</td><td>no partition</td><td>Baseline latency and loss</td></tr>
+<tr><td>partition</td><td>as above</td><td>Catch-up time; zero loss across a cut</td></tr>
+<tr><td>lossy</td><td>pf adds 50 ms one-way delay and 2% loss for the whole run</td><td>Behaviour on a bad link</td></tr>
+<tr><td>restart</td><td>the coordinator kills and relaunches the app at 40 s via <code>devicectl</code>; the agent brings the node up on the same directory</td><td>Durable state and resumption after a process restart</td></tr>
+<tr><td>fan-out</td><td>the phone writes, the laptop nodes read; journal times are the phone's clock</td><td>Load on the sending side</td></tr>
+<tr><td>same identity</td><td>a laptop node and the phone are two devices of one identity, linked; both write</td><td>Replication between devices of one identity, which uses the swarm path; an entry may arrive from either device</td></tr>
+<tr><td>join under load</td><td>half of the writers connect while the others are already writing; each writer's grant is read back before its own first write</td><td>Establishing connections on a busy node</td></tr>
+<tr><td>withdraw</td><td>at 60 s, <code>w2</code> withdraws its grant</td><td>No <code>w2</code> entry written after the withdraw arrives before the phone unbinds; after the unbind the phone refuses <code>w2</code>, and that refusal is the expected outcome, not a loss</td></tr>
+</table></div>
+
+<h2>Test data and what is recorded</h2>
+<p>Every write is individually observable, every observation carries a timestamp taken where it happened, and nothing the test does to observe starts a sync.</p>
+<p><strong>Entries.</strong> Each writer writes <code>s/000000001</code>, <code>s/000000002</code>, … once each and never rewrites a slot, so each entry is its own unit of measurement; fixed-width numbers keep listings and logs in write order. A write replaces only the entry at its own key (<code>put</code> in <code>crates/pdn-store/src/ranger.rs</code>). A separate small set <code>h/000001..h/000016</code> is rewritten with a rising version number. For these only the last version is expected anywhere: earlier versions can be superseded before any session sees them, and they are not classified.</p>
+<p><strong>Payload.</strong> Self-describing and self-checking, padded to <code>--payload</code> bytes:</p>
+<pre><code>{"run":"20260928-1412","writer":"w3","seq":417,"pad":"xxxx…","sha256":"9f2c…"}</code></pre>
+<p><code>sha256</code> covers the other fields. A reader can prove an entry intact without asking the writer, and a payload from another run, another writer or another slot is recognisable as such.</p>
+<p><strong>Grants up front.</strong> A claim covers exactly one path (<code>covers_key</code> and <code>egress_filter</code> in <code>crates/data-layer/src/access.rs</code>), so every slot the run will use is granted in step 6, before measurement. A grant republished during the run would put grant traffic inside the entry numbers.</p>
+<p><strong>Writer journal.</strong> For each entry, one line once the write call has answered:</p>
+<div class="table-wrap"><table>
+<tr><th>Field</th><th>Example</th><th>Source</th></tr>
+<tr><td>writer, seq, path</td><td><code>w3</code>, 417, <code>s/000000417</code></td><td>the coordinator</td></tr>
+<tr><td><code>t_write</code></td><td>12:00:41.203</td><td>the entry's own timestamp, set by the writer's node at insert (<code>timestamp()</code> in <code>crates/pdn-store/src/sync.rs</code>), on the writer's clock</td></tr>
+<tr><td>sha256</td><td><code>9f2c…</code></td><td>the coordinator</td></tr>
+<tr><td>result</td><td>ok / refused + reason</td><td>the write call</td></tr>
+</table></div>
+<p><code>t_write</code> travels inside the entry, so the phone sees the same value, and the coordinator's own HTTP round trip never enters it. A refused write is not expected anywhere and is counted on its own line of the report: it is a writer failure, not a sync loss.</p>
+<p><strong>Event log.</strong> Every node reports these events from the sync engine's own stream (<code>LiveEvent</code> in <code>crates/pdn-store/src/engine.rs</code>), timestamped in Rust where the event is produced:</p>
+<div class="table-wrap"><table>
+<tr><th>Event</th><th>Recorded fields</th><th>Used for</th></tr>
+<tr><td><code>InsertRemote</code></td><td>node, namespace, path, entry timestamp, sending peer, content status, time</td><td>Arrival of the entry</td></tr>
+<tr><td><code>ContentReady</code></td><td>node, content hash, time</td><td>The entry becomes readable: a fresh payload is a separate blob, downloaded after the entry</td></tr>
+<tr><td><code>PendingContentReady</code></td><td>node, time</td><td>Downloads queued by the last sync have completed or failed</td></tr>
+<tr><td><code>SyncFinished</code></td><td>node, peer node, origin (dialed or accepted), started, finished, ok or error</td><td>Which sessions happened, when, and how they ended</td></tr>
+<tr><td><code>Lagged</code></td><td>node, time</td><td>The engine's stream dropped events: the entries they reported are in the replica, the sessions and downloads they reported are gone</td></tr>
+</table></div>
+<p>Laptop nodes expose the stream as a new debug route, <code>/debug/events</code>; the phone's node exposes it to the agent through the test build's facade. Each hop — the route, the facade to the agent, the agent to the coordinator — numbers its events, and a gap in the numbers is treated like <code>Lagged</code>.</p>
+<p><strong>No sync started by observing.</strong> Both a product <code>read</code> and a product <code>list</code> of a replica received under a grant nudge a sync (<code>nudge_scoped</code> in <code>crates/data-layer/src/node.rs</code>). A test that polled the phone would therefore be measuring its own polling. The run observes through events only. The final listing uses an unnudged list that does not exist yet: <code>read_unnudged</code> is test-only and reads one key, so the facade's test build and the debug route both need an unnudged list. The app's own screens do poll; a separate <em>active reader</em> variant polls like a screen does, and its rows are labelled as such.</p>
+<p><strong>Clock samples.</strong> Every 30 seconds, the coordinator and the agent exchange timestamped pings; the sample with the smallest round trip gives the offset of the phone's clock and its error bound, half that round trip. The offset is used for latency only — the classification never compares two devices' clocks.</p>
+
+<h2>Classifying every entry</h2>
+<p>An absent entry becomes a failure only when a sync session that must have carried it has ended successfully on both sides, and the entry is still not on the reader. Elapsed time alone never turns <em>not yet</em> into <em>lost</em>, and no decision compares two devices' clocks.</p>
+<p><strong>How entries actually move.</strong> Gossip carries no entries: a local write only announces "this author has news", and entries travel only inside a reconciliation session (<code>on_replica_event</code> in <code>crates/pdn-store/src/engine/live.rs</code>; the swarm is content-free). A replica received under a grant does not join the swarm: its holder's <em>reconcile pass</em> — a loop that re-dials every tracked replica's contacts every interval, 5 seconds on the phone — opens a session with each writer (<code>reconcile_pass</code> and <code>SyncStrategy::ContactsOnly</code> in <code>crates/data-layer/src/node.rs</code>). Waiting up to one interval is therefore normal.</p>
+<p>Writers dial the phone too: after one successful session a writer records the phone as a peer, and its own pass dials it (<code>register_useful_peer</code> in <code>live.rs</code>). Those sessions address the writer's own identity rather than the phone's, and are expected to fail or carry nothing. The rule never uses them; they are reported separately under session health.</p>
+<p><strong>The guarantee the rule stands on.</strong> A session serves a view of the writer's replica frozen when the session is set up (<code>sync_session_start</code> in <code>crates/pdn-store/src/actor.rs</code>), and a successful session leaves the reader holding everything in that view its grant covers. The first half is specified; the second has no test that isolates one session, which is why such a test is step 0 of the build order.</p>
+<p><strong>Why both sides must report ok.</strong> The writer's report alone is not enough. When the dialing side fails midway, it still closes its stream cleanly (<code>connect_and_sync_inner</code> in <code>crates/pdn-store/src/net.rs</code>), and the accepting side reads that end as a normal finish (<code>run_rounds</code> in <code>crates/pdn-store/src/net/codec.rs</code>). The writer then reports ok while the phone reports an error. A session that is ok on one side only is not used by the rule; it is a finding of its own, a <em>split session</em>.</p>
+<p><strong>The qualifying session</strong> for entry <em>e</em> of writer <em>W</em> and reader <em>R</em> is one session dialed by <em>R</em> and accepted by <em>W</em> in which:</p>
+<ol>
+<li><em>W</em>'s <code>SyncFinished</code> (origin accepted, peer <em>R</em>) is ok, and its <code>started</code> is later than <em>e</em>'s <code>t_write</code> — both on <em>W</em>'s clock. <code>started</code> is taken before the view is frozen, so the view holds <em>e</em>.</li>
+<li><em>R</em>'s <code>SyncFinished</code> for the same session (origin dialed, peer <em>W</em>) is ok. The pass never starts a second session for a pair while one is running, so the two sides' events pair up one to one, in order.</li>
+</ol>
+<p><em>e</em> must then be on <em>R</em> by the time <em>R</em>'s side finished: an <code>InsertRemote</code> for <em>e</em> on <em>R</em> no later than that <code>finished</code>, both on <em>R</em>'s clock.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" role="img" aria-label="An absent entry is in flight until a session that started after its write has ended ok on both sides" font-size="13">
+<defs><marker id="cls-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrowhead"/></marker></defs>
+<text x="24" y="30" font-size="15" font-weight="600" class="ink">Absent is in flight until a later session has ended ok on both sides</text>
+<text x="24" y="50" font-size="11.5" class="quiet">entry s/000000417 of w3, reader: the phone · w3's times on the laptop's clock, the phone's on its own · not to scale</text>
+<line x1="40" y1="150" x2="720" y2="150" class="line" marker-end="url(#cls-arrow)"/>
+<path d="M120 142l8 8l-8 8l-8 -8z" style="fill: var(--edge)"/>
+<text x="120" y="130" text-anchor="middle" class="ink">write</text>
+<text x="120" y="180" text-anchor="middle" font-size="11.5" class="quiet">41.203</text>
+<rect x="60" y="88" width="110" height="14" rx="7" style="fill: var(--grid); stroke: var(--edge); stroke-width: 1"/>
+<text x="24" y="80" font-size="11.5" class="quiet">session started before: proves nothing</text>
+<rect x="360" y="143" width="130" height="14" rx="7" style="fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.25"/>
+<text x="425" y="130" text-anchor="middle" class="ink">qualifying session</text>
+<text x="410" y="180" text-anchor="middle" font-size="11.5" class="quiet">w3 accepts: 43.900 → 44.050, ok</text>
+<text x="410" y="196" text-anchor="middle" font-size="11.5" class="quiet">started after the write</text>
+<line x1="490" y1="110" x2="490" y2="162" style="stroke: var(--warn); stroke-width: 1.25" stroke-dasharray="4 4"/>
+<text x="498" y="104" font-size="11.5" class="quiet">phone's side ends ok: 44.185, phone clock</text>
+<line x1="128" y1="236" x2="486" y2="236" style="stroke: var(--accent); stroke-width: 2"/>
+<text x="307" y="256" text-anchor="middle" font-weight="600" class="ink">absent here = in flight (normal)</text>
+<text x="307" y="274" text-anchor="middle" font-size="11.5" class="quiet">a grantee pulls on its reconcile pass, every 5 s</text>
+<line x1="494" y1="236" x2="712" y2="236" style="stroke: var(--warn); stroke-width: 2"/>
+<text x="603" y="256" text-anchor="middle" font-weight="600" class="ink">absent here = violated</text>
+<text x="603" y="274" text-anchor="middle" font-size="11.5" class="quiet">a defect, however long we wait</text>
+</svg>
+<figcaption>One entry, one reader: in flight versus violated.</figcaption>
+</figure>
+
+<p><strong>Worked example</strong>, entry <code>s/000000417</code> of <code>w3</code>, read by the phone:</p>
+<ul>
+<li>41.203 on the laptop's clock — <code>w3</code> writes it; that is the entry's own timestamp.</li>
+<li>43.000 — the phone does not have it, and no session with <code>w3</code> has started since the write. <strong>In flight.</strong> That the phone already has 418 or 416 says nothing: reconciliation does not deliver in write order.</li>
+<li>The phone's pass dials <code>w3</code>. <code>w3</code> reports the session accepted, started 43.900, finished 44.050, ok (laptop clock) — it started after the write, so its view holds 417. The phone reports the same session ok, finished 44.185 on the phone's clock. The session qualifies.</li>
+<li>The phone's <code>InsertRemote</code> for 417 is at 44.160 on its clock, before 44.185: <strong>delivered in that session</strong>. Its payload blob follows with <code>ContentReady</code> at 44.240. The phone's clock runs 0.130 s ahead (±0.004 s), so it became readable at 44.110 on the laptop's clock: latency 2.907 s ±0.004 s.</li>
+<li>Had there been no <code>InsertRemote</code> for 417 by 44.185 on the phone's clock: <strong>violated</strong>. If it arrives in a later session, it is also counted <em>late after violation</em>; if never, <strong>lost</strong>. Either way it is a defect, and the report names the session that should have carried it.</li>
+<li>Had <code>w3</code> reported ok and the phone an error for that session: not a violation but a <strong>split session</strong>, and 417 stays in flight for the next one.</li>
+</ul>
+<p>A session that started <em>before</em> the write (the grey bar) proves nothing, however late it finished: the writer may not have held the entry when its view was frozen.</p>
+<p><strong>All states</strong>, per pair of an expected entry and a reader:</p>
+<div class="table-wrap"><table>
+<tr><th>State</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td>readable</td><td>entry present, payload hash matches the journal, content available</td><td>Delivered; latency is computed</td></tr>
+<tr><td>content pending</td><td>entry present, payload not yet downloaded</td><td>Normal: a failed download is retried by the next successful session (<code>missing_hashes</code> in <code>live.rs</code>); decided only at the final listing</td></tr>
+<tr><td>in flight</td><td>absent, no qualifying session yet</td><td>Normal; its age is reported</td></tr>
+<tr><td>violated</td><td>absent when <em>R</em>'s side of a qualifying session finished</td><td>Defect: the session delivered less than its view</td></tr>
+<tr><td>lost</td><td>not readable at the final listing, although a qualifying session exists</td><td>Defect: a permanent loss</td></tr>
+<tr><td>content lost</td><td>entry present at the final listing, payload absent</td><td>Defect: payload never downloaded</td></tr>
+<tr><td>stalled</td><td>the writer–reader pair has no qualifying session after the writer's last write within 5 × the reader's reconcile interval; each of the pair's absent entries is listed under it</td><td>Loss neither shown nor excluded: the run is INCONCLUSIVE</td></tr>
+<tr><td>undetermined</td><td>events of the reader or the writer were lost over the relevant interval (<code>Lagged</code> or a numbering gap on a hop)</td><td>No violation is claimed without evidence; the final listing still decides readable or lost</td></tr>
+</table></div>
+<p>Findings that are not per entry:</p>
+<div class="table-wrap"><table>
+<tr><th>Finding</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td>split session</td><td>one side reports ok, the other an error</td><td>Defect in session reporting, found above</td></tr>
+<tr><td>corrupt</td><td>an entry whose payload hash does not match</td><td>Defect: integrity</td></tr>
+<tr><td>extra</td><td>a control holds an entry outside its expected set, or any reader holds a payload no journal has</td><td>Defect: access control</td></tr>
+<tr><td>stale</td><td>an <code>h/</code> slot at the final listing holds an older version than the last journaled one</td><td>Defect: latest-wins convergence</td></tr>
+</table></div>
+<p>For the controls the expected set is explicit: <code>outsider</code> must hold none of <code>w1</code>'s entries, <code>partial</code> exactly the even slots. Both are read on the laptop.</p>
+<p><code>SyncFinished</code> names the peer's node, not its identity. The main run hosts one identity per node, so the node identifies the counterpart; variants with co-located or linked identities need the identity added to the event first.</p>
+
+<h2>Metrics and how each is computed</h2>
+<p>Every number in the report is computed from three inputs only: the writer journals, the event logs, and the final listings. Latency is a measurement; it becomes a pass condition only once a threshold is agreed per scenario.</p>
+<p><strong>Verdict.</strong></p>
+<ul>
+<li><strong>FAIL</strong> — any defect: violated, lost, content lost, split session, corrupt, extra, stale.</li>
+<li><strong>INCONCLUSIVE</strong> — no defect, but at least one stalled pair, or undetermined pairs above 1% of expected: the run could not show whether something was lost.</li>
+<li><strong>PASS</strong> — neither of the above.</li>
+</ul>
+<p><strong>Counts.</strong> An <em>expected pair</em> is an entry and a reader it must reach: every <code>s/</code> entry whose write returned ok, and the last version of every <code>h/</code> slot, times every reader whose grant covers it.</p>
+<div class="table-wrap"><table>
+<tr><th>Metric</th><th>Computed as</th><th>Tells</th></tr>
+<tr><td>expected</td><td>number of expected pairs</td><td>The denominator of everything below</td></tr>
+<tr><td>readable</td><td>expected pairs readable at the final listing</td><td>Delivered</td></tr>
+<tr><td>violated</td><td>expected pairs absent when the reader's side of a qualifying session finished</td><td>Guarantee failures, including those later repaired</td></tr>
+<tr><td>late after violation</td><td>violated pairs readable at the final listing</td><td>Repaired by a later session: still defects</td></tr>
+<tr><td>lost</td><td>expected pairs not readable at the final listing that have a qualifying session</td><td>Permanent losses</td></tr>
+<tr><td>content lost</td><td>entry present at the final listing, payload absent</td><td>Payloads never downloaded</td></tr>
+<tr><td>download retries</td><td>payload downloads that failed and later succeeded</td><td>Transient failures; not a defect, most telling in the lossy scenario</td></tr>
+<tr><td>stalled pairs</td><td>writer–reader pairs with no qualifying session after the writer's last write within 5 × the reader's reconcile interval, with their absent entries</td><td>Connectivity or session failure; makes the run INCONCLUSIVE</td></tr>
+<tr><td>split sessions</td><td>sessions ok on one side and an error on the other</td><td>Session misreporting</td></tr>
+<tr><td>corrupt</td><td>entries whose payload hash does not match</td><td>Integrity</td></tr>
+<tr><td>extra</td><td>entries at a control outside its expected set, or payloads matching no journal</td><td>Access control</td></tr>
+<tr><td>stale</td><td><code>h/</code> slots holding an older version than the last journaled one</td><td>Latest-wins convergence</td></tr>
+<tr><td>undetermined</td><td>expected pairs whose reader's or writer's events were lost over the relevant interval</td><td>How much the violation check could not see</td></tr>
+<tr><td>refused writes</td><td>journal lines with result refused</td><td>Writer failures, not sync</td></tr>
+</table></div>
+<p><strong>Latency</strong> — per readable pair, in seconds:</p>
+<p class="formula">latency = t_readable(R) − offset(R) − t_write(W)</p>
+<p><code>t_write</code> is the entry's own timestamp. <code>t_readable</code> is the <code>ContentReady</code> time of the payload's hash on the reader's clock — or the <code>InsertRemote</code> time in the rare case the content was already complete. <code>offset</code> is the reader's clock minus the laptop's from the nearest clock sample, 0 for a laptop reader, and each value carries that sample's error bound.</p>
+<ul>
+<li>Reported as p50, p90, p99 and max with nearest-rank percentiles, separately for each phase (steady, partition, recovery) and for each reader: mixing phases would let 30 seconds of partition dominate the tail and hide the steady-state number.</li>
+<li>Pairs readable only through the final listing (their events were lost) have no latency and are counted, not guessed.</li>
+<li>The steady-phase shape is roughly known in advance: the wait for the reader's next pass (the interval plus the pass's own time, longer when a pair's previous session is still running and the pass skips it), then the session, then the blob download. A p50 of several seconds with a 5-second interval is the design, not slowness. The open <code>reconcile-trigger</code> change in <code>mia-docs</code> would replace this shape entirely.</li>
+<li><strong>Clock checks.</strong> A corrected arrival must lie between the entry's <code>t_write</code> and the <code>finished</code> of the writer's side of the session that carried it, both on the laptop's clock, each widened by the error bound. An arrival outside that window in either direction means the offset is wrong, and the run's phone latencies are marked invalid. The classification is unaffected: it never uses the offset.</li>
+</ul>
+<p><strong>Recovery</strong> — for the partition scenario:</p>
+<ul>
+<li><em>time to first session</em> = the first qualifying session between the phone and any writer after the pf rules pass traffic again, minus that moment;</li>
+<li><em>catch-up time</em> = the last <code>t_readable</code> among entries written during the partition, minus that moment;</li>
+<li><em>time to converge</em> = the last <code>t_readable</code> of the run, minus the last <code>t_write</code>.</li>
+</ul>
+<p>A session running when the cut starts can hold its pair until the transport gives up — the QUIC idle timeout, or <code>SYNC_SESSION_TIMEOUT</code> of 300 seconds in <code>crates/pdn-store/src/net.rs</code> — and the pass skips that pair meanwhile. Such sessions are listed beside the recovery times, because they, not the network, can set them.</p>
+<p><strong>Session health</strong> — per writer–reader pair and per origin (dialed by the phone, dialed by the writer): successful, failed and split sessions, their error strings, and the gaps between successful sessions. A median gap far above the reconcile interval means the pass is not running as configured, which explains latency before anyone blames the network.</p>
+<p><strong>Validity of the run</strong> — recorded in the same row and printed first:</p>
+<div class="table-wrap"><table>
+<tr><th>Check</th><th>Rule</th><th>Effect when it fails</th></tr>
+<tr><td>host CPU</td><td>peak of the node processes' %CPU below 90% of the cores</td><td>Latency marked host-bound; counts still stand</td></tr>
+<tr><td>event loss</td><td>undetermined pairs below 1% of expected</td><td>The run is INCONCLUSIVE</td></tr>
+<tr><td>clock</td><td>every sample's half round trip below 20 ms, and every arrival inside its clock-check window</td><td>Phone latencies marked invalid</td></tr>
+<tr><td>path</td><td>every phone connection direct, none via relay (<code>/debug/paths</code>)</td><td>Run marked as a different network variant</td></tr>
+<tr><td>shaper</td><td>pf counters rose for the UDP probe</td><td>Run aborted before it starts</td></tr>
+<tr><td>foreground</td><td>the app never left the foreground</td><td>Run invalid</td></tr>
+</table></div>
+<p>None of these ever turns a defect into a pass: a saturated laptop may slow sync, but it gives the platform no licence to lose an entry.</p>
+
+<h2>Why the numbers can be trusted</h2>
+<p>The test is trusted for two reasons: each known way a sync test lies is closed by construction, and the test is itself run against planted defects and must report each one as exactly what it is.</p>
+<p><strong>Known ways a sync test lies, and how each is closed.</strong></p>
+<div class="table-wrap"><table>
+<tr><th>Threat</th><th>What would go wrong</th><th>How it is closed</th></tr>
+<tr><td>A timer decides loss</td><td>A slow entry past the budget reads as lost, and a budget raised to hide that hides real losses too</td><td>Loss is decided by a qualifying session, never by elapsed time</td></tr>
+<tr><td>One side's word decides</td><td>The writer reports ok for a session the reader failed</td><td>Both sides must report ok; disagreement is a split session</td></tr>
+<tr><td>Sessions that prove nothing</td><td>Writer-dialed sessions address the wrong identity and carry nothing</td><td>Only sessions the reader dialed and the writer accepted qualify</td></tr>
+<tr><td>The observer drives sync</td><td>Every product read and list nudges a sync, so polling shortens the latency it measures</td><td>Events only during the run; one unnudged listing at the end; the polling reader is a separate, labelled variant</td></tr>
+<tr><td>Only present data is checked</td><td>Comparing what the reader holds against the writer counts nothing the reader lacks</td><td>Expected pairs come from the journals and the grants; every one is classified</td></tr>
+<tr><td>Clocks disagree</td><td>Phone and laptop clocks differ by up to seconds</td><td>Ordering against the write uses the writer's clock, presence the reader's; cross-device offsets enter latency only, and are checked in both directions</td></tr>
+<tr><td>Lost events</td><td>The engine's stream, or a forwarding hop, drops events</td><td><code>Lagged</code> and numbering gaps on every hop, on writer and reader alike, make pairs undetermined, never violated</td></tr>
+<tr><td>Lost reports</td><td>The agent's HTTP report of an arrival is lost</td><td>The agent's local journal is pulled over the cable and is the source for the verdict</td></tr>
+<tr><td>Superseded versions</td><td>Intermediate <code>h/</code> versions counted as lost</td><td>Only the last version of an <code>h/</code> slot is expected</td></tr>
+<tr><td>Grant traffic inside entry numbers</td><td>Republishing a grant during the run</td><td>Every slot granted before measurement; grants read back before the first write</td></tr>
+<tr><td>Wrong expected set</td><td>A refused write counted as lost</td><td>Only writes that returned ok are expected</td></tr>
+<tr><td>A vacuous control</td><td>A party without a ticket never dials, so it trivially receives nothing</td><td><code>outsider</code> holds a ticket but no grant</td></tr>
+<tr><td>The shaper does nothing</td><td>A "bad network" run on a perfect network</td><td>pf counters must rise for a UDP probe, or the run aborts</td></tr>
+<tr><td>Hidden relay or blocked port</td><td>A direct-path number measured through a relay, or a node the firewall hides</td><td>Paths recorded per connection; the connect step fails loudly when a node is unreachable</td></tr>
+<tr><td>Host saturation</td><td>The laptop, not the platform, sets latency</td><td>CPU recorded; latency marked host-bound above 90%</td></tr>
+<tr><td>The phone sleeps</td><td>iOS stops the node in the background</td><td>Auto-lock off; the agent reports every change of app state; a run where the app left the foreground is invalid</td></tr>
+<tr><td>Leftover state</td><td>A warm directory already holds last run's namespaces</td><td>Fresh laptop directories; the agent deletes the phone node's directory before bring-up</td></tr>
+<tr><td>The test build differs from the product</td><td>Measuring code the product does not run</td><td>The agent calls the same facade the screens call; the build adds only the agent screen, the control channel, the event stream and the unnudged list; release configuration</td></tr>
+</table></div>
+<p><strong>The test is tested.</strong> Before its numbers count, the harness runs against defects planted on purpose, with a laptop node standing in for the phone. Each must come out as exactly the stated report; a harness that reports any of them as PASS is broken.</p>
+<div class="table-wrap"><table>
+<tr><th>Planted defect</th><th>Expected report</th></tr>
+<tr><td>The journal lists <code>s/000000500</code> of <code>w2</code>, but it is never written</td><td>violated, then lost; FAIL; every other pair readable</td></tr>
+<tr><td><code>w3</code> writes one payload whose sha256 is wrong</td><td>exactly one corrupt; FAIL</td></tr>
+<tr><td><code>w1</code> grants <code>partial</code> slot 7 (odd), while the expected set says even only</td><td>exactly one extra; FAIL</td></tr>
+<tr><td>The reader's side of one session is made to fail by a test hook</td><td>exactly one split session; the entries stay in flight and are delivered by the next session; FAIL</td></tr>
+<tr><td>The partition is never lifted</td><td>the phone's pairs stalled, none violated, none lost; INCONCLUSIVE</td></tr>
+<tr><td>The clock offset is shifted by +2 s, then by −2 s</td><td>clock invalid in both runs; the counts unchanged</td></tr>
+<tr><td>The reader's reconcile interval raised to 30 s</td><td>longer in flight, zero violations, zero stalled; PASS</td></tr>
+<tr><td>A forwarding hop drops a range of events</td><td>undetermined pairs, zero violations claimed from them</td></tr>
+</table></div>
+<p>The suite needs two things the laptop does not have today: a reconcile-interval setting for <code>pdn-node-http</code>, which uses the runtime's 10-second default, and, on a Linux pipeline where pf does not exist, another way to cut a node — stopping the reader's process, or nftables inside a container. This mirrors the repository rule that a test rewritten onto the product path must fail with its mechanism deliberately broken (<code>product-path-arrangement.md</code>).</p>
+<p><strong>What a clean run proves, statistically.</strong> Zero losses in <em>n</em> independent trials bounds the loss rate below 3/<em>n</em> at 95% confidence (the rule of three, <code>flaky-tests.md</code>). Entries are not independent: a failing session tends to lose many at once. So the report states two bounds. Per session, the honest one: the main run has about 130 qualifying sessions (10 writers, one every 5 seconds or so over the 70 seconds the network is up), so a clean run bounds the rate of losing sessions below 3 in 130. Per entry, 10,160 pairs, valid only if losses were independent. More confidence comes from more runs, not a longer report.</p>
+<p><strong>Every defect found is reproducible.</strong> The report names the writer, the reader, the seq, <code>t_write</code>, both sides of the session that should have carried it, and the log directory. That is enough to replay the case as a scenario test in the workspace, where it is fixed and pinned, as <code>flaky-tests.md</code> asks.</p>
+
+<h2>Facts to confirm, and the build order</h2>
+<p>The design rests on properties of the code and the tools that were read but not yet exercised; each is confirmed first, and a failed one changes the design before anything is built on it.</p>
+<p><strong>To confirm or build in the code:</strong></p>
+<ul class="check">
+<li>One successful scoped session leaves the grantee holding every covered entry of the view it served — the claim the classification rests on. No test isolates it today: <code>crates/data-layer/tests/read_restriction.rs</code> polls <code>read</code>, which nudges, so it proves eventual convergence, not one session.</li>
+<li>The replica applies an insert, timestamp included, before it opens any session's view: the timestamp is taken inside the insert (<code>Record::new_current</code> in <code>crates/pdn-store/src/sync.rs</code>), and <code>started</code> precedes the view. If a session could freeze its view between an entry's timestamp and its insert, a session started after <code>t_write</code> could miss it without any defect.</li>
+<li>The dialing side sends <code>Abort</code> when its exchange fails, instead of closing cleanly. Without it the writer reports ok for a session the reader failed; a host can trigger that through the public surface, so it is a fix, not a note.</li>
+<li>What writer-dialed sessions to a grantee actually do: fail, or succeed carrying nothing. The rule excludes them either way; session health needs to know which.</li>
+<li>A node on <code>Connectivity::Direct</code> puts its LAN address in an invite, and a phone node on <code>for_product</code> dials it directly. Nothing has exercised this path yet.</li>
+<li>Event subscription for a data namespace from <code>pdn-node</code>, a <code>/debug/events</code> route, and the same stream in the facade: none exists today.</li>
+<li>An unnudged list, in the facade's test build and in the debug routes.</li>
+<li>A reconcile-interval setting for <code>pdn-node-http</code>.</li>
+<li>A grant of 1,016 claims fits the entry payload limit and publishes in reasonable time.</li>
+<li>iroh tells, per remote node, whether the connection is direct or relayed, for <code>/debug/paths</code>.</li>
+</ul>
+<p><strong>To confirm in the tools:</strong></p>
+<ul class="check">
+<li><code>xcrun devicectl device process launch</code> passes environment variables, a native module exposes them to JavaScript, and <code>xcrun devicectl device copy from</code> reads the app's data container.</li>
+<li>Local Network access survives relaunching the app and deleting the node's directory; only a reinstall asks again.</li>
+<li>pf rules for the phone's IP on the interface <code>route get</code> names drop its UDP in both directions while TCP passes, and their counters show it.</li>
+<li>The macOS application firewall lets inbound UDP reach a freshly built <code>pdn-node-http</code>, or is told to.</li>
+</ul>
+<p><strong>Build order.</strong> Each step is usable on its own, and the phone arrives last, onto a method already proven on the laptop.</p>
+<ol start="0">
+<li><strong>The single-session test</strong>, in the workspace: covered and uncovered entries, exactly one scoped session, the grantee holds every covered entry and no uncovered one. Nothing below is built before it passes.</li>
+<li><strong>Network spike, about half a day:</strong> the direct path, the pf rules and the firewall, by hand.</li>
+<li><strong><code>pdn-node-http</code>:</strong> <code>/debug/events</code> with numbered events, <code>/debug/paths</code>, the unnudged list, the reconcile-interval setting.</li>
+<li><strong>Coordinator and the planted-defect suite, laptop only.</strong> Every row of the planted-defect table passes before step 4.</li>
+<li><strong>OpenSpec change in <code>mobile-common</code>:</strong> the test build, the agent, its control channel, the event stream and the unnudged list in the facade. The application's README states that it speaks no HTTP to anything, and its behaviour is specified in <code>mobile-common</code>, so this is specified before it is built.</li>
+<li><strong>The agent in <code>pdn-app</code>,</strong> then the steady and partition scenarios on the phone.</li>
+<li><strong>The remaining scenarios,</strong> then the network variants: a router with its own shaper, LTE with relays, a second phone.</li>
+</ol>
+<p>The coordinator is a Python script using only the standard library, run as <code>python3 -I</code>, as the repository's rules for scripts require. It lives in <code>pdn-app/sync-test/</code>, because it stages this application.</p>
+</main>
+</body>
+</html>

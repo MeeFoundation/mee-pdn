@@ -18,6 +18,10 @@ build
 **/xcuserdata
 tmp
 var
+# Python bytecode of sync-test/.
+__pycache__/
+# Results of container runs (sync-test/container.sh).
+/sync-test/runs/
 /.cargo/*
 !/.cargo/config.toml
 .claude/settings.local.json

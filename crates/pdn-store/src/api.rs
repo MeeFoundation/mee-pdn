@@ -231,6 +231,15 @@ pub struct Doc {
     namespace_id: NamespaceId,
 }
 
+/// The recorded peers that decode to a key: bytes that decode to none name
+/// no node to dial, as a corrupt entry in the recorded peers does.
+fn recorded_keys(recorded: &[PeerIdBytes]) -> Vec<iroh::PublicKey> {
+    recorded
+        .iter()
+        .filter_map(|peer| iroh::PublicKey::from_bytes(peer).ok())
+        .collect()
+}
+
 impl Doc {
     fn new(engine: Weak<Engine>, namespace_id: NamespaceId) -> Self {
         Self {
@@ -359,19 +368,37 @@ impl Doc {
         default_identity: Identity,
         join_gossip: bool,
     ) -> Result<()> {
-        // Bytes that decode to no key name no node to dial, as a corrupt
-        // entry in the recorded peers does.
-        let recorded = recorded
-            .iter()
-            .filter_map(|peer| iroh::PublicKey::from_bytes(peer).ok())
-            .collect();
         self.engine()?
             .sync_with_peers(
                 self.namespace_id,
                 peers,
-                recorded,
+                recorded_keys(&recorded),
                 default_identity,
                 join_gossip,
+            )
+            .await
+    }
+
+    /// [`Self::sync_with_peers`] with an ordered subscription attached, as
+    /// [`Engine::sync_with_peers_observed`](crate::engine::Engine::sync_with_peers_observed)
+    /// gives it.
+    #[cfg(feature = "observation")]
+    pub async fn sync_with_peers_observed(
+        &self,
+        peers: Vec<Contact>,
+        recorded: Vec<PeerIdBytes>,
+        default_identity: Identity,
+        join_gossip: bool,
+        capacity: usize,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.engine()?
+            .sync_with_peers_observed(
+                self.namespace_id,
+                peers,
+                recorded_keys(&recorded),
+                default_identity,
+                join_gossip,
+                capacity,
             )
             .await
     }
@@ -396,6 +423,16 @@ impl Doc {
         &self,
     ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
         self.engine()?.subscribe(self.namespace_id).await
+    }
+
+    /// An ordered subscription to this document, as
+    /// [`Engine::observe`](crate::engine::Engine::observe) gives it.
+    #[cfg(feature = "observation")]
+    pub async fn observe(
+        &self,
+        capacity: usize,
+    ) -> Result<impl Stream<Item = Result<LiveEvent>> + Send + Unpin + 'static> {
+        self.engine()?.observe(self.namespace_id, capacity).await
     }
 
     /// Returns sync peers for this document

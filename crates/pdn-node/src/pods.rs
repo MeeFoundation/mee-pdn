@@ -354,6 +354,50 @@ impl<'rt> RuntimePodsService<'rt> {
         require_member(&membership, identity, pod)?;
         Ok((node, membership))
     }
+
+    /// `join` with its import made by `import`, which answers the catch-up
+    /// beside what it opened: the outer error is a join refused or failed
+    /// through its record, the inner one its wait for the catch-up.
+    pub(crate) async fn join_with<T, F, Fut>(
+        &self,
+        identity: PdnId,
+        invite: PodInvite,
+        import: F,
+    ) -> Result<(PodId, T, Result<()>)>
+    where
+        F: FnOnce(Arc<SyncNode>, PodTickets) -> Fut,
+        Fut: std::future::Future<Output = Result<(data_layer::PodCatchUp, T)>>,
+    {
+        if invite.version != POD_INVITE_FORMAT_VERSION {
+            return Err(UnsupportedPodInviteVersion {
+                version: invite.version,
+            }
+            .into());
+        }
+        let cleanup_tasks = {
+            let mut state = self.runtime.state.lock().await;
+            state.hosted(identity)?;
+            if !state.joining_in_flight.insert((identity, invite.pod)) {
+                return Err(JoinInProgress {
+                    identity,
+                    pod: invite.pod,
+                }
+                .into());
+            }
+            state.cleanup_tasks.clone()
+        };
+        // Released synchronously on every outcome; the reservation's `Drop`
+        // covers a cancellation of this future alone.
+        let reservation = JoinReservation {
+            state: Arc::clone(&self.runtime.state),
+            key: (identity, invite.pod),
+            armed: true,
+            cleanup_tasks,
+        };
+        let joined = join_via_dialogue(&self.runtime.state, identity, &invite, import).await;
+        reservation.release().await;
+        joined
+    }
 }
 
 impl PodsService for RuntimePodsService<'_> {
@@ -422,35 +466,14 @@ impl PodsService for RuntimePodsService<'_> {
     }
 
     async fn join(&self, identity: PdnId, invite: PodInvite) -> Result<PodId> {
-        if invite.version != POD_INVITE_FORMAT_VERSION {
-            return Err(UnsupportedPodInviteVersion {
-                version: invite.version,
-            }
-            .into());
-        }
-        let cleanup_tasks = {
-            let mut state = self.runtime.state.lock().await;
-            state.hosted(identity)?;
-            if !state.joining_in_flight.insert((identity, invite.pod)) {
-                return Err(JoinInProgress {
-                    identity,
-                    pod: invite.pod,
-                }
-                .into());
-            }
-            state.cleanup_tasks.clone()
-        };
-        // Released synchronously on every outcome; the reservation's `Drop`
-        // covers a cancellation of this future alone.
-        let reservation = JoinReservation {
-            state: Arc::clone(&self.runtime.state),
-            key: (identity, invite.pod),
-            armed: true,
-            cleanup_tasks,
-        };
-        let joined = join_via_dialogue(&self.runtime.state, identity, &invite).await;
-        reservation.release().await;
-        joined
+        let pod = invite.pod;
+        let (pod, (), waited) = self
+            .join_with(identity, invite, move |node, tickets| async move {
+                Ok((node.import_pod(identity, pod, tickets).await?, ()))
+            })
+            .await?;
+        waited?;
+        Ok(pod)
     }
 
     async fn act(&self, identity: PdnId, pod: PodId, act: PodAct) -> Result<()> {
@@ -1014,11 +1037,16 @@ async fn writer(state: &State, identity: PdnId, pod: PodId) -> Result<(AuthorId,
 /// The joiner's half: dial, run the dialogue, then record the tickets and
 /// the PMS's entry before it imports the stores and waits for their catch-up.
 #[allow(clippy::too_many_lines)] // one dialogue, both transports and each record in one place
-async fn join_via_dialogue(
+async fn join_via_dialogue<T, F, Fut>(
     state: &Arc<Mutex<State>>,
     identity: PdnId,
     invite: &PodInvite,
-) -> Result<PodId> {
+    import: F,
+) -> Result<(PodId, T, Result<()>)>
+where
+    F: FnOnce(Arc<SyncNode>, PodTickets) -> Fut,
+    Fut: std::future::Future<Output = Result<(data_layer::PodCatchUp, T)>>,
+{
     let (node, keys, author) = {
         let state = state.lock().await;
         let hosted = state.hosted(identity)?;
@@ -1143,17 +1171,20 @@ async fn join_via_dialogue(
             pause.release.notified().await;
         }
     }
-    let caught_up = node.import_pod(identity, pod, inviter).await?;
+    let (caught_up, opened) = import(Arc::clone(&node), inviter).await?;
     let deadline = Instant::now() + JOIN_CATCH_UP_TIMEOUT;
-    caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
-    // A member from here on: the caller's next act checks the membership view.
-    node.await_pod_member(
-        identity,
-        pod,
-        deadline.saturating_duration_since(Instant::now()),
-    )
-    .await?;
-    Ok(pod)
+    let waited = async {
+        caught_up.wait(JOIN_CATCH_UP_TIMEOUT).await?;
+        // A member from here on: the caller's next act checks the membership view.
+        node.await_pod_member(
+            identity,
+            pod,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+    }
+    .await;
+    Ok((pod, opened, waited))
 }
 
 /// The sequence the inviter offers the joiner and whether it writes a

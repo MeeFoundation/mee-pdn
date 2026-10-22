@@ -21,7 +21,7 @@ use n0_future::{
 };
 use pdn_store::{
     api::{AddrInfoOptions, Doc},
-    engine::{LiveEvent, Origin},
+    engine::{LiveEvent, Origin, SyncEvent, SyncReason},
     store::Query,
     AuthorId, ContentStatus, Entry, EntryFilter, NamespaceId, RestsOn, SessionAccess,
     SessionAccessProvider, SessionRole,
@@ -2192,19 +2192,17 @@ async fn a_dial_ordered_after_another_namespace_follows_its_exchange() -> Result
     Ok(())
 }
 
-/// A dial held behind an exchange stays held when the dial of that exchange
-/// loses its slot to the counterpart's own and then ends refused: it starts
-/// only once the exchange that took the slot over has finished.
-///
-/// Node `x`, the greater id, wins the tie-break as the accepting side. Its
-/// own dial of `first` waits in its provider until the counterpart's dial
-/// has been accepted and reached `x`'s entries, then is refused; the
-/// counterpart reveals its entries of `first` slowly, so the accepted
-/// exchange outlasts that refusal by seconds.
-#[tokio::test(flavor = "multi_thread")]
-#[traced_test]
-async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Result<()> {
-    let mut rng = test_rng(b"a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held");
+/// Node `x`, the greater id, with `then` ordered after `first`, and node
+/// `y`. `x`'s dial of `first` waits in its provider until `y`'s dial of
+/// `first` has been accepted and reached `x`'s entries, then takes
+/// `answer`; `y` reveals its entries of `first` slowly, so the accepted
+/// exchange outlasts whatever becomes of `x`'s dial by seconds. Answers the
+/// accepted exchange of `first` and the exchange of `then` that `x` dialed.
+async fn crossed_dials_of_first(
+    seed: &[u8],
+    answer: fn() -> SessionAccess,
+) -> Result<(SyncEvent, SyncEvent)> {
+    let mut rng = test_rng(seed);
     let (mut key_x, mut key_y) = (
         SecretKey::from_bytes(&rng.random()),
         SecretKey::from_bytes(&rng.random()),
@@ -2227,7 +2225,7 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
                     SessionRole::Dial if ours && gate.swap(false, Ordering::SeqCst) => {
                         dial_asked.notify_one();
                         accepted.notified().await;
-                        SessionAccess::Deny
+                        answer()
                     }
                     SessionRole::Accept if ours => {
                         let reached: EntryFilter = Arc::new(move |_entry| {
@@ -2332,17 +2330,155 @@ async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Re
         "the exchange of first was not the accepted one: {:?}",
         first.origin
     );
-    // The finished stamp is taken after the exchange releases its held
-    // dials; the slow egress keeps the exchange itself over a second long.
+    Ok((first, then))
+}
+
+/// `then` started no earlier than `first` finished. The finished stamp is
+/// taken after the exchange releases its held dials; the slow egress keeps
+/// the exchange itself over a second long.
+fn assert_started_after(then: &SyncEvent, first: &SyncEvent) -> Result<()> {
     let released = first
         .finished
         .checked_sub(Duration::from_millis(100))
         .context("a finished stamp after the epoch")?;
     assert!(
         then.started >= released,
-        "the held dial started {:?} before the exchange that took the slot over finished",
+        "the held dial started {:?} before the exchange it follows finished",
         first
             .finished
+            .duration_since(then.started)
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// A dial held behind an exchange stays held when the dial of that exchange
+/// loses its slot to the counterpart's own and then ends refused: it starts
+/// only once the exchange that took the slot over has finished.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held() -> Result<()> {
+    let (first, then) = crossed_dials_of_first(
+        b"a_dial_superseded_by_the_tie_break_leaves_the_ordered_dial_held",
+        || SessionAccess::Deny,
+    )
+    .await?;
+    assert_started_after(&then, &first)
+}
+
+/// A dial held behind an exchange stays held when the dial of that exchange
+/// is refused by the counterpart as already syncing: it starts only once
+/// the exchange the counterpart refused it for has finished.
+///
+/// `x`'s dial goes out once `y`'s is accepted, so `y`, the lesser id with
+/// its own dial of `first` running, refuses it as already syncing.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn a_dial_refused_as_already_syncing_leaves_the_ordered_dial_held() -> Result<()> {
+    let (first, then) = crossed_dials_of_first(
+        b"a_dial_refused_as_already_syncing_leaves_the_ordered_dial_held",
+        SessionAccess::whole,
+    )
+    .await?;
+    assert_started_after(&then, &first)
+}
+
+/// A dial held behind an exchange that a resync is queued behind starts
+/// only once the resync has finished, not when the exchange it followed
+/// did: the sync of `first` asked for while its exchange runs queues the
+/// resync, and the dial was for what that exchange may not carry.
+///
+/// `x`'s dial of `first` waits in its provider while the second sync is
+/// asked for.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn a_dial_held_behind_an_exchange_with_a_resync_queued_follows_the_resync() -> Result<()> {
+    let mut rng =
+        test_rng(b"a_dial_held_behind_an_exchange_with_a_resync_queued_follows_the_resync");
+    let first_id: Arc<std::sync::OnceLock<NamespaceId>> = Arc::default();
+    let dial_asked = Arc::new(Notify::new());
+    let go = Arc::new(Notify::new());
+    let gate = Arc::new(AtomicBool::new(true));
+    let x_access: SessionAccessProvider = {
+        let (first_id, dial_asked, go) = (first_id.clone(), dial_asked.clone(), go.clone());
+        Arc::new(move |namespace, _identity, _caller, _peer, role| {
+            let held = role == SessionRole::Dial
+                && first_id.get() == Some(&namespace)
+                && gate.swap(false, Ordering::SeqCst);
+            let (dial_asked, go) = (dial_asked.clone(), go.clone());
+            Box::pin(async move {
+                if held {
+                    dial_asked.notify_one();
+                    go.notified().await;
+                }
+                SessionAccess::whole()
+            })
+        })
+    };
+    let x = test_node(SecretKey::from_bytes(&rng.random()))
+        .await?
+        .access(x_access)
+        .spawn()
+        .await?;
+    let y = test_node(SecretKey::from_bytes(&rng.random()))
+        .await?
+        .spawn()
+        .await?;
+    let id_y = y.id();
+
+    let (first_x, then_x) = (x.docs().create().await?, x.docs().create().await?);
+    first_id
+        .set(first_x.id())
+        .map_err(|_| anyhow!("first set once"))?;
+    let mut y_contacts = Vec::new();
+    for doc in [&first_x, &then_x] {
+        let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
+        let imported = y.docs().import_namespace(ticket.capability).await?;
+        imported
+            .sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
+            .await?;
+        y_contacts = imported
+            .share(AddrInfoOptions::RelayAndAddresses)
+            .await?
+            .contacts();
+    }
+    let mut first_events = first_x.subscribe().await?;
+    let mut then_events = then_x.subscribe().await?;
+
+    x.engine()
+        .order_after(then_x.id(), Some(first_x.id()))
+        .await?;
+    first_x
+        .sync_with_peers(vec![], vec![], util::TEST_HOLDER, false)
+        .await?;
+    then_x
+        .sync_with_peers(y_contacts.clone(), vec![], util::TEST_HOLDER, false)
+        .await?;
+    n0_future::time::timeout(TIMEOUT, dial_asked.notified()).await?;
+    // Asked for while the exchange of `first` runs: queued as its resync.
+    first_x
+        .sync_with_peers(y_contacts, vec![], util::TEST_HOLDER, false)
+        .await?;
+    go.notify_one();
+
+    let resync = next_event_matching(&mut first_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id_y)
+            && matches!(e, LiveEvent::SyncFinished(sync) if sync.origin == Origin::Connect(SyncReason::Resync))
+    })
+    .await;
+    let then = next_event_matching(&mut then_events, TIMEOUT, move |e| {
+        match_sync_finished(e, id_y)
+            && matches!(e, LiveEvent::SyncFinished(sync) if matches!(sync.origin, Origin::Connect(_)))
+    })
+    .await;
+    let (LiveEvent::SyncFinished(resync), LiveEvent::SyncFinished(then)) = (resync, then) else {
+        unreachable!("matched as finished syncs");
+    };
+    assert!(
+        then.started > resync.started,
+        "the held dial started {:?} before the resync it was left to",
+        resync
+            .started
             .duration_since(then.started)
             .unwrap_or_default()
     );

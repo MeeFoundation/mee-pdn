@@ -27,7 +27,14 @@ pub use identity_key::{
 };
 #[cfg(feature = "test-util")]
 pub use node::{
-    BlobStreamHold, CollectionPause, PodSession, PodSessions, PodStartPause, StopStep, StopSteps,
+    BlobStreamHold, CollectionPause, OrderedEvents, PodObservation, PodSession, PodSessions,
+    PodStartPause, StopStep, StopSteps,
+};
+// The ordered subscription's vocabulary, for the runtime's observation.
+#[cfg(feature = "test-util")]
+pub use pdn_store::{
+    engine::{LiveEvent, Origin, SyncEvent},
+    ContentStatus,
 };
 #[cfg(feature = "test-util")]
 pub use pod::PodVerdicts;

@@ -5,8 +5,14 @@ edition = "2021"
 publish = false
 description = "Thin HTTP host for the demo stand, embedding one pdn-node runtime"
 
+[features]
+# The observation routes over the runtime's test-only calls: the sync tests'
+# laptop node, never the stand's image or a product build.
+observation = ["pdn-node/test-util", "dep:futures-lite"]
+
 [dependencies]
 anyhow = "1"
+futures-lite = { version = "2", optional = true }
 # `json` for the structured response bodies; record payloads travel raw.
 axum = { version = "0.8", features = ["json"] }
 pdn-node = { path = "../pdn-node" }

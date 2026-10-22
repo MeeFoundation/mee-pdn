@@ -38,9 +38,19 @@ setup-tooling:
 openspec-skills:
   @python3 -I scripts/openspec-skills.py
 
+# Build the mobile facade for one target — what `pdn-sdk` packages (see scripts/build-mobile.sh)
+[doc("Build the mobile facade for one target, with the crate features named (positional; TARGET_API picks the NDK wrapper)")]
+build-mobile target="aarch64-linux-android" features="":
+  @sh scripts/build-mobile.sh {{ target }} "{{ features }}"
+
 # Run workspace tests via nextest — extra args forwarded; a run with no selection ends with the workspace doctests, a `-p` or `-E` selection skips them
 test *args: _need-nextest
   @sh scripts/test.sh "$@"
+
+# The product configuration's own tests: the facade a device installs and the store under it, no feature enabled (test nodes bind loopback — see data-layer node.rs)
+[doc("Test the facade and the store in the product configuration, no feature enabled")]
+test-product: _need-nextest
+  PDN_BIND_ADDR=127.0.0.1 cargo nextest run -p pdn-mobile -p pdn-store
 
 # Test in release mode via nextest — extra args forwarded (test nodes bind loopback — see data-layer node.rs)
 test-release *args: _need-nextest
@@ -56,6 +66,24 @@ image := "pdn-node-http:dev"
 [doc("Build the stand's node image")]
 build-image:
   @sh scripts/build-image.sh {{ image }}
+
+# The stand's image with the host's observation routes, which only the
+# observation scenarios run against.
+observation_image := "pdn-node-http:observation"
+
+[doc("Build the node image with the observation routes")]
+build-observation-image:
+  @sh scripts/build-image.sh {{ observation_image }} observation
+
+# The pod load test, sync-test/load.md ("One command"): test L on the laptop,
+# or in the runner image with --container as CI does. Runs land in tmp/load,
+# or in sync-test/runs with --container, as <run>-ramp-plain. Test P, with
+# the phone as r, is pdn-app's `just load`.
+[doc("Collect a full report's data for test L: the ramp with its catch-ups (--container: in the runner image)")]
+[arg("container", long="container", value="true")]
+[arg("run", long="run")]
+load container="false" run="":
+  @sh sync-test/full.sh plain "{{ container }}" "{{ run }}"
 
 # What the build context actually carries, listed against the allowed set in
 # .dockerignore. The criterion is presence — anything outside that set is a
@@ -97,11 +125,11 @@ demo-pods:
 # revisions into one scenario — and an id cannot be moved. Prints nothing
 # when no daemon answers or nothing is built, so a caller reads an empty
 # answer rather than an error from a missing image.
-[doc("Print the image id the stand's scenarios run against")]
-stand-image:
+[doc("Print the image id the stand's scenarios run against (or the tag named)")]
+stand-image tag=image:
   #!/bin/sh
   set -eu
-  docker images --no-trunc --quiet {{ image }} 2>/dev/null | head -n 1
+  docker images --no-trunc --quiet {{ tag }} 2>/dev/null | head -n 1
 
 [doc("Print the nextest profile matching the daemon's CPU count")]
 stand-profile:
@@ -171,17 +199,28 @@ check: _check-devcontainer-tools
   #!/bin/sh
   set -eux
   cargo fmt --all -- --check
+  # The load harness's self-checks: stdlib, seconds.
+  python3 -I sync-test/selfcheck.py --synthetic
+  python3 -I sync-test/analyze.py --synthetic
+  python3 -I sync-test/report.py --synthetic
+  python3 -I sync-test/load.py --selfcheck
   # Both configurations: the product build first — a break there is invisible
   # to a run that only ever enables the dev feature. Product targets only:
   # `--all-targets` builds the dev targets, and a dev-dependency on
   # `pdn-node/test-util` unifies the feature back in, which would make this
   # line a copy of the next one.
   cargo clippy --workspace --lib --bins
+  # The observation build is a release build: checked in that profile.
+  cargo clippy -p pdn-node-http --release --features observation --lib --bins
+  cargo clippy -p pdn-mobile --release --features observation --lib
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh)
   cargo check --workspace --all-targets $(sh scripts/test-features.sh)
   # The store keeps its own lints, not the workspace's; its warnings and
   # rustdoc's are denied here (an intra-doc link to a private item is one).
   cargo clippy -p pdn-store --all-targets -- -Dwarnings
+  cargo clippy -p pdn-store --all-targets --features observation -- -Dwarnings
+  # The product graph enables no observation feature (see scripts/check-product-graph.sh).
+  sh scripts/check-product-graph.sh
   # Private items too: most docs sit on them, and a link there that no longer
   # resolves is otherwise seen by nothing.
   RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)
