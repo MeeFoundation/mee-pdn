@@ -107,7 +107,7 @@ impl Engine {
         gossip: Gossip,
         replica_store: crate::store::Store,
         bao_store: iroh_blobs::api::Store,
-        fetches_per_provider: usize,
+        fetches_per_provider: std::num::NonZeroUsize,
         default_author_storage: DefaultAuthorStorage,
         session_access: crate::filter::SessionAccessProvider,
         identity: Identity,

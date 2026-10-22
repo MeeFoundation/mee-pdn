@@ -4,7 +4,7 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
 };
@@ -99,12 +99,14 @@ pub async fn endpoint(
 }
 
 /// What a test node's blob protocol records and does: the requests it
-/// holds open at once, and while held, every request kept unanswered.
+/// holds open at once, while held every request kept unanswered, and while
+/// ignoring every request arriving left unanswered for good.
 #[derive(Debug)]
 pub struct BlobServing {
     open: AtomicUsize,
     most: AtomicUsize,
     held: tokio::sync::watch::Sender<bool>,
+    ignoring: AtomicBool,
 }
 
 impl Default for BlobServing {
@@ -113,6 +115,7 @@ impl Default for BlobServing {
             open: AtomicUsize::new(0),
             most: AtomicUsize::new(0),
             held: tokio::sync::watch::channel(false).0,
+            ignoring: AtomicBool::new(false),
         }
     }
 }
@@ -137,10 +140,21 @@ impl BlobServing {
     pub fn release(&self) {
         self.held.send_replace(false);
     }
+
+    /// Every request arriving from now on stays unanswered for as long as
+    /// its connection lives, past [`Self::answer`].
+    pub fn ignore(&self) {
+        self.ignoring.store(true, Ordering::SeqCst);
+    }
+
+    /// Answers every request arriving from now on.
+    pub fn answer(&self) {
+        self.ignoring.store(false, Ordering::SeqCst);
+    }
 }
 
 /// `iroh_blobs::provider::handle_connection` with each request counted by
-/// [`BlobServing`] and held while it holds.
+/// [`BlobServing`], held while it holds and ignored while it ignores.
 #[derive(Debug, Clone)]
 struct ServedBlobs {
     store: iroh_blobs::api::Store,
@@ -160,11 +174,15 @@ impl iroh::protocol::ProtocolHandler for ServedBlobs {
         {
             let store = self.store.clone();
             let serving = Arc::clone(&self.serving);
+            let connection = connection.clone();
             tokio::spawn(async move {
                 let open = serving.open.fetch_add(1, Ordering::SeqCst) + 1;
                 serving.most.fetch_max(open, Ordering::SeqCst);
                 let mut held = serving.held.subscribe();
-                if held.wait_for(|held| !held).await.is_ok() {
+                if serving.ignoring.load(Ordering::SeqCst) {
+                    let _unanswered = pair;
+                    connection.closed().await;
+                } else if held.wait_for(|held| !held).await.is_ok() {
                     iroh_blobs::provider::handle_stream(pair, store).await.ok();
                 }
                 serving.open.fetch_sub(1, Ordering::SeqCst);
@@ -220,7 +238,7 @@ pub struct Builder {
     access: Option<SessionAccessProvider>,
     serve_blobs: bool,
     blob_serving: Option<Arc<BlobServing>>,
-    fetches_per_provider: Option<u32>,
+    fetches_per_provider: Option<std::num::NonZeroU32>,
 }
 
 impl Builder {
@@ -320,7 +338,7 @@ impl Builder {
     }
 
     /// The engine's limit of fetches in flight toward one provider.
-    pub fn fetches_per_provider(mut self, limit: u32) -> Self {
+    pub fn fetches_per_provider(mut self, limit: std::num::NonZeroU32) -> Self {
         self.fetches_per_provider = Some(limit);
         self
     }
