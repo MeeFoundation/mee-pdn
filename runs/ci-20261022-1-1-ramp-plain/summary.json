@@ -1,0 +1,177 @@
+{
+ "run": "ci-20261022-1-1-ramp-plain",
+ "started": 1792689994.3162606,
+ "finished": 1792697659.7800407,
+ "mee_pdn": "fe5d90106b9413edd3473cb8cd0b1ded42272f98",
+ "ci": "https://github.com/MeeFoundation/mee-pdn/actions/runs/39821925552",
+ "host": {
+  "platform": "linux",
+  "cpu_budget": 4,
+  "cpu_count": 4,
+  "cpu_model": "AMD EPYC 9V45 96-Core Processor",
+  "steal_s": 0.0
+ },
+ "profile": {
+  "test": "L",
+  "variant": "plain",
+  "rate": 20,
+  "V": 20000,
+  "N": [
+   2,
+   4,
+   8,
+   12,
+   16,
+   24
+  ],
+  "pod_interval_s": 300,
+  "catchup": true,
+  "cpu_budget": 4.0
+ },
+ "lines": [
+  {
+   "N": 2,
+   "stop": "reached",
+   "reached": 20000,
+   "catchup": "done (lagged)",
+   "host_max_pct": 26.883499999999998,
+   "evidence": "",
+   "metrics": {
+    "p50_ms@1000": 9.588,
+    "p95_ms@1000": 32.88,
+    "p50_ms@5000": 27.419,
+    "p95_ms@5000": 59.66,
+    "p50_ms@10000": 70.563,
+    "p95_ms@10000": 109.599,
+    "p50_ms@20000": 183.696,
+    "p95_ms@20000": 252.07,
+    "r_cpu_ms_per_record": 22.54,
+    "sessions_per_record": 0.8089999999999999,
+    "content_lag_p50_ms": 0.571,
+    "content_lag_p90_ms": 0.969
+   },
+   "write_failures": 0,
+   "lagged": 0
+  },
+  {
+   "N": 4,
+   "stop": "reached",
+   "reached": 20000,
+   "catchup": "done (lagged)",
+   "host_max_pct": 85.53490000000001,
+   "evidence": "",
+   "metrics": {
+    "p50_ms@1000": 20.275,
+    "p95_ms@1000": 112.979,
+    "p50_ms@5000": 71.249,
+    "p95_ms@5000": 114.291,
+    "p50_ms@10000": 183.939,
+    "p95_ms@10000": 298.437,
+    "p50_ms@20000": 452.955,
+    "p95_ms@20000": 734.073,
+    "r_cpu_ms_per_record": 41.96,
+    "sessions_per_record": 1.9300000000000002,
+    "content_lag_p50_ms": 2.0,
+    "content_lag_p90_ms": 5.667
+   },
+   "write_failures": 0,
+   "lagged": 0
+  },
+  {
+   "N": 8,
+   "stop": "reached",
+   "reached": 20000,
+   "catchup": "done (lagged)",
+   "host_max_pct": 98.5403,
+   "evidence": "",
+   "metrics": {
+    "p50_ms@1000": 205.663,
+    "p95_ms@1000": 345.239,
+    "p50_ms@5000": 565.943,
+    "p95_ms@5000": 958.132,
+    "p50_ms@10000": 1095.27,
+    "p95_ms@10000": 1868.66,
+    "p50_ms@20000": 2141.98,
+    "p95_ms@20000": 3951.36,
+    "r_cpu_ms_per_record": 25.619999999999997,
+    "sessions_per_record": 1.388,
+    "content_lag_p50_ms": 5.522,
+    "content_lag_p90_ms": 16.076
+   },
+   "write_failures": 0,
+   "lagged": 0
+  },
+  {
+   "N": 12,
+   "stop": "reached",
+   "reached": 20000,
+   "catchup": "done (lagged)",
+   "host_max_pct": 98.6625,
+   "evidence": "",
+   "metrics": {
+    "p50_ms@1000": 520.927,
+    "p95_ms@1000": 848.327,
+    "p50_ms@5000": 1549.25,
+    "p95_ms@5000": 2517.59,
+    "p50_ms@10000": 2459.26,
+    "p95_ms@10000": 3966.35,
+    "p50_ms@20000": 5365.84,
+    "p95_ms@20000": 8435.26,
+    "r_cpu_ms_per_record": 18.39,
+    "sessions_per_record": 1.186,
+    "content_lag_p50_ms": 7.349,
+    "content_lag_p90_ms": 22.519
+   },
+   "write_failures": 0,
+   "lagged": 0
+  },
+  {
+   "N": 16,
+   "stop": "reached",
+   "reached": 20000,
+   "catchup": "done (lagged)",
+   "host_max_pct": 98.8197,
+   "evidence": "",
+   "metrics": {
+    "p50_ms@1000": 1050.01,
+    "p95_ms@1000": 1796.56,
+    "p50_ms@5000": 2877.93,
+    "p95_ms@5000": 4643.23,
+    "p50_ms@10000": 5289.32,
+    "p95_ms@10000": 8270.0,
+    "p50_ms@20000": 8913.54,
+    "p95_ms@20000": 14205.9,
+    "r_cpu_ms_per_record": 14.51,
+    "sessions_per_record": 1.0670000000000002,
+    "content_lag_p50_ms": 9.843,
+    "content_lag_p90_ms": 31.072
+   },
+   "write_failures": 0,
+   "lagged": 0
+  },
+  {
+   "N": 24,
+   "stop": "reached",
+   "reached": 20000,
+   "catchup": "done (lagged)",
+   "host_max_pct": 98.8467,
+   "evidence": "",
+   "metrics": {
+    "p50_ms@1000": 2592.14,
+    "p95_ms@1000": 4095.79,
+    "p50_ms@5000": 6255.06,
+    "p95_ms@5000": 9399.12,
+    "p50_ms@10000": 10895.9,
+    "p95_ms@10000": 16977.0,
+    "p50_ms@20000": 18848.1,
+    "p95_ms@20000": 28520.1,
+    "r_cpu_ms_per_record": 12.629999999999999,
+    "sessions_per_record": 1.228,
+    "content_lag_p50_ms": 16.537,
+    "content_lag_p90_ms": 64.447
+   },
+   "write_failures": 0,
+   "lagged": 0
+  }
+ ]
+}
