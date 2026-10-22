@@ -24,7 +24,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Query, Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{header::HOST, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse as _, Response},
     routing::{get, post},
@@ -95,7 +95,9 @@ pub async fn serve(
 /// requests there fall through to 404, not to an unauthorized answer. With
 /// `any_origin` the subtree answers a page of any origin (`PDN_ANY_ORIGIN`);
 /// without it a browser's cross-origin read is refused as any browser
-/// refuses it. Event streams of a router built here end only with the
+/// refuses it. A request of the subtree names an IP literal or `localhost`
+/// in `Host` or is refused 421, so a page made same-origin by DNS rebinding
+/// is kept out. Event streams of a router built here end only with the
 /// runtime.
 pub fn router(runtime: Arc<Runtime>, debug: bool, any_origin: bool) -> Router {
     assemble(runtime, debug, any_origin, watch::channel(false).1)
@@ -125,7 +127,7 @@ fn assemble(
         } else {
             debug
         };
-        app.merge(debug)
+        app.merge(debug.layer(middleware::from_fn(admit_local_host)))
     } else {
         app
     };
@@ -142,6 +144,32 @@ async fn admit_request(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     next.run(request).await
+}
+
+/// Refuses a request whose `Host` is a name other than `localhost`: the
+/// subtree is reached by an IP literal or `localhost` alone, so a page made
+/// same-origin by DNS rebinding is kept out. The phone's test surface shares
+/// it.
+pub async fn admit_local_host(request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if is_local_host(host) {
+        next.run(request).await
+    } else {
+        StatusCode::MISDIRECTED_REQUEST.into_response()
+    }
+}
+
+/// `localhost` or an IP literal, with or without a port.
+fn is_local_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or("", |(ip, _port)| ip),
+        None => host.rsplit_once(':').map_or(host, |(name, _port)| name),
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok()
 }
 
 const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
@@ -286,6 +314,32 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
+
+    /// A `Host` naming an IP literal or `localhost`, with or without a port,
+    /// is admitted, and a name is refused, one with `localhost` as a label
+    /// included.
+    #[test]
+    fn a_host_is_admitted_as_an_ip_literal_or_localhost_alone() {
+        for host in [
+            "127.0.0.1:3011",
+            "127.0.0.1",
+            "[::1]:3011",
+            "[::1]",
+            "localhost",
+            "LOCALHOST:3011",
+        ] {
+            assert!(is_local_host(host), "{host}");
+        }
+        for host in [
+            "evil.example:3011",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "evil.example:localhost",
+            "",
+        ] {
+            assert!(!is_local_host(host), "{host}");
+        }
+    }
 
     /// A future that outlives [`READINESS_BUDGET`] answers non-200 within a
     /// bounded margin, not a hang. Not end to end: the real coarse lock

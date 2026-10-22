@@ -325,8 +325,7 @@ async fn two_identities_on_one_node_keep_separate_pods() -> Result<()> {
 /// A node started with `PDN_ANY_ORIGIN` answers a debug request with the
 /// header a page of another origin needs to read it. Denied: a node started
 /// without it sends none, so a page of another origin reads nothing of a
-/// node nobody opened; the `Host` header is not checked, so a page made
-/// same-origin by DNS rebinding is outside what this asserts.
+/// node nobody opened.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
 async fn the_debug_surface_opens_to_any_origin_only_when_asked() -> Result<()> {
@@ -349,5 +348,28 @@ async fn the_debug_surface_opens_to_any_origin_only_when_asked() -> Result<()> {
     let answer = closed.get("/debug/status").await?;
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
     assert_eq!(answer.headers.get(ORIGIN), None, "{:?}", answer.headers);
+    Ok(())
+}
+
+/// A debug request naming another host in `Host` is refused, so a page made
+/// same-origin by DNS rebinding is kept out. Paired: `localhost` is answered,
+/// as the IP literal the suite's other requests name is.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+async fn the_debug_surface_answers_an_ip_literal_or_localhost_alone() -> Result<()> {
+    let stand = Stand::new();
+    let node = stand.spawn("named").await?;
+    let answer = node.get_as_host("/debug/status", "localhost").await?;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    // Denied (a name).
+    let answer = node
+        .get_as_host("/debug/status", "evil.example:3011")
+        .await?;
+    assert_eq!(
+        answer.status,
+        StatusCode::MISDIRECTED_REQUEST,
+        "{}",
+        answer.text()
+    );
     Ok(())
 }

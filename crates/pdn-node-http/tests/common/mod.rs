@@ -610,16 +610,36 @@ impl Host {
     }
 
     pub async fn request(&self, method: Method, path: &str, body: Bytes) -> Result<Answer> {
+        self.request_as_host(method, path, body, None).await
+    }
+
+    /// A `GET` naming `host` in `Host` rather than the address dialed.
+    pub async fn get_as_host(&self, path: &str, host: &str) -> Result<Answer> {
+        self.request_as_host(Method::Get, path, Bytes::new(), Some(host))
+            .await
+    }
+
+    async fn request_as_host(
+        &self,
+        method: Method,
+        path: &str,
+        body: Bytes,
+        host: Option<&str>,
+    ) -> Result<Answer> {
         let method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
         let base = self
             .base
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("base-url lock poisoned"))?
             .clone();
-        let response = self
+        let mut request = self
             .client
             .request(method, format!("{base}{path}"))
-            .body(body)
+            .body(body);
+        if let Some(host) = host {
+            request = request.header(reqwest::header::HOST, host);
+        }
+        let response = request
             .send()
             .await
             .with_context(|| format!("{} did not answer {path}", self.label))?;

@@ -59,9 +59,7 @@ pub fn debug_enabled_from_env() -> Result<bool> {
 
 /// `PDN_ANY_ORIGIN`: the debug subtree's cross-origin headers, the same
 /// closed set as `PDN_DEBUG`, unset meaning off. Off, a page of another
-/// origin cannot read what the subtree answers — the `Host` header is not
-/// checked, so a page made same-origin by DNS rebinding can; the demo turns
-/// it on.
+/// origin cannot read what the subtree answers; the demo turns it on.
 pub fn any_origin(raw: Option<&str>) -> Result<bool> {
     flag("PDN_ANY_ORIGIN", raw)
 }

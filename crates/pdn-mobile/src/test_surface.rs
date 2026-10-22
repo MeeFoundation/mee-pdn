@@ -93,6 +93,7 @@ pub(crate) fn serve(
         .route("/debug/agent/samples", get(samples))
         .route("/debug/agent/clock", get(clock))
         .fallback(forward)
+        .layer(axum::middleware::from_fn(pdn_node_http::admit_local_host))
         .with_state(surface);
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {

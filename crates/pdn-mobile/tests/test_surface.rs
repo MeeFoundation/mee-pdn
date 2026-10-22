@@ -67,6 +67,17 @@ impl Phone {
         Ok((response.status().as_u16(), response.text().await?))
     }
 
+    /// A `GET` naming `host` in `Host` rather than the address dialed.
+    async fn get_as_host(&self, path: &str, host: &str) -> Result<(u16, String)> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header("host", host)
+            .send()
+            .await?;
+        Ok((response.status().as_u16(), response.text().await?))
+    }
+
     async fn create_pod(&self, identity: &str) -> Result<String> {
         let (status, body) = self
             .post(&format!("/debug/identities/{identity}/pods"), "")
@@ -415,6 +426,22 @@ async fn the_surface_answers_on_loopback_alone() -> Result<()> {
         !matches!(refused, Ok(Ok(_))),
         "the surface answered at {network}"
     );
+    Ok(())
+}
+
+/// A request naming another host in `Host` is refused on the surface's own
+/// routes as on the laptop host's, so a page made same-origin by DNS
+/// rebinding is kept out. Paired: `localhost` is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_naming_another_host_is_refused() -> Result<()> {
+    let phone = Phone::serve().await?;
+    let (status, body) = phone.get_as_host("/debug/agent/clock", "localhost").await?;
+    assert_eq!(status, 200, "localhost answered {body}");
+    // Denied (a name): the surface's own route and a forwarded one.
+    for path in ["/debug/agent/clock", "/debug/status"] {
+        let (status, body) = phone.get_as_host(path, "evil.example").await?;
+        assert_eq!(status, 421, "{path} answered {status}: {body}");
+    }
     Ok(())
 }
 

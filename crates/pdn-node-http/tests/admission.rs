@@ -43,7 +43,11 @@ async fn a_request_past_the_debug_ceiling_is_shed() -> Result<()> {
         .map(|_| {
             let app = app.clone();
             tokio::spawn(async move {
-                let request = Request::get("/debug/identities").body(Body::empty())?;
+                // The `Host` every client sends, which the subtree checks
+                // before admission.
+                let request = Request::get("/debug/identities")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())?;
                 let response = app.oneshot(request).await?;
                 anyhow::Ok(response.status())
             })

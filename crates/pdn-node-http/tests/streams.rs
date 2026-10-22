@@ -32,6 +32,7 @@ async fn hosting_a_pod() -> Result<(Arc<Runtime>, PdnId, PodId)> {
 
 async fn open_events(app: &Router, identity: PdnId, pod: PodId) -> Result<Response> {
     let request = Request::get(format!("/debug/identities/{identity}/pods/{pod}/events"))
+        .header("host", "127.0.0.1")
         .body(Body::empty())?;
     Ok(app.clone().oneshot(request).await?)
 }
@@ -87,7 +88,9 @@ async fn open_streams_leave_the_request_bound_free() -> Result<()> {
         .map(|_| {
             let app = app.clone();
             tokio::spawn(async move {
-                let request = Request::get("/debug/identities").body(Body::empty())?;
+                let request = Request::get("/debug/identities")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())?;
                 anyhow::Ok(app.oneshot(request).await?.status())
             })
         })
@@ -150,6 +153,7 @@ async fn an_observed_join_past_the_bound_is_refused_without_joining() -> Result<
     let mut streams = open_streams(&app, identity, pod, MAX_OPEN_STREAMS).await?;
     let join = || {
         Request::post(format!("/debug/identities/{identity}/pods/join-observed"))
+            .header("host", "127.0.0.1")
             .body(Body::from(invite.clone()))
     };
 
