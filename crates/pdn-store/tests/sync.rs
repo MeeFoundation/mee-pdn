@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    num::NonZeroU32,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -688,17 +689,18 @@ async fn open_while_held(serving: &util::BlobServing) -> usize {
     open
 }
 
-/// A replica joining a namespace of 2,000 entries whose payloads one
-/// provider holds never has more requests open at that provider than its
-/// limit, and receives every payload.
+/// A replica joining a namespace of 500 entries whose payloads one provider
+/// holds never has more requests open at that provider than its limit, and
+/// receives every payload.
 ///
 /// The count is read with the provider holding every request: a request it
 /// has answered can still be counted for a moment after the replica's next
-/// one arrives.
+/// one arrives. The catch-up is sized for a debug build on a CI runner,
+/// whose reconciliation takes tens of milliseconds an entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
-    const ENTRIES: usize = 2_000;
-    const LIMIT: u32 = 2;
+    const ENTRIES: usize = 500;
+    const LIMIT: NonZeroU32 = NonZeroU32::new(2).unwrap();
     let mut rng = test_rng(b"a_catch_up_keeps_the_limit_toward_its_provider");
     let serving = Arc::new(util::BlobServing::default());
     let provider = loopback_node(&mut rng, |node| node.blob_serving(Arc::clone(&serving))).await?;
@@ -708,16 +710,18 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 
     let (_doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
     let mut ready = 0;
+    let mut lagged = 0;
     let mut open_counts = Vec::new();
     let arrived = tokio::time::timeout(TIMEOUT, async {
         while ready < ENTRIES {
             match events.try_next().await? {
                 Some(LiveEvent::ContentReady { .. }) => {
                     ready += 1;
-                    if ready % 500 == 1 {
+                    if ready % 125 == 1 {
                         open_counts.push(open_while_held(&serving).await);
                     }
                 }
+                Some(LiveEvent::Lagged) => lagged += 1,
                 Some(_) => {}
                 None => bail!("the event stream ended"),
             }
@@ -728,7 +732,7 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
     let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+        "{ready} of {ENTRIES} payloads arrived ({lagged} lag notices): {arrived:?}; fetches: {fetches}"
     );
     assert_eq!(
         open_counts,
@@ -745,12 +749,16 @@ async fn a_catch_up_keeps_the_limit_toward_its_provider() -> Result<()> {
 /// takes payloads the replica still waits for, at most the limit toward it
 /// as toward the first provider, and every payload arrives.
 ///
-/// Counts are read with both providers holding every request, as in
-/// `a_catch_up_keeps_the_limit_toward_its_provider`.
+/// Both providers hold every request until the counts are read, so every
+/// payload still waits when the second provider's session ends. That session
+/// starts only once the replica holds every entry, and the second provider
+/// has left the swarm, so no entry of it registers it: only the session's
+/// end can. The catch-up is sized for a debug build on a CI runner, whose
+/// reconciliation takes tens of milliseconds an entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Result<()> {
-    const ENTRIES: usize = 2_000;
-    const LIMIT: u32 = 10;
+    const ENTRIES: usize = 200;
+    const LIMIT: NonZeroU32 = NonZeroU32::new(10).unwrap();
     let mut rng = test_rng(b"a_provider_registered_during_a_catch_up_takes_waiting_payloads");
     let (first_serving, second_serving) = (
         Arc::new(util::BlobServing::default()),
@@ -767,39 +775,42 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     let joining = loopback_node(&mut rng, |node| node.fetches_per_provider(LIMIT)).await?;
     let (doc, _hashes) = records_with_payloads(&first, ENTRIES).await?;
     let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
-    let (_doc_second, events_second) =
+    let (doc_second, events_second) =
         util::import_and_subscribe(second.docs(), ticket.clone()).await?;
     wait_for_events(events_second, ENTRIES, TIMEOUT, |e| {
         matches!(e, LiveEvent::ContentReady { .. })
     })
     .await?;
+    doc_second.leave_gossip().await?;
 
-    let limit = usize::try_from(LIMIT)?;
+    let limit = usize::try_from(LIMIT.get())?;
+    let (first_id, second_id) = (first.id(), second.id());
+    first_serving.hold();
+    second_serving.hold();
     let (doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
     let mut ready = 0;
-    let mut open_counts = Vec::new();
+    let mut lagged = 0;
+    let mut open_counts = None;
+    let mut started = None;
     let arrived = tokio::time::timeout(TIMEOUT, async {
         while ready < ENTRIES {
             match events.try_next().await? {
-                Some(LiveEvent::ContentReady { .. }) => {
-                    ready += 1;
-                    if ready == 1 {
-                        doc_joining
-                            .start_sync(
-                                util::contacts([second.endpoint().addr()]),
-                                util::TEST_HOLDER,
-                            )
-                            .await?;
-                    }
-                    if ready % 500 == 0 {
-                        first_serving.hold();
-                        second_serving.hold();
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        open_counts.push((first_serving.open(), second_serving.open()));
-                        first_serving.release();
-                        second_serving.release();
-                    }
+                Some(LiveEvent::ContentReady { .. }) => ready += 1,
+                Some(event) if started.is_none() && match_sync_finished(&event, first_id) => {
+                    let doc = doc_joining.clone();
+                    let addr = second.endpoint().addr();
+                    started = Some(tokio::spawn(async move {
+                        doc.start_sync(util::contacts([addr]), util::TEST_HOLDER)
+                            .await
+                    }));
                 }
+                Some(event) if open_counts.is_none() && match_sync_finished(&event, second_id) => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    open_counts = Some((first_serving.open(), second_serving.open()));
+                    first_serving.release();
+                    second_serving.release();
+                }
+                Some(LiveEvent::Lagged) => lagged += 1,
                 Some(_) => {}
                 None => bail!("the event stream ended"),
             }
@@ -810,18 +821,17 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     let fetches = joining.engine().fetches_report().await?;
     assert!(
         matches!(arrived, Ok(Ok(()))),
-        "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
+        "{ready} of {ENTRIES} payloads arrived ({lagged} lag notices): {arrived:?}; fetches: {fetches}"
     );
+    if let Some(started) = started {
+        started.await??;
+    }
+    let (first_open, second_open) = open_counts.expect("the counts were read");
     assert!(
-        open_counts
-            .iter()
-            .all(|(first, second)| *first <= limit && *second <= limit),
-        "a provider held more than the limit: {open_counts:?}"
+        first_open <= limit && second_open <= limit,
+        "a provider held more than the limit: {first_open} and {second_open}"
     );
-    assert!(
-        open_counts.iter().any(|(_, second)| *second > 0),
-        "the second provider served nothing: {open_counts:?}"
-    );
+    assert!(second_open > 0, "the second provider served nothing");
 
     for node in [first, second, joining] {
         node.shutdown().await?;
@@ -829,8 +839,15 @@ async fn a_provider_registered_during_a_catch_up_takes_waiting_payloads() -> Res
     Ok(())
 }
 
-/// A replica whose only provider answers nothing for 15 seconds and then
-/// serves receives every payload once it serves, with no session between.
+/// A replica whose only provider ignores the requests it receives for 15
+/// seconds receives every payload from it once it serves, with no session
+/// between.
+///
+/// A request the provider ignored stays unanswered for good, so a payload
+/// arrives only through a request made after the first ones were dropped,
+/// 10 s after they were made; the window for sessions opens a second before
+/// that drop, since nothing is parked earlier. The provider serves from 15 s
+/// on, between the first probe, at 11 s, and the second, at 23 s.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
     const ENTRIES: usize = 5;
@@ -840,11 +857,11 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
     let joining = loopback_node(&mut rng, |node| node).await?;
     let (doc, _hashes) = records_with_payloads(&provider, ENTRIES).await?;
     let ticket = doc.share(AddrInfoOptions::RelayAndAddresses).await?;
-    serving.hold();
+    serving.ignore();
 
     let (_doc_joining, mut events) = util::import_and_subscribe(joining.docs(), ticket).await?;
-    let (mut inserted, mut ready, mut sessions_after_entries) = (0, 0, 0);
-    let mut released = false;
+    let (mut inserted, mut ready, mut sessions_while_waiting) = (0, 0, 0);
+    let mut answering = false;
     let entries_in = tokio::time::timeout(TIMEOUT, async {
         while inserted < ENTRIES {
             if let Some(LiveEvent::InsertRemote { .. }) = events.try_next().await? {
@@ -858,30 +875,29 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
         matches!(entries_in, Ok(Ok(()))),
         "the entries did not arrive"
     );
-    // The session that brought the entries ends within a moment of them.
-    let quiet_from = Instant::now() + Duration::from_secs(2);
-    let silent_until = quiet_from + Duration::from_secs(13);
+    let quiet_from = Instant::now() + Duration::from_secs(9);
+    let answer_from = Instant::now() + Duration::from_secs(15);
     let arrived = tokio::time::timeout(TIMEOUT, async {
         while ready < ENTRIES {
-            let next = if released {
+            let next = if answering {
                 events.try_next().await?
             } else {
-                match tokio::time::timeout_at(silent_until, events.try_next()).await {
+                match tokio::time::timeout_at(answer_from, events.try_next()).await {
                     Ok(next) => next?,
                     Err(_) => {
-                        serving.release();
-                        released = true;
+                        serving.answer();
+                        answering = true;
                         continue;
                     }
                 }
             };
             match next {
                 Some(LiveEvent::ContentReady { .. }) => {
-                    assert!(released, "a payload arrived while the provider was silent");
+                    assert!(answering, "a payload arrived while the provider was silent");
                     ready += 1;
                 }
                 Some(LiveEvent::SyncFinished(_)) if Instant::now() >= quiet_from => {
-                    sessions_after_entries += 1;
+                    sessions_while_waiting += 1;
                 }
                 Some(_) => {}
                 None => bail!("the event stream ended"),
@@ -896,7 +912,7 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
         "{ready} of {ENTRIES} payloads arrived: {arrived:?}; fetches: {fetches}"
     );
     assert_eq!(
-        sessions_after_entries, 0,
+        sessions_while_waiting, 0,
         "sessions while the payloads waited"
     );
 

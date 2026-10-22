@@ -18,6 +18,16 @@ use super::{UNREACHED_RETRY_FIRST, UNREACHED_RETRY_FOR, UNREACHED_RETRY_MAX};
 /// after which the transport abandons a quiet path.
 pub(super) const NO_PROGRESS: Duration = Duration::from_secs(10);
 
+/// Gives back what a catch-up's peak left allocated: a collection under a
+/// quarter full shrinks to twice what it holds.
+macro_rules! shrink_if_sparse {
+    ($collection:expr) => {
+        if $collection.len() < $collection.capacity() / 4 {
+            $collection.shrink_to($collection.len().saturating_mul(2));
+        }
+    };
+}
+
 /// How a fetch ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outcome {
@@ -35,8 +45,10 @@ pub(super) enum Outcome {
     LocalFailure,
 }
 
-/// What the live actor carries out after a step.
+/// What the live actor carries out after a step: the step has already
+/// counted each fetch as in flight and each payload as unrouted.
 #[derive(Debug, Default)]
+#[must_use]
 pub(super) struct Steps {
     /// Fetches to start, each toward its provider.
     pub(super) start: Vec<(PublicKey, Hash)>,
@@ -146,6 +158,7 @@ impl Fetches {
 
     /// Wants `hash`, queued at every provider registered for it; `false`
     /// when none is, and then it is not wanted here.
+    #[must_use = "on `false` the caller parks the payload"]
     pub(super) fn want(&mut self, hash: Hash) -> (bool, Steps) {
         let mut steps = Steps::default();
         if self.wanted.contains_key(&hash) {
@@ -177,9 +190,11 @@ impl Fetches {
     /// Stops wanting `hash`; a fetch of it in flight runs to its end.
     pub(super) fn unwant(&mut self, hash: &Hash) {
         if let Some(wanted) = self.wanted.remove(hash) {
+            shrink_if_sparse!(self.wanted);
             for provider in wanted.eligible {
                 if let Some(entry) = self.providers.get_mut(&provider) {
                     entry.holds.remove(hash);
+                    shrink_if_sparse!(entry.holds);
                 }
             }
         }
@@ -324,7 +339,7 @@ impl Fetches {
         let Some(entry) = self.providers.get_mut(&provider) else {
             return;
         };
-        entry.queue.clear();
+        entry.queue = VecDeque::new();
         entry.series = None;
         let holds = std::mem::take(&mut entry.holds);
         for hash in holds {
@@ -341,6 +356,7 @@ impl Fetches {
         }
         if let Some(entry) = self.providers.get_mut(&provider) {
             entry.holds.remove(&hash);
+            shrink_if_sparse!(entry.holds);
         }
     }
 
@@ -369,6 +385,7 @@ impl Fetches {
             .is_some_and(|wanted| wanted.eligible.is_empty() && wanted.fetching.is_none())
         {
             self.wanted.remove(&hash);
+            shrink_if_sparse!(self.wanted);
             steps.unrouted.push(hash);
         }
     }
@@ -401,6 +418,7 @@ impl Fetches {
             entry.in_flight = entry.in_flight.saturating_add(1);
             steps.start.push((provider, hash));
         }
+        shrink_if_sparse!(entry.queue);
         if entry.in_flight == 0 && entry.series.as_ref().is_some_and(|series| series.probing) {
             entry.series = None;
         }
@@ -425,7 +443,7 @@ mod tests {
     fn want_from(fetches: &mut Fetches, provider: PublicKey, hashes: &[Hash]) -> Vec<Hash> {
         let mut started = Vec::new();
         for hash in hashes {
-            fetches.register(*hash, provider);
+            let _ = fetches.register(*hash, provider);
             let (routed, steps) = fetches.want(*hash);
             assert!(routed, "a payload with a provider is wanted");
             started.extend(steps.start.into_iter().map(|(_, hash)| hash));
@@ -447,6 +465,30 @@ mod tests {
         assert_eq!(steps.start, [(a1, hashes[2])]);
     }
 
+    /// A catch-up that has ended keeps none of what its peak allocated.
+    #[test]
+    fn a_finished_catch_up_gives_its_capacity_back() {
+        let mut fetches = Fetches::new(100);
+        let a1 = node(1);
+        let hashes: Vec<Hash> = (0..10_000u32).map(|i| Hash::new(i.to_le_bytes())).collect();
+        let mut in_flight = want_from(&mut fetches, a1, &hashes);
+        while let Some(hash) = in_flight.pop() {
+            let steps = fetches.finished(a1, hash, Outcome::Fetched, false, Instant::now());
+            in_flight.extend(steps.start.into_iter().map(|(_, hash)| hash));
+        }
+        assert_eq!(fetches.report(), "0 wanted", "every payload arrived");
+        let entry = fetches.providers.get(&a1).expect("a1 has an entry");
+        let capacities = [
+            entry.queue.capacity(),
+            entry.holds.capacity(),
+            fetches.wanted.capacity(),
+        ];
+        assert!(
+            capacities.iter().all(|capacity| *capacity < 16),
+            "queue, holds and wanted capacities: {capacities:?}"
+        );
+    }
+
     /// A pair of payload and provider registered twice is queued once.
     #[test]
     fn a_pair_registered_twice_is_queued_once() {
@@ -454,8 +496,8 @@ mod tests {
         let (a1, b1) = (node(1), node(2));
         let (p, q) = (payload(1), payload(2));
         want_from(&mut fetches, a1, &[p, q]);
-        fetches.register(q, b1);
-        fetches.register(q, b1);
+        let _ = fetches.register(q, b1);
+        let _ = fetches.register(q, b1);
         let queued = fetches.providers.get(&b1).map(|entry| entry.queue.clone());
         assert_eq!(queued, Some(VecDeque::new()), "q went to b1 at once");
         let entry = fetches.providers.get(&b1).map(|entry| entry.in_flight);
@@ -595,12 +637,12 @@ mod tests {
         let (a1, b1) = (node(1), node(2));
         let (p, q) = (payload(1), payload(2));
         want_from(&mut fetches, b1, &[p]);
-        fetches.register(p, a1);
+        let _ = fetches.register(p, a1);
         let t0 = Instant::now();
         let steps = fetches.finished(b1, p, Outcome::Stalled, false, t0);
         let (_, series, _) = steps.pause.expect("a pause");
         assert_eq!(steps.start, [(a1, p)], "a1 takes the stalled payload");
-        fetches.finished(a1, p, Outcome::Fetched, false, t0);
+        let _ = fetches.finished(a1, p, Outcome::Fetched, false, t0);
         assert_eq!(fetches.resume(b1, series).start, [], "nothing to probe");
 
         want_from(&mut fetches, b1, &[q]);
@@ -691,7 +733,7 @@ mod tests {
         let b1 = node(1);
         let p = payload(1);
         want_from(&mut fetches, b1, &[p]);
-        fetches.finished(b1, p, Outcome::ConnectFailed, true, Instant::now());
+        let _ = fetches.finished(b1, p, Outcome::ConnectFailed, true, Instant::now());
         let steps = fetches.neighbor_gone(b1);
         assert_eq!(steps.unrouted, [p]);
     }
