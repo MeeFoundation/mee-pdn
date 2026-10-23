@@ -232,20 +232,8 @@ check-fix:
   cargo clippy --workspace --all-targets $(sh scripts/test-features.sh) --fix --allow-dirty --allow-staged
   # After the fixes: clippy writes them unformatted.
   cargo fmt --all
-  # Both configurations: the product build first — a break there is invisible
-  # to a run that only ever enables the dev feature. Product targets only:
-  # `--all-targets` builds the dev targets, and a dev-dependency on
-  # `pdn-node/test-util` unifies the feature back in, which would make this
-  # line a copy of the next one.
-  cargo clippy --workspace --lib --bins
-  cargo clippy --workspace --all-targets $(sh scripts/test-features.sh)
-  cargo check --workspace --all-targets $(sh scripts/test-features.sh)
-  # The store keeps its own lints, not the workspace's; its warnings and
-  # rustdoc's are denied here (an intra-doc link to a private item is one).
-  cargo clippy -p pdn-store --all-targets -- -Dwarnings
-  # Private items too: most docs sit on them, and a link there that no longer
-  # resolves is otherwise seen by nothing.
-  RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)
+  # The checks live in `check` alone, so the two recipes cannot drift apart.
+  just check
 
 # Every test of the HTTP surface is a container test: needs a container
 # daemon and builds the image. `clean-stale --init` marks an unmarked target/, so a first
