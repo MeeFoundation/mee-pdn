@@ -6,6 +6,15 @@ name: load
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: the profile under sync-test/profiles; only ci joins the compared history
+        type: choice
+        options: [ci, smoke, pilot-100k]
+        default: ci
+      extra:
+        description: load.py arguments after the profile's, e.g. --n 100 --v 2000
+        type: string
+        default: ''
       publish:
         description: add the run to the load-history branch
         type: boolean
@@ -61,14 +70,16 @@ jobs:
         run: echo "RUN_ID=ci-$(date -u +%Y%m%d)-${{ github.run_number }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
 
       - name: Run the load test
-        run: just load --container --run "$RUN_ID"
+        env:
+          EXTRA: ${{ inputs.extra }}
+        run: just load --container --profile "${{ inputs.profile }}" --run "$RUN_ID" -- $EXTRA
 
       # A ramp that stopped or failed is reported all the same: how far each N got is what the report leads with.
       - name: Report, and publish to load-history
         if: ${{ !cancelled() && env.RUN_ID != '' }}
         env:
           PUSH: ${{ inputs.publish && 'push' || '' }}
-        run: sh sync-test/publish.sh "sync-test/runs/$RUN_ID-ramp-plain" $PUSH
+        run: sh sync-test/publish.sh "sync-test/runs/$RUN_ID-${{ inputs.profile }}-plain" $PUSH
 
       # The events, the nodes' logs and a stalled ramp's evidence: what a regression in the report needs looked at.
       - name: Keep the run

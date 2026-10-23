@@ -1,0 +1,6 @@
+# The profile the CI history compares: a run with other arguments starts a history of its own, so a change here is
+# a new baseline, not a regression.
+--ramp 20
+--n 2,4,8,16,12,24
+--v 20000
+--s 256
