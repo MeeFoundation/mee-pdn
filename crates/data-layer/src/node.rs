@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     net::IpAddr,
+    num::NonZeroU32,
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
     time::Duration,
@@ -196,6 +197,11 @@ async fn hold_blob_stream(
 /// permanently.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a join after a departure waits for the membership view to show
+/// the join before the record store starts: one session with the inviter
+/// and the joined event's payload after it, on a reachable inviter.
+const JOIN_VIEW_WAIT: Duration = Duration::from_secs(5);
+
 /// Default of [`SpawnOptions::pod_reconcile_interval`]: a pod store's
 /// writes arrive over its swarm, and its pass catches up what gossip lost.
 const POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
@@ -242,7 +248,10 @@ const BLOB_STORE_IDLE_WAIT: Duration = Duration::from_secs(5);
 /// Bidirectional streams a peer holds open on one connection, the
 /// transport's default. A blob request takes one, so it is also how many
 /// payloads an engine fetches from one provider at once.
-const MAX_BI_STREAMS: u32 = 100;
+const MAX_BI_STREAMS: NonZeroU32 = match NonZeroU32::new(100) {
+    Some(count) => count,
+    None => NonZeroU32::MIN,
+};
 
 /// Unidirectional streams a peer holds open on one connection. Gossip keeps
 /// one per swarm topic two nodes share, a pod's stores are two, and a sender
@@ -529,6 +538,11 @@ struct HostedStack {
     /// Pods whose membership view the last run of the pass found listing
     /// nobody.
     found_empty: Mutex<HashSet<PodId>>,
+    /// Pods whose start is in flight: their stores are first started by
+    /// that start alone, so a subscription it attaches sees the first
+    /// session whole and the record store's dial queues behind the
+    /// membership store's.
+    starting_pods: Mutex<HashSet<PodId>>,
     /// One per pod, held through each derivation of that pod's contacts,
     /// from its membership view to its last write: one that read the view
     /// before a change would otherwise set its list after the one that read
@@ -538,6 +552,23 @@ struct HostedStack {
 }
 
 impl HostedStack {
+    /// Holds `pod` out of the passes' reach until the guard drops.
+    #[must_use]
+    fn starting(&self, pod: PodId) -> StartingPod<'_> {
+        self.starting_pods
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pod);
+        StartingPod { stack: self, pod }
+    }
+
+    fn is_starting(&self, pod: PodId) -> bool {
+        self.starting_pods
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&pod)
+    }
+
     /// `pod`'s derivation lock. A map of locks holds no state a panic
     /// could leave half-written, so a poisoned one is used as it stands.
     fn pod_derivation(&self, pod: PodId) -> Arc<tokio::sync::Mutex<()>> {
@@ -998,6 +1029,7 @@ impl SyncNode {
             announcements_in_flight: Mutex::new(HashSet::new()),
             converged_tombstones: Mutex::new(HashSet::new()),
             found_empty: Mutex::new(HashSet::new()),
+            starting_pods: Mutex::new(HashSet::new()),
             pod_derivations: Mutex::new(HashMap::new()),
             notices: Arc::clone(&self.pod_notices),
         });
@@ -1298,6 +1330,7 @@ impl SyncNode {
                 "identity {identity} already holds pod {pod}"
             ));
         }
+        let _starting = stack.starting(pod);
         let membership = stack.api.create().await?;
         let records = match self.create_pod_records(&stack).await {
             Ok(records) => records,
@@ -1334,8 +1367,9 @@ impl SyncNode {
             stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
             Self::order_pod_stores(&stack, &membership, &records).await?;
             self.watch_pod(&stack, pod, &membership);
-            start_pod_store(&membership, Vec::new(), stack.identity(), true).await?;
-            start_pod_store(&records, Vec::new(), stack.identity(), true).await
+            start_pod_store(&membership, Vec::new(), stack.identity(), true, None).await?;
+            start_pod_store(&records, Vec::new(), stack.identity(), true, None).await?;
+            Ok(())
         }
         .await;
         if let Err(err) = started {
@@ -1491,7 +1525,70 @@ impl SyncNode {
         tickets: PodTickets,
         others: &[PodTickets],
     ) -> Result<PodCatchUp> {
+        let (caught_up, _observation) = self
+            .import_pod_observing(identity, pod, tickets, others, None)
+            .await?;
+        Ok(caught_up)
+    }
+
+    /// [`import_pod_with`](Self::import_pod_with) with each store's sync
+    /// started with an ordered subscription of `capacity` attached; a store
+    /// whose sync already runs gets the one [`Doc::observe`] gives.
+    #[cfg(feature = "test-util")]
+    pub async fn import_pod_observed_for_test(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        tickets: PodTickets,
+        others: &[PodTickets],
+        capacity: usize,
+    ) -> Result<(PodCatchUp, PodObservation)> {
+        let (caught_up, observation) = self
+            .import_pod_observing(identity, pod, tickets, others, Some(capacity))
+            .await?;
+        let (membership, records) =
+            observation.context("an observed import started no subscription")?;
+        Ok((
+            caught_up,
+            PodObservation {
+                membership,
+                records: Some(records),
+            },
+        ))
+    }
+
+    /// The ordered subscription of each store of `pod` `identity` holds,
+    /// `records` `None` on a tombstone. [`UnknownPod`] for a pod not held.
+    #[cfg(feature = "test-util")]
+    pub async fn observe_pod_for_test(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        capacity: usize,
+    ) -> Result<PodObservation> {
         let stack = self.require(identity)?;
+        let held = stack.registry.pod(pod)?.ok_or(UnknownPod { pod })?;
+        let membership: OrderedEvents = Box::pin(held.membership.observe(capacity).await?);
+        let records: Option<OrderedEvents> = match held.records {
+            Some(records) => Some(Box::pin(records.observe(capacity).await?)),
+            None => None,
+        };
+        Ok(PodObservation {
+            membership,
+            records,
+        })
+    }
+
+    async fn import_pod_observing(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        tickets: PodTickets,
+        others: &[PodTickets],
+        observe: Option<usize>,
+    ) -> Result<(PodCatchUp, Option<(OrderedEvents, OrderedEvents)>)> {
+        let stack = self.require(identity)?;
+        let _starting = stack.starting(pod);
         let held = Self::admit_pod_tickets(&stack, pod, &tickets)?;
         let membership_contacts = contacts_of(
             &tickets.membership,
@@ -1502,7 +1599,7 @@ impl SyncNode {
         if let Some(held) = held {
             return match held.records {
                 Some(records) => {
-                    self.start_pod(&stack, pod, &held.membership, &records)
+                    self.start_pod(&stack, pod, &held.membership, &records, observe)
                         .await
                 }
                 None => {
@@ -1512,6 +1609,7 @@ impl SyncNode {
                         &held.membership,
                         tickets.records,
                         records_contacts,
+                        observe,
                     )
                     .await
                 }
@@ -1534,20 +1632,15 @@ impl SyncNode {
                 records: Some(records.clone()),
             },
         )?;
-        stack.track(
-            &membership,
-            membership_contacts,
-            SyncStrategy::Swarm,
-            membership_minted_by,
-        )?;
-        stack.track(
-            &records,
-            records_contacts,
-            SyncStrategy::Swarm,
-            records_minted_by,
-        )?;
+        for (doc, contacts, minted_by) in [
+            (&membership, membership_contacts, membership_minted_by),
+            (&records, records_contacts, records_minted_by),
+        ] {
+            stack.track(doc, contacts, SyncStrategy::Swarm, minted_by)?;
+        }
         self.watch_pod(&stack, pod, &membership);
-        self.start_pod(&stack, pod, &membership, &records).await
+        self.start_pod(&stack, pod, &membership, &records, observe)
+            .await
     }
 
     /// A join after a departure: the record store imported again beside the
@@ -1559,14 +1652,16 @@ impl SyncNode {
         membership: &Doc,
         ticket: DocTicket,
         contacts: Vec<Contact>,
-    ) -> Result<PodCatchUp> {
+        observe: Option<usize>,
+    ) -> Result<(PodCatchUp, Option<(OrderedEvents, OrderedEvents)>)> {
         Self::guard_pod_import(stack, ticket.capability.id())?;
         let minted_by = ticket.identity;
         let records = stack.api.import_namespace(ticket.capability).await?;
         stack.registry.set_pod_records(pod, Some(records.clone()))?;
         stack.track(&records, contacts, SyncStrategy::Swarm, minted_by)?;
         stack.set_strategy(membership.id(), SyncStrategy::Swarm)?;
-        self.start_pod(stack, pod, membership, &records).await
+        self.start_pod(stack, pod, membership, &records, observe)
+            .await
     }
 
     fn watch_pod(&self, stack: &Arc<HostedStack>, pod: PodId, membership: &Doc) {
@@ -1576,14 +1671,16 @@ impl SyncNode {
 
     /// Start both tracked stores' sync, the record store's every dial
     /// ordered after the membership store's, behind a wait for the first
-    /// session of each that this start brings.
+    /// session of each that this start brings. With `observe`, each start
+    /// carries an ordered subscription of that capacity, returned beside.
     async fn start_pod(
         &self,
         stack: &HostedStack,
         pod: PodId,
         membership: &Doc,
         records: &Doc,
-    ) -> Result<PodCatchUp> {
+        observe: Option<usize>,
+    ) -> Result<(PodCatchUp, Option<(OrderedEvents, OrderedEvents)>)> {
         let held = PodBinding {
             membership: membership.clone(),
             records: Some(records.clone()),
@@ -1608,11 +1705,12 @@ impl SyncNode {
         // derives both stores' contacts again, from a membership view that
         // can list no device of the inviter yet, and the record store would
         // start with none.
-        let (membership, records) = (
+        let (tracked_membership, tracked_records) = (
             stack.tracked(membership.id())?,
             stack.tracked(records.id())?,
         );
-        Self::start_tracked(membership).await?;
+        let membership_events = Self::start_tracked(tracked_membership, observe).await?;
+        self.await_own_membership(stack, pod, membership).await?;
         #[cfg(feature = "test-util")]
         {
             let pause = self
@@ -1625,8 +1723,33 @@ impl SyncNode {
                 pause.release.notified().await;
             }
         }
-        Self::start_tracked(records).await?;
-        Ok(caught_up)
+        let records_events = Self::start_tracked(tracked_records, observe).await?;
+        Ok((caught_up, membership_events.zip(records_events)))
+    }
+
+    /// A join after a departure: wait, at most [`JOIN_VIEW_WAIT`], for the
+    /// membership view to show the join, which the membership store's
+    /// session with the inviter brings and its payload completes. Started
+    /// before that, the record store's first session is judged by the
+    /// departure and takes nothing, and the join's catch-up counts it.
+    async fn await_own_membership(
+        &self,
+        stack: &HostedStack,
+        pod: PodId,
+        membership: &Doc,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + JOIN_VIEW_WAIT;
+        loop {
+            let view = stack.access.membership_view(pod, membership).await?;
+            let departed = view
+                .member(&stack.identity)
+                .and_then(Member::departed_at)
+                .is_some();
+            if !departed || tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Drop both of `pod`'s stores and its registration, as if the pod
@@ -1653,16 +1776,21 @@ impl SyncNode {
     }
 
     /// Start a tracked pod store's sync with the contacts and the default
-    /// identity it is tracked with.
-    async fn start_tracked(tracked: Option<TrackedDoc>) -> Result<()> {
+    /// identity it is tracked with, with an ordered subscription of
+    /// `observe`'s capacity attached when asked.
+    async fn start_tracked(
+        tracked: Option<TrackedDoc>,
+        observe: Option<usize>,
+    ) -> Result<Option<OrderedEvents>> {
         let Some(tracked) = tracked else {
-            return Ok(());
+            return Ok(None);
         };
         start_pod_store(
             &tracked.doc,
             tracked.contacts,
             tracked.default_identity,
             true,
+            observe,
         )
         .await
     }
@@ -1753,6 +1881,7 @@ impl SyncNode {
         if stack.registry.pod(pod)?.is_some() {
             return Ok(());
         }
+        let _starting = stack.starting(pod);
         Self::guard_pod_import(&stack, membership.capability.id())?;
         let contacts = contacts_of(&membership, others.iter())?;
         let minted_by = membership.identity;
@@ -1776,7 +1905,8 @@ impl SyncNode {
             .tracked(doc.id())?
             .map(|tracked| tracked.contacts)
             .unwrap_or_default();
-        start_pod_store(&doc, contacts, minted_by, false).await
+        start_pod_store(&doc, contacts, minted_by, false, None).await?;
+        Ok(())
     }
 
     /// The pods `identity` holds here, each with whether its record store
@@ -1943,6 +2073,28 @@ impl SyncNode {
     /// too.
     pub async fn pod_record_view(&self, identity: PdnId, pod: PodId) -> Result<RecordView> {
         self.record_view(identity, pod, Query::all()).await
+    }
+
+    /// Every entry of [`pod_record_view`](Self::pod_record_view) with its
+    /// verdict and, when it has arrived and `payloads` asks for it, its
+    /// payload; without `payloads` no blob is read.
+    #[cfg(feature = "test-util")]
+    pub async fn pod_record_listing_for_test(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        payloads: bool,
+    ) -> Result<Vec<(crate::RecordEntry, crate::Verdict, Option<Vec<u8>>)>> {
+        let view = self.pod_record_view(identity, pod).await?;
+        let mut listing = Vec::new();
+        for (entry, verdict) in view.verdicts() {
+            let payload = match entry.payload {
+                Some(hash) if payloads => Some(self.blobs.get_bytes(hash).await?.to_vec()),
+                _ => None,
+            };
+            listing.push((entry.clone(), verdict, payload));
+        }
+        Ok(listing)
     }
 
     /// [`pod_record_view`](Self::pod_record_view) over `record`'s own
@@ -3318,7 +3470,7 @@ async fn bind_endpoint(
         ))
         .transport_config(
             QuicTransportConfig::builder()
-                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BI_STREAMS))
+                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BI_STREAMS.get()))
                 .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
                 .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
                 .build(),
@@ -3481,6 +3633,9 @@ async fn pod_reconcile_pass(
                 continue;
             };
             for (pod, held) in pods {
+                if stack.is_starting(pod) {
+                    continue;
+                }
                 reconcile_pod(stack, node, pod, &held, &probes).await;
             }
         }
@@ -3544,7 +3699,14 @@ async fn sync_pod_store(
     contacts: Vec<Contact>,
 ) -> Result<()> {
     let swarm = tracked.strategy == SyncStrategy::Swarm;
-    start_pod_store(&tracked.doc, contacts, tracked.default_identity, swarm).await?;
+    start_pod_store(
+        &tracked.doc,
+        contacts,
+        tracked.default_identity,
+        swarm,
+        None,
+    )
+    .await?;
     let turned_out = stack
         .tracked(tracked.doc.id())?
         .is_some_and(|now| now.strategy == SyncStrategy::ContactsOnly);
@@ -3557,14 +3719,36 @@ async fn sync_pod_store(
 /// Start, or run again, a pod store's sync with `contacts` alone: a peer
 /// the engine recorded is a node the membership derivation may leave out —
 /// a former member's device, or a member's a converged tombstone is done with.
+/// With `observe`, the start carries an ordered subscription of that
+/// capacity, returned; the one start for the product's path and the
+/// observed one, so their arguments cannot differ.
 async fn start_pod_store(
     doc: &Doc,
     contacts: Vec<Contact>,
     default_identity: Identity,
     join_gossip: bool,
-) -> Result<()> {
-    doc.sync_with_peers(contacts, Vec::new(), default_identity, join_gossip)
-        .await
+    observe: Option<usize>,
+) -> Result<Option<OrderedEvents>> {
+    let Some(capacity) = observe else {
+        doc.sync_with_peers(contacts, Vec::new(), default_identity, join_gossip)
+            .await?;
+        return Ok(None);
+    };
+    #[cfg(not(feature = "test-util"))]
+    anyhow::bail!("an ordered subscription of {capacity} events needs the test-util build");
+    #[cfg(feature = "test-util")]
+    {
+        let events = doc
+            .sync_with_peers_observed(
+                contacts,
+                Vec::new(),
+                default_identity,
+                join_gossip,
+                capacity,
+            )
+            .await?;
+        Ok(Some(Box::pin(events)))
+    }
 }
 
 /// What a derivation found of the identity's own standing.
@@ -3737,6 +3921,9 @@ async fn dial_own_devices(stack: &HostedStack, node: EndpointId, devices: &[Node
         return;
     };
     for (pod, held) in pods {
+        if stack.is_starting(pod) {
+            continue;
+        }
         derive_pod_contacts(stack, node, pod, &held, &[]).await;
         for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
             let Ok(Some(tracked)) = stack.tracked(doc.id()) else {
@@ -3801,6 +3988,17 @@ fn watch_pod_membership(
             };
             let met: Vec<Identity> = seen.met.iter().map(|(_peer, identity)| *identity).collect();
             let derived = derive_pod_contacts(&stack, node, pod, &held, &met).await;
+            // A start in flight first starts the record store itself, once
+            // the view shows the join; dialed here before, its first
+            // session is judged by the departure.
+            let held = if stack.is_starting(pod) {
+                PodBinding {
+                    records: None,
+                    ..held
+                }
+            } else {
+                held
+            };
             let again = seen.brought();
             if derived.departed && !again.is_empty() {
                 if let Err(err) = dial_again(&stack, &held, again).await {
@@ -3817,6 +4015,22 @@ fn watch_pod_membership(
             departed = derived.departed;
         }
     });
+}
+
+/// A pod's start in flight, held by [`HostedStack::starting`].
+struct StartingPod<'a> {
+    stack: &'a HostedStack,
+    pod: PodId,
+}
+
+impl Drop for StartingPod<'_> {
+    fn drop(&mut self) {
+        self.stack
+            .starting_pods
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.pod);
+    }
 }
 
 /// What a membership store's watcher has seen of its sessions.
@@ -4327,6 +4541,17 @@ async fn entries_without_payload(
         }
     }
     Ok(missing)
+}
+
+/// A store's ordered subscription (the change subscription spec).
+pub type OrderedEvents = futures_lite::stream::Boxed<Result<pdn_store::engine::LiveEvent>>;
+
+/// The ordered subscription of each store of one pod an identity holds;
+/// `records` is `None` on a tombstone.
+#[cfg(feature = "test-util")]
+pub struct PodObservation {
+    pub membership: OrderedEvents,
+    pub records: Option<OrderedEvents>,
 }
 
 /// The hold [`SyncNode::pause_next_pod_start_for_test`] puts on a pod

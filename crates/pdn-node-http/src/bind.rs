@@ -3,9 +3,14 @@
 //! would come up on loopback and look like an unreachable peer, a mistyped
 //! flag would look like a renamed route.
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result};
+use pdn_node::{Connectivity, SpawnOptions};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 
@@ -45,24 +50,93 @@ pub fn bind_addr_from_env() -> Result<SocketAddr> {
 
 /// `PDN_DEBUG`: a closed set of values, unset meaning off.
 pub fn debug_enabled(raw: Option<&str>) -> Result<bool> {
-    match raw {
-        Some("1" | "true") => Ok(true),
-        None | Some("0" | "false") => Ok(false),
-        Some(other) => Err(anyhow::anyhow!(
-            "PDN_DEBUG must be one of 1, true, 0, false, or unset — got {other:?}"
-        )),
-    }
+    flag("PDN_DEBUG", raw)
 }
 
 pub fn debug_enabled_from_env() -> Result<bool> {
     debug_enabled(env("PDN_DEBUG")?.as_deref())
 }
 
+/// `PDN_ANY_ORIGIN`: the debug subtree's cross-origin headers, the same
+/// closed set as `PDN_DEBUG`, unset meaning off. Off, a page of another
+/// origin cannot read what the subtree answers; the demo turns it on.
+pub fn any_origin(raw: Option<&str>) -> Result<bool> {
+    flag("PDN_ANY_ORIGIN", raw)
+}
+
+pub fn any_origin_from_env() -> Result<bool> {
+    any_origin(env("PDN_ANY_ORIGIN")?.as_deref())
+}
+
+fn flag(name: &str, raw: Option<&str>) -> Result<bool> {
+    match raw {
+        Some("1" | "true") => Ok(true),
+        None | Some("0" | "false") => Ok(false),
+        Some(other) => Err(anyhow::anyhow!(
+            "{name} must be one of 1, true, 0, false, or unset — got {other:?}"
+        )),
+    }
+}
+
+/// `PDN_CONNECTIVITY`: a closed set of values, unset meaning `direct`.
+/// Every value past `direct` routes through infrastructure this project does
+/// not run, so a host reaches it only when told to — the container stand
+/// binds direct paths and the demonstration stand names `product`, whose
+/// peers are devices that move between networks.
+pub fn connectivity(raw: Option<&str>) -> Result<Connectivity> {
+    match raw {
+        None | Some("direct") => Ok(Connectivity::Direct),
+        Some("relays") => Ok(Connectivity::Relays),
+        Some("product") => Ok(Connectivity::RelaysAndAddressLookup),
+        Some(other) => Err(anyhow::anyhow!(
+            "PDN_CONNECTIVITY must be one of direct, relays, product, or unset — got {other:?}"
+        )),
+    }
+}
+
+pub fn connectivity_from_env() -> Result<Connectivity> {
+    connectivity(env("PDN_CONNECTIVITY")?.as_deref())
+}
+
+/// `PDN_POD_RECONCILE_INTERVAL_SECS`: `None` unset, leaving the runtime's
+/// default.
+pub fn pod_reconcile_interval(raw: Option<&str>) -> Result<Option<Duration>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Some(Duration::from_secs(secs))),
+        _ => Err(anyhow::anyhow!(
+            "PDN_POD_RECONCILE_INTERVAL_SECS must be a positive whole number of seconds — got {raw:?}"
+        )),
+    }
+}
+
+pub fn pod_reconcile_interval_from_env() -> Result<Option<Duration>> {
+    pod_reconcile_interval(env("PDN_POD_RECONCILE_INTERVAL_SECS")?.as_deref())
+}
+
+/// The runtime's spawn options from the host's parsed settings.
+pub fn spawn_options(
+    data_dir: PathBuf,
+    connectivity: Connectivity,
+    pod_reconcile_interval: Option<Duration>,
+) -> SpawnOptions {
+    let options = SpawnOptions {
+        connectivity,
+        ..SpawnOptions::on_directory(data_dir)
+    };
+    SpawnOptions {
+        pod_reconcile_interval: pod_reconcile_interval.unwrap_or(options.pod_reconcile_interval),
+        ..options
+    }
+}
+
 /// `PDN_DATA_DIR`, required: a host started without a directory would
 /// promise persistence while holding everything in RAM.
-pub fn data_dir(raw: Option<&str>) -> Result<std::path::PathBuf> {
+pub fn data_dir(raw: Option<&str>) -> Result<PathBuf> {
     match raw {
-        Some(dir) if !dir.is_empty() => Ok(std::path::PathBuf::from(dir)),
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
         Some(_) | None => Err(anyhow::anyhow!(
             "PDN_DATA_DIR is not set — the host requires the runtime's storage directory \
              and offers no in-memory mode"
@@ -70,7 +144,7 @@ pub fn data_dir(raw: Option<&str>) -> Result<std::path::PathBuf> {
     }
 }
 
-pub fn data_dir_from_env() -> Result<std::path::PathBuf> {
+pub fn data_dir_from_env() -> Result<PathBuf> {
     data_dir(env("PDN_DATA_DIR")?.as_deref())
 }
 
@@ -123,10 +197,38 @@ mod tests {
         assert!(bind_addr(Some("not a host"), None).is_err());
     }
 
-    /// An unset `PDN_DEBUG` leaves the debug subtree off.
+    /// An unset `PDN_CONNECTIVITY` is direct paths, each named value is
+    /// its connectivity, and a value outside the closed set fails the start.
+    #[test]
+    fn connectivity_is_direct_unless_named() {
+        assert_eq!(connectivity(None).unwrap(), Connectivity::Direct);
+        assert_eq!(connectivity(Some("direct")).unwrap(), Connectivity::Direct);
+        assert_eq!(connectivity(Some("relays")).unwrap(), Connectivity::Relays);
+        assert_eq!(
+            connectivity(Some("product")).unwrap(),
+            Connectivity::RelaysAndAddressLookup
+        );
+        assert!(connectivity(Some("relay")).is_err());
+    }
+
+    /// An unset `PDN_DEBUG` leaves the debug subtree off, and an unset
+    /// `PDN_ANY_ORIGIN` leaves its cross-origin headers off.
     #[test]
     fn nothing_configured_is_off() {
         assert!(!debug_enabled(None).unwrap());
+        assert!(!any_origin(None).unwrap());
+    }
+
+    /// `PDN_ANY_ORIGIN` takes the closed set `PDN_DEBUG` takes, and a value
+    /// outside it fails the start naming the variable.
+    #[test]
+    fn any_origin_takes_the_debug_flags_values() {
+        assert!(any_origin(Some("1")).unwrap());
+        assert!(any_origin(Some("true")).unwrap());
+        assert!(!any_origin(Some("0")).unwrap());
+        assert!(!any_origin(Some("false")).unwrap());
+        let err = any_origin(Some("yes")).unwrap_err();
+        assert!(err.to_string().contains("PDN_ANY_ORIGIN"), "{err}");
     }
 
     /// `PDN_DEBUG` set to `1` or `true` turns the debug subtree on, and `0`
@@ -166,7 +268,44 @@ mod tests {
     fn a_configured_data_dir_is_taken_as_given() {
         assert_eq!(
             data_dir(Some("/var/lib/pdn")).unwrap(),
-            std::path::PathBuf::from("/var/lib/pdn")
+            PathBuf::from("/var/lib/pdn")
         );
+    }
+
+    /// An unset `PDN_POD_RECONCILE_INTERVAL_SECS` parses as none, and the
+    /// spawn options then keep the runtime's own pod interval.
+    #[test]
+    fn an_unset_pod_interval_leaves_the_runtimes_default() {
+        assert_eq!(pod_reconcile_interval(None).unwrap(), None);
+        let options = spawn_options(PathBuf::from("/var/lib/pdn"), Connectivity::Direct, None);
+        assert_eq!(options.pod_reconcile_interval, Duration::from_secs(300));
+    }
+
+    /// A configured pod interval reaches the spawn options as given, beside
+    /// the connectivity named.
+    #[test]
+    fn a_configured_pod_interval_is_the_runtimes() {
+        let interval = pod_reconcile_interval(Some("30")).unwrap();
+        assert_eq!(interval, Some(Duration::from_secs(30)));
+        let options = spawn_options(
+            PathBuf::from("/var/lib/pdn"),
+            Connectivity::Relays,
+            interval,
+        );
+        assert_eq!(options.pod_reconcile_interval, Duration::from_secs(30));
+        assert_eq!(options.connectivity, Connectivity::Relays);
+    }
+
+    /// A pod interval of zero, a negative one, one with a unit, or an empty
+    /// one fails the start, the error naming the variable.
+    #[test]
+    fn a_pod_interval_that_is_no_positive_whole_number_fails_naming_the_variable() {
+        for raw in ["0", "-5", "30s", ""] {
+            let err = pod_reconcile_interval(Some(raw)).unwrap_err();
+            assert!(
+                err.to_string().contains("PDN_POD_RECONCILE_INTERVAL_SECS"),
+                "the refusal of {raw:?} must name the variable: {err}"
+            );
+        }
     }
 }

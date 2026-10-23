@@ -10,6 +10,11 @@ rust-version = "1.91"
 # The platform's own variant of n0's `iroh-docs` (ADR-0016): never on crates.io.
 publish = false
 
+[features]
+# The ordered subscription and the session id a load test observes a pod's
+# sync by; never the product. `data-layer/test-util` turns it on.
+observation = []
+
 [dependencies]
 anyhow = "1"
 async-channel = "2.3.1"
@@ -73,3 +78,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [lints.rust]
 missing_debug_implementations = "warn"
+
+[[test]]
+name = "observe"
+required-features = ["observation"]

@@ -1,14 +1,38 @@
 #!/bin/sh
-# The test-util feature flag for a cargo arg list. `pdn-node/test-util`
-# enables the runtime's fault and pause hooks and turns on
-# `data-layer/test-util`, data-layer's observation surface, under it. A
-# selection gets the flag of the package it names, because cargo rejects a feature of a package it leaves
-# out; one naming neither gets nothing — the scenarios that need the surface
-# live in these two crates. Dev builds only — never a product build.
+# The dev feature flags for a cargo arg list. `pdn-node/test-util` enables
+# the runtime's fault and pause hooks and turns on `data-layer/test-util`,
+# data-layer's observation surface, which turns on the store's ordered
+# subscription (`pdn-store/observation`); `pdn-node-http/observation`
+# serves that surface over HTTP, and `pdn-mobile/observation` on a phone's
+# loopback. A selection gets the flag of every package it names, because
+# cargo rejects a feature of a package it leaves out; one naming none of
+# them gets nothing. Dev builds only — never a product build.
 set -eu
-case " $* " in
-  *" -p pdn-node "*|*" --package pdn-node "*|*" --package=pdn-node "*) echo '--features pdn-node/test-util' ;;
-  *" -p data-layer "*|*" --package data-layer "*|*" --package=data-layer "*) echo '--features data-layer/test-util' ;;
-  *" -p "*|*" --package "*|*" --package="*) ;;
-  *) echo '--features pdn-node/test-util' ;;
-esac
+features=
+selected=false
+expecting=false
+for arg in "$@"; do
+  if $expecting; then
+    expecting=false
+    name="$arg"
+  else
+    case "$arg" in
+      -p|--package) expecting=true; selected=true; continue ;;
+      --package=*) name="${arg#--package=}"; selected=true ;;
+      *) continue ;;
+    esac
+  fi
+  case "$name" in
+    pdn-node) flag=pdn-node/test-util ;;
+    data-layer) flag=data-layer/test-util ;;
+    pdn-store|pdn-node-http|pdn-mobile) flag="$name/observation" ;;
+    *) continue ;;
+  esac
+  features="${features:+$features,}$flag"
+done
+if ! $selected; then
+  features=pdn-node/test-util,pdn-node-http/observation,pdn-mobile/observation
+fi
+if [ -n "$features" ]; then
+  echo "--features $features"
+fi

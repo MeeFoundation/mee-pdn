@@ -1,0 +1,92 @@
+# The pod load test's full collection (sync-test/load.md, "One command": `just load --container`, test L) on a
+# GitHub-hosted runner, started by hand on a ref: the ramp run is reported against the latest earlier run of the same
+# profile and joins the history GitHub Pages serves from the load-history branch, and stays an artifact.
+name: load
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: the profile under sync-test/profiles; only ci joins the compared history
+        type: choice
+        options: [ci, smoke, pilot-100k]
+        default: ci
+      extra:
+        description: load.py arguments after the profile's, e.g. --n 100 --v 2000
+        type: string
+        default: ''
+      publish:
+        description: add the run to the load-history branch
+        type: boolean
+        default: true
+
+# Two runs side by side would share the runner's cores with each other's nodes, and both would push the history.
+concurrency:
+  group: load-history
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  load:
+    runs-on: ubuntu-26.04
+    # One cold image build, then 17 minutes of ramp and up to 4 of catch-up per N: GitHub stops a hosted job at 6 hours.
+    timeout-minutes: 360
+    steps:
+      # The credentials stay for publish.sh's push to the history branch.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up buildx
+        id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          use: false
+
+      # The layer cache needs the buildx builder; the runner image below is built FROM this one by the daemon's own
+      # builder, which is the one that sees the loaded image.
+      - name: Build the node image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ops/Dockerfile
+          tags: pdn-node-http:observation
+          build-args: FEATURES=observation
+          load: true
+          cache-from: type=gha,scope=load-observation
+          cache-to: type=gha,mode=max,scope=load-observation
+
+      - name: Build the runner image
+        run: sh sync-test/container.sh runner
+
+      - name: Install just
+        uses: ./.github/actions/install-tools
+        with:
+          tools: just
+
+      - name: Name the run
+        run: echo "RUN_ID=ci-$(date -u +%Y%m%d)-${{ github.run_number }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
+
+      - name: Run the load test
+        env:
+          EXTRA: ${{ inputs.extra }}
+        run: just load --container --profile "${{ inputs.profile }}" --run "$RUN_ID" -- $EXTRA
+
+      # A ramp that stopped or failed is reported all the same: how far each N got is what the report leads with.
+      - name: Report, and publish to load-history
+        if: ${{ !cancelled() && env.RUN_ID != '' }}
+        env:
+          PUSH: ${{ inputs.publish && 'push' || '' }}
+        run: sh sync-test/publish.sh "sync-test/runs/$RUN_ID-${{ inputs.profile }}-plain" $PUSH
+
+      # The events, the nodes' logs and a stalled ramp's evidence: what a regression in the report needs looked at.
+      - name: Keep the run
+        if: ${{ always() && env.RUN_ID != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.RUN_ID }}
+          path: sync-test/runs/${{ env.RUN_ID }}-*
+          if-no-files-found: ignore
+          retention-days: 14

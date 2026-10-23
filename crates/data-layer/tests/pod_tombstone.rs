@@ -18,6 +18,7 @@ use data_layer::{
     MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace, SpawnOptions,
     SyncNode, Traced,
 };
+use pdn_store::SessionRole;
 use pdn_types::PodId;
 use test_utils::{
     join_identity,
@@ -1301,6 +1302,88 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
     }
 
     for node in [alice_phone, bob_phone, bob_laptop, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A member that joins again after it left has the records placed in its
+/// absence once the join's catch-up answers, though its own joined event's
+/// payload lands after the session that brought the event: the record
+/// store starts once the membership view shows the join, and no dial of
+/// the membership watcher starts it before. Fails with either taken out.
+/// The inviter's blob stream of the payload is held one second past the
+/// session, long enough for a record store started before the view shows
+/// the join to be judged by the departure meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_after_a_leave_catches_up_on_the_records_placed_meanwhile() -> Result<()> {
+    let (alice_phone, carol_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    let carols = vec![device_of(&carol_phone, &carol)?];
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let from_alice = tickets(&alice_phone, &alice, pod).await?;
+    carol_phone
+        .import_pod(carol.id, pod, from_alice.clone())
+        .await?;
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, PLAIN).await?);
+
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_pod(carol.id, pod).await?;
+    assert!(lists(&alice_phone, alice.id, pod, carol.id, OUT).await?);
+    let meanwhile = place_claim(&alice_phone, &alice, pod, 7).await?;
+    let rejoined = MembershipKey::Event {
+        subject: carol.id,
+        seq: Seq::new(3),
+        kind: EventKind::Joined,
+        actor: alice.id,
+        actor_seq: Seq::FIRST,
+    };
+    let join_statement = carol
+        .keys
+        .join_statement(&pod, Seq::new(3), device_of(&carol_phone, &carol)?)
+        .encode();
+    // Armed before the write: whichever session brings the event, its
+    // payload is the first stream the inviter serves.
+    let hold = alice_phone.hold_next_blob_stream_for_test();
+    let releasing = tokio::spawn({
+        let hold = std::sync::Arc::clone(&hold);
+        async move {
+            let _ = tokio::time::timeout(TIMEOUT, hold.reached.notified()).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            hold.release.notify_one();
+            std::time::Instant::now()
+        }
+    });
+    let mut traces = carol_phone.take_session_traces().context("taken once")?;
+    let records = from_alice.records.capability.id();
+    write(&alice_phone, &alice, pod, rejoined, join_statement).await?;
+    carol_phone
+        .import_pod(carol.id, pod, from_alice)
+        .await?
+        .wait(TIMEOUT)
+        .await?;
+    let caught_up = carol_phone
+        .pod_record_view(carol.id, pod)
+        .await?
+        .placed(&meanwhile)
+        .is_some();
+    let released = releasing.await?;
+    assert!(
+        caught_up,
+        "the join answered without the record placed in the member's absence"
+    );
+    // The inviter's own dials of the record store meanwhile are denied and
+    // count for nothing; a dial of this device's is a start before the join.
+    while let Ok(trace) = traces.try_recv() {
+        assert!(
+            trace.namespace != records || trace.role != SessionRole::Dial || trace.at >= released,
+            "the record store dialed while the view showed the departure: {trace:?}"
+        );
+    }
+
+    for node in [alice_phone, carol_phone] {
         node.shutdown().await?;
     }
     Ok(())

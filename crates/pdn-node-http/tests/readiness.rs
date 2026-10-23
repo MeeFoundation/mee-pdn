@@ -20,7 +20,7 @@ use tower::ServiceExt as _;
 #[tokio::test(flavor = "multi_thread")]
 async fn live_stays_up_while_ready_times_out_on_the_state_lock() -> Result<()> {
     let runtime = Arc::new(Runtime::spawn(SpawnOptions::memory()).await?);
-    let app = router(Arc::clone(&runtime), false);
+    let app = router(Arc::clone(&runtime), false, false);
     let acquired = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let lock_holder = {

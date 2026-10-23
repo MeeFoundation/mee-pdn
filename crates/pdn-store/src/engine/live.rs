@@ -16,6 +16,7 @@ use iroh_blobs::{
         fsm::{AtBlobHeaderNextError, DecodeError},
         GetError,
     },
+    protocol::GetRequest,
     util::connection_pool::{self, ConnectionPool},
     Hash, HashAndFormat,
 };
@@ -38,8 +39,9 @@ use crate::{
     actor::SyncHandle,
     engine::gossip::GossipState,
     net::{
-        connect_and_sync_asking, handle_in_process_session, handle_session, AbortReason,
-        AcceptError, AcceptOutcome, ConnectError, SessionOpening, SyncFinished,
+        connect_and_sync_asking, handle_in_process_session, handle_session, session_id,
+        AbortReason, AcceptError, AcceptOutcome, ConnectError, SessionId, SessionOpening,
+        SyncFinished,
     },
     subscribers::{Delivery, LagNotice, Subscribers},
     AuthorHeads, Contact, ContentStatus, Identity, NamespaceId, SignedEntry,
@@ -125,6 +127,10 @@ pub(crate) enum ToLiveActor {
         /// its swarm — the data layer's pod tombstone — syncs without
         /// joining it.
         join_gossip: bool,
+        /// An ordered subscriber, registered before the replica is opened
+        /// for sync and before the first dial.
+        #[debug("observer")]
+        observer: Option<async_channel::Sender<Event>>,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
     },
@@ -142,6 +148,16 @@ pub(crate) enum ToLiveActor {
         reply: sync::oneshot::Sender<()>,
     },
     Subscribe {
+        namespace: NamespaceId,
+        #[debug("sender")]
+        sender: async_channel::Sender<Event>,
+        #[debug("oneshot::Sender")]
+        reply: sync::oneshot::Sender<Result<()>>,
+    },
+    /// An ordered subscriber; refused for a namespace not syncing, whose
+    /// inserts this actor never receives.
+    #[cfg(feature = "observation")]
+    Observe {
         namespace: NamespaceId,
         #[debug("sender")]
         sender: async_channel::Sender<Event>,
@@ -260,6 +276,13 @@ pub(crate) enum ToLiveActor {
 /// Events informing about actions of the live sync progress.
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, strum::Display)]
 pub enum Event {
+    /// A local insertion; only ordered subscribers receive it.
+    LocalInsert { entry: SignedEntry },
+    /// A remote insertion; only ordered subscribers receive it.
+    RemoteInsert {
+        from: crate::PeerIdBytes,
+        entry: SignedEntry,
+    },
     /// The content of an entry was downloaded and is now available at the local node
     ContentReady {
         /// The content hash of the newly available entry content
@@ -297,6 +320,7 @@ type SyncConnectRes = (
     PublicKey,
     Identity,
     SyncReason,
+    Option<SessionId>,
     Result<SyncFinished, ConnectError>,
 );
 /// The namespace and peer the session was opened on, then the identity it
@@ -306,6 +330,7 @@ type SyncAcceptRes = (
     NamespaceId,
     PublicKey,
     Identity,
+    Option<SessionId>,
     Result<SyncFinished, AcceptError>,
 );
 type FetchRes = (PublicKey, Hash, Outcome);
@@ -547,7 +572,7 @@ impl LiveActor {
         gossip: Gossip,
         bao_store: Store,
         held_payloads: Arc<super::held::HeldPayloads>,
-        fetches_per_provider: usize,
+        fetches_per_provider: std::num::NonZeroUsize,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         session_access: crate::filter::SessionAccessProvider,
@@ -558,11 +583,7 @@ impl LiveActor {
         let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            iroh_blobs::ALPN,
-            connection_pool::Options::default(),
-        );
+        let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, fetch_pool_options());
         Ok(Self {
             inbox,
             sync: DrainingSync::new(sync),
@@ -576,7 +597,7 @@ impl LiveActor {
             running_sync_accept: Default::default(),
             subscribers: Default::default(),
             download_tasks: Default::default(),
-            fetches: Fetches::new(fetches_per_provider),
+            fetches: Fetches::new(fetches_per_provider.get()),
             pool,
             unrouted: Vec::new(),
             state: Default::default(),
@@ -602,10 +623,11 @@ impl LiveActor {
 
     /// Best effort: the node's periodic pass over its co-located pairs
     /// reconciles whatever a request lost to a full channel would have.
-    fn ask_co_located(&self, request: crate::engine::CoLocatedRequest) {
-        if let Some(requests) = &self.co_located {
-            let _ = requests.try_send(request);
-        }
+    /// Whether the request was queued: a full channel drops it.
+    fn ask_co_located(&self, request: crate::engine::CoLocatedRequest) -> bool {
+        self.co_located
+            .as_ref()
+            .is_some_and(|requests| requests.try_send(request).is_ok())
     }
 
     /// Run the actor loop.
@@ -650,6 +672,9 @@ impl LiveActor {
                         }
                     }
                 }
+                // Before the session ends below: an ordered subscriber takes a
+                // session's inserts before its `SyncFinished` (the data layer's
+                // `change-subscription` spec).
                 event = self.sync.next_event() => {
                     trace!(?i, "tick: replica_event");
                     let event = event.context("replica_events closed")?;
@@ -659,15 +684,15 @@ impl LiveActor {
                 }
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
-                    let (namespace, peer, callee, reason, res) = res.context("running_sync_connect closed")?;
-                    self.on_sync_via_connect_finished(namespace, peer, callee, reason, res).await;
+                    let (namespace, peer, callee, reason, session, res) = res.context("running_sync_connect closed")?;
+                    self.on_sync_via_connect_finished(namespace, peer, callee, reason, session, res).await;
 
                 }
                 Some(res) = self.running_sync_accept.join_next(), if !self.running_sync_accept.is_empty() => {
                     trace!(?i, "tick: running_sync_accept");
-                    let (namespace, peer, caller, res) = res.context("running_sync_accept closed")?;
+                    let (namespace, peer, caller, session, res) = res.context("running_sync_accept closed")?;
                     self.release_peer_identity(namespace, peer, caller);
-                    self.on_sync_via_accept_finished(caller, res).await;
+                    self.on_sync_via_accept_finished(caller, session, res).await;
                 }
                 res = self.gossip.next_ended(), if !self.gossip.is_empty() => {
                     match res {
@@ -724,11 +749,18 @@ impl LiveActor {
                 recorded,
                 default_identity,
                 join_gossip,
+                observer,
                 reply,
             } => {
+                if let Some(observer) = &observer {
+                    self.subscribers.observe(namespace, observer.clone());
+                }
                 let res = self
                     .start_sync(namespace, peers, recorded, default_identity, join_gossip)
                     .await;
+                if let (Err(_), Some(observer)) = (&res, &observer) {
+                    self.subscribers.unobserve(namespace, observer);
+                }
                 reply.send(res).ok();
             }
             ToLiveActor::LeaveGossip { namespace, reply } => {
@@ -749,6 +781,20 @@ impl LiveActor {
             } => {
                 self.subscribers.subscribe(namespace, sender);
                 reply.send(Ok(())).ok();
+            }
+            #[cfg(feature = "observation")]
+            ToLiveActor::Observe {
+                namespace,
+                sender,
+                reply,
+            } => {
+                let res = if self.state.is_syncing(&namespace) {
+                    self.subscribers.observe(namespace, sender);
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("{} is not syncing", namespace.fmt_short()))
+                };
+                reply.send(res).ok();
             }
             ToLiveActor::HandleSession { conn, opening } => {
                 self.handle_session(conn, opening).await;
@@ -934,11 +980,16 @@ impl LiveActor {
         // ticket, a device record, a contact list — reaches its identity
         // inside the process or not at all.
         if peer == self.endpoint.id() {
-            self.ask_co_located(crate::engine::CoLocatedRequest::Dial {
+            let asked = self.ask_co_located(crate::engine::CoLocatedRequest::Dial {
                 namespace,
                 caller: self.identity,
                 callee,
             });
+            // A dropped request runs no exchange, so nothing else would
+            // release the dials held on this one.
+            if !asked && !self.state.is_running(&namespace, (peer, callee)) {
+                self.release_held(namespace, peer, callee);
+            }
             return;
         }
         if let Some(first) = self.prerequisites.get(&namespace).copied() {
@@ -979,6 +1030,7 @@ impl LiveActor {
             // bidirectional), so the embedder's access provider gates this
             // role exactly like the accept role, asked once the session's
             // snapshot is open.
+            let mut session = None;
             let res = connect_and_sync_asking(
                 &endpoint,
                 &sync,
@@ -987,9 +1039,10 @@ impl LiveActor {
                 caller,
                 EndpointAddr::new(peer),
                 &session_access,
+                &mut session,
             )
             .await;
-            (namespace, peer, callee, reason, res)
+            (namespace, peer, callee, reason, session, res)
         }
         .instrument(Span::current());
         self.running_sync_connect.spawn(fut);
@@ -1021,9 +1074,9 @@ impl LiveActor {
                 return;
             }
         }
-        // Announced, so a pair found busy queues a resync. The replay dials
-        // through `sync_with_peer`, which on this identity's own namespace
-        // resolves to this identity itself and reaches no co-located one.
+        // Announced, so a pair found busy queues a resync; the replay dials
+        // the pair, which on this node's own id asks the co-located
+        // identity for the exchange again.
         let reason = SyncReason::Announced;
         if !self.state.start_connect(&namespace, peer, callee, reason) {
             return;
@@ -1044,7 +1097,7 @@ impl LiveActor {
                 &session_access,
             )
             .await;
-            (namespace, peer, callee, reason, res)
+            (namespace, peer, callee, reason, None, res)
         }
         .instrument(Span::current());
         self.running_sync_connect.spawn(fut);
@@ -1405,6 +1458,7 @@ impl LiveActor {
         peer: PublicKey,
         callee: Identity,
         reason: SyncReason,
+        session: Option<SessionId>,
         result: Result<SyncFinished, ConnectError>,
     ) {
         match result {
@@ -1416,11 +1470,12 @@ impl LiveActor {
                 // it — otherwise this (namespace, peer) pair stays `Running` forever and every
                 // later sync trigger for it is silently dropped.
                 self.state.abort_connect(&namespace, peer, callee, reason);
-                // An incoming exchange that took the slot over releases the
-                // held dials when it finishes; with none, nothing else would.
-                if !self.state.is_running(&namespace, (peer, callee)) {
-                    self.release_held(namespace, peer, callee);
-                }
+                // The dials held behind this one stay held: the exchange this
+                // dial was refused for has brought nothing here yet, and a
+                // record store dialed now is judged on the membership view
+                // before it. The redial, or the incoming exchange, releases
+                // them when it finishes (`a_leave_closes_the_record_stream`
+                // in pdn-node).
                 // The remote's exchange may be one this side refuses — a
                 // replica holding nothing yet judges no caller — and then
                 // neither runs; or one that froze the remote's view before
@@ -1433,6 +1488,10 @@ impl LiveActor {
                 *streak = streak.saturating_add(1);
                 if *streak > MAX_REDIALS {
                     debug!(?reason, "redials in a row exhausted");
+                    // No redial follows, so nothing else would release them.
+                    if !self.state.is_running(&namespace, (peer, callee)) {
+                        self.release_held(namespace, peer, callee);
+                    }
                     return;
                 }
                 let delay = REDIAL_AFTER_ABORT.saturating_mul(
@@ -1456,6 +1515,7 @@ impl LiveActor {
                     peer,
                     callee,
                     Origin::Connect(reason),
+                    session,
                     res.map_err(Into::into),
                 )
                 .await;
@@ -1557,6 +1617,7 @@ impl LiveActor {
     async fn on_sync_via_accept_finished(
         &mut self,
         caller: Identity,
+        session: Option<SessionId>,
         res: Result<SyncFinished, AcceptError>,
     ) {
         match res {
@@ -1566,6 +1627,7 @@ impl LiveActor {
                     state.peer,
                     caller,
                     Origin::Accept,
+                    session,
                     Ok(state),
                 )
                 .await
@@ -1584,6 +1646,7 @@ impl LiveActor {
                         peer,
                         caller,
                         Origin::Accept,
+                        session,
                         Err(anyhow::Error::from(err)),
                     )
                     .await;
@@ -1600,6 +1663,7 @@ impl LiveActor {
         peer: PublicKey,
         counterpart: Identity,
         origin: Origin,
+        session: Option<SessionId>,
         result: Result<SyncFinished>,
     ) {
         match &result {
@@ -1690,8 +1754,12 @@ impl LiveActor {
 
         let finished = self.state.finish(&namespace, peer, counterpart, &origin);
         // A dial the tie-break superseded leaves the held dials to the
-        // exchange that took its slot over.
-        if !self.state.is_running(&namespace, (peer, counterpart)) {
+        // exchange that took its slot over, and an exchange a resync is
+        // queued behind leaves them to the resync: asked for while this
+        // one ran, the dial they follow wanted news this one may not carry
+        // (`a_remove_closes_the_removed_members_record_stream` in pdn-node).
+        let resync_queued = finished.is_some_and(|(_started, resync)| resync);
+        if !resync_queued && !self.state.is_running(&namespace, (peer, counterpart)) {
             self.release_held(namespace, peer, counterpart);
         }
         let Some((started, resync)) = finished else {
@@ -1705,6 +1773,7 @@ impl LiveActor {
             result: result_for_event,
             finished: SystemTime::now(),
             started,
+            session,
         };
         self.subscribers
             .send(&namespace, Event::SyncFinished(ev))
@@ -1724,8 +1793,11 @@ impl LiveActor {
             self.state.set_may_emit_ready(&namespace, false);
         }
 
+        // The pair's own state queued it, so the pair is dialed again: the
+        // dials held on this exchange are keyed by the counterpart, and a
+        // dial of another identity of the peer would release none of them.
         if resync {
-            self.sync_with_peer(namespace, peer, SyncReason::Resync);
+            self.sync_with_identity(namespace, peer, counterpart, SyncReason::Resync);
         }
     }
 
@@ -1922,6 +1994,31 @@ impl LiveActor {
     }
 
     async fn on_replica_event(&mut self, event: crate::Event) -> Result<()> {
+        // Before anything else: a download this event queues completes after it.
+        #[cfg(feature = "observation")]
+        match &event {
+            crate::Event::LocalInsert { namespace, entry } => {
+                self.subscribers
+                    .send_ordered(namespace, || Event::LocalInsert {
+                        entry: entry.clone(),
+                    })
+                    .await
+            }
+            crate::Event::RemoteInsert {
+                namespace,
+                entry,
+                from,
+                ..
+            } => {
+                self.subscribers
+                    .send_ordered(namespace, || Event::RemoteInsert {
+                        from: *from,
+                        entry: entry.clone(),
+                    })
+                    .await
+            }
+            crate::Event::Lagged { .. } => {}
+        }
         match event {
             crate::Event::LocalInsert { namespace, entry } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
@@ -2078,6 +2175,12 @@ impl LiveActor {
         opening: SessionOpening<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
     ) {
         let (namespace, peer, caller) = (opening.namespace(), opening.peer(), opening.caller());
+        // One key export per connection, for the observation alone.
+        let session = if cfg!(feature = "observation") {
+            session_id(&conn)
+        } else {
+            None
+        };
         let accept_request_cb = self.accept_callback();
         let sync = self.sync.handle().clone();
         self.running_sync_accept.spawn(
@@ -2086,7 +2189,7 @@ impl LiveActor {
                 // The connection outlives the session it carries: dropping
                 // it at the dispatcher would cut the streams mid-exchange.
                 drop(conn);
-                (namespace, peer, caller, res)
+                (namespace, peer, caller, session, res)
             }
             .instrument(Span::current()),
         );
@@ -2101,7 +2204,7 @@ impl LiveActor {
         self.running_sync_accept.spawn(
             async move {
                 let res = handle_in_process_session(sync, opening, accept_request_cb).await;
-                (namespace, peer, caller, res)
+                (namespace, peer, caller, None, res)
             }
             .instrument(Span::current()),
         );
@@ -2142,6 +2245,9 @@ pub struct SyncEvent {
     pub started: SystemTime,
     /// Result of the sync operation
     pub result: std::result::Result<SyncDetails, String>,
+    /// The id both ends of a session over a network connection report;
+    /// `None` in process and for a dial that never connected.
+    pub session: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -2161,35 +2267,66 @@ impl From<&SyncFinished> for SyncDetails {
     }
 }
 
+/// The product's subscribers, which take inserts from the replica itself,
+/// and the ordered ones, which take them from this actor.
 #[derive(Debug, Default)]
-struct SubscribersMap(HashMap<NamespaceId, Subscribers<Event>>);
+struct SubscribersMap {
+    all: HashMap<NamespaceId, Subscribers<Event>>,
+    ordered: HashMap<NamespaceId, Subscribers<Event>>,
+}
 
 impl SubscribersMap {
     fn subscribe(&mut self, namespace: NamespaceId, sender: async_channel::Sender<Event>) {
-        self.0
+        self.all
             .entry(namespace)
             .or_default()
             .subscribe(sender, Delivery::Lossy);
     }
 
-    async fn send(&mut self, namespace: &NamespaceId, event: Event) -> bool {
-        debug!(namespace=%namespace.fmt_short(), %event, "emit event");
-        let Some(subscribers) = self.0.get_mut(namespace) else {
-            return false;
-        };
-        subscribers.send(event).await;
-        if subscribers.is_empty() {
-            self.0.remove(namespace);
+    fn observe(&mut self, namespace: NamespaceId, sender: async_channel::Sender<Event>) {
+        self.ordered
+            .entry(namespace)
+            .or_default()
+            .subscribe(sender, Delivery::Lossy);
+    }
+
+    fn unobserve(&mut self, namespace: NamespaceId, sender: &async_channel::Sender<Event>) {
+        if let Some(subscribers) = self.ordered.get_mut(&namespace) {
+            subscribers.unsubscribe(sender);
         }
-        true
+    }
+
+    async fn send(&mut self, namespace: &NamespaceId, event: Event) {
+        debug!(namespace=%namespace.fmt_short(), %event, "emit event");
+        for map in [&mut self.all, &mut self.ordered] {
+            if let Some(subscribers) = map.get_mut(namespace) {
+                subscribers.send(event.clone()).await;
+                if subscribers.is_empty() {
+                    map.remove(namespace);
+                }
+            }
+        }
+    }
+
+    /// Builds the event only for a namespace with an ordered subscriber.
+    #[cfg(feature = "observation")]
+    async fn send_ordered(&mut self, namespace: &NamespaceId, event: impl FnOnce() -> Event) {
+        if let Some(subscribers) = self.ordered.get_mut(namespace) {
+            subscribers.send_with(event).await;
+            if subscribers.is_empty() {
+                self.ordered.remove(namespace);
+            }
+        }
     }
 
     fn remove(&mut self, namespace: &NamespaceId) {
-        self.0.remove(namespace);
+        self.all.remove(namespace);
+        self.ordered.remove(namespace);
     }
 
     fn clear(&mut self) {
-        self.0.clear();
+        self.all.clear();
+        self.ordered.clear();
     }
 }
 
@@ -2260,19 +2397,30 @@ impl QueuedHashes {
     }
 }
 
+/// The options of the pool an engine's fetches connect through: attempts to
+/// connect bounded only as connections are, as in iroh-util 0.6.0. An attempt
+/// the pool turns away fails as a connect does, which drops a provider that is
+/// no gossip neighbor (iroh-util-001).
+fn fetch_pool_options() -> connection_pool::Options {
+    let options = connection_pool::Options::default();
+    connection_pool::Options {
+        max_pending_connections: options.max_connections,
+        ..options
+    }
+}
+
 /// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
 /// [`NO_PROGRESS`] with nothing: the request's stream lives in this future,
 /// so dropping it frees the stream (iroh-blobs-006).
 async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Hash) -> Outcome {
-    let content = HashAndFormat::raw(hash);
-    match blobs.remote().local(content).await {
+    let missing = match blobs.remote().local(HashAndFormat::raw(hash)).await {
         Ok(local) if local.is_complete() => return Outcome::Held,
-        Ok(_) => {}
+        Ok(local) => local.missing(),
         Err(err) => {
             debug!(%hash, "the blob store cannot say what it holds: {err:#}");
             return Outcome::LocalFailure;
         }
-    }
+    };
     let connection =
         match n0_future::time::timeout(NO_PROGRESS, pool.get_or_connect(provider)).await {
             Ok(Ok(connection)) => connection,
@@ -2282,14 +2430,20 @@ async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Ha
             }
             Err(_elapsed) => return Outcome::Stalled,
         };
-    fetch_over(&connection, &blobs, hash).await
+    fetch_over(&connection, &blobs, missing).await
 }
 
-/// [`fetch`] over a connection to the provider.
-async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash: Hash) -> Outcome {
+/// [`fetch`] of what the blob store lacks of a payload, over a connection to
+/// the provider.
+async fn fetch_over(
+    connection: &iroh::endpoint::Connection,
+    blobs: &Store,
+    missing: GetRequest,
+) -> Outcome {
     let provider = connection.remote_id();
-    // Opened here: `fetch` reports a stream that fails to open as a failure of
-    // the local store (iroh-blobs-007).
+    let hash = missing.hash;
+    // Opened here: iroh-blobs reports a stream that fails to open as a failure
+    // of the local store (iroh-blobs-007).
     let pair = match n0_future::time::timeout(NO_PROGRESS, connection.open_bi()).await {
         Ok(Ok((send, recv))) => iroh_blobs::get::StreamPair::new(
             u64::try_from(connection.stable_id()).unwrap_or_default(),
@@ -2302,16 +2456,13 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
         }
         Err(_elapsed) => return Outcome::Stalled,
     };
-    let progress = blobs
-        .remote()
-        .fetch(pair, HashAndFormat::raw(hash))
-        .stream();
+    let progress = blobs.remote().execute_get(pair, missing).stream();
     tokio::pin!(progress);
     loop {
         match n0_future::time::timeout(NO_PROGRESS, progress.next()).await {
             Err(_elapsed) => return Outcome::Stalled,
             Ok(Some(GetProgressItem::Progress(_))) => {}
-            Ok(Some(GetProgressItem::Done(_))) => return Outcome::Fetched,
+            Ok(Some(GetProgressItem::Done(_))) => return landed(blobs, hash).await,
             Ok(Some(GetProgressItem::Error(err))) => {
                 debug!(provider = %provider.fmt_short(), %hash, "fetch failed: {err:#}");
                 return outcome_of_failure(&err);
@@ -2321,11 +2472,29 @@ async fn fetch_over(connection: &iroh::endpoint::Connection, blobs: &Store, hash
     }
 }
 
+/// What a fetch iroh-blobs reports done came to: iroh-blobs drops a failure
+/// of the blob store's last write (iroh-blobs-008).
+async fn landed(blobs: &Store, hash: Hash) -> Outcome {
+    match blobs.remote().local(HashAndFormat::raw(hash)).await {
+        Ok(local) if local.is_complete() => Outcome::Fetched,
+        Ok(_) => {
+            debug!(%hash, "a fetch reported done left the payload incomplete");
+            Outcome::LocalFailure
+        }
+        Err(err) => {
+            debug!(%hash, "the blob store cannot say what it holds: {err:#}");
+            Outcome::LocalFailure
+        }
+    }
+}
+
 /// Whose failure a fetch's error is: the node's own blob store's, the
 /// provider's answer that it lacks the payload, or the provider's.
 fn outcome_of_failure(err: &GetError) -> Outcome {
     match err {
-        GetError::LocalFailure { .. } => Outcome::LocalFailure,
+        // `IrpcSend`: the import into the blob store has failed and dropped
+        // the receiving end of what the fetch hands it (iroh-blobs-008).
+        GetError::LocalFailure { .. } | GetError::IrpcSend { .. } => Outcome::LocalFailure,
         GetError::AtBlobHeaderNext {
             source: AtBlobHeaderNextError::NotFound { .. },
             ..
@@ -2433,7 +2602,8 @@ mod tests {
         connection.closed().await;
         let store = iroh_blobs::store::mem::MemStore::new();
 
-        let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
+        let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
+        let outcome = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Failed);
 
         fetching.close().await;
@@ -2466,11 +2636,111 @@ mod tests {
             .await?;
         let store = iroh_blobs::store::mem::MemStore::new();
 
-        let outcome = fetch_over(&connection, &store, Hash::new(b"payload")).await;
+        let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
+        let outcome = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Lacks);
 
         fetching.close().await;
         provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// A payload the node's own blob store fails to write is the store's
+    /// failure, whether iroh-blobs reports its fetch done or failed
+    /// (iroh-blobs-008).
+    ///
+    /// The store's data directory is a file once the store is open, so a
+    /// payload past the 16 KiB the store keeps inline fails to land, under
+    /// root too. Its last write follows the end of the transfer for a payload
+    /// of 2 or 3 chunk groups, and comes before it for a larger one.
+    #[tokio::test]
+    async fn a_payload_the_blob_store_fails_to_write_is_a_local_failure() -> anyhow::Result<()> {
+        let held = iroh_blobs::store::mem::MemStore::new();
+        let mut payloads = Vec::new();
+        for size in [40_960, 1_048_576] {
+            payloads.push((size, held.add_bytes(vec![7u8; size]).await?.hash));
+        }
+        let provider = Router::builder(
+            Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?,
+        )
+        .accept(
+            iroh_blobs::ALPN,
+            iroh_blobs::BlobsProtocol::new(&held, None),
+        )
+        .spawn();
+        let fetching = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let connection = fetching
+            .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+            .await?;
+        let dir = tempfile::tempdir()?;
+        let store = iroh_blobs::store::fs::FsStore::load(dir.path()).await?;
+        std::fs::remove_dir_all(dir.path().join("data"))?;
+        std::fs::write(dir.path().join("data"), b"")?;
+
+        for (size, hash) in payloads {
+            let request = GetRequest::from(HashAndFormat::raw(hash));
+            let outcome = fetch_over(&connection, &store, request).await;
+            assert_eq!(outcome, Outcome::LocalFailure, "a payload of {size} bytes");
+        }
+
+        store.shutdown().await?;
+        fetching.close().await;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// Attempts to connect toward more silent peers at once than iroh-util's
+    /// own bound on pending attempts all reach the fetch pool's connect, none
+    /// turned away (iroh-util-001).
+    #[tokio::test]
+    async fn the_fetch_pool_turns_away_no_attempt_to_connect() -> anyhow::Result<()> {
+        // One past iroh-util's default of 64.
+        const PEERS: u8 = 65;
+        let lookup = MemoryLookup::new();
+        let mut silent = Vec::new();
+        let mut peers = Vec::new();
+        for seed in 0..PEERS {
+            // A socket nobody reads: the handshake toward it gets no answer.
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let peer = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+            lookup.add_endpoint_info(EndpointAddr {
+                id: peer,
+                addrs: [iroh::TransportAddr::Ip(socket.local_addr()?)]
+                    .into_iter()
+                    .collect(),
+            });
+            silent.push(socket);
+            peers.push(peer);
+        }
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .address_lookup(lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, fetch_pool_options());
+
+        let attempts = peers.iter().map(|peer| {
+            let pool = pool.clone();
+            async move { pool.get_or_connect(*peer).await }
+        });
+        let turned_away = futures_buffered::join_all(attempts)
+            .await
+            .iter()
+            .filter(|attempt| {
+                matches!(
+                    attempt,
+                    Err(connection_pool::PoolConnectError::TooManyPendingConnections { .. })
+                )
+            })
+            .count();
+        assert_eq!(turned_away, 0, "attempts turned away");
+
+        endpoint.close().await;
         Ok(())
     }
 

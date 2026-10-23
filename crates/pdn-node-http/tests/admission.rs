@@ -24,7 +24,7 @@ use tower::ServiceExt as _;
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_past_the_debug_ceiling_is_shed() -> Result<()> {
     let runtime = Arc::new(Runtime::spawn(SpawnOptions::memory()).await?);
-    let app = router(Arc::clone(&runtime), true);
+    let app = router(Arc::clone(&runtime), true, false);
     let acquired = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let lock_holder = {
@@ -43,7 +43,11 @@ async fn a_request_past_the_debug_ceiling_is_shed() -> Result<()> {
         .map(|_| {
             let app = app.clone();
             tokio::spawn(async move {
-                let request = Request::get("/debug/identities").body(Body::empty())?;
+                // The `Host` every client sends, which the subtree checks
+                // before admission.
+                let request = Request::get("/debug/identities")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())?;
                 let response = app.oneshot(request).await?;
                 anyhow::Ok(response.status())
             })

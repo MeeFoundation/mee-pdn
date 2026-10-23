@@ -13,8 +13,8 @@ description = "Data layer: document sync over our iroh-docs variant, every sessi
 # node derived instead of sleeping and guessing. The node in memory too,
 # which keeps nothing across a restart. Off in every product
 # build; `pdn-node/test-util` turns it on, and `just test -p data-layer`
-# names it directly.
-test-util = []
+# names it directly. The store's ordered subscription comes with it.
+test-util = ["pdn-store/observation"]
 
 [dependencies]
 anyhow = "1"
