@@ -77,13 +77,17 @@ build-observation-image:
 
 # The pod load test, sync-test/load.md ("One command"): test L on the laptop,
 # or in the runner image with --container as CI does. Runs land in tmp/load,
-# or in sync-test/runs with --container, as <run>-ramp-plain. Test P, with
-# the phone as r, is pdn-app's `just load`.
-[doc("Collect a full report's data for test L: the ramp with its catch-ups (--container: in the runner image)")]
+# or in sync-test/runs with --container, as <run>-<profile>-plain. The profile
+# is a file under sync-test/profiles; load.py arguments after `--` override
+# its own. Test P, with the phone as r, is pdn-app's `just load`.
+[doc("Collect a full report's data for test L: the ramp with its catch-ups (--profile ci|smoke|pilot-100k, --container: in the runner image, --cpus/--memory: its cap, -- <load.py args>)")]
+[arg("profile", long="profile")]
 [arg("container", long="container", value="true")]
 [arg("run", long="run")]
-load container="false" run="":
-  @sh sync-test/full.sh plain "{{ container }}" "{{ run }}"
+[arg("cpus", long="cpus")]
+[arg("memory", long="memory")]
+load profile="ci" container="false" run="" cpus="" memory="" *extra:
+  @sh sync-test/full.sh plain "{{ container }}" "{{ run }}" "{{ profile }}" "{{ cpus }}" "{{ memory }}" {{ extra }}
 
 # What the build context actually carries, listed against the allowed set in
 # .dockerignore. The criterion is presence — anything outside that set is a

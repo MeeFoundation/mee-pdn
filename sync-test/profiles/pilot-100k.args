@@ -1,0 +1,5 @@
+# The 100,000-record cell of the load pilot (load.md), by hand, not CI.
+--ramp 20
+--n 4
+--v 100000
+--s 256
