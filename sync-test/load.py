@@ -378,6 +378,18 @@ def request(port, method, path, body=None, timeout=STATUS_S, conn=None, raw=Fals
     return json.loads(data)
 
 
+def signal_group(proc, sig):
+    """`sig` to the process group of a node this coordinator started, unless the node has exited."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        # Exited between the poll and the signal: macOS answers EPERM for a group whose one process is not yet
+        # reaped, and until then its pid cannot be anyone else's.
+        pass
+
+
 class Node:
     offset_us = 0
 
@@ -478,16 +490,14 @@ class Node:
         return stream
 
     def stop(self):
-        if self.proc is None or self.proc.poll() is not None:
+        if self.proc is None:
             return
+        signal_group(self.proc, signal.SIGTERM)
         try:
-            os.killpg(self.pid, signal.SIGTERM)
             self.proc.wait(15)
         except subprocess.TimeoutExpired:
-            os.killpg(self.pid, signal.SIGKILL)
+            signal_group(self.proc, signal.SIGKILL)
             self.proc.wait()
-        except ProcessLookupError:
-            pass
         if self.stream:
             self.stream.close()
         self.run.live.pop(self.pid, None)
@@ -816,19 +826,13 @@ class Run:
         node is its own process group, so one interrupted wait still leaves none behind."""
         nodes = list(self.live.values())
         for node in nodes:
-            try:
-                os.killpg(node.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            signal_group(node.proc, signal.SIGTERM)
         deadline = time.monotonic() + 15
         for node in nodes:
             try:
                 node.proc.wait(max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(node.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_group(node.proc, signal.SIGKILL)
         for node in nodes:
             node.stop()
         if self.phone:
@@ -1007,11 +1011,8 @@ class Pod:
     def stop(self):
         # Signalled together, then waited for: a node takes about 2.5 s to stop, 4 minutes for 100 one by one.
         for node in self.nodes:
-            if node and node.proc is not None and node.proc.poll() is None:
-                try:
-                    os.killpg(node.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+            if node and node.proc is not None:
+                signal_group(node.proc, signal.SIGTERM)
         for node in self.nodes:
             if node:
                 node.stop()
@@ -1337,9 +1338,11 @@ def run_n(run, n):
                 if run.meta['obs_cost'] and not pod.broken and not why:
                     obs_cost(run, pod)
         finally:
-            pod.stop()
-            for node in pod.writers + ([pod.r] if pod.r else []):
-                shutil.rmtree(node.data, ignore_errors=True)
+            try:
+                pod.stop()
+            finally:
+                for node in pod.writers + ([pod.r] if pod.r else []):
+                    shutil.rmtree(node.data, ignore_errors=True)
     for path in (run.dir / 'events').glob(f'n{n}s*.jsonl'):
         with path.open('rb') as src, gzip.open(f'{path}.gz', 'wb') as dst:
             shutil.copyfileobj(src, dst)
@@ -1466,10 +1469,13 @@ def ramp(run, n, rate, to):
                                                             'listed': cell['catchup'].get('listed'),
                                                             'last_ready_s': cell['catchup'].get('last_ready_s')})
     finally:
-        pod.stop()
-        for node in pod.writers + ([pod.r] if pod.r else []):
-            shutil.rmtree(node.data, ignore_errors=True)
-        run.save()
+        # A stop that raises still leaves no stores behind: 100 nodes at 7,000 records hold 1.5 GB.
+        try:
+            pod.stop()
+        finally:
+            for node in pod.writers + ([pod.r] if pod.r else []):
+                shutil.rmtree(node.data, ignore_errors=True)
+            run.save()
 
 
 def relaunch(run):
@@ -1533,9 +1539,11 @@ def main():
                     print(f'N={n}: {e}', flush=True)
                     run.meta.setdefault('ramp_errors', []).append({'N': n, 'error': str(e)})
         finally:
-            run.stop_all()
-            run.meta.update(finished=time.time(), host_after=host_info())
-            run.save()
+            try:
+                run.stop_all()
+            finally:
+                run.meta.update(finished=time.time(), host_after=host_info())
+                run.save()
         return 1 if run.meta.get('ramp_errors') else 0
     print(f'run {run.meta["run"]} in {run.dir}; N order {run.meta["N"]}', flush=True)
     try:
@@ -1558,10 +1566,12 @@ def main():
                                 for rep in range(run.meta['repeats']):
                                     run.row(n, v, s, rep, '', not_run='node_down')
     finally:
-        run.stop_all()
-        run.meta.update(finished=time.time(), host_after=host_info())
-        run.meta['sleep_jumps'] = len(run.sampler.jumps)
-        run.save()
+        try:
+            run.stop_all()
+        finally:
+            run.meta.update(finished=time.time(), host_after=host_info())
+            run.meta['sleep_jumps'] = len(run.sampler.jumps)
+            run.save()
     return 0
 
 
