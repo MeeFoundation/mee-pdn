@@ -72,7 +72,7 @@ The container is named after the run, so `docker stop <id>-<p>-plain` ends it cl
 
 ## What a run stops on, and what is not a knob
 
-A pod's ramp stops early when `r` holds no new content for 60 s, when the median delay falls more than 30 s behind, or when a writer drops out (ten refusals in a row or its process gone), each marked in `ramp.csv` with the evidence kept under `stalled/` or `writes-failed/`. The waits, their bounds and the marks a cell can carry (`contended` above 70% host CPU, `lagged`, `incomplete`, `join_hung`, `slept`, `not_quiet`, `pod_pass`) are the table in `load.md`, "Running the matrix unattended", and constants at the top of `load.py`. They define what a cell is, so they are not arguments: a run with other windows would not compare with any other.
+A pod's ramp stops early when `r` holds no new content for 60 s, when the median delay falls more than 30 s behind, or when a writer drops out (ten refusals in a row, counted across steps, or its process gone), each marked in `ramp.csv` with the evidence kept under `stalled/` or `writes-failed/`. The waits, their bounds and the marks a cell can carry (`contended` above 70% host CPU, `lagged`, `incomplete`, `join_hung`, `slept`, `not_quiet`, `pod_pass`) are the table in `load.md`, "Running the matrix unattended", and constants at the top of `load.py`. They define what a cell is, so they are not arguments: a run with other windows would not compare with any other.
 
 ## Reading the result
 
