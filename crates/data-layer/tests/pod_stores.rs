@@ -12,7 +12,7 @@ use data_layer::{
     SyncNode, UnknownPod,
 };
 use pdn_types::{PdnId, PodId};
-use test_utils::{host_identity, ids, memory_node};
+use test_utils::{host_identity, ids, memory_node, pod as c};
 
 /// "Family", `ad58a3faa04cdc5576c8dc5823a347c6` in the specs' examples.
 const FAMILY: PodId = PodId::from_bytes([
@@ -422,5 +422,39 @@ async fn a_pod_whose_record_store_fails_to_create_leaves_nothing() -> Result<()>
     assert_eq!(node.tracked_doc_count(ids::ALICE)?, tracked_before + 2);
 
     node.shutdown().await?;
+    Ok(())
+}
+
+/// A pod's membership view is built once while its store takes no write, and
+/// built anew after a write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_membership_view_is_built_again_only_after_a_write() -> Result<()> {
+    let node = memory_node().await?;
+    let (alice, _pms) = c::host(&node).await?;
+    let pod = c::create(&node, &alice).await?;
+    let first = node.pod_membership_view(alice.id, pod).await?;
+    let builds = node.membership_view_builds_for_test(alice.id)?;
+    let again = node.pod_membership_view(alice.id, pod).await?;
+    assert_eq!(
+        node.membership_view_builds_for_test(alice.id)?,
+        builds,
+        "the view was built again with no write in between"
+    );
+    assert_eq!(again.verdicts(), first.verdicts());
+    node.write_pod_entry(
+        alice.id,
+        pod,
+        data_layer::PodStore::Membership,
+        b"member/x",
+        b"x",
+    )
+    .await?;
+    let after = node.pod_membership_view(alice.id, pod).await?;
+    assert_eq!(
+        node.membership_view_builds_for_test(alice.id)?,
+        builds + 1,
+        "a write left the view as it was built"
+    );
+    assert_eq!(after.verdicts().len(), first.verdicts().len() + 1);
     Ok(())
 }

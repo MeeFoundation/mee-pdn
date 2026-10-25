@@ -645,6 +645,17 @@ impl Runtime {
         self.state.lock().await.node.dial_handle()
     }
 
+    /// [`SyncNode::sync_replica_store_for_test`](data_layer::SyncNode::sync_replica_store_for_test)
+    /// for `identity`.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_replica_store_for_test(
+        &self,
+        identity: pdn_types::PdnId,
+    ) -> anyhow::Result<()> {
+        let node = std::sync::Arc::clone(&self.state.lock().await.node);
+        node.sync_replica_store_for_test(identity).await
+    }
+
     /// [`SyncNode::own_entries_without_payload`](data_layer::SyncNode::own_entries_without_payload)
     /// for `identity`.
     #[cfg(feature = "test-util")]

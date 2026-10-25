@@ -14,12 +14,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use data_layer::{
-    identity_of, AddrInfoOptions, AuthorId, Contact, EventKind, MemberDevice, MemberState,
-    MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace, SpawnOptions,
-    SyncNode, Traced,
+    identity_of, AddrInfoOptions, AuthorId, BlobStreamHold, Contact, EventKind, MemberDevice,
+    MemberState, MembershipKey, NamespaceId, PodStore, PrivateMetadataStore, Seq, SessionTrace,
+    SpawnOptions, SyncNode, Traced,
 };
 use pdn_store::SessionRole;
-use pdn_types::PodId;
+use pdn_types::{PodId, RecordRef};
 use test_utils::{
     join_identity,
     pod::{
@@ -1307,14 +1307,16 @@ async fn a_removed_member_reads_as_itself_before_and_after_it_joins_again() -> R
     Ok(())
 }
 
-/// A member that joins again after it left has the records placed in its
-/// absence once the join's catch-up answers, though its own joined event's
-/// payload lands after the session that brought the event: the record
-/// store starts once the membership view shows the join, and no dial of
-/// the membership watcher starts it before. Fails with either taken out.
-/// The inviter's blob stream of the payload is held one second past the
+/// A member that joins again after it left holds the entries of the records
+/// placed in its absence once the join's catch-up answers, though its own
+/// joined event's payload lands after the session that brought the event:
+/// the record store starts once the membership view shows the join, and no
+/// dial of the membership watcher starts it before. Fails with either taken
+/// out. The inviter's blob stream of the payload is held one second past the
 /// session, long enough for a record store started before the view shows
-/// the join to be judged by the departure meanwhile.
+/// the join to be judged by the departure meanwhile. The catch-up answers
+/// once a session went through and a payload follows its entry, so the
+/// record itself is asserted to read only eventually.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_join_after_a_leave_catches_up_on_the_records_placed_meanwhile() -> Result<()> {
     let (alice_phone, carol_phone) = (node(QUIET).await?, node(QUIET).await?);
@@ -1352,8 +1354,10 @@ async fn a_join_after_a_leave_catches_up_on_the_records_placed_meanwhile() -> Re
         async move {
             let _ = tokio::time::timeout(TIMEOUT, hold.reached.notified()).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
+            // Stamped first: whatever the release causes is traced after it.
+            let released = std::time::Instant::now();
             hold.release.notify_one();
-            std::time::Instant::now()
+            released
         }
     });
     let mut traces = carol_phone.take_session_traces().context("taken once")?;
@@ -1364,29 +1368,155 @@ async fn a_join_after_a_leave_catches_up_on_the_records_placed_meanwhile() -> Re
         .await?
         .wait(TIMEOUT)
         .await?;
+    let answered = Instant::now();
     let caught_up = carol_phone
-        .pod_record_view(carol.id, pod)
+        .pod_record_view_of(carol.id, pod, &meanwhile)
         .await?
-        .placed(&meanwhile)
+        .verdicts()
+        .next()
         .is_some();
+    let at_answer = record_entries(&carol_phone, &carol, pod).await?;
     let released = releasing.await?;
-    assert!(
-        caught_up,
-        "the join answered without the record placed in the member's absence"
-    );
-    // The inviter's own dials of the record store meanwhile are denied and
-    // count for nothing; a dial of this device's is a start before the join.
-    while let Ok(trace) = traces.try_recv() {
-        assert!(
-            trace.namespace != records || trace.role != SessionRole::Dial || trace.at >= released,
-            "the record store dialed while the view showed the departure: {trace:?}"
-        );
+    Joined {
+        node: &carol_phone,
+        holder: &carol,
+        pod,
+        records,
+        hold: &hold,
+        traces: std::iter::from_fn(|| traces.try_recv().ok()).collect(),
+        released,
+        answered,
     }
+    .check(&meanwhile, caught_up, &at_answer)
+    .await?;
 
     for node in [alice_phone, carol_phone] {
         node.shutdown().await?;
     }
     Ok(())
+}
+
+/// A join that answered: what the joiner held and decided, checked against
+/// what the join promises, with the evidence for a failure message.
+struct Joined<'a> {
+    node: &'a SyncNode,
+    holder: &'a Person,
+    pod: PodId,
+    records: NamespaceId,
+    hold: &'a BlobStreamHold,
+    traces: Vec<SessionTrace>,
+    released: Instant,
+    answered: Instant,
+}
+
+impl Joined<'_> {
+    /// The record's entry held as the join answered, the record read once its
+    /// payload lands, and no dial of this device's record store, a start
+    /// before the join, until the payload that shows the join was released.
+    async fn check(&self, record: &RecordRef, caught_up: bool, at_answer: &[String]) -> Result<()> {
+        if !caught_up {
+            anyhow::bail!(
+                "the join answered without the entry of the record placed in the member's absence\n\
+                 as it answered, the holder's record entries: {at_answer:?}\n{}",
+                self.evidence().await?
+            );
+        }
+        let reads = test_utils::eventually(|| async {
+            Ok(self
+                .node
+                .pod_record_view(self.holder.id, self.pod)
+                .await?
+                .placed(record)
+                .is_some())
+        })
+        .await?;
+        anyhow::ensure!(
+            reads,
+            "the record placed in the member's absence never read"
+        );
+        // The inviter's own dials of the record store meanwhile are denied
+        // and count for nothing.
+        if let Some(early) = self.traces.iter().find(|trace| {
+            trace.namespace == self.records
+                && trace.role == SessionRole::Dial
+                && trace.at < self.released
+        }) {
+            anyhow::bail!(
+                "the record store dialed while the view showed the departure: {early:?}\n{}",
+                self.evidence().await?
+            );
+        }
+        Ok(())
+    }
+
+    /// The holder in its own membership view, its record entries with their
+    /// verdicts, and each session decision and each blob request the inviter
+    /// read timed from the payload's release and from the join's answer.
+    async fn evidence(&self) -> Result<String> {
+        let since = |at: Instant, mark: Instant| match at.checked_duration_since(mark) {
+            Some(after) => format!("+{} ms", after.as_millis()),
+            None => format!("-{} ms", mark.duration_since(at).as_millis()),
+        };
+        let mut evidence = String::new();
+        let view = self
+            .node
+            .pod_membership_view(self.holder.id, self.pod)
+            .await?;
+        let own = view
+            .member(&self.holder.id)
+            .map(|member| (member.state, member.departed_at()));
+        let _ = writeln!(evidence, "the holder in its own view now: {own:?}");
+        for entry in record_entries(self.node, self.holder, self.pod).await? {
+            let _ = writeln!(evidence, "its record entry {entry}");
+        }
+        for trace in &self.traces {
+            let store = if trace.namespace == self.records {
+                "records"
+            } else {
+                "membership"
+            };
+            let decision = match &trace.traced {
+                Traced::Admitted { key, .. } => {
+                    format!("admitted {}", String::from_utf8_lossy(key))
+                }
+                other => format!("{other:?}"),
+            };
+            let _ = writeln!(
+                evidence,
+                "{} from the release, {} from the answer: {store} {:?} {decision}",
+                since(trace.at, self.released),
+                since(trace.at, self.answered),
+                trace.role,
+            );
+        }
+        let served = self.hold.served.lock().map(|served| served.clone());
+        for (at, request) in served.unwrap_or_default() {
+            let _ = writeln!(
+                evidence,
+                "{} from the release, {} from the answer: the inviter read {request}",
+                since(at, self.released),
+                since(at, self.answered),
+            );
+        }
+        Ok(evidence)
+    }
+}
+
+/// `holder`'s record entries on `node`, each with its verdict and whether its
+/// payload is held.
+async fn record_entries(node: &SyncNode, holder: &Person, pod: PodId) -> Result<Vec<String>> {
+    Ok(node
+        .pod_record_listing_for_test(holder.id, pod, false)
+        .await?
+        .into_iter()
+        .map(|(entry, verdict, _payload)| {
+            let key = String::from_utf8_lossy(&entry.key);
+            format!(
+                "{key}: {verdict:?}, payload held {}",
+                entry.payload.is_some()
+            )
+        })
+        .collect())
 }
 
 /// A leave dated before the join it ends, as a device whose clock runs

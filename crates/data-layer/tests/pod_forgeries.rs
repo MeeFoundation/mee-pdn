@@ -51,6 +51,30 @@ async fn dial(
         .await
 }
 
+/// Whether `pod`'s stores come to have nothing in flight on every one of
+/// `nodes` — no exchange running, held or due to redial — in two reads in
+/// a row: a dial one node still makes lands on another between two reads.
+async fn settle(nodes: &[&SyncNode], pod: PodId) -> Result<bool> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut quiet_reads = 0_u8;
+    while std::time::Instant::now() < deadline {
+        let mut in_flight = 0_usize;
+        for node in nodes {
+            in_flight = in_flight.saturating_add(node.pod_syncs_in_flight_for_test(pod).await?);
+        }
+        quiet_reads = if in_flight == 0 {
+            quiet_reads.saturating_add(1)
+        } else {
+            0
+        };
+        if quiet_reads == 2 {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
+}
+
 /// Every entry `holder`'s replica on `node` holds in either store, by key
 /// and author, beside what it counts for: the membership store's from the
 /// membership view a read reports on `reports`.
@@ -417,7 +441,10 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         assert_eq!(carols, BTreeSet::from([c::device_of(carol_phone, &carol)?]));
     }
 
-    // A later session, by the forger and by a device that only received.
+    // A later session, by the forger and by a device that only received,
+    // once every node settled: a dial above returns when asked for, and a
+    // session it queued would be taken for the later one.
+    assert!(settle(&[alice_phone, bob_phone, carol_phone], pod).await?);
     for (from, holder, to, callee) in [
         (bob_phone, &bob, alice_phone, &alice),
         (alice_phone, &alice, carol_phone, &carol),
@@ -425,10 +452,13 @@ async fn every_forgery_is_held_on_every_member_device_and_read_by_nothing() -> R
         for store in [PodStore::Membership, PodStore::Records] {
             let mut sessions = from.watch_pod_sessions(holder.id, pod, store).await?;
             dial(from, holder.id, pod, store, to, callee.id).await?;
-            let session = sessions.next_with(to.node_id(), true, TIMEOUT).await?;
+            let exchanged = sessions
+                .next_with(to.node_id(), true, TIMEOUT)
+                .await?
+                .map(|session| session.exchanged);
             assert!(
-                session.is_some_and(|session| session.exchanged == Ok((0, 0))),
-                "a later session between member devices found a difference"
+                matches!(exchanged, Some(Ok((0, 0)))),
+                "a later session between member devices found a difference: {exchanged:?}"
             );
         }
     }
