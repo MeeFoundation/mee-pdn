@@ -333,7 +333,8 @@ type SyncAcceptRes = (
     Option<SessionId>,
     Result<SyncFinished, AcceptError>,
 );
-type FetchRes = (PublicKey, Hash, Outcome);
+/// A fetch's end: its outcome, and what went wrong when something did.
+type FetchRes = (PublicKey, Hash, Outcome, Option<String>);
 
 /// The identities one peer of one replica is dialed as. Two sources, held
 /// apart because they are trusted and live differently: a contact is the
@@ -657,8 +658,8 @@ impl LiveActor {
                 // completions are bounded by the downloads this actor started.
                 Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
                     trace!(?i, "tick: pending_downloads");
-                    let (provider, hash, outcome) = res.context("pending_downloads closed")?;
-                    self.on_fetch_finished(provider, hash, outcome).await;
+                    let (provider, hash, outcome, why) = res.context("pending_downloads closed")?;
+                    self.on_fetch_finished(provider, hash, outcome, why).await;
                 }
                 msg = self.inbox.recv() => {
                     let msg = msg.context("to_actor closed")?;
@@ -1849,9 +1850,16 @@ impl LiveActor {
             .await;
     }
 
-    async fn on_fetch_finished(&mut self, provider: PublicKey, hash: Hash, outcome: Outcome) {
-        debug!(provider = %provider.fmt_short(), %hash, ?outcome, "fetch finished");
+    async fn on_fetch_finished(
+        &mut self,
+        provider: PublicKey,
+        hash: Hash,
+        outcome: Outcome,
+        why: Option<String>,
+    ) {
+        debug!(provider = %provider.fmt_short(), %hash, ?outcome, ?why, "fetch finished");
         let neighbor = self.is_neighbor(provider);
+        self.fetches.noted(provider, hash, outcome, why);
         let steps = self
             .fetches
             .finished(provider, hash, outcome, neighbor, Instant::now());
@@ -1913,8 +1921,8 @@ impl LiveActor {
             let pool = self.pool.clone();
             let blobs = self.bao_store.clone();
             self.download_tasks.spawn(async move {
-                let outcome = fetch(pool, blobs, provider, hash).await;
-                (provider, hash, outcome)
+                let (outcome, why) = fetch(pool, blobs, provider, hash).await;
+                (provider, hash, outcome, why)
             });
         }
         if let Some((provider, series, wait)) = steps.pause {
@@ -2411,14 +2419,20 @@ fn fetch_pool_options() -> connection_pool::Options {
 
 /// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
 /// [`NO_PROGRESS`] with nothing: the request's stream lives in this future,
-/// so dropping it frees the stream (iroh-blobs-006).
-async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Hash) -> Outcome {
+/// so dropping it frees the stream (iroh-blobs-006). Beside the outcome, what
+/// went wrong, for the fetches' report.
+async fn fetch(
+    pool: ConnectionPool,
+    blobs: Store,
+    provider: PublicKey,
+    hash: Hash,
+) -> (Outcome, Option<String>) {
     let missing = match blobs.remote().local(HashAndFormat::raw(hash)).await {
-        Ok(local) if local.is_complete() => return Outcome::Held,
+        Ok(local) if local.is_complete() => return (Outcome::Held, None),
         Ok(local) => local.missing(),
         Err(err) => {
             debug!(%hash, "the blob store cannot say what it holds: {err:#}");
-            return Outcome::LocalFailure;
+            return (Outcome::LocalFailure, Some(format!("{err:#}")));
         }
     };
     let connection =
@@ -2426,9 +2440,9 @@ async fn fetch(pool: ConnectionPool, blobs: Store, provider: PublicKey, hash: Ha
             Ok(Ok(connection)) => connection,
             Ok(Err(err)) => {
                 debug!(provider = %provider.fmt_short(), "no connection for a fetch: {err:#}");
-                return Outcome::ConnectFailed;
+                return (Outcome::ConnectFailed, Some(format!("{err:#}")));
             }
-            Err(_elapsed) => return Outcome::Stalled,
+            Err(_elapsed) => return (Outcome::Stalled, Some("no connection".to_owned())),
         };
     fetch_over(&connection, &blobs, missing).await
 }
@@ -2439,7 +2453,7 @@ async fn fetch_over(
     connection: &iroh::endpoint::Connection,
     blobs: &Store,
     missing: GetRequest,
-) -> Outcome {
+) -> (Outcome, Option<String>) {
     let provider = connection.remote_id();
     let hash = missing.hash;
     // Opened here: iroh-blobs reports a stream that fails to open as a failure
@@ -2452,22 +2466,27 @@ async fn fetch_over(
         ),
         Ok(Err(err)) => {
             debug!(provider = %provider.fmt_short(), %hash, "no stream for a fetch: {err:#}");
-            return Outcome::Failed;
+            return (Outcome::Failed, Some(format!("no stream: {err:#}")));
         }
-        Err(_elapsed) => return Outcome::Stalled,
+        Err(_elapsed) => return (Outcome::Stalled, Some("no stream".to_owned())),
     };
     let progress = blobs.remote().execute_get(pair, missing).stream();
     tokio::pin!(progress);
     loop {
         match n0_future::time::timeout(NO_PROGRESS, progress.next()).await {
-            Err(_elapsed) => return Outcome::Stalled,
+            Err(_elapsed) => return (Outcome::Stalled, Some("no progress".to_owned())),
             Ok(Some(GetProgressItem::Progress(_))) => {}
-            Ok(Some(GetProgressItem::Done(_))) => return landed(blobs, hash).await,
+            Ok(Some(GetProgressItem::Done(_))) => return (landed(blobs, hash).await, None),
             Ok(Some(GetProgressItem::Error(err))) => {
                 debug!(provider = %provider.fmt_short(), %hash, "fetch failed: {err:#}");
-                return outcome_of_failure(&err);
+                return (outcome_of_failure(&err), Some(format!("{err:#}")));
             }
-            Ok(None) => return Outcome::Failed,
+            Ok(None) => {
+                return (
+                    Outcome::Failed,
+                    Some("the get ended with no outcome".to_owned()),
+                )
+            }
         }
     }
 }
@@ -2603,7 +2622,7 @@ mod tests {
         let store = iroh_blobs::store::mem::MemStore::new();
 
         let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
-        let outcome = fetch_over(&connection, &store, request).await;
+        let (outcome, _why) = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Failed);
 
         fetching.close().await;
@@ -2637,7 +2656,7 @@ mod tests {
         let store = iroh_blobs::store::mem::MemStore::new();
 
         let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
-        let outcome = fetch_over(&connection, &store, request).await;
+        let (outcome, _why) = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Lacks);
 
         fetching.close().await;
@@ -2685,7 +2704,7 @@ mod tests {
 
         for (size, hash) in payloads {
             let request = GetRequest::from(HashAndFormat::raw(hash));
-            let outcome = fetch_over(&connection, &store, request).await;
+            let (outcome, _why) = fetch_over(&connection, &store, request).await;
             assert_eq!(outcome, Outcome::LocalFailure, "a payload of {size} bytes");
         }
 
