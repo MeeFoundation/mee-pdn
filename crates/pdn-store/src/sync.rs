@@ -2059,7 +2059,7 @@ mod tests {
     }
 
     /// Opening a session commits the store's pending write batch
-    /// (`snapshot_owned` flushes): an entry inserted right before session
+    /// (`snapshot_owned` commits it): an entry inserted right before session
     /// setup is in the snapshot, and the store stays writable afterwards
     /// with the new batch invisible to the held snapshot.
     ///

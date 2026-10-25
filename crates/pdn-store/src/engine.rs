@@ -68,6 +68,10 @@ pub type CoLocatedRequests = mpsc::Sender<CoLocatedRequest>;
 const ACTOR_CHANNEL_CAP: usize = 64;
 /// Capacity for the channels for [`Engine::subscribe`].
 const SUBSCRIBE_CHANNEL_CAP: usize = 256;
+/// Conversions an ordered subscription keeps in flight, each one blob-store
+/// status request.
+#[cfg(feature = "observation")]
+const OBSERVED_CONVERSIONS: usize = 64;
 
 /// The sync engine coordinates actors that manage open documents, set-reconciliation syncs with
 /// peers and a gossip swarm for each syncing document.
@@ -239,7 +243,7 @@ impl Engine {
             Some(s),
         )
         .await?;
-        Ok(self.live_events(r))
+        Ok(self.observed_events(r))
     }
 
     /// Start to sync a document with no peers of its own, keeping whom an
@@ -459,7 +463,27 @@ impl Engine {
             })
             .await?;
         reply_rx.await??;
-        Ok(self.live_events(r))
+        Ok(self.observed_events(r))
+    }
+
+    /// [`Self::live_events`] with up to [`OBSERVED_CONVERSIONS`] in flight,
+    /// yielded in order: each waits on the blob store, which a catch-up keeps
+    /// busy, and one at a time the reader falls behind the bounded channel.
+    #[cfg(feature = "observation")]
+    fn observed_events(
+        &self,
+        r: async_channel::Receiver<live::Event>,
+    ) -> BoxStream<Result<LiveEvent>> {
+        use n0_future::BufferedStreamExt as _;
+        let content_status_cb = self.content_status_cb.clone();
+        Box::pin(
+            Box::pin(r)
+                .map(move |ev| {
+                    let content_status_cb = content_status_cb.clone();
+                    async move { LiveEvent::from_live_event(ev, &content_status_cb).await }
+                })
+                .buffered_ordered(OBSERVED_CONVERSIONS),
+        )
     }
 
     fn live_events(&self, r: async_channel::Receiver<live::Event>) -> BoxStream<Result<LiveEvent>> {

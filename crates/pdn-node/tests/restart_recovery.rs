@@ -690,11 +690,11 @@ async fn an_identity_whose_create_returned_is_on_disk_whole() -> Result<()> {
 /// A pod is never held without its tickets: a copy of the directory taken
 /// once the PMS's record of a created pod is on disk opens the pod.
 ///
-/// The list reads the PMS, and that read commits the replica store's write
-/// batch while the blob store's stays open: an order the stores' own
-/// commits reach within their settle window. Without the flush before the
-/// record, the copy then holds the record and the tickets' entries but not
-/// their payloads, and the pod is listed and never opened.
+/// The replica store is synced alone before the copy, the blob store's write
+/// batch still open: an order the stores' own commits reach within their
+/// settle window. Without the flush before the record, the copy then holds
+/// the record and the tickets' entries but not their payloads, and the pod
+/// is listed and never opened.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pod_whose_record_is_on_disk_opens_from_it() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -710,6 +710,7 @@ async fn a_pod_whose_record_is_on_disk_opens_from_it() -> Result<()> {
             .any(|info| info.id == pod),
         "the created pod must be listed"
     );
+    runtime.sync_replica_store_for_test(alice).await?;
     let copy = tempfile::tempdir()?;
     test_utils::crash_copy(dir.path(), copy.path())?;
     runtime.shutdown().await?;

@@ -74,7 +74,13 @@ struct Provider {
     holds: HashSet<Hash>,
     in_flight: usize,
     series: Option<Series>,
+    /// The last fetches from it that did not land, each with what went
+    /// wrong, for the report: at most [`ENDS_KEPT`].
+    ends: VecDeque<String>,
 }
+
+/// How many fetches that did not land a provider's report names.
+const ENDS_KEPT: usize = 8;
 
 #[derive(Debug)]
 struct Series {
@@ -123,8 +129,13 @@ impl Fetches {
                     Some(series) if series.probing => ", probed",
                     Some(_) => ", paused",
                 };
+                let ends = if entry.ends.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", Vec::from(entry.ends.clone()).join(", "))
+                };
                 format!(
-                    "{}: {} in flight, {} queued{pause}",
+                    "{}: {} in flight, {} queued{pause}{ends}",
                     provider.fmt_short(),
                     entry.in_flight,
                     entry.queue.len()
@@ -134,6 +145,30 @@ impl Fetches {
         lines.sort();
         lines.push(format!("{} wanted", self.wanted.len()));
         lines.join("; ")
+    }
+
+    /// Keeps a fetch from `provider` that did not land, for the report.
+    pub(super) fn noted(
+        &mut self,
+        provider: PublicKey,
+        hash: Hash,
+        outcome: Outcome,
+        why: Option<String>,
+    ) {
+        if matches!(outcome, Outcome::Fetched | Outcome::Held) {
+            return;
+        }
+        let Some(entry) = self.providers.get_mut(&provider) else {
+            return;
+        };
+        if entry.ends.len() == ENDS_KEPT {
+            entry.ends.pop_front();
+        }
+        let hash = hash.fmt_short();
+        entry.ends.push_back(match why {
+            Some(why) => format!("{hash} {outcome:?}: {why}"),
+            None => format!("{hash} {outcome:?}"),
+        });
     }
 
     pub(super) fn is_wanted(&self, hash: &Hash) -> bool {

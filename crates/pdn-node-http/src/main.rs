@@ -21,7 +21,8 @@ use pdn_node_http::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Held to the end: its drop writes out the lines still queued.
+    let _log = install_log();
 
     // Parsed whole before anything is created, so a typo answers at once
     // with no directory made, no key minted, no lock taken.
@@ -106,4 +107,36 @@ async fn stop_signal() {
         () = interrupt => {}
         () = terminate => {}
     }
+}
+
+/// The log, written by a thread of its own: a slow standard output — a file
+/// behind a busy disk, a pipe nobody drains — would otherwise stall the
+/// runtime worker that logs, the store's live actor among them. Past 128,000
+/// queued lines a line is dropped rather than waited for. `RUST_LOG` filters
+/// as `tracing_subscriber::fmt::init` reads it without its `env-filter`
+/// feature, `info` when unset.
+fn install_log() -> tracing_appender::non_blocking::WorkerGuard {
+    use std::str::FromStr as _;
+
+    use tracing_subscriber::{
+        filter::Targets, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+    };
+
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let default = || Targets::new().with_default(tracing::Level::INFO);
+    let (targets, refused) = match std::env::var("RUST_LOG") {
+        Ok(var) => match Targets::from_str(&var) {
+            Ok(targets) => (targets, None),
+            Err(err) => (default(), Some(format!("ignoring RUST_LOG={var:?}: {err}"))),
+        },
+        Err(_) => (default(), None),
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+        .with(targets)
+        .init();
+    if let Some(refused) = refused {
+        tracing::warn!("{refused}");
+    }
+    guard
 }

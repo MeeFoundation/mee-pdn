@@ -10,7 +10,8 @@ use data_layer::{
     identity_of, AddrInfoOptions, AuthorId, Contact, MemberDevice, MembershipKey, PodStore,
     PodVerdicts, RecordKey, Seq, SpawnOptions, SyncNode, Traced, Verdict,
 };
-use pdn_store::SessionRole;
+use futures_lite::StreamExt as _;
+use pdn_store::{engine::LiveEvent, SessionRole};
 use pdn_types::{NodeId, PodId, RecordId};
 use test_utils::{
     eventually, join_identity,
@@ -180,8 +181,11 @@ async fn a_sibling_refused_before_its_listing_arrived_is_dialed_once_it_does() -
 /// the statement alone, though the device offers an entry of its own beside
 /// it, and sends nothing.
 ///
-/// Both replicas are out of their swarm and every pass out of reach, so the
-/// two dials named are the only sessions between them.
+/// Both replicas are out of their swarm, every pass out of reach, and the
+/// laptop refuses what it is asked to serve, so the two dials named are the
+/// only sessions between them: the member device's watcher dials the laptop
+/// it met before, as its own statement goes in, and a session it decided
+/// before the traces were taken would carry the laptop's statement unseen.
 #[allow(clippy::too_many_lines)] // one scenario: the sibling gone, the first dial and the second
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_statement() -> Result<()> {
@@ -215,6 +219,7 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
         .leave_swarm_for_test(alice.id, membership)
         .await?;
     bob_laptop.leave_swarm_for_test(bob.id, membership).await?;
+    bob_laptop.refuse_pod_sessions_for_test(bob.id, true)?;
     // Taken before the statement: the laptop's redials of sessions from
     // before can bring it ahead of the dial below.
     let mut traces = alice_phone.take_session_traces().context("taken once")?;
@@ -264,10 +269,21 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
     let laptop_node = bob_laptop.node_id();
     let mut first = Vec::new();
     let mut opened = false;
+    let mut seen = Vec::new();
     while let Ok(trace) = traces.try_recv() {
         if trace.namespace != membership {
             continue;
         }
+        let decision = match &trace.traced {
+            Traced::Admitted { key, .. } => format!("admitted {}", String::from_utf8_lossy(key)),
+            other => format!("{other:?}"),
+        };
+        let peer = if trace.peer == laptop_node {
+            "the laptop"
+        } else {
+            "another node"
+        };
+        seen.push(format!("{:?} with {peer}: {decision}", trace.role));
         let laptops = trace.peer == laptop_node && trace.role == SessionRole::Accept;
         match trace.traced {
             Traced::Admitted { key, .. } if opened => first.push(key),
@@ -282,7 +298,11 @@ async fn a_device_whose_sibling_is_gone_reaches_a_member_device_with_its_stateme
             _ => {}
         }
     }
-    assert!(opened, "the member device refused the unlisted device");
+    assert!(
+        opened,
+        "the member device refused the unlisted device; its membership sessions:\n{}",
+        seen.join("\n")
+    );
     assert_eq!(first, [listing]);
     // The session that carried the statement, as the laptop saw it: later
     // ones, served whole, may already have run.
@@ -464,11 +484,15 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
     }
 
     // The laptop, lagging at version 2 and its own version 3, writes
-    // version 2 again, and the session after it brings that entry.
-    statement(&bob_laptop, &bob, &bob, pod, 2, vec![b1, b2], b2.author).await?;
-    let mut sessions = alice_phone
-        .watch_pod_sessions(alice.id, pod, PodStore::Membership)
-        .await?;
+    // version 2 again, and that entry reaches the owner. Observed before the
+    // write, whose key and author alone are the old entry's too: the
+    // laptop's watcher dials the owner as it goes in, and that session can
+    // end before the dial below is asked for.
+    let mut owners = alice_phone
+        .observe_pod_for_test(alice.id, pod, 1_024)
+        .await?
+        .membership;
+    let rewritten = statement(&bob_laptop, &bob, &bob, pod, 2, vec![b1, b2], b2.author).await?;
     dial(
         &alice_phone,
         &alice,
@@ -478,24 +502,34 @@ async fn statements_written_out_of_reach_of_each_other_list_every_device() -> Re
         &bob,
     )
     .await?;
-    // A session already running as the dial is asked for can finish first,
-    // with nothing new: a dial returns when asked for.
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    let mut arrived = false;
-    while let Some(session) = sessions
-        .next_with(
-            bob_laptop.node_id(),
-            true,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
-        .await?
-    {
-        if session.exchanged.is_ok_and(|(received, _)| received > 0) {
-            arrived = true;
-            break;
+    let mut seen = Vec::new();
+    let arrived = tokio::time::timeout(TIMEOUT, async {
+        while let Some(event) = owners.next().await {
+            match event? {
+                LiveEvent::InsertRemote { entry, .. } => {
+                    let id = entry.id();
+                    if id.key() == rewritten.as_slice() && id.author() == b2.author {
+                        return Ok(true);
+                    }
+                    seen.push(format!("insert {}", String::from_utf8_lossy(id.key())));
+                }
+                LiveEvent::SyncFinished(sync) => seen.push(format!(
+                    "session with {}: {:?}",
+                    sync.peer.fmt_short(),
+                    sync.result
+                )),
+                _ => {}
+            }
         }
-    }
-    assert!(arrived, "the old version written again did not arrive");
+        anyhow::Ok(false)
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    assert!(
+        arrived,
+        "the old version written again did not arrive; the owner's membership store saw:\n{}",
+        seen.join("\n")
+    );
     // Denied: a statement for Bob under a key that is not his.
     let stranger = Person::generate();
     let b6 = nowhere(0xb6, AuthorId::from([0xb6; 32]));

@@ -7,8 +7,8 @@
 //! holds (ADR-0013).
 
 use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock, RwLock},
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -31,6 +31,11 @@ use crate::{
 /// entries lack before it is refused; the payloads are small and follow
 /// their entries at once.
 const CALLER_PAYLOADS_WAIT: Duration = Duration::from_secs(5);
+
+/// How many pods' membership views a book keeps built; past it the kept ones
+/// are dropped together, so their memory stays bounded however many pods the
+/// identity has held.
+const KEPT_VIEWS: usize = 256;
 
 /// A hosted identity as the store names it on the wire: the 32 bytes of
 /// its `PdnId`, which the store compares and never interprets.
@@ -67,6 +72,15 @@ enum WriteAdmission {
 /// the entries it was built from.
 type Read = (MembershipView, Vec<HeldEntry>);
 
+/// A membership view kept with the write count its store had before its
+/// entries were read.
+#[derive(Debug)]
+struct KeptView {
+    store: NamespaceId,
+    writes: u64,
+    read: Arc<Read>,
+}
+
 /// What a dial still takes from a pod session's callee it serves nothing.
 enum Unserved {
     /// Everything: the membership view counts no current member, or lists
@@ -100,6 +114,13 @@ pub(crate) struct AccessBook {
     /// Set once the stack spawns, before the identity is hosted; what an
     /// accept decision rests on is read through it.
     sync: OnceLock<pdn_store::actor::SyncHandle>,
+    /// The last membership view built per pod, served again while its store's
+    /// write count holds: every session on a pod's store classifies, and a
+    /// build checks every statement's signature. One that awaited a payload
+    /// is not kept, since a payload's arrival moves no count.
+    views: Mutex<HashMap<PodId, KeptView>>,
+    #[cfg(feature = "test-util")]
+    view_builds: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-util")]
     pod_verdicts: OnceLock<PodVerdictSink>,
     #[cfg(feature = "test-util")]
@@ -181,6 +202,9 @@ impl AccessBook {
             pms: RwLock::new(None),
             blobs: OnceLock::new(),
             sync: OnceLock::new(),
+            views: Mutex::default(),
+            #[cfg(feature = "test-util")]
+            view_builds: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-util")]
             pod_verdicts: OnceLock::new(),
             #[cfg(feature = "test-util")]
@@ -739,14 +763,64 @@ impl AccessBook {
         pod: PodId,
         membership: &Doc,
     ) -> Result<(MembershipView, Vec<HeldEntry>)> {
+        let store = membership.id();
+        // Read before the entries: a write landing in between leaves a kept
+        // view newer than its count, which the next look reads as a change.
+        let writes = match self.sync.get() {
+            Some(sync) => sync.writes(store).await.ok(),
+            None => None,
+        };
+        if let Some(read) = writes.and_then(|writes| self.kept_view(pod, store, writes)) {
+            #[cfg(feature = "test-util")]
+            self.report_pod_verdicts(pod, &read.1, &read.0);
+            return Ok((read.0.clone(), read.1.clone()));
+        }
         let entries = match self.blobs.get() {
             Some(blobs) => held_entries(membership, blobs).await?,
             None => Vec::new(),
         };
-        let view = MembershipView::new(&pod, &membership.id(), &entries);
+        let view = MembershipView::new(&pod, &store, &entries);
+        #[cfg(feature = "test-util")]
+        self.view_builds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(feature = "test-util")]
         self.report_pod_verdicts(pod, &entries, &view);
+        let awaited = entries
+            .iter()
+            .any(|entry| entry.payload == HeldPayload::Awaited);
+        if let (Some(writes), false) = (writes, awaited) {
+            self.keep_view(pod, store, writes, (view.clone(), entries.clone()));
+        }
         Ok((view, entries))
+    }
+
+    /// How many membership views this book has built rather than reused.
+    #[cfg(feature = "test-util")]
+    pub(crate) fn view_builds(&self) -> usize {
+        self.view_builds.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn kept_view(&self, pod: PodId, store: NamespaceId, writes: u64) -> Option<Arc<Read>> {
+        let views = self.views.lock().ok()?;
+        let kept = views.get(&pod)?;
+        (kept.store == store && kept.writes == writes).then(|| Arc::clone(&kept.read))
+    }
+
+    fn keep_view(&self, pod: PodId, store: NamespaceId, writes: u64, read: Read) {
+        let Ok(mut views) = self.views.lock() else {
+            return;
+        };
+        if views.len() >= KEPT_VIEWS && !views.contains_key(&pod) {
+            views.clear();
+        }
+        views.insert(
+            pod,
+            KeptView {
+                store,
+                writes,
+                read: Arc::new(read),
+            },
+        );
     }
 
     #[cfg(feature = "test-util")]

@@ -153,7 +153,7 @@ async fn serve_blob_stream(
         }
     };
     #[cfg(feature = "test-util")]
-    let held = hold_blob_stream(&hold_slot, &streams).await;
+    let held = hold_blob_stream(&hold_slot, &streams, &request).await;
     let served = match request {
         Request::Get(request) => handle_get(pair, store, request).await,
         Request::GetMany(request) => handle_get_many(pair, store, request).await,
@@ -177,8 +177,15 @@ async fn serve_blob_stream(
 async fn hold_blob_stream(
     hold_slot: &BlobStreamHoldSlot,
     streams: &TaskTracker,
+    request: &Request,
 ) -> Option<Arc<BlobStreamHold>> {
-    let held = hold_slot.lock().ok().and_then(|mut slot| slot.take())?;
+    let held = hold_slot.lock().ok().and_then(|slot| slot.clone())?;
+    if let Ok(mut served) = held.served.lock() {
+        served.push((std::time::Instant::now(), format!("{request:?}")));
+    }
+    if held.taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
     held.reached.notify_one();
     while !streams.is_closed() {
         tokio::select! {
@@ -2715,6 +2722,26 @@ impl SyncNode {
         Ok(missing)
     }
 
+    /// How many membership views `identity`'s book has built rather than
+    /// reused.
+    #[cfg(feature = "test-util")]
+    pub fn membership_view_builds_for_test(&self, identity: PdnId) -> Result<usize> {
+        Ok(self.require(identity)?.access.view_builds())
+    }
+
+    /// Syncs `identity`'s replica store to disk while the blob store's batch
+    /// stays open: the order the stores' own commits can reach within their
+    /// settle window. A read commits without a sync, so it cannot stage it.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_replica_store_for_test(&self, identity: PdnId) -> Result<()> {
+        self.require(identity)?
+            .docs
+            .engine()
+            .sync
+            .flush_store()
+            .await
+    }
+
     pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
         self.blobs.clone()
     }
@@ -4578,13 +4605,16 @@ type CollectionPauseSlot = Arc<std::sync::Mutex<Option<Arc<CollectionPause>>>>;
 
 /// The hold [`SyncNode::hold_next_blob_stream_for_test`] puts on a blob
 /// stream: `reached` once it has read its request, `done` once it has
-/// answered it.
+/// answered it; `served` lists every request read from the arming on, the
+/// held one first, for a failure message.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Default)]
 pub struct BlobStreamHold {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
     pub done: tokio::sync::Notify,
+    pub served: std::sync::Mutex<Vec<(std::time::Instant, String)>>,
+    taken: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "test-util")]

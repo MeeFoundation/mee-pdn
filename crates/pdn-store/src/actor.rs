@@ -700,7 +700,7 @@ impl SyncHandle {
     ///
     /// It's not necessary to call this function before shutdown, as `shutdown` will
     /// trigger a flush on its own.
-    pub(crate) async fn flush_store(&self) -> Result<()> {
+    pub async fn flush_store(&self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::FlushStore { reply }).await?;
         rx.await?
@@ -792,22 +792,21 @@ impl Actor {
 
     async fn run_async(mut self) {
         let reply = loop {
-            let timeout = n0_future::time::sleep(MAX_COMMIT_DELAY);
+            // Checked between actions too: an actor that is never idle for
+            // `MAX_COMMIT_DELAY` would otherwise hold a snapshot's unsynced
+            // commit off the disk for as long as it stays busy.
+            let due_in = self.store.sync_due_in();
+            if due_in == Some(Duration::ZERO) {
+                self.commit_on_timer();
+                continue;
+            }
+            let timeout = n0_future::time::sleep(
+                due_in.map_or(MAX_COMMIT_DELAY, |due_in| due_in.min(MAX_COMMIT_DELAY)),
+            );
             tokio::pin!(timeout);
             let action = tokio::select! {
                 _ = &mut timeout => {
-                    // Before the flush, not after: a commit reclaims the
-                    // pages a released read transaction pinned, so the
-                    // release has to precede it. On a node that wrote
-                    // nothing the flush commits nothing and the pages wait
-                    // for the next write ([`Store::finish_write`]).
-                    self.reclaim_abandoned_sessions();
-                    if let Err(cause) = self.store.flush() {
-                        error!(?cause, "failed to flush store");
-                        self.failed_commit = Some(cause.context(
-                            "a commit of this store failed, and the writes it held are lost",
-                        ));
-                    }
+                    self.commit_on_timer();
                     continue;
                 }
                 Some(res) = self.tasks.join_next(), if !self.tasks.is_empty() => {
@@ -1003,8 +1002,8 @@ impl Actor {
                 send_reply_with(reply, self, |this| {
                     this.states.ensure_syncing(&namespace)?;
                     // Committing the pending write batch is part of the
-                    // contract (`snapshot_owned` flushes): the snapshot holds
-                    // every entry inserted before session setup.
+                    // contract (`snapshot_owned` commits it, unsynced): the
+                    // snapshot holds every entry inserted before session setup.
                     let tables = this.store.snapshot_owned()?;
                     let id = this.next_session_id;
                     this.next_session_id += 1;
@@ -1117,6 +1116,22 @@ impl Actor {
     /// A handle releases its snapshot by message; this covers the cases
     /// where no message comes — a release lost to a full queue, and a
     /// registration whose handle a cancelled caller never received.
+    /// The store's own commit: the pending write batch and every unsynced
+    /// commit to disk, a failure kept for the next write or flush.
+    fn commit_on_timer(&mut self) {
+        // Before the flush, not after: a commit reclaims the pages a released
+        // read transaction pinned, so the release has to precede it. On a
+        // node that wrote nothing the flush commits nothing and the pages
+        // wait for the next write ([`Store::finish_write`]).
+        self.reclaim_abandoned_sessions();
+        if let Err(cause) = self.store.flush() {
+            error!(?cause, "failed to flush store");
+            self.failed_commit = Some(
+                cause.context("a commit of this store failed, and the writes it held are lost"),
+            );
+        }
+    }
+
     fn reclaim_abandoned_sessions(&mut self) {
         if self.sessions.is_empty() {
             return;
@@ -1396,6 +1411,49 @@ mod tests {
         sync.subscribe(id, tx).await?;
         sync.close(id).await?;
         assert!(rx.recv().await.is_err());
+        Ok(())
+    }
+
+    /// A session's snapshot commit is on disk within the settle window on an
+    /// actor never idle for that long. The copy of the file is what a kill at
+    /// that moment would leave.
+    #[tokio::test]
+    async fn a_busy_actor_takes_a_snapshots_commit_to_disk() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("docs.redb");
+        let store = store::Store::persistent(&path, 1 << 20)?;
+        let sync = SyncHandle::spawn(store, None, "foo".into());
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        sync.import_namespace(namespace.into()).await?;
+        sync.open(id, Default::default()).await?;
+        sync.set_sync(id, true).await?;
+        let author = sync.import_author(Author::new(&mut rand::rng())).await?;
+        sync.flush_store().await?;
+        sync.insert_local(
+            id,
+            author,
+            Bytes::from_static(b"key"),
+            Hash::new(b"value"),
+            5,
+        )
+        .await?;
+        let session = sync.sync_session_start(id).await?;
+        // A request every 50 ms, so the idle timer never runs.
+        let until = Instant::now() + MAX_COMMIT_DELAY * 4;
+        while Instant::now() < until {
+            sync.writes(id).await?;
+            n0_future::time::sleep(Duration::from_millis(50)).await;
+        }
+        let copy = dir.path().join("copy.redb");
+        std::fs::copy(&path, &copy)?;
+        let mut copied = store::Store::persistent(&copy, 1 << 20)?;
+        assert_eq!(
+            copied.get_many(id, crate::store::Query::all())?.count(),
+            1,
+            "the snapshot's commit never reached the disk"
+        );
+        drop(session);
         Ok(())
     }
 

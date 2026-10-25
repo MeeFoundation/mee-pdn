@@ -37,6 +37,9 @@ use util::{Builder, Node};
 use crate::util::empty_endpoint;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// A stage of a scenario whose subject is speed: well past what it asserts,
+/// well short of `TIMEOUT`, so a stall names its stage.
+const STAGE: Duration = Duration::from_secs(10);
 
 async fn test_node(secret_key: SecretKey) -> Result<Builder> {
     let ep = Endpoint::builder(presets::Minimal)
@@ -925,8 +928,11 @@ async fn the_only_provider_silent_for_a_while_is_asked_again() -> Result<()> {
 /// its own payload fetched at once.
 ///
 /// The writer serves no payload, so the neighbor holds the first entry
-/// without its payload. The neighbor writes only after a session it ran as
-/// a neighbor has ended, since that end is what asks it for the payload it
+/// without its payload, and the writer stops once it does: in the replica's
+/// swarm too, it would take the neighbor's own entry and payload, hand the
+/// entry on first, and stand as the payload's only provider while refusing
+/// every fetch. The neighbor writes only after a session it ran as a
+/// neighbor has ended, since that end is what asks it for the payload it
 /// lacks; a pause from that answer is at least 1 s, which sizes the bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_neighbor_lacking_a_payload_has_its_own_fetched_at_once() -> Result<()> {
@@ -945,6 +951,7 @@ async fn a_neighbor_lacking_a_payload_has_its_own_fetched_at_once() -> Result<()
         matches!(event, LiveEvent::InsertRemote { .. })
     })
     .await;
+    writer.shutdown().await?;
 
     let ticket = doc_neighbor
         .share(AddrInfoOptions::RelayAndAddresses)
@@ -967,25 +974,45 @@ async fn a_neighbor_lacking_a_payload_has_its_own_fetched_at_once() -> Result<()
     let own = doc_neighbor
         .set_bytes(author, b"record/own".to_vec(), b"own".to_vec())
         .await?;
-    next_event_matching(&mut events, TIMEOUT, |event| {
-        matches!(event, LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == own)
-    })
-    .await;
-    let inserted = Instant::now();
-    next_event_matching(
-        &mut events,
-        TIMEOUT,
-        |event| matches!(event, LiveEvent::ContentReady { hash } if *hash == own),
-    )
-    .await;
+    // In either order: the subscription merges the replica's events with
+    // the engine's, and a fetch that lands at once can be reported first.
+    let (mut inserted, mut ready) = (None, None);
+    let deadline = Instant::now() + STAGE;
+    while inserted.is_none() || ready.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(next) = n0_future::time::timeout(left, events.try_next()).await else {
+            break;
+        };
+        match next?.context("event stream ended")? {
+            LiveEvent::InsertRemote { entry, .. } if entry.content_hash() == own => {
+                inserted = Some(Instant::now());
+            }
+            LiveEvent::ContentReady { hash } if hash == own => ready = Some(Instant::now()),
+            _ => {}
+        }
+    }
     let fetches = replica.engine().fetches_report().await?;
+    let (Some(inserted), Some(ready)) = (inserted, ready) else {
+        panic!(
+            "in {STAGE:?} the neighbor's own entry {} and its payload {}; fetches: {fetches}",
+            if inserted.is_some() {
+                "arrived"
+            } else {
+                "did not arrive"
+            },
+            if ready.is_some() {
+                "arrived"
+            } else {
+                "did not"
+            },
+        );
+    };
+    let took = ready.saturating_duration_since(inserted);
     assert!(
-        inserted.elapsed() < Duration::from_secs(1),
-        "the neighbor's own payload took {:?}; fetches: {fetches}",
-        inserted.elapsed()
+        took < Duration::from_secs(1),
+        "the neighbor's own payload took {took:?}; fetches: {fetches}"
     );
 
-    writer.shutdown().await?;
     neighbor.shutdown().await?;
     replica.shutdown().await?;
     Ok(())
@@ -2112,29 +2139,31 @@ async fn assert_events_matching(
 }
 
 /// Receive events from the stream until one matches, discarding the rest.
-/// Panics when the timeout elapses first. For scenarios where gossip emits
-/// a nondeterministic set of surrounding events (neighbor changes, repeated
-/// readiness notifications) and only one specific event is the checkpoint.
+/// Panics when the timeout elapses first, naming the events discarded, so a
+/// timeout tells which stage the scenario stopped at. For scenarios where
+/// gossip emits a nondeterministic set of surrounding events (neighbor
+/// changes, repeated readiness notifications) and only one specific event is
+/// the checkpoint.
 async fn next_event_matching(
     stream: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin + Send),
     timeout: Duration,
     matcher: impl Fn(&LiveEvent) -> bool,
 ) -> LiveEvent {
-    let fut = async {
-        loop {
-            let event = stream
-                .try_next()
-                .await
-                .expect("event stream errored")
-                .expect("event stream ended");
-            if matcher(&event) {
-                break event;
-            }
+    let deadline = Instant::now() + timeout;
+    let mut discarded = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(next) = n0_future::time::timeout(left, stream.try_next()).await else {
+            panic!("timeout waiting for matching event; discarded meanwhile: {discarded:#?}");
+        };
+        let event = next
+            .expect("event stream errored")
+            .expect("event stream ended");
+        if matcher(&event) {
+            return event;
         }
-    };
-    n0_future::time::timeout(timeout, fut)
-        .await
-        .expect("timeout waiting for matching event")
+        discarded.push(format!("{event:?}").chars().take(200).collect::<String>());
+    }
 }
 
 /// A dial of a namespace ordered after another starts only once an

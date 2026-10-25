@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import random
+import resource
 import shutil
 import signal
 import socket
@@ -66,6 +67,11 @@ GRID_FILL_STALL_S = 60
 FILL_MIN_S, FILL_RECORDS_PER_S = 300, 20
 SILENT_S = 30
 STATUS_S = 30
+# Refusals in a row, counted across steps, that mark a writer dropped out: its share of one step at N = 100 is 5.
+WRITE_FAILURE_CAP = 10
+# The coordinator's open files per node — its event stream, the stream's file, a writer's connection, a request's —
+# and its own beside them; short of that, `ps` and the writers' connections fail with EMFILE.
+OPEN_FILES_PER_NODE, OPEN_FILES_SPARE = 4, 256
 LEAVE_S = 60
 CONTENDED_SHARE = 0.7
 SLEEP_JUMP_S = 5
@@ -235,9 +241,11 @@ class Stream:
         return [(self.ready[h] - self.entry_ts[h]) / 1e6 for h in self.order[mark:] if h in self.ready]
 
     def close(self):
-        if self.conn and self.conn.sock:
+        # Ends the pump's read; the pump closes the connection itself.
+        sock = self.conn.sock if self.conn else None
+        if sock:
             try:
-                self.conn.sock.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
         if self.file:
@@ -370,6 +378,18 @@ def request(port, method, path, body=None, timeout=STATUS_S, conn=None, raw=Fals
     return json.loads(data)
 
 
+def signal_group(proc, sig):
+    """`sig` to the process group of a node this coordinator started, unless the node has exited."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        # Exited between the poll and the signal: macOS answers EPERM for a group whose one process is not yet
+        # reaped, and until then its pid cannot be anyone else's.
+        pass
+
+
 class Node:
     offset_us = 0
 
@@ -403,6 +423,15 @@ class Node:
         self.started = time.monotonic()
         self.run.record_pid(self)
         self.run.live[self.pid] = self
+        try:
+            self.await_status()
+        except BaseException:
+            # A node no pod lists yet: no pod's stop reaches it, and it would run through the next N.
+            self.stop()
+            raise
+        return self
+
+    def await_status(self):
         deadline = time.monotonic() + STATUS_S
         while True:
             try:
@@ -413,12 +442,10 @@ class Node:
                     raise NodeDown(f'{self.name} did not answer its status; see {self.log}')
                 time.sleep(0.2)
         if 'profile release' not in status or 'observation on' not in status:
-            self.stop()
             sys.exit(f'{self.run.bin} answers {status!r}: a release build with the observation feature only')
         self.run.meta['profiles'] = sorted(set(self.run.meta.get('profiles', [])) | {
             ' '.join(line for line in status if line.startswith(('profile', 'observation')))})
         self.identity = request(self.port, 'POST', '/debug/identities')['identity']
-        return self
 
     def status(self):
         return request(self.port, 'GET', '/debug/status', raw=True).decode().splitlines()
@@ -451,6 +478,8 @@ class Node:
             except (OSError, http.client.HTTPException, ValueError) as e:
                 stream.error = stream.error or repr(e)
             finally:
+                if stream.conn:
+                    stream.conn.close()
                 stream.ended = True
                 stream.answered.set()
                 if stream.file:
@@ -461,16 +490,14 @@ class Node:
         return stream
 
     def stop(self):
-        if self.proc is None or self.proc.poll() is not None:
+        if self.proc is None:
             return
+        signal_group(self.proc, signal.SIGTERM)
         try:
-            os.killpg(self.pid, signal.SIGTERM)
             self.proc.wait(15)
         except subprocess.TimeoutExpired:
-            os.killpg(self.pid, signal.SIGKILL)
+            signal_group(self.proc, signal.SIGKILL)
             self.proc.wait()
-        except ProcessLookupError:
-            pass
         if self.stream:
             self.stream.close()
         self.run.live.pop(self.pid, None)
@@ -526,6 +553,7 @@ class Sampler(threading.Thread):
         self.ncpu = cpu_budget()
         self.phone_points = collections.deque(maxlen=20_000)  # (monotonic t, the device's sample)
         self.phone_seq = None
+        self.missed = 0
 
     def run(self):
         offset = time.time() - time.monotonic()
@@ -534,7 +562,15 @@ class Sampler(threading.Thread):
                 pids = list(self.owner.live)
                 procs = {}
                 if pids:
-                    procs = proc_sample(pids)
+                    try:
+                        procs = proc_sample(pids)
+                    except (OSError, ValueError) as e:
+                        # An empty sample is a gap the windows read across; a raise would end the thread, and every
+                        # later window would read no CPU at all.
+                        self.missed += 1
+                        self.owner.meta['sampler_missed'] = self.missed
+                        if self.missed == 1:
+                            print(f'sampler: a sample failed ({e!r}); later failures count in meta.json', flush=True)
                 t = time.monotonic()
                 self.samples.append((t, time.time(), procs))
                 out.write(json.dumps({'t': time.time(), 'cpu_s': {self.owner.live[p].name: c for p, (c, _) in procs.items()
@@ -738,8 +774,20 @@ class Run:
         free = shutil.disk_usage(self.dir).free
         if free < need:
             sys.exit(f'preflight: {free / 1e9:.1f} GB free, the run needs {need / 1e9:.1f} GB')
+        self.open_files(OPEN_FILES_PER_NODE * max(self.meta['N']) + OPEN_FILES_SPARE)
         if shutil.which('caffeinate'):
             self.caffeinate = subprocess.Popen(['caffeinate', '-dims', '-w', str(os.getpid())])
+
+    @staticmethod
+    def open_files(need):
+        """Lifts the soft open-file limit to `need`, which the nodes inherit: macOS starts a terminal at 256."""
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft == resource.RLIM_INFINITY or soft >= need:
+            return
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+        except (ValueError, OSError) as e:
+            sys.exit(f'preflight: the run needs {need} open files, the limit is {soft} and cannot rise ({e})')
 
     def expected_rows(self):
         return sum(len(self.levels(s)) for s in self.meta['S']) * self.meta['repeats']
@@ -778,19 +826,13 @@ class Run:
         node is its own process group, so one interrupted wait still leaves none behind."""
         nodes = list(self.live.values())
         for node in nodes:
-            try:
-                os.killpg(node.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            signal_group(node.proc, signal.SIGTERM)
         deadline = time.monotonic() + 15
         for node in nodes:
             try:
                 node.proc.wait(max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(node.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_group(node.proc, signal.SIGKILL)
         for node in nodes:
             node.stop()
         if self.phone:
@@ -828,6 +870,7 @@ class Pod:
         self.incarnation = 0
         self.held = 0
         self.seq = collections.Counter()
+        self.refusals = collections.Counter()  # per writer, in a row: WRITE_FAILURE_CAP
         self.broken = None
         self.evidence = ''
         self.streams = []  # every stream the pod's nodes opened, a departed r's included
@@ -842,9 +885,12 @@ class Pod:
         self.writers.append(owner)
         owner_stream = owner.open_stream(self.pod, track=False)
         self.streams.append(owner_stream)
+        # Each node is listed before its join, so a join that raises leaves it to `stop`.
         for i in range(2, self.n):
-            self.writers.append(self.join(Node(self.run, f'{self.prefix}-w{i}').start()))
-        self.r = self.join(self.run.reader(f'{self.prefix}-r0').start(), track=True)
+            self.writers.append(Node(self.run, f'{self.prefix}-w{i}').start())
+            self.join(self.writers[-1])
+        self.r = self.run.reader(f'{self.prefix}-r0').start()
+        self.join(self.r, track=True)
 
     def join(self, node, track=False):
         invite = self.writers[0].call('POST', f'/pods/{self.pod}/invites')
@@ -873,23 +919,25 @@ class Pod:
 
         def write(w, times):
             conn = http.client.HTTPConnection('127.0.0.1', w.port, timeout=STATUS_S)
-            consecutive = 0
-            for at in times:
-                if at is not None:
-                    time.sleep(max(0.0, at - time.time()))
-                try:
-                    c0 = time.monotonic()
-                    self.ids.add(self.place(w, conn, tag))
-                    self.calls.append((time.monotonic(), time.monotonic() - c0))
-                    placed[w.name] += 1
-                    consecutive = 0
-                except (NodeDown, RuntimeError) as e:
-                    conn = http.client.HTTPConnection('127.0.0.1', w.port, timeout=STATUS_S)
-                    failures.append(str(e))
-                    consecutive += 1
-                    if consecutive >= 10:
-                        return
-            conn.close()
+            try:
+                for at in times:
+                    if at is not None:
+                        time.sleep(max(0.0, at - time.time()))
+                    try:
+                        c0 = time.monotonic()
+                        self.ids.add(self.place(w, conn, tag))
+                        self.calls.append((time.monotonic(), time.monotonic() - c0))
+                        placed[w.name] += 1
+                        self.refusals[w.name] = 0
+                    except (NodeDown, RuntimeError) as e:
+                        conn.close()
+                        conn = http.client.HTTPConnection('127.0.0.1', w.port, timeout=STATUS_S)
+                        failures.append(str(e))
+                        self.refusals[w.name] += 1
+                        if self.refusals[w.name] >= WRITE_FAILURE_CAP:
+                            return
+            finally:
+                conn.close()
 
         threads = [threading.Thread(target=write, args=(w, schedule[i::len(self.writers)]), daemon=True)
                    for i, w in enumerate(self.writers)]
@@ -961,6 +1009,10 @@ class Pod:
         return [(node.name, t) for node in self.nodes for t in predicted_passes(node.started, interval, t0, t1)]
 
     def stop(self):
+        # Signalled together, then waited for: a node takes about 2.5 s to stop, 4 minutes for 100 one by one.
+        for node in self.nodes:
+            if node and node.proc is not None:
+                signal_group(node.proc, signal.SIGTERM)
         for node in self.nodes:
             if node:
                 node.stop()
@@ -1286,9 +1338,11 @@ def run_n(run, n):
                 if run.meta['obs_cost'] and not pod.broken and not why:
                     obs_cost(run, pod)
         finally:
-            pod.stop()
-            for node in pod.writers + ([pod.r] if pod.r else []):
-                shutil.rmtree(node.data, ignore_errors=True)
+            try:
+                pod.stop()
+            finally:
+                for node in pod.writers + ([pod.r] if pod.r else []):
+                    shutil.rmtree(node.data, ignore_errors=True)
     for path in (run.dir / 'events').glob(f'n{n}s*.jsonl'):
         with path.open('rb') as src, gzip.open(f'{path}.gz', 'wb') as dst:
             shutil.copyfileobj(src, dst)
@@ -1339,8 +1393,11 @@ def ramp(run, n, rate, to):
                 start = time.time() + 0.2
                 t0, t0_us = time.monotonic() + 0.2, int(start * 1e6)
                 placed, failures = pod.writing([start + k / rate for k in range(count)], f'ramp-{pod.held}')
-                # A writer at its failure cap leaves the rest of its share neither placed nor failed.
-                writes_failed = placed + len(failures) < count or any(w.proc.poll() is not None for w in pod.writers)
+                # A writer at its failure cap leaves the rest of its share neither placed nor failed, or reached the
+                # cap on the last record of its share.
+                writes_failed = (placed + len(failures) < count
+                                 or any(pod.refusals[w.name] >= WRITE_FAILURE_CAP for w in pod.writers)
+                                 or any(w.proc.poll() is not None for w in pod.writers))
                 calls = [d for _, d in pod.calls]
                 held, moved = -1, time.monotonic()
                 while pod.r.stream.held_since(mark) < placed and time.monotonic() - moved < RAMP_STALL_S:
@@ -1379,7 +1436,8 @@ def ramp(run, n, rate, to):
                                       f'{float(row["sessions_per_record"]):.1f}' if row['sessions_per_record'] else '-',
                                       f'{float(row["host_share"] or 0) * 100:.0f}',
                                       'WRITES FAILED' if writes_failed else 'CONTENT STOPPED' if stalled
-                                      else 'BEHIND > 30 s' if behind else 'ok'), flush=True)
+                                      else 'BEHIND > 30 s' if behind
+                                      else f'ok, {len(failures)} refused' if failures else 'ok'), flush=True)
                 if writes_failed:
                     name = keep_evidence(run, f'writes-failed/ramp-N{n}-at{pod.held}', pod.writers,
                                          {w.name: 0 for w in pod.writers})
@@ -1411,10 +1469,13 @@ def ramp(run, n, rate, to):
                                                             'listed': cell['catchup'].get('listed'),
                                                             'last_ready_s': cell['catchup'].get('last_ready_s')})
     finally:
-        pod.stop()
-        for node in pod.writers + ([pod.r] if pod.r else []):
-            shutil.rmtree(node.data, ignore_errors=True)
-        run.save()
+        # A stop that raises still leaves no stores behind: 100 nodes at 7,000 records hold 1.5 GB.
+        try:
+            pod.stop()
+        finally:
+            for node in pod.writers + ([pod.r] if pod.r else []):
+                shutil.rmtree(node.data, ignore_errors=True)
+            run.save()
 
 
 def relaunch(run):
@@ -1478,9 +1539,11 @@ def main():
                     print(f'N={n}: {e}', flush=True)
                     run.meta.setdefault('ramp_errors', []).append({'N': n, 'error': str(e)})
         finally:
-            run.stop_all()
-            run.meta.update(finished=time.time(), host_after=host_info())
-            run.save()
+            try:
+                run.stop_all()
+            finally:
+                run.meta.update(finished=time.time(), host_after=host_info())
+                run.save()
         return 1 if run.meta.get('ramp_errors') else 0
     print(f'run {run.meta["run"]} in {run.dir}; N order {run.meta["N"]}', flush=True)
     try:
@@ -1503,10 +1566,12 @@ def main():
                                 for rep in range(run.meta['repeats']):
                                     run.row(n, v, s, rep, '', not_run='node_down')
     finally:
-        run.stop_all()
-        run.meta.update(finished=time.time(), host_after=host_info())
-        run.meta['sleep_jumps'] = len(run.sampler.jumps)
-        run.save()
+        try:
+            run.stop_all()
+        finally:
+            run.meta.update(finished=time.time(), host_after=host_info())
+            run.meta['sleep_jumps'] = len(run.sampler.jumps)
+            run.save()
     return 0
 
 
