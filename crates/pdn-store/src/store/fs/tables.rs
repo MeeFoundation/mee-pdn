@@ -109,8 +109,15 @@ impl TransactionAndTables {
         self.inner.with_dependent_mut(|_, t| f(t))
     }
 
-    pub fn commit(self) -> std::result::Result<(), redb::CommitError> {
-        self.inner.into_owner().commit()
+    /// Commits, syncing the file when `synced`; answers whether it did. An
+    /// unsynced commit is visible to every later reader and reaches the disk
+    /// with the next synced one.
+    pub fn commit(self, synced: bool) -> std::result::Result<bool, redb::CommitError> {
+        let mut tx = self.inner.into_owner();
+        // Refused only after a persistent savepoint, which this store never takes.
+        let synced = synced || tx.set_durability(redb::Durability::None).is_err();
+        tx.commit()?;
+        Ok(synced)
     }
 }
 

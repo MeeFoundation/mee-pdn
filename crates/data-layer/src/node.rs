@@ -2715,6 +2715,26 @@ impl SyncNode {
         Ok(missing)
     }
 
+    /// How many membership views `identity`'s book has built rather than
+    /// reused.
+    #[cfg(feature = "test-util")]
+    pub fn membership_view_builds_for_test(&self, identity: PdnId) -> Result<usize> {
+        Ok(self.require(identity)?.access.view_builds())
+    }
+
+    /// Syncs `identity`'s replica store to disk while the blob store's batch
+    /// stays open: the order the stores' own commits can reach within their
+    /// settle window. A read commits without a sync, so it cannot stage it.
+    #[cfg(feature = "test-util")]
+    pub async fn sync_replica_store_for_test(&self, identity: PdnId) -> Result<()> {
+        self.require(identity)?
+            .docs
+            .engine()
+            .sync
+            .flush_store()
+            .await
+    }
+
     pub(crate) fn blobs(&self) -> iroh_blobs::api::Store {
         self.blobs.clone()
     }

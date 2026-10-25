@@ -717,9 +717,9 @@ async fn a_blob_store_that_cannot_open_fails_the_spawn() -> Result<()> {
 
 /// A membership store's entry is on disk with its payload when its write
 /// returns: a copy of the directory taken then, as a kill leaves it, holds
-/// the payload. The read before the copy commits the replica store's batch
-/// while the blob store's stays open, the order in which a kill would leave
-/// the entry without the payload the membership view rests on.
+/// the payload. The replica store is synced alone before the copy, the blob
+/// store's batch still open: the order in which a kill would leave the entry
+/// without the payload the membership view rests on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_membership_write_is_on_disk_whole_when_it_returns() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -729,7 +729,7 @@ async fn a_membership_write_is_on_disk_whole_when_it_returns() -> Result<()> {
     let payload = b"a statement no other device holds yet";
     node.write_pod_entry(alice.id, pod, PodStore::Membership, b"member/x", payload)
         .await?;
-    let _view = node.pod_membership_view(alice.id, pod).await?;
+    node.sync_replica_store_for_test(alice.id).await?;
     let copy = tempfile::tempdir()?;
     test_utils::crash_copy(dir.path(), copy.path())?;
     node.shutdown().await?;

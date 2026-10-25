@@ -11,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use iroh::{KeyParsingError, PublicKey};
 use iroh_blobs::Hash;
-use n0_future::time::SystemTime;
+use n0_future::time::{Duration, Instant, SystemTime};
 use redb::{Database, ReadableDatabase, ReadableMultimapTable, ReadableTable};
 use tracing::warn;
 
@@ -54,8 +54,15 @@ pub(crate) struct Store {
     /// restart resets it to zero and whoever compares treats the first
     /// look after a start as a change.
     writes: HashMap<NamespaceId, u64>,
+    /// When the oldest transaction committed without a file sync began. A
+    /// snapshot commits for visibility alone; the next synced commit, a
+    /// flush or the actor's within [`MAX_COMMIT_DELAY`] of this, takes the
+    /// writes to disk (the data layer's `durable-storage` spec).
+    unsynced_since: Option<Instant>,
     #[cfg(test)]
     commits: usize,
+    #[cfg(test)]
+    syncs: usize,
     /// Fails the next commit of a dirty transaction, as a full disk does.
     #[cfg(test)]
     fail_next_commit: bool,
@@ -135,25 +142,50 @@ impl Store {
             open_replicas: Default::default(),
             pubkeys: Default::default(),
             writes: Default::default(),
+            unsynced_since: None,
             #[cfg(test)]
             commits: 0,
+            #[cfg(test)]
+            syncs: 0,
             #[cfg(test)]
             fail_next_commit: false,
         })
     }
 
-    /// Flush the current transaction, if any.
+    /// Commit the current transaction, if any, and sync every commit so far
+    /// to the file.
     ///
     /// This is the cheapest way to ensure that the data is persisted.
     pub fn flush(&mut self) -> Result<()> {
         if let CurrentTransaction::Write(w) = std::mem::take(&mut self.transaction) {
-            self.finish_write(w)?;
+            self.finish_write(w, true)?;
+        }
+        if self.unsynced_since.is_some() {
+            // An empty synced commit takes the unsynced ones before it to disk.
+            self.db.begin_write()?.commit()?;
+            self.synced();
         }
         Ok(())
     }
 
-    /// Commit a write transaction, or drop it when nothing was written
-    /// through it.
+    /// How long until the writes an unsynced commit holds are due on disk;
+    /// `None` when every commit is synced.
+    pub(crate) fn sync_due_in(&self) -> Option<Duration> {
+        self.unsynced_since
+            .map(|since| MAX_COMMIT_DELAY.saturating_sub(since.elapsed()))
+    }
+
+    fn synced(&mut self) {
+        self.unsynced_since = None;
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
+    }
+
+    /// Commit a write transaction, syncing the file when `synced` or when an
+    /// unsynced commit is already due on disk, or drop it when nothing was
+    /// written through it.
     ///
     /// redb commits durably and has no path that skips the file sync for a
     /// transaction that changed nothing, so committing a clean one buys a
@@ -167,7 +199,7 @@ impl Store {
     /// pages freed under a since-closed read transaction to the allocator,
     /// so on a node that holds no writes those pages wait for the next real
     /// one.
-    fn finish_write(&mut self, w: TransactionAndTables) -> Result<()> {
+    fn finish_write(&mut self, w: TransactionAndTables, synced: bool) -> Result<()> {
         if !w.is_dirty() {
             return Ok(());
         }
@@ -178,8 +210,25 @@ impl Store {
             }
             self.commits += 1;
         }
-        w.commit()?;
+        let began = self
+            .unsynced_since
+            .map_or(w.since, |unsynced| unsynced.min(w.since));
+        // Due as well: a steady stream of snapshots would otherwise keep
+        // every write off the disk.
+        let synced = synced || began.elapsed() >= MAX_COMMIT_DELAY;
+        if w.commit(synced)? {
+            self.synced();
+        } else {
+            self.unsynced_since = Some(began);
+        }
         Ok(())
+    }
+
+    /// How many commits synced the file (test observability for the
+    /// snapshot's unsynced commit).
+    #[cfg(test)]
+    pub(crate) fn debug_sync_count(&self) -> usize {
+        self.syncs
     }
 
     #[cfg(test)]
@@ -208,7 +257,8 @@ impl Store {
     /// Get a read-only snapshot of the database.
     ///
     /// This has the side effect of committing any open write transaction,
-    /// so it can be used as a way to ensure that the data is persisted.
+    /// unsynced: what it wrote is in the snapshot, and on disk after the next
+    /// [`flush`](Self::flush) or within [`MAX_COMMIT_DELAY`].
     pub fn snapshot(&mut self) -> Result<&ReadOnlyTables> {
         let tables = match std::mem::take(&mut self.transaction) {
             CurrentTransaction::None => {
@@ -216,7 +266,7 @@ impl Store {
                 ReadOnlyTables::new(tx)?
             }
             CurrentTransaction::Write(w) => {
-                self.finish_write(w)?;
+                self.finish_write(w, false)?;
                 let tx = self.db.begin_read()?;
                 ReadOnlyTables::new(tx)?
             }
@@ -235,10 +285,11 @@ impl Store {
     /// reads.
     ///
     /// This has the side effect of committing any open write transaction,
-    /// so it can be used as a way to ensure that the data is persisted.
+    /// unsynced, as [`snapshot`](Self::snapshot) does.
     pub(crate) fn snapshot_owned(&mut self) -> Result<ReadOnlyTables> {
-        // make sure the current transaction is committed
-        self.flush()?;
+        if let CurrentTransaction::Write(w) = std::mem::take(&mut self.transaction) {
+            self.finish_write(w, false)?;
+        }
         assert!(matches!(self.transaction, CurrentTransaction::None));
         let tx = self.db.begin_read()?;
         let tables = ReadOnlyTables::new(tx)?;
@@ -271,7 +322,7 @@ impl Store {
             CurrentTransaction::Write(w) if w.since.elapsed() <= MAX_COMMIT_DELAY => Ok(w),
             CurrentTransaction::Write(w) => {
                 tracing::debug!("committing transaction because it's too old");
-                self.finish_write(w)?;
+                self.finish_write(w, true)?;
                 let tx = self.db.begin_write()?;
                 Ok(TransactionAndTables::new(tx)?)
             }
@@ -463,7 +514,11 @@ impl Store {
             tables.namespaces.remove(namespace.as_bytes())?;
             tables.namespace_peers.remove_all(namespace.as_bytes())?;
             Ok(())
-        })
+        })?;
+        // A removal is a mutation like any write: a reader keyed on the count
+        // would otherwise take the emptied replica for the one it read.
+        self.wrote(*namespace);
+        Ok(())
     }
 
     /// Get an iterator over entries of a replica.
@@ -1066,6 +1121,107 @@ mod tests {
     /// A persistent store keeps a replica's capability and an author's key,
     /// a second write at a key replaces the first, and a removed entry reads
     /// as absent.
+    /// A replica and its author, on disk, with nothing written yet.
+    fn replica(store: &mut Store) -> Result<(NamespaceSecret, Author)> {
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        store.flush()?;
+        Ok((namespace, author))
+    }
+
+    /// One entry at `key`, into the store's open write batch.
+    fn put(
+        store: &mut Store,
+        namespace: &NamespaceSecret,
+        author: &Author,
+        key: &str,
+    ) -> Result<()> {
+        let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+        let entry = Entry::new(id, Record::current_from_data("world"));
+        StoreInstance::new(namespace.id(), store)
+            .entry_put(SignedEntry::from_entry(entry, namespace, author))
+    }
+
+    /// Removing a replica moves its write count, as a write does.
+    #[test]
+    fn a_removal_counts_as_a_write() -> Result<()> {
+        let mut store = Store::memory();
+        let (namespace, author) = replica(&mut store)?;
+        put(&mut store, &namespace, &author, "hello")?;
+        let writes = store.writes_of(namespace.id());
+        store.remove_replica(&namespace.id())?;
+        assert_eq!(store.writes_of(namespace.id()), writes + 1);
+        Ok(())
+    }
+
+    /// A snapshot makes a pending write visible without syncing the file,
+    /// and the flush after it syncs.
+    #[test]
+    fn a_snapshot_commits_without_a_sync_and_a_flush_syncs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
+        let (namespace, author) = replica(&mut store)?;
+        put(&mut store, &namespace, &author, "hello")?;
+        let syncs = store.debug_sync_count();
+        let snapshot = store.snapshot_owned()?;
+        assert_eq!(
+            redb::ReadableTableMetadata::len(&snapshot.records_by_key)?,
+            1,
+            "the write is in the snapshot"
+        );
+        assert_eq!(
+            store.debug_sync_count(),
+            syncs,
+            "the snapshot synced the file"
+        );
+        assert!(
+            store.sync_due_in().is_some(),
+            "the unsynced commit has no deadline"
+        );
+        drop(snapshot);
+        store.flush()?;
+        assert_eq!(store.debug_sync_count(), syncs + 1);
+        assert_eq!(store.sync_due_in(), None);
+        assert_eq!(store.get_many(namespace.id(), Query::all())?.count(), 1);
+        Ok(())
+    }
+
+    /// A snapshot syncs the file once the settle window has passed since the
+    /// oldest write it would leave unsynced: its own batch's, or an earlier
+    /// unsynced commit's.
+    #[test]
+    fn a_snapshot_past_the_settle_window_syncs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path(), TEST_CACHE_BYTES)?;
+        let (namespace, author) = replica(&mut store)?;
+        let syncs = store.debug_sync_count();
+        // The batch itself is past the window.
+        put(&mut store, &namespace, &author, "first")?;
+        std::thread::sleep(MAX_COMMIT_DELAY + Duration::from_millis(50));
+        drop(store.snapshot_owned()?);
+        assert_eq!(
+            store.debug_sync_count(),
+            syncs + 1,
+            "an old batch stayed unsynced"
+        );
+        // A young batch behind an unsynced commit past the window.
+        put(&mut store, &namespace, &author, "second")?;
+        drop(store.snapshot_owned()?);
+        assert_eq!(store.debug_sync_count(), syncs + 1);
+        std::thread::sleep(MAX_COMMIT_DELAY + Duration::from_millis(50));
+        put(&mut store, &namespace, &author, "third")?;
+        drop(store.snapshot_owned()?);
+        assert_eq!(
+            store.debug_sync_count(),
+            syncs + 2,
+            "a due commit stayed unsynced"
+        );
+        assert_eq!(store.sync_due_in(), None);
+        Ok(())
+    }
+
     #[test]
     fn test_basics() -> Result<()> {
         let dbfile = tempfile::NamedTempFile::new()?;
