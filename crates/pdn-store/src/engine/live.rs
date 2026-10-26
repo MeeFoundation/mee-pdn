@@ -2264,6 +2264,10 @@ pub struct SyncDetails {
     pub entries_received: usize,
     /// Number of entries sent
     pub entries_sent: usize,
+    /// The replica's write count as the session's snapshot opened: the
+    /// snapshot held every write counted up to it. Compared only with
+    /// this replica's own [`SyncHandle::writes`](crate::actor::SyncHandle::writes).
+    pub snapshot_writes: u64,
 }
 
 impl From<&SyncFinished> for SyncDetails {
@@ -2271,6 +2275,7 @@ impl From<&SyncFinished> for SyncDetails {
         Self {
             entries_received: value.outcome.num_recv,
             entries_sent: value.outcome.num_sent,
+            snapshot_writes: value.outcome.snapshot_writes,
         }
     }
 }

@@ -159,7 +159,7 @@ enum ReplicaAction {
         /// Write counts to compare in the step that opens the snapshot.
         read: Vec<(NamespaceId, u64)>,
         #[debug("reply")]
-        reply: oneshot::Sender<Result<(SyncSessionId, Arc<()>, bool)>>,
+        reply: oneshot::Sender<Result<OpenedSession>>,
     },
     SyncInitialMessage {
         session: SyncSessionId,
@@ -235,6 +235,15 @@ pub(crate) struct SyncSessionId {
     seq: u64,
 }
 
+/// What the step that opens a session's snapshot answers.
+struct OpenedSession {
+    id: SyncSessionId,
+    alive: Arc<()>,
+    /// Every replica the request named still had the write count it named.
+    unwritten: bool,
+    writes: u64,
+}
+
 /// Handle to one sync session's read snapshot in the actor.
 ///
 /// The snapshot pins a redb read transaction, so its lifetime must stay
@@ -254,6 +263,9 @@ pub(crate) struct SyncSessionId {
 #[derive(Debug)]
 pub(crate) struct SyncSession {
     id: SyncSessionId,
+    /// The replica's write count as the snapshot opened, every write it
+    /// counts held in the snapshot.
+    writes: u64,
     tx: async_channel::Sender<Action>,
     /// Held, never read: the actor watches the strong count.
     _alive: Arc<()>,
@@ -264,6 +276,10 @@ impl SyncSession {
     /// [`SyncHandle::sync_process_message`].
     pub fn id(&self) -> SyncSessionId {
         self.id
+    }
+
+    pub fn writes(&self) -> u64 {
+        self.writes
     }
 }
 
@@ -476,9 +492,15 @@ impl SyncHandle {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::SyncSessionStart { read, reply };
         self.send_replica(namespace, action).await?;
-        let (id, alive, unwritten) = rx.await??;
+        let OpenedSession {
+            id,
+            alive,
+            unwritten,
+            writes,
+        } = rx.await??;
         let session = SyncSession {
             id,
+            writes,
             tx: self.tx.clone(),
             _alive: alive,
         };
@@ -1027,7 +1049,12 @@ impl Actor {
                     let unwritten = read
                         .iter()
                         .all(|(read, writes)| this.store.writes_of(*read) == *writes);
-                    Ok((id, alive, unwritten))
+                    Ok(OpenedSession {
+                        id,
+                        alive,
+                        unwritten,
+                        writes: this.store.writes_of(namespace),
+                    })
                 })
             }
             ReplicaAction::SyncInitialMessage {

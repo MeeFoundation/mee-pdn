@@ -766,10 +766,7 @@ impl AccessBook {
         let store = membership.id();
         // Read before the entries: a write landing in between leaves a kept
         // view newer than its count, which the next look reads as a change.
-        let writes = match self.sync.get() {
-            Some(sync) => sync.writes(store).await.ok(),
-            None => None,
-        };
+        let writes = self.writes(store).await;
         if let Some(read) = writes.and_then(|writes| self.kept_view(pod, store, writes)) {
             #[cfg(feature = "test-util")]
             self.report_pod_verdicts(pod, &read.1, &read.0);
@@ -792,6 +789,13 @@ impl AccessBook {
             self.keep_view(pod, store, writes, (view.clone(), entries.clone()));
         }
         Ok((view, entries))
+    }
+
+    /// How many writes this identity's replica of `store` has taken since
+    /// the store opened; `None` before the engine is attached or for a
+    /// replica it cannot reach.
+    pub(crate) async fn writes(&self, store: NamespaceId) -> Option<u64> {
+        self.sync.get()?.writes(store).await.ok()
     }
 
     /// How many membership views this book has built rather than reused.
