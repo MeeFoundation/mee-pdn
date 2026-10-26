@@ -133,6 +133,8 @@ pub(crate) struct SyncOutcome {
     pub(crate) num_recv: usize,
     /// Number of entries we sent.
     pub(crate) num_sent: usize,
+    /// The replica's write count as the session's snapshot opened.
+    pub(crate) snapshot_writes: u64,
 }
 
 /// Kind of capability of the namespace.

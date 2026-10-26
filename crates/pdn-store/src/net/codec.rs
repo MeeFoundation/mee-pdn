@@ -177,6 +177,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .sync_session_start(namespace)
         .await
         .map_err(ConnectError::sync)?;
+    progress.snapshot_writes = session.writes();
     let (filter, ingest) = match access {
         DialAccess::Given { filter, ingest } => (filter, ingest),
         // The addressed identity first, the acting one second, as on the
@@ -539,6 +540,7 @@ impl BobState {
             .await
             .map_err(|e| self.fail(e))?;
         let session_id = session.id();
+        self.progress.snapshot_writes = session.writes();
         self.session = Some(session);
         if let Some(recheck) = recheck {
             let holds = match recheck.rests_on {

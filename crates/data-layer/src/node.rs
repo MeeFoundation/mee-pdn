@@ -538,10 +538,12 @@ struct HostedStack {
     /// dropped, not replayed to it: a later announcement or pass carries
     /// what it would have.
     announcements_in_flight: Mutex<HashSet<(NamespaceId, Identity)>>,
-    /// Pods this identity departed whose tombstone has converged with a
-    /// member's device, and is reconciled with the identity's own devices
-    /// alone from then on.
-    converged_tombstones: Mutex<HashSet<PodId>>,
+    /// The identity's own departure from each pod whose membership view
+    /// shows one, as this process first read it held.
+    tombstones: Mutex<HashMap<PodId, Tombstone>>,
+    /// How many sessions the membership store watchers' derivations took in.
+    #[cfg(feature = "test-util")]
+    sessions_derived: std::sync::atomic::AtomicUsize,
     /// Pods whose membership view the last run of the pass found listing
     /// nobody.
     found_empty: Mutex<HashSet<PodId>>,
@@ -1034,7 +1036,9 @@ impl SyncNode {
             author,
             tracked_docs: Mutex::new(HashMap::new()),
             announcements_in_flight: Mutex::new(HashSet::new()),
-            converged_tombstones: Mutex::new(HashSet::new()),
+            tombstones: Mutex::new(HashMap::new()),
+            #[cfg(feature = "test-util")]
+            sessions_derived: std::sync::atomic::AtomicUsize::new(0),
             found_empty: Mutex::new(HashSet::new()),
             starting_pods: Mutex::new(HashSet::new()),
             pod_derivations: Mutex::new(HashMap::new()),
@@ -2234,7 +2238,8 @@ impl SyncNode {
     }
 
     /// The contacts `identity`'s replica of one of `pod`'s stores is
-    /// tracked with, as the last derivation left them; reading derives none.
+    /// tracked with, as the last derivation left them, a tombstone's
+    /// included; reading derives none.
     #[cfg(feature = "test-util")]
     pub fn pod_contacts_for_test(
         &self,
@@ -2243,7 +2248,16 @@ impl SyncNode {
         store: PodStore,
     ) -> Result<Vec<Contact>> {
         let stack = self.require(identity)?;
-        let doc = Self::pod_doc(&stack, pod, store)?;
+        let doc = match store {
+            PodStore::Membership => {
+                stack
+                    .registry
+                    .pod(pod)?
+                    .ok_or(UnknownPod { pod })?
+                    .membership
+            }
+            PodStore::Records => Self::pod_doc(&stack, pod, store)?,
+        };
         Ok(stack
             .tracked(doc.id())?
             .map(|tracked| tracked.contacts)
@@ -2727,6 +2741,17 @@ impl SyncNode {
     #[cfg(feature = "test-util")]
     pub fn membership_view_builds_for_test(&self, identity: PdnId) -> Result<usize> {
         Ok(self.require(identity)?.access.view_builds())
+    }
+
+    /// How many sessions that went through `identity`'s pods' membership
+    /// stores a derivation of their contacts has taken in, counted once that
+    /// derivation set them.
+    #[cfg(feature = "test-util")]
+    pub fn pod_sessions_derived_for_test(&self, identity: PdnId) -> Result<usize> {
+        Ok(self
+            .require(identity)?
+            .sessions_derived
+            .load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Syncs `identity`'s replica store to disk while the blob store's batch
@@ -3796,7 +3821,7 @@ async fn derive_pod_contacts(
     node: EndpointId,
     pod: PodId,
     held: &PodBinding,
-    met: &[Identity],
+    met: &[Met],
 ) -> Derived {
     let derivation = stack.pod_derivation(pod);
     let _derivation = derivation.lock().await;
@@ -3809,7 +3834,7 @@ async fn derive_pod_contacts_locked(
     node: EndpointId,
     pod: PodId,
     held: &PodBinding,
-    met: &[Identity],
+    met: &[Met],
 ) -> Derived {
     let derived = match pod_contacts(stack, node, pod, held, met).await {
         Ok(derived) => derived,
@@ -4013,8 +4038,12 @@ fn watch_pod_membership(
             let Ok(Some(held)) = stack.registry.pod(pod) else {
                 continue;
             };
-            let met: Vec<Identity> = seen.met.iter().map(|(_peer, identity)| *identity).collect();
+            let met: Vec<Met> = seen.met.iter().map(|(_peer, met)| *met).collect();
             let derived = derive_pod_contacts(&stack, node, pod, &held, &met).await;
+            #[cfg(feature = "test-util")]
+            stack
+                .sessions_derived
+                .fetch_add(met.len(), std::sync::atomic::Ordering::SeqCst);
             // A start in flight first starts the record store itself, once
             // the view shows the join; dialed here before, its first
             // session is judged by the departure.
@@ -4063,9 +4092,9 @@ impl Drop for StartingPod<'_> {
 /// What a membership store's watcher has seen of its sessions.
 #[derive(Default)]
 struct Seen {
-    /// The peer and counterpart of each session that went through since the
-    /// last derivation.
-    met: Vec<(EndpointId, Identity)>,
+    /// The peer of each session that went through since the last
+    /// derivation, and the session as the derivation weighs it.
+    met: Vec<(EndpointId, Met)>,
     /// The peers an entry arrived from since their last session ended.
     brought_by: HashSet<EndpointId>,
 }
@@ -4077,8 +4106,14 @@ impl Seen {
         use pdn_store::engine::LiveEvent;
         match event {
             Ok(LiveEvent::SyncFinished(sync)) => {
-                if sync.result.is_ok() {
-                    self.met.push((sync.peer, sync.counterpart));
+                if let Ok(details) = &sync.result {
+                    self.met.push((
+                        sync.peer,
+                        Met {
+                            counterpart: sync.counterpart,
+                            snapshot_writes: details.snapshot_writes,
+                        },
+                    ));
                 }
                 false
             }
@@ -4100,9 +4135,9 @@ impl Seen {
     /// each peer's mark cleared.
     fn brought(&mut self) -> Vec<(EndpointId, Identity)> {
         let mut brought = Vec::new();
-        for (peer, identity) in &self.met {
+        for (peer, met) in &self.met {
             if self.brought_by.remove(peer) {
-                brought.push((*peer, *identity));
+                brought.push((*peer, met.counterpart));
             }
         }
         brought
@@ -4161,15 +4196,16 @@ async fn dial_again(
 /// nothing yet keeps the contacts its ticket gave it. A tombstone drops
 /// the members' devices and the ticketed ones once a session with a
 /// current member's replica — a counterpart among `met`, on whichever
-/// node — went through. A replica holding its record store again keeps
-/// them while its membership view still shows the departure: they are how
-/// a rejoin dials its inviter.
+/// node — went through from a snapshot that held the departure
+/// ([`Tombstone`]). A replica holding its record store again keeps them
+/// while its membership view still shows the departure: they are how a
+/// rejoin dials its inviter.
 async fn pod_contacts(
     stack: &HostedStack,
     node: EndpointId,
     pod: PodId,
     held: &PodBinding,
-    met: &[Identity],
+    met: &[Met],
 ) -> Result<DerivedContacts> {
     let membership = &held.membership;
     let view = stack.access.membership_view(pod, membership).await?;
@@ -4192,24 +4228,12 @@ async fn pod_contacts(
         author: stack.author,
     };
     let unlisted = member && standing.is_some_and(|standing| !standing.devices.contains(&device));
-    let converged = {
-        let mut converged = stack
-            .converged_tombstones
-            .lock()
-            .map_err(|_poisoned| anyhow::anyhow!("tombstone lock poisoned"))?;
-        if departed.is_some() && held.records.is_none() {
-            let member = |counterpart: &Identity| {
-                view.member(&PdnId::from_bytes(*counterpart.as_bytes()))
-                    .is_some_and(|member| member.state.member)
-            };
-            if met.iter().any(member) {
-                converged.insert(pod);
-            }
-        } else {
-            converged.remove(&pod);
-        }
-        converged.contains(&pod)
+    // Read after the view, so it counts every write the view holds.
+    let writes = match departed {
+        Some(_) => stack.access.writes(membership.id()).await,
+        None => None,
     };
+    let converged = tombstone_converged(stack, pod, departed, writes, held, met, &view)?;
     let mut devices: Vec<(NodeId, Identity)> = view
         .identities()
         .filter(|(_id, member)| member.state.member && !converged)
@@ -4246,6 +4270,58 @@ async fn pod_contacts(
         departed,
         member,
         unlisted,
+    })
+}
+
+/// Whether `pod`'s tombstone has converged once `met` is taken in. The
+/// identity's own departure is kept at `writes`, the first count read past
+/// a view showing it, and dropped once the view shows none.
+fn tombstone_converged(
+    stack: &HostedStack,
+    pod: PodId,
+    departed: Option<Seq>,
+    writes: Option<u64>,
+    held: &PodBinding,
+    met: &[Met],
+    view: &MembershipView,
+) -> Result<bool> {
+    let mut tombstones = stack
+        .tombstones
+        .lock()
+        .map_err(|_poisoned| anyhow::anyhow!("tombstone lock poisoned"))?;
+    let kept = tombstones.get(&pod).map(|kept| kept.departed);
+    match (departed, writes) {
+        (Some(seq), _) if kept == Some(seq) => {}
+        (Some(seq), Some(held_at)) => {
+            tombstones.insert(
+                pod,
+                Tombstone {
+                    departed: seq,
+                    held_at,
+                    converged: false,
+                },
+            );
+        }
+        _ => {
+            tombstones.remove(&pod);
+        }
+    }
+    let member = |counterpart: &Identity| {
+        view.member(&PdnId::from_bytes(*counterpart.as_bytes()))
+            .is_some_and(|member| member.state.member)
+    };
+    Ok(match tombstones.get_mut(&pod) {
+        Some(tombstone) if held.records.is_none() => {
+            tombstone.converged |= met
+                .iter()
+                .any(|met| met.snapshot_writes >= tombstone.held_at && member(&met.counterpart));
+            tombstone.converged
+        }
+        Some(tombstone) => {
+            tombstone.converged = false;
+            false
+        }
+        None => false,
     })
 }
 
@@ -4320,6 +4396,28 @@ fn known_addresses(stack: &HostedStack, store: &Doc) -> Result<HashMap<EndpointI
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// A session that went through, as a derivation of contacts weighs it.
+#[derive(Clone, Copy, Debug)]
+struct Met {
+    counterpart: Identity,
+    /// The write count the replica had as the session's snapshot opened.
+    snapshot_writes: u64,
+}
+
+/// The identity's own departure from a pod, kept per process: write counts
+/// restart with the store.
+#[derive(Debug)]
+struct Tombstone {
+    departed: Seq,
+    /// The replica's write count once a view showing the departure was
+    /// read: a session whose snapshot opened at it or later carried the
+    /// departure's past, and one that opened before may have carried none.
+    held_at: u64,
+    /// A session with a current member's replica went through from a
+    /// snapshot past `held_at` while the record store was forgotten.
+    converged: bool,
 }
 
 /// What [`pod_contacts`] derives from one membership view.

@@ -21,7 +21,7 @@ use data_layer::{
 use pdn_store::SessionRole;
 use pdn_types::{PodId, RecordRef};
 use test_utils::{
-    join_identity,
+    eventually, join_identity,
     pod::{
         create, device_of, held_records, host, invite, lists, lists_device, place_claim, reads,
         state_on, tickets, write, Person,
@@ -1089,6 +1089,94 @@ async fn a_tombstone_short_of_a_member_flushes_its_departure_to_the_members() ->
     }
 
     for node in [alice_phone, bob_phone, carol_phone, carol_laptop] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A session set up before a leave that ends once the record store is
+/// forgotten leaves the tombstone short of convergence: the member's device
+/// stays among its contacts, and the flush after it carries the left event
+/// there, which converges it.
+///
+/// The dial is held right after its access decision, its snapshot already
+/// open. Every pass is out of reach and the leaving device is out of both
+/// swarms and settled, so the held dial and the flush are its only sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_set_up_before_a_leave_does_not_converge_its_tombstone() -> Result<()> {
+    let (alice_phone, carol_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    let carols = vec![device_of(&carol_phone, &carol)?];
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let tickets = tickets(&alice_phone, &alice, pod).await?;
+    let membership = tickets.membership.capability.id();
+    carol_phone
+        .import_pod(carol.id, pod, tickets.clone())
+        .await?;
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, PLAIN).await?);
+    for namespace in [membership, tickets.records.capability.id()] {
+        carol_phone
+            .leave_swarm_for_test(carol.id, namespace)
+            .await?;
+    }
+    assert!(settle(&[&alice_phone, &carol_phone], pod).await?);
+    let contacts = || -> Result<HashSet<_>> {
+        Ok(carol_phone
+            .pod_contacts_for_test(carol.id, pod, PodStore::Membership)?
+            .into_iter()
+            .map(|contact| (contact.addr.id, contact.identity))
+            .collect())
+    };
+    let alice_on_phone = (
+        data_layer::EndpointId::from_bytes(alice_phone.node_id().as_bytes())?,
+        identity_of(alice.id),
+    );
+
+    let held_dial =
+        carol_phone.pause_next_dial_for_test(carol.id, membership, alice_phone.node_id())?;
+    dial(
+        &carol_phone,
+        &carol,
+        pod,
+        PodStore::Membership,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    held_dial.reached.notified().await;
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    carol_phone.forget_pod(carol.id, pod).await?;
+    let derived = carol_phone.pod_sessions_derived_for_test(carol.id)?;
+    held_dial.release.notify_one();
+    // The derivation that takes the held session in.
+    assert!(
+        eventually(|| async { Ok(carol_phone.pod_sessions_derived_for_test(carol.id)? > derived) })
+            .await?
+    );
+    assert_eq!(
+        contacts()?,
+        HashSet::from([alice_on_phone]),
+        "a session set up before the leave converged the tombstone"
+    );
+
+    let flushed = carol_phone
+        .flush_pod(carol.id, pod)
+        .await?
+        .wait(TIMEOUT)
+        .await;
+    assert!(flushed, "the tombstone's flush reached no member's device");
+    assert!(
+        lists(&alice_phone, alice.id, pod, carol.id, OUT).await?,
+        "the leave did not reach the member's device"
+    );
+    assert!(
+        eventually(|| async { Ok(contacts()?.is_empty()) }).await?,
+        "the flush's session did not converge the tombstone"
+    );
+
+    for node in [alice_phone, carol_phone] {
         node.shutdown().await?;
     }
     Ok(())
