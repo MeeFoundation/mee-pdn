@@ -54,10 +54,11 @@ pub(crate) struct Store {
     /// restart resets it to zero and whoever compares treats the first
     /// look after a start as a change.
     writes: HashMap<NamespaceId, u64>,
-    /// When the oldest transaction committed without a file sync began. A
-    /// snapshot commits for visibility alone; the next synced commit, a
-    /// flush or the actor's within [`MAX_COMMIT_DELAY`] of this, takes the
-    /// writes to disk (the data layer's `durable-storage` spec).
+    /// When the oldest transaction committed without a file sync began, or
+    /// when a flush last failed to sync it. A snapshot commits for
+    /// visibility alone; the next synced commit, a flush or the actor's
+    /// within [`MAX_COMMIT_DELAY`] of this, takes the writes to disk (the
+    /// data layer's `durable-storage` spec).
     unsynced_since: Option<Instant>,
     #[cfg(test)]
     commits: usize,
@@ -130,6 +131,12 @@ impl Store {
         Self::new_impl(open_database(path.as_ref(), cache_bytes)?)
     }
 
+    /// A store on `backend`, for a test that makes the storage fail.
+    #[cfg(test)]
+    pub(crate) fn on_backend(backend: impl redb::StorageBackend) -> Result<Self> {
+        Self::new_impl(Database::builder().create_with_backend(backend)?)
+    }
+
     fn new_impl(db: redb::Database) -> Result<Self> {
         // Setup all tables
         let write_tx = db.begin_write()?;
@@ -157,6 +164,17 @@ impl Store {
     ///
     /// This is the cheapest way to ensure that the data is persisted.
     pub fn flush(&mut self) -> Result<()> {
+        let flushed = self.commit_and_sync();
+        if flushed.is_err() && self.unsynced_since.is_some() {
+            // Due again a settle window later, not at once: redb refuses
+            // every commit after an I/O error, so a sync due at once would
+            // hold the actor retrying it for good.
+            self.unsynced_since = Some(Instant::now());
+        }
+        flushed
+    }
+
+    fn commit_and_sync(&mut self) -> Result<()> {
         if let CurrentTransaction::Write(w) = std::mem::take(&mut self.transaction) {
             self.finish_write(w, true)?;
         }

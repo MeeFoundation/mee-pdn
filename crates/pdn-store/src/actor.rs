@@ -1503,6 +1503,96 @@ mod tests {
         Ok(())
     }
 
+    /// Memory that refuses every write once `full` is set, as a full disk
+    /// does; redb then refuses every commit after the first it failed.
+    #[derive(Debug)]
+    struct FillingDisk {
+        memory: redb::backends::InMemoryBackend,
+        full: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FillingDisk {
+        fn refuse(&self) -> std::io::Result<()> {
+            if self.full.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            Ok(())
+        }
+    }
+
+    impl redb::StorageBackend for FillingDisk {
+        fn len(&self) -> std::io::Result<u64> {
+            self.memory.len()
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+            self.memory.read(offset, out)
+        }
+
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            self.refuse()?;
+            self.memory.set_len(len)
+        }
+
+        fn sync_data(&self) -> std::io::Result<()> {
+            self.refuse()?;
+            self.memory.sync_data()
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            self.refuse()?;
+            self.memory.write(offset, data)
+        }
+    }
+
+    /// A store whose disk fills behind a session's unsynced commit keeps
+    /// answering, a write with the storage failure. The sync of that commit
+    /// is due once the settle window passes and fails on every retry.
+    #[tokio::test]
+    async fn a_store_whose_disk_stays_full_keeps_answering() -> anyhow::Result<()> {
+        let full = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = store::Store::on_backend(FillingDisk {
+            memory: redb::backends::InMemoryBackend::new(),
+            full: full.clone(),
+        })?;
+        let sync = SyncHandle::spawn(store, None, "foo".into());
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        sync.import_namespace(namespace.into()).await?;
+        sync.open(id, Default::default()).await?;
+        sync.set_sync(id, true).await?;
+        let author = sync.import_author(Author::new(&mut rand::rng())).await?;
+        sync.insert_local(
+            id,
+            author,
+            Bytes::from_static(b"key"),
+            Hash::new(b"value"),
+            5,
+        )
+        .await?;
+        let session = sync.sync_session_start(id).await?;
+        full.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(MAX_COMMIT_DELAY * 2).await;
+
+        let next = tokio::time::timeout(
+            MAX_COMMIT_DELAY * 4,
+            sync.insert_local(
+                id,
+                author,
+                Bytes::from_static(b"next"),
+                Hash::new(b"next"),
+                4,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(next, Ok(Err(_))),
+            "a write on a full disk must be answered with its failure, got {next:?}"
+        );
+        drop(session);
+        Ok(())
+    }
+
     /// A request queued behind the shutdown fails its caller instead of
     /// leaving it waiting while a handle lives. Both are in the channel
     /// before the actor starts, so the shutdown is the first thing it reads.
