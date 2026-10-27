@@ -15,6 +15,21 @@ use test_utils::eventually;
 /// the sessions a write or a join prompts.
 const POD_INTERVAL_SECS: u64 = 300;
 
+/// A client of the surface, with a TLS configuration of its own (iroh-002):
+/// without one it panics on its first request, plain HTTP included. Its empty
+/// root store trusts no server.
+fn client() -> Result<reqwest::Client> {
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    Ok(reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()?)
+}
+
 /// One handle serving its surface on a loopback port of its own.
 struct Phone {
     node: Arc<PdnNode>,
@@ -34,7 +49,7 @@ impl Phone {
         Ok(Self {
             node,
             base: format!("http://127.0.0.1:{port}"),
-            http: reqwest::Client::new(),
+            http: client()?,
             _dir: dir,
         })
     }
@@ -516,7 +531,7 @@ async fn a_reset_outlives_its_client() -> Result<()> {
     let phone = Phone::serve().await?;
     let first = phone.reset().await?;
     let (_, before) = phone.get("/debug/status").await?;
-    let hasty = reqwest::Client::new();
+    let hasty = client()?;
     let gone = tokio::spawn(
         hasty
             .post(format!("{}/debug/agent/reset", phone.base))

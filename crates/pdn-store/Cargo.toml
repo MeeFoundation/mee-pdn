@@ -62,7 +62,7 @@ data-encoding = "2.6.0"
 futures-buffered = "0.2.4"
 iroh = { version = "1", features = ["test-utils"] }
 nested_enum_utils = "0.2"
-parking_lot = "0.12.3"
+parking_lot = "0.13"
 proptest = "1.2.0"
 rand = { version = "0.10", features = ["chacha"] }
 # The cache statistics a test reads to see the bound reach the database.
