@@ -1576,9 +1576,13 @@ mod tests {
     }
 
     /// A cancelled session run releases its snapshot: the guard drops with
-    /// the future.
+    /// the future. The abort waits for the run's first bytes on the wire:
+    /// a run aborted while the actor's reply still sits undelivered holds
+    /// no guard yet, and its registration waits for the reclaim pass.
     #[tokio::test]
     async fn test_sync_session_released_on_cancelled_initiator() -> Result<()> {
+        use tokio::io::AsyncReadExt as _;
+
         let mut rng = rand::rng();
         let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
         let namespace = NamespaceSecret::new(&mut rng);
@@ -1589,7 +1593,7 @@ mod tests {
             .await?;
 
         // The peer end stays open and silent, so the run parks mid-session.
-        let (alice, _bob_kept_silent) = tokio::io::duplex(64);
+        let (alice, mut bob_kept_silent) = tokio::io::duplex(64);
         let (mut alice_reader, mut alice_writer) = tokio::io::split(alice);
         let alice_handle2 = alice_handle.clone();
         let alice_task = tokio::task::spawn(async move {
@@ -1609,16 +1613,13 @@ mod tests {
             .await
         });
 
-        // Wait until the parked session's snapshot is registered.
-        let mut registered = false;
-        for _ in 0..1000 {
-            if alice_handle.debug_session_count().await? == 1 {
-                registered = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(registered, "session snapshot was never registered");
+        let mut first = [0u8; 1];
+        bob_kept_silent.read_exact(&mut first).await?;
+        assert_eq!(
+            alice_handle.debug_session_count().await?,
+            1,
+            "a run that sent its opening holds a registered snapshot"
+        );
 
         alice_task.abort();
         assert!(alice_task.await.is_err());
