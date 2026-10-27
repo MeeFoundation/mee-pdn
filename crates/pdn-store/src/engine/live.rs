@@ -2415,11 +2415,9 @@ impl QueuedHashes {
 /// the pool turns away fails as a connect does, which drops a provider that is
 /// no gossip neighbor (iroh-util-001).
 fn fetch_pool_options() -> connection_pool::Options {
-    let options = connection_pool::Options::default();
-    connection_pool::Options {
-        max_pending_connections: options.max_connections,
-        ..options
-    }
+    let mut options = connection_pool::Options::default();
+    options.max_pending_connections = options.max_connections;
+    options
 }
 
 /// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
@@ -2663,6 +2661,43 @@ mod tests {
         let request = GetRequest::from(HashAndFormat::raw(Hash::new(b"payload")));
         let (outcome, _why) = fetch_over(&connection, &store, request).await;
         assert_eq!(outcome, Outcome::Lacks);
+
+        fetching.close().await;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// A provider that has only asked its own store what it lacks of a
+    /// payload still answers that it lacks it (iroh-blobs-009): the question
+    /// leaves the payload in the store as an entry without data.
+    #[tokio::test]
+    async fn a_provider_that_asked_what_it_lacks_answers_that_it_lacks_it() -> anyhow::Result<()> {
+        let held = iroh_blobs::store::mem::MemStore::new();
+        let hash = Hash::new(b"payload");
+        let _missing = held.remote().local(HashAndFormat::raw(hash)).await?;
+        let provider = Router::builder(
+            Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?,
+        )
+        .accept(
+            iroh_blobs::ALPN,
+            iroh_blobs::BlobsProtocol::new(&held, None),
+        )
+        .spawn();
+        let fetching = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let connection = fetching
+            .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+            .await?;
+        let store = iroh_blobs::store::mem::MemStore::new();
+
+        let request = GetRequest::from(HashAndFormat::raw(hash));
+        let (outcome, why) = fetch_over(&connection, &store, request).await;
+        assert_eq!(outcome, Outcome::Lacks, "{why:?}");
 
         fetching.close().await;
         provider.shutdown().await?;

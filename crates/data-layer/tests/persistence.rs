@@ -695,9 +695,8 @@ async fn an_operation_sequence_continues_after_a_respawn() -> Result<()> {
 }
 
 /// A node whose blob store cannot open fails its spawn with an error rather
-/// than hanging (iroh-blobs-001, answered by the workspace's iroh-blobs
-/// fork). A directory in the place of the store's database file is what
-/// fails the open.
+/// than hanging (iroh-blobs-001). A directory in the place of the store's
+/// database file is what fails the open.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_store_that_cannot_open_fails_the_spawn() -> Result<()> {
     let dir = tempfile::tempdir()?;

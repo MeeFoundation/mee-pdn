@@ -52,8 +52,7 @@ serde = { version = "1.0.164", features = ["derive"] }
 strum = { version = "0.28", features = ["derive"] }
 tempfile = { version = "3.4" }
 thiserror = "2"
-# rt-multi-thread: iroh-blobs-002.
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "io-util"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7.12", features = ["codec", "io-util", "io", "rt"] }
 tracing = "0.1"

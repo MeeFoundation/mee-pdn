@@ -418,9 +418,9 @@ dependencies = [
 
 [[package]]
 name = "bao-tree"
-version = "0.16.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149a2a6017771141e2cd5d0c55b3892d8ff1958df5c318b2e496bf3544b426ed"
+checksum = "50d0e17303b78c9bb240014f3f401ecae5c0460438ace49a171e5f97e3ae57ba"
 dependencies = [
  "blake3",
  "bytes",
@@ -2253,9 +2253,8 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.1"
-source = "git+https://github.com/MeeFoundation/iroh-blobs?rev=2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff#2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff"
+source = "git+https://github.com/n0-computer/iroh-blobs?rev=3369597fa5d35804f1634d4a6be7c3ed3a7f05f6#3369597fa5d35804f1634d4a6be7c3ed3a7f05f6"
 dependencies = [
- "arrayvec",
  "bao-tree",
  "bytes",
  "cfg_aliases",
@@ -2461,8 +2460,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-util"
-version = "0.6.0"
-source = "git+https://github.com/n0-computer/iroh-util?rev=603d8907247e867c1451fff161ed9fb4070ce853#603d8907247e867c1451fff161ed9fb4070ce853"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "889d5cc9da2eaac9f63657237c491db17d1fe9fffdc7c0f2f0e04c49d5d45053"
 dependencies = [
  "derive_more",
  "iroh",
