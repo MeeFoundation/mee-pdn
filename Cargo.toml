@@ -30,13 +30,12 @@ pdn-store = { path = "crates/pdn-store" }
 [patch.crates-io]
 # Each patch answers the iroh defects it names, listed with their state
 # upstream in mia-docs' components/mee-pdn/iroh-defects.md.
-# iroh-blobs-001: upstream's latest release with the fix. What the fork
-# carries and when it goes: UPSTREAM.md in the fork.
-iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
+# iroh-blobs-001, iroh-blobs-002: upstream's main, fixed and unreleased, at
+# the commit before #298 (iroh-blobs-009). It takes iroh-util 0.7.0, the
+# release with the fix of iroh-util-001.
+iroh-blobs = { git = "https://github.com/n0-computer/iroh-blobs", rev = "3369597fa5d35804f1634d4a6be7c3ed3a7f05f6" }
 # iroh-gossip-001: upstream's main, fixed and unreleased.
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "6cbbafa865c1b60c813dd8f12f78a54a45c1ecb1" }
-# iroh-util-001: upstream's main, fixed and unreleased.
-iroh-util = { git = "https://github.com/n0-computer/iroh-util", rev = "603d8907247e867c1451fff161ed9fb4070ce853" }
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "cf859543942b017d9e7034ecfa4aa61bfcf291e7" }
 
 # Full debug info is copied into every test binary and build variant, and on
 # macOS into object files beside them: tens of gigabytes of target/. Backtraces

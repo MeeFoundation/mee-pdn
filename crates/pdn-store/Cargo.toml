@@ -52,8 +52,7 @@ serde = { version = "1.0.164", features = ["derive"] }
 strum = { version = "0.28", features = ["derive"] }
 tempfile = { version = "3.4" }
 thiserror = "2"
-# rt-multi-thread: iroh-blobs-002.
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "io-util"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7.12", features = ["codec", "io-util", "io", "rt"] }
 tracing = "0.1"
@@ -63,6 +62,7 @@ data-encoding = "2.6.0"
 futures-buffered = "0.2.4"
 iroh = { version = "1", features = ["test-utils"] }
 nested_enum_utils = "0.2"
+# 0.13 takes libc 0.2.191, past the bound pdn-mobile holds libc to on iOS.
 parking_lot = "0.12.3"
 proptest = "1.2.0"
 rand = { version = "0.10", features = ["chacha"] }

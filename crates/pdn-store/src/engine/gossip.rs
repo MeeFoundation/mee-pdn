@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::EndpointId;
 use iroh_gossip::{
-    api::{Event, GossipReceiver, GossipSender, JoinOptions},
+    api::{ApiError, Event, GossipReceiver, GossipSender, JoinOptions},
     net::Gossip,
 };
 use n0_future::{
@@ -100,12 +100,20 @@ impl GossipState {
 
     pub async fn broadcast_neighbors(&mut self, namespace: &NamespaceId, message: Bytes) {
         if let Some(state) = self.active.get_mut(namespace) {
-            state.sender.broadcast_neighbors(message).await.ok();
+            match state.sender.broadcast_neighbors(message).await {
+                Ok(()) => {}
+                Err(err @ ApiError::TooLarge { .. }) => warn!(%err, "gossip refused a message"),
+                Err(err) => debug!(%err, "gossip broadcast failed"),
+            }
         }
     }
 
-    pub(crate) fn max_message_size(&self) -> usize {
-        self.gossip.max_message_size()
+    /// The largest content a broadcast on `namespace`'s topic takes, while
+    /// the namespace is joined.
+    pub(crate) fn max_content_size(&self, namespace: &NamespaceId) -> Option<usize> {
+        self.active
+            .get(namespace)
+            .map(|state| state.sender.max_content_size())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -242,6 +250,10 @@ async fn receive_loop(
                     })
                     .await?;
             }
+            other => warn!(
+                ?other,
+                "ignoring a gossip event this engine does not handle"
+            ),
         }
     }
     Ok(())

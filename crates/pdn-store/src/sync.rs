@@ -457,11 +457,9 @@ where
 
         // update state with incoming data.
         state.num_recv += message.value_count();
-        for (entry, _content_status) in message.values() {
-            state
-                .heads_received
-                .insert(entry.author(), entry.timestamp());
-        }
+        // Heads of what the store took alone: the sync report announces them
+        // as news this replica holds (iroh-docs-004).
+        let heads_received = &mut state.heads_received;
 
         let cb = self.info.content_status_cb.clone();
 
@@ -487,6 +485,7 @@ where
                 },
                 // on_insert callback: is called when an entry was actually inserted in the store
                 async |_store, entry, content_status| {
+                    heads_received.insert(entry.author(), entry.timestamp());
                     // We use `send_with` to only clone the entry if we have active subscriptions.
                     self.info
                         .subscribers
@@ -2852,6 +2851,45 @@ mod tests {
                 .get_exact(id, author.id(), b"dropped", false)?
                 .is_some(),
             "the next session must offer the dropped entry again"
+        );
+        Ok(())
+    }
+
+    /// The heads a session reports are those of the entries the store took:
+    /// an entry the ingest verdict drops crossed the wire and names no head
+    /// (iroh-docs-004).
+    #[tokio::test]
+    async fn a_dropped_entry_names_no_received_head() -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let mut store1 = store::Store::memory();
+        let mut store2 = store::Store::memory();
+        let kept = Author::new(&mut rng);
+        let dropped = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let mut alice = store1.new_replica(namespace.clone())?;
+        alice.hash_and_insert("ok", &kept, b"payload").await?;
+        alice
+            .hash_and_insert("dropped", &dropped, b"payload")
+            .await?;
+        let mut bob = store2.new_replica(namespace.clone())?;
+        let drop_one: crate::filter::SessionIngest = Arc::new(|entry: &SignedEntry| {
+            if entry.key() == b"dropped" {
+                ValidateOutcome::Drop
+            } else {
+                ValidateOutcome::Accept
+            }
+        });
+
+        let first = alice.sync_initial_message(None)?;
+        let (_, bob_state, _) =
+            sync_transcript(&mut alice, &mut bob, first, None, Some(drop_one)).await?;
+        assert_eq!(bob_state.num_recv, 2, "both entries crossed the wire");
+        assert!(bob_state.heads_received.get(&kept.id()).is_some());
+        assert_eq!(
+            bob_state.heads_received.get(&dropped.id()),
+            None,
+            "a dropped entry's author is reported as news"
         );
         Ok(())
     }

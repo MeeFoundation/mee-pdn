@@ -22,7 +22,7 @@ test-util = ["data-layer/test-util", "dep:base64"]
 [dependencies]
 anyhow = "1"
 # The record listing's payload in its JSON form (`test-util`).
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 data-layer = { path = "../data-layer" }
 # Consuming data-layer's PMS change stream (the identity armer).
 futures-lite = "2"

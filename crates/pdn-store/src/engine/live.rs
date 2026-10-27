@@ -111,6 +111,34 @@ pub(crate) struct SyncReport {
     identity: Identity,
 }
 
+/// A [`SyncReport`] message naming the newest of `heads` that fit, with the
+/// report around them, in `max_content`, gossip's limit on a message's
+/// content (iroh-docs-003).
+fn sync_report_message(
+    namespace: NamespaceId,
+    identity: Identity,
+    heads: &AuthorHeads,
+    max_content: usize,
+) -> Result<Vec<u8>> {
+    let empty = postcard::to_stdvec(&Op::SyncReport(SyncReport {
+        namespace,
+        heads: Vec::new(),
+        identity,
+    }))?;
+    // The empty heads' length prefix is one byte, and no heads that fit take
+    // a longer prefix than `max_content` would.
+    let around = empty
+        .len()
+        .saturating_sub(1)
+        .saturating_add(postcard::experimental::serialized_size(&max_content)?);
+    let heads = heads.encode(Some(max_content.saturating_sub(around)))?;
+    Ok(postcard::to_stdvec(&Op::SyncReport(SyncReport {
+        namespace,
+        heads,
+        identity,
+    }))?)
+}
+
 /// Messages to the live actor
 #[derive(derive_more::Debug, strum::Display)]
 pub(crate) enum ToLiveActor {
@@ -1725,25 +1753,11 @@ impl LiveActor {
                     self.register_provider(namespace, hash, peer);
                 }
 
-                // broadcast a sync report to our neighbors, but only if we received new entries.
-                if details.outcome.num_recv > 0 {
+                // broadcast a sync report to our neighbors, but only if the store took new entries.
+                if !details.outcome.heads_received.is_empty() {
                     info!("broadcast sync report to neighbors");
-                    match details
-                        .outcome
-                        .heads_received
-                        .encode(Some(self.gossip.max_message_size()))
-                    {
-                        Err(err) => warn!(?err, "Failed to encode author heads for sync report"),
-                        Ok(heads) => {
-                            let report = SyncReport {
-                                namespace,
-                                heads,
-                                identity: self.identity,
-                            };
-                            self.broadcast_neighbors(namespace, &Op::SyncReport(report))
-                                .await;
-                        }
-                    }
+                    self.broadcast_heads(namespace, &details.outcome.heads_received)
+                        .await;
                 }
             }
         };
@@ -1831,23 +1845,25 @@ impl LiveActor {
     async fn broadcast_local_head(&mut self, namespace: NamespaceId, entry: &SignedEntry) {
         let mut author_heads = AuthorHeads::default();
         author_heads.insert(entry.author_bytes(), entry.timestamp());
-        let heads = match author_heads.encode(Some(self.gossip.max_message_size())) {
-            Ok(heads) => heads,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "Failed to encode author head for local-insert announce"
-                );
-                return;
+        self.broadcast_heads(namespace, &author_heads).await;
+    }
+
+    /// Announce `heads` to the namespace's neighbors as a [`SyncReport`].
+    async fn broadcast_heads(&mut self, namespace: NamespaceId, heads: &AuthorHeads) {
+        if !self.state.is_syncing(&namespace) {
+            return;
+        }
+        let Some(max_content) = self.gossip.max_content_size(&namespace) else {
+            return;
+        };
+        match sync_report_message(namespace, self.identity, heads, max_content) {
+            Ok(message) => {
+                self.gossip
+                    .broadcast_neighbors(&namespace, message.into())
+                    .await;
             }
-        };
-        let report = SyncReport {
-            namespace,
-            heads,
-            identity: self.identity,
-        };
-        self.broadcast_neighbors(namespace, &Op::SyncReport(report))
-            .await;
+            Err(err) => warn!(?err, "failed to encode a sync report"),
+        }
     }
 
     async fn on_fetch_finished(
@@ -2415,11 +2431,9 @@ impl QueuedHashes {
 /// the pool turns away fails as a connect does, which drops a provider that is
 /// no gossip neighbor (iroh-util-001).
 fn fetch_pool_options() -> connection_pool::Options {
-    let options = connection_pool::Options::default();
-    connection_pool::Options {
-        max_pending_connections: options.max_connections,
-        ..options
-    }
+    let mut options = connection_pool::Options::default();
+    options.max_pending_connections = options.max_connections;
+    options
 }
 
 /// Fetches `hash` from `provider` alone, until it arrives, fails, or goes
@@ -2666,6 +2680,88 @@ mod tests {
 
         fetching.close().await;
         provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// A provider that has only asked its own store what it lacks of a
+    /// payload still answers that it lacks it (iroh-blobs-009): the question
+    /// leaves the payload in the store as an entry without data.
+    #[tokio::test]
+    async fn a_provider_that_asked_what_it_lacks_answers_that_it_lacks_it() -> anyhow::Result<()> {
+        let held = iroh_blobs::store::mem::MemStore::new();
+        let hash = Hash::new(b"payload");
+        let _missing = held.remote().local(HashAndFormat::raw(hash)).await?;
+        let provider = Router::builder(
+            Endpoint::builder(presets::Minimal)
+                .bind_addr("127.0.0.1:0")?
+                .bind()
+                .await?,
+        )
+        .accept(
+            iroh_blobs::ALPN,
+            iroh_blobs::BlobsProtocol::new(&held, None),
+        )
+        .spawn();
+        let fetching = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let connection = fetching
+            .connect(provider.endpoint().addr(), iroh_blobs::ALPN)
+            .await?;
+        let store = iroh_blobs::store::mem::MemStore::new();
+
+        let request = GetRequest::from(HashAndFormat::raw(hash));
+        let (outcome, why) = fetch_over(&connection, &store, request).await;
+        assert_eq!(outcome, Outcome::Lacks, "{why:?}");
+
+        fetching.close().await;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// The report of a session that brought the entries of 150 authors is
+    /// one gossip takes, and it names the newest of them (iroh-docs-003).
+    #[tokio::test]
+    async fn a_report_of_many_authors_fits_the_topic_and_names_the_newest() -> anyhow::Result<()> {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+        let mut topic = gossip
+            .subscribe(iroh_gossip::proto::TopicId::from_bytes([7; 32]), vec![])
+            .await?;
+        let author = |i: u32| {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            crate::AuthorId::from(id)
+        };
+        let mut heads = AuthorHeads::default();
+        for i in 0..150u32 {
+            heads.insert(author(i), 1_800_000_000_000_000 + u64::from(i));
+        }
+
+        let message = sync_report_message(
+            NamespaceId::from(&[1; 32]),
+            Identity::from_bytes([2; 32]),
+            &heads,
+            topic.max_content_size(),
+        )?;
+        // Gossip refuses a message over its limit before it sends anything.
+        topic.broadcast_neighbors(message.clone().into()).await?;
+        let Op::SyncReport(report) = postcard::from_bytes(&message)? else {
+            panic!("the message is no sync report");
+        };
+        let named = AuthorHeads::decode(&report.heads)?;
+        assert!(named.len() > 90, "{} of 150 heads named", named.len());
+        assert!(
+            named.get(&author(149)).is_some(),
+            "the newest head left out"
+        );
+        assert!(named.get(&author(0)).is_none(), "the oldest head named");
+
+        endpoint.close().await;
         Ok(())
     }
 
