@@ -10,7 +10,7 @@ What this crate took from n0's `iroh-docs`, and what was done here with each ups
 
 ## Last pass
 
-2026-10-16. Upstream's `main` holds no commit past `8cfeacb`. Its open pull requests titled as fixes are #114, #112, #111, #106, #94, #93 and #88, each with an entry below.
+2026-10-27, at the bump of iroh to 1.4.1. Upstream's `main` holds no commit past `8cfeacb`. Its open pull requests titled as fixes are #114, #112, #111, #106, #94, #93 and #88, each with an entry below; none has changed since the pass of 2026-10-16.
 
 ## Pull requests
 

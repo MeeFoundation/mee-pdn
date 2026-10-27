@@ -2361,7 +2361,10 @@ mod tests {
         );
 
         let mut replica = store.new_replica(namespace.clone())?;
-        let t = system_time_now() + MAX_TIMESTAMP_FUTURE_SHIFT + 10000;
+        // A minute past the bound: the insert reads the clock again, and a
+        // CPU-capped runner stalls tens of milliseconds between the two reads.
+        let past_the_bound = Duration::from_secs(60).as_micros() as u64;
+        let t = system_time_now() + MAX_TIMESTAMP_FUTURE_SHIFT + past_the_bound;
         let record = Record::from_data(b"2", t);
         let entry3 = SignedEntry::from_parts(&namespace, &author, key, record);
         let res = replica.insert_entry(entry3, InsertOrigin::Local).await;
