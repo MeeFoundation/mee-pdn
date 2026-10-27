@@ -34,7 +34,7 @@ pdn-store = { path = "crates/pdn-store" }
 # carries and when it goes: UPSTREAM.md in the fork.
 iroh-blobs = { git = "https://github.com/MeeFoundation/iroh-blobs", rev = "2b0f54d8bb95f25e4be053ce3261c0cb6e9e1dff" }
 # iroh-gossip-001: upstream's main, fixed and unreleased.
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "6cbbafa865c1b60c813dd8f12f78a54a45c1ecb1" }
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "cf859543942b017d9e7034ecfa4aa61bfcf291e7" }
 # iroh-util-001: upstream's main, fixed and unreleased.
 iroh-util = { git = "https://github.com/n0-computer/iroh-util", rev = "603d8907247e867c1451fff161ed9fb4070ce853" }
 

@@ -242,6 +242,10 @@ async fn receive_loop(
                     })
                     .await?;
             }
+            other => warn!(
+                ?other,
+                "ignoring a gossip event this engine does not handle"
+            ),
         }
     }
     Ok(())
