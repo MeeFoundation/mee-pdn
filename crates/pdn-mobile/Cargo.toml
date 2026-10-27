@@ -61,6 +61,12 @@ tracing = { workspace = true }
 tracing-subscriber = "0.3"
 uniffi = { version = "0.32", default-features = false }
 
+# netdev 0.46, which iroh's netwatch takes, reads `libc::in6_ifreq` on iOS,
+# and libc declares it for macOS alone from 0.2.190 (netdev pull request #192,
+# open). One lockfile serves every target, so the bound holds the workspace's.
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = ">=0.2, <0.2.190"
+
 [dev-dependencies]
 # The test surface's tests speak HTTP to it as a coordinator does. iroh turns
 # on this reqwest's `rustls-no-provider`, so the client takes a TLS
