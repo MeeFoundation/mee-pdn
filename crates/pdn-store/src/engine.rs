@@ -73,6 +73,16 @@ const SUBSCRIBE_CHANNEL_CAP: usize = 256;
 #[cfg(feature = "observation")]
 const OBSERVED_CONVERSIONS: usize = 64;
 
+/// The hold [`Engine::hold_next_dial_for_test`] puts on a dial.
+#[cfg(feature = "observation")]
+#[derive(Debug, Default)]
+pub struct DialHold {
+    /// Notified once the dial's task runs, before it connects.
+    pub reached: tokio::sync::Notify,
+    /// Notified to let the dial connect.
+    pub release: tokio::sync::Notify,
+}
+
 /// The sync engine coordinates actors that manage open documents, set-reconciliation syncs with
 /// peers and a gossip swarm for each syncing document.
 #[derive(derive_more::Debug)]
@@ -439,6 +449,21 @@ impl Engine {
         };
 
         Ok(a.or(b))
+    }
+
+    /// Holds the next dial of `namespace` this engine makes before it
+    /// connects, until the hold's `release` is notified; the dial's task
+    /// keeps the hold until it ends.
+    #[cfg(feature = "observation")]
+    pub async fn hold_next_dial_for_test(&self, namespace: NamespaceId) -> Result<Arc<DialHold>> {
+        let hold = Arc::new(DialHold::default());
+        self.to_live_actor
+            .send(ToLiveActor::HoldNextDial {
+                namespace,
+                hold: Arc::clone(&hold),
+            })
+            .await?;
+        Ok(hold)
     }
 
     /// Subscribe to a replica's events in the order the live sync handled

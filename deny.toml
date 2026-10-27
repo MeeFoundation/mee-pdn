@@ -1,7 +1,7 @@
 # The dependency-tree policy behind `cargo deny check`: RustSec advisories,
 # license compatibility with the project's Apache-2.0, crates.io and our own
-# forks as the allowed sources. Run by the nightly dependency-audit job and
-# `just audit`.
+# forks as the allowed sources. Run by the dependency-audit job of the
+# pipeline and of the nightly, and by `just audit`.
 
 [graph]
 # The whole lock: every dependency any feature gates is audited, whichever

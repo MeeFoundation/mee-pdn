@@ -1378,8 +1378,26 @@ impl SyncNode {
             stack.track(&records, Vec::new(), SyncStrategy::Swarm, stack.identity())?;
             Self::order_pod_stores(&stack, &membership, &records).await?;
             self.watch_pod(&stack, pod, &membership);
-            start_pod_store(&membership, Vec::new(), stack.identity(), true, None).await?;
-            start_pod_store(&records, Vec::new(), stack.identity(), true, None).await?;
+            start_pod_store(
+                &stack,
+                "create",
+                &membership,
+                Vec::new(),
+                stack.identity(),
+                true,
+                None,
+            )
+            .await?;
+            start_pod_store(
+                &stack,
+                "create",
+                &records,
+                Vec::new(),
+                stack.identity(),
+                true,
+                None,
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -1446,6 +1464,21 @@ impl SyncNode {
             peer,
             pdn_store::SessionRole::Dial,
         ))
+    }
+
+    /// Holds the next dial `identity`'s engine makes of `namespace` before it
+    /// connects, until the hold's `release` is notified.
+    #[cfg(feature = "test-util")]
+    pub async fn hold_next_dial_for_test(
+        &self,
+        identity: PdnId,
+        namespace: NamespaceId,
+    ) -> Result<Arc<pdn_store::engine::DialHold>> {
+        self.require(identity)?
+            .docs
+            .engine()
+            .hold_next_dial_for_test(namespace)
+            .await
     }
 
     /// Holds the next session `identity` accepts on `namespace` from `peer`
@@ -1720,7 +1753,7 @@ impl SyncNode {
             stack.tracked(membership.id())?,
             stack.tracked(records.id())?,
         );
-        let membership_events = Self::start_tracked(tracked_membership, observe).await?;
+        let membership_events = Self::start_tracked(stack, tracked_membership, observe).await?;
         self.await_own_membership(stack, pod, membership).await?;
         #[cfg(feature = "test-util")]
         {
@@ -1734,7 +1767,7 @@ impl SyncNode {
                 pause.release.notified().await;
             }
         }
-        let records_events = Self::start_tracked(tracked_records, observe).await?;
+        let records_events = Self::start_tracked(stack, tracked_records, observe).await?;
         Ok((caught_up, membership_events.zip(records_events)))
     }
 
@@ -1749,7 +1782,8 @@ impl SyncNode {
         pod: PodId,
         membership: &Doc,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + JOIN_VIEW_WAIT;
+        let started = tokio::time::Instant::now();
+        let deadline = started + JOIN_VIEW_WAIT;
         loop {
             let view = stack.access.membership_view(pod, membership).await?;
             let departed = view
@@ -1757,6 +1791,17 @@ impl SyncNode {
                 .and_then(Member::departed_at)
                 .is_some();
             if !departed || tokio::time::Instant::now() >= deadline {
+                #[cfg(feature = "test-util")]
+                stack.access.note(
+                    membership.id(),
+                    crate::access::Traced::JoinViewWaited {
+                        member: view
+                            .member(&stack.identity)
+                            .map(|member| member.state.member),
+                        departed_at: view.member(&stack.identity).and_then(Member::departed_at),
+                        waited: started.elapsed(),
+                    },
+                );
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1790,6 +1835,7 @@ impl SyncNode {
     /// identity it is tracked with, with an ordered subscription of
     /// `observe`'s capacity attached when asked.
     async fn start_tracked(
+        stack: &HostedStack,
         tracked: Option<TrackedDoc>,
         observe: Option<usize>,
     ) -> Result<Option<OrderedEvents>> {
@@ -1797,6 +1843,8 @@ impl SyncNode {
             return Ok(None);
         };
         start_pod_store(
+            stack,
+            "start",
             &tracked.doc,
             tracked.contacts,
             tracked.default_identity,
@@ -1916,7 +1964,7 @@ impl SyncNode {
             .tracked(doc.id())?
             .map(|tracked| tracked.contacts)
             .unwrap_or_default();
-        start_pod_store(&doc, contacts, minted_by, false, None).await?;
+        start_pod_store(&stack, "tombstone", &doc, contacts, minted_by, false, None).await?;
         Ok(())
     }
 
@@ -2003,7 +2051,7 @@ impl SyncNode {
             };
             // Subscribed before the dial, so no session ends unseen.
             flush.sessions.push(Box::pin(doc.subscribe().await?));
-            sync_pod_store(&stack, &tracked, drawn.clone()).await?;
+            sync_pod_store(&stack, "flush", &tracked, drawn.clone()).await?;
         }
         Ok(flush)
     }
@@ -2345,6 +2393,13 @@ impl SyncNode {
         let tracked = stack
             .tracked(doc.id())?
             .context("the identity tracks no replica of that store")?;
+        stack.access.note(
+            doc.id(),
+            crate::access::Traced::SyncStarted {
+                cause: "test dial",
+                contacts: vec![NodeId::from_bytes(*contact.addr.id.as_bytes())],
+            },
+        );
         doc.sync_with_peers(vec![contact], Vec::new(), tracked.default_identity, false)
             .await
     }
@@ -3738,7 +3793,7 @@ async fn reconcile_pod(
             contacts: tracked.contacts.clone(),
             drawn: drawn.clone(),
         });
-        let _ = sync_pod_store(stack, &tracked, drawn).await;
+        let _ = sync_pod_store(stack, "pass", &tracked, drawn).await;
     }
 }
 
@@ -3747,11 +3802,14 @@ async fn reconcile_pod(
 /// swarm again: the forget's own leave can run before this sync joins.
 async fn sync_pod_store(
     stack: &HostedStack,
+    cause: &'static str,
     tracked: &TrackedDoc,
     contacts: Vec<Contact>,
 ) -> Result<()> {
     let swarm = tracked.strategy == SyncStrategy::Swarm;
     start_pod_store(
+        stack,
+        cause,
         &tracked.doc,
         contacts,
         tracked.default_identity,
@@ -3775,12 +3833,26 @@ async fn sync_pod_store(
 /// capacity, returned; the one start for the product's path and the
 /// observed one, so their arguments cannot differ.
 async fn start_pod_store(
+    stack: &HostedStack,
+    cause: &'static str,
     doc: &Doc,
     contacts: Vec<Contact>,
     default_identity: Identity,
     join_gossip: bool,
     observe: Option<usize>,
 ) -> Result<Option<OrderedEvents>> {
+    tracing::debug!(identity = %stack.identity, namespace = %doc.id().fmt_short(), cause, contacts = contacts.len(), "pod store sync started");
+    #[cfg(feature = "test-util")]
+    stack.access.note(
+        doc.id(),
+        crate::access::Traced::SyncStarted {
+            cause,
+            contacts: contacts
+                .iter()
+                .map(|contact| NodeId::from_bytes(*contact.addr.id.as_bytes()))
+                .collect(),
+        },
+    );
     let Some(capacity) = observe else {
         doc.sync_with_peers(contacts, Vec::new(), default_identity, join_gossip)
             .await?;
@@ -3981,7 +4053,8 @@ async fn dial_own_devices(stack: &HostedStack, node: EndpointId, devices: &[Node
             let Ok(Some(tracked)) = stack.tracked(doc.id()) else {
                 continue;
             };
-            if let Err(err) = sync_pod_store(stack, &tracked, contacts.clone()).await {
+            if let Err(err) = sync_pod_store(stack, "own devices", &tracked, contacts.clone()).await
+            {
                 tracing::warn!(%pod, "dialing a newly listed device failed: {err:#}");
             }
         }
@@ -4154,7 +4227,7 @@ async fn dial_drawn(stack: &HostedStack, held: &PodBinding) -> Result<()> {
     let drawn = draw(tracked.contacts);
     for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
         if let Some(tracked) = stack.tracked(doc.id())? {
-            sync_pod_store(stack, &tracked, drawn.clone()).await?;
+            sync_pod_store(stack, "held again", &tracked, drawn.clone()).await?;
         }
     }
     Ok(())
@@ -4181,7 +4254,7 @@ async fn dial_again(
         .collect();
     for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
         if let Some(tracked) = stack.tracked(doc.id())? {
-            sync_pod_store(stack, &tracked, contacts.clone()).await?;
+            sync_pod_store(stack, "again", &tracked, contacts.clone()).await?;
         }
     }
     Ok(())

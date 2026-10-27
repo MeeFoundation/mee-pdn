@@ -1,15 +1,15 @@
 # The flaky hunt, run without anyone deciding to look: one job per suite —
-# the container stand's and the in-process scenarios'. Beside the hunt, the
+# the Docker tests' and the in-process tests'. Beside the hunt, the
 # dependency audit — deny.toml's policy over the tree, rechecked nightly
 # because the advisory database moves while the repository stands still.
 #
 # Both cost seconds per test and pass on any given run; the failures worth
 # finding here show up once in tens or hundreds of them, which no pull
 # request can afford and no person remembers to do. So each suite is repeated
-# nightly, and a night that catches something in the stand keeps the nodes'
+# nightly, and a night that catches something in the Docker tests keeps the nodes'
 # logs as an artifact — the assertion says a value never arrived, and only
 # those logs say what the node was doing instead.
-name: nightly
+name: Nightly
 
 on:
   schedule:
@@ -19,20 +19,19 @@ on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: "How many times to repeat the stand's suite"
+        description: "How many times to repeat the Docker tests"
         default: "100"
       scenario_iterations:
-        description: "How many times to repeat the in-process scenarios"
+        description: "How many times to repeat the in-process tests"
         default: "15"
 
 jobs:
-  # deny.toml's policy over the dependency tree: RustSec advisories, license
-  # compatibility, sources. Nightly rather than per pull request: the
-  # advisory database moves on its own, so a new advisory reddens the next
-  # night instead of whichever pull request happens to run first. The hunts
-  # wait on it — a dependency that just received an advisory is not compiled
-  # and run for hours on a runner first.
+  # deny.toml's policy over the dependency tree, as every pull request runs
+  # it: again nightly, since the advisory database moves while the tree
+  # stands still. The hunts wait on it — a dependency that just received an
+  # advisory is not compiled and run for hours on a runner first.
   dependency-audit:
+    name: Dependency audit
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -47,9 +46,10 @@ jobs:
       - name: Check the tree against deny.toml
         run: cargo deny check
 
-  # The container suite: every test of the HTTP surface is a container test,
-  # so this job needs the daemon and builds the stand's image itself.
-  container-stand:
+  # Every test of the HTTP surface is a container test, so this job needs the
+  # daemon and builds the pdn-node-http image itself.
+  docker-tests:
+    name: Docker tests × ${{ inputs.iterations || '100' }}
     needs: dependency-audit
     runs-on: ubuntu-26.04
     # A hundred iterations of a suite whose own wall clock is seconds, plus
@@ -75,7 +75,7 @@ jobs:
       # The recipe builds the image itself, without the pull request job's
       # layer cache: a nightly can afford the cold build, and paying it here
       # keeps one command doing the same thing locally and in the pipeline.
-      - name: Hunt the container stand
+      - name: Stress the Docker tests
         run: just stress-docker "${{ github.event.inputs.iterations || '100' }}"
 
       - name: Keep what the failure needs
@@ -87,16 +87,17 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # The in-process scenarios — no container, no daemon, no image. Hunted the
-  # same way and in parallel with the stand's: they share nothing, and a
+  # The in-process tests — no container, no daemon, no image. Hunted the
+  # same way and in parallel with the Docker tests: they share nothing, and a
   # public repository's runners are free.
-  in-process-scenarios:
+  in-process-tests:
+    name: In-process tests × ${{ inputs.scenario_iterations || '15' }}
     needs: dependency-audit
     runs-on: ubuntu-26.04
     # One pass of the scenario tests is about two minutes on a development
-    # machine and slower on a runner's four cores. The budget is what the job
-    # is allowed to take, not what the hunt is worth.
-    timeout-minutes: 120
+    # machine and five to nine on a runner's four cores. The budget is what the
+    # job is allowed to take, not what the hunt is worth.
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -114,11 +115,11 @@ jobs:
         with:
           workspaces: . -> target
 
-      # `--no-fail-fast` for the reason the container hunt has it: an early
+      # `--no-fail-fast` for the reason the Docker tests' hunt has it: an early
       # failure must not cancel the remaining repeats, or one flake hides
       # how often it happens and whether anything else fails too. The
       # selection is the recipe's own default — the scenario tests, the
-      # store's integration tests among them, with the stand's container
-      # binaries skipped as they are everywhere else.
-      - name: Hunt the in-process scenarios
+      # store's integration tests among them, with the Docker tests' binaries
+      # skipped as they are everywhere else.
+      - name: Stress the in-process tests
         run: just stress --stress-count "${{ github.event.inputs.scenario_iterations || '15' }}" --no-fail-fast

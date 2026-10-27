@@ -1,7 +1,7 @@
 # The pod load test's full collection (sync-test/load.md, "One command": `just load --container`, test L) on a
 # GitHub-hosted runner, started by hand on a ref: the ramp run is reported against the latest earlier run of the same
 # profile and joins the history GitHub Pages serves from the load-history branch, and stays an artifact.
-name: load
+name: Load test
 
 on:
   workflow_dispatch:
@@ -30,6 +30,7 @@ permissions:
 
 jobs:
   load:
+    name: Load test
     runs-on: ubuntu-26.04
     # One cold image build, then 17 minutes of ramp and up to 4 of catch-up per N: GitHub stops a hosted job at 6 hours.
     timeout-minutes: 360
@@ -46,7 +47,7 @@ jobs:
 
       # The layer cache needs the buildx builder; the runner image below is built FROM this one by the daemon's own
       # builder, which is the one that sees the loaded image.
-      - name: Build the node image
+      - name: Build the pdn-node-http observation image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           builder: ${{ steps.buildx.outputs.name }}
