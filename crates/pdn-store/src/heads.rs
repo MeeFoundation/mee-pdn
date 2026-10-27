@@ -30,6 +30,11 @@ impl AuthorHeads {
         self.heads.len()
     }
 
+    /// Whether no author has a timestamp.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.heads.is_empty()
+    }
+
     /// Get the timestamp for an author.
     pub fn get(&self, author: &AuthorId) -> Option<Timestamp> {
         self.heads.get(author).copied()

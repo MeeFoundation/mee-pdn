@@ -1753,8 +1753,8 @@ impl LiveActor {
                     self.register_provider(namespace, hash, peer);
                 }
 
-                // broadcast a sync report to our neighbors, but only if we received new entries.
-                if details.outcome.num_recv > 0 {
+                // broadcast a sync report to our neighbors, but only if the store took new entries.
+                if !details.outcome.heads_received.is_empty() {
                     info!("broadcast sync report to neighbors");
                     self.broadcast_heads(namespace, &details.outcome.heads_received)
                         .await;
