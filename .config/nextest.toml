@@ -51,3 +51,15 @@ test-group = 'stand-8'
 [[profile.cap-16.overrides]]
 filter = 'binary(~stand)'
 test-group = 'stand-16'
+
+# On GitHub's runner these tests take from half a minute to four, the rest
+# seconds; queued last, the longest ran alone at the end of every iteration.
+[[profile.default.overrides]]
+filter = '''
+    test(=a_ten_thousand_entry_session_drained_at_conversion_pace_loses_nothing)
+  | test(=a_killed_member_restarted_at_a_new_address_is_reached_there)
+  | test(=two_nodes_sharing_sixty_pods_keep_live_delivery_in_each)
+  | test(=a_catch_up_past_the_events_channel_finishes_while_the_live_actor_asks_the_sync_actor)
+  | test(=a_dial_toward_a_neighbor_it_cannot_reach_is_tried_again)
+'''
+priority = 100
