@@ -1484,6 +1484,118 @@ async fn a_join_after_a_leave_catches_up_on_the_records_placed_meanwhile() -> Re
     Ok(())
 }
 
+/// A dial of the record store a member's device began before the member
+/// left runs no session on the record store it imports again when it joins:
+/// judged then, by a view that still shows the departure, the session would
+/// take nothing and could count as the join's catch-up. The dial is held in
+/// flight across the departure and the import, and let go while the
+/// inviter's stream of the joined event's payload is held, so the view
+/// still shows the departure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_begun_before_a_leave_runs_no_session_on_the_store_joined_again() -> Result<()> {
+    let (alice_phone, carol_phone) = (node(QUIET).await?, node(QUIET).await?);
+    let (alice, _) = host(&alice_phone).await?;
+    let (carol, _) = host(&carol_phone).await?;
+    let pod = create(&alice_phone, &alice).await?;
+    let carols = vec![device_of(&carol_phone, &carol)?];
+    invite(&alice_phone, &alice, pod, &carol, carols).await?;
+    let from_alice = tickets(&alice_phone, &alice, pod).await?;
+    let records = from_alice.records.capability.id();
+    carol_phone
+        .import_pod(carol.id, pod, from_alice.clone())
+        .await?;
+    assert!(lists(&carol_phone, carol.id, pod, carol.id, PLAIN).await?);
+
+    depart(&carol_phone, &carol, pod, EventKind::Left, &carol, 2).await?;
+    // Settled first: a dial of the pair already running takes the one asked
+    // for below over, and the hold would wait for a dial that never starts.
+    assert!(settle(&[&alice_phone, &carol_phone], pod).await?);
+    let in_flight = carol_phone
+        .hold_next_dial_for_test(carol.id, records)
+        .await?;
+    dial(
+        &carol_phone,
+        &carol,
+        pod,
+        PodStore::Records,
+        &alice_phone,
+        &alice,
+    )
+    .await?;
+    tokio::time::timeout(TIMEOUT, in_flight.reached.notified())
+        .await
+        .context("the record store's dial never started")?;
+    carol_phone.forget_pod(carol.id, pod).await?;
+    assert!(lists(&alice_phone, alice.id, pod, carol.id, OUT).await?);
+    let meanwhile = place_claim(&alice_phone, &alice, pod, 7).await?;
+    let rejoined = MembershipKey::Event {
+        subject: carol.id,
+        seq: Seq::new(3),
+        kind: EventKind::Joined,
+        actor: alice.id,
+        actor_seq: Seq::FIRST,
+    };
+    let join_statement = carol
+        .keys
+        .join_statement(&pod, Seq::new(3), device_of(&carol_phone, &carol)?)
+        .encode();
+    let hold = alice_phone.hold_next_blob_stream_for_test();
+    let mut traces = carol_phone.take_session_traces().context("taken once")?;
+    write(&alice_phone, &alice, pod, rejoined, join_statement).await?;
+
+    let joining = async {
+        carol_phone
+            .import_pod(carol.id, pod, from_alice)
+            .await?
+            .wait(TIMEOUT)
+            .await
+    };
+    // Let go once the record store is held again, and the payload once the
+    // dial's task has ended or was dropped: it keeps the hold until then.
+    let letting_go = async {
+        let held_again =
+            eventually(|| async { Ok(carol_phone.pod_holdings(carol.id)?.contains(&(pod, true))) })
+                .await?;
+        anyhow::ensure!(held_again, "the record store was never imported again");
+        in_flight.release.notify_one();
+        let ended =
+            eventually(|| async { Ok(std::sync::Arc::strong_count(&in_flight) == 1) }).await?;
+        anyhow::ensure!(ended, "the dial held before the leave never ended");
+        let _ = tokio::time::timeout(TIMEOUT, hold.reached.notified()).await;
+        let released = Instant::now();
+        hold.release.notify_one();
+        anyhow::Ok(released)
+    };
+    let (joined, released) = tokio::join!(joining, letting_go);
+    joined?;
+    let released = released?;
+    let answered = Instant::now();
+    let caught_up = carol_phone
+        .pod_record_view_of(carol.id, pod, &meanwhile)
+        .await?
+        .verdicts()
+        .next()
+        .is_some();
+    let at_answer = record_entries(&carol_phone, &carol, pod).await?;
+    Joined {
+        node: &carol_phone,
+        holder: &carol,
+        pod,
+        records,
+        hold: &hold,
+        traces: std::iter::from_fn(|| traces.try_recv().ok()).collect(),
+        released,
+        answered,
+    }
+    .check(&meanwhile, caught_up, &at_answer)
+    .await?;
+
+    for node in [alice_phone, carol_phone] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A join that answered: what the joiner held and decided, checked against
 /// what the join promises, with the evidence for a failure message.
 struct Joined<'a> {
@@ -1528,6 +1640,10 @@ impl Joined<'_> {
             trace.namespace == self.records
                 && trace.role == SessionRole::Dial
                 && trace.at < self.released
+                && !matches!(
+                    trace.traced,
+                    Traced::SyncStarted { .. } | Traced::JoinViewWaited { .. }
+                )
         }) {
             anyhow::bail!(
                 "the record store dialed while the view showed the departure: {early:?}\n{}",

@@ -184,6 +184,12 @@ pub(crate) enum ToLiveActor {
     },
     /// An ordered subscriber; refused for a namespace not syncing, whose
     /// inserts this actor never receives.
+    /// [`Engine::hold_next_dial_for_test`](crate::engine::Engine::hold_next_dial_for_test).
+    #[cfg(feature = "observation")]
+    HoldNextDial {
+        namespace: NamespaceId,
+        hold: Arc<crate::engine::DialHold>,
+    },
     #[cfg(feature = "observation")]
     Observe {
         namespace: NamespaceId,
@@ -568,6 +574,9 @@ pub(crate) struct LiveActor {
     held_dials: HashMap<(NamespaceId, PublicKey, Identity), Vec<HeldDial>>,
     /// Redials waiting out [`REDIAL_AFTER_ABORT`], by namespace.
     redials_due: HashMap<NamespaceId, usize>,
+    /// The next dial of each namespace a test holds before it connects.
+    #[cfg(feature = "observation")]
+    dial_holds: HashMap<NamespaceId, Arc<crate::engine::DialHold>>,
     /// Aborts as already syncing in a row per pair, cleared by an exchange
     /// that finishes.
     redial_streaks: HashMap<(NamespaceId, PublicKey, Identity), u32>,
@@ -640,6 +649,8 @@ impl LiveActor {
             prerequisites: Default::default(),
             held_dials: Default::default(),
             redials_due: Default::default(),
+            #[cfg(feature = "observation")]
+            dial_holds: Default::default(),
             redial_streaks: Default::default(),
             unreached_dials: Default::default(),
             refused_dials: Default::default(),
@@ -810,6 +821,10 @@ impl LiveActor {
             } => {
                 self.subscribers.subscribe(namespace, sender);
                 reply.send(Ok(())).ok();
+            }
+            #[cfg(feature = "observation")]
+            ToLiveActor::HoldNextDial { namespace, hold } => {
+                self.dial_holds.insert(namespace, hold);
             }
             #[cfg(feature = "observation")]
             ToLiveActor::Observe {
@@ -1054,7 +1069,14 @@ impl LiveActor {
         let sync = self.sync.handle().clone();
         let session_access = self.session_access.clone();
         let caller = self.identity;
+        #[cfg(feature = "observation")]
+        let hold = self.dial_holds.remove(&namespace);
         let fut = async move {
+            #[cfg(feature = "observation")]
+            if let Some(hold) = &hold {
+                hold.reached.notify_one();
+                hold.release.notified().await;
+            }
             // The dialing side serves entries too (reconciliation is
             // bidirectional), so the embedder's access provider gates this
             // role exactly like the accept role, asked once the session's
@@ -1071,6 +1093,8 @@ impl LiveActor {
                 &mut session,
             )
             .await;
+            #[cfg(feature = "observation")]
+            drop(hold);
             (namespace, peer, callee, reason, session, res)
         }
         .instrument(Span::current());

@@ -193,6 +193,22 @@ pub enum Traced {
         key: Vec<u8>,
         author: AuthorId,
     },
+    /// No session decision: a pod store's sync started, by `cause`, with
+    /// `contacts`. The trace's `remote` is this identity and its `peer` all
+    /// zeros.
+    SyncStarted {
+        cause: &'static str,
+        contacts: Vec<NodeId>,
+    },
+    /// No session decision: a join's start stopped waiting for the
+    /// membership view after `waited`, the view showing this identity a
+    /// member or not, and departed at the sequence named or not. The
+    /// trace's `remote` is this identity and its `peer` all zeros.
+    JoinViewWaited {
+        member: Option<bool>,
+        departed_at: Option<u64>,
+        waited: std::time::Duration,
+    },
 }
 
 impl AccessBook {
@@ -431,6 +447,27 @@ impl AccessBook {
                     rests_on,
                 }
             }
+        }
+    }
+
+    /// Report `traced`, a note on `namespace` rather than a session's
+    /// decision, to the scenario that took the traces.
+    #[cfg(feature = "test-util")]
+    pub(crate) fn note(&self, namespace: NamespaceId, traced: Traced) {
+        let sender = self
+            .session_traces
+            .get()
+            .and_then(|sink| sink.lock().ok().and_then(|sender| sender.clone()));
+        if let Some(sender) = sender {
+            let _ = sender.send(SessionTrace {
+                at: std::time::Instant::now(),
+                identity: self.identity,
+                namespace,
+                role: SessionRole::Dial,
+                remote: identity_of(self.identity),
+                peer: NodeId::from_bytes([0; 32]),
+                traced,
+            });
         }
     }
 
