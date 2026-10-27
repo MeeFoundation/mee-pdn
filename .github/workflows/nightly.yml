@@ -13,9 +13,9 @@ name: nightly
 
 on:
   schedule:
-    # Nothing depends on the hour; it is off the hour because every scheduled
-    # workflow in the world asks for :00 and the runner queue shows it.
-    - cron: "17 3 * * *"
+    # Every day at 23:17 UTC; GitHub starts it when it sees fit, at times 12
+    # hours later.
+    - cron: "17 23 * * *"
   workflow_dispatch:
     inputs:
       iterations:
