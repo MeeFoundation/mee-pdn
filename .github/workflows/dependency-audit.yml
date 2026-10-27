@@ -4,7 +4,7 @@
 # advisory reddens the night, not an unrelated pull request. Its own
 # workflow rather than a job in ci.yml: a paths filter is a trigger of the
 # whole workflow, not of one job.
-name: dependency-audit
+name: Dependency audit
 
 on:
   pull_request:
@@ -27,6 +27,7 @@ permissions:
 
 jobs:
   dependency-audit:
+    name: Dependency audit
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
