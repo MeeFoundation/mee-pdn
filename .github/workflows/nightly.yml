@@ -94,9 +94,9 @@ jobs:
     needs: dependency-audit
     runs-on: ubuntu-26.04
     # One pass of the scenario tests is about two minutes on a development
-    # machine and slower on a runner's four cores. The budget is what the job
-    # is allowed to take, not what the hunt is worth.
-    timeout-minutes: 120
+    # machine and five to nine on a runner's four cores. The budget is what the
+    # job is allowed to take, not what the hunt is worth.
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
