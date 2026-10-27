@@ -1645,7 +1645,8 @@ async fn test_list_docs_stream() -> testresult::TestResult<()> {
         }
     };
 
-    n0_future::time::timeout(Duration::from_secs(2), fut)
+    // A deadlock never ends; on half a CPU the 200 opens took over 2 s.
+    n0_future::time::timeout(Duration::from_secs(30), fut)
         .await
         .expect("not to timeout");
 
