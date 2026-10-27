@@ -26,12 +26,10 @@ on:
         default: "15"
 
 jobs:
-  # deny.toml's policy over the dependency tree: RustSec advisories, license
-  # compatibility, sources. Nightly rather than per pull request: the
-  # advisory database moves on its own, so a new advisory reddens the next
-  # night instead of whichever pull request happens to run first. The hunts
-  # wait on it — a dependency that just received an advisory is not compiled
-  # and run for hours on a runner first.
+  # deny.toml's policy over the dependency tree, as every pull request runs
+  # it: again nightly, since the advisory database moves while the tree
+  # stands still. The hunts wait on it — a dependency that just received an
+  # advisory is not compiled and run for hours on a runner first.
   dependency-audit:
     name: Dependency audit
     runs-on: ubuntu-26.04

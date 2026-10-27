@@ -18,9 +18,30 @@ permissions:
   contents: read
 
 jobs:
+  # deny.toml's policy over the dependency tree: RustSec advisories, license
+  # compatibility, sources. Every other job waits on it, so a tree it refuses
+  # is neither built nor run; an advisory against anything in the tree stops
+  # every pull request until the tree or deny.toml answers it.
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-deny
+        uses: ./.github/actions/install-tools
+        with:
+          tools: cargo-deny
+
+      - name: Check the tree against deny.toml
+        run: cargo deny check
+
   # Apart from the tests, so a lint failure leaves their result in view.
   lint:
     name: Lint
+    needs: dependency-audit
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout
@@ -45,6 +66,7 @@ jobs:
 
   in-process-tests:
     name: In-process tests
+    needs: dependency-audit
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout
@@ -74,6 +96,7 @@ jobs:
   # alone.
   android:
     name: Android build
+    needs: dependency-audit
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout
@@ -110,6 +133,7 @@ jobs:
 
   ios:
     name: iOS build
+    needs: dependency-audit
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -137,6 +161,7 @@ jobs:
 
   docker-tests:
     name: Docker tests
+    needs: dependency-audit
     runs-on: ubuntu-26.04
     # A release image build plus the Docker tests and the demo. Past this
     # the job is stuck rather than slow, and the runner's own ceiling is six
