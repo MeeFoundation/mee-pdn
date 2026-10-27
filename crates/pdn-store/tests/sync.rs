@@ -2973,7 +2973,8 @@ async fn a_catch_up_past_the_events_channel_finishes_while_the_live_actor_asks_t
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
-    tokio::time::timeout(TIMEOUT, async {
+    // A deadlock never ends; on a slow GitHub runner the catch-up took over 60 s.
+    tokio::time::timeout(Duration::from_secs(180), async {
         tokio::select! {
             res = caught_up => res,
             res = asking => res.context("a restart failed"),
