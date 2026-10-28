@@ -657,10 +657,19 @@ async fn a_join_whose_inviter_drops_out_during_its_catch_up_is_finished_later() 
         .await?;
 
     let both = vec![member(alice, true), member(bob, false)];
-    assert!(
-        lists_members(&bob_phone, bob, pod, both).await?,
-        "the pod pass did not catch the cut join up"
-    );
+    if !lists_members(&bob_phone, bob, pod, both).await? {
+        let members = bob_phone.pods().members(bob, pod).await;
+        let holdings = bob_phone.pod_holdings_for_test(bob).await?;
+        let view = bob_phone.pod_membership_view_for_test(bob, pod).await;
+        let joining = bob_phone.pod_syncs_in_flight_report_for_test(pod).await;
+        let inviting = alice_phone.pod_syncs_in_flight_report_for_test(pod).await;
+        anyhow::bail!(
+            "the pod pass did not catch the cut join up\n\
+             the newcomer's members: {members:?}; its holdings: {holdings:?}\n\
+             its membership view: {view:?}\n\
+             in flight on the newcomer: {joining:?}; on the inviter: {inviting:?}"
+        );
+    }
     assert!(reads(&bob_phone, bob, pod, before, b"before").await?);
     let membership = bob_phone.pod_membership_view_for_test(bob, pod).await?;
     assert_eq!(
