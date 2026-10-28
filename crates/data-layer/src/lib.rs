@@ -47,6 +47,10 @@ pub use pod::{
 // The ceremony registration point (ADR-0012, ADR-0015), re-exported so
 // consumers need no direct iroh dependency. The raw `Endpoint` is
 // deliberately not re-exported — the dial handle wraps it.
+/// What an Android host hands the endpoint's DNS reader before a spawn, so it
+/// reads the active network's resolvers instead of falling back.
+#[cfg(target_os = "android")]
+pub use iroh::dns::install_android_jni_context;
 pub use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler},
