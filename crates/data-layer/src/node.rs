@@ -3436,9 +3436,10 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
     })
 }
 
-/// Written beside and linked into place, so no half-written key can exist;
-/// linked exclusively, so two starts racing on one directory cannot mint
-/// different keys — the loser reads the winner's file.
+/// Written beside and renamed into place, so no half-written key can exist.
+/// No second start reaches this on the directory: its lock is taken first
+/// (`lock_directory`). A rename rather than a link: an Android app may not
+/// link a file in its own data directory.
 #[cfg(unix)]
 fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Result<SecretKey> {
     use std::{
@@ -3462,28 +3463,20 @@ fn generate_node_key(directory: &std::path::Path, path: &std::path::Path) -> Res
         file.write_all(encoded.as_bytes())?;
         file.sync_all()?;
     }
-    let committed = match std::fs::hard_link(&staged, path) {
-        Ok(()) => Ok(fresh),
-        // Another start committed first; its key is the node's key.
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read the node key file {}", path.display()))?;
-            parse_node_key(&text)
-                .with_context(|| format!("cannot parse the node key file {}", path.display()))
-        }
-        Err(err) => {
-            Err(err).with_context(|| format!("cannot commit the node key file {}", path.display()))
-        }
-    };
-    let _staged_gone = std::fs::remove_file(&staged);
-    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    std::fs::rename(&staged, path)
+        .with_context(|| format!("cannot commit the node key file {}", path.display()))?;
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("cannot read the node key file {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
     if mode != KEY_MODE {
         return Err(anyhow::anyhow!(
             "node key file {} has permissions {mode:o}, expected {KEY_MODE:o}",
             path.display()
         ));
     }
-    committed
+    Ok(fresh)
 }
 
 #[cfg(not(unix))]
