@@ -3491,6 +3491,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "jni 0.22.4",
  "libc",
  "pdn-node",
  "pdn-node-http",

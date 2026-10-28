@@ -6,6 +6,8 @@
 //! than the other host's, and the `observation` build are in the crate's
 //! `CLAUDE.md`; its requirements are the `pdn-mobile/host` spec.
 
+#[cfg(target_os = "android")]
+mod android;
 mod error;
 mod node;
 mod payload;

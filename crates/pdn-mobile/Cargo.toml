@@ -61,6 +61,11 @@ tracing = { workspace = true }
 tracing-subscriber = "0.3"
 uniffi = { version = "0.32", default-features = false }
 
+# The JNI entry an Android host calls (`src/android.rs`); the version iroh's
+# DNS reader takes.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+
 # netdev 0.46, which iroh's netwatch takes, reads `libc::in6_ifreq` on iOS,
 # and libc declares it for macOS alone from 0.2.190 (netdev pull request #192,
 # open). One lockfile serves every target, so the bound holds the workspace's.
