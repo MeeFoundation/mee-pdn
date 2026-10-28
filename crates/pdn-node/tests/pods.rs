@@ -628,7 +628,10 @@ async fn a_join_cut_by_a_restart_before_its_import_is_finished_by_the_armer() ->
 /// catches it up, by the one joined event. Denied: the invite presented
 /// again. The inviter refusing every pod session stands in for the
 /// connection gone, since the dialogue runs on its own protocol; the
-/// catch-up's whole budget passes.
+/// catch-up's whole budget passes. The inviter answers again only once the
+/// newcomer's pass has named its own device in the membership store, as two
+/// runs over an empty store make it do in any longer cut: its membership
+/// view then lists an identity and no current member.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_join_whose_inviter_drops_out_during_its_catch_up_is_finished_later() -> Result<()> {
     let alice_phone = memory_runtime().await?;
@@ -652,6 +655,15 @@ async fn a_join_whose_inviter_drops_out_during_its_catch_up_is_finished_later() 
     let cut = bob_phone.pods().join(bob, invite.clone()).await;
     assert!(cut.is_err_and(|err| is::<data_layer::CatchUpTimeout>(&err)));
     assert!(lists_pod(&bob_phone, bob, pod, true).await?);
+    let named = eventually(|| async {
+        Ok(bob_phone
+            .pod_membership_view_for_test(bob, pod)
+            .await?
+            .member(&bob)
+            .is_some())
+    })
+    .await?;
+    assert!(named, "the newcomer's pass never named its own device");
     alice_phone
         .refuse_pod_sessions_for_test(alice, false)
         .await?;
