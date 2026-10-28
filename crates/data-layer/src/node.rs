@@ -4400,6 +4400,8 @@ fn tombstone_converged(
 
 /// The devices `held`'s tickets name as a current member that no statement
 /// lists yet: the inviter's other device, reached before its statement is.
+/// While the view counts no current member, every device the tickets name:
+/// a newcomer whose own statement is all its store holds reaches nobody else.
 fn ticketed_unlisted(
     stack: &HostedStack,
     held: &PodBinding,
@@ -4409,6 +4411,7 @@ fn ticketed_unlisted(
         .identities()
         .flat_map(|(_id, member)| member.devices.iter().map(|device| device.node))
         .collect();
+    let no_member = !view.identities().any(|(_id, member)| member.state.member);
     let mut devices = Vec::new();
     for doc in std::iter::once(&held.membership).chain(held.records.as_ref()) {
         for contact in stack
@@ -4420,7 +4423,7 @@ fn ticketed_unlisted(
             let current = view
                 .member(&PdnId::from_bytes(*contact.identity.as_bytes()))
                 .is_some_and(|member| member.state.member);
-            if current && !listed.contains(&device) {
+            if no_member || (current && !listed.contains(&device)) {
                 devices.push((device, contact.identity));
             }
         }
