@@ -6,7 +6,7 @@
 //! as bytes with no framing of the facade's own — what was written is what
 //! is read.
 
-use std::time::Duration;
+use std::{fmt::Display, time::Duration};
 
 use pdn_node::{Operation, PdnId, PodAct, PodId, PodMember, RecordId, RecordKind, RecordRef};
 
@@ -45,6 +45,34 @@ impl From<PodMember> for PodMemberInfo {
         Self {
             identity: member.id.to_string(),
             owner: member.owner,
+        }
+    }
+}
+
+/// What became of a code this node minted: `by` is the joiner's identity
+/// for a pod invite and the newcomer's node id for a linking payload.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum InviteState {
+    Pending,
+    /// Presented and burned; its dialogue in flight or cut short.
+    Burned,
+    Used {
+        by: String,
+    },
+    /// Never presented, its lifetime over.
+    Expired,
+    /// Not minted here for what the call names, or minted before the node last came up.
+    Unknown,
+}
+
+impl<N: Display> From<pdn_node::InviteState<N>> for InviteState {
+    fn from(state: pdn_node::InviteState<N>) -> Self {
+        match state {
+            pdn_node::InviteState::Pending => Self::Pending,
+            pdn_node::InviteState::Burned => Self::Burned,
+            pdn_node::InviteState::Used(by) => Self::Used { by: by.to_string() },
+            pdn_node::InviteState::Expired => Self::Expired,
+            pdn_node::InviteState::Unknown => Self::Unknown,
         }
     }
 }

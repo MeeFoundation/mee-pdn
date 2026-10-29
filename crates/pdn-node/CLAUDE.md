@@ -1,6 +1,6 @@
 # crates/pdn-node
 
-The embeddable runtime core: identity / pods / sync services as thin glue over `data-layer`, plus the runtime's two ceremonies — linking and a pod's join — which share one framing, one kind of pending one-time secret and one unreachable-inviter error (`ceremony.rs`).
+The embeddable runtime core: identity / pods / sync services as thin glue over `data-layer`, plus the runtime's two ceremonies — linking and a pod's join — which share one framing, one kind of pending one-time secret and one unreachable-inviter error (`ceremony.rs`). A presented secret stays in its pending set until its lifetime ends, marked burned and then used by its newcomer once the serving half's last write returned, so `invite_state` and `linking_invite_state` answer what became of an invite (`InviteState`); the set is memory alone, and a restart forgets it.
 
 Device linking (ADR-0012, the `linking` module): `linking_invite` mints a bearer-free payload carrying a one-time secret (no ticket, no identity proof — nothing in it gives durable access; the secret burns on first use), `link` dials the linking ALPN — the inviter verifies-and-burns, registers the newcomer as pending (from the connection's authenticated peer id), and replies with a fresh PMS write ticket; `link` imports it, records its own hosting, confirms its pending record itself, and returns caught up, rolling the import back on a failure before the commit point.
 

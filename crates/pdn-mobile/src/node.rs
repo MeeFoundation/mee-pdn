@@ -30,7 +30,9 @@ use pdn_node::{
 use crate::{
     error::{self, PdnError},
     payload,
-    shapes::{self, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind},
+    shapes::{
+        self, InviteState, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind,
+    },
     streams::{self, RecordReader, RecordWriter},
 };
 
@@ -252,6 +254,16 @@ impl PdnNode {
         payload::encode(&minted)
     }
 
+    /// What became of a linking payload this node minted (device-linking
+    /// spec); `Used` names the newcomer's node id. Writes nothing.
+    pub async fn linking_payload_state(&self, code: String) -> Result<InviteState, PdnError> {
+        let payload: LinkingPayload = payload::decode(&code)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.identity().linking_invite_state(&payload).await })
+            .await
+            .map(InviteState::from)
+    }
+
     /// Join the identity a linking payload names, as a device of it.
     ///
     /// `budget_secs` bounds the whole act: the dialogue spends from it
@@ -321,6 +333,21 @@ impl PdnNode {
             .on_node(async move { runtime.pods().invite(identity, pod, lifetime).await })
             .await?;
         payload::encode(&minted)
+    }
+
+    /// What became of a pod invite this node minted for `identity` (pods
+    /// spec); `Used` names the joiner. Writes nothing.
+    pub async fn pod_invite_state(
+        &self,
+        identity: String,
+        code: String,
+    ) -> Result<InviteState, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let invite: PodInvite = payload::decode(&code)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().invite_state(identity, &invite).await })
+            .await
+            .map(InviteState::from)
     }
 
     /// Join the pod an invitation names, as a plain member. Answers once

@@ -4,7 +4,7 @@
 //! the host never names. Scaffolding — unpinned, and no contract for anything
 //! outside this repository.
 
-use std::time::Duration;
+use std::{fmt::Display, time::Duration};
 
 use pdn_node::{
     Operation, PdnId, PodAct, PodId, PodMember, PodStore, RecordKind, RecordRef, UnknownEntry,
@@ -108,6 +108,31 @@ impl From<PodMember> for Member {
         Self {
             id: member.id,
             owner: member.owner,
+        }
+    }
+}
+
+/// What became of an invite, `{"state": "used", "by": "<id>"}`: the
+/// joiner's `PdnId` for a pod invite, the newcomer's node id for a linking
+/// one; `by` for `used` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InviteState {
+    Pending,
+    Burned,
+    Used { by: String },
+    Expired,
+    Unknown,
+}
+
+impl<N: Display> From<pdn_node::InviteState<N>> for InviteState {
+    fn from(state: pdn_node::InviteState<N>) -> Self {
+        match state {
+            pdn_node::InviteState::Pending => Self::Pending,
+            pdn_node::InviteState::Burned => Self::Burned,
+            pdn_node::InviteState::Used(by) => Self::Used { by: by.to_string() },
+            pdn_node::InviteState::Expired => Self::Expired,
+            pdn_node::InviteState::Unknown => Self::Unknown,
         }
     }
 }
@@ -231,5 +256,18 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// An invite's state names the newcomer for `used` alone.
+    #[test]
+    fn an_invite_state_carries_its_newcomer_when_used() -> serde_json::Result<()> {
+        let used = InviteState::from(pdn_node::InviteState::Used(PdnId::from_bytes([0xab; 32])));
+        assert_eq!(
+            serde_json::to_string(&used)?,
+            format!(r#"{{"state":"used","by":"{}"}}"#, "ab".repeat(32))
+        );
+        let pending = InviteState::from(pdn_node::InviteState::<PdnId>::Pending);
+        assert_eq!(serde_json::to_string(&pending)?, r#"{"state":"pending"}"#);
+        Ok(())
     }
 }

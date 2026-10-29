@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use pdn_types::PdnId;
 use rand::{rngs::SysRng, TryRng as _};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -32,23 +31,48 @@ pub(crate) const MAX_WIRE_MESSAGE_LEN: u32 = 64 * 1024;
 #[error("could not reach the inviter")]
 pub struct InviterUnreachable;
 
+/// What became of an invite on the runtime that minted it; the pods spec
+/// and the device-linking spec hold when each state is entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteState<N> {
+    Pending,
+    /// Presented and burned; its dialogue in flight or cut short.
+    Burned,
+    /// Its serving half handed this newcomer what it came for.
+    Used(N),
+    /// Never presented, its lifetime over.
+    Expired,
+    /// Not held for what the question names: never minted here, minted
+    /// for another identity or pod, swept, or minted before this start.
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct PendingInvite<T> {
+enum Fate<N> {
+    Pending,
+    Burned,
+    Used(N),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingInvite<T, N> {
     minted_for: T,
     expires_at: Instant,
+    fate: Fate<N>,
 }
 
 /// One instance per ceremony that mints one-time secrets, inside the
 /// runtime state so every operation is a map operation under the coarse
 /// lock. Expiry is lazy: checked at presentation, swept at the next invite.
-/// `T` is what a secret was minted for — an identity, or an identity and a
-/// pod.
+/// A presented secret stays, marked, until that sweep. `T` is what a secret
+/// was minted for — an identity, or an identity and a pod; `N` names the
+/// newcomer it was used by.
 #[derive(Debug)]
-pub(crate) struct PendingInvites<T = PdnId> {
-    map: HashMap<[u8; 32], PendingInvite<T>>,
+pub(crate) struct PendingInvites<T, N> {
+    map: HashMap<[u8; 32], PendingInvite<T, N>>,
 }
 
-impl<T> Default for PendingInvites<T> {
+impl<T, N> Default for PendingInvites<T, N> {
     fn default() -> Self {
         Self {
             map: HashMap::new(),
@@ -56,7 +80,7 @@ impl<T> Default for PendingInvites<T> {
     }
 }
 
-impl<T: Copy> PendingInvites<T> {
+impl<T: Copy + PartialEq, N: Copy> PendingInvites<T, N> {
     /// 32 bytes from the operating-system generator.
     pub(crate) fn mint(
         &mut self,
@@ -77,18 +101,43 @@ impl<T: Copy> PendingInvites<T> {
             PendingInvite {
                 minted_for,
                 expires_at,
+                fate: Fate::Pending,
             },
         );
         Ok(secret)
     }
 
-    /// Present and unexpired — burned and returned; expired — burned and
-    /// refused; unknown — refused, burning nothing.
+    /// Pending and unexpired — marked burned and returned; anything else
+    /// refused, changing nothing.
     pub(crate) fn verify_and_burn(&mut self, secret: &[u8; 32], now: Instant) -> Option<T> {
-        // Peek first: a miss must not disturb the map.
-        let live = self.map.get(secret)?.expires_at > now;
-        let pending = self.map.remove(secret)?;
-        live.then_some(pending.minted_for)
+        let pending = self.map.get_mut(secret)?;
+        if !matches!(pending.fate, Fate::Pending) || pending.expires_at <= now {
+            return None;
+        }
+        pending.fate = Fate::Burned;
+        Some(pending.minted_for)
+    }
+
+    /// Called once the serving half's last write to `newcomer` returned; a
+    /// secret swept meanwhile stays unknown.
+    pub(crate) fn mark_used(&mut self, secret: &[u8; 32], newcomer: N) {
+        if let Some(pending) = self.map.get_mut(secret) {
+            if matches!(pending.fate, Fate::Burned) {
+                pending.fate = Fate::Used(newcomer);
+            }
+        }
+    }
+
+    pub(crate) fn state(&self, secret: &[u8; 32], minted_for: T, now: Instant) -> InviteState<N> {
+        match self.map.get(secret) {
+            Some(pending) if pending.minted_for == minted_for => match pending.fate {
+                Fate::Pending if pending.expires_at <= now => InviteState::Expired,
+                Fate::Pending => InviteState::Pending,
+                Fate::Burned => InviteState::Burned,
+                Fate::Used(newcomer) => InviteState::Used(newcomer),
+            },
+            _ => InviteState::Unknown,
+        }
     }
 }
 
@@ -126,4 +175,81 @@ pub(crate) async fn read_message<R: AsyncRead + Unpin, T: DeserializeOwned>(
     let mut bytes = vec![0u8; usize::try_from(len)?];
     recv.read_exact(&mut bytes).await?;
     Ok(postcard::from_bytes(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIFETIME: Duration = Duration::from_secs(120);
+
+    fn invites() -> PendingInvites<u8, char> {
+        PendingInvites::default()
+    }
+
+    /// A presented secret is marked burned, then used by its newcomer, and a
+    /// second presentation is refused and leaves it used.
+    #[test]
+    fn a_presented_secret_reads_burned_then_used() -> Result<()> {
+        let now = Instant::now();
+        let mut set = invites();
+        let secret = set.mint(1, LIFETIME, now)?;
+        assert_eq!(set.state(&secret, 1, now), InviteState::Pending);
+        assert_eq!(set.verify_and_burn(&secret, now), Some(1));
+        assert_eq!(set.state(&secret, 1, now), InviteState::Burned);
+        set.mark_used(&secret, 'c');
+        assert_eq!(set.state(&secret, 1, now), InviteState::Used('c'));
+        // A replay is refused and changes nothing.
+        assert_eq!(set.verify_and_burn(&secret, now), None);
+        assert_eq!(set.state(&secret, 1, now), InviteState::Used('c'));
+        Ok(())
+    }
+
+    /// A secret never presented reads expired once its lifetime ends, is
+    /// refused then without a change, and reads unknown once a mint swept it.
+    #[test]
+    fn an_unpresented_secret_expires_and_is_swept() -> Result<()> {
+        let now = Instant::now();
+        let later = now + LIFETIME + Duration::from_secs(1);
+        let mut set = invites();
+        let secret = set.mint(1, LIFETIME, now)?;
+        assert_eq!(set.state(&secret, 1, later), InviteState::Expired);
+        assert_eq!(set.verify_and_burn(&secret, later), None);
+        assert_eq!(set.state(&secret, 1, later), InviteState::Expired);
+        set.mint(1, LIFETIME, later)?;
+        assert_eq!(set.state(&secret, 1, later), InviteState::Unknown);
+        Ok(())
+    }
+
+    /// A refused presentation of a never-minted secret leaves a pending one
+    /// pending and live; a used one is swept with its lifetime too.
+    #[test]
+    fn a_refused_presentation_changes_nothing() -> Result<()> {
+        let now = Instant::now();
+        let mut set = invites();
+        let pending = set.mint(1, LIFETIME, now)?;
+        assert_eq!(set.verify_and_burn(&[7; 32], now), None);
+        assert_eq!(set.state(&[7; 32], 1, now), InviteState::Unknown);
+        assert_eq!(set.state(&pending, 1, now), InviteState::Pending);
+        // Marking a secret no presentation burned leaves it pending.
+        set.mark_used(&pending, 'x');
+        assert_eq!(set.state(&pending, 1, now), InviteState::Pending);
+        assert_eq!(set.verify_and_burn(&pending, now), Some(1));
+        set.mark_used(&pending, 'c');
+        let later = now + LIFETIME + Duration::from_secs(1);
+        set.mint(1, LIFETIME, later)?;
+        assert_eq!(set.state(&pending, 1, later), InviteState::Unknown);
+        Ok(())
+    }
+
+    /// A secret is answered only for what it was minted for.
+    #[test]
+    fn a_secret_reads_unknown_for_anything_else() -> Result<()> {
+        let now = Instant::now();
+        let mut set = invites();
+        let secret = set.mint(1, LIFETIME, now)?;
+        assert_eq!(set.state(&secret, 2, now), InviteState::Unknown);
+        assert_eq!(set.state(&secret, 1, now), InviteState::Pending);
+        Ok(())
+    }
 }

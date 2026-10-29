@@ -6,13 +6,19 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use axum::http::StatusCode;
+use anyhow::{Context as _, Result};
+use axum::{body::Bytes, http::StatusCode};
 use pdn_node::{PdnId, RecordKind};
-use pdn_node_http::shapes::{Act, HeldPod, HeldPods, Member};
+use pdn_node_http::shapes::{Act, HeldPod, HeldPods, InviteState, Member};
 
 mod common;
-use common::{members_read, ops_read, pod_listed, pod_route, record_reads, record_route, Stand};
+use common::{
+    eventually, members_read, ops_read, pod_listed, pod_route, record_reads, record_route, Host,
+    Stand,
+};
+
+/// What the serving half's mark takes after its last write, many times over.
+const USED_WATCH: Duration = Duration::from_secs(30);
 
 /// Several times what an announced write takes to reach a member device,
 /// which the remaining member's read of the later record has just shown.
@@ -173,5 +179,72 @@ async fn a_pod_runs_across_three_containers() -> Result<()> {
         refused.text()
     );
 
+    Ok(())
+}
+
+/// The state of `code` as `host` answers it at `route`.
+async fn state_of(host: &Host, route: &str, code: &Bytes) -> Result<InviteState> {
+    host.post(route, code.clone()).await?.json()
+}
+
+/// Whether `host` reads `code` used by `by` within the watch.
+async fn reads_used(host: &Host, route: &str, code: &Bytes, by: String) -> Result<bool> {
+    let used = InviteState::Used { by };
+    let seen = eventually(USED_WATCH, || async {
+        Ok((state_of(host, route, code).await? == used).then_some(()))
+    })
+    .await?;
+    Ok(seen.is_some())
+}
+
+/// An invite's state is read over HTTP alone: a pod invite and a linking
+/// invite minted on one host read pending before a second host consumes
+/// each, and used afterwards, naming the joiner and the newcomer's node id.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a container daemon and the pdn-node-http:dev image (just test-docker)"]
+async fn an_invites_state_is_read_over_http() -> Result<()> {
+    let stand = Stand::new();
+    let alice_node = stand.spawn("alice").await?;
+    let bob_node = stand.spawn("bob").await?;
+    let alice = alice_node.create_identity().await?;
+    let bob = bob_node.create_identity().await?;
+    let family = alice_node.create_pod(alice).await?;
+
+    let invite = alice_node.invite_to_pod(alice, family).await?;
+    let pod_state = format!("/debug/identities/{alice}/pods/invite-state");
+    assert_eq!(
+        state_of(&alice_node, &pod_state, &invite).await?,
+        InviteState::Pending
+    );
+    let joined: HeldPod = bob_node.join_pod(bob, invite.clone()).await?.json()?;
+    assert_eq!(joined.pod, family);
+    assert!(
+        reads_used(&alice_node, &pod_state, &invite, bob.to_string()).await?,
+        "the pod invite never read used by the joiner: {:?}",
+        state_of(&alice_node, &pod_state, &invite).await
+    );
+
+    let payload = alice_node
+        .post(
+            &format!("/debug/identities/{alice}/linking-invite"),
+            Bytes::new(),
+        )
+        .await?
+        .ok()?;
+    let linking_state = "/debug/linking-invite-state";
+    assert_eq!(
+        state_of(&alice_node, linking_state, &payload).await?,
+        InviteState::Pending
+    );
+    bob_node
+        .post("/debug/link?timeout_secs=60", payload.clone())
+        .await?
+        .ok()?;
+    let newcomer = bob_node.node_id().await.context("the newcomer's node id")?;
+    assert!(
+        reads_used(&alice_node, linking_state, &payload, newcomer).await?,
+        "the linking invite never read used by the newcomer: {:?}",
+        state_of(&alice_node, linking_state, &payload).await
+    );
     Ok(())
 }

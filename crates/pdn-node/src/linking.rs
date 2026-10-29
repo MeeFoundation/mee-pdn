@@ -196,6 +196,13 @@ impl LinkingHandler {
         // newcomer pending, and a fresh invite converges.
         write_message(&mut send, &response).await.ok()?;
         send.finish().ok()?;
+        self.state
+            .get()?
+            .upgrade()?
+            .lock()
+            .await
+            .pending_linking_invites
+            .mark_used(&request.secret, newcomer);
         // Held until the dialer closes, so the response is not cut off.
         connection.closed().await;
         Some(())

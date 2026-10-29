@@ -32,8 +32,8 @@ use tokio::{
 
 use crate::{
     ceremony::{
-        read_message, write_message, InviterUnreachable, StateSlot, DEFAULT_INVITE_LIFETIME,
-        MAX_WIRE_MESSAGE_LEN,
+        read_message, write_message, InviteState, InviterUnreachable, StateSlot,
+        DEFAULT_INVITE_LIFETIME, MAX_WIRE_MESSAGE_LEN,
     },
     runtime::{CleanupSupervisor, Runtime, ServingHalves, State},
 };
@@ -273,6 +273,11 @@ pub trait PodsService {
     /// the PMS's entry recorded.
     async fn join(&self, identity: PdnId, invite: PodInvite) -> Result<PodId>;
 
+    /// What became of an invite this runtime minted for the identity into
+    /// the pod the invite names (pods spec); writes nothing.
+    async fn invite_state(&self, identity: PdnId, invite: &PodInvite)
+        -> Result<InviteState<PdnId>>;
+
     /// Write a membership act once the identity's role allows it, both
     /// sequences picked from what the replica holds;
     /// [`ActRefused`] writes nothing. A leave also tombstones the pod in the
@@ -496,6 +501,18 @@ impl PodsService for RuntimePodsService<'_> {
             .await?;
         waited?;
         Ok(pod)
+    }
+
+    async fn invite_state(
+        &self,
+        identity: PdnId,
+        invite: &PodInvite,
+    ) -> Result<InviteState<PdnId>> {
+        let state = self.runtime.state.lock().await;
+        state.hosted(identity)?;
+        Ok(state
+            .pending_pod_invites
+            .state(&invite.secret, (identity, invite.pod), Instant::now()))
     }
 
     async fn act(&self, identity: PdnId, pod: PodId, act: PodAct) -> Result<()> {
@@ -1548,7 +1565,13 @@ where
         },
     )
     .await
-    .map_err(|_| Refused)
+    .map_err(|_| Refused)?;
+    state
+        .lock()
+        .await
+        .pending_pod_invites
+        .mark_used(&request.secret, request.joiner);
+    Ok(())
 }
 
 /// The identity holds `pod` from `seq` of its chain on: both stores' write
