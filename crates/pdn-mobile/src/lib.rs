@@ -12,6 +12,7 @@ mod error;
 mod node;
 mod payload;
 mod shapes;
+mod streams;
 #[cfg(feature = "observation")]
 mod test_surface;
 
@@ -21,6 +22,7 @@ pub use shapes::{
     PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind, MAX_DOCUMENT_PAYLOAD,
     MAX_ENTRY_PAYLOAD,
 };
+pub use streams::{RecordReader, RecordWriter};
 
 uniffi::setup_scaffolding!();
 

@@ -18,8 +18,9 @@ use data_layer::{
     creates, devices_verify, join_verifies, pdn_id_of, pod_id_of, pod_inviter_ticket_kind,
     pod_ticket_kind, AcceptError, AddrInfoOptions, AuthorId, Connection, CreatedPayload,
     DevicesPayload, DocTicket, EndpointAddr, EventKind, JoinedPayload, Member, MemberDevice,
-    MembershipKey, MembershipView, OpId, Operation, PodNotice, PodStore, PodTickets,
-    ProtocolHandler, RecordKey, Seq, SyncNode, UnknownEntry, UnknownPod, ACT_PAYLOAD,
+    MembershipKey, MembershipView, OpId, Operation, PayloadReader, PayloadStream, PodNotice,
+    PodStore, PodTickets, ProtocolHandler, RecordKey, Seq, SyncNode, UnknownEntry, UnknownPod,
+    ACT_PAYLOAD,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
 use rand::{rngs::SysRng, TryRng as _};
@@ -308,6 +309,27 @@ pub trait PodsService {
     async fn read(&self, identity: PdnId, pod: PodId, record: RecordRef)
         -> Result<Option<Vec<u8>>>;
 
+    /// [`put_record`](Self::put_record) of what `payload` yields, written
+    /// only once the stream ends whole: the identity's membership is checked
+    /// before the stream is read and again at the write, and no lock of the
+    /// runtime is held while it is read.
+    async fn put_record_streamed(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        kind: RecordKind,
+        payload: PayloadStream,
+    ) -> Result<RecordRef>;
+
+    /// [`read`](Self::read) as a reader, which holds the payload while it
+    /// lives.
+    async fn read_streamed(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        record: RecordRef,
+    ) -> Result<Option<PayloadReader>>;
+
     /// A mergeable-document's operations that read here, each with its
     /// writer, in the order of their ids and merged into no document state;
     /// [`UnknownRecord`] when none reads, [`WrongRecordKind`] for another
@@ -536,28 +558,34 @@ impl PodsService for RuntimePodsService<'_> {
         // Local writes alone: no round trip runs under the lock.
         let state = self.runtime.state.lock().await;
         let (author, mseq) = writer(&state, identity, pod).await?;
-        let mut id = [0u8; 16];
-        SysRng
-            .try_fill_bytes(&mut id)
-            .context("operating-system randomness unavailable")?;
-        let (member, id) = (identity, RecordId::from_bytes(id));
-        let key = match kind {
-            RecordKind::Claim => RecordKey::Claim { member, id, mseq },
-            RecordKind::ImmutableDocument => RecordKey::ImmutableDocument { member, id, mseq },
-            RecordKind::MergeableDocument => RecordKey::Operation {
-                member,
-                id,
-                op: OpId {
-                    writer: identity,
-                    author,
-                    mseq,
-                    op_seq: 1,
-                },
-            },
-        };
+        let key = fresh_record_key(identity, kind, author, mseq)?;
         state
             .node
             .write_pod_entry(identity, pod, PodStore::Records, &key.to_bytes(), payload)
+            .await?;
+        Ok(key.record())
+    }
+
+    async fn put_record_streamed(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        kind: RecordKind,
+        payload: PayloadStream,
+    ) -> Result<RecordRef> {
+        // A non-member's stream is refused before a byte of it is read.
+        let node = {
+            let state = self.runtime.state.lock().await;
+            writer(&state, identity, pod).await?;
+            Arc::clone(&state.node)
+        };
+        let imported = node.import_payload(payload).await?;
+        let state = self.runtime.state.lock().await;
+        let (author, mseq) = writer(&state, identity, pod).await?;
+        let key = fresh_record_key(identity, kind, author, mseq)?;
+        state
+            .node
+            .write_pod_record_imported(identity, pod, &key.to_bytes(), imported)
             .await?;
         Ok(key.record())
     }
@@ -615,6 +643,19 @@ impl PodsService for RuntimePodsService<'_> {
             return Err(WrongRecordKind { record }.into());
         }
         node.read_pod_record(identity, pod, &record).await
+    }
+
+    async fn read_streamed(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        record: RecordRef,
+    ) -> Result<Option<PayloadReader>> {
+        let (node, _membership) = self.as_member(identity, pod).await?;
+        if record.kind == RecordKind::MergeableDocument {
+            return Err(WrongRecordKind { record }.into());
+        }
+        node.read_pod_record_streamed(identity, pod, &record).await
     }
 
     async fn read_ops(
@@ -1027,6 +1068,35 @@ async fn pod_tickets(
 
 /// The author `identity` writes with here and the point of its chain its
 /// records name, once it is a member of `pod`.
+/// A key of `kind` under `identity`'s name at a fresh id: a claim's or an
+/// immutable-document's one entry, or a mergeable-document's first operation.
+fn fresh_record_key(
+    identity: PdnId,
+    kind: RecordKind,
+    author: AuthorId,
+    mseq: Seq,
+) -> Result<RecordKey> {
+    let mut id = [0u8; 16];
+    SysRng
+        .try_fill_bytes(&mut id)
+        .context("operating-system randomness unavailable")?;
+    let (member, id) = (identity, RecordId::from_bytes(id));
+    Ok(match kind {
+        RecordKind::Claim => RecordKey::Claim { member, id, mseq },
+        RecordKind::ImmutableDocument => RecordKey::ImmutableDocument { member, id, mseq },
+        RecordKind::MergeableDocument => RecordKey::Operation {
+            member,
+            id,
+            op: OpId {
+                writer: identity,
+                author,
+                mseq,
+                op_seq: 1,
+            },
+        },
+    })
+}
+
 async fn writer(state: &State, identity: PdnId, pod: PodId) -> Result<(AuthorId, Seq)> {
     let author = state.hosted(identity)?.author;
     let membership = state.node.pod_membership_view(identity, pod).await?;

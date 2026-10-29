@@ -52,6 +52,8 @@ test = false
 doc = false
 
 [dev-dependencies]
+# A streamed payload's pieces, as the pods service takes them.
+bytes = "1"
 # Scenario tests probe an identity's PMS by running the linking
 # dialogue raw against a bare node — the store-level view of what the
 # ceremonies published, and the pin on the linking wire format.

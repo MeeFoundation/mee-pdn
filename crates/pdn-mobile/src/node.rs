@@ -31,6 +31,7 @@ use crate::{
     error::{self, PdnError},
     payload,
     shapes::{self, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind},
+    streams::{self, RecordReader, RecordWriter},
 };
 
 /// What a handle holds. `ComingUp` is a state of its own so 2 concurrent
@@ -405,6 +406,46 @@ impl PdnNode {
             .await
     }
 
+    /// Place a record whose payload the host writes in pieces; the writer's
+    /// `finish` answers the record, and nothing is placed before it.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // asynchronous as every exported call is; it starts the placing
+    pub async fn put_record_streamed(
+        &self,
+        identity: String,
+        pod: String,
+        kind: PodRecordKind,
+    ) -> Result<Arc<RecordWriter>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let runtime = self.runtime()?;
+        let (pieces, payload) = streams::pieces();
+        let placing = self.handle()?.spawn(async move {
+            runtime
+                .pods()
+                .put_record_streamed(identity, pod, kind.into(), payload)
+                .await
+        });
+        Ok(Arc::new(RecordWriter::new(kind, pieces, placing)))
+    }
+
+    /// `read_record` as a reader, `None` as `read_record` answers it.
+    pub async fn read_record_streamed(
+        &self,
+        identity: String,
+        pod: String,
+        record: PodRecord,
+    ) -> Result<Option<Arc<RecordReader>>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let record = shapes::record(&record)?;
+        let runtime = self.runtime()?;
+        let tokio = self.handle()?;
+        let reader = self
+            .on_node(async move { runtime.pods().read_streamed(identity, pod, record).await })
+            .await?;
+        Ok(reader.map(|reader| Arc::new(RecordReader::new(reader, tokio))))
+    }
+
     /// A mergeable-document's operations in the order of their ids, each
     /// with its writer.
     pub async fn read_ops(
@@ -527,6 +568,19 @@ impl PdnNode {
             }
             State::ComingUp(_) | State::Up(_) => Err(PdnError::NodeAlreadyUp),
         }
+    }
+
+    /// The facade's asynchronous runtime, for work a writer or a reader
+    /// hands it after the call that made them.
+    fn handle(&self) -> Result<tokio::runtime::Handle, PdnError> {
+        let tokio = self.tokio.lock().map_err(|_| {
+            tracing::error!("the facade's runtime lock is poisoned");
+            PdnError::Internal
+        })?;
+        tokio
+            .as_ref()
+            .map(|tokio| tokio.handle().clone())
+            .ok_or(PdnError::Internal)
     }
 
     /// The node an exported call acts on.
