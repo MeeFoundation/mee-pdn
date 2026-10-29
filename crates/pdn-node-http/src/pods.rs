@@ -20,8 +20,8 @@ use crate::{
     error::HostError,
     parse,
     shapes::{
-        Act, HeldPod, HeldPods, Lifetime, Members, NoQuery, Operations, Placement, Records,
-        UnknownEntries,
+        Act, HeldPod, HeldPods, InviteState, Lifetime, Members, NoQuery, Operations, Placement,
+        Records, UnknownEntries,
     },
 };
 
@@ -98,6 +98,20 @@ pub(crate) async fn join(
     let invite: PodInvite = parse::json(&body, "pod invite")?;
     let pod = runtime.pods().join(identity, invite).await?;
     Ok(Json(HeldPod { pod }))
+}
+
+/// `POST /debug/identities/{identity}/pods/invite-state` — the invite as
+/// the join route takes it; the invite names the pod.
+pub(crate) async fn invite_state(
+    State(runtime): State<Arc<Runtime>>,
+    Path(identity): Path<String>,
+    Query(NoQuery {}): Query<NoQuery>,
+    body: Bytes,
+) -> Result<Json<InviteState>, HostError> {
+    let identity = parse::segment(&identity, "identity")?;
+    let invite: PodInvite = parse::json(&body, "pod invite")?;
+    let state = runtime.pods().invite_state(identity, &invite).await?;
+    Ok(Json(state.into()))
 }
 
 /// `POST /debug/identities/{identity}/pods/{pod}/acts`.

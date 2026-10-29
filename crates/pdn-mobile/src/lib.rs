@@ -19,8 +19,8 @@ mod test_surface;
 pub use error::{PdnError, PodActRefusal};
 pub use node::PdnNode;
 pub use shapes::{
-    PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind, MAX_DOCUMENT_PAYLOAD,
-    MAX_ENTRY_PAYLOAD,
+    InviteState, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind,
+    MAX_DOCUMENT_PAYLOAD, MAX_ENTRY_PAYLOAD,
 };
 pub use streams::{RecordReader, RecordWriter};
 

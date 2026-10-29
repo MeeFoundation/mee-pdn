@@ -13,10 +13,10 @@ use data_layer::{
     PodStore, PodTickets, PrivateMetadataStore, RecordKey, SyncNode, Verdict,
 };
 use pdn_node::{
-    ActRefusal, ActRefused, ForgedJoin, IdentityService as _, JoinInProgress, JoinRefused,
-    JoinTimeout, PayloadStream, PodAct, PodInvite, PodMember, PodsService as _, RecordPlacedOnce,
-    Runtime, SpawnOptions, UnknownIdentity, UnknownPod, UnknownRecord, UnsupportedPodInviteVersion,
-    WrongRecordKind, JOIN_DIALOGUE_TIMEOUT, POD_INVITE_FORMAT_VERSION,
+    ActRefusal, ActRefused, ForgedJoin, IdentityService as _, InviteState, JoinInProgress,
+    JoinRefused, JoinTimeout, PayloadStream, PodAct, PodInvite, PodMember, PodsService as _,
+    RecordPlacedOnce, Runtime, SpawnOptions, UnknownIdentity, UnknownPod, UnknownRecord,
+    UnsupportedPodInviteVersion, WrongRecordKind, JOIN_DIALOGUE_TIMEOUT, POD_INVITE_FORMAT_VERSION,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
 use test_utils::{
@@ -235,6 +235,86 @@ async fn a_newcomer_joins_and_a_replayed_secret_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// Whether `runtime` reads `invite`, minted for `identity`, used by `joiner`
+/// within the bound: the mark follows the inviter's last write, which the
+/// joiner's own return may precede.
+async fn reads_used(
+    runtime: &Runtime,
+    identity: PdnId,
+    invite: &PodInvite,
+    joiner: PdnId,
+) -> Result<bool> {
+    eventually(|| async {
+        Ok(runtime.pods().invite_state(identity, invite).await? == InviteState::Used(joiner))
+    })
+    .await
+}
+
+/// A served join marks its invite used by the joiner, and an invite minted
+/// beside it reads pending throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_join_marks_the_invite_used_by_the_joiner() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = alice_phone.pods().create(alice).await?;
+    let first = alice_phone.pods().invite(alice, pod, None).await?;
+    let second = alice_phone.pods().invite(alice, pod, None).await?;
+    for invite in [&first, &second] {
+        assert_eq!(
+            alice_phone.pods().invite_state(alice, invite).await?,
+            InviteState::Pending
+        );
+    }
+
+    bob_phone.pods().join(bob, first.clone()).await?;
+    assert!(
+        reads_used(&alice_phone, alice, &first, bob).await?,
+        "the served invite never read used by the joiner"
+    );
+    assert_eq!(
+        alice_phone.pods().invite_state(alice, &second).await?,
+        InviteState::Pending
+    );
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A join whose inviter's storage fails once the secret burned leaves the
+/// invite burned, and the invite the newcomer then joins with reads used
+/// by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_cut_short_after_the_burn_leaves_the_invite_burned() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = alice_phone.pods().create(alice).await?;
+    let first = alice_phone.pods().invite(alice, pod, None).await?;
+    alice_phone.fail_next_joined_write_for_test().await;
+    let cut = bob_phone.pods().join(bob, first.clone()).await;
+    assert!(cut.is_err_and(|err| is::<JoinRefused>(&err)));
+    assert_eq!(
+        alice_phone.pods().invite_state(alice, &first).await?,
+        InviteState::Burned
+    );
+
+    let second = alice_phone.pods().invite(alice, pod, None).await?;
+    bob_phone.pods().join(bob, second.clone()).await?;
+    assert!(reads_used(&alice_phone, alice, &second, bob).await?);
+    assert_eq!(
+        alice_phone.pods().invite_state(alice, &first).await?,
+        InviteState::Burned
+    );
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// A member invited by the creator invites in turn, and the creator's
 /// device lists the third member with no act of its own.
 #[tokio::test(flavor = "multi_thread")]
@@ -270,7 +350,8 @@ async fn an_invited_member_invites_in_turn() -> Result<()> {
 }
 
 /// The pending invite's real secret joins after a secret never minted and
-/// an expired invite were refused with no observable state; an invite of a
+/// an expired invite were refused with no observable state, the pending
+/// invite reading pending and the never-minted one unknown; an invite of a
 /// version the runtime does not know is refused before any dial, and an
 /// invite lifetime no clock can hold is an error, not a panic.
 #[tokio::test(flavor = "multi_thread")]
@@ -293,11 +374,19 @@ async fn a_wrong_secret_burns_nothing() -> Result<()> {
         secret: [0x5a; 32],
         ..invite.clone()
     };
-    let refused = bob_phone.pods().join(bob, wrong).await;
+    let refused = bob_phone.pods().join(bob, wrong.clone()).await;
     assert!(refused.is_err_and(|err| is::<JoinRefused>(&err)));
     assert_eq!(
         alice_phone.pods().members(alice, pod).await?,
         vec![member(alice, true)]
+    );
+    assert_eq!(
+        alice_phone.pods().invite_state(alice, &wrong).await?,
+        InviteState::Unknown
+    );
+    assert_eq!(
+        alice_phone.pods().invite_state(alice, &invite).await?,
+        InviteState::Pending
     );
     assert_eq!(bob_phone.pods().list(bob).await?, []);
     let expired = alice_phone
@@ -333,8 +422,10 @@ async fn a_wrong_secret_burns_nothing() -> Result<()> {
 }
 
 /// Two identities of one node invite and join with no other node
-/// reachable, each listing the other. Denied: the secret presented again
-/// inside the process is refused.
+/// reachable, each listing the other, and the invite reads used by the
+/// joiner for the inviting identity alone. Denied: the secret presented
+/// again inside the process is refused, and an unhosted identity's question
+/// is refused as unknown.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_identities_of_one_node_invite_and_join() -> Result<()> {
     let tablet = memory_runtime().await?;
@@ -349,6 +440,14 @@ async fn two_identities_of_one_node_invite_and_join() -> Result<()> {
     for holder in [leisure, work] {
         assert!(lists_members(&tablet, holder, pod, both.clone()).await?);
     }
+    assert!(reads_used(&tablet, leisure, &invite, work).await?);
+    assert_eq!(
+        tablet.pods().invite_state(work, &invite).await?,
+        InviteState::Unknown
+    );
+    let unhosted = PdnId::from_bytes([0x99; 32]);
+    let asked = tablet.pods().invite_state(unhosted, &invite).await;
+    assert!(asked.is_err_and(|err| is::<UnknownIdentity>(&err)));
     // Denied: the burned secret, by a third co-located identity.
     let replayed = tablet.pods().join(erin, invite).await;
     assert!(replayed.is_err_and(|err| is::<JoinRefused>(&err)));
@@ -477,7 +576,8 @@ async fn a_storage_failure_after_the_burn_reaches_the_caller_on_the_inviters_nod
 
 /// A newcomer whose join lost the inviter's reply, after its joined event
 /// was written, joins through a second invite that writes no second joined
-/// event, and catches up.
+/// event, and catches up; the first invite reads burned and the second used
+/// by the newcomer.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> Result<()> {
     let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
@@ -487,14 +587,19 @@ async fn a_member_whose_join_lost_the_reply_joins_through_a_second_invite() -> R
 
     alice_phone.drop_next_join_reply_for_test().await;
     let first = alice_phone.pods().invite(alice, pod, None).await?;
-    let lost = bob_phone.pods().join(bob, first).await;
+    let lost = bob_phone.pods().join(bob, first.clone()).await;
     assert!(lost.is_err_and(|err| is::<JoinRefused>(&err)));
+    assert_eq!(
+        alice_phone.pods().invite_state(alice, &first).await?,
+        InviteState::Burned
+    );
     let both = vec![member(alice, true), member(bob, false)];
     assert!(lists_members(&alice_phone, alice, pod, both.clone()).await?);
     assert_eq!(bob_phone.pods().list(bob).await?, []);
 
     let second = alice_phone.pods().invite(alice, pod, None).await?;
-    bob_phone.pods().join(bob, second).await?;
+    bob_phone.pods().join(bob, second.clone()).await?;
+    assert!(reads_used(&alice_phone, alice, &second, bob).await?);
     assert!(lists_members(&bob_phone, bob, pod, both).await?);
     for (runtime, holder) in [(&alice_phone, alice), (&bob_phone, bob)] {
         let membership = runtime.pod_membership_view_for_test(holder, pod).await?;
@@ -2357,6 +2462,49 @@ async fn a_pod_is_hosted_again_after_a_restart() -> Result<()> {
     );
 
     for runtime in [alice_phone, bob_tablet] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// An invite never presented reads expired once its lifetime ended and
+/// unknown once a further invite swept it, and a used invite reads unknown
+/// after the inviter restarted on its directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_expires_and_a_restart_forgets_every_invite() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let alice_tablet = runtime_on(dir.path()).await?;
+    let bob_phone = memory_runtime().await?;
+    let alice = alice_tablet.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = alice_tablet.pods().create(alice).await?;
+
+    let brief = alice_tablet
+        .pods()
+        .invite(alice, pod, Some(Duration::from_secs(1)))
+        .await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        alice_tablet.pods().invite_state(alice, &brief).await?,
+        InviteState::Expired
+    );
+    let used = alice_tablet.pods().invite(alice, pod, None).await?;
+    assert_eq!(
+        alice_tablet.pods().invite_state(alice, &brief).await?,
+        InviteState::Unknown
+    );
+    bob_phone.pods().join(bob, used.clone()).await?;
+    assert!(reads_used(&alice_tablet, alice, &used, bob).await?);
+
+    alice_tablet.shutdown().await?;
+    drop(alice_tablet);
+    let alice_tablet = runtime_on(dir.path()).await?;
+    assert_eq!(
+        alice_tablet.pods().invite_state(alice, &used).await?,
+        InviteState::Unknown
+    );
+
+    for runtime in [alice_tablet, bob_phone] {
         runtime.shutdown().await?;
     }
     Ok(())

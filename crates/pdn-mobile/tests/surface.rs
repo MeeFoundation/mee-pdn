@@ -15,7 +15,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pdn_mobile::{PdnError, PdnNode, PodActRefusal, PodMembershipAct, PodRecordKind};
+use pdn_mobile::{InviteState, PdnError, PdnNode, PodActRefusal, PodMembershipAct, PodRecordKind};
 use pdn_node::{Connectivity, PodInvite};
 use tempfile::TempDir;
 use test_utils::eventually;
@@ -372,6 +372,92 @@ async fn a_code_read_for_the_wrong_act_is_refused_as_malformed() -> Result<()> {
         scanner.node.pods(bob).await?,
         Vec::<String>::new(),
         "neither refusal left a pod behind"
+    );
+
+    for device in [inviter, scanner] {
+        device.node.stop().await?;
+    }
+    Ok(())
+}
+
+/// A pod invite and a linking payload read pending until a second handle
+/// consumes each, and then used, naming the joiner and the newcomer's node
+/// id. Denied: a code asked about as the other kind is refused as
+/// malformed input.
+#[tokio::test]
+async fn a_codes_state_reads_used_once_another_device_consumed_it() -> Result<()> {
+    let inviter = Device::boot().await?;
+    let scanner = Device::boot().await?;
+    let alice = inviter.node.create_identity().await?;
+    let bob = scanner.node.create_identity().await?;
+    let pod = inviter.node.create_pod(alice.clone()).await?;
+
+    let invite = inviter
+        .node
+        .mint_pod_invite(alice.clone(), pod, Some(120))
+        .await?;
+    assert_eq!(
+        inviter
+            .node
+            .pod_invite_state(alice.clone(), invite.clone())
+            .await?,
+        InviteState::Pending
+    );
+    scanner.node.join_pod(bob.clone(), invite.clone()).await?;
+    let joined = InviteState::Used { by: bob };
+    assert!(
+        eventually(|| async {
+            Ok(inviter
+                .node
+                .pod_invite_state(alice.clone(), invite.clone())
+                .await?
+                == joined)
+        })
+        .await?,
+        "the pod invite never read used by the joiner"
+    );
+
+    let linking = inviter
+        .node
+        .mint_linking_payload(alice.clone(), Some(120))
+        .await?;
+    assert_eq!(
+        inviter.node.linking_payload_state(linking.clone()).await?,
+        InviteState::Pending
+    );
+    scanner
+        .node
+        .consume_linking_payload(linking.clone(), LINK_BUDGET_SECS)
+        .await?;
+    let linked = InviteState::Used {
+        by: scanner.node.node_id().await?,
+    };
+    assert!(
+        eventually(|| async {
+            Ok(inviter.node.linking_payload_state(linking.clone()).await? == linked)
+        })
+        .await?,
+        "the linking payload never read used by the newcomer"
+    );
+
+    // Denied: each code asked about as the other kind.
+    let wrong_kind = inviter
+        .node
+        .linking_payload_state(invite)
+        .await
+        .expect_err("a pod invite must not read as a linking payload");
+    assert!(
+        matches!(wrong_kind, PdnError::MalformedInput { .. }),
+        "{wrong_kind:?}"
+    );
+    let wrong_kind = inviter
+        .node
+        .pod_invite_state(alice, linking)
+        .await
+        .expect_err("a linking payload must not read as a pod invite");
+    assert!(
+        matches!(wrong_kind, PdnError::MalformedInput { .. }),
+        "{wrong_kind:?}"
     );
 
     for device in [inviter, scanner] {
