@@ -359,7 +359,7 @@ impl PdnNode {
     ) -> Result<PodRecord, PdnError> {
         let identity = shapes::identity(&identity, "identity")?;
         let pod = shapes::pod(&pod)?;
-        shapes::entry_payload(&payload)?;
+        shapes::entry_payload(kind, &payload)?;
         let runtime = self.runtime()?;
         self.on_node(async move {
             runtime
@@ -383,7 +383,7 @@ impl PdnNode {
         let identity = shapes::identity(&identity, "identity")?;
         let pod = shapes::pod(&pod)?;
         let record = shapes::record(&record)?;
-        shapes::entry_payload(&op)?;
+        shapes::entry_payload(PodRecordKind::MergeableDocument, &op)?;
         let runtime = self.runtime()?;
         self.on_node(async move { runtime.pods().append_op(identity, pod, record, &op).await })
             .await

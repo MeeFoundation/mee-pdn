@@ -18,15 +18,16 @@ mod test_surface;
 pub use error::{PdnError, PodActRefusal};
 pub use node::PdnNode;
 pub use shapes::{
-    PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind, MAX_ENTRY_PAYLOAD,
+    PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind, MAX_DOCUMENT_PAYLOAD,
+    MAX_ENTRY_PAYLOAD,
 };
 
 uniffi::setup_scaffolding!();
 
-/// The ceiling on one record payload, in bytes — the same value
-/// [`MAX_ENTRY_PAYLOAD`] states, reachable from a screen that wants to
-/// refuse before it calls.
+/// The ceiling on one payload of a record of `kind`, in bytes — [`MAX_DOCUMENT_PAYLOAD`] for an
+/// immutable-document, [`MAX_ENTRY_PAYLOAD`] for a claim and for each operation of a
+/// mergeable-document — reachable from a screen that wants to refuse before it calls.
 #[uniffi::export]
-pub fn max_entry_payload() -> u64 {
-    MAX_ENTRY_PAYLOAD
+pub fn max_payload(kind: PodRecordKind) -> u64 {
+    shapes::max_payload(kind)
 }

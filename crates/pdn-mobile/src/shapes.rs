@@ -17,18 +17,21 @@ use crate::error::PdnError;
 /// current instant would overflow.
 const MAX_DURATION_SECS: u64 = 24 * 60 * 60;
 
-/// The ceiling on one record payload or operation. A payload crosses the boundary as one
-/// buffer in memory, and a phone is killed for memory rather than asked to
-/// swap, so an unbounded one ends the process instead of returning an
-/// error. `pdn-node-http` bounds its own at 64 MB for a container; a
-/// device gets a tighter one.
-///
-/// It bounds what this host puts in and not what a read hands back: a
-/// record another member wrote — through a host whose own ceiling is 64
-/// times this one — is in the replica whatever its size, and refusing to
-/// hand it over would make the record unreadable rather than making the
-/// device safer.
+/// The ceiling on one claim's payload and on one operation of a mergeable-document, the first
+/// included: every read of a document reads all its operations again. It bounds what this host
+/// puts in, not what a read hands back (`pdn-mobile/host` spec).
 pub const MAX_ENTRY_PAYLOAD: u64 = 1_048_576;
+
+/// The ceiling on one immutable-document's payload — a file, read only when asked for.
+pub const MAX_DOCUMENT_PAYLOAD: u64 = 104_857_600;
+
+/// The ceiling a payload of `kind` is bounded by; an operation takes its mergeable-document's.
+pub(crate) fn max_payload(kind: PodRecordKind) -> u64 {
+    match kind {
+        PodRecordKind::ImmutableDocument => MAX_DOCUMENT_PAYLOAD,
+        PodRecordKind::Claim | PodRecordKind::MergeableDocument => MAX_ENTRY_PAYLOAD,
+    }
+}
 
 /// A pod member and whether it is an owner.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -187,17 +190,21 @@ pub(crate) fn lifetime(secs: Option<u64>) -> Result<Option<Duration>, PdnError> 
     secs.map(|secs| duration(secs, "lifetime")).transpose()
 }
 
-/// A record payload or operation on its way in: bytes, unchanged, bounded.
-pub(crate) fn entry_payload(payload: &[u8]) -> Result<(), PdnError> {
+/// A payload or operation of a record of `kind` on its way in: bytes, unchanged, bounded.
+pub(crate) fn entry_payload(kind: PodRecordKind, payload: &[u8]) -> Result<(), PdnError> {
     if payload.is_empty() {
         return Err(PdnError::malformed(
             "an empty entry payload, which the engine keeps no entry for",
         ));
     }
-    let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    if len > MAX_ENTRY_PAYLOAD {
+    bounded(kind, u64::try_from(payload.len()).unwrap_or(u64::MAX))
+}
+
+fn bounded(kind: PodRecordKind, len: u64) -> Result<(), PdnError> {
+    let ceiling = max_payload(kind);
+    if len > ceiling {
         return Err(PdnError::malformed(format!(
-            "an entry payload of {len} bytes, above the ceiling of {MAX_ENTRY_PAYLOAD}"
+            "an entry payload of {len} bytes, above the ceiling of {ceiling} for {kind:?}"
         )));
     }
     Ok(())
@@ -226,13 +233,19 @@ mod tests {
         assert!(lifetime(None).unwrap().is_none());
     }
 
-    /// An empty payload and one a byte past `MAX_ENTRY_PAYLOAD` are refused;
-    /// one byte is taken.
+    /// Each kind is bounded by its own ceiling: a claim and an operation a byte past 1 MiB are
+    /// refused where an immutable-document of that size is taken, and an immutable-document a
+    /// byte past 100 MiB is refused too; an empty payload is refused, one byte taken. The lengths
+    /// are checked without allocating them.
     #[test]
-    fn an_empty_payload_and_one_above_the_ceiling_are_refused() {
-        assert!(entry_payload(b"").is_err());
-        assert!(entry_payload(b"a").is_ok());
-        let too_big = vec![0_u8; usize::try_from(MAX_ENTRY_PAYLOAD).unwrap_or(usize::MAX) + 1];
-        assert!(entry_payload(&too_big).is_err());
+    fn each_kind_is_bounded_by_its_own_ceiling() {
+        assert!(entry_payload(PodRecordKind::Claim, b"").is_err());
+        assert!(entry_payload(PodRecordKind::Claim, b"a").is_ok());
+        assert!(bounded(PodRecordKind::Claim, MAX_ENTRY_PAYLOAD).is_ok());
+        assert!(bounded(PodRecordKind::Claim, MAX_ENTRY_PAYLOAD + 1).is_err());
+        assert!(bounded(PodRecordKind::MergeableDocument, MAX_ENTRY_PAYLOAD + 1).is_err());
+        assert!(bounded(PodRecordKind::ImmutableDocument, MAX_ENTRY_PAYLOAD + 1).is_ok());
+        assert!(bounded(PodRecordKind::ImmutableDocument, MAX_DOCUMENT_PAYLOAD).is_ok());
+        assert!(bounded(PodRecordKind::ImmutableDocument, MAX_DOCUMENT_PAYLOAD + 1).is_err());
     }
 }
