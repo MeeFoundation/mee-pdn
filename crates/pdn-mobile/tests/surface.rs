@@ -200,6 +200,137 @@ async fn a_pod_member_reads_its_records_and_an_outsider_reads_nothing() -> Resul
     Ok(())
 }
 
+/// A payload written in pieces reads back on a member's other node in
+/// pieces, as the bytes written; a writer past its kind's ceiling, or
+/// finished with nothing written, places nothing.
+///
+/// Paired denial: an identity that never joined the pod is refused the
+/// placing and a reader of the record.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one scenario, its denials in the same place
+async fn a_payload_written_in_pieces_reads_back_in_pieces() -> Result<()> {
+    let first_device = Device::boot().await?;
+    let joiner = Device::boot().await?;
+    let outsider = Device::boot().await?;
+    let alice = first_device.node.create_identity().await?;
+    let bob = joiner.node.create_identity().await?;
+    let carol = outsider.node.create_identity().await?;
+    let pod = first_device.node.create_pod(alice.clone()).await?;
+
+    let payload: Vec<u8> = std::iter::repeat(0u8..=250)
+        .flatten()
+        .take(5 << 19)
+        .collect();
+    let writer = first_device
+        .node
+        .put_record_streamed(alice.clone(), pod.clone(), PodRecordKind::ImmutableDocument)
+        .await?;
+    for piece in payload.chunks(1 << 20) {
+        writer.write(piece.to_vec()).await?;
+    }
+    let record = writer.finish().await?;
+    let code = first_device
+        .node
+        .mint_pod_invite(alice.clone(), pod.clone(), Some(120))
+        .await?;
+    assert_eq!(joiner.node.join_pod(bob.clone(), code).await?, pod);
+    let arrived = eventually(|| async {
+        Ok(joiner
+            .node
+            .read_record_streamed(bob.clone(), pod.clone(), record.clone())
+            .await
+            .is_ok_and(|reader| reader.is_some()))
+    })
+    .await;
+    assert!(arrived.is_ok(), "the joiner reads the creator's file");
+    let reader = joiner
+        .node
+        .read_record_streamed(bob.clone(), pod.clone(), record.clone())
+        .await?
+        .expect("the payload has arrived");
+    assert_eq!(reader.size(), u64::try_from(payload.len())?);
+    let mut read = Vec::new();
+    loop {
+        let piece = reader.read(300_000).await?;
+        if piece.is_empty() {
+            break;
+        }
+        read.extend_from_slice(&piece);
+    }
+    assert!(
+        read == payload,
+        "the pieces read must be the bytes written: {} bytes of {}",
+        read.len(),
+        payload.len()
+    );
+
+    let writer = first_device
+        .node
+        .put_record_streamed(alice.clone(), pod.clone(), PodRecordKind::Claim)
+        .await?;
+    writer.write(vec![1; 1 << 20]).await?;
+    let refused = writer
+        .write(vec![1])
+        .await
+        .expect_err("a claim a byte past its ceiling must be refused");
+    assert!(
+        matches!(refused, PdnError::MalformedInput { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        writer.finish().await.is_err(),
+        "a refused writer must place nothing"
+    );
+    let writer = first_device
+        .node
+        .put_record_streamed(alice.clone(), pod.clone(), PodRecordKind::Claim)
+        .await?;
+    let refused = writer
+        .finish()
+        .await
+        .expect_err("an empty payload must be refused");
+    assert!(
+        matches!(refused, PdnError::MalformedInput { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        first_device.node.list_records(alice, pod.clone()).await?,
+        std::slice::from_ref(&record)
+    );
+
+    // Denied (outsider).
+    let writer = outsider
+        .node
+        .put_record_streamed(carol.clone(), pod.clone(), PodRecordKind::ImmutableDocument)
+        .await?;
+    let refused = match writer.write(b"a file".to_vec()).await {
+        Err(refused) => refused,
+        Ok(()) => writer
+            .finish()
+            .await
+            .expect_err("an outsider must not place a record"),
+    };
+    assert!(
+        matches!(refused, PdnError::UnknownPod { .. }),
+        "{refused:?}"
+    );
+    let refused = outsider
+        .node
+        .read_record_streamed(carol, pod, record)
+        .await
+        .err()
+        .expect("an outsider must not read the file");
+    assert!(
+        matches!(refused, PdnError::UnknownPod { .. }),
+        "{refused:?}"
+    );
+
+    for device in [first_device, joiner, outsider] {
+        device.node.stop().await?;
+    }
+    Ok(())
+}
+
 /// A code read for the wrong act is refused by the facade as malformed
 /// input before the runtime sees it: each call decodes the runtime type it
 /// consumes, strictly, and neither payload kind decodes as the other.

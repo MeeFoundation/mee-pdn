@@ -14,8 +14,8 @@ use data_layer::{
 };
 use pdn_node::{
     ActRefusal, ActRefused, ForgedJoin, IdentityService as _, JoinInProgress, JoinRefused,
-    JoinTimeout, PodAct, PodInvite, PodMember, PodsService as _, RecordPlacedOnce, Runtime,
-    SpawnOptions, UnknownIdentity, UnknownPod, UnknownRecord, UnsupportedPodInviteVersion,
+    JoinTimeout, PayloadStream, PodAct, PodInvite, PodMember, PodsService as _, RecordPlacedOnce,
+    Runtime, SpawnOptions, UnknownIdentity, UnknownPod, UnknownRecord, UnsupportedPodInviteVersion,
     WrongRecordKind, JOIN_DIALOGUE_TIMEOUT, POD_INVITE_FORMAT_VERSION,
 };
 use pdn_types::{PdnId, PodId, RecordId, RecordKind, RecordRef};
@@ -974,6 +974,135 @@ async fn a_claim_and_an_immutable_document_are_placed_once() -> Result<()> {
     }
     let refused = alice_phone.pods().list_records(erin, pod).await;
     assert!(refused.is_err_and(|err| is::<UnknownPod>(&err)));
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A stream of `chunks`, an error among them ending it there.
+fn stream_of(chunks: Vec<std::io::Result<Vec<u8>>>) -> PayloadStream {
+    Box::pin(futures_lite::stream::iter(
+        chunks
+            .into_iter()
+            .map(|chunk| chunk.map(bytes::Bytes::from)),
+    ))
+}
+
+/// A payload placed from a stream reads on another member's device as the
+/// bytes the stream yielded, whole and through a reader alike, and a stream
+/// that fails partway places nothing. Denied: a co-located identity that is
+/// no member is refused before its stream is read, and opens no reader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_payload_round_trips_and_a_failed_stream_places_nothing() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let erin = bob_phone.identity().create().await?;
+    let pod = pod_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+
+    let payload: Vec<u8> = std::iter::repeat(0u8..=250)
+        .flatten()
+        .take(3 << 20)
+        .collect();
+    let chunks = payload.chunks(1 << 20).map(|chunk| Ok(chunk.to_vec()));
+    let record = bob_phone
+        .pods()
+        .put_record_streamed(
+            bob,
+            pod,
+            RecordKind::ImmutableDocument,
+            stream_of(chunks.collect()),
+        )
+        .await?;
+    assert_eq!(
+        (record.member, record.kind),
+        (bob, RecordKind::ImmutableDocument)
+    );
+    assert!(reads(&alice_phone, alice, pod, record, &payload).await?);
+    let mut reader = alice_phone
+        .pods()
+        .read_streamed(alice, pod, record)
+        .await?
+        .context("the payload has arrived")?;
+    assert_eq!(reader.len(), u64::try_from(payload.len())?);
+    let mut read = Vec::new();
+    loop {
+        let chunk = reader.read(64 << 10).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        read.extend_from_slice(&chunk);
+    }
+    assert!(
+        read == payload,
+        "the reader must yield the bytes placed: {} bytes of {}",
+        read.len(),
+        payload.len()
+    );
+
+    let listed = bob_phone.pods().list_records(bob, pod).await?;
+    let failing = stream_of(vec![
+        Ok(vec![1; 1 << 20]),
+        Ok(vec![2; 1 << 20]),
+        Err(std::io::Error::other("the source failed")),
+    ]);
+    let failed = bob_phone
+        .pods()
+        .put_record_streamed(bob, pod, RecordKind::ImmutableDocument, failing)
+        .await;
+    assert!(failed.is_err(), "a stream that fails must place nothing");
+    assert_eq!(bob_phone.pods().list_records(bob, pod).await?, listed);
+
+    // Denied (outsider): refused before its stream is read.
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&polled);
+    let watched: PayloadStream = Box::pin(futures_lite::stream::poll_fn(move |_| {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(None)
+    }));
+    let refused = bob_phone
+        .pods()
+        .put_record_streamed(erin, pod, RecordKind::ImmutableDocument, watched)
+        .await;
+    assert!(refused.is_err_and(|err| is::<UnknownPod>(&err)));
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "a non-member's stream must not be read"
+    );
+    let refused = bob_phone.pods().read_streamed(erin, pod, record).await;
+    assert!(refused.is_err_and(|err| is::<UnknownPod>(&err)));
+
+    for runtime in [alice_phone, bob_phone] {
+        runtime.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A record placed while a stream of the same identity waits on its host
+/// is written at once: the streamed placing holds no lock of the runtime
+/// while it reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_that_waits_holds_up_no_other_call() -> Result<()> {
+    let (alice_phone, bob_phone) = (memory_runtime().await?, memory_runtime().await?);
+    let alice = alice_phone.identity().create().await?;
+    let bob = bob_phone.identity().create().await?;
+    let pod = pod_of_two(&alice_phone, alice, &bob_phone, bob).await?;
+
+    let waiting: PayloadStream = Box::pin(futures_lite::stream::pending());
+    let pods = bob_phone.pods();
+    let streamed = pods.put_record_streamed(bob, pod, RecordKind::ImmutableDocument, waiting);
+    let placed = pods.put_record(bob, pod, RecordKind::Claim, b"placed meanwhile");
+    let placed = tokio::time::timeout(TIMEOUT, async {
+        tokio::select! {
+            placed = placed => placed,
+            streamed = streamed => anyhow::bail!("a stream that never ends placed {streamed:?}"),
+        }
+    })
+    .await
+    .context("a placing waited on the stream of another")??;
+    assert!(reads(&alice_phone, alice, pod, placed, b"placed meanwhile").await?);
 
     for runtime in [alice_phone, bob_phone] {
         runtime.shutdown().await?;

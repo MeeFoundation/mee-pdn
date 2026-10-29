@@ -28,8 +28,8 @@ pub use ceremony::InviterUnreachable;
 #[cfg(target_os = "android")]
 pub use data_layer::install_android_jni_context;
 pub use data_layer::{
-    CatchUpTimeout, Connectivity, DirectoryHeld, OpId, Operation, PodStore, SpawnOptions,
-    StorageConfig, UnknownEntry, UnknownPod,
+    CatchUpTimeout, Connectivity, DirectoryHeld, OpId, Operation, PayloadReader, PayloadStream,
+    PodStore, SpawnOptions, StorageConfig, UnknownEntry, UnknownPod,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{

@@ -193,14 +193,16 @@ pub(crate) fn lifetime(secs: Option<u64>) -> Result<Option<Duration>, PdnError> 
 /// A payload or operation of a record of `kind` on its way in: bytes, unchanged, bounded.
 pub(crate) fn entry_payload(kind: PodRecordKind, payload: &[u8]) -> Result<(), PdnError> {
     if payload.is_empty() {
-        return Err(PdnError::malformed(
-            "an empty entry payload, which the engine keeps no entry for",
-        ));
+        return Err(empty_payload());
     }
     bounded(kind, u64::try_from(payload.len()).unwrap_or(u64::MAX))
 }
 
-fn bounded(kind: PodRecordKind, len: u64) -> Result<(), PdnError> {
+pub(crate) fn empty_payload() -> PdnError {
+    PdnError::malformed("an empty entry payload, which the engine keeps no entry for")
+}
+
+pub(crate) fn bounded(kind: PodRecordKind, len: u64) -> Result<(), PdnError> {
     let ceiling = max_payload(kind);
     if len > ceiling {
         return Err(PdnError::malformed(format!(
