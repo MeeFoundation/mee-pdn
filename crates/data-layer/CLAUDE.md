@@ -17,7 +17,7 @@ Storage is a required choice of every spawn (`SpawnOptions::storage`): memory by
   node.key                  the endpoint's secret key: the node id survives a restart
   lock                      the running node's exclusive hold; a second node on the directory is refused as DirectoryHeld
   peers                     the address book: the last addresses of every peer a replica syncs with or names, handed to the endpoint at the next start
-  blobs/                    payload bytes, one store for the node
+  blobs/                    payload bytes, one store for the node; its temp/ emptied at every start (iroh-blobs-010)
   identities/<identity>/    one identity's half of the node
     docs.redb               its replica store
     default-author          the one author its writes carry

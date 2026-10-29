@@ -3190,6 +3190,7 @@ async fn open_blob_store(
         StorageConfig::Directory(directory) => {
             let root = directory.join(BLOBS_DIR);
             let mut store_options = iroh_blobs::store::fs::options::Options::new(&root);
+            remove_import_leftovers(store_options.path.temp_path.clone()).await;
             let opened = Arc::new(std::sync::OnceLock::new());
             store_options.gc = Some(GcConfig {
                 interval: options.blob_collection_interval.min(BLOB_COLLECTION_TICK),
@@ -3216,6 +3217,36 @@ async fn open_blob_store(
             store
         }
     })
+}
+
+/// Empties the blob store's temp directory before the store opens, under
+/// the directory lock, so no import is under way (iroh-blobs-010). A file
+/// that stays is warned about; the spawn goes on.
+async fn remove_import_leftovers(temp: std::path::PathBuf) {
+    let removed = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(&temp) {
+            Ok(entries) => entries,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(cause) => return Err(cause),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if let Err(cause) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), %cause, "an import's leftover stays in the blob store");
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match removed {
+        Ok(Ok(())) => {}
+        Ok(Err(cause)) => {
+            tracing::warn!(%cause, "the blob store's leftover imports could not be listed");
+        }
+        Err(cause) => {
+            tracing::warn!(%cause, "the blob store's leftover imports could not be removed");
+        }
+    }
 }
 
 /// Blob collection's protect callback: every payload a replica of an
