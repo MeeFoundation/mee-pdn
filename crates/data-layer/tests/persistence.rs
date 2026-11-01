@@ -488,6 +488,78 @@ async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
     Ok(())
 }
 
+/// What an import the blob store failed to finish left behind is gone after
+/// the next start (iroh-blobs-010). The source fails after two chunks: the
+/// store reads two ahead before its temp file opens, so a source failing
+/// sooner leaves none. Denied: a payload the store holds is no leftover,
+/// and reads back after the start.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_cut_short_leaves_nothing_after_a_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = node_on(dir.path()).await?;
+    let (alice, pms) = c::host(&first).await?;
+    let pms_namespace = pms.namespace();
+    let pod = c::create(&first, &alice).await?;
+    let key = RecordKey::ImmutableDocument {
+        member: alice.id,
+        id: RecordId::from_bytes([0x02; 16]),
+        mseq: Seq::FIRST,
+    };
+    let payload = vec![0x5a; 1 << 20];
+    first
+        .write_pod_entry(alice.id, pod, PodStore::Records, &key.to_bytes(), &payload)
+        .await?;
+    let tickets = c::tickets(&first, &alice, pod).await?;
+    first.shutdown().await?;
+    drop(pms);
+    drop(first);
+
+    let blobs = dir.path().join("blobs");
+    let store = iroh_blobs::store::fs::FsStore::load(&blobs).await?;
+    let chunk = || Ok(vec![0xa5; 1 << 20].into());
+    let source = futures_lite::stream::iter([
+        chunk(),
+        chunk(),
+        Err(std::io::Error::other("the source failed")),
+    ]);
+    assert!(
+        store.add_stream(source).await.temp_tag().await.is_err(),
+        "an import whose source fails must fail"
+    );
+    store.shutdown().await?;
+    drop(store);
+    let leftovers = || -> std::io::Result<Vec<std::path::PathBuf>> {
+        std::fs::read_dir(blobs.join("temp"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    };
+    // Sentinel: the failed import left its file behind.
+    assert_ne!(leftovers()?, Vec::<std::path::PathBuf>::new());
+
+    let second = node_on(dir.path()).await?;
+    assert_eq!(
+        leftovers()?,
+        Vec::<std::path::PathBuf>::new(),
+        "the start must remove what the failed import left"
+    );
+
+    // Denied (a held payload).
+    second.provision_identity(alice.id).await?;
+    let reopened = PrivateMetadataStore::open(&second, alice.id, pms_namespace)
+        .await?
+        .expect("the respawned store must still hold the PMS replica");
+    second.host_identity(alice.id, &reopened)?;
+    second.import_pod(alice.id, pod, tickets).await?;
+    let read = second.read_pod_record(alice.id, pod, &key.record()).await?;
+    assert!(
+        read.as_deref() == Some(payload.as_slice()),
+        "the payload the store held must read back whole, read {:?} bytes",
+        read.map(|read| read.len())
+    );
+    second.shutdown().await?;
+    Ok(())
+}
+
 /// A device record rewritten after a restart replaces its predecessor
 /// instead of accreting beside it under a second author: the PMS
 /// writes with its identity's one author — the half a store that minted

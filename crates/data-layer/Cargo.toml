@@ -19,6 +19,8 @@ test-util = ["pdn-store/observation"]
 [dependencies]
 anyhow = "1"
 blake3 = "1.8"
+# A streamed payload's pieces, as iroh-blobs takes them.
+bytes = "1"
 futures-core = "0.3"
 futures-lite = "2"
 serde = { version = "1", features = ["derive"] }
@@ -37,7 +39,7 @@ rand = "0.10"
 # when a spawn's store open fails (`DirectoryHeld`).
 redb = "4.1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
 # The blob protocol's stream tasks, tracked so a stop waits for them before
 # it closes the blob store.
 tokio-util = { version = "0.7", features = ["rt"] }

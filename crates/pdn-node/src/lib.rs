@@ -24,12 +24,12 @@ pub use pods::{
     JOIN_DIALOGUE_TIMEOUT, LEAVE_FLUSH_TIMEOUT, POD_INVITE_FORMAT_VERSION,
 };
 // Vocabulary re-exports, so hosts depend on `pdn-node` alone.
-pub use ceremony::InviterUnreachable;
+pub use ceremony::{InviteState, InviterUnreachable};
 #[cfg(target_os = "android")]
 pub use data_layer::install_android_jni_context;
 pub use data_layer::{
-    CatchUpTimeout, Connectivity, DirectoryHeld, OpId, Operation, PodStore, SpawnOptions,
-    StorageConfig, UnknownEntry, UnknownPod,
+    CatchUpTimeout, Connectivity, DirectoryHeld, OpId, Operation, PayloadReader, PayloadStream,
+    PodStore, SpawnOptions, StorageConfig, UnknownEntry, UnknownPod,
 };
 pub use identity::{IdentityService, RuntimeIdentityService};
 pub use linking::{

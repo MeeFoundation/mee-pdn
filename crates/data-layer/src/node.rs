@@ -43,6 +43,7 @@ use tokio_util::task::TaskTracker;
 use crate::{
     access::{session_access_provider, AccessBook},
     address_book::{AddressBook, ADDRESS_BOOK_INTERVAL},
+    payload::{ImportedPayload, PayloadReader, PayloadStream},
     pod::{
         record_entries, record_prefix, unknown_entries, CreatedPayload, EventKind, Member,
         MemberDevice, MembershipKey, MembershipView, Operation, PodCatchUp, PodHolding, PodNotice,
@@ -2183,6 +2184,25 @@ impl SyncNode {
         Ok(Some(self.blobs.get_bytes(hash).await?.to_vec()))
     }
 
+    /// [`read_pod_record`](Self::read_pod_record) as a reader, the payload
+    /// held against collection while it lives.
+    pub async fn read_pod_record_streamed(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        record: &RecordRef,
+    ) -> Result<Option<PayloadReader>> {
+        let view = self.pod_record_view_of(identity, pod, record).await?;
+        let Some((hash, len)) = view
+            .placed(record)
+            .and_then(|entry| Some((entry.payload?, entry.len)))
+        else {
+            return Ok(None);
+        };
+        let held = self.blobs.tags().temp_tag(hash).await?;
+        Ok(Some(PayloadReader::new(self.blobs.reader(hash), len, held)))
+    }
+
     /// A mergeable-document's operations that read, in the order of their
     /// ids.
     pub async fn read_pod_operations(
@@ -2262,6 +2282,36 @@ impl SyncNode {
                 derive_pod_contacts(&stack, self.router.endpoint().id(), pod, &held, &[]).await;
             }
         }
+        Ok(())
+    }
+
+    /// What `payload` yields, whole in the blob store and held there for
+    /// [`write_pod_record_imported`](Self::write_pod_record_imported); an
+    /// error the stream yields fails the import, and no entry names what it
+    /// left (iroh-blobs-010).
+    pub async fn import_payload(&self, payload: PayloadStream) -> Result<ImportedPayload> {
+        let tag = self.blobs.add_stream(payload).await.temp_tag().await?;
+        let len = match self.blobs.status(tag.hash()).await? {
+            iroh_blobs::api::proto::BlobStatus::Complete { size } => size,
+            status => anyhow::bail!("an imported payload reads as {status:?}"),
+        };
+        Ok(ImportedPayload { tag, len })
+    }
+
+    /// [`write_pod_entry`](Self::write_pod_entry) into `pod`'s record store
+    /// of a payload [`import_payload`](Self::import_payload) holds, landing
+    /// in the stores' write batches as that call's record-store write does.
+    pub async fn write_pod_record_imported(
+        &self,
+        identity: PdnId,
+        pod: PodId,
+        key: &[u8],
+        payload: ImportedPayload,
+    ) -> Result<()> {
+        let stack = self.require(identity)?;
+        let doc = Self::pod_doc(&stack, pod, PodStore::Records)?;
+        doc.set_imported(stack.author, key.to_vec(), payload.tag, payload.len)
+            .await?;
         Ok(())
     }
 
@@ -3190,6 +3240,7 @@ async fn open_blob_store(
         StorageConfig::Directory(directory) => {
             let root = directory.join(BLOBS_DIR);
             let mut store_options = iroh_blobs::store::fs::options::Options::new(&root);
+            remove_import_leftovers(store_options.path.temp_path.clone()).await;
             let opened = Arc::new(std::sync::OnceLock::new());
             store_options.gc = Some(GcConfig {
                 interval: options.blob_collection_interval.min(BLOB_COLLECTION_TICK),
@@ -3216,6 +3267,36 @@ async fn open_blob_store(
             store
         }
     })
+}
+
+/// Empties the blob store's temp directory before the store opens, under
+/// the directory lock, so no import is under way (iroh-blobs-010). A file
+/// that stays is warned about; the spawn goes on.
+async fn remove_import_leftovers(temp: std::path::PathBuf) {
+    let removed = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(&temp) {
+            Ok(entries) => entries,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(cause) => return Err(cause),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if let Err(cause) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), %cause, "an import's leftover stays in the blob store");
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match removed {
+        Ok(Ok(())) => {}
+        Ok(Err(cause)) => {
+            tracing::warn!(%cause, "the blob store's leftover imports could not be listed");
+        }
+        Err(cause) => {
+            tracing::warn!(%cause, "the blob store's leftover imports could not be removed");
+        }
+    }
 }
 
 /// Blob collection's protect callback: every payload a replica of an

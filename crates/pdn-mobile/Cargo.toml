@@ -43,6 +43,9 @@ axum = { version = "0.8", features = ["json"], optional = true }
 # The textual form of a ceremony payload: the runtime type's own serde bytes
 # in an alphabet a code renders and a scan recovers.
 base64 = "0.23"
+# A streamed payload's pieces, as the runtime takes them.
+bytes = "1"
+futures-core = "0.3"
 pdn-node = { path = "../pdn-node" }
 # Only the test build links the laptop host, for its router: what ships keeps
 # its host dependency pointing toward the runtime alone.

@@ -239,10 +239,18 @@ fn debug_routes() -> Router<Arc<Runtime>> {
         )
         .route("/debug/link", post(identity::link))
         .route(
+            "/debug/linking-invite-state",
+            post(identity::linking_invite_state),
+        )
+        .route(
             "/debug/identities/{identity}/pods",
             post(pods::create).get(pods::list),
         )
         .route("/debug/identities/{identity}/pods/join", post(pods::join))
+        .route(
+            "/debug/identities/{identity}/pods/invite-state",
+            post(pods::invite_state),
+        )
         .route(
             "/debug/identities/{identity}/pods/{pod}/members",
             get(pods::members),

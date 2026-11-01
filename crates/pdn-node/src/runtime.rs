@@ -145,11 +145,11 @@ pub(crate) struct State {
     /// Exactly the identities created or linked here.
     pub(crate) identities: HashMap<PdnId, HostedIdentity>,
     /// In memory on purpose: an invite does not survive a restart.
-    pub(crate) pending_linking_invites: PendingInvites,
+    pub(crate) pending_linking_invites: PendingInvites<PdnId, NodeId>,
     /// The pod join dialogue's, each secret minted for an identity and a
     /// pod. Separate from linking's: a secret minted for one ceremony must
     /// never verify in the other.
-    pub(crate) pending_pod_invites: PendingInvites<(PdnId, pdn_types::PodId)>,
+    pub(crate) pending_pod_invites: PendingInvites<(PdnId, pdn_types::PodId), PdnId>,
     /// Keyed by `(joining identity, pod)`.
     pub(crate) joining_in_flight: HashSet<(PdnId, pdn_types::PodId)>,
     /// Reserved in the same lock scope as the already-hosted check, so a

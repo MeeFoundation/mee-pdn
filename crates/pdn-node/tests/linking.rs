@@ -15,9 +15,9 @@ use data_layer::{
     DocTicket, PodStore, PrivateMetadataStore, ProtocolHandler, SyncNode,
 };
 use pdn_node::{
-    DialogueTimeout, IdentityService as _, InviterUnreachable, LinkingLocalFailure, LinkingPayload,
-    LinkingRefused, PodsService as _, Runtime, SpawnOptions, SyncService as _, UnknownIdentity,
-    UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
+    DialogueTimeout, IdentityService as _, InviteState, InviterUnreachable, LinkingLocalFailure,
+    LinkingPayload, LinkingRefused, PodsService as _, Runtime, SpawnOptions, SyncService as _,
+    UnknownIdentity, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
 };
 use pdn_types::{NodeId, PdnId, PodId};
 use test_utils::{eventually, ids, memory_node, wait_devices, TIMEOUT};
@@ -173,6 +173,80 @@ async fn linking_completes_and_brings_up_the_full_store_set() -> Result<()> {
     Ok(())
 }
 
+/// Whether `inviter` reads `payload` used by `newcomer` within the bound:
+/// the mark follows the inviter's reply, which the link's own return may
+/// precede.
+async fn reads_used(inviter: &Runtime, payload: &LinkingPayload, newcomer: NodeId) -> Result<bool> {
+    eventually(|| async {
+        Ok(inviter.identity().linking_invite_state(payload).await? == InviteState::Used(newcomer))
+    })
+    .await
+}
+
+/// A served linking marks its invite used by the newcomer's node id, the
+/// one the inviter registered, and the invite read pending before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_linking_marks_the_invite_used_by_the_newcomer() -> Result<()> {
+    let rt_a = memory_runtime().await?;
+    let rt_b = memory_runtime().await?;
+    let x = rt_a.identity().create().await?;
+    let payload = rt_a.identity().linking_invite(x, None).await?;
+    assert_eq!(
+        rt_a.identity().linking_invite_state(&payload).await?,
+        InviteState::Pending
+    );
+
+    rt_b.identity().link(payload.clone(), TIMEOUT).await?;
+    assert!(
+        reads_used(&rt_a, &payload, rt_b.node_id()).await?,
+        "the served linking invite never read used by the newcomer"
+    );
+
+    rt_a.shutdown().await?;
+    rt_b.shutdown().await?;
+    Ok(())
+}
+
+/// A linking invite never presented reads expired once its lifetime ended
+/// and unknown once a further invite swept it, and a used one reads unknown
+/// after the inviter restarted on its directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linking_invite_expires_and_a_restart_forgets_every_linking_invite() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let rt_a = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    let rt_b = memory_runtime().await?;
+    let x = rt_a.identity().create().await?;
+
+    let brief = rt_a
+        .identity()
+        .linking_invite(x, Some(Duration::from_secs(1)))
+        .await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        rt_a.identity().linking_invite_state(&brief).await?,
+        InviteState::Expired
+    );
+    let used = rt_a.identity().linking_invite(x, None).await?;
+    assert_eq!(
+        rt_a.identity().linking_invite_state(&brief).await?,
+        InviteState::Unknown
+    );
+    rt_b.identity().link(used.clone(), TIMEOUT).await?;
+    assert!(reads_used(&rt_a, &used, rt_b.node_id()).await?);
+
+    rt_a.shutdown().await?;
+    drop(rt_a);
+    let rt_a = Runtime::spawn(SpawnOptions::on_directory(dir.path())).await?;
+    assert_eq!(
+        rt_a.identity().linking_invite_state(&used).await?,
+        InviteState::Unknown
+    );
+
+    rt_a.shutdown().await?;
+    rt_b.shutdown().await?;
+    Ok(())
+}
+
 /// The pods `runtime` lists for `identity`.
 async fn pod_ids(runtime: &Runtime, identity: PdnId) -> Result<Vec<PodId>> {
     Ok(runtime
@@ -263,7 +337,8 @@ async fn linking_through_a_linked_device() -> Result<()> {
 
 /// The refusal pairs of the verify-and-burn requirement, each probed for no
 /// observable state on either side: expired; an invite for an unhosted
-/// identity; wrong (burns nothing); a live pod invite's secret (burns
+/// identity; wrong (burns nothing, the live invite reading pending); a live
+/// pod invite's secret (burns
 /// nothing of the pod invite); unknown payload version (refused before
 /// dialing, typed); a replay after a completed link. Already-hosted has its
 /// own test below.
@@ -327,6 +402,10 @@ async fn refusals_are_uniform_and_leave_no_state() -> Result<()> {
         "a never-minted secret must be refused"
     );
     assert_eq!(rt_c.sync().hosted_identities().await?, vec![]);
+    assert_eq!(
+        rt_a.identity().linking_invite_state(&live).await?,
+        InviteState::Pending
+    );
     assert_pms_is(&probe_pms, &baseline_devices, &baseline_kinds).await?;
 
     // ...and so is a live pod invite's secret, which the linking dialogue
@@ -915,7 +994,8 @@ async fn retry_after_cancellation_cannot_be_undone_by_old_cleanup() -> Result<()
 /// An inviter whose pending-device write fails after the secret is burnt
 /// refuses the dialer, reports the failure locally as
 /// `LinkingLocalFailure::PendingDeviceWrite`, refuses the replay too, and
-/// leaves the newcomer neither pending nor a device.
+/// leaves the newcomer neither pending nor a device, the invite reading
+/// burned throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothing() -> Result<()> {
     let inviter = memory_runtime().await?;
@@ -936,11 +1016,19 @@ async fn pending_write_failure_after_burn_is_locally_observable_and_grants_nothi
         failures.recv().await?,
         LinkingLocalFailure::PendingDeviceWrite { identity, newcomer }
     );
-    let replay = dialer.identity().link(payload, TIMEOUT).await;
+    assert_eq!(
+        inviter.identity().linking_invite_state(&payload).await?,
+        InviteState::Burned
+    );
+    let replay = dialer.identity().link(payload.clone(), TIMEOUT).await;
     assert!(replay
         .unwrap_err()
         .downcast_ref::<LinkingRefused>()
         .is_some());
+    assert_eq!(
+        inviter.identity().linking_invite_state(&payload).await?,
+        InviteState::Burned
+    );
     assert!(!pms.list_pending_devices().await?.contains(&newcomer));
     assert!(!pms.list_devices().await?.contains(&newcomer));
 

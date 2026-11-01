@@ -1087,6 +1087,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
  "futures-core",
  "futures-lite",
  "iroh",
@@ -3491,6 +3492,8 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "bytes",
+ "futures-core",
  "jni 0.22.4",
  "libc",
  "pdn-node",
@@ -3515,6 +3518,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "bytes",
  "data-layer",
  "futures-lite",
  "pdn-types",

@@ -8,10 +8,10 @@ use std::{
 
 use anyhow::Result;
 use data_layer::{IdentityKeyPair, PrivateMetadataStore};
-use pdn_types::PdnId;
+use pdn_types::{NodeId, PdnId};
 
 use crate::{
-    ceremony::DEFAULT_INVITE_LIFETIME,
+    ceremony::{InviteState, DEFAULT_INVITE_LIFETIME},
     linking::{
         link_via_dialogue, LinkingPayload, UnsupportedLinkingVersion, LINKING_FORMAT_VERSION,
     },
@@ -135,6 +135,10 @@ pub trait IdentityService {
     /// version and an identity already hosted here are refused before
     /// dialing.
     async fn link(&self, payload: LinkingPayload, timeout: Duration) -> Result<()>;
+
+    /// What became of a linking invite this runtime minted, for the
+    /// identity the payload names (device-linking spec); writes nothing.
+    async fn linking_invite_state(&self, payload: &LinkingPayload) -> Result<InviteState<NodeId>>;
 }
 
 /// The production [`IdentityService`].
@@ -250,6 +254,13 @@ impl IdentityService for RuntimeIdentityService<'_> {
             secret,
             identity,
         })
+    }
+
+    async fn linking_invite_state(&self, payload: &LinkingPayload) -> Result<InviteState<NodeId>> {
+        let state = self.runtime.state.lock().await;
+        Ok(state
+            .pending_linking_invites
+            .state(&payload.secret, payload.identity, Instant::now()))
     }
 
     async fn link(&self, payload: LinkingPayload, timeout: Duration) -> Result<()> {

@@ -15,6 +15,7 @@ mod address_book;
 mod identity_key;
 pub mod node;
 mod path_selector;
+mod payload;
 mod pod;
 pub mod private_metadata;
 mod registry;
@@ -61,6 +62,7 @@ pub use node::{
     PodFlush, PodPassDraw, RecordedHosting, SpawnOptions, StorageConfig, SyncNode,
     UntrackedNamespace, BUILT_IN_ALPNS, DEFAULT_REPLICA_CACHE_BUDGET_BYTES,
 };
+pub use payload::{ImportedPayload, PayloadReader, PayloadStream};
 // pdn-store vocabulary of the share and import flows, so downstream crates
 // need no direct dependency on the fork.
 pub use pdn_store::{api::AddrInfoOptions, AuthorId, Contact, DocTicket, Identity, NamespaceId};

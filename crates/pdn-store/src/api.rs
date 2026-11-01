@@ -286,6 +286,29 @@ impl Doc {
         Ok(hash)
     }
 
+    /// [`Doc::set_bytes`] for a payload of `len` bytes already in the blob
+    /// store, `tag` holding it until its entry is in, as `set_bytes` holds
+    /// its own.
+    pub async fn set_imported(
+        &self,
+        author_id: AuthorId,
+        key: impl Into<Bytes>,
+        tag: iroh_blobs::api::TempTag,
+        len: u64,
+    ) -> Result<Hash> {
+        let engine = self.engine()?;
+        let hash = tag.hash();
+        let _held = HeldOnDrop {
+            engine: &engine,
+            tag: Some(tag),
+        };
+        engine
+            .sync
+            .insert_local(self.namespace_id, author_id, key.into(), hash, len)
+            .await?;
+        Ok(hash)
+    }
+
     /// Deletes `author_id`'s entry at `key` by writing an empty entry there;
     /// no other key is touched.
     ///

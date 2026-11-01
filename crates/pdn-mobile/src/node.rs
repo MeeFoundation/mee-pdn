@@ -30,7 +30,10 @@ use pdn_node::{
 use crate::{
     error::{self, PdnError},
     payload,
-    shapes::{self, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind},
+    shapes::{
+        self, InviteState, PodMemberInfo, PodMembershipAct, PodOperation, PodRecord, PodRecordKind,
+    },
+    streams::{self, RecordReader, RecordWriter},
 };
 
 /// What a handle holds. `ComingUp` is a state of its own so 2 concurrent
@@ -251,6 +254,16 @@ impl PdnNode {
         payload::encode(&minted)
     }
 
+    /// What became of a linking payload this node minted (device-linking
+    /// spec); `Used` names the newcomer's node id. Writes nothing.
+    pub async fn linking_payload_state(&self, code: String) -> Result<InviteState, PdnError> {
+        let payload: LinkingPayload = payload::decode(&code)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.identity().linking_invite_state(&payload).await })
+            .await
+            .map(InviteState::from)
+    }
+
     /// Join the identity a linking payload names, as a device of it.
     ///
     /// `budget_secs` bounds the whole act: the dialogue spends from it
@@ -322,6 +335,21 @@ impl PdnNode {
         payload::encode(&minted)
     }
 
+    /// What became of a pod invite this node minted for `identity` (pods
+    /// spec); `Used` names the joiner. Writes nothing.
+    pub async fn pod_invite_state(
+        &self,
+        identity: String,
+        code: String,
+    ) -> Result<InviteState, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let invite: PodInvite = payload::decode(&code)?;
+        let runtime = self.runtime()?;
+        self.on_node(async move { runtime.pods().invite_state(identity, &invite).await })
+            .await
+            .map(InviteState::from)
+    }
+
     /// Join the pod an invitation names, as a plain member. Answers once
     /// both stores caught up; [`PdnError::CatchUpTimedOut`] leaves the pod
     /// recorded, its catch-up continuing.
@@ -359,7 +387,7 @@ impl PdnNode {
     ) -> Result<PodRecord, PdnError> {
         let identity = shapes::identity(&identity, "identity")?;
         let pod = shapes::pod(&pod)?;
-        shapes::entry_payload(&payload)?;
+        shapes::entry_payload(kind, &payload)?;
         let runtime = self.runtime()?;
         self.on_node(async move {
             runtime
@@ -383,7 +411,7 @@ impl PdnNode {
         let identity = shapes::identity(&identity, "identity")?;
         let pod = shapes::pod(&pod)?;
         let record = shapes::record(&record)?;
-        shapes::entry_payload(&op)?;
+        shapes::entry_payload(PodRecordKind::MergeableDocument, &op)?;
         let runtime = self.runtime()?;
         self.on_node(async move { runtime.pods().append_op(identity, pod, record, &op).await })
             .await
@@ -403,6 +431,46 @@ impl PdnNode {
         let runtime = self.runtime()?;
         self.on_node(async move { runtime.pods().read(identity, pod, record).await })
             .await
+    }
+
+    /// Place a record whose payload the host writes in pieces; the writer's
+    /// `finish` answers the record, and nothing is placed before it.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // asynchronous as every exported call is; it starts the placing
+    pub async fn put_record_streamed(
+        &self,
+        identity: String,
+        pod: String,
+        kind: PodRecordKind,
+    ) -> Result<Arc<RecordWriter>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let runtime = self.runtime()?;
+        let (pieces, payload) = streams::pieces();
+        let placing = self.handle()?.spawn(async move {
+            runtime
+                .pods()
+                .put_record_streamed(identity, pod, kind.into(), payload)
+                .await
+        });
+        Ok(Arc::new(RecordWriter::new(kind, pieces, placing)))
+    }
+
+    /// `read_record` as a reader, `None` as `read_record` answers it.
+    pub async fn read_record_streamed(
+        &self,
+        identity: String,
+        pod: String,
+        record: PodRecord,
+    ) -> Result<Option<Arc<RecordReader>>, PdnError> {
+        let identity = shapes::identity(&identity, "identity")?;
+        let pod = shapes::pod(&pod)?;
+        let record = shapes::record(&record)?;
+        let runtime = self.runtime()?;
+        let tokio = self.handle()?;
+        let reader = self
+            .on_node(async move { runtime.pods().read_streamed(identity, pod, record).await })
+            .await?;
+        Ok(reader.map(|reader| Arc::new(RecordReader::new(reader, tokio))))
     }
 
     /// A mergeable-document's operations in the order of their ids, each
@@ -527,6 +595,19 @@ impl PdnNode {
             }
             State::ComingUp(_) | State::Up(_) => Err(PdnError::NodeAlreadyUp),
         }
+    }
+
+    /// The facade's asynchronous runtime, for work a writer or a reader
+    /// hands it after the call that made them.
+    fn handle(&self) -> Result<tokio::runtime::Handle, PdnError> {
+        let tokio = self.tokio.lock().map_err(|_| {
+            tracing::error!("the facade's runtime lock is poisoned");
+            PdnError::Internal
+        })?;
+        tokio
+            .as_ref()
+            .map(|tokio| tokio.handle().clone())
+            .ok_or(PdnError::Internal)
     }
 
     /// The node an exported call acts on.

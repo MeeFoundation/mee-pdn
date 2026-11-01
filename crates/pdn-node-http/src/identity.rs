@@ -14,7 +14,7 @@ use pdn_node::{IdentityService as _, LinkingPayload, Runtime, SyncService as _};
 use crate::{
     error::HostError,
     parse,
-    shapes::{CreatedIdentity, HostedIdentities, Lifetime, LinkBudget, NoQuery},
+    shapes::{CreatedIdentity, HostedIdentities, InviteState, Lifetime, LinkBudget, NoQuery},
 };
 
 /// `POST /debug/identities`.
@@ -49,6 +49,18 @@ pub(crate) async fn linking_invite(
         .linking_invite(identity, lifetime.as_duration()?)
         .await?;
     Ok(Json(payload))
+}
+
+/// `POST /debug/linking-invite-state` — the payload as the link route
+/// takes it, naming the identity it was minted for.
+pub(crate) async fn linking_invite_state(
+    State(runtime): State<Arc<Runtime>>,
+    Query(NoQuery {}): Query<NoQuery>,
+    body: Bytes,
+) -> Result<Json<InviteState>, HostError> {
+    let payload: LinkingPayload = parse::json(&body, "linking payload")?;
+    let state = runtime.identity().linking_invite_state(&payload).await?;
+    Ok(Json(state.into()))
 }
 
 /// `POST /debug/link` — addressed to no hosted identity, since the payload
