@@ -46,6 +46,10 @@ jobs:
       - name: Check the tree against deny.toml
         run: cargo deny check
 
+      # The KERI crates' fuzz targets are a workspace of their own.
+      - name: Check the fuzz tree against deny.toml
+        run: cargo deny --manifest-path crates/kerita/fuzz/Cargo.toml check
+
   # Every test of the HTTP surface is a container test, so this job needs the
   # daemon and builds the pdn-node-http image itself.
   docker-tests:
@@ -84,6 +88,58 @@ jobs:
         with:
           name: stand-hunt
           path: target/tmp/stand-hunt-*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The KERI crates against keripy at the commit their oracle pins: the corpora
+  # regenerated and kerita's own KELs folded in keripy, a difference from the
+  # committed corpora failing the night, then the crates against the corpora.
+  # The pin moves only by a change that commits the corpora regenerated with
+  # it. Then each fuzz target for a fixed time, a crashing input kept.
+  keri-oracle:
+    name: KERI oracle and fuzzing
+    needs: dependency-audit
+    runs-on: ubuntu-26.04
+    # Two image builds' worth of keripy, a test run, and four targets of ten
+    # minutes each.
+    timeout-minutes: 90
+    env:
+      # Pinned, so a fuzzer's finding reproduces on the compiler that made it.
+      FUZZ_TOOLCHAIN: nightly-2026-07-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+
+      - name: Install just, nextest and cargo-fuzz
+        uses: ./.github/actions/install-tools
+        with:
+          tools: just cargo-nextest cargo-fuzz
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: . -> target
+
+      - name: Regenerate the corpora and fold kerita's KELs in keripy
+        run: just keri-check
+
+      - name: Check the crates against the corpora
+        run: just test -p kerita -p kerita-cesr
+
+      - name: Fuzz each target
+        run: just keri-fuzz 600
+
+      - name: Keep what a crash needs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: keri-fuzz
+          path: crates/kerita/fuzz/artifacts
           if-no-files-found: ignore
           retention-days: 14
 

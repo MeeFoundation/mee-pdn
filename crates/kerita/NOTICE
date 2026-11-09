@@ -1,0 +1,18 @@
+kerita
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This crate contains material from the following projects.
+
+keripy — https://github.com/WebOfTrust/keripy
+  Copyright the keripy contributors (WebOfTrust).
+  Licensed under the Apache License, Version 2.0.
+  Used for: test cases, copied verbatim or replayed through keripy, under
+  tests/corpus/. Each case names the keripy commit and the test it came from.
+
+cesr-rs — https://github.com/devrandom-labs/cesr
+  Copyright (c) Joel DSouza.
+  Licensed under either of the Apache License, Version 2.0 or the MIT license;
+  taken here under the Apache License, Version 2.0.
+  Used for: the corpora under oracle/cesr-rs/, copied verbatim at the commit
+  CESR_RS_PIN names, from which the oracle admits into kerita-cesr's corpus the
+  vectors keripy reproduces.

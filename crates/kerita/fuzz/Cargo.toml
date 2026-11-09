@@ -1,0 +1,46 @@
+# The fuzz targets of kerita and kerita-cesr, a workspace of their own: cargo-fuzz builds them on a nightly
+# toolchain, which the workspace's own build never sees.
+[package]
+name = "kerita-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kerita = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "primitive"
+path = "fuzz_targets/primitive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attachments"
+path = "fuzz_targets/attachments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event"
+path = "fuzz_targets/event.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream"
+path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false

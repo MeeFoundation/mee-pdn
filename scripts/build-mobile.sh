@@ -37,3 +37,6 @@ case "$target" in
   *) echo "not a mobile target: $target"; exit 1 ;;
 esac
 cargo rustc -p pdn-mobile --release --target "$target" ${features:+--features "$features"} --crate-type "$kind"
+# The KERI crates run on the phones before the facade embeds them; `blake3`
+# compiles C for the target, so they are built here, with the target's compiler.
+cargo build -p kerita --release --target "$target"

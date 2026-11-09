@@ -1,0 +1,20 @@
+[package]
+name = "kerita"
+version = "0.1.0"
+edition = "2024"
+description = "A subset of KERI 2.00: events in native CESR, read, written and folded into key state"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+blake3 = { version = "1.8.3", default-features = false }
+kerita-cesr = { path = "../kerita-cesr" }
+
+[dev-dependencies]
+ed25519-dalek = { version = "3", features = ["signature"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
+proptest = "1.10.0"
+serde_json = "1"
+
+[lints]
+workspace = true
