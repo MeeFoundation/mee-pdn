@@ -1,7 +1,10 @@
-//! The CESR 2.00 primitives a subset of KERI reads, in the text domain: keys, digests, plain and
-//! indexed signatures, numbers, count codes and the genus-version code, read and written as
+//! The [CESR] 2.00 primitives a subset of [KERI] reads, in the text domain: keys, digests, plain
+//! and indexed signatures, numbers, count codes and the genus-version code, read and written as
 //! keripy reads and writes them, and signatures verified. No I/O and no secret key. Spec:
 //! `mia-docs/openspec/specs/components/mee-pdn/kerita-cesr/`.
+//!
+//! [CESR]: https://trustoverip.github.io/kswg-cesr-specification/
+//! [KERI]: https://trustoverip.github.io/kswg-keri-specification/
 
 extern crate alloc;
 
