@@ -1,0 +1,26 @@
+[package]
+name = "kerita-cesr"
+version = "0.1.0"
+# The CESR module is a fork of `cesr-rs`, written for edition 2024.
+edition = "2024"
+description = "The CESR 2.00 primitives a subset of KERI reads: keys, digests, signatures, numbers and count codes"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+blake3 = { version = "1.8.3", default-features = false }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "fast"] }
+num-traits = { version = "0.2.19", default-features = false }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
+strum = { version = "0.28.0", default-features = false, features = ["derive", "phf"] }
+thiserror = { version = "2.0.18", default-features = false }
+
+[dev-dependencies]
+ed25519-dalek = { version = "3", features = ["signature"] }
+hex = "0.4"
+proptest = "1.10.0"
+rstest = "0.26.1"
+serde_json = "1"
+
+[lints]
+workspace = true

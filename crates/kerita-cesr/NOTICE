@@ -1,0 +1,20 @@
+kerita-cesr
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This crate contains material from the following projects.
+
+keripy — https://github.com/WebOfTrust/keripy
+  Copyright the keripy contributors (WebOfTrust).
+  Licensed under the Apache License, Version 2.0.
+  Used for: test cases, copied verbatim from keripy's tests, under
+  tests/corpus/keripy/. Each case names the keripy commit and the test it came
+  from.
+
+cesr-rs — https://github.com/devrandom-labs/cesr
+  Copyright (c) Joel DSouza.
+  Licensed under either of the Apache License, Version 2.0 or the MIT license;
+  taken here under the Apache License, Version 2.0.
+  Used for: the CESR primitives under src/cesr/, forked and modified. The
+  commit taken and every modification are listed in UPSTREAM.md. And the
+  vectors under tests/corpus/cesr-rs/, taken from its corpora where keripy
+  reproduces them.

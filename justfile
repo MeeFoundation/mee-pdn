@@ -194,9 +194,29 @@ stress *args: _need-nextest
 hammer binary count="100":
   @sh scripts/hammer.sh "$@"
 
-# Check the dependency tree against deny.toml (advisories, licenses, sources)
+# The KERI crates' oracle: keripy at crates/kerita/oracle/KERIPY_PIN, in its
+# own image. An ordinary `just test` reads the committed corpora and needs neither.
+[doc("Regenerate the KERI crates' corpora from the pinned keripy (needs docker)")]
+keri-corpus:
+  @sh scripts/keri-oracle.sh corpus
+
+[doc("Fold the KELs kerita wrote in the pinned keripy (needs docker)")]
+keri-oracle:
+  @sh scripts/keri-oracle.sh fold
+
+[doc("Regenerate the KERI corpora and fold kerita's KELs, failing on any difference (needs docker)")]
+keri-check:
+  @sh scripts/keri-oracle.sh check
+
+[doc("Fuzz each target of the KERI crates for the seconds given, on FUZZ_TOOLCHAIN (a nightly)")]
+keri-fuzz seconds="60":
+  @sh scripts/keri-fuzz.sh {{ seconds }}
+
+# Check the dependency trees against deny.toml (advisories, licenses, sources): the workspace's,
+# and that of the KERI crates' fuzz targets, a workspace of their own
 audit:
   cargo deny check
+  cargo deny --manifest-path crates/kerita/fuzz/Cargo.toml check
 
 # Lint and type-check without modifying files
 check: _check-devcontainer-tools
@@ -225,6 +245,8 @@ check: _check-devcontainer-tools
   cargo clippy -p pdn-store --all-targets --features observation -- -Dwarnings
   # The product graph enables no observation feature (see scripts/check-product-graph.sh).
   sh scripts/check-product-graph.sh
+  # The KERI crate's product build is a leaf (see scripts/check-keri-graph.sh).
+  sh scripts/check-keri-graph.sh
   # Private items too: most docs sit on them, and a link there that no longer
   # resolves is otherwise seen by nothing.
   RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --document-private-items $(sh scripts/test-features.sh)

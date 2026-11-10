@@ -1,0 +1,46 @@
+# The Python packages keripy's install resolves to at KERIPY_PIN, frozen so that the oracle
+# moves only with the pin: regenerated from `pip freeze` in the image, keripy itself left out,
+# whenever the pin moves.
+apispec==6.10.0
+attrs==26.1.0
+blake3==1.0.9
+cbor2==6.1.4
+cffi==2.1.1
+coverage==7.16.0
+cryptography==50.0.1
+execnet==2.1.2
+falcon==4.3.1
+hio==0.7.20
+hjson==3.1.0
+http_sfv==0.9.9
+iniconfig==2.3.1
+itermate==1.0.2
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+lmdb==2.3.0
+mnemonic==0.21
+msgpack==1.2.2
+multicommand==1.0.0
+multidict==6.9.1
+ordered-set==4.1.0
+packaging==26.3
+pluggy==1.7.0
+prettytable==3.18.0
+pycparser==3.12
+Pygments==2.21.0
+pysodium==0.7.18
+pytest==9.1.1
+pytest-cov==7.1.0
+pytest-shell==0.3.2
+pytest-xdist==3.8.0
+PyYAML==6.0.3
+qrcode==8.2
+referencing==0.37.0
+rpds-py==2026.9.1
+semver==3.0.4
+setuptools==84.0.0
+sortedcontainers==2.4.0
+typing_extensions==4.16.0
+wcwidth==0.9.4
+wheel==0.48.0
+where==1.0.2

@@ -28,6 +28,7 @@ allow = [
   "ISC",
   "MIT",
   "MIT-0",
+  "NCSA",
   "Unicode-3.0",
   "Unlicense",
   "Zlib",

@@ -38,6 +38,10 @@ jobs:
       - name: Check the tree against deny.toml
         run: cargo deny check
 
+      # The KERI crates' fuzz targets are a workspace of their own.
+      - name: Check the fuzz tree against deny.toml
+        run: cargo deny --manifest-path crates/kerita/fuzz/Cargo.toml check
+
   # Apart from the tests, so a lint failure leaves their result in view.
   lint:
     name: Lint

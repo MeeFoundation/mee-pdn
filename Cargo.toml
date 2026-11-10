@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/pdn-types",     # platform primitives + the data vocabulary
+  "crates/kerita-cesr",   # the CESR 2.00 primitives a KERI subset reads
+  "crates/kerita",        # a KERI subset: native CESR events folded into key state
   "crates/pdn-store",     # our iroh-docs variant: document sync whose sessions the embedder judges
   "crates/data-layer",    # document sync over our iroh-docs variant
   "crates/pdn-layer",     # platform surface: domain model + PdnOp AST
@@ -10,6 +12,8 @@ members = [
   "crates/test-utils",    # shared scenario-test plumbing (dev-dependency only)
 ]
 exclude = [
+  # The KERI crates' fuzz targets: a workspace of their own, built on a nightly toolchain.
+  "crates/kerita/fuzz",
   # Nested checkouts carrying their own manifests — without this, cargo run from
   # inside them walks up, finds this workspace, and refuses to build.
   "mee-v1",
