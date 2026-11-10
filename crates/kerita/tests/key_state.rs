@@ -25,15 +25,18 @@ fn alice() -> Result<Vec<Message>, String> {
         .into_iter()
         .find(|c| c.name == "alice")
         .ok_or("no case alice")?;
-    let identity = case
-        .messages
+    let messages: Vec<Message> = case
+        .steps
+        .into_iter()
+        .filter_map(crate_kels::Step::message)
+        .collect();
+    let identity = messages
         .first()
         .ok_or("no inception")?
         .event()
         .prefix()
         .clone();
-    let own: Vec<Message> = case
-        .messages
+    let own: Vec<Message> = messages
         .into_iter()
         .filter(|m| m.event().prefix() == &identity)
         .collect();

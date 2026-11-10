@@ -30,8 +30,8 @@ fn written() -> Result<Vec<Value>, String> {
                     "test": case.name,
                 },
                 "input": {
-                    "steps": case.messages.iter().map(|m| Ok(json!({
-                        "message": m.to_text().map_err(|e| e.to_string())?,
+                    "steps": case.steps.iter().map(|s| Ok(json!({
+                        "message": s.text().map_err(|e| e.to_string())?,
                         "validator": "remote",
                     }))).collect::<Result<Vec<_>, String>>()?,
                 },

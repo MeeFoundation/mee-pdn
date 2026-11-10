@@ -61,6 +61,16 @@ def _wrap_init(cls, harvest, kind, describe, parsed=("qb64", "qb64b")):
             if source is not None:
                 harvest.record(kind, {"refused": source, "error": type(error).__name__})
             raise
+        # Built with its checks off, as a test builds an event for the key state to refuse:
+        # recorded as keripy's parser answers it, checks on.
+        if kwargs.get("verify") is False and hasattr(self, "_verify"):
+            try:
+                self._verify()
+            except Exception as error:
+                source = _text(self.raw)
+                if source is not None:
+                    harvest.record(kind, {"refused": source, "error": type(error).__name__})
+                return
         # A record that cannot be made is dropped: the harvest never fails a test it watches.
         try:
             entry = describe(self)

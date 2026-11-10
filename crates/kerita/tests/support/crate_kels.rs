@@ -12,10 +12,41 @@ use kerita::event::{Draft, Event, Ilk, Seal};
 use kerita::message::{Message, Source};
 use kerita::primitive::{IndexedSignature, Primitive, Refusal};
 use kerita::threshold::{Threshold, Weight};
+use kerita_cesr::count;
 
 pub struct Case {
     pub name: &'static str,
-    pub messages: Vec<Message>,
+    pub steps: Vec<Step>,
+}
+
+pub enum Step {
+    Built(Box<Message>),
+    /// The text of a message whose event keripy refuses as it reads it, which the crate does not
+    /// build.
+    Forged(String),
+}
+
+impl Step {
+    pub fn text(&self) -> Result<String, Refusal> {
+        match self {
+            Self::Built(message) => message.to_text(),
+            Self::Forged(text) => Ok(text.clone()),
+        }
+    }
+
+    pub fn message(self) -> Option<Message> {
+        match self {
+            Self::Built(message) => Some(*message),
+            Self::Forged(_) => None,
+        }
+    }
+}
+
+fn built(messages: Vec<Message>) -> Vec<Step> {
+    messages
+        .into_iter()
+        .map(|m| Step::Built(Box::new(m)))
+        .collect()
 }
 
 struct Key(p256::ecdsa::SigningKey);
@@ -232,7 +263,7 @@ fn alice() -> Result<Case, Refusal> {
     let both = [(at(&laptop, 1)?, 0, Some(0)), (at(&phone, 4)?, 1, Some(1))];
     Ok(Case {
         name: "alice",
-        messages: vec![
+        steps: built(vec![
             signed(&icp, &[(at(&phone, 0)?, 0, Some(0))])?.witnessed(tellipod.receipt(&icp, 0)?),
             signed(&rot1, &[(at(&phone, 1)?, 0, Some(0))])?.witnessed(tellipod.receipt(&rot1, 0)?),
             signed(&phone_dip, &[(&phone_device, 0, Some(0))])?.sourced(source(&rot1)),
@@ -248,7 +279,7 @@ fn alice() -> Result<Case, Refusal> {
             // The receipt of the witness rotation 4 cuts counts for nothing.
             signed(&rot4, &both)?.witnessed(tellipod.receipt(&rot4, 0)?),
             signed(&rot4, &both)?.witnessed(home.receipt(&rot4, 0)?),
-        ],
+        ]),
     })
 }
 
@@ -289,13 +320,53 @@ fn rotated(
     )
 }
 
+/// `text` with `from`, found at `at`, replaced by `to`.
+fn spliced(text: &str, at: usize, from: &str, to: &str) -> String {
+    let (head, tail) = text.split_at_checked(at).unwrap_or((text, ""));
+    format!("{head}{to}{}", tail.strip_prefix(from).unwrap_or(tail))
+}
+
+/// A message whose event keripy refuses as it reads it: `twin`, which the crate builds, with
+/// `edit` applied to its body, its count code and SAID taken again, signed by `signers`.
+fn forged(
+    twin: &Event,
+    edit: impl FnOnce(&str) -> String,
+    signers: &[(&Key, u32, Option<u32>)],
+) -> Result<Step, Refusal> {
+    let (_, header) = count::read(twin.text())?;
+    let body = edit(twin.text().get(header..).unwrap_or_default());
+    let text = format!("{}{body}", count::write("-F", body.len() / 4));
+    let said = twin.said().to_text();
+    let at = text
+        .find(said)
+        .ok_or_else(|| Refusal::Malformed("a twin's SAID edited away".to_owned()))?;
+    let dummied = spliced(&text, at, said, &"#".repeat(said.len()));
+    let digest = Primitive::new("E", blake3::hash(dummied.as_bytes()).as_bytes())?;
+    let text = spliced(&text, at, said, digest.to_text());
+    let message = signers.iter().try_fold(
+        Message::new(twin.clone()),
+        |message, (key, index, ondex)| {
+            let signature: p256::ecdsa::Signature = key.0.sign(text.as_bytes());
+            let indexed =
+                IndexedSignature::new(&key.public()?, *index, *ondex, &signature.to_bytes())?;
+            Ok::<_, Refusal>(message.with_signature(indexed))
+        },
+    )?;
+    let attached = message.to_text()?;
+    Ok(Step::Forged(format!(
+        "{text}{}",
+        attached.get(twin.text().len()..).unwrap_or_default()
+    )))
+}
+
 /// A basic prefix is its inception's one key: another key under it is refused, and the key's own
 /// inception accepted.
 fn basic_prefix() -> Result<Case, Refusal> {
     let keys = keys("basic", 4)?;
     let prefix = at(&keys, 0)?.public()?;
-    let forged = incepted(at(&keys, 2)?, at(&keys, 3)?, |d| Draft {
-        prefix: Some(prefix.clone()),
+    let other = at(&keys, 2)?.public()?;
+    let twin = incepted(at(&keys, 2)?, at(&keys, 3)?, |d| Draft {
+        prefix: Some(other.clone()),
         ..d
     })?;
     let own = incepted(at(&keys, 0)?, at(&keys, 1)?, |d| Draft {
@@ -304,9 +375,13 @@ fn basic_prefix() -> Result<Case, Refusal> {
     })?;
     Ok(Case {
         name: "basic-prefix",
-        messages: vec![
-            signed(&forged, &[(at(&keys, 2)?, 0, Some(0))])?,
-            signed(&own, &[(at(&keys, 0)?, 0, Some(0))])?,
+        steps: vec![
+            forged(
+                &twin,
+                |body| body.replacen(other.to_text(), prefix.to_text(), 1),
+                &[(at(&keys, 2)?, 0, Some(0))],
+            )?,
+            Step::Built(Box::new(signed(&own, &[(at(&keys, 0)?, 0, Some(0))])?)),
         ],
     })
 }
@@ -317,9 +392,9 @@ fn non_transferable() -> Result<Case, Refusal> {
     let keys = keys("non-transferable", 3)?;
     let owner = at(&keys, 0)?;
     let prefix = owner.coded("1AAI")?;
+    let transferable = owner.public()?;
     let committing = incepted(owner, at(&keys, 1)?, |d| Draft {
-        prefix: Some(prefix.clone()),
-        keys: vec![prefix.clone()],
+        prefix: Some(transferable.clone()),
         ..d
     })?;
     let icp = incepted(owner, at(&keys, 1)?, |d| Draft {
@@ -330,13 +405,24 @@ fn non_transferable() -> Result<Case, Refusal> {
         ..d
     })?;
     let thief = Key::new("thief")?;
-    let rot = rotated(Ilk::Rotation, &icp, &thief, at(&keys, 2)?, |d| d)?;
+    let rot = rotated(Ilk::Rotation, &icp, &thief, at(&keys, 2)?, |d| Draft {
+        prefix: Some(transferable.clone()),
+        ..d
+    })?;
     Ok(Case {
         name: "non-transferable",
-        messages: vec![
-            signed(&committing, &[(owner, 0, None)])?,
-            signed(&icp, &[(owner, 0, None)])?,
-            signed(&rot, &[(&thief, 0, None)])?,
+        steps: vec![
+            forged(
+                &committing,
+                |body| body.replace(transferable.to_text(), prefix.to_text()),
+                &[(owner, 0, None)],
+            )?,
+            Step::Built(Box::new(signed(&icp, &[(owner, 0, None)])?)),
+            forged(
+                &rot,
+                |body| body.replacen(transferable.to_text(), prefix.to_text(), 1),
+                &[(&thief, 0, None)],
+            )?,
         ],
     })
 }
@@ -356,11 +442,11 @@ fn prior_digest() -> Result<Case, Refusal> {
     let rot = rotated(Ilk::Rotation, &icp, at(&keys, 1)?, at(&keys, 2)?, |d| d)?;
     Ok(Case {
         name: "prior-digest",
-        messages: vec![
+        steps: built(vec![
             signed(&icp, &[(at(&keys, 0)?, 0, Some(0))])?,
             signed(&elsewhere, &[(at(&keys, 1)?, 0, Some(0))])?,
             signed(&rot, &[(at(&keys, 1)?, 0, Some(0))])?,
-        ],
+        ]),
     })
 }
 
@@ -417,14 +503,14 @@ fn witness_lists() -> Result<Case, Refusal> {
     };
     Ok(Case {
         name: "witness-lists",
-        messages: vec![
+        steps: built(vec![
             signed(&twice, &[(at(&keys, 0)?, 0, Some(0))])?.witnessed(one.receipt(&twice, 0)?),
             signed(&icp, &[(at(&keys, 0)?, 0, Some(0))])?.witnessed(one.receipt(&icp, 0)?),
             rotation(&cut_unlisted)?,
             rotation(&add_listed)?,
             rotation(&above)?,
             rotation(&rot)?,
-        ],
+        ]),
     })
 }
 
@@ -450,7 +536,7 @@ fn threshold_over_keys() -> Result<Case, Refusal> {
     };
     Ok(Case {
         name: "threshold-over-keys",
-        messages: vec![both(&over)?, both(&icp)?],
+        steps: built(vec![both(&over)?, both(&icp)?]),
     })
 }
 
@@ -498,13 +584,13 @@ fn rotation_kind() -> Result<Case, Refusal> {
     )?;
     Ok(Case {
         name: "rotation-kind",
-        messages: vec![
+        steps: built(vec![
             signed(&icp, &[(at(&keys, 0)?, 0, Some(0))])?,
             signed(&approval, &[(at(&keys, 0)?, 0, None)])?,
             signed(&dip, &[(at(&devices, 0)?, 0, Some(0))])?.sourced(source(&approval)),
             signed(&plain, &[(at(&devices, 1)?, 0, Some(0))])?,
             signed(&drt, &[(at(&keys, 1)?, 0, Some(0))])?,
-        ],
+        ]),
     })
 }
 
@@ -512,21 +598,31 @@ fn rotation_kind() -> Result<Case, Refusal> {
 fn delegated_basic_prefix() -> Result<Case, Refusal> {
     let keys = keys("delegated-basic", 3)?;
     let delegator = incepted(at(&keys, 2)?, at(&keys, 1)?, |d| d)?;
-    let dip = Event::build(
+    let basic = at(&keys, 0)?.public()?;
+    let twin = Event::build(
         Ilk::DelegatedInception,
         Draft {
-            prefix: Some(at(&keys, 0)?.public()?),
             key_threshold: Some(Threshold::Count(1)),
-            keys: vec![at(&keys, 0)?.public()?],
+            keys: vec![basic.clone()],
             next_threshold: Some(Threshold::Count(1)),
             next_digests: vec![at(&keys, 1)?.digest()?],
             delegator: Some(delegator.prefix().clone()),
             ..Draft::default()
         },
     )?;
+    // The twin is self-addressing: its prefix is the second copy of its SAID.
+    let said = twin.said().to_text();
+    let dip = forged(
+        &twin,
+        |body| match body.rfind(said) {
+            Some(at) => spliced(body, at, said, basic.to_text()),
+            None => body.to_owned(),
+        },
+        &[(at(&keys, 0)?, 0, Some(0))],
+    )?;
     Ok(Case {
         name: "delegated-basic-prefix",
-        messages: vec![signed(&dip, &[(at(&keys, 0)?, 0, Some(0))])?],
+        steps: vec![dip],
     })
 }
 
@@ -548,10 +644,10 @@ fn establishment_only() -> Result<Case, Refusal> {
     )?;
     Ok(Case {
         name: "establishment-only",
-        messages: vec![
+        steps: built(vec![
             signed(&icp, &[(at(&keys, 0)?, 0, Some(0))])?,
             signed(&ixn, &[(at(&keys, 0)?, 0, None)])?,
-        ],
+        ]),
     })
 }
 

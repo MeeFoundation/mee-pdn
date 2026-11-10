@@ -145,7 +145,8 @@ fn keripy_state(s: &Value) -> Value {
 
 /// Every step of every KEL of the subset that keripy's validators were given — keripy's own and
 /// the ones the crate wrote — gets keripy's answer from the crate, and every step keripy accepted
-/// leaves keripy's key state; a KEL outside the subset meets a refusal as unsupported. A KEL
+/// leaves keripy's key state, and an event keripy refuses as it reads it the crate refuses as it
+/// reads it too; a KEL outside the subset meets a refusal as unsupported. A KEL
 /// resting on keripy's rule for a validator's own events from another source is outside what the
 /// crate decides, and is counted apart; one where keripy supersedes an accepted event matches
 /// keripy up to that event, which the crate answers as likely duplicitous.
@@ -154,6 +155,7 @@ fn keripy_state(s: &Value) -> Value {
 fn kels_fold_as_keripy_folds_them() {
     let mut replayed = [0usize; 3];
     let mut refolded = 0;
+    let mut refused_as_read = 0;
     for (directory, file) in ["keripy", "crate"].into_iter().flat_map(|d| {
         support::manifest(d)
             .unwrap()
@@ -195,6 +197,7 @@ fn kels_fold_as_keripy_folds_them() {
                     Some(raw) => Message::read(raw.as_bytes(), &LIMITS).map(|(m, _)| m),
                     None => assembled(step),
                 };
+                let read = message.is_ok();
                 let verdict = match message {
                     Ok(message) => validator.give(&message, checked_by(step).unwrap()),
                     Err(refusal) => Err(Verdict::Refused(refusal)),
@@ -213,8 +216,19 @@ fn kels_fold_as_keripy_folds_them() {
                     );
                     break;
                 }
-                let theirs = keripy_answer(keripy["outcome"].as_str().unwrap());
-                assert_eq!(answer(&verdict), theirs, "{id} step {n}: {verdict:?}");
+                let outcome = keripy["outcome"].as_str().unwrap();
+                if outcome == "ParseError" {
+                    assert!(
+                        !read,
+                        "{id} step {n}: read, though keripy refuses the event as it reads it: {verdict:?}"
+                    );
+                    refused_as_read += 1;
+                }
+                assert_eq!(
+                    answer(&verdict),
+                    keripy_answer(outcome),
+                    "{id} step {n}: {verdict:?}"
+                );
                 if verdict.is_ok() {
                     let prefix = keripy["state"]["i"].as_str().unwrap();
                     let ours = state(&validator.kels[prefix].0);
@@ -250,6 +264,10 @@ fn kels_fold_as_keripy_folds_them() {
         "same, unsupported, outside: {replayed:?}"
     );
     assert!(refolded > 0, "no KEL refolded");
+    assert!(
+        refused_as_read > 0,
+        "no event keripy refuses as it reads it"
+    );
 }
 
 /// Folding every AID's accepted messages again from the first reaches the key state accepting

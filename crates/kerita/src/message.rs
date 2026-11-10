@@ -105,7 +105,7 @@ impl Message {
 
     /// The message `bytes` start with, and how many bytes it takes — a genus-version code before
     /// it included, which a stream carries to name CESR 2.00 and which keripy reads past; one
-    /// naming another version is unsupported, as keripy reads nothing after it.
+    /// naming another version is unsupported, as keripy reads no native message after it.
     pub fn read(bytes: &[u8], limits: &Limits) -> Result<(Self, usize), Refusal> {
         let skipped = match count::genus_version(bytes)? {
             None => 0,

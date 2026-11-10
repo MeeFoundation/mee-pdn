@@ -615,8 +615,52 @@ impl<'a> Cursor<'a> {
                 "an event not as keripy writes it".to_owned(),
             ));
         }
+        check_prefix(&event)?;
         Ok(event)
     }
+}
+
+/// The prefix codes of the subset, keripy's `PreDex`: basic, then self-addressing.
+const PREFIXES: [&str; 5] = ["D", "B", "1AAJ", "1AAI", "E"];
+
+/// The basic prefix codes that commit to no next key, keripy's `NonTransDex`.
+const NON_TRANSFERABLE: [&str; 2] = ["B", "1AAI"];
+
+/// The rules keripy checks of a prefix as it reads the event (`SerderKERI._verify`), before any
+/// key state.
+fn check_prefix(event: &Event) -> Result<(), Refusal> {
+    let invalid = |why: &str| Err(Refusal::Invalid(why.to_owned()));
+    let code = event.prefix.code();
+    if !PREFIXES.contains(&code) {
+        return invalid("a prefix under a code no AID takes");
+    }
+    if event.ilk.is_delegated() && code != "E" {
+        return invalid("a delegated AID that is not self-addressing");
+    }
+    if event.ilk.is_inception() && code != "E" {
+        if event.keys != core::slice::from_ref(&event.prefix) {
+            return invalid("a basic prefix that is not the event's one key");
+        }
+        if event.key_threshold != Some(Threshold::Count(1)) {
+            return invalid("a basic prefix under a threshold other than 1");
+        }
+    }
+    if event.ilk.is_establishment()
+        && NON_TRANSFERABLE.contains(&code)
+        && (!event.next_digests.is_empty()
+            || !event.witnesses.is_empty()
+            || !event.seals.is_empty())
+    {
+        return invalid("a non-transferable AID that commits to more");
+    }
+    if event
+        .delegator
+        .as_ref()
+        .is_some_and(|d| !PREFIXES.contains(&d.code()))
+    {
+        return invalid("a delegator under a code no AID takes");
+    }
+    Ok(())
 }
 
 /// The SAID is the Blake3 digest of the text with the SAID — and an inception's self-addressing
@@ -665,6 +709,119 @@ mod tests {
                 limits: &limits,
             };
             assert_eq!(cursor.traits(), Ok(alloc::vec![tag.to_owned()]), "{text}");
+        }
+    }
+
+    /// `event` with `change` made to its fields, its text left as it was.
+    fn changed(event: &Event, change: impl FnOnce(&mut Event)) -> Event {
+        let mut event = event.clone();
+        change(&mut event);
+        event
+    }
+
+    fn primitive(code: &str, size: usize, byte: u8) -> Primitive {
+        Primitive::new(code, &alloc::vec![byte; size]).unwrap()
+    }
+
+    /// The key's own inception under its basic prefix, a non-transferable one committing to
+    /// nothing, and a self-addressing delegated one.
+    fn kept() -> [Event; 3] {
+        let (key, digest, lone) = (
+            primitive("D", 32, 1),
+            primitive("E", 32, 3),
+            primitive("B", 32, 5),
+        );
+        let draft = Draft {
+            prefix: Some(key.clone()),
+            key_threshold: Some(Threshold::Count(1)),
+            keys: alloc::vec![key],
+            next_threshold: Some(Threshold::Count(1)),
+            next_digests: alloc::vec![digest.clone()],
+            ..Draft::default()
+        };
+        let basic = Event::build(Ilk::Inception, draft).unwrap();
+        let non_transferable = changed(&basic, |e| {
+            e.prefix = lone.clone();
+            e.keys = alloc::vec![lone];
+            e.next_threshold = Some(Threshold::Count(0));
+            e.next_digests = Vec::new();
+        });
+        let delegated = changed(&basic, |e| {
+            e.ilk = Ilk::DelegatedInception;
+            e.prefix = digest.clone();
+            e.delegator = Some(digest);
+        });
+        [basic, non_transferable, delegated]
+    }
+
+    /// An event breaking a rule keripy checks of a prefix as it reads the event is invalid, and
+    /// an event keeping every rule passes: the key's own inception under its basic prefix, a
+    /// non-transferable one committing to nothing, a self-addressing delegated one.
+    #[test]
+    fn a_prefix_breaking_a_rule_keripy_reads_by_is_invalid() {
+        let [basic, lone, delegated] = kept();
+        for event in [&basic, &lone, &delegated] {
+            assert_eq!(check_prefix(event), Ok(()), "{event:?}");
+        }
+        let (key, other, digest) = (
+            primitive("D", 32, 1),
+            primitive("D", 32, 2),
+            primitive("E", 32, 3),
+        );
+        let signature = primitive("0B", 64, 4);
+        let one = crate::threshold::Weight::new(1, 1).unwrap();
+        let weighted = Threshold::weighted(alloc::vec![alloc::vec![one]]).unwrap();
+        let broken = [
+            (
+                "a signature's code",
+                changed(&basic, |e| e.prefix = signature.clone()),
+            ),
+            (
+                "another key",
+                changed(&basic, |e| e.keys = alloc::vec![other.clone()]),
+            ),
+            ("a second key", changed(&basic, |e| e.keys.push(other))),
+            (
+                "a weighted threshold",
+                changed(&basic, |e| e.key_threshold = Some(weighted)),
+            ),
+            (
+                "a delegated rotation",
+                changed(&basic, |e| e.ilk = Ilk::DelegatedRotation),
+            ),
+            (
+                "a delegated inception",
+                changed(&delegated, |e| e.prefix = key),
+            ),
+            (
+                "a delegator's code",
+                changed(&delegated, |e| e.delegator = Some(signature)),
+            ),
+            (
+                "a next key",
+                changed(&lone, |e| e.next_digests.push(digest.clone())),
+            ),
+            (
+                "a witness",
+                changed(&lone, |e| e.witnesses.push(primitive("B", 32, 6))),
+            ),
+            (
+                "a seal",
+                changed(&lone, |e| e.seals.push(Seal::Digest(digest))),
+            ),
+            (
+                "a rotation committing to a next key",
+                changed(&lone, |e| {
+                    e.ilk = Ilk::Rotation;
+                    e.next_digests.push(primitive("E", 32, 7));
+                }),
+            ),
+        ];
+        for (case, event) in broken {
+            assert!(
+                matches!(check_prefix(&event), Err(Refusal::Invalid(_))),
+                "{case}"
+            );
         }
     }
 }

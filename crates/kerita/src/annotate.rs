@@ -84,7 +84,6 @@ mod tests {
         let wrong = Event::build(
             Ilk::Inception,
             Draft {
-                prefix: Some(event.prefix().clone()),
                 key_threshold: Some(Threshold::Count(2)),
                 keys: event.keys().to_vec(),
                 next_threshold: Some(Threshold::Count(0)),

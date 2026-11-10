@@ -303,7 +303,6 @@ fn incept(message: &Message, context: Context<'_>) -> Result<KeyState, Verdict> 
     if event.sn() != 0 {
         return Err(refused("an inception past sequence number 0"));
     }
-    derived(event)?;
     let establishment_only = event
         .traits()
         .iter()
@@ -350,31 +349,6 @@ fn incept(message: &Message, context: Context<'_>) -> Result<KeyState, Verdict> 
         signers: slots(&verified, |_| None),
         seals: event.seals().to_vec(),
     })
-}
-
-/// A prefix derives from its inception: a self-addressing one is its SAID (checked as the event
-/// is read), a basic one is its one key — and a non-transferable one commits to nothing more.
-fn derived(event: &Event) -> Result<(), Verdict> {
-    match event.prefix().code() {
-        "E" => Ok(()),
-        _ if event.ilk().is_delegated() => {
-            Err(refused("a delegated AID that is not self-addressing"))
-        }
-        code => {
-            if event.keys() != core::slice::from_ref(event.prefix()) {
-                return Err(refused("a basic prefix that is not the event's one key"));
-            }
-            let non_transferable = matches!(code, "B" | "1AAI");
-            if non_transferable
-                && (!event.next_digests().is_empty()
-                    || !event.witnesses().is_empty()
-                    || !event.seals().is_empty())
-            {
-                return Err(refused("a non-transferable AID that commits to more"));
-            }
-            Ok(())
-        }
-    }
 }
 
 /// A threshold an establishment event sets, weighing no more keys than it lists.
