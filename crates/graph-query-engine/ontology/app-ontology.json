@@ -1,0 +1,485 @@
+{
+ "source": "pdn-agent application ontology v1 (ADR-0030): the platform's types for its pod-tools, loaded on top of mia-ontologies",
+ "types": [
+  {
+   "type_id": "app:text-content:v1",
+   "name": "text-content",
+   "canonical_name": "app:text-content",
+   "description": "Text as a person wrote it, or as it was extracted from a file.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:title:v1",
+   "name": "title",
+   "canonical_name": "app:title",
+   "description": "A short name for a note, an event or a file.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:record-id:v1",
+   "name": "record-id",
+   "canonical_name": "app:record-id",
+   "description": "The id of another record in the same Pod, such as the message one answers or the event one repeats.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:written-by-agent:v1",
+   "name": "written-by-agent",
+   "canonical_name": "app:written-by-agent",
+   "description": "The agent that wrote this on its principal's behalf, where an agent wrote it.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:position:v1",
+   "name": "position",
+   "canonical_name": "app:position",
+   "description": "A coordinate on a canvas.",
+   "kind": "scalar",
+   "primitive_representation": "float"
+  },
+  {
+   "type_id": "app:instant:v1",
+   "name": "instant",
+   "canonical_name": "app:instant",
+   "description": "A moment in time, with its time zone.",
+   "kind": "scalar",
+   "primitive_representation": "timestamp"
+  },
+  {
+   "type_id": "app:place:v1",
+   "name": "place",
+   "canonical_name": "app:place",
+   "description": "Where something happens, as written.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:recurrence-rule:v1",
+   "name": "recurrence-rule",
+   "canonical_name": "app:recurrence-rule",
+   "description": "How often something repeats, as an iCalendar RRULE.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:media-type:v1",
+   "name": "media-type",
+   "canonical_name": "app:media-type",
+   "description": "A file's media type, such as image/jpeg.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "app:byte-size:v1",
+   "name": "byte-size",
+   "canonical_name": "app:byte-size",
+   "description": "A file's size in bytes.",
+   "kind": "scalar",
+   "primitive_representation": "int"
+  },
+  {
+   "type_id": "app:UnstructuredText:v1",
+   "name": "UnstructuredText",
+   "canonical_name": "app:UnstructuredText",
+   "description": "Free text a pod-tool holds. The general type of every text below; a consumer that knows only this reads any of them as text.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "app:Message:v1",
+   "name": "Message",
+   "canonical_name": "app:Message",
+   "description": "One message in a conversation.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "app:Note:v1",
+   "name": "Note",
+   "canonical_name": "app:Note",
+   "description": "A text document, edited by the Pod's members.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "app:CanvasElement:v1",
+   "name": "CanvasElement",
+   "canonical_name": "app:CanvasElement",
+   "description": "Something placed on a canvas: its text and where it is.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "app:Attachment:v1",
+   "name": "Attachment",
+   "canonical_name": "app:Attachment",
+   "description": "A file shared in a Pod; its content is the text extracted from it, where any was.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "app:CalendarEvent:v1",
+   "name": "CalendarEvent",
+   "canonical_name": "app:CalendarEvent",
+   "description": "An event with a time.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "app:Recurrence:v1",
+   "name": "Recurrence",
+   "canonical_name": "app:Recurrence",
+   "description": "How an event repeats.",
+   "kind": "entity",
+   "primitive_representation": null
+  }
+ ],
+ "fields": [
+  {
+   "field_id": "app:UnstructuredText:v1.content",
+   "member_key": "content",
+   "display_name": "content",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:Message:v1.content",
+   "member_key": "content",
+   "display_name": "content",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:Message:v1.reply_to",
+   "member_key": "reply_to",
+   "display_name": "in reply to",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "app:Message:v1.agent",
+   "member_key": "agent",
+   "display_name": "written by agent",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "app:Note:v1.content",
+   "member_key": "content",
+   "display_name": "content",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:Note:v1.title",
+   "member_key": "title",
+   "display_name": "title",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "app:CanvasElement:v1.content",
+   "member_key": "content",
+   "display_name": "content",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:CanvasElement:v1.x",
+   "member_key": "x",
+   "display_name": "x",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "app:CanvasElement:v1.y",
+   "member_key": "y",
+   "display_name": "y",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "app:Attachment:v1.content",
+   "member_key": "content",
+   "display_name": "content",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:Attachment:v1.title",
+   "member_key": "title",
+   "display_name": "file name",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "app:Attachment:v1.media_type",
+   "member_key": "media_type",
+   "display_name": "media type",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "app:Attachment:v1.byte_size",
+   "member_key": "byte_size",
+   "display_name": "size",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "app:CalendarEvent:v1.title",
+   "member_key": "title",
+   "display_name": "title",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:CalendarEvent:v1.starts_at",
+   "member_key": "starts_at",
+   "display_name": "starts at",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "app:CalendarEvent:v1.ends_at",
+   "member_key": "ends_at",
+   "display_name": "ends at",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "app:CalendarEvent:v1.place",
+   "member_key": "place",
+   "display_name": "place",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "app:CalendarEvent:v1.content",
+   "member_key": "content",
+   "display_name": "description",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "app:Recurrence:v1.event",
+   "member_key": "event",
+   "display_name": "event",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "app:Recurrence:v1.rule",
+   "member_key": "rule",
+   "display_name": "rule",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  }
+ ],
+ "type_has_field": [
+  [
+   "app:UnstructuredText:v1",
+   "app:UnstructuredText:v1.content"
+  ],
+  [
+   "app:Message:v1",
+   "app:Message:v1.content"
+  ],
+  [
+   "app:Message:v1",
+   "app:Message:v1.reply_to"
+  ],
+  [
+   "app:Message:v1",
+   "app:Message:v1.agent"
+  ],
+  [
+   "app:Note:v1",
+   "app:Note:v1.content"
+  ],
+  [
+   "app:Note:v1",
+   "app:Note:v1.title"
+  ],
+  [
+   "app:CanvasElement:v1",
+   "app:CanvasElement:v1.content"
+  ],
+  [
+   "app:CanvasElement:v1",
+   "app:CanvasElement:v1.x"
+  ],
+  [
+   "app:CanvasElement:v1",
+   "app:CanvasElement:v1.y"
+  ],
+  [
+   "app:Attachment:v1",
+   "app:Attachment:v1.content"
+  ],
+  [
+   "app:Attachment:v1",
+   "app:Attachment:v1.title"
+  ],
+  [
+   "app:Attachment:v1",
+   "app:Attachment:v1.media_type"
+  ],
+  [
+   "app:Attachment:v1",
+   "app:Attachment:v1.byte_size"
+  ],
+  [
+   "app:CalendarEvent:v1",
+   "app:CalendarEvent:v1.title"
+  ],
+  [
+   "app:CalendarEvent:v1",
+   "app:CalendarEvent:v1.starts_at"
+  ],
+  [
+   "app:CalendarEvent:v1",
+   "app:CalendarEvent:v1.ends_at"
+  ],
+  [
+   "app:CalendarEvent:v1",
+   "app:CalendarEvent:v1.place"
+  ],
+  [
+   "app:CalendarEvent:v1",
+   "app:CalendarEvent:v1.content"
+  ],
+  [
+   "app:Recurrence:v1",
+   "app:Recurrence:v1.event"
+  ],
+  [
+   "app:Recurrence:v1",
+   "app:Recurrence:v1.rule"
+  ]
+ ],
+ "field_value_type": [
+  [
+   "app:UnstructuredText:v1.content",
+   "app:text-content:v1"
+  ],
+  [
+   "app:Message:v1.content",
+   "app:text-content:v1"
+  ],
+  [
+   "app:Message:v1.reply_to",
+   "app:record-id:v1"
+  ],
+  [
+   "app:Message:v1.agent",
+   "app:written-by-agent:v1"
+  ],
+  [
+   "app:Note:v1.content",
+   "app:text-content:v1"
+  ],
+  [
+   "app:Note:v1.title",
+   "app:title:v1"
+  ],
+  [
+   "app:CanvasElement:v1.content",
+   "app:text-content:v1"
+  ],
+  [
+   "app:CanvasElement:v1.x",
+   "app:position:v1"
+  ],
+  [
+   "app:CanvasElement:v1.y",
+   "app:position:v1"
+  ],
+  [
+   "app:Attachment:v1.content",
+   "app:text-content:v1"
+  ],
+  [
+   "app:Attachment:v1.title",
+   "app:title:v1"
+  ],
+  [
+   "app:Attachment:v1.media_type",
+   "app:media-type:v1"
+  ],
+  [
+   "app:Attachment:v1.byte_size",
+   "app:byte-size:v1"
+  ],
+  [
+   "app:CalendarEvent:v1.title",
+   "app:title:v1"
+  ],
+  [
+   "app:CalendarEvent:v1.starts_at",
+   "app:instant:v1"
+  ],
+  [
+   "app:CalendarEvent:v1.ends_at",
+   "app:instant:v1"
+  ],
+  [
+   "app:CalendarEvent:v1.place",
+   "app:place:v1"
+  ],
+  [
+   "app:CalendarEvent:v1.content",
+   "app:text-content:v1"
+  ],
+  [
+   "app:Recurrence:v1.event",
+   "app:record-id:v1"
+  ],
+  [
+   "app:Recurrence:v1.rule",
+   "app:recurrence-rule:v1"
+  ]
+ ],
+ "extends": [
+  [
+   "app:Message:v1",
+   "app:UnstructuredText:v1"
+  ],
+  [
+   "app:Note:v1",
+   "app:UnstructuredText:v1"
+  ],
+  [
+   "app:CanvasElement:v1",
+   "app:UnstructuredText:v1"
+  ],
+  [
+   "app:Attachment:v1",
+   "app:UnstructuredText:v1"
+  ]
+ ]
+}

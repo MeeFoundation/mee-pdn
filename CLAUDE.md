@@ -34,6 +34,7 @@ Each crate carries its own `CLAUDE.md` with its contracts and what is deliberate
 - [`crates/pdn-node`](crates/pdn-node/) — the embeddable runtime core: identity / pods / sync services over `data-layer`, plus the linking ceremony (ADR-0012) and a pod's join (ADR-0015). No host or HTTP dependencies.
 - [`crates/pdn-node-http`](crates/pdn-node-http/) — the thin HTTP host for the demo stand: an axum binary embedding one runtime, with the `/debug/` subtree behind `PDN_DEBUG` (`1` or `true`).
 - [`crates/pdn-mobile`](crates/pdn-mobile/) — the mobile host: a uniffi facade over the runtime, one handle owning one node, with its own error table. `pdn-sdk` packages what it produces.
+- [`crates/graph-query-engine`](crates/graph-query-engine/) — the graph query engine (ADR-0019): the only crate that depends on LadybugDB. Pod-tools register materializations, readers query each identity's graph through handles fixed to the zones they were made for, and owners search texts by meaning. It depends on no other crate of the workspace; `just lbug-vector-source` assembles the engine's sources with its vector extension.
 
 ## Commands
 

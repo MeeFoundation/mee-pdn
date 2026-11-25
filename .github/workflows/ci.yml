@@ -61,6 +61,9 @@ jobs:
         with:
           workspaces: . -> target
 
+      - name: Assemble LadybugDB's sources with its vector extension
+        run: just lbug-vector-source
+
       - name: Lint & type-check
         run: just check
 
@@ -84,6 +87,9 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: . -> target
+
+      - name: Assemble LadybugDB's sources with its vector extension
+        run: just lbug-vector-source
 
       - name: Run the in-process tests
         run: just test

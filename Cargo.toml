@@ -7,6 +7,7 @@ members = [
   "crates/pdn-node",      # embeddable node runtime: service glue over data-layer
   "crates/pdn-node-http", # thin HTTP host embedding one runtime
   "crates/pdn-mobile",    # uniffi facade: the host a phone embeds
+  "crates/graph-query-engine", # the only way to the graph database, LadybugDB behind it
   "crates/test-utils",    # shared scenario-test plumbing (dev-dependency only)
 ]
 exclude = [
@@ -45,6 +46,11 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# LadybugDB's C++ is built by cmake in the build type the profile implies,
+# and unoptimized it is several times slower at everything.
+[profile.dev.package.lbug]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "deny"

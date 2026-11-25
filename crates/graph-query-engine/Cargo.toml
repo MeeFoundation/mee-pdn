@@ -1,0 +1,25 @@
+[package]
+name = "graph-query-engine"
+version = "0.1.0"
+edition = "2021"
+description = "The graph query engine: the only way to the graph database, and search by meaning beside it"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+# LadybugDB, the graph database. This crate alone depends on it. 0.22.1, the
+# first with its vector extension buildable into the engine for Android.
+# Built from source (the workspace's .cargo/config.toml): needs cmake and OpenSSL 3.
+lbug = "=0.22.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

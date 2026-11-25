@@ -1,0 +1,2075 @@
+{
+ "source": "mia-experiments@2ff493b ladybug_app.ingestion.write_registry_csvs",
+ "types": [
+  {
+   "type_id": "mee:Subject:v1",
+   "name": "Subject",
+   "canonical_name": "mee:Subject",
+   "description": "A claim subject: the person, organization, user, or agent that a claim is about.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:Person:v1",
+   "name": "Person",
+   "canonical_name": "persona:Person",
+   "description": "A human subject represented in the claim graph.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:Corporation:v1",
+   "name": "Corporation",
+   "canonical_name": "mee:Corporation",
+   "description": "An organizational subject represented in the claim graph.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:User:v1",
+   "name": "User",
+   "canonical_name": "mee:User",
+   "description": "A person operating a Mee identity agent or local-first assistant.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:IdentityAgent:v1",
+   "name": "IdentityAgent",
+   "canonical_name": "mee:IdentityAgent",
+   "description": "A local identity agent that stores, syncs, and reasons over claim data.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:PaymentCard:v1",
+   "name": "PaymentCard",
+   "canonical_name": "mee:PaymentCard",
+   "description": "A payment card credential carrying card network, card number, CVV, and expiration details.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:DriverLicense:v1",
+   "name": "DriverLicense",
+   "canonical_name": "mee:DriverLicense",
+   "description": "A driving-privilege record: which state issued the license, the license number, and which driving categories/endorsements (e.g. motorcycle, commercial) it authorizes. Carries no personal identity fields (no name, date of birth, address, or photo) -- use `DriversLicenseDocument` for the identity claims printed on the physical license.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:DrivingCategory:v1",
+   "name": "DrivingCategory",
+   "canonical_name": "mee:DrivingCategory",
+   "description": "A licensed driving class or endorsement code with a human-readable description. Nested only under `DriverLicense.driving_category` -- never a standalone/root entity.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:BirthCertificateDocument:v1",
+   "name": "BirthCertificateDocument",
+   "canonical_name": "identitydocuments:BirthCertificate",
+   "description": "An identity document record carrying birth-certificate name claims.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:DriversLicenseDocument:v1",
+   "name": "DriversLicenseDocument",
+   "canonical_name": "identitydocuments:DriversLicense",
+   "description": "The identity document record carrying the claims printed on a government-issued driver's license: legal name, date of birth, license number, expiration date, residential address, issuing jurisdiction, and photo. Carries no driving categories/endorsements -- use `DriverLicense` for those.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:PassportDocument:v1",
+   "name": "PassportDocument",
+   "canonical_name": "identitydocuments:Passport",
+   "description": "An identity document record carrying passport claims such as legal name, passport number, issue and expiration dates, issuing country, place of birth, and gender marker.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:MedicalAppointmentRecord:v1",
+   "name": "MedicalAppointmentRecord",
+   "canonical_name": "medicalappointments:MedicalAppointmentRecord",
+   "description": "A shareable medical-appointment record containing the claims needed to coordinate care for a patient, including patient reference, insurance, medications, allergies, and care contacts.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:CheckingAccount:v1",
+   "name": "CheckingAccount",
+   "canonical_name": "banking:CheckingAccount",
+   "description": "A bank checking account record with account and routing identifiers.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:Wallet:v1",
+   "name": "Wallet",
+   "canonical_name": "persona:Wallet",
+   "description": "A physical wallet record that can contain physical cards and other personal documents.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:PhysicalCard:v1",
+   "name": "PhysicalCard",
+   "canonical_name": "persona:PhysicalCard",
+   "description": "A physical card carried in a wallet, such as a driver's license, health insurance card, or payment card.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:PetMedicationRecord:v1",
+   "name": "PetMedicationRecord",
+   "canonical_name": "pets:PetMedicationRecord",
+   "description": "A shareable record of a pet's medications, each with dosage and administration details.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:Medication:v1",
+   "name": "Medication",
+   "canonical_name": "pets:Medication",
+   "description": "A single medication entry within a pet medication record, including active ingredients, dose form, dosage, and administration schedule.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:DosageAmount:v1",
+   "name": "DosageAmount",
+   "canonical_name": "pets:DosageAmount",
+   "description": "A structured dosage amount consisting of a decimal value and a unit of measure.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:MedicationAdministration:v1",
+   "name": "MedicationAdministration",
+   "canonical_name": "pets:MedicationAdministration",
+   "description": "The administration schedule for a medication, including frequency and start/end dates.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:ContactInfo:v1",
+   "name": "ContactInfo",
+   "canonical_name": "persona:ContactInfo",
+   "description": "A JSContact-style contact card carrying name, organization, and contact-channel claims for a subject.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:Anniversary:v1",
+   "name": "Anniversary",
+   "canonical_name": "persona:Anniversary",
+   "description": "A dated anniversary entry, such as a wedding date or a custom recurring date, attached to a contact card.",
+   "kind": "entity",
+   "primitive_representation": null
+  },
+  {
+   "type_id": "mee:legal-given-name:v1",
+   "name": "legal-given-name",
+   "canonical_name": "cco:ent00000002",
+   "description": "A person's legal given or first name.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:legal-family-name:v1",
+   "name": "legal-family-name",
+   "canonical_name": "cco:ent00000004",
+   "description": "A person's legal family or last name.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:email-address:v1",
+   "name": "email-address",
+   "canonical_name": "cco:ent00000024",
+   "description": "An electronic mail address recorded as a claim value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:phone-number:v1",
+   "name": "phone-number",
+   "canonical_name": "cco:ent00000023",
+   "description": "A telephone number recorded as a claim value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:home-address:v1",
+   "name": "home-address",
+   "canonical_name": "cco:ent00000010",
+   "description": "A residential or home address recorded as a claim value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:date-of-birth:v1",
+   "name": "date-of-birth",
+   "canonical_name": "cco:ent00000046",
+   "description": "A person's birth date.",
+   "kind": "scalar",
+   "primitive_representation": "date"
+  },
+  {
+   "type_id": "mee:age-over-18:v1",
+   "name": "age-over-18",
+   "canonical_name": "mee:age-over-18",
+   "description": "A boolean claim indicating whether a subject is at least eighteen years old.",
+   "kind": "scalar",
+   "primitive_representation": "bool"
+  },
+  {
+   "type_id": "mee:account-id:v1",
+   "name": "account-id",
+   "canonical_name": "mee:account-id",
+   "description": "An account identifier used by an external service or relying party.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:group-name:v1",
+   "name": "group-name",
+   "canonical_name": "mee:group-name",
+   "description": "The name of a group, club, or affiliation.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:payment-card-last4:v1",
+   "name": "payment-card-last4",
+   "canonical_name": "p:PhysicalPaymentCard",
+   "description": "The final four digits of a payment card number.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:seating-preference:v1",
+   "name": "seating-preference",
+   "canonical_name": "mee:seating-preference",
+   "description": "A person's seating preference for travel or events.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:meal-preference:v1",
+   "name": "meal-preference",
+   "canonical_name": "mee:meal-preference",
+   "description": "A person's meal preference for travel, events, or hospitality.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:safety-word:v1",
+   "name": "safety-word",
+   "canonical_name": "mee:safety-word",
+   "description": "A shared safety word or phrase recorded as a claim value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:primary-physician:v1",
+   "name": "primary-physician",
+   "canonical_name": "cat:PrimaryCarePhysician",
+   "description": "A primary-care physician recorded as a claim value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:vaccination-status:v1",
+   "name": "vaccination-status",
+   "canonical_name": "cat:MedicalHistory",
+   "description": "A free-text vaccination status or summary.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:allergy:v1",
+   "name": "allergy",
+   "canonical_name": "medicalappointments:allergy",
+   "description": "An allergy recorded as a single free-text string; repeat for multiple allergies.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:driver-license-status:v1",
+   "name": "driver-license-status",
+   "canonical_name": "cat:DriversLicense",
+   "description": "A driver-license status claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:membership-status:v1",
+   "name": "membership-status",
+   "canonical_name": "cat:Affiliations",
+   "description": "A membership or affiliation status claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:employment-title:v1",
+   "name": "employment-title",
+   "canonical_name": "persona:JobTitle",
+   "description": "A job or employment title claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:organization-affiliation:v1",
+   "name": "organization-affiliation",
+   "canonical_name": "o:Organization",
+   "description": "An organization with which a subject is affiliated.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:social-security-number:v1",
+   "name": "social-security-number",
+   "canonical_name": "cat:SSN",
+   "description": "A United States Social Security number claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:passport-number:v1",
+   "name": "passport-number",
+   "canonical_name": "cco:ent00000066",
+   "description": "A passport number identifying a government-issued passport.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:issuing-country:v1",
+   "name": "issuing-country",
+   "canonical_name": "cco:ent00000068",
+   "description": "The country that issued a government document such as a passport.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:place-of-birth:v1",
+   "name": "place-of-birth",
+   "canonical_name": "cco:ent00000067",
+   "description": "The place where a person was born as recorded on an identity document.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:gender-marker:v1",
+   "name": "gender-marker",
+   "canonical_name": "identitydocuments:GenderMarker",
+   "description": "The gender marker shown on a government-issued identity document.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:issue-date:v1",
+   "name": "issue-date",
+   "canonical_name": "cco:ent00000069",
+   "description": "The date on which a government document was issued.",
+   "kind": "scalar",
+   "primitive_representation": "date"
+  },
+  {
+   "type_id": "mee:drivers-license-number:v1",
+   "name": "drivers-license-number",
+   "canonical_name": "cco:ent00000065",
+   "description": "The license number printed on a driver's license document.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:issuing-jurisdiction:v1",
+   "name": "issuing-jurisdiction",
+   "canonical_name": "cco:ent00000068",
+   "description": "The jurisdiction that issued a state or regional identity document.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:credential:v1",
+   "name": "credential",
+   "canonical_name": "persona:Credential",
+   "description": "A credential or authorization claim value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:organization-unit:v1",
+   "name": "organization-unit",
+   "canonical_name": "persona:OrganizationUnit",
+   "description": "A department, team, or organizational unit claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:job-title:v1",
+   "name": "job-title",
+   "canonical_name": "persona:JobTitle",
+   "description": "A professional job title claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:personal-info-kind:v1",
+   "name": "personal-info-kind",
+   "canonical_name": "persona:personalInfoKind",
+   "description": "A label identifying the kind of personal information being recorded.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:personal-info-value:v1",
+   "name": "personal-info-value",
+   "canonical_name": "persona:personalInfoValue",
+   "description": "The value of a generic personal-information claim.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:personal-info-level:v1",
+   "name": "personal-info-level",
+   "canonical_name": "persona:personalInfoLevel",
+   "description": "A level or sensitivity classification for generic personal information.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:current-medication:v1",
+   "name": "current-medication",
+   "canonical_name": "medicalappointments:currentMedication",
+   "description": "A medication the patient is currently taking, represented as free text.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:medical-history-note:v1",
+   "name": "medical-history-note",
+   "canonical_name": "medicalappointments:medicalHistoryNote",
+   "description": "A free-text summary of relevant medical history or ongoing conditions.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:insurance-provider:v1",
+   "name": "insurance-provider",
+   "canonical_name": "medicalappointments:insuranceProvider",
+   "description": "The health insurance provider associated with a medical appointment record.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:insurance-policy-number:v1",
+   "name": "insurance-policy-number",
+   "canonical_name": "medicalappointments:insurancePolicyNumber",
+   "description": "The health insurance policy number associated with a medical appointment record.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:insurance-group-number:v1",
+   "name": "insurance-group-number",
+   "canonical_name": "medicalappointments:insuranceGroupNumber",
+   "description": "The health insurance group number associated with a medical appointment record.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:preferred-pharmacy:v1",
+   "name": "preferred-pharmacy",
+   "canonical_name": "medicalappointments:preferredPharmacy",
+   "description": "The patient's preferred pharmacy.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:physical-card-scan:v1",
+   "name": "physical-card-scan",
+   "canonical_name": "p:PhysicalCard",
+   "description": "A URI or reference to an image scan of a physical card.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:wallet-label:v1",
+   "name": "wallet-label",
+   "canonical_name": "rdfs:label",
+   "description": "A human-readable label for a wallet.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:health-insurance-card-id:v1",
+   "name": "health-insurance-card-id",
+   "canonical_name": "p:PhysicalHealthInsuranceCard",
+   "description": "An identifier printed on a physical health insurance card.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:medication-start-date:v1",
+   "name": "medication-start-date",
+   "canonical_name": "pets:MedicationAdministration",
+   "description": "Ontology type for medication start date; source reference pets:MedicationAdministration.",
+   "kind": "scalar",
+   "primitive_representation": "date"
+  },
+  {
+   "type_id": "mee:medication-end-date:v1",
+   "name": "medication-end-date",
+   "canonical_name": "pets:MedicationAdministration",
+   "description": "Ontology type for medication end date; source reference pets:MedicationAdministration.",
+   "kind": "scalar",
+   "primitive_representation": "date"
+  },
+  {
+   "type_id": "mee:anniversary-date:v1",
+   "name": "anniversary-date",
+   "canonical_name": "persona:Anniversary",
+   "description": "Ontology type for anniversary date; source reference persona:Anniversary.",
+   "kind": "scalar",
+   "primitive_representation": "date"
+  },
+  {
+   "type_id": "mee:network:v1",
+   "name": "network",
+   "canonical_name": "mee:network",
+   "description": "The payment network or card brand associated with a payment card.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:credit-card-number:v1",
+   "name": "credit-card-number",
+   "canonical_name": "mee:credit-card-number",
+   "description": "A payment card number identifying a credit or debit card account.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:cvv:v1",
+   "name": "cvv",
+   "canonical_name": "mee:cvv",
+   "description": "A payment card security code.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:expiry-month:v1",
+   "name": "expiry-month",
+   "canonical_name": "mee:expiry-month",
+   "description": "The calendar month in which a payment card expires.",
+   "kind": "scalar",
+   "primitive_representation": "int"
+  },
+  {
+   "type_id": "mee:expiry-year:v1",
+   "name": "expiry-year",
+   "canonical_name": "mee:expiry-year",
+   "description": "The calendar year in which a payment card expires.",
+   "kind": "scalar",
+   "primitive_representation": "int"
+  },
+  {
+   "type_id": "mee:license-number:v1",
+   "name": "license-number",
+   "canonical_name": "mee:license-number",
+   "description": "An identifier designating a driver-license credential.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:issuing-state:v1",
+   "name": "issuing-state",
+   "canonical_name": "mee:issuing-state",
+   "description": "The state or jurisdiction that issued a driver-license credential.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:driving-category-code:v1",
+   "name": "driving-category-code",
+   "canonical_name": "mee:driving-category-code",
+   "description": "The short code for a licensed driving category.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:driving-category-description:v1",
+   "name": "driving-category-description",
+   "canonical_name": "mee:driving-category-description",
+   "description": "The human-readable meaning of a driving category code.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:additional-name:v1",
+   "name": "additional-name",
+   "canonical_name": "cco:ent00000003",
+   "description": "An additional or middle name component on an identity document.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:alternate-name:v1",
+   "name": "alternate-name",
+   "canonical_name": "mee:alternate-name",
+   "description": "Ontology type for alternate name; source reference mee:alternate-name.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:expiration-date:v1",
+   "name": "expiration-date",
+   "canonical_name": "cco:ont00001340",
+   "description": "The date on which a credential or document expires.",
+   "kind": "scalar",
+   "primitive_representation": "date"
+  },
+  {
+   "type_id": "mee:photo-uri:v1",
+   "name": "photo-uri",
+   "canonical_name": "persona:hasPhoto",
+   "description": "A URI or reference to a photo associated with an identity document.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:checking-account-number:v1",
+   "name": "checking-account-number",
+   "canonical_name": "cco:ent00000071",
+   "description": "An identifier designating a bank checking account.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:routing-number:v1",
+   "name": "routing-number",
+   "canonical_name": "cco:ent00000072",
+   "description": "An ABA routing transit number identifying a financial institution.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:physical-card-kind:v1",
+   "name": "physical-card-kind",
+   "canonical_name": "rdf:type",
+   "description": "The kind of physical card, such as debit, driver's license, or health insurance.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:active-ingredient:v1",
+   "name": "active-ingredient",
+   "canonical_name": "mee:active-ingredient",
+   "description": "Ontology type for active ingredient; source reference mee:active-ingredient.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:dose-form:v1",
+   "name": "dose-form",
+   "canonical_name": "mee:dose-form",
+   "description": "Ontology type for dose form; source reference mee:dose-form.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:medication-brand-name:v1",
+   "name": "medication-brand-name",
+   "canonical_name": "mee:medication-brand-name",
+   "description": "Ontology type for medication brand name; source reference mee:medication-brand-name.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:medication-manufacturer:v1",
+   "name": "medication-manufacturer",
+   "canonical_name": "mee:medication-manufacturer",
+   "description": "Ontology type for medication manufacturer; source reference mee:medication-manufacturer.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:medication-duration:v1",
+   "name": "medication-duration",
+   "canonical_name": "mee:medication-duration",
+   "description": "Ontology type for medication duration; source reference mee:medication-duration.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:dosage-value:v1",
+   "name": "dosage-value",
+   "canonical_name": "mee:dosage-value",
+   "description": "Ontology type for dosage value; source reference mee:dosage-value.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:dosage-unit:v1",
+   "name": "dosage-unit",
+   "canonical_name": "mee:dosage-unit",
+   "description": "Ontology type for dosage unit; source reference mee:dosage-unit.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:medication-frequency:v1",
+   "name": "medication-frequency",
+   "canonical_name": "mee:medication-frequency",
+   "description": "Ontology type for medication frequency; source reference mee:medication-frequency.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:honorific-prefix:v1",
+   "name": "honorific-prefix",
+   "canonical_name": "mee:honorific-prefix",
+   "description": "Ontology type for honorific prefix; source reference mee:honorific-prefix.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:suffix:v1",
+   "name": "suffix",
+   "canonical_name": "mee:suffix",
+   "description": "Ontology type for suffix; source reference mee:suffix.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:nickname:v1",
+   "name": "nickname",
+   "canonical_name": "mee:nickname",
+   "description": "Ontology type for nickname; source reference mee:nickname.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:organization-name:v1",
+   "name": "organization-name",
+   "canonical_name": "mee:organization-name",
+   "description": "Ontology type for organization name; source reference mee:organization-name.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:web-url:v1",
+   "name": "web-url",
+   "canonical_name": "mee:web-url",
+   "description": "Ontology type for web url; source reference mee:web-url.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:anniversary-kind:v1",
+   "name": "anniversary-kind",
+   "canonical_name": "mee:anniversary-kind",
+   "description": "Ontology type for anniversary kind; source reference mee:anniversary-kind.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  },
+  {
+   "type_id": "mee:anniversary-label:v1",
+   "name": "anniversary-label",
+   "canonical_name": "mee:anniversary-label",
+   "description": "Ontology type for anniversary label; source reference mee:anniversary-label.",
+   "kind": "scalar",
+   "primitive_representation": "string"
+  }
+ ],
+ "fields": [
+  {
+   "field_id": "mee:PaymentCard:v1.network",
+   "member_key": "network",
+   "display_name": "network",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:PaymentCard:v1.credit_card_number",
+   "member_key": "credit_card_number",
+   "display_name": "credit_card_number",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:PaymentCard:v1.cvv",
+   "member_key": "cvv",
+   "display_name": "cvv",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:PaymentCard:v1.expiry_month",
+   "member_key": "expiry_month",
+   "display_name": "expiry_month",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:PaymentCard:v1.expiry_year",
+   "member_key": "expiry_year",
+   "display_name": "expiry_year",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "mee:DriverLicense:v1.issuing_state",
+   "member_key": "issuing_state",
+   "display_name": "issuing_state",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 5
+  },
+  {
+   "field_id": "mee:DriverLicense:v1.license_number",
+   "member_key": "license_number",
+   "display_name": "license_number",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 6
+  },
+  {
+   "field_id": "mee:DriverLicense:v1.driving_category",
+   "member_key": "driving_category",
+   "display_name": "driving_category",
+   "required": true,
+   "cardinality": "many",
+   "ordinal": 7
+  },
+  {
+   "field_id": "mee:DrivingCategory:v1.category_code",
+   "member_key": "category_code",
+   "display_name": "category_code",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 8
+  },
+  {
+   "field_id": "mee:DrivingCategory:v1.category_description",
+   "member_key": "category_description",
+   "display_name": "category_description",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 9
+  },
+  {
+   "field_id": "mee:BirthCertificateDocument:v1.given_name",
+   "member_key": "given_name",
+   "display_name": "cco:ont00001879[cco:ent00000002]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:BirthCertificateDocument:v1.family_name",
+   "member_key": "family_name",
+   "display_name": "cco:ont00001879[cco:ent00000004]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:BirthCertificateDocument:v1.additional_name",
+   "member_key": "additional_name",
+   "display_name": "cco:ont00001879[cco:ent00000003]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:BirthCertificateDocument:v1.alternate_name",
+   "member_key": "alternate_name",
+   "display_name": "cco:ont00001879[cco:ent00000006]",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.given_name",
+   "member_key": "given_name",
+   "display_name": "cco:ont00001879[cco:ent00000002]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.family_name",
+   "member_key": "family_name",
+   "display_name": "cco:ont00001879[cco:ent00000004]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.date_of_birth",
+   "member_key": "date_of_birth",
+   "display_name": "cco:ont00001879[cco:ent00000046]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.drivers_license_number",
+   "member_key": "drivers_license_number",
+   "display_name": "BFO:0000101[cco:ent00000065]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.expiration_date",
+   "member_key": "expiration_date",
+   "display_name": "cco:ent00000070[cco:ont00001340]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.additional_name",
+   "member_key": "additional_name",
+   "display_name": "cco:ont00001879[cco:ent00000003]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 5
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.residential_address",
+   "member_key": "residential_address",
+   "display_name": "cco:ont00001879[cco:ent00000010]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 6
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.issuing_jurisdiction",
+   "member_key": "issuing_jurisdiction",
+   "display_name": "cco:ont00001879[cco:ent00000068]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 7
+  },
+  {
+   "field_id": "mee:DriversLicenseDocument:v1.photo",
+   "member_key": "photo",
+   "display_name": "persona:hasPhoto",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 8
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.given_name",
+   "member_key": "given_name",
+   "display_name": "cco:ont00001879[cco:ent00000002]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.family_name",
+   "member_key": "family_name",
+   "display_name": "cco:ont00001879[cco:ent00000004]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.date_of_birth",
+   "member_key": "date_of_birth",
+   "display_name": "cco:ont00001879[cco:ent00000046]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.passport_number",
+   "member_key": "passport_number",
+   "display_name": "BFO:0000101[cco:ent00000066]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.expiration_date",
+   "member_key": "expiration_date",
+   "display_name": "cco:ent00000070[cco:ont00001340]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.additional_name",
+   "member_key": "additional_name",
+   "display_name": "cco:ont00001879[cco:ent00000003]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 5
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.issue_date",
+   "member_key": "issue_date",
+   "display_name": "cco:ent00000069[cco:ont00001340]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 6
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.issuing_country",
+   "member_key": "issuing_country",
+   "display_name": "cco:ont00001879[cco:ent00000068]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 7
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.place_of_birth",
+   "member_key": "place_of_birth",
+   "display_name": "cco:ont00001879[cco:ent00000067]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 8
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.gender_marker",
+   "member_key": "gender_marker",
+   "display_name": "cco:ont00001879[identitydocuments:GenderMarker]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 9
+  },
+  {
+   "field_id": "mee:PassportDocument:v1.photo",
+   "member_key": "photo",
+   "display_name": "persona:hasPhoto",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 10
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.for_patient",
+   "member_key": "for_patient",
+   "display_name": "medicalappointments:forPatient",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.insurance_provider",
+   "member_key": "insurance_provider",
+   "display_name": "medicalappointments:insuranceProvider",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.insurance_policy_number",
+   "member_key": "insurance_policy_number",
+   "display_name": "medicalappointments:insurancePolicyNumber",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.primary_care_physician",
+   "member_key": "primary_care_physician",
+   "display_name": "medicalappointments:hasPrimaryCarePhysician",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.medical_history_note",
+   "member_key": "medical_history_note",
+   "display_name": "medicalappointments:medicalHistoryNote",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.insurance_group_number",
+   "member_key": "insurance_group_number",
+   "display_name": "medicalappointments:insuranceGroupNumber",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 5
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.preferred_pharmacy",
+   "member_key": "preferred_pharmacy",
+   "display_name": "medicalappointments:preferredPharmacy",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 6
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.current_medication",
+   "member_key": "current_medication",
+   "display_name": "medicalappointments:currentMedication",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 7
+  },
+  {
+   "field_id": "mee:MedicalAppointmentRecord:v1.allergy",
+   "member_key": "allergy",
+   "display_name": "medicalappointments:allergy",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 8
+  },
+  {
+   "field_id": "mee:CheckingAccount:v1.account_number",
+   "member_key": "account_number",
+   "display_name": "cco:ont00001879[cco:ent00000071]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:CheckingAccount:v1.routing_number",
+   "member_key": "routing_number",
+   "display_name": "cco:ont00001879[cco:ent00000072]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:Wallet:v1.label",
+   "member_key": "label",
+   "display_name": "rdfs:label",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:Wallet:v1.physical_card",
+   "member_key": "physical_card",
+   "display_name": "inverse(BFO:0000176)",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:PhysicalCard:v1.card_kind",
+   "member_key": "card_kind",
+   "display_name": "rdf:type",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:PhysicalCard:v1.image_scan",
+   "member_key": "image_scan",
+   "display_name": "persona:hasImageScan",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:PetMedicationRecord:v1.medication",
+   "member_key": "medication",
+   "display_name": "pets:hasMedication",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:Medication:v1.active_ingredient",
+   "member_key": "active_ingredient",
+   "display_name": "pets:hasActiveIngredient",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:Medication:v1.dose_form",
+   "member_key": "dose_form",
+   "display_name": "pets:hasDoseForm",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:Medication:v1.dosage_amount",
+   "member_key": "dosage_amount",
+   "display_name": "pets:hasDosageAmount",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:Medication:v1.administration",
+   "member_key": "administration",
+   "display_name": "pets:hasAdministration",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:Medication:v1.brand_name",
+   "member_key": "brand_name",
+   "display_name": "pets:medicationBrandName",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "mee:Medication:v1.manufacturer",
+   "member_key": "manufacturer",
+   "display_name": "pets:medicationManufacturer",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 5
+  },
+  {
+   "field_id": "mee:Medication:v1.duration",
+   "member_key": "duration",
+   "display_name": "pets:medicationDuration",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 6
+  },
+  {
+   "field_id": "mee:DosageAmount:v1.value",
+   "member_key": "value",
+   "display_name": "cco:hasDecimalValue",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:DosageAmount:v1.unit",
+   "member_key": "unit",
+   "display_name": "UCUM:unit",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:MedicationAdministration:v1.frequency",
+   "member_key": "frequency",
+   "display_name": "pets:medicationFrequencyPerDay",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:MedicationAdministration:v1.start_date",
+   "member_key": "start_date",
+   "display_name": "BFO:0000199[cco:ent00000017]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:MedicationAdministration:v1.end_date",
+   "member_key": "end_date",
+   "display_name": "BFO:0000199[cco:ent00000018]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.given_name",
+   "member_key": "given_name",
+   "display_name": "cco:ont00001879[cco:ent00000002]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.family_name",
+   "member_key": "family_name",
+   "display_name": "cco:ont00001879[cco:ent00000004]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.additional_name",
+   "member_key": "additional_name",
+   "display_name": "cco:ont00001879[cco:ent00000003]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.honorific_prefix",
+   "member_key": "honorific_prefix",
+   "display_name": "cco:ont00001879[cco:ent00000057]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 3
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.suffix",
+   "member_key": "suffix",
+   "display_name": "cco:ont00001879[cco:ent00000005]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 4
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.nickname",
+   "member_key": "nickname",
+   "display_name": "cco:ont00001879[cco:ent00000006]",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 5
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.credential",
+   "member_key": "credential",
+   "display_name": "persona:Credential",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 6
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.organization_name",
+   "member_key": "organization_name",
+   "display_name": "cco:ont00001879[cco:ent00000047]",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 7
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.organization_unit",
+   "member_key": "organization_unit",
+   "display_name": "persona:OrganizationUnit",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 8
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.job_title",
+   "member_key": "job_title",
+   "display_name": "persona:JobTitle",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 9
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.email_address",
+   "member_key": "email_address",
+   "display_name": "cco:ent00000024",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 10
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.phone_number",
+   "member_key": "phone_number",
+   "display_name": "cco:ent00000023",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 11
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.web_url",
+   "member_key": "web_url",
+   "display_name": "persona:WebURL",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 12
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.anniversary",
+   "member_key": "anniversary",
+   "display_name": "persona:hasAnniversary",
+   "required": false,
+   "cardinality": "many",
+   "ordinal": 13
+  },
+  {
+   "field_id": "mee:ContactInfo:v1.photo",
+   "member_key": "photo",
+   "display_name": "persona:hasPhoto",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 14
+  },
+  {
+   "field_id": "mee:Anniversary:v1.kind",
+   "member_key": "kind",
+   "display_name": "persona:anniversaryKind",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 0
+  },
+  {
+   "field_id": "mee:Anniversary:v1.date",
+   "member_key": "date",
+   "display_name": "persona:anniversaryDate",
+   "required": true,
+   "cardinality": "one",
+   "ordinal": 1
+  },
+  {
+   "field_id": "mee:Anniversary:v1.label",
+   "member_key": "label",
+   "display_name": "persona:anniversaryLabel",
+   "required": false,
+   "cardinality": "one",
+   "ordinal": 2
+  }
+ ],
+ "type_has_field": [
+  [
+   "mee:PaymentCard:v1",
+   "mee:PaymentCard:v1.network"
+  ],
+  [
+   "mee:PaymentCard:v1",
+   "mee:PaymentCard:v1.credit_card_number"
+  ],
+  [
+   "mee:PaymentCard:v1",
+   "mee:PaymentCard:v1.cvv"
+  ],
+  [
+   "mee:PaymentCard:v1",
+   "mee:PaymentCard:v1.expiry_month"
+  ],
+  [
+   "mee:PaymentCard:v1",
+   "mee:PaymentCard:v1.expiry_year"
+  ],
+  [
+   "mee:DriverLicense:v1",
+   "mee:DriverLicense:v1.issuing_state"
+  ],
+  [
+   "mee:DriverLicense:v1",
+   "mee:DriverLicense:v1.license_number"
+  ],
+  [
+   "mee:DriverLicense:v1",
+   "mee:DriverLicense:v1.driving_category"
+  ],
+  [
+   "mee:DrivingCategory:v1",
+   "mee:DrivingCategory:v1.category_code"
+  ],
+  [
+   "mee:DrivingCategory:v1",
+   "mee:DrivingCategory:v1.category_description"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1",
+   "mee:BirthCertificateDocument:v1.given_name"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1",
+   "mee:BirthCertificateDocument:v1.family_name"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1",
+   "mee:BirthCertificateDocument:v1.additional_name"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1",
+   "mee:BirthCertificateDocument:v1.alternate_name"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.given_name"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.family_name"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.date_of_birth"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.drivers_license_number"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.expiration_date"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.additional_name"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.residential_address"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.issuing_jurisdiction"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1",
+   "mee:DriversLicenseDocument:v1.photo"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.given_name"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.family_name"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.date_of_birth"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.passport_number"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.expiration_date"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.additional_name"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.issue_date"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.issuing_country"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.place_of_birth"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.gender_marker"
+  ],
+  [
+   "mee:PassportDocument:v1",
+   "mee:PassportDocument:v1.photo"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.for_patient"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.insurance_provider"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.insurance_policy_number"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.primary_care_physician"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.medical_history_note"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.insurance_group_number"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.preferred_pharmacy"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.current_medication"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1",
+   "mee:MedicalAppointmentRecord:v1.allergy"
+  ],
+  [
+   "mee:CheckingAccount:v1",
+   "mee:CheckingAccount:v1.account_number"
+  ],
+  [
+   "mee:CheckingAccount:v1",
+   "mee:CheckingAccount:v1.routing_number"
+  ],
+  [
+   "mee:Wallet:v1",
+   "mee:Wallet:v1.label"
+  ],
+  [
+   "mee:Wallet:v1",
+   "mee:Wallet:v1.physical_card"
+  ],
+  [
+   "mee:PhysicalCard:v1",
+   "mee:PhysicalCard:v1.card_kind"
+  ],
+  [
+   "mee:PhysicalCard:v1",
+   "mee:PhysicalCard:v1.image_scan"
+  ],
+  [
+   "mee:PetMedicationRecord:v1",
+   "mee:PetMedicationRecord:v1.medication"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.active_ingredient"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.dose_form"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.dosage_amount"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.administration"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.brand_name"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.manufacturer"
+  ],
+  [
+   "mee:Medication:v1",
+   "mee:Medication:v1.duration"
+  ],
+  [
+   "mee:DosageAmount:v1",
+   "mee:DosageAmount:v1.value"
+  ],
+  [
+   "mee:DosageAmount:v1",
+   "mee:DosageAmount:v1.unit"
+  ],
+  [
+   "mee:MedicationAdministration:v1",
+   "mee:MedicationAdministration:v1.frequency"
+  ],
+  [
+   "mee:MedicationAdministration:v1",
+   "mee:MedicationAdministration:v1.start_date"
+  ],
+  [
+   "mee:MedicationAdministration:v1",
+   "mee:MedicationAdministration:v1.end_date"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.given_name"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.family_name"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.additional_name"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.honorific_prefix"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.suffix"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.nickname"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.credential"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.organization_name"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.organization_unit"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.job_title"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.email_address"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.phone_number"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.web_url"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.anniversary"
+  ],
+  [
+   "mee:ContactInfo:v1",
+   "mee:ContactInfo:v1.photo"
+  ],
+  [
+   "mee:Anniversary:v1",
+   "mee:Anniversary:v1.kind"
+  ],
+  [
+   "mee:Anniversary:v1",
+   "mee:Anniversary:v1.date"
+  ],
+  [
+   "mee:Anniversary:v1",
+   "mee:Anniversary:v1.label"
+  ]
+ ],
+ "field_value_type": [
+  [
+   "mee:PaymentCard:v1.network",
+   "mee:network:v1"
+  ],
+  [
+   "mee:PaymentCard:v1.credit_card_number",
+   "mee:credit-card-number:v1"
+  ],
+  [
+   "mee:PaymentCard:v1.cvv",
+   "mee:cvv:v1"
+  ],
+  [
+   "mee:PaymentCard:v1.expiry_month",
+   "mee:expiry-month:v1"
+  ],
+  [
+   "mee:PaymentCard:v1.expiry_year",
+   "mee:expiry-year:v1"
+  ],
+  [
+   "mee:DriverLicense:v1.issuing_state",
+   "mee:issuing-state:v1"
+  ],
+  [
+   "mee:DriverLicense:v1.license_number",
+   "mee:license-number:v1"
+  ],
+  [
+   "mee:DriverLicense:v1.driving_category",
+   "mee:DrivingCategory:v1"
+  ],
+  [
+   "mee:DrivingCategory:v1.category_code",
+   "mee:driving-category-code:v1"
+  ],
+  [
+   "mee:DrivingCategory:v1.category_description",
+   "mee:driving-category-description:v1"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1.given_name",
+   "mee:legal-given-name:v1"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1.family_name",
+   "mee:legal-family-name:v1"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1.additional_name",
+   "mee:additional-name:v1"
+  ],
+  [
+   "mee:BirthCertificateDocument:v1.alternate_name",
+   "mee:alternate-name:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.given_name",
+   "mee:legal-given-name:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.family_name",
+   "mee:legal-family-name:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.date_of_birth",
+   "mee:date-of-birth:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.drivers_license_number",
+   "mee:drivers-license-number:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.expiration_date",
+   "mee:expiration-date:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.additional_name",
+   "mee:additional-name:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.residential_address",
+   "mee:home-address:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.issuing_jurisdiction",
+   "mee:issuing-jurisdiction:v1"
+  ],
+  [
+   "mee:DriversLicenseDocument:v1.photo",
+   "mee:photo-uri:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.given_name",
+   "mee:legal-given-name:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.family_name",
+   "mee:legal-family-name:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.date_of_birth",
+   "mee:date-of-birth:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.passport_number",
+   "mee:passport-number:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.expiration_date",
+   "mee:expiration-date:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.additional_name",
+   "mee:additional-name:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.issue_date",
+   "mee:issue-date:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.issuing_country",
+   "mee:issuing-country:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.place_of_birth",
+   "mee:place-of-birth:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.gender_marker",
+   "mee:gender-marker:v1"
+  ],
+  [
+   "mee:PassportDocument:v1.photo",
+   "mee:photo-uri:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.for_patient",
+   "mee:Person:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.insurance_provider",
+   "mee:insurance-provider:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.insurance_policy_number",
+   "mee:insurance-policy-number:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.primary_care_physician",
+   "mee:Person:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.medical_history_note",
+   "mee:medical-history-note:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.insurance_group_number",
+   "mee:insurance-group-number:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.preferred_pharmacy",
+   "mee:preferred-pharmacy:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.current_medication",
+   "mee:current-medication:v1"
+  ],
+  [
+   "mee:MedicalAppointmentRecord:v1.allergy",
+   "mee:allergy:v1"
+  ],
+  [
+   "mee:CheckingAccount:v1.account_number",
+   "mee:checking-account-number:v1"
+  ],
+  [
+   "mee:CheckingAccount:v1.routing_number",
+   "mee:routing-number:v1"
+  ],
+  [
+   "mee:Wallet:v1.label",
+   "mee:wallet-label:v1"
+  ],
+  [
+   "mee:Wallet:v1.physical_card",
+   "mee:PhysicalCard:v1"
+  ],
+  [
+   "mee:PhysicalCard:v1.card_kind",
+   "mee:physical-card-kind:v1"
+  ],
+  [
+   "mee:PhysicalCard:v1.image_scan",
+   "mee:physical-card-scan:v1"
+  ],
+  [
+   "mee:PetMedicationRecord:v1.medication",
+   "mee:Medication:v1"
+  ],
+  [
+   "mee:Medication:v1.active_ingredient",
+   "mee:active-ingredient:v1"
+  ],
+  [
+   "mee:Medication:v1.dose_form",
+   "mee:dose-form:v1"
+  ],
+  [
+   "mee:Medication:v1.dosage_amount",
+   "mee:DosageAmount:v1"
+  ],
+  [
+   "mee:Medication:v1.administration",
+   "mee:MedicationAdministration:v1"
+  ],
+  [
+   "mee:Medication:v1.brand_name",
+   "mee:medication-brand-name:v1"
+  ],
+  [
+   "mee:Medication:v1.manufacturer",
+   "mee:medication-manufacturer:v1"
+  ],
+  [
+   "mee:Medication:v1.duration",
+   "mee:medication-duration:v1"
+  ],
+  [
+   "mee:DosageAmount:v1.value",
+   "mee:dosage-value:v1"
+  ],
+  [
+   "mee:DosageAmount:v1.unit",
+   "mee:dosage-unit:v1"
+  ],
+  [
+   "mee:MedicationAdministration:v1.frequency",
+   "mee:medication-frequency:v1"
+  ],
+  [
+   "mee:MedicationAdministration:v1.start_date",
+   "mee:medication-start-date:v1"
+  ],
+  [
+   "mee:MedicationAdministration:v1.end_date",
+   "mee:medication-end-date:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.given_name",
+   "mee:legal-given-name:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.family_name",
+   "mee:legal-family-name:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.additional_name",
+   "mee:additional-name:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.honorific_prefix",
+   "mee:honorific-prefix:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.suffix",
+   "mee:suffix:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.nickname",
+   "mee:nickname:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.credential",
+   "mee:credential:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.organization_name",
+   "mee:organization-name:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.organization_unit",
+   "mee:organization-unit:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.job_title",
+   "mee:job-title:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.email_address",
+   "mee:email-address:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.phone_number",
+   "mee:phone-number:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.web_url",
+   "mee:web-url:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.anniversary",
+   "mee:Anniversary:v1"
+  ],
+  [
+   "mee:ContactInfo:v1.photo",
+   "mee:photo-uri:v1"
+  ],
+  [
+   "mee:Anniversary:v1.kind",
+   "mee:anniversary-kind:v1"
+  ],
+  [
+   "mee:Anniversary:v1.date",
+   "mee:anniversary-date:v1"
+  ],
+  [
+   "mee:Anniversary:v1.label",
+   "mee:anniversary-label:v1"
+  ]
+ ]
+}

@@ -4,3 +4,10 @@
 # Resolution skips registry versions younger than this; to be uncommented after Cargo 1.100 is released.
 # [registry]
 # global-min-publish-age = "7 days"
+
+# crates/graph-query-engine: LadybugDB built from the tree `just lbug-vector-source`
+# assembles, its vector extension linked in. Where the tree is missing, lbug
+# builds its bundled engine, without the extension.
+[env]
+LBUG_BUILD_FROM_SOURCE = "1"
+LBUG_SOURCE_DIR = { value = "crates/graph-query-engine/.lbug-src", relative = true }
