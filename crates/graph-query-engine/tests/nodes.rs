@@ -24,7 +24,7 @@ fn record(key: &str, author: &str, second: i64, bytes: Value) -> Record {
         id: format!("{key}.{second}.{author}"),
         key: key.into(),
         author: author.into(),
-        at: OffsetDateTime::from_unix_timestamp(1_790_000_000 + second).unwrap(),
+        at: OffsetDateTime::from_unix_timestamp(1_790_000_000 + second).expect("a time in range"),
         device: Some(format!("{author}-phone")),
         bytes: serde_json::to_vec(&bytes).expect("a JSON value serializes"),
     }

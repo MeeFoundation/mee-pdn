@@ -8,9 +8,9 @@ use common::*;
 use graph_query_engine::db::{zone, GraphDb};
 use graph_query_engine::Ontology;
 
-/// A bulk load that cannot stage its files leaves nothing behind, and every key is applied one at a time instead.
+/// A bulk load that cannot stage its files writes nothing, and every key is applied one at a time instead. A load that fails after writing is in `catch_up.rs`.
 #[test]
-fn a_bulk_load_that_cannot_stage_its_files_leaves_nothing_and_the_keys_are_applied_one_at_a_time() {
+fn a_bulk_load_that_cannot_stage_its_files_falls_back_to_one_key_at_a_time() {
     let db = GraphDb::in_memory(&Ontology::platform())
         .unwrap()
         .with_bulk_threshold(10);
@@ -37,10 +37,6 @@ fn a_bulk_load_that_cannot_stage_its_files_leaves_nothing_and_the_keys_are_appli
     let read = db
         .find_in(&["p".into()], &[zone("p", NOTES)], None, None)
         .unwrap();
-    assert_eq!(
-        read.len(),
-        40,
-        "each note once: the failed load left nothing behind"
-    );
+    assert_eq!(read.len(), 40, "each note once");
     assert_eq!(read[0].value["content"], "note 00");
 }

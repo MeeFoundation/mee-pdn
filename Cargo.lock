@@ -1758,11 +1758,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "graph-query-engine",
  "lbug",
  "serde",
  "serde_json",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -177,6 +177,37 @@ fn two_nodes_that_do_not_fit_are_skipped_and_the_other_ten_load() {
     );
 }
 
+/// A bulk load that fails after its subjects and nodes have committed leaves nothing of what it wrote: the keys applied one at a time instead give the graph applying them key by key gives, subjects and their types included.
+#[test]
+fn a_bulk_load_that_fails_leaves_nothing_and_its_keys_are_applied_one_at_a_time() {
+    let records: Vec<_> = (0..40).map(med_record).collect();
+    let failing = graph(10).with_bulk_failing_at("Link");
+    let applied = failing.catch_up_zone("p", MEDS, &Meds, &records).unwrap();
+    assert_eq!(
+        (applied.bulk, applied.appended, applied.skipped),
+        (0, 40, 0),
+        "every key applied one at a time instead"
+    );
+
+    let key_by_key = graph(1_000);
+    key_by_key
+        .catch_up_zone("p", MEDS, &Meds, &records)
+        .unwrap();
+    let (pods, zones) = (["p".to_owned()], [zone("p", MEDS)]);
+    let read = failing.find_in(&pods, &zones, None, None).unwrap();
+    assert_eq!(read.len(), 40, "each claim once");
+    assert_eq!(read, key_by_key.find_in(&pods, &zones, None, None).unwrap());
+    let subjects = failing.subjects_in(&pods, &zones).unwrap();
+    assert_eq!(subjects.len(), 5);
+    assert!(
+        subjects
+            .iter()
+            .all(|s| s.type_id.as_deref() == Some(SUBJECT)),
+        "every subject keeps its type: {subjects:?}"
+    );
+    assert_eq!(subjects, key_by_key.subjects_in(&pods, &zones).unwrap());
+}
+
 /// A key added after a bulk load is applied on its own.
 #[test]
 fn a_new_key_after_the_first_load_is_applied_on_its_own() {

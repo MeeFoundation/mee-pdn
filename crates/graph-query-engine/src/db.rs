@@ -296,6 +296,8 @@ pub struct GraphDb {
     /// built only where this is one of them.
     identity: Option<String>,
     state: Mutex<State>,
+    /// The table a bulk load fails at, set only by the crate's tests.
+    bulk_fails_at: Option<&'static str>,
     /// Reads share it; a catch-up holds it alone, so no read sees part of
     /// what a catch-up writes, a bulk load's tables among them.
     gate: std::sync::RwLock<()>,
@@ -327,6 +329,7 @@ impl GraphDb {
                 shapes: HashMap::new(),
                 generalizations: HashMap::new(),
             }),
+            bulk_fails_at: None,
             gate: std::sync::RwLock::new(()),
         };
         {
@@ -337,6 +340,15 @@ impl GraphDb {
             load_registry(&conn, tables)?;
         }
         Ok(graph)
+    }
+
+    /// Fail every bulk load at the `COPY` into `table`, after the tables
+    /// before it have committed.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn with_bulk_failing_at(mut self, table: &'static str) -> Self {
+        self.bulk_fails_at = Some(table);
+        self
     }
 
     /// Bulk-load a new zone's backlog from this many nodes up, rather than
@@ -621,8 +633,8 @@ impl GraphDb {
         Ok(applied)
     }
 
-    /// Load fresh zones in one bulk load; where it fails, clear them and
-    /// apply them key by key.
+    /// Load fresh zones in one bulk load; where it fails, take out what it
+    /// wrote, the subjects it made among them, and apply the zones key by key.
     fn load_in_bulk(
         &self,
         conn: &Connection<'_>,
@@ -646,11 +658,26 @@ impl GraphDb {
             }
             per_zone.push((planned, skipped, withheld));
         }
-        let bulked = bulk_load(conn, &plans, &links, &self.known_types).is_ok();
-        if !bulked {
+        let mut made_subjects = Vec::new();
+        let loaded = bulk_load(
+            conn,
+            &plans,
+            &links,
+            &self.known_types,
+            &mut made_subjects,
+            self.bulk_fails_at,
+        );
+        let bulked = loaded.is_ok();
+        if let Err(e) = loaded {
+            let zones: Vec<String> = which.iter().map(|p| zone(&p.pod, &p.tool)).collect();
+            tracing::warn!(
+                ?zones,
+                "a bulk load failed, its zones are applied key by key: {e}"
+            );
             for p in which {
                 clear_zone(conn, &p.pod, &p.tool)?;
             }
+            remove_subjects(conn, &made_subjects)?;
         }
         let mut applied = Applied::default();
         for (p, (planned, skipped, withheld)) in which.iter().zip(per_zone) {
@@ -2783,13 +2810,25 @@ fn append_one(
 /// Load fresh zones' backlog: node tables by `COPY`, value nodes by
 /// prepared `CREATE`, edge tables by `COPY`.
 #[allow(clippy::too_many_lines)] // one bulk load, table by table, each before the edges that need it
+///
+/// Each subject the load makes is pushed to `made` before any table is
+/// copied, so a load that fails can take them out again. `fails_at`
+/// names a table whose `COPY` fails, for the crate's tests.
 fn bulk_load(
     conn: &Connection<'_>,
     plans: &[Plan<'_>],
     links: &[LinkPlan],
     known_types: &HashSet<String>,
+    made: &mut Vec<String>,
+    fails_at: Option<&str>,
 ) -> Result<(), String> {
     let dir = Staging::new()?;
+    let copy = |table: &str, header: &[&str], rows: &[Vec<String>]| {
+        if fails_at == Some(table) {
+            return Err(format!("the bulk load is made to fail at {table}"));
+        }
+        copy(conn, &dir, table, header, rows)
+    };
     let mut subjects: Vec<Vec<String>> = Vec::new();
     let mut subject_types: Vec<Vec<String>> = Vec::new();
     let mut seen_subjects = HashSet::new();
@@ -2800,6 +2839,7 @@ fn bulk_load(
         let (n, pod) = (plan.node, plan.pod);
         if let (Some(subject), Some(subject_key)) = (&n.subject, plan.subject_key()) {
             if seen_subjects.insert(subject_key.clone()) && !subject_exists(conn, &subject_key)? {
+                made.push(subject_key.clone());
                 subjects.push(vec![
                     subject_key.clone(),
                     pod.to_owned(),
@@ -2862,15 +2902,11 @@ fn bulk_load(
         .collect();
 
     copy(
-        conn,
-        &dir,
         "Subject",
         &["subject_key", "pod_id", "subject_id", "display_name"],
         &subjects,
     )?;
     copy(
-        conn,
-        &dir,
         "Node",
         &[
             "node_key",
@@ -2887,8 +2923,6 @@ fn bulk_load(
         &nodes,
     )?;
     copy(
-        conn,
-        &dir,
         "Link",
         &[
             "link_key",
@@ -2911,19 +2945,11 @@ fn bulk_load(
         }
         Ok(())
     })?;
+    copy("SUBJECT_HAS_TYPE", &["from", "to"], &subject_types)?;
+    copy("NODE_ABOUT", &["from", "to"], &about)?;
+    copy("NODE_HAS_VALUE", &["from", "to"], &has_value)?;
+    copy("VALUE_HAS_TYPE", &["from", "to"], &value_type)?;
     copy(
-        conn,
-        &dir,
-        "SUBJECT_HAS_TYPE",
-        &["from", "to"],
-        &subject_types,
-    )?;
-    copy(conn, &dir, "NODE_ABOUT", &["from", "to"], &about)?;
-    copy(conn, &dir, "NODE_HAS_VALUE", &["from", "to"], &has_value)?;
-    copy(conn, &dir, "VALUE_HAS_TYPE", &["from", "to"], &value_type)?;
-    copy(
-        conn,
-        &dir,
         "VALUE_HAS_OBJECT_MEMBER",
         &[
             "from",
@@ -2936,8 +2962,6 @@ fn bulk_load(
         &members,
     )?;
     copy(
-        conn,
-        &dir,
         "VALUE_HAS_LIST_ITEM",
         &["from", "to", "containment_id", "index"],
         &items,
@@ -2952,6 +2976,19 @@ fn subject_exists(conn: &Connection<'_>, subject_key: &str) -> Result<bool, Stri
         vec![("key", s(subject_key))],
     )?;
     Ok(rows.first().and_then(|r| r.first()).map_or(0, int) > 0)
+}
+
+/// Remove the subjects `keys` name, with their type edges.
+fn remove_subjects(conn: &Connection<'_>, keys: &[String]) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    run(
+        conn,
+        "MATCH (s:Subject) WHERE s.subject_key IN $keys DETACH DELETE s;",
+        vec![("keys", list(keys))],
+    )?;
+    Ok(())
 }
 
 /// Remove one zone's nodes, values and relations; every other zone's, the
