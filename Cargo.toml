@@ -47,11 +47,6 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
-# LadybugDB's C++ is built by cmake in the build type the profile implies,
-# and unoptimized it is several times slower at everything.
-[profile.dev.package.lbug]
-opt-level = 3
-
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"

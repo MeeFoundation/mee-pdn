@@ -1,7 +1,5 @@
 //! The vector index: `LadybugDB`'s vector extension, linked into the engine,
-//! made and searched with nothing downloaded or installed. Built only where
-//! the engine was built with it (scripts/lbug-vector-source.sh).
-#![cfg(lbug_vector)]
+//! made and searched with nothing downloaded or installed at run time.
 
 use graph_query_engine::vector::{Entry, VectorIndex};
 

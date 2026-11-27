@@ -194,10 +194,6 @@ stress *args: _need-nextest
 hammer binary count="100":
   @sh scripts/hammer.sh "$@"
 
-# LadybugDB's sources with its vector extension linked in, for crates/graph-query-engine (see scripts/lbug-vector-source.sh)
-lbug-vector-source:
-  sh scripts/lbug-vector-source.sh
-
 # Check the dependency tree against deny.toml (advisories, licenses, sources)
 audit:
   cargo deny check
