@@ -2,8 +2,10 @@
 //! missing required one, a wrong cardinality or a wrong primitive, and coercing nothing. Spec: the
 //! ontology-registry capability of mia-docs' `graph-query-engine`.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde_json::{Map, Value};
+use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+use time::{Date, OffsetDateTime, PrimitiveDateTime};
 
 use super::shape::{Cardinality, FieldInfo, Primitive, ShapeNode, TypeKind};
 use super::{GraphError, GraphResult};
@@ -141,15 +143,23 @@ fn conform_primitive(primitive: Primitive, value: &Value, path: &str) -> GraphRe
 
 /// `2026-11-21`.
 fn is_date(text: &str) -> bool {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
+    Date::parse(text, format_description!("[year]-[month]-[day]")).is_ok()
 }
 
 /// `2026-11-21T10:00:00Z` (RFC 3339), or without a zone, as UTC.
 fn is_timestamp(text: &str) -> bool {
-    DateTime::parse_from_rfc3339(text).is_ok()
-        || ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+    let zoneless = [
+        format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second][optional [.[subsecond]]]"
+        ),
+        format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]]"
+        ),
+    ];
+    OffsetDateTime::parse(text, &Rfc3339).is_ok()
+        || zoneless
             .iter()
-            .any(|format| NaiveDateTime::parse_from_str(text, format).is_ok())
+            .any(|format| PrimitiveDateTime::parse(text, format).is_ok())
 }
 
 /// Within the graph's `DECIMAL(38, 10)`: at most 28 digits before the point.

@@ -3,7 +3,7 @@
 //! materialization.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 /// One record of a pod-tool, as the record store holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +15,7 @@ pub struct Record {
     pub key: String,
     /// Who wrote it, as the host recorded.
     pub author: String,
-    pub at: DateTime<Utc>,
+    pub at: OffsetDateTime,
     /// The device of the author's it was written on, where the host knows.
     pub device: Option<String>,
     pub bytes: Vec<u8>,

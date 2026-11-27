@@ -1757,11 +1757,11 @@ name = "graph-query-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chrono",
  "futures",
  "lbug",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "uuid",
 ]

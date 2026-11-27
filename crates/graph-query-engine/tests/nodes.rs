@@ -2,7 +2,6 @@
 //! interface), how they reach the graph (catch-up) and how they are read
 //! (queries). Each test is a scenario of the change `graph-query-engine`.
 
-use chrono::{TimeZone, Utc};
 use graph_query_engine::db::{zone, Applied, GraphDb};
 use graph_query_engine::materialize::{
     newest, Materialization, Materialized, Node, Relation, Subject, ToolOntology, ToolRelation,
@@ -11,6 +10,7 @@ use graph_query_engine::materialize::{
 use graph_query_engine::record::Record;
 use graph_query_engine::{Direction, NodeView, Ontology};
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 const POD: &str = "ginger";
 const MESSAGE: &str = "app:Message:v1";
@@ -24,7 +24,7 @@ fn record(key: &str, author: &str, second: i64, bytes: Value) -> Record {
         id: format!("{key}.{second}.{author}"),
         key: key.into(),
         author: author.into(),
-        at: Utc.timestamp_opt(1_790_000_000 + second, 0).unwrap(),
+        at: OffsetDateTime::from_unix_timestamp(1_790_000_000 + second).unwrap(),
         device: Some(format!("{author}-phone")),
         bytes: serde_json::to_vec(&bytes).expect("a JSON value serializes"),
     }

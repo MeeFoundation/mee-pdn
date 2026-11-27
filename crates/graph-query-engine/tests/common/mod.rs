@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
 use graph_query_engine::materialize::{
     newest, register, Materialization, Materialized, Node, Subject, ToolOntology, ToolType,
 };
 use graph_query_engine::record::{Record, RecordSource};
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 pub const NOTE: &str = "app:Note:v1";
 pub const MESSAGE: &str = "app:Message:v1";
@@ -33,7 +33,7 @@ pub fn record(key: &str, author: &str, second: i64, bytes: Value) -> Record {
         id: format!("{key}.{second}.{author}"),
         key: key.into(),
         author: author.into(),
-        at: Utc.timestamp_opt(1_790_000_000 + second, 0).unwrap(),
+        at: OffsetDateTime::from_unix_timestamp(1_790_000_000 + second).unwrap(),
         device: Some(format!("{author}-phone")),
         bytes: serde_json::to_vec(&bytes).expect("a JSON value serializes"),
     }

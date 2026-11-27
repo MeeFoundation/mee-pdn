@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
-use chrono::SecondsFormat;
 use lbug::{Connection, Database, LogicalType, PreparedStatement, SystemConfig, Value as Lv};
 use serde_json::{Map, Number, Value};
+use time::macros::format_description;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::materialize::{by_key, Materialization, Materialized, Subject, ToolOntology};
 use crate::ontology::RegistryTables;
@@ -97,8 +98,34 @@ fn root_key(node_key: &str) -> String {
     format!("{node_key}/value")
 }
 
-fn rfc3339(at: &chrono::DateTime<chrono::Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Micros, true)
+/// UTC to the microsecond, `2026-11-21T10:00:00.000000Z`: one width, so
+/// that `issued_at` orders as text the way it orders as time.
+fn rfc3339(at: &OffsetDateTime) -> String {
+    at.to_offset(UtcOffset::UTC)
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z"
+        ))
+        .unwrap_or_else(|_| at.to_string())
+}
+
+/// UTC with the fractional digits it needs, in threes: `2026-11-21T10:00:00Z`,
+/// `2026-11-21T10:00:00.250Z`.
+fn time_as_read(at: &OffsetDateTime) -> String {
+    let at = at.to_offset(UtcOffset::UTC);
+    let nanos = at.nanosecond();
+    let fraction = if nanos == 0 {
+        String::new()
+    } else if nanos.is_multiple_of(1_000_000) {
+        format!(".{:03}", nanos / 1_000_000)
+    } else if nanos.is_multiple_of(1_000) {
+        format!(".{:06}", nanos / 1_000)
+    } else {
+        format!(".{nanos:09}")
+    };
+    at.format(format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second]"
+    ))
+    .map_or_else(|_| at.to_string(), |whole| format!("{whole}{fraction}Z"))
 }
 
 // ---------------------------------------------------------------- records
@@ -1890,12 +1917,7 @@ fn payload(value: &Lv) -> Option<Value> {
                 .unwrap_or(Value::String(text))
         }
         Lv::Date(d) => Value::String(d.to_string()),
-        Lv::Timestamp(t) => Value::String(
-            chrono::DateTime::from_timestamp(t.unix_timestamp(), t.nanosecond()).map_or_else(
-                || t.to_string(),
-                |d| d.to_rfc3339_opts(SecondsFormat::AutoSi, true),
-            ),
-        ),
+        Lv::Timestamp(t) => Value::String(time_as_read(t)),
         other => Value::String(other.to_string()),
     })
 }

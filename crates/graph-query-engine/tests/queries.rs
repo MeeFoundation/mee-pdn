@@ -458,7 +458,10 @@ fn a_node_reads_back_exactly_as_it_was_written() {
             node.at,
             written
                 .at
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+                .format(time::macros::format_description!(
+                    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z"
+                ))
+                .unwrap()
         );
         assert_eq!(
             node.subject_id(),
