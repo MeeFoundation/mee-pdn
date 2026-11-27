@@ -3,7 +3,7 @@
 //! (queries). Each test is a scenario of the change `graph-query-engine`.
 
 use chrono::{TimeZone, Utc};
-use graph_query_engine::db::{zone, GraphDb};
+use graph_query_engine::db::{zone, Applied, GraphDb};
 use graph_query_engine::materialize::{
     newest, Materialization, Materialized, Node, Relation, Subject, ToolOntology, ToolRelation,
     ToolType,
@@ -17,6 +17,7 @@ const MESSAGE: &str = "app:Message:v1";
 const NOTE: &str = "app:Note:v1";
 const TEXT: &str = "app:UnstructuredText:v1";
 const ATTACHMENT: &str = "app:Attachment:v1";
+const EVENT: &str = "app:CalendarEvent:v1";
 
 fn record(key: &str, author: &str, second: i64, bytes: Value) -> Record {
     Record {
@@ -615,6 +616,100 @@ fn a_node_for_some_members_is_built_only_into_their_graphs() {
         if let Some(dm) = read.iter().find(|n| n.node_id == "dm1") {
             assert_eq!(dm.readers, ["alice", "bob"]);
         }
+    }
+}
+
+/// A node id that moves to a key earlier in byte order is read from that key, as in a graph built from the same records at once.
+#[test]
+fn a_node_id_moving_to_an_earlier_key_is_read_from_it() {
+    let db = graph("alice");
+    let first = [record("b", "alice", 1, json!({ "id": "x" }))];
+    db.catch_up_zone(POD, "echo", &Echo, &first).unwrap();
+    let both = [
+        record("a", "bob", 2, json!({ "id": "x" })),
+        record("b", "alice", 1, json!({ "id": "x" })),
+    ];
+    let applied = db.catch_up_zone(POD, "echo", &Echo, &both).unwrap();
+    assert_eq!((applied.appended, applied.skipped), (1, 1));
+    let read = all(&db, &["echo"]);
+    assert_eq!(ids(&read), ["x"]);
+    assert_eq!(
+        read[0].value,
+        json!({ "content": "a" }),
+        "key `a` now keeps `x`"
+    );
+    let fresh = graph("alice");
+    fresh.catch_up_zone(POD, "echo", &Echo, &both).unwrap();
+    assert_eq!(read, all(&fresh, &["echo"]));
+    assert_eq!(
+        db.catch_up_zone(POD, "echo", &Echo, &both).unwrap(),
+        Applied::default(),
+        "the same records apply nothing"
+    );
+}
+
+/// Events: one node per key, of the record's value.
+struct Events;
+
+impl Materialization for Events {
+    fn kind(&self) -> &'static str {
+        "calendar"
+    }
+
+    fn ontology(&self) -> ToolOntology {
+        ToolOntology {
+            kind: "calendar".into(),
+            types: vec![tool_type(EVENT)],
+            relations: Vec::new(),
+        }
+    }
+
+    fn materialize(&self, key: &str, records: &[Record]) -> Materialized {
+        newest(records, |r| Some(Node::new(key, EVENT, body(r))))
+    }
+}
+
+fn event(key: &str, second: i64, starts_at: &str) -> Record {
+    record(
+        key,
+        "alice",
+        second,
+        json!({ "title": key, "starts_at": starts_at }),
+    )
+}
+
+/// A time `LadybugDB` cannot parse costs its own node alone, applied one key at a time and in bulk, and is not tried again until its record changes.
+#[test]
+fn a_time_the_graph_cannot_parse_costs_its_own_node_alone() {
+    for bulk_from in [10, 1_000] {
+        let db = graph("alice").with_bulk_threshold(bulk_from);
+        let mut records: Vec<Record> = (0..12)
+            .map(|i| event(&format!("e{i:02}"), i, "2026-11-21T10:00:00Z"))
+            .collect();
+        records[5] = event("e05", 5, "next Tuesday");
+        let applied = db
+            .catch_up_zone(POD, "calendar", &Events, &records)
+            .unwrap();
+        assert_eq!(
+            (applied.bulk + applied.appended, applied.skipped),
+            (11, 1),
+            "bulk from {bulk_from}"
+        );
+        let read = all(&db, &["calendar"]);
+        assert_eq!(read.len(), 11);
+        assert!(!ids(&read).contains(&"e05".to_owned()));
+        assert_eq!(
+            db.catch_up_zone(POD, "calendar", &Events, &records)
+                .unwrap(),
+            Applied::default(),
+            "the same records try nothing again"
+        );
+        records.push(event("e05", 20, "2026-11-28T10:00:00Z"));
+        let applied = db
+            .catch_up_zone(POD, "calendar", &Events, &records)
+            .unwrap();
+        assert_eq!((applied.appended, applied.skipped), (1, 0));
+        assert_eq!(all(&db, &["calendar"]).len(), 12);
     }
 }
 

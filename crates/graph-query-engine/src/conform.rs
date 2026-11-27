@@ -2,6 +2,7 @@
 //! missing required one, a wrong cardinality or a wrong primitive, and coercing nothing. Spec: the
 //! ontology-registry capability of mia-docs' `graph-query-engine`.
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde_json::{Map, Value};
 
 use super::shape::{Cardinality, FieldInfo, Primitive, ShapeNode, TypeKind};
@@ -120,12 +121,13 @@ fn conform_field(field: &FieldInfo, value: &Value, path: &str) -> GraphResult<Va
 
 fn conform_primitive(primitive: Primitive, value: &Value, path: &str) -> GraphResult<Value> {
     let ok = match primitive {
-        Primitive::String | Primitive::Date | Primitive::Timestamp | Primitive::Reference => {
-            value.is_string()
-        }
+        Primitive::String | Primitive::Reference => value.is_string(),
+        Primitive::Date => value.as_str().is_some_and(is_date),
+        Primitive::Timestamp => value.as_str().is_some_and(is_timestamp),
         Primitive::Bool => value.is_boolean(),
         Primitive::Int => value.is_i64() || value.is_u64(),
-        Primitive::Float | Primitive::Decimal => value.is_number(),
+        Primitive::Float => value.is_number(),
+        Primitive::Decimal => value.as_f64().is_some_and(fits_decimal),
     };
     if ok {
         Ok(value.clone())
@@ -135,4 +137,22 @@ fn conform_primitive(primitive: Primitive, value: &Value, path: &str) -> GraphRe
             reason: format!("must be {}", primitive.as_str()),
         })
     }
+}
+
+/// `2026-11-21`.
+fn is_date(text: &str) -> bool {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
+}
+
+/// `2026-11-21T10:00:00Z` (RFC 3339), or without a zone, as UTC.
+fn is_timestamp(text: &str) -> bool {
+    DateTime::parse_from_rfc3339(text).is_ok()
+        || ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+            .iter()
+            .any(|format| NaiveDateTime::parse_from_str(text, format).is_ok())
+}
+
+/// Within the graph's `DECIMAL(38, 10)`: at most 28 digits before the point.
+fn fits_decimal(number: f64) -> bool {
+    number.is_finite() && number.abs() < 1e28
 }

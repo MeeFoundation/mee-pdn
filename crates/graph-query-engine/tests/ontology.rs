@@ -120,6 +120,25 @@ fn a_value_is_refused_for_a_missing_field_a_wrong_cardinality_or_a_wrong_primiti
     );
 }
 
+/// A time that is no date, or no time of day, is refused at the field that holds it, and one in ISO 8601 is taken.
+#[test]
+fn a_time_that_is_not_iso_8601_is_refused() {
+    let db = db();
+    let event = |starts_at: &str| json!({ "title": "vet", "starts_at": starts_at });
+    for wrong in ["next Tuesday", "2026-11-21T25:00:00Z", "21.11.2026 10:00"] {
+        let refused = refusal(&db, "app:CalendarEvent:v1", event(wrong));
+        assert!(refused.contains("value.starts_at"), "{wrong}: {refused}");
+    }
+    let shape = db.shape(&TypeId::new("app:CalendarEvent:v1")).unwrap();
+    for right in [
+        "2026-11-21T10:00:00Z",
+        "2026-11-21T10:00:00+01:00",
+        "2026-11-21 10:00:00",
+    ] {
+        assert_eq!(check(&shape, &event(right)).unwrap(), event(right));
+    }
+}
+
 /// Shapes, entity types and subject types are read from the registry in the graph, and an unknown name is refused.
 #[test]
 fn shapes_entity_types_and_subject_types_come_from_the_registry_in_the_graph() {

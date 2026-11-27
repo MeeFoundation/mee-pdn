@@ -658,6 +658,9 @@ impl GraphDb {
 
     /// Apply every key of a zone whose rows changed, each in a transaction
     /// of its own, and take out every key no record is under any more.
+    /// Every changed key is emptied before any is filled: a node id that
+    /// moves to a key earlier in byte order would otherwise meet its old
+    /// row under the key it leaves.
     fn apply_by_key(
         &self,
         conn: &Connection<'_>,
@@ -678,6 +681,7 @@ impl GraphDb {
             state.zone(&p.pod, &p.tool).keys.remove(k);
             applied.removed += 1;
         }
+        let mut changed = Vec::new();
         for (k, (sig, output, rows, skipped, withheld)) in &p.keys {
             let before = state
                 .zones
@@ -692,21 +696,29 @@ impl GraphDb {
                 }
                 continue;
             }
+            if had {
+                in_transaction(conn, |conn| remove_key(conn, &p.pod, &p.tool, k))?;
+                // Forgotten until filled: a catch-up that stops before then
+                // applies the key again.
+                state.zone(&p.pod, &p.tool).keys.remove(k);
+                applied.replaced += 1;
+            }
+            changed.push((k, sig, output, rows, skipped, withheld));
+        }
+        for (k, sig, output, rows, skipped, withheld) in changed {
             applied.skipped += skipped;
             applied.withheld += withheld;
             let (plans, failed) = plan_key(conn, &mut state.shapes, &p.pod, &p.tool, k, rows);
             applied.skipped += failed.len();
             let links = link_rows(&p.pod, &p.tool, k, rows, &failed);
-            in_transaction(conn, |conn| {
-                if had {
-                    remove_key(conn, &p.pod, &p.tool, k)?;
-                }
+            let refused = match in_transaction(conn, |conn| {
                 append(conn, &plans, &links, &self.known_types)
-            })?;
-            applied.appended += plans.len();
-            if had {
-                applied.replaced += 1;
-            }
+            }) {
+                Ok(()) => Refused::default(),
+                Err(_) => append_each(conn, &plans, &links, &self.known_types),
+            };
+            applied.appended += plans.len().saturating_sub(refused.nodes);
+            applied.skipped += refused.nodes + refused.links;
             state.zone(&p.pod, &p.tool).keys.insert(
                 k.clone(),
                 KeyState {
@@ -2570,6 +2582,41 @@ fn in_transaction<T>(
             Err(e)
         }
     }
+}
+
+/// How many of a key's nodes, and of the relations from the nodes that
+/// went in, `LadybugDB` refused.
+#[derive(Default)]
+struct Refused {
+    nodes: usize,
+    links: usize,
+}
+
+/// Write one key's nodes and relations one transaction each, after the key
+/// as a whole was refused: what `LadybugDB` refuses (a date it cannot
+/// parse, a decimal out of range) costs that node and its relations alone.
+fn append_each(
+    conn: &Connection<'_>,
+    plans: &[Plan<'_>],
+    links: &[LinkPlan],
+    known_types: &HashSet<String>,
+) -> Refused {
+    let mut refused = Refused::default();
+    let mut out: HashSet<&str> = HashSet::new();
+    for plan in plans {
+        let one = std::slice::from_ref(plan);
+        if in_transaction(conn, |conn| append(conn, one, &[], known_types)).is_err() {
+            refused.nodes += 1;
+            out.insert(&plan.node_key);
+        }
+    }
+    for link in links.iter().filter(|l| !out.contains(l.from_key.as_str())) {
+        let one = std::slice::from_ref(link);
+        if in_transaction(conn, |conn| append(conn, &[], one, known_types)).is_err() {
+            refused.links += 1;
+        }
+    }
+    refused
 }
 
 /// Write one key's nodes and relations, inside the caller's transaction.
