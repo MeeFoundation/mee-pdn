@@ -10,7 +10,7 @@ What this crate took from n0's `iroh-docs`, and what was done here with each ups
 
 ## Last pass
 
-2026-10-27, at the bump of iroh to 1.4.1 and of iroh-gossip and iroh-blobs to upstream's main, at `cf85954` and `3369597`. Upstream's `main` holds no commit past `8cfeacb`. Its open pull requests titled as fixes are #114, #112, #111, #106, #94, #93 and #88, each with an entry below; none has changed since the pass of 2026-10-16.
+2026-11-27, at the bump of iroh to 1.5.0; iroh-gossip and iroh-blobs stay at upstream's main, at `cf85954` and `3369597`. Upstream's `main` holds no commit past `8cfeacb`. Its open pull requests titled as fixes are #114, #112, #111, #106, #94, #93 and #88, each with an entry below; since the pass of 2026-10-27 only #88 has changed, by its commit `3389481`, which its entry covers.
 
 ## Pull requests
 
@@ -41,6 +41,8 @@ What this crate took from n0's `iroh-docs`, and what was done here with each ups
 ### #88 · cbenhagen · fix: retry incomplete blob downloads after sync
 
 **Already fixed here, another way.** Of the pull request's four cases: content a peer lacked is asked for from the peer of every later successful session (#112 above); content a restart left missing is parked by a scan at the first `start_sync` of a namespace in the live actor's life (`content_a_restart_left_missing_is_fetched_from_the_first_sync_peer` in `tests/sync.rs`); a download that fails toward a gossip neighbor is tried again (the provider's series of pauses in `src/engine/live/fetches.rs`); and a change of download policy does not apply, the crate holding no download policies. Upstream's scan of the whole replica at the end of every session is not taken: the scan here runs once per namespace per start. No action.
+
+**Its commit `3389481`, already fixed here, another way.** Upstream spends a gossip `ContentReady` that arrives before its entry without a download, then parks the content when the entry comes from a peer lacking it, waiting for a signal that already came; the commit fetches it from the node that signalled. Here the signal is not spent: `Fetches::register` in `src/engine/live/fetches.rs` keeps that node among the content's holders whether or not anything wants the content yet. An entry arrives only in a session, since gossip carries none, and that session's end, when it goes through, registers its peer for every parked content in `on_sync_finished` in `src/engine/live.rs`, which wants each from all its holders, the node that signalled included. The content waits for the rest of the session that brought its entry; when that session fails after taking the entry, it waits for the next signal or the next session that goes through. No action.
 
 ## Commits
 
