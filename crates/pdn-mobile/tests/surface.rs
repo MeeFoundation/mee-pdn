@@ -584,10 +584,9 @@ async fn one_handle_owns_one_node() -> Result<()> {
 }
 
 /// A node comes back on its directory as itself: the same node id, the same
-/// hosted identity, its pod listed and its records readable, with no
+/// hosted identity, and its pod and records readable at once with no
 /// ceremony repeated. What does not come back is work in flight — a pod
-/// invite minted before the stop is refused after it. The read is repeated:
-/// the armer's first sweep opens the pod after the bring-up returns.
+/// invite minted before the stop is refused after it.
 #[tokio::test]
 async fn a_node_comes_back_on_its_directory() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -625,16 +624,12 @@ async fn a_node_comes_back_on_its_directory() -> Result<()> {
         vec![pod.clone()],
         "its pod is held again"
     );
-    assert!(
-        eventually(|| async {
-            let value = node
-                .read_record(alice.clone(), pod.clone(), claim.clone())
-                .await
-                .unwrap_or(None);
-            Ok(value.as_deref() == Some(b"a@example".as_slice()))
-        })
-        .await?,
-        "its own records never read after the restart"
+    assert_eq!(
+        node.read_record(alice.clone(), pod, claim)
+            .await?
+            .as_deref(),
+        Some(b"a@example".as_slice()),
+        "its own records read at once"
     );
 
     // The pod invite was work in flight, and work in flight does not come back.

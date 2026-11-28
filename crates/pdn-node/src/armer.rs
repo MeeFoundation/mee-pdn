@@ -8,9 +8,21 @@ use std::sync::Weak;
 use anyhow::Result;
 use futures_lite::{Stream, StreamExt as _};
 use pdn_types::PdnId;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::runtime::State;
+
+/// The end of an armer's first sweep, whatever the sweep met: a sweep that
+/// failed is the next sweep's to repeat, not the waiter's.
+pub(crate) struct FirstSweep(oneshot::Receiver<()>);
+
+impl FirstSweep {
+    /// Also answers once the armer ended before sweeping: its runtime gone,
+    /// or its PMS subscription failed.
+    pub(crate) async fn done(self) {
+        let _ = self.0.await;
+    }
+}
 
 /// Keep hosted `identity`'s device confirmed and its pods open: one sweep
 /// now, then one per PMS change and one per sweep interval. Holds the state
@@ -20,8 +32,10 @@ pub(crate) fn spawn_identity_armer(
     state: Weak<Mutex<State>>,
     identity: PdnId,
     changes: impl Stream<Item = Result<()>> + Send + Unpin + 'static,
-) {
+) -> FirstSweep {
     let mut changes = changes;
+    let (swept, first_sweep) = oneshot::channel();
+    let mut swept = Some(swept);
     let _detached = tokio::spawn(async move {
         loop {
             let interval = {
@@ -36,6 +50,9 @@ pub(crate) fn spawn_identity_armer(
                     tracing::warn!(%identity, "confirming this device in the PMS failed: {err:#}");
                 }
                 crate::pods::arm_pods(&guard, identity).await;
+                if let Some(swept) = swept.take() {
+                    let _ = swept.send(());
+                }
                 guard.sweep_interval
             };
             // Two wake sources: a sweep can fail for a reason the PMS
@@ -50,6 +67,7 @@ pub(crate) fn spawn_identity_armer(
             }
         }
     });
+    FirstSweep(first_sweep)
 }
 
 /// Consumes every change already buffered, taken under the lock, so the

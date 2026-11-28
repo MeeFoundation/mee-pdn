@@ -116,27 +116,11 @@ async fn pod_with_claim(
     Ok((pod, record))
 }
 
-/// Whether `identity` on `runtime` comes to read the claim
-/// [`pod_with_claim`] placed, its pod opened again or not yet.
-async fn reads_claim(
-    runtime: &Runtime,
-    identity: pdn_types::PdnId,
-    pod: pdn_types::PodId,
-    record: pdn_types::RecordRef,
-) -> Result<bool> {
-    eventually(|| async {
-        match runtime.pods().read(identity, pod, record).await {
-            Ok(payload) => Ok(payload.as_deref() == Some(b"written before".as_slice())),
-            Err(_not_reopened_yet) => Ok(false),
-        }
-    })
-    .await
-}
-
-/// An identity created before the restart is hosted after it, with no peer
-/// and no ceremony repeated. Denied: with its hosting record removed, the
-/// same directory hosts nothing; with the record unreadable, the start
-/// fails naming the file.
+/// An identity created before the restart is hosted after it, its pod's
+/// records readable as soon as the spawn returns, with no peer and no
+/// ceremony repeated. Denied: with its hosting record removed, the same
+/// directory hosts nothing; with the record unreadable, the start fails
+/// naming the file.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -155,11 +139,10 @@ async fn a_restarted_runtime_hosts_what_its_record_names() -> Result<()> {
         vec![alice],
         "the recorded identity must be hosted again"
     );
-    // The pod reopens from the PMS's tickets on the armer's first sweep;
-    // the payload is local.
-    assert!(
-        reads_claim(&second, alice, pod, record).await?,
-        "the record placed before the restart must read back"
+    assert_eq!(
+        second.pods().read(alice, pod, record).await?.as_deref(),
+        Some(b"written before".as_slice()),
+        "the record placed before the restart must read as soon as the spawn returns"
     );
     second.shutdown().await?;
     drop(second);
@@ -355,8 +338,9 @@ async fn a_record_whose_replica_is_absent_is_skipped_and_the_rest_comes_back() -
         vec![alice],
         "the healthy identity must come back and both others must be skipped"
     );
-    assert!(
-        reads_claim(&second, alice, pod, record).await?,
+    assert_eq!(
+        second.pods().read(alice, pod, record).await?.as_deref(),
+        Some(b"written before".as_slice()),
         "the healthy identity's record must read back across the skip"
     );
     for skipped in [storeless, mismatched] {
