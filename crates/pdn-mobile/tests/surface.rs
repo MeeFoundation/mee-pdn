@@ -135,8 +135,8 @@ async fn a_pod_member_reads_its_records_and_an_outsider_reads_nothing() -> Resul
             .unwrap_or(None);
         Ok(value.as_deref() == Some(b"blood type 0+".as_slice()))
     })
-    .await;
-    assert!(read.is_ok(), "the joiner reads the creator's claim");
+    .await?;
+    assert!(read, "the joiner never read the creator's claim");
     let mut members = joiner.node.pod_members(bob.clone(), pod.clone()).await?;
     members.sort_by(|a, b| a.identity.cmp(&b.identity));
     let mut expected = vec![(alice.clone(), true), (bob.clone(), false)];
@@ -241,8 +241,8 @@ async fn a_payload_written_in_pieces_reads_back_in_pieces() -> Result<()> {
             .await
             .is_ok_and(|reader| reader.is_some()))
     })
-    .await;
-    assert!(arrived.is_ok(), "the joiner reads the creator's file");
+    .await?;
+    assert!(arrived, "the joiner never read the creator's file");
     let reader = joiner
         .node
         .read_record_streamed(bob.clone(), pod.clone(), record.clone())

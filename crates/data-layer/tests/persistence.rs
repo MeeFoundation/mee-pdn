@@ -491,8 +491,10 @@ async fn a_leftover_key_staging_file_does_not_block_the_start() -> Result<()> {
 /// What an import the blob store failed to finish left behind is gone after
 /// the next start (iroh-blobs-010). The source fails after two chunks: the
 /// store reads two ahead before its temp file opens, so a source failing
-/// sooner leaves none. Denied: a payload the store holds is no leftover,
-/// and reads back after the start.
+/// sooner leaves none. The file is awaited before the store stops:
+/// `add_stream` answers the source's failure once its chunks are queued,
+/// before the store's import has read them. Denied: a payload the store
+/// holds is no leftover, and reads back after the start.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_cut_short_leaves_nothing_after_a_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -526,15 +528,18 @@ async fn an_import_cut_short_leaves_nothing_after_a_restart() -> Result<()> {
         store.add_stream(source).await.temp_tag().await.is_err(),
         "an import whose source fails must fail"
     );
-    store.shutdown().await?;
-    drop(store);
     let leftovers = || -> std::io::Result<Vec<std::path::PathBuf>> {
         std::fs::read_dir(blobs.join("temp"))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     };
-    // Sentinel: the failed import left its file behind.
-    assert_ne!(leftovers()?, Vec::<std::path::PathBuf>::new());
+    // Sentinel: the failed import leaves its file behind.
+    assert!(
+        test_utils::eventually(|| async { Ok(!leftovers()?.is_empty()) }).await?,
+        "the failed import left no file behind"
+    );
+    store.shutdown().await?;
+    drop(store);
 
     let second = node_on(dir.path()).await?;
     assert_eq!(

@@ -296,9 +296,10 @@ impl Runtime {
     /// On a directory-configured runtime, every identity whose subdirectory
     /// records its hosting is hosted again before the spawn returns, through
     /// the same tail `create` runs: the PMS opens from the replica the
-    /// node holds, arms classification, and its armer's sweeps bring the
-    /// rest back. No ceremony, no dial; an unreadable record stops
-    /// the spawn, and a directory with none is a first start.
+    /// node holds, arms classification, and its armer's first sweep has
+    /// opened its pods by the time the spawn returns. No ceremony, no dial;
+    /// an unreadable record stops the spawn, and a directory with none is a
+    /// first start.
     pub async fn spawn(options: SpawnOptions) -> Result<Self> {
         let sweep_interval = options.reconcile_interval;
         let serving_halves = ServingHalves::new();
@@ -335,10 +336,11 @@ impl Runtime {
         };
 
         let state = Arc::new(Mutex::new(State::new(node, serving_halves, sweep_interval)));
+        let mut first_sweeps = Vec::new();
         {
             let mut guard = state.lock().await;
             for (identity, hosted, changes) in recovered {
-                admit_hosted(&state, &mut guard, identity, hosted, changes);
+                first_sweeps.push(admit_hosted(&state, &mut guard, identity, hosted, changes));
             }
             // Every identity the directory records is hosted again by now.
             guard.node.start_blob_collection();
@@ -350,6 +352,9 @@ impl Runtime {
         join_slot
             .set(Arc::downgrade(&state))
             .map_err(|_already_filled| anyhow::anyhow!("join state slot filled twice"))?;
+        for first_sweep in first_sweeps {
+            first_sweep.done().await;
+        }
         Ok(Self {
             node_id,
             state,
@@ -763,16 +768,17 @@ type PmsChanges = Box<dyn futures_lite::Stream<Item = Result<()>> + Send + Unpin
 
 /// The one step every path hosting an identity takes: it enters the hosted
 /// set and its armer starts, so no hosted identity serves its PMS while
-/// nothing opens its pods on this device.
+/// nothing opens its pods on this device. The first sweep takes the state
+/// lock, so it is awaited only once `guard` is released.
 pub(crate) fn admit_hosted(
     state: &Arc<Mutex<State>>,
     guard: &mut State,
     identity: PdnId,
     hosted: HostedIdentity,
     changes: impl futures_lite::Stream<Item = Result<()>> + Send + Unpin + 'static,
-) {
+) -> crate::armer::FirstSweep {
     guard.identities.insert(identity, hosted);
-    crate::armer::spawn_identity_armer(Arc::downgrade(state), identity, changes);
+    crate::armer::spawn_identity_armer(Arc::downgrade(state), identity, changes)
 }
 
 /// Host every identity whose subdirectory records its hosting. An
