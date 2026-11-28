@@ -4,3 +4,10 @@
 # Resolution skips registry versions younger than this; to be uncommented after Cargo 1.100 is released.
 # [registry]
 # global-min-publish-age = "7 days"
+
+# crates/graph-query-engine: LadybugDB as MeeFoundation/ladybug releases it,
+# its vector extension linked in. The lbug crate downloads the release's
+# archive for the build machine; releases there are immutable.
+[env]
+LBUG_GITHUB_REPOSITORY = "MeeFoundation/ladybug"
+LBUG_VERSION = "0.22.1-mee.1"
